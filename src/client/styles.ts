@@ -6,6 +6,9 @@ import xtermCss from 'xterm/css/xterm.css'
 export const css = xtermCss + '\n' + [
   // 区块整体
   '.dsh-wt_section{box-sizing:border-box;display:flex;flex-direction:column;gap:6px;width:100%;padding:0}',
+  // 无头宿主：不在侧栏出现工作台区块，只保留添加项目等 fixed 弹窗
+  '.dsh-wt_section[data-headless="true"]{display:contents}',
+  '.dsh-wt_section[data-headless="true"] > *:not(.dsh-wt_pop):not(.dsh-wt_popBackdrop):not(.dsh-wt_iconPop):not(.dsh-wt_confirm):not(.dsh-wt_confirmBackdrop){display:none !important}',
   '.dsh-wt_float{min-width:176px;max-width:264px;background:var(--dsw-alias-bg-base,#0b0e14);border:1px solid var(--dsw-alias-border-l2,#3a4150);border-radius:10px;padding:8px;box-shadow:var(--dsw-shadow-lv2,0 8px 24px rgba(0,0,0,.4))}',
   '.dsh-wt_rail{pointer-events:none}',
   '.dsh-wt_railBox{display:flex;flex-wrap:wrap;gap:5px;justify-content:center;padding:5px 3px;border:1px solid var(--dsw-alias-border-l2,#3a4150);border-radius:8px;background:var(--dsw-alias-bg-base,#0b0e14)}',
