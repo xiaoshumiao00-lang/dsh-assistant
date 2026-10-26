@@ -1,7 +1,6 @@
 // 电脑路径浏览器（底部抽屉）：浏览的一定是**本地电脑**的目录/文件（fs.list 主机端执行）。
 // mode='dir' → 只列目录，底部「选择此目录」；mode='file' → 列目录+文件，点文件即选中。
 import { useEffect, useState } from 'react'
-import type { OrbApi } from './orb-api.ts'
 import type { OrbKey } from './locales.ts'
 
 export interface FsEntry {
@@ -23,14 +22,23 @@ interface FsListing {
   truncated: boolean
 }
 
+export interface FsBrowserApi {
+  listFs(path: string, opts?: { includeFiles?: boolean; cwd?: string }): Promise<unknown>
+}
+
 export interface PathBrowserProps {
   mode: 'dir' | 'file'
-  api: OrbApi
+  api: FsBrowserApi
   startPath: string
   t: (key: OrbKey) => string
   onPick: (entry: FsEntry) => void
   onPickDir: (path: string) => void
   onClose: () => void
+  /** 选中文件后的读取/暂存中状态（不阻塞列表浏览，只提示正在处理）。 */
+  busy?: boolean
+  busyLabel?: string
+  /** 选中文件失败时显示在列表上方的错误（例如读取失败/会话输入框不可用）。 */
+  actionError?: string | null
 }
 
 function fmtSize(bytes: number): string {
@@ -39,7 +47,7 @@ function fmtSize(bytes: number): string {
   return `${bytes} B`
 }
 
-export function PathBrowser({ mode, api, startPath, t, onPick, onPickDir, onClose }: PathBrowserProps) {
+export function PathBrowser({ mode, api, startPath, t, onPick, onPickDir, onClose, busy = false, busyLabel, actionError = null }: PathBrowserProps) {
   const [path, setPath] = useState(startPath)
   const [listing, setListing] = useState<FsListing | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -106,6 +114,10 @@ export function PathBrowser({ mode, api, startPath, t, onPick, onPickDir, onClos
         )}
         <div data-pocket-orb="sheet-list">
           {error !== null && <div data-pocket-orb="sheet-status">{error}</div>}
+          {actionError != null && actionError !== '' && (
+            <div data-pocket-orb="sheet-status" role="alert" style={{ color: 'var(--dsw-alias-state-error-primary,#d54941)' }}>{actionError}</div>
+          )}
+          {busy && <div data-pocket-orb="sheet-status" role="status">{busyLabel ?? t('loading')}</div>}
           {listing === null && error === null && <div data-pocket-orb="sheet-status">{t('loading')}</div>}
           {listing !== null && listing.entries.length === 0 && <div data-pocket-orb="sheet-status">{t('emptyDir')}</div>}
           {listing?.entries.map((entry) => (
@@ -113,6 +125,7 @@ export function PathBrowser({ mode, api, startPath, t, onPick, onPickDir, onClos
               key={entry.path}
               type="button"
               data-pocket-orb="entry"
+              disabled={busy && entry.kind === 'file'}
               onClick={() => (entry.kind === 'dir' ? setPath(entry.path) : onPick(entry))}
             >
               <span data-pocket-orb="entry-icon">{entry.kind === 'dir' ? '📁' : '📄'}</span>
