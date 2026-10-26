@@ -437,6 +437,52 @@ function loadProjects(): ProjectsState {
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), hi)
 
+/** 合并宿主与本地项目数据（首次同步用）：
+ *  - 布局按 id 取并集（宿主优先），避免任一端的新项目被覆盖丢失；
+ *  - 排序、文件夹、绑定、视图、模板进度：本地兜底、宿主覆盖；
+ *  - hidden / removed 取并集。
+ * 删除操作要等两端都同步过之后才生效；首次合并宁可多留不可丢。 */
+function mergeProjects(server: any, local: any): any {
+  const s = server && typeof server === 'object' ? server : {}
+  const l = local && typeof local === 'object' ? local : {}
+  const layoutList: any[] = []
+  const seen = new Set<string>()
+  for (const arr of [Array.isArray(s.layouts) ? s.layouts : [], Array.isArray(l.layouts) ? l.layouts : []]) {
+    for (const x of arr) {
+      if (!x || typeof x.id !== 'string' || seen.has(x.id)) continue
+      seen.add(x.id)
+      layoutList.push(x)
+    }
+  }
+  const ids = new Set(layoutList.map((x) => x.id))
+  const order: string[] = []
+  for (const id of [...(Array.isArray(s.order) ? s.order : []), ...(Array.isArray(l.order) ? l.order : [])]) {
+    if (typeof id === 'string' && ids.has(id) && !order.includes(id)) order.push(id)
+  }
+  const uniq = (a: any, b: any): string[] => Array.from(new Set([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])].filter((x) => typeof x === 'string')))
+  const mergeMap = (a: any, b: any): Record<string, any> => ({ ...(b && typeof b === 'object' ? b : {}), ...(a && typeof a === 'object' ? a : {}) })
+  const shortcuts: any[] = []
+  const scSeen = new Set<string>()
+  for (const arr of [Array.isArray(s.shortcuts) ? s.shortcuts : [], Array.isArray(l.shortcuts) ? l.shortcuts : []]) {
+    for (const x of arr) if (x && typeof x.id === 'string' && !scSeen.has(x.id)) { scSeen.add(x.id); shortcuts.push(x) }
+  }
+  return {
+    order,
+    lastUsed: mergeMap(s.lastUsed, l.lastUsed),
+    hidden: uniq(s.hidden, l.hidden),
+    nameOverrides: mergeMap(s.nameOverrides, l.nameOverrides),
+    iconOverrides: mergeMap(s.iconOverrides, l.iconOverrides),
+    removed: uniq(s.removed, l.removed),
+    views: mergeMap(s.views, l.views),
+    shortcuts,
+    layouts: layoutList,
+    bindings: mergeMap(s.bindings, l.bindings),
+    folders: mergeMap(s.folders, l.folders),
+    flows: mergeMap(s.flows, l.flows),
+    briefs: mergeMap(s.briefs, l.briefs),
+  }
+}
+
 type FloatRect = { top: number }
 
 /** 从组件挂载点向上找 sidebar 容器：className 含 SidebarRoot/sidebar，或标签 aside/nav，到 body 为止。 */
@@ -1717,17 +1763,23 @@ function WorktableSection(props: any) {
         if (!r.ok) throw new Error('HTTP ' + r.status)
         const d = await r.json()
         const st = d?.state
-        const serverLayouts = Array.isArray(st?.projects?.layouts) ? st.projects.layouts.length : -1
-        const localLayouts = projectsRef.current.projects.layouts.length
-        if (st && st.projects && !(serverLayouts === 0 && localLayouts > 0)) {
-          // 宿主已有真值：以宿主为准
+        if (st && st.projects) {
+          // 两端都可能有尚未同步过的新项目：取并集后再以宿主为准，避免任何一端被覆盖丢失
+          const merged = mergeProjects(st.projects, projectsRef.current.projects)
           syncSkipRef.current += 1
-          try { localStorage.setItem(PROJECTS_KEY, JSON.stringify(st.projects)) } catch {}
+          try { localStorage.setItem(PROJECTS_KEY, JSON.stringify(merged)) } catch {}
           if (st.view) { try { localStorage.setItem(PERSIST_KEY, JSON.stringify(st.view)) } catch {} }
           if (alive) { setProjects(loadProjects()); setView(loadView()) }
-          syncRevRef.current = Number(st.revision) || 0
+          // 把并集写回宿主（补上本机独有项目）
+          const res = await fetch('/api/assistant/state', {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ projects: merged, view: st.view ?? viewRef.current }),
+          })
+          const dd = await res.json().catch(() => null)
+          syncRevRef.current = Number(dd?.state?.revision ?? st.revision) || 0
         } else {
-          // 宿主为空（或只被另一端以空数据初始化过）而本机有项目：把本机数据推上去
+          // 宿主为空：把本机数据推上去
           const res = await fetch('/api/assistant/state', {
             method: 'PUT',
             headers: { 'content-type': 'application/json' },
