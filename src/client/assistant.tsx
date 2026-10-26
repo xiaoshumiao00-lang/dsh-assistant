@@ -25,6 +25,13 @@ export function apply(ctx: any): void {
   // 控制室/工作台共用一套宿主调用（模型目录、选模型、后台模型、带预设建会话）
   try { setAssistantApi(makeOrbApi(ctx)) } catch { setAssistantApi(null) }
 
+  // 控制室兜底：面板未就绪时给一个「打开侧栏」按钮（布局服务可选，取不到就静默）
+  try {
+    ;(window as any).__dshAssistantToggleSidebar = () => {
+      try { ctx.layout?.toggleSidebar?.() } catch {}
+    }
+  } catch {}
+
   worktableApply(ctx)
   pocketApply(ctx)
 

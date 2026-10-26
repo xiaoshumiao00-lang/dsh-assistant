@@ -6,8 +6,8 @@
 //
 // 入口：手机/电脑上的悬浮球（dsh-pocket 那颗）现在打开这里，而不再打开快捷输入页；
 // 快捷输入页仍保留在抽屉底部入口里，功能不删。
-import { useEffect, useSyncExternalStore } from 'react'
-import { ConsolePane } from './split'
+import { useEffect, useState, useSyncExternalStore } from 'react'
+import { ConsolePane, consoleEnvReady } from './split'
 import { controlRoomStore } from './orb-bridge'
 
 const CR_CSS = `
@@ -16,6 +16,8 @@ const CR_CSS = `
 .dsh-assistant-crInner>.dsh-wt_console{flex:1;min-height:0;border-radius:0;padding:14px 14px calc(14px + env(safe-area-inset-bottom))}
 .dsh-assistant-crClose{position:absolute;top:calc(10px + env(safe-area-inset-top));right:12px;z-index:5;width:34px;height:34px;border-radius:50%;border:1px solid rgba(255,255,255,.18);background:rgba(20,26,36,.72);color:#e6e8eb;font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center;cursor:pointer;backdrop-filter:blur(8px)}
 .dsh-assistant-crClose:hover{background:rgba(40,50,66,.85)}
+.dsh-assistant-crWait{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:#9aa4b2;font-size:13px;padding:24px;text-align:center}
+.dsh-assistant-crWait button{padding:8px 16px;border-radius:9px;border:1px solid rgba(255,255,255,.18);background:rgba(79,142,247,.18);color:#e6e8eb;font:inherit;font-size:12px;cursor:pointer}
 @media (max-width:640px){
   .dsh-assistant-crInner>.dsh-wt_console{padding:10px 10px calc(10px + env(safe-area-inset-bottom))}
   .dsh-assistant-crClose{top:calc(8px + env(safe-area-inset-top));right:10px}
@@ -24,6 +26,7 @@ const CR_CSS = `
 
 export function ControlRoomOverlay() {
   const open = useSyncExternalStore(controlRoomStore.subscribe, controlRoomStore.getSnapshot)
+  const [ready, setReady] = useState(() => consoleEnvReady())
 
   useEffect(() => {
     const tag = document.createElement('style')
@@ -42,11 +45,35 @@ export function ControlRoomOverlay() {
     return () => document.removeEventListener('keydown', onKey)
   }, [open])
 
+  // 侧栏工作台区块可能晚于悬浮球挂载（或用户折叠了侧栏）：轮询到它就绪再渲染面板
+  useEffect(() => {
+    if (!open || ready) return
+    const timer = window.setInterval(() => {
+      if (consoleEnvReady()) setReady(true)
+    }, 700)
+    return () => window.clearInterval(timer)
+  }, [open, ready])
+
   if (!open) return null
   return (
     <div className="dsh-assistant-cr" role="region" aria-label="控制室">
       <div className="dsh-assistant-crInner">
-        <ConsolePane />
+        {ready ? (
+          <ConsolePane />
+        ) : (
+          <div className="dsh-assistant-crWait">
+            <div>控制室组件还没挂载（侧栏工作台区块未就绪）</div>
+            <button
+              type="button"
+              onClick={() => {
+                try { (window as any).__dshAssistantToggleSidebar?.() } catch {}
+                window.setTimeout(() => { if (consoleEnvReady()) setReady(true) }, 400)
+              }}
+            >
+              打开侧栏后重试
+            </button>
+          </div>
+        )}
       </div>
       <button
         type="button"

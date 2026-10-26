@@ -352,6 +352,11 @@ let splitEnv: SplitEnv | null = null
 export function setSplitEnv(env: SplitEnv | null) {
   splitEnv = env
 }
+/** 控制室面板是否已拿到工作台环境（侧栏工作台区块挂载后会注入）。
+ *  悬浮球控制室用它做兜底：极端情况下侧栏被完全卸载，面板会提示而不是空白。 */
+export function consoleEnvReady(): boolean {
+  return !!(splitEnv && splitEnv.console)
+}
 
 async function postJson(url: string, body: unknown): Promise<any> {
   const res = await fetch(url, {
