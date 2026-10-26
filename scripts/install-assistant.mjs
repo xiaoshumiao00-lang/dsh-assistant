@@ -7,14 +7,15 @@
 // 回退：把 package.json.bak-assistant-<时间戳> 复制回 package.json 再重启。
 import { readFileSync, writeFileSync, existsSync, copyFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 
 const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
 const profileName = process.argv[2] || 'desktop'
 const profileDir = join(dshHome, 'profiles', profileName)
 const pkgPath = join(profileDir, 'package.json')
-const repo = process.cwd()
+const repo = dirname(dirname(fileURLToPath(import.meta.url)))
 
 if (!existsSync(pkgPath)) {
   console.error(`找不到 profile：${pkgPath}`)
