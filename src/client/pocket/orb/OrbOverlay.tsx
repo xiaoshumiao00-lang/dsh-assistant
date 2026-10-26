@@ -1,7 +1,7 @@
 // 悬浮球主页面（全屏）：会话历史 + 目标（新会话/会话）+ 输入区。
 // 发送语义与桌面悬浮球一致：新会话 → 电脑上创建会话并执行；已有会话 → 追加指令。
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import { controlRoomStore } from '../../orb-bridge.ts'
+import { controlRoomStore, nativeBallStore } from '../../orb-bridge.ts'
 import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, TouchEvent as ReactTouchEvent } from 'react'
 import { Composer } from './Composer.tsx'
 import type { OrbChip, OrbVoiceBridge, SlashItem } from './Composer.tsx'
@@ -41,6 +41,12 @@ export function OrbOverlay({ api, t }: OrbOverlayProps) {
   const open = useSyncExternalStore(orbStore.subscribe, orbStore.getSnapshot)
   // 控制室打开时把球收起来（否则会浮在全屏控制室上面）
   const controlRoomOpen = useSyncExternalStore(controlRoomStore.subscribe, controlRoomStore.getSnapshot)
+  // Electron 宿主有原生桌面球（可拖到 DSH 窗口外）时，隐藏网页内这颗，避免两个球。
+  // 只在 Electron 渲染器里隐藏：手机浏览器与普通桌面浏览器仍需要页内球
+  // （原生球在电脑上，点它只会打开电脑上的窗口）。
+  const nativeBallFlag = useSyncExternalStore(nativeBallStore.subscribe, nativeBallStore.getSnapshot)
+  const electronShell = typeof navigator !== 'undefined' && /Electron/i.test(navigator.userAgent)
+  const nativeBall = nativeBallFlag && electronShell
   // 惰性挂载：悬浮球页首次打开前不渲染（哪怕只是 display:none）——
   // 会话历史可能有数百行，常驻在手机 WebView 里会白占几 MB 内存与上万个 DOM 节点，
   // 正是「详情页一崩就整页 reload」时最不该存在的负担。打开过一次后保持挂载，
@@ -51,7 +57,7 @@ export function OrbOverlay({ api, t }: OrbOverlayProps) {
   if (open) mountedRef.current = true
   return (
     <>
-      {!open && !controlRoomOpen && (
+      {!open && !controlRoomOpen && !nativeBall && (
         <OrbBall
           label={t('open')}
           onOpen={() => {

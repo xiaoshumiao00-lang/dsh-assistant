@@ -32,7 +32,7 @@ await build({
   define: { __WT_VERSION__: JSON.stringify(pkg.version) },
   format: 'esm',
   target: ['node22'],
-  external: ['@deepseek-ai/*', 'node:*', 'ws', 'node-pty', 'qrcode'],
+  external: ['@deepseek-ai/*', 'node:*', 'ws', 'node-pty', 'qrcode', 'electron'],
   loader: { '.css': 'text', '.html': 'text' }, // 原生皮肤模板以文本嵌入服务端 bundle
 })
 

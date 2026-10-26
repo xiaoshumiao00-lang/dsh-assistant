@@ -58,7 +58,7 @@ const styles = {
   warn: { color: 'var(--dsw-alias-state-warn-primary,#b45309)', fontSize: 12, lineHeight: 1.5 },
 };
 
-function PocketSettingsTab({ rpcCall, t }) {
+export function PocketSettingsTab({ rpcCall, t }) {
   const [status, setStatus] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
@@ -845,19 +845,7 @@ export function apply(ctx) {
   const rpcCall = (endpoint, payload, signal) =>
     ctx.connection.rpc.call(POCKET_RPC_CHANNEL, endpoint, payload, signal);
 
-  // 设置一级入口（与 通用设置/模型/插件 同级，order 1 = 通用之后、最外层）
-  ctx.slots.inject('settings.section', () =>
-    ctx.slots.register(
-      {
-        name: 'settings.section',
-        id: 'pocket',
-        order: 1,
-        label: () => translate('section'),
-        inject: () => ({ rpcCall, t: translate }),
-      },
-      PocketSettingsTab,
-    ),
-  );
+  // 设置入口统一收进 dsh-assistant 的「个人助手」页；这里不再单独注册「手机访问」页签。
 }
 
 export { name, inject, redactStatus };

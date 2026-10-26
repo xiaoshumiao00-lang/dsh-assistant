@@ -37,7 +37,7 @@ for (const name of bundles) {
   if (name === 'dsh-worktable') {
     next.push('dsh-assistant')
     replaced.push(name)
-  } else if (name === 'dsh-pocket') {
+  } else if (name === 'dsh-pocket' || name === 'dsh-tuoguan') {
     replaced.push(name)
     // 位置示意：dsh-assistant 放在工作台原来的位置
   } else {
