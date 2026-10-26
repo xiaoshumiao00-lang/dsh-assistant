@@ -13,6 +13,7 @@ import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import { PocketSettingsTab } from './pocket/index.jsx'
 import { setTuoguanDefault, useTuoguanDefaultOn } from './tuoguan.tsx'
 import { getAssistantApi, readModelPref, writeModelPref, readBgPref, writeBgPref, ballConfigStore } from './orb-bridge.ts'
+import { DEFAULT_ORB_AVATAR } from './pocket/orb/defaultAvatar.ts'
 
 type HubSection = 'phone' | 'cu' | 'tuoguan'
 
@@ -209,7 +210,7 @@ function ComputerUsePanel() {
         <div style={row}>
           <div>
             <div style={title}>悬浮球头像</div>
-            <p style={desc}>可换成任意图片（gif / png / webp / jpg，≤ 512 KB），不设就用默认 🔮。</p>
+            <p style={desc}>可换成任意图片（gif / png / webp / jpg，≤ 512 KB），不设就用默认头像。</p>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{
@@ -218,9 +219,7 @@ function ComputerUsePanel() {
               display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
               background: 'var(--dsw-alias-fill-l1, rgba(0,0,0,.04))',
             }}>
-              {ball.avatar
-                ? <img src={ball.avatar} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                : <span style={{ fontSize: 20 }}>🔮</span>}
+              <img src={ball.avatar || DEFAULT_ORB_AVATAR} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
             </span>
             <button type="button" style={{ ...selectStyle, minWidth: 0, height: 28, cursor: 'pointer' }} onClick={pickAvatar}>选择图片</button>
             <button type="button" style={{ ...selectStyle, minWidth: 0, height: 28, cursor: 'pointer' }} onClick={() => ballConfigStore.set({ avatar: '' })}>恢复默认</button>

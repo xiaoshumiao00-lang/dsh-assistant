@@ -48,7 +48,7 @@ await build({
   target: ['es2022'],
   jsx: 'automatic',
   external: ['@deepseek-ai/*', 'react', 'react-dom', 'react/jsx-runtime', 'react/jsx-dev-runtime', 'scheduler'],
-  loader: { '.css': 'text' }, // xterm.css 以文本内联进样式串（宿主不加载独立 css 文件）
+  loader: { '.css': 'text', '.png': 'dataurl' }, // xterm.css 内联；悬浮球默认头像内联为 data URL
   banner: clientBanner,
   footer: clientFooter,
   // 客户端自报版本（随 package.json version 走，发版即自动一致）
