@@ -16,6 +16,7 @@ import { AssistantSettingsHub } from './assistant-settings.tsx'
 import { apply as tuoguanApply } from './tuoguan.tsx'
 import { POCKET_RPC_CHANNEL } from './pocket/api.js'
 import { NS as POCKET_NS } from './pocket/pocket-locales.js'
+import { installComposerMenuToggle } from './composerMenu'
 
 export const name = 'dsh-assistant'
 
@@ -26,6 +27,12 @@ export const inject = Array.from(new Set([
 ]))
 
 export function apply(ctx: any): void {
+  // 输入框「＋」菜单：再次点加号关闭（宿主原生只在点外部时关）。
+  try {
+    const dispose = installComposerMenuToggle()
+    ctx.effect(() => dispose, 'dsh-assistant: composer menu toggle')
+  } catch { /* 非浏览器环境或旧宿主无输入框时忽略 */ }
+
   // 控制室/工作台共用一套宿主调用（模型目录、选模型、后台模型、带预设建会话）。
   // 必须等 remote.session / uiWorkspace 等 Remote 服务注入后再建 API——直接拿根 ctx
   // 会取不到 ctx.remote（未 inject 的命名空间），模型目录恒为空。
