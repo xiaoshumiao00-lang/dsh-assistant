@@ -1,12 +1,15 @@
-// 悬浮球装配层：注入样式/词典，注册两个 slot：
-//   shell.overlay        → 全屏悬浮球页（OrbOverlay，orbStore 开关）
+// 悬浮球装配层：注入样式/词典，注册悬浮球入口、会话输入框「电脑文件」桥与选择器：
 //   sidebar.footer.action → 抽屉底部「悬浮球」入口（OrbEntry）
+//   shell.overlay         → 悬浮球页 / 电脑文件选择器
+//   conversation.input.left → 登记官方附件写入面（不可见）
 import { OrbEntry } from './OrbEntry.tsx'
 import { OrbOverlay } from './OrbOverlay.tsx'
 import { installBootGuard } from './boot-guard.ts'
 import { ORB_CSS } from './orb.css.ts'
-import { NS, zh, en } from './locales.ts'
+import { NS, zh, en, type OrbKey } from './locales.ts'
 import { makeOrbApi } from './orb-api.ts'
+import { PcFileCommandIcon, PcFileInputBridge, PcFilePickerOverlay, hasPcFileComposer, isPhoneComposerLayout, pcFilePickerStore } from './PcFileAttach.tsx'
+import { sessionCwdOf } from '../../pcFile.ts'
 
 export function orbApply(ctx: any): void {
   const api = makeOrbApi(ctx)
@@ -26,6 +29,62 @@ export function orbApply(ctx: any): void {
       tag.remove()
     }
   }, 'dsh-pocket: orb styles')
+
+  // 会话输入框「＋ → 电脑文件」：命令只在手机布局出现，桌面端继续用系统选择器。
+  // 输入框挂载时把附件写入面登记到模块级表，命令触发后由全屏选择器读取电脑文件并加入附件。
+  const tr = (key: OrbKey): string => {
+    try { return ctx.locale.bind(NS)(key) } catch { return key }
+  }
+  const conversationApi = (() => {
+    try { return ctx.get?.('conversation') ?? ctx.conversation ?? null } catch { return null }
+  })()
+
+  ctx.slots.inject('conversation.input.left', () =>
+    ctx.slots.register(
+      {
+        name: 'conversation.input.left',
+        id: 'assistant-pc-file-input',
+        order: 30,
+        locale: NS,
+        inject: (sessionId: string | undefined) => ({ sessionId }),
+      },
+      PcFileInputBridge,
+    ),
+  )
+
+  ctx.slots.inject('shell.overlay', () =>
+    ctx.slots.register(
+      {
+        name: 'shell.overlay',
+        id: 'assistant-pc-file-picker',
+        order: 115,
+        locale: NS,
+        inject: () => ({ api, conversationApi, sessions: ctx.sessions }),
+      },
+      PcFilePickerOverlay,
+    ),
+  )
+
+  try {
+    ctx.inject(['commandUi'], (scope: any) => {
+      scope.effect(() => scope.commandUi.register({
+        name: 'file-pc',
+        label: () => tr('pcFiles'),
+        description: () => tr('pcFileAttachDesc'),
+        icon: PcFileCommandIcon,
+        available: (session: any) => isPhoneComposerLayout() && hasPcFileComposer(session?.sessionId),
+        ui: {
+          kind: 'action',
+          run: (session: any) => {
+            const cwd = (() => {
+              try { return sessionCwdOf(ctx.sessions.list.getSnapshot()?.byId?.[session.sessionId]) } catch { return '' }
+            })()
+            pcFilePickerStore.open(session.sessionId, cwd)
+          },
+        },
+      }), 'dsh-assistant: PC file attachment command')
+    })
+  } catch { /* 旧宿主没有 commandUi：不影响悬浮球/设置页 */ }
 
   // ⚠️ 不要再往 conversation.input.activity 里注册录音按钮。
   // 2026-10-25 实测：往官方语音插件占用的同名槽位再注册一个条目，会让**官方插件自己的

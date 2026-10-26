@@ -47,7 +47,7 @@
   "scripts": {
     "build": "node build.mjs",
     "check": "node --check lib/index.js && node --check lib/client.js",
-    "test": "node scripts/test-session-focus.mjs && node scripts/test-session-folder.mjs && node scripts/test-session-status.mjs"
+    "test": "node scripts/test-session-focus.mjs && node scripts/test-session-folder.mjs && node scripts/test-session-status.mjs && node scripts/test-pc-file.mjs"
   },
   "dependencies": {
     "qrcode": "^1.5.4",
