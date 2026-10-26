@@ -1393,7 +1393,10 @@ function RenameInput(props: { initial: string; placeholder: string; onCommit: (v
 }
 
 function WorktableSection(props: any) {
-  const wide = props.wide !== false
+  // headless：作为 shell.overlay 常驻的「数据/弹窗宿主」——不渲染侧栏工作台区块，
+  // 只保留 splitEnv 注入与添加项目等弹窗（控制室通过悬浮球进入，侧栏不再出现工作台）。
+  const headless = props.headless === true
+  const wide = headless ? true : props.wide !== false
   const renderProjectSlot = typeof props.renderSlot === 'function' ? props.renderSlot : null
   /** locale 座席 t；宿主未安装 locale 服务时回退 zh 词典（保持独立可用）。 */
   const t = (key: WorktableKey, params?: Record<string, string>): string => {
@@ -4405,7 +4408,7 @@ function buildCustomLayoutPrompt(req: string): string {
       ? { position: 'fixed' as const, top: float.top, left: railRect.left, width: railRect.width, zIndex: 70 }
       : bottomInset > 0 ? { marginBottom: bottomInset } : undefined
     return (
-      <div ref={rootRef} className="dsh-wt_section dsh-wt_rail" style={railStyle}>
+      <div ref={rootRef} className="dsh-wt_section dsh-wt_rail" style={railStyle} data-headless={headless ? 'true' : undefined}>
         <div className="dsh-wt_divider" />
         <div className="dsh-wt_railBox">
           {railItems.length > 0
@@ -4427,7 +4430,7 @@ function buildCustomLayoutPrompt(req: string): string {
   }
 
   return (
-    <div ref={rootRef} className={'dsh-wt_section' + (isFloat ? ' dsh-wt_float' : '')} style={isFloat ? floatStyle : dockedStyle}>
+    <div ref={rootRef} className={'dsh-wt_section' + (isFloat ? ' dsh-wt_float' : '')} style={isFloat ? floatStyle : dockedStyle} data-headless={headless ? 'true' : undefined}>
       <div className="dsh-wt_divider" />
       <div className="dsh-wt_header">
         <button
@@ -4507,7 +4510,9 @@ function buildCustomLayoutPrompt(req: string): string {
 
       {addOpen && <div className="dsh-wt_popBackdrop" onClick={() => { invalidatePickState(); setAddOpen(false) }} />}
       {addOpen && (
-        <div className="dsh-wt_menu dsh-wt_add dsh-wt_pop" style={{ position: 'fixed', left: popLeft, top: popTop, width: 360, zIndex: 80 }}>
+        <div className="dsh-wt_menu dsh-wt_add dsh-wt_pop" style={headless
+          ? { position: 'fixed', left: '50%', top: '50%', transform: 'translate(-50%, -50%)', width: 360, maxWidth: 'calc(100vw - 24px)', maxHeight: 'calc(100vh - 32px)', overflow: 'auto', zIndex: 80 }
+          : { position: 'fixed', left: popLeft, top: popTop, width: 360, zIndex: 80 }}>
           <span className="dsh-wt_menuLabel">模板（可选）</span>
           <div className="dsh-wt_tmpls">
             <button type="button" className="dsh-wt_tmpl" data-on={wsTemplate === '' ? 'true' : 'false'}
@@ -5177,17 +5182,14 @@ export function apply(ctx: any) {
     order: 100,
   }, SplitWorkspace), 'dsh-worktable: split workspace overlay')
 
-  ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
-    name: 'sidebar.footer.action',
-    id: 'dsh-worktable',
-    order: 20,
-    children: {
-      'sidebar.worktable.project': {
-        kind: 'list',
-        scope: 'root',
-      },
-    },
-  }, WorktableSection), 'dsh-worktable: worktable section')
+  // 控制室的数据/弹窗宿主：常驻但「无头」——不在侧栏渲染工作台区块，
+  // 只负责 splitEnv 注入与添加项目/图标/绑定等弹窗。控制室一律从悬浮球进入。
+  ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+    name: 'shell.overlay',
+    id: 'dsh-assistant-headless-worktable',
+    order: 90,
+    inject: () => ({ headless: true }),
+  }, WorktableSection), 'dsh-assistant: headless worktable host')
 }
 
 export { WorktableSection }
