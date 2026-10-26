@@ -74,6 +74,37 @@ export function apply(ctx: any, config: any = {}): () => void {
   const ballDir = (() => { try { return ballProfileDir(ctx) } catch { return '' } })()
   const ballStateFile = ballDir ? joinPathNode(ballDir, 'state.json') : ''
   const ballAvatarFile = ballDir ? joinPathNode(ballDir, 'avatar.txt') : ''
+
+  // 点击事件用长轮询推给页面：有等待者时立刻响应，没有时仍保留一次性 pending。
+  // 与旧的 1.2s 定时轮询相比，点击延迟不再取决于下一次轮询何时发生。
+  let pendingOpenConsole = false
+  type ClickWaiter = { res: any; timer: ReturnType<typeof setTimeout> | null; done: boolean }
+  const clickWaiters = new Set<ClickWaiter>()
+  const sendClick = (res: any, open: boolean): void => {
+    if (res?.destroyed || res?.writableEnded) return
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+    res.end(JSON.stringify({ open, longPoll: true }))
+  }
+  const finishClickWaiter = (waiter: ClickWaiter, open: boolean, respond = true): void => {
+    if (waiter.done) return
+    waiter.done = true
+    if (waiter.timer) clearTimeout(waiter.timer)
+    clickWaiters.delete(waiter)
+    if (respond) { try { sendClick(waiter.res, open) } catch {} }
+  }
+  const takeOpenClick = (): boolean => {
+    let open = ballHandle ? ballHandle.takeClick() === true : false
+    if (pendingOpenConsole) { pendingOpenConsole = false; open = true }
+    return open
+  }
+  const wakeClickWaiters = (): void => {
+    // 一次点击只交给一个页面，保持旧接口的「取走」语义；其余页面继续等待。
+    for (const waiter of [...clickWaiters]) {
+      if (takeOpenClick()) finishClickWaiter(waiter, true)
+    }
+  }
+  disposers.push(() => { for (const waiter of [...clickWaiters]) finishClickWaiter(waiter, false) })
+
   const readBallState = (): { enabled: boolean; avatar: string } => {
     let enabled = true
     let avatar = ''
@@ -112,13 +143,13 @@ export function apply(ctx: any, config: any = {}): () => void {
       if (!handle) return
       ballHandle = handle
       nativeBall = true
-      disposers.push(() => { try { handle.dispose() } catch {} })
+      const offClick = handle.onClick?.(wakeClickWaiters)
+      disposers.push(() => { try { offClick?.(); handle.dispose() } catch {} })
       try { ctx.logger?.('dsh-assistant')?.info?.('desktop ball started') } catch {}
     } catch (err) {
       try { ctx.logger?.('dsh-assistant')?.error?.('desktop ball failed: %s', String(err)) } catch {}
     }
   }
-  void applyBall()
   /** 读一个小小的 JSON body（头像 data URL 可能到 1MB 量级）。 */
   const readSmallJson = (req: any, limit = 2 * 1024 * 1024): Promise<any> => new Promise((resolve) => {
     let raw = ''
@@ -130,7 +161,6 @@ export function apply(ctx: any, config: any = {}): () => void {
   //   POST（或 GET）http://127.0.0.1:<web端口>/api/assistant/open-console
   // 置位后由页面下一次轮询 /api/assistant/ball-click 取走并打开控制室。
   // 用途：桌面球点不开/没有球（网页、CLI）时，用一条 curl 即可打开，便于验收与排障。
-  let pendingOpenConsole = false
   try {
     ctx.webServer?.register?.({
       kind: 'exact',
@@ -182,6 +212,7 @@ export function apply(ctx: any, config: any = {}): () => void {
       path: '/api/assistant/open-console',
       handler: (_req: any, res: any) => {
         pendingOpenConsole = true
+        wakeClickWaiters()
         const payload = JSON.stringify({ ok: true, opened: true })
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
         res.end(payload)
@@ -213,17 +244,20 @@ export function apply(ctx: any, config: any = {}): () => void {
     ctx.webServer?.register?.({
       kind: 'exact',
       path: '/api/assistant/ball-click',
-      handler: (_req: any, res: any) => {
-        // 两个来源合成一个「取走」语义：桌面球点击，或外部 open-console 指令
-        let open = ballHandle ? ballHandle.takeClick() === true : false
-        if (pendingOpenConsole) { pendingOpenConsole = false; open = true }
-        const payload = JSON.stringify({ open })
-        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-        res.end(payload)
+      handler: (req: any, res: any) => {
+        if (takeOpenClick()) { sendClick(res, true); return }
+        const wantsWait = /[?&]wait=1(?:&|$)/.test(String(req.url ?? ''))
+        if (!wantsWait) { sendClick(res, false); return }
+        const waiter: ClickWaiter = { res, timer: null, done: false }
+        // 15 秒空响应一次，兼容代理/浏览器超时；客户端收到后立即发起下一次等待。
+        waiter.timer = setTimeout(() => finishClickWaiter(waiter, false), 15000)
+        clickWaiters.add(waiter)
+        req.on('close', () => finishClickWaiter(waiter, false, false))
       },
     })
   } catch {}
 
+  void applyBall()
   return () => {
     for (const dispose of disposers.reverse()) {
       try { dispose() } catch {}

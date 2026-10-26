@@ -82,33 +82,52 @@ export function apply(ctx: any): void {
     } catch {}
   } catch {}
 
-  // 原生球点击 / 外部指令 → 宿主 pending → 这里轮询后打开控制室（1.2s 内响应）。
-  //
-  // 轮询必须「全局只有一个」并且随插件 disposal 一起清掉：
-  // 客户端 bundle 被 HMR/重新 apply 时会再执行一遍 apply()，而 window.setInterval 不在
-  // ctx.effect 里就永远不会被清 → 旧实例的定时器活着，继续 fetch /api/assistant/ball-click
-  // 把点击「吃掉」，并 setOpen 到**已经卸载**的 controlRoomStore 上。
-  // 表现为：球点了没反应、控制室永远不出现（每次重建 lib/client.js 后必现）。
-  // 所以：新实例先清掉手上一个句柄，再把自己登记进去；dispose 时清自己。
-  //
-  // 不再用 nativeBallStore 做前置条件：该接口同时承担「外部 open-console 指令」，
-  // 没有桌面球的网页/CLI 环境也要能被打开（本机 1.2s 一次 GET，开销可忽略）。
+  // 原生球点击 / 外部指令：宿主长轮询，点击发生即响应（不再固定等待 1.2s）。
+  // 老宿主没有 longPoll 标记时自动退回低频轮询；HMR/重复 apply 仍全局只留一个循环。
   const BALL_POLL_KEY = '__dshAssistantBallPoll'
   try {
     const prev = (window as any)[BALL_POLL_KEY]
-    if (typeof prev === 'number' && prev > 0) { try { window.clearInterval(prev) } catch {} }
-    const timer = window.setInterval(() => {
-      void fetch('/api/assistant/ball-click', { cache: 'no-store' })
-        .then((r) => r.json())
-        .then((d) => { if (d?.open === true) controlRoomStore.setOpen(true) })
-        .catch(() => {})
-    }, 1200)
-    ;(window as any)[BALL_POLL_KEY] = timer
-    const stop = (): void => {
-      try { window.clearInterval(timer) } catch {}
-      if ((window as any)[BALL_POLL_KEY] === timer) (window as any)[BALL_POLL_KEY] = 0
+    if (typeof prev === 'function') { try { prev() } catch {} }
+    else if (typeof prev === 'number' && prev > 0) { try { window.clearInterval(prev) } catch {} }
+    let stopped = false
+    let controller: AbortController | null = null
+    let retryTimer: number | null = null
+    let retryResolve: (() => void) | null = null
+    const delay = (ms: number): Promise<void> => new Promise((resolve) => {
+      retryResolve = resolve
+      retryTimer = window.setTimeout(() => { retryTimer = null; retryResolve = null; resolve() }, ms)
+    })
+    const run = async (): Promise<void> => {
+      while (!stopped) {
+        let needsDelay = false
+        try {
+          controller = new AbortController()
+          const r = await fetch('/api/assistant/ball-click?wait=1', { cache: 'no-store', signal: controller.signal })
+          const d = await r.json()
+          if (stopped) break
+          if (d?.open === true) controlRoomStore.setOpen(true)
+          needsDelay = d?.longPoll !== true
+        } catch {
+          needsDelay = true
+        } finally {
+          controller = null
+        }
+        // 老宿主会立即返回，必须节流；新宿主只有出错/兼容回退才等待。
+        if (!stopped && needsDelay) await delay(1200)
+      }
     }
-    try { if (typeof ctx.effect === 'function') ctx.effect(() => stop, 'dsh-assistant: ball click poll') } catch {}
+    const stop = (): void => {
+      if (stopped) return
+      stopped = true
+      try { controller?.abort() } catch {}
+      if (retryTimer != null) { window.clearTimeout(retryTimer); retryTimer = null }
+      retryResolve?.()
+      retryResolve = null
+      if ((window as any)[BALL_POLL_KEY] === stop) (window as any)[BALL_POLL_KEY] = 0
+    }
+    ;(window as any)[BALL_POLL_KEY] = stop
+    void run()
+    try { if (typeof ctx.effect === 'function') ctx.effect(() => stop, 'dsh-assistant: ball click wait') } catch {}
   } catch {}
 
   // URL 直达：…/?assistant=console 或 …/#console 打开控制室（重开窗口/外部打开时用；

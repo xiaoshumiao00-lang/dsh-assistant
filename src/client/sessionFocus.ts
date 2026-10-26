@@ -35,6 +35,8 @@ export interface FocusBridge {
 export interface FocusDeps {
   now?: () => number
   sleep?: (ms: number) => Promise<void>
+  /** 宿主已确认切到新会话时立即通知；历史流修复继续在后台等待，不挡住界面切换。 */
+  onOpened?: (result: FocusResult) => void
 }
 
 export interface FocusResult {
@@ -81,6 +83,18 @@ const POLL_MS = 120
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((res) => { setTimeout(res, ms) })
 
+/** 聚焦与常驻看门狗共用同一把 resync 锁，避免同一空白会话被并发重建历史流。 */
+const blankResyncs = new Map<string, Promise<void>>()
+async function resyncBlankShared(sessionId: string, session: any): Promise<void> {
+  let task = blankResyncs.get(sessionId)
+  if (!task) {
+    task = (async () => { await session?.resync?.() })()
+    blankResyncs.set(sessionId, task)
+    void task.finally(() => { if (blankResyncs.get(sessionId) === task) blankResyncs.delete(sessionId) }).catch(() => {})
+  }
+  await task
+}
+
 /**
  * 打开并校验「当前会话」是否已切到 sessionId。
  * @returns 已切换 / 无校验手段（视为成功）/ 失败
@@ -123,8 +137,7 @@ export async function healBlankSessionIfStuck(bridge: FocusBridge | null, sessio
   const st = faceStateOf(bridge, sessionId)
   if (!st || st.openState !== 'loading' || !st.blank) return false
   try {
-    const job = st.session.resync?.()
-    if (job && typeof job.then === 'function') await job
+    await resyncBlankShared(sessionId, st.session)
   } catch { return false }
   return true
 }
@@ -162,8 +175,7 @@ async function settleBlankHistory(
     const cur = faceStateOf(bridge, sessionId)
     if (!cur || cur.openState !== 'loading' || !cur.blank) break
     try {
-      const job = cur.session.resync?.()
-      if (job && typeof job.then === 'function') await job
+      await resyncBlankShared(sessionId, cur.session)
     } catch { /* resync 不存在/失败：下一轮再看 */ }
     result.resyncs++
     const ok = await waitUntil(() => {
@@ -270,8 +282,11 @@ export async function focusSessionInHost(bridge: FocusBridge | null, sessionId: 
     else result.reason = 'open-not-confirmed'
   }
 
-  // 4) 白屏兜底：切过去之后，把卡在 loading 的空白会话历史流重建出来
-  if (result.opened) await settleBlankHistory(bridge, sessionId, result, waitUntil)
+  // 4) 宿主已确认切换就先让调用方露出会话；空白历史流的检查与修复随后继续。
+  if (result.opened) {
+    try { deps.onOpened?.(result) } catch { /* 界面回调不影响聚焦诊断 */ }
+    await settleBlankHistory(bridge, sessionId, result, waitUntil)
+  }
 
   return result
 }

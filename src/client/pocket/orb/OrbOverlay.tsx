@@ -529,6 +529,7 @@ function OrbPage({ api, t, open }: OrbOverlayProps & { open: boolean }) {
   // 节流：宿主每次投影更新都会推一版快照，手机上即便只是重渲染几十行也很贵，
   // 合并成 250ms 一次，列表看起来仍然是实时的。
   useEffect(() => {
+    if (!open) return
     let timer: number | null = null
     const flush = (): void => {
       timer = null
@@ -553,7 +554,7 @@ function OrbPage({ api, t, open }: OrbOverlayProps & { open: boolean }) {
       stopWorkspaces()
       if (timer !== null) window.clearTimeout(timer)
     }
-  }, [api])
+  }, [api, open])
 
   // 关闭悬浮球时把分页收回首屏：下次打开仍从 40 条开始，内存不随使用时长增长。
   useEffect(() => {
