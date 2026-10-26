@@ -9,6 +9,9 @@ scripts/*.json
 scripts/shot-*.png
 scripts/ball.json
 
+# 本地备份
+.backup-*/
+
 # 编辑器 / 系统
 .DS_Store
 Thumbs.db

@@ -77,6 +77,12 @@ export type LayoutSpec = {
   chatFullHeight?: boolean
   /** 顶行首次打开时高度占可用高度比例（0~1；0.5 = 上下等分）；拖动后由存档值覆盖 */
   topHeightRatio?: number
+  /** 全屏布局：不显示对话列（内容占满可用宽，chatW 视为 0）。
+   *  标题栏 💬 可临时拉出对话列（不落盘，重开仍是全屏）。 */
+  chatHidden?: boolean
+  /** 会话全屏：不显示内容列（内容窗保留在 spec 里但不渲染，切到其它布局时标签不丢），
+   *  官方会话视图占满可用宽——「全屏看到的就是会话本身」。 */
+  chatOnly?: boolean
 }
 
 type Geom = { left: number; top: number; right: number; bottom: number }
@@ -90,6 +96,8 @@ type SplitState = {
   chatW: number
   /** true = 用户手动拖过聊天分隔线（固定像素）；false = 占比模式，宽度随可用宽比例走 */
   chatWManual: boolean
+  /** 全屏布局下临时拉出对话列（仅内存态，不持久化） */
+  chatPeek: boolean
   topH: number
   leftW: number
   paneWs: number[]
@@ -131,6 +139,8 @@ type SplitState = {
   moveTab(fromRow: PaneRow, fromI: number, tabId: string, toRow: PaneRow, toI: number): void
   swapPanes(aRow: PaneRow, aI: number, bRow: PaneRow, bI: number): void
   setChatSide(side: 'left' | 'right'): void
+  /** 全屏布局：显示/隐藏对话列（仅内存态） */
+  toggleChatPeek(): void
   persist(): void
   subscribe(fn: () => void): () => void
   notify(): void
@@ -224,6 +234,8 @@ export type ConsoleCardData = {
   kids: number
   /** 最近一条消息预览（单行文本，可能为空） */
   preview: string
+  /** 该预览来自「正在运行」的会话：卡片中间按实时进度持续刷新（流式），显示光标提示 */
+  live?: boolean
   /** 是否绑定对话 */
   bound: boolean
   /** 项目已配置文件夹：卡片可「新建会话」（在该文件夹下新开对话并绑定） */
@@ -282,8 +294,11 @@ type SplitEnv = {
     getCards: () => ConsoleCardData[]
     onOpen: (id: string) => void
     onJump: (id: string) => void
+    /** 打开图标选择器：唯一入口 = 控制室下方工具条「项目管理」里每行的「更换图标」按钮
+     *  （卡片图标只是标识，不再当按钮）。below=true → 选择器贴按钮下方弹出，不挡住操作列。 */
+    onPickIcon?: (id: string, anchor: HTMLElement, opts?: { below?: boolean }) => void
     /** 卡片「＋」：在项目文件夹下新开对话（cwd = 项目文件夹）→ 绑定到该项目 → 切过去 */
-    onNewSession?: (id: string) => void
+    onNewSession?: (id: string) => void | Promise<boolean | void>
     /** 卡片「会话列表」：该项目目录下的全部会话（含模板各步骤子目录），按最近更新倒序 */
     getProjectSessions?: (id: string) => ProjectSessionItem[]
     /** 从列表进入某个会话（历史保留，可继续对话） */
@@ -298,12 +313,15 @@ type SplitEnv = {
     onPinSession?: (sessionId: string, pinned: boolean) => void
     /** 归档 / 恢复（宿主工作区：归档 = 从列表移除，磁盘日志保留） */
     onArchiveSession?: (sessionId: string, archived: boolean) => void
-    /** 卡片「＋」新建会话：可指定标准 / computer-use 模式与前台、后台模型 */
-    onCreateSession?: (id: string, opts: NewSessionOptions) => void | Promise<void>
+    /** 卡片「＋」新建会话：可指定标准 / computer-use 模式与前台、后台模型。
+     *  返回 false（或 resolve 成 false）= 未建成：面板留在原处让用户重试；true/undefined = 关面板 */
+    onCreateSession?: (id: string, opts: NewSessionOptions) => void | Promise<boolean | void>
     /** 项目管理：全部项目（含已隐藏） */
     getManageProjects?: () => { id: string; name: string; icon: string; hidden: boolean }[]
     /** 隐藏 / 恢复项目（只影响控制室显示） */
     onHideProject?: (id: string, hidden: boolean) => void
+    /** 拖动排序：把 dragId 插到 targetId 之前（before=true）或之后 */
+    onReorderProject?: (dragId: string, targetId: string, before: boolean) => void
     /** 删除项目条目（不删磁盘文件夹/会话） */
     onDeleteProject?: (id: string) => void
     /** 点发光卡片：确认（熄灭光）再打开 */
@@ -834,6 +852,7 @@ export const splitStore: SplitState = {
   geom: null,
   chatW: 320,
   chatWManual: true,
+  chatPeek: false,
   topH: 200,
   leftW: 260,
   paneWs: [],
@@ -901,6 +920,7 @@ export const splitStore: SplitState = {
     this.chatW = hasChatW ? saved!.chatW : spec.chatWidth.default
     // 占比模式（chatWidthRatio）：未手动拖过聊天分隔线 = 跟随可用宽比例；拖过/无占比声明 = 固定像素
     this.chatWManual = spec.chatWidthRatio ? (saved?.chatWManual ?? false) : true
+    this.chatPeek = false // 全屏布局：每次打开都从「不显示对话列」开始
     this.topH = hasTopH ? saved!.topH : (spec.topHeight?.default ?? 200)
     this.leftW = hasLeftW ? saved!.leftW : (spec.leftWidth?.default ?? 260)
     this.paneWs = hasPaneWs ? [...saved!.paneWs] : main.map((p) => p.min)
@@ -941,7 +961,7 @@ export const splitStore: SplitState = {
         this.topH = clamp(Math.round((rowH0 - BAR_H) * ratio), lo, Math.max(lo, rowH0 - BAR_H - 80))
       }
       if (!hasPaneWs) {
-        const contentW = Math.max(0, colW0 - this.chatW)
+        const contentW = Math.max(0, colW0 - (spec.chatHidden === true || spec.chatOnly === true ? 0 : this.chatW))
         const avail = Math.max(main.length * 120, contentW - Math.max(0, main.length - 1) * GAP)
         const share = Math.round(avail / main.length)
         this.paneWs = main.map((p) => Math.max(p.min, share))
@@ -1059,11 +1079,26 @@ export const splitStore: SplitState = {
     if (!viewArea || !g || !spec) return
     const colW = g.right - g.left
     const rowH = g.bottom - g.top
+    // 会话全屏：内容列宽 0（内容窗整体隐藏），官方会话视图占满整宽，只让出标题栏高度
+    if (spec.chatOnly === true) {
+      if (this.root && this.root.isConnected) {
+        this.root.style.setProperty('--dsh-chat-user-width', Math.round(colW) + 'px')
+      }
+      this.lastMarginLeft = ''
+      this.lastMarginRight = ''
+      this.lastMarginTop = BAR_H + 'px'
+      viewArea.style.marginLeft = ''
+      viewArea.style.marginRight = ''
+      viewArea.style.marginTop = this.lastMarginTop
+      return
+    }
     const hasLeft = !!spec.left
     const hasTop = !!(spec.top && spec.top.length > 0)
     // 占比模式：未手动拖动时聊天宽 = 可用宽 × 占比，窗口缩放仍保持等分（如左右布局恒定 1/2）
     if (!this.chatWManual && spec.chatWidthRatio) this.chatW = Math.round(colW * spec.chatWidthRatio)
-    const chatW = clamp(this.chatW, spec.chatWidth.min, Math.max(spec.chatWidth.min, colW - 60))
+    // 全屏布局：对话列收成 0 宽（内容满宽）；💬 拉出时才按存档宽度显示
+    const hiddenChat = spec.chatHidden === true && !this.chatPeek
+    const chatW = hiddenChat ? 0 : clamp(this.chatW, spec.chatWidth.min, Math.max(spec.chatWidth.min, colW - 60))
     // 会话内容宽 clamp(680px, …, 920px) 不随挤出的聊天列收缩 → 显式钉到挤出的列宽
     // （close/重锚定时原样恢复；0.1.1 上该 CSS 变量闲置，设置无害）
     if (this.root && this.root.isConnected) {
@@ -1091,6 +1126,8 @@ export const splitStore: SplitState = {
     const g = this.geom
     const spec = this.spec
     if (!g || !spec) return
+    if (spec.chatHidden === true && !this.chatPeek) return // 全屏布局未拉出对话列：不可拖
+    if (spec.chatOnly === true) return // 会话全屏：没有内容列可拖
     this.chatWManual = true // 手动拖动：退出占比模式，转固定像素
     const colW = g.right - g.left
     const main = spec.main ?? []
@@ -1394,6 +1431,15 @@ export const splitStore: SplitState = {
     this.notify()
   },
 
+  /** 全屏布局：标题栏 💬 临时拉出/收回对话列（只改内存，不写存档 —— 重开仍是全屏） */
+  toggleChatPeek() {
+    const spec = this.spec
+    if (!spec || spec.chatHidden !== true) return
+    this.chatPeek = !this.chatPeek
+    this.applyMargin()
+    this.notify()
+  },
+
   persist() {
     if (!this.spec) return
     persistSaved(this.spec.id, { chatW: this.chatW, chatWManual: this.chatWManual, topH: this.topH, leftW: this.leftW, paneWs: this.paneWs, topWs: this.topWs, leftWs: this.leftWs })
@@ -1421,6 +1467,7 @@ export const splitStore: SplitState = {
     this.savedWidthVar = ''
     this.geom = null
     this.spec = null
+    this.chatPeek = false
     this.active = false
     this.notify()
   },
@@ -1720,6 +1767,52 @@ export function ConsolePane() {
   /** 新建会话面板：项目 id/名称 + 模式 + 前台/后台模型 */
   const [newSessFor, setNewSessFor] = useState<{ id: string; name: string } | null>(null)
   const [manageOpen, setManageOpen] = useState(false)
+  /** 项目管理：拖动排序（pointer 事件，鼠标/触屏通用）。targetId/before = 落点提示（目标行上/下边缘高亮）。 */
+  const [manageDrag, setManageDrag] = useState<{ id: string; targetId: string; before: boolean } | null>(null)
+  const manageDragIdRef = useRef<string | null>(null)
+  const manageDropRef = useRef<{ targetId: string; before: boolean } | null>(null)
+  const manageListRef = useRef<HTMLDivElement | null>(null)
+  /** 按住行首「⋮⋮」开始拖：只捕获指针、记下被拖行，落点由 pointermove 现算 */
+  const beginManageDrag = (e: any, id: string): void => {
+    e.preventDefault(); e.stopPropagation()
+    manageDragIdRef.current = id
+    manageDropRef.current = null
+    try { e.currentTarget.setPointerCapture(e.pointerId) } catch {}
+    setManageDrag({ id, targetId: id, before: true })
+  }
+  /** 拖动中：按指针 Y 找最近的行（在行中点之上=插到它前面，之下=插到它后面） */
+  const moveManageDrag = (e: any): void => {
+    const dragId = manageDragIdRef.current
+    const container = manageListRef.current
+    if (!dragId || !container) return
+    e.preventDefault()
+    const rows = Array.from(container.querySelectorAll<HTMLElement>('[data-pid]'))
+    let targetId = ''
+    let before = false
+    for (const el of rows) {
+      const pid = el.dataset.pid ?? ''
+      if (!pid || pid === dragId) continue
+      const r = el.getBoundingClientRect()
+      if (e.clientY < r.top + r.height / 2) { targetId = pid; before = true; break }
+      targetId = pid; before = false
+    }
+    if (!targetId) return
+    // 落点没变就不 setState：拖动时每次 pointermove 都重渲染整个控制室面板（卡片会重算预览），很吃性能
+    const prev = manageDropRef.current
+    if (prev && prev.targetId === targetId && prev.before === before) return
+    manageDropRef.current = { targetId, before }
+    setManageDrag({ id: dragId, targetId, before })
+  }
+  /** 松手：把被拖行插到落点（同一行 = 不动）；排序写回 projects.order */
+  const endManageDrag = (): void => {
+    const dragId = manageDragIdRef.current
+    const drop = manageDropRef.current
+    manageDragIdRef.current = null
+    manageDropRef.current = null
+    setManageDrag(null)
+    if (!dragId || !drop || drop.targetId === dragId) return
+    splitEnv?.console?.onReorderProject?.(dragId, drop.targetId, drop.before)
+  }
   const [newSessMode, setNewSessMode] = useState<'standard' | 'computer-use'>('standard')
   const [newSessModels, setNewSessModels] = useState<OrbModel[]>([])
   const [newSessModelsLoading, setNewSessModelsLoading] = useState(false)
@@ -1819,21 +1912,31 @@ export function ConsolePane() {
       setNewSessModelsLoading(false)
     })()
   }
-  /** 提交「新建会话」：标准模式也可选前台模型；computer-use 另带后台模型 */
+  /** 提交「新建会话」：标准模式也可选前台模型；computer-use 另带后台模型。
+   *  建会话是异步的（注册工作区 + 建会话 + 切到新会话约 1s），面板必须留到有结果：
+   *  成功才关、失败留在原处并复位按钮——否则「点了创建会话，界面没动」看起来像没反应。 */
   const submitNewSession = () => {
     if (!newSessFor || newSessBusy) return
+    const target = newSessFor
     setNewSessBusy(true)
     const opts = {
       mode: newSessMode,
       front: newSessFront,
       background: newSessMode === 'computer-use' ? newSessBg : null,
     }
+    const close = () => setNewSessFor((cur) => (cur && cur.id === target.id ? null : cur))
     try {
-      const r = splitEnv?.console?.onCreateSession?.(newSessFor.id, opts)
-      if (r && typeof (r as Promise<void>).then === 'function') (r as Promise<void>).catch(() => {}).finally(() => setNewSessBusy(false))
-      else setNewSessBusy(false)
+      const r = splitEnv?.console?.onCreateSession?.(target.id, opts)
+      if (r && typeof (r as Promise<boolean | void>).then === 'function') {
+        ;(r as Promise<boolean | void>)
+          .then((ok) => { if (ok !== false) close() })
+          .catch(() => {})
+          .finally(() => setNewSessBusy(false))
+      } else {
+        close()
+        setNewSessBusy(false)
+      }
     } catch { setNewSessBusy(false) }
-    setNewSessFor(null)
   }
   /** 选择本地图片文件并入库 */
   const pickPhotoFile = () => {
@@ -2305,6 +2408,7 @@ export function ConsolePane() {
             }}
           >
             <div className="dsh-wt_consoleCardHead">
+              {/* 图标只是标识，不再是按钮：换图标统一走「控制室下方工具条 → 项目管理 → 更换图标」 */}
               <span className="dsh-wt_consoleIcon" aria-hidden>{c.icon}</span>
               <span className="dsh-wt_consoleName">{c.name}</span>
             </div>
@@ -2314,26 +2418,12 @@ export function ConsolePane() {
               {c.runtimeMs != null && <span className="dsh-wt_consoleRuntime">{fmtDur(c.runtimeMs)}</span>}
             </div>
             {(c.status === 'busy' || c.status === 'error' || (c.glow && c.status === 'need')) && <span className="dsh-wt_consoleSweep" aria-hidden />}
-            <div className={'dsh-wt_consolePreview' + (c.preview ? '' : ' dsh-wt_consolePreviewNone')} title={c.preview}>
+            <div className={'dsh-wt_consolePreview' + (c.preview ? '' : ' dsh-wt_consolePreviewNone') + (c.live ? ' dsh-wt_consolePreviewLive' : '')} title={c.preview}>
               {c.preview || (c.bound ? T('console.noPreview') : T('console.unboundShort'))}
+              {c.live && c.preview ? <span className="dsh-wt_consoleCaret" aria-hidden>▍</span> : null}
             </div>
-            {/* 卡片底部操作行：查看该项目目录下的会话列表 / 新开一条会话（都在该项目的目录里） */}
+            {/* 卡片底部操作行：上面「标准 / CU」两个新建会话按钮，下面「会话列表」 */}
             <div className="dsh-wt_consoleCardOps">
-              <button
-                type="button"
-                className="dsh-wt_consoleOpBtn"
-                title={T('console.sessionsTip')}
-                aria-label={T('console.sessions')}
-                onClick={(e) => { e.stopPropagation(); openSessionList(e.currentTarget as HTMLElement, c) }}
-              >
-                <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
-                  <path d="M5.6 4.3h7.1M5.6 8h7.1M5.6 11.7h7.1" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-                  <circle cx="3.1" cy="4.3" r="0.95" fill="currentColor" />
-                  <circle cx="3.1" cy="8" r="0.95" fill="currentColor" />
-                  <circle cx="3.1" cy="11.7" r="0.95" fill="currentColor" />
-                </svg>
-                <span>{T('console.sessions')}</span>
-              </button>
               {c.canNewSession && (
                 <>
                   <button
@@ -2362,6 +2452,21 @@ export function ConsolePane() {
                   </button>
                 </>
               )}
+              <button
+                type="button"
+                className="dsh-wt_consoleOpBtn dsh-wt_consoleOpBtnFull"
+                title={T('console.sessionsTip')}
+                aria-label={T('console.sessions')}
+                onClick={(e) => { e.stopPropagation(); openSessionList(e.currentTarget as HTMLElement, c) }}
+              >
+                <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
+                  <path d="M5.6 4.3h7.1M5.6 8h7.1M5.6 11.7h7.1" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                  <circle cx="3.1" cy="4.3" r="0.95" fill="currentColor" />
+                  <circle cx="3.1" cy="8" r="0.95" fill="currentColor" />
+                  <circle cx="3.1" cy="11.7" r="0.95" fill="currentColor" />
+                </svg>
+                <span>{T('console.sessions')}</span>
+              </button>
             </div>
           </div>
         ))}
@@ -2617,21 +2722,52 @@ export function ConsolePane() {
               <span className="dsh-wt_newSessTitle">{T('console.manage')}</span>
               <span className="dsh-wt_newSessProj">{T('console.manageHint')}</span>
             </div>
-            <div className="dsh-wt_manageList">
+            <div className="dsh-wt_manageList" ref={manageListRef}>
               {(() => {
                 const list = splitEnv?.console?.getManageProjects?.() ?? []
                 if (list.length === 0) return <div className="dsh-wt_modelHint">{T('console.manageEmpty')}</div>
                 return list.map((p) => (
-                  <div key={p.id} className={'dsh-wt_manageRow' + (p.hidden ? ' dsh-wt_manageRowHidden' : '')}>
+                  <div
+                    key={p.id}
+                    data-pid={p.id}
+                    className={'dsh-wt_manageRow' + (p.hidden ? ' dsh-wt_manageRowHidden' : '')
+                      + (manageDrag && manageDrag.id === p.id ? ' dsh-wt_manageRowDragging' : '')
+                      + (manageDrag && manageDrag.id !== p.id && manageDrag.targetId === p.id
+                        ? (manageDrag.before ? ' dsh-wt_manageRowDropBefore' : ' dsh-wt_manageRowDropAfter')
+                        : '')}
+                  >
+                    <span
+                      className="dsh-wt_manageGrip"
+                      title={T('console.dragSort')}
+                      aria-label={T('console.dragSort')}
+                      role="button"
+                      tabIndex={0}
+                      onPointerDown={(e) => beginManageDrag(e, p.id)}
+                      onPointerMove={moveManageDrag}
+                      onPointerUp={endManageDrag}
+                      onPointerCancel={endManageDrag}
+                    >⋮⋮</span>
                     <span className="dsh-wt_manageIcon" aria-hidden>{p.icon}</span>
                     <span className="dsh-wt_manageName" title={p.name}>{p.name}</span>
                     {p.hidden && <span className="dsh-wt_sessTag">{T('console.hiddenTag')}</span>}
-                    <button type="button" className="dsh-wt_manageBtn" onClick={() => splitEnv?.console?.onHideProject?.(p.id, !p.hidden)}>
-                      {p.hidden ? T('console.show') : T('console.hide')}
-                    </button>
-                    <button type="button" className="dsh-wt_manageBtn dsh-wt_manageDel" onClick={() => splitEnv?.console?.onDeleteProject?.(p.id)}>
-                      {T('console.deleteProject')}
-                    </button>
+                    <div className="dsh-wt_manageOps">
+                      <button
+                        type="button"
+                        className="dsh-wt_manageBtn dsh-wt_manageIconPick"
+                        title={T('console.changeIcon')}
+                        aria-label={T('console.changeIcon')}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          splitEnv?.console?.onPickIcon?.(p.id, e.currentTarget as HTMLElement, { below: true })
+                        }}
+                      >🎨 {T('console.changeIconShort')}</button>
+                      <button type="button" className="dsh-wt_manageBtn" onClick={() => splitEnv?.console?.onHideProject?.(p.id, !p.hidden)}>
+                        {p.hidden ? T('console.show') : T('console.hide')}
+                      </button>
+                      <button type="button" className="dsh-wt_manageBtn dsh-wt_manageDel" onClick={() => splitEnv?.console?.onDeleteProject?.(p.id)}>
+                        {T('console.deleteProject')}
+                      </button>
+                    </div>
                   </div>
                 ))
               })()}
@@ -2709,8 +2845,8 @@ export function ConsolePane() {
             {newSessModelsLoading && <div className="dsh-wt_modelHint">{T('console.modelLoading')}</div>}
             {!newSessModelsLoading && newSessModels.length === 0 && <div className="dsh-wt_modelHint">{T('console.modelUnavailable')}</div>}
             <div className="dsh-wt_newSessOps">
-              <button type="button" className="dsh-wt_btnGhost" onClick={() => setNewSessFor(null)}>{T('console.cancel')}</button>
-              <button type="button" className="dsh-wt_btnPrimary" disabled={newSessBusy} onClick={submitNewSession}>{T('console.createSession')}</button>
+              <button type="button" className="dsh-wt_btnGhost" disabled={newSessBusy} onClick={() => setNewSessFor(null)}>{T('console.cancel')}</button>
+              <button type="button" className="dsh-wt_btnPrimary" disabled={newSessBusy} onClick={submitNewSession}>{newSessBusy ? T('console.creatingSession') : T('console.createSession')}</button>
             </div>
           </div>
         </div>
@@ -3465,20 +3601,23 @@ function PanePicker(props: { row: PaneRow; index: number }) {
   )
 }
 
-type PoolItem = { spec: LayoutSpec; chatW: number; topH: number; leftW: number; paneWs: number[]; topWs: number[] }
+type PoolItem = { spec: LayoutSpec; chatW: number; chatPeek: boolean; topH: number; leftW: number; paneWs: number[]; topWs: number[] }
 
 /** 单个工作区渲染层（geom 为 null 时用 0 几何渲染，外层 display:none 保活，保留网页/MD 滚动/激活标签等状态） */
-function WorkspaceLayer(props: { spec: LayoutSpec; geom: Geom | null; chatW: number; topH: number; leftW: number; paneWs: number[]; topWs: number[] }) {
+function WorkspaceLayer(props: { spec: LayoutSpec; geom: Geom | null; chatW: number; chatPeek: boolean; topH: number; leftW: number; paneWs: number[]; topWs: number[] }) {
   const g = props.geom ?? { left: 0, top: 0, right: 0, bottom: 0 }
   const spec = props.spec
   const top = spec.top ?? []
-  const main = spec.main ?? []
+  const chatOnly = spec.chatOnly === true
+  const main = chatOnly ? [] : (spec.main ?? [])
   const hasLeft = !!spec.left
   const hasTop = top.length > 0
   const chatLeft = !hasLeft && spec.chatSide === 'left'
   const colW = g.right - g.left
   const rowH = g.bottom - g.top
-  const chatW = clamp(props.chatW, spec.chatWidth.min, Math.max(spec.chatWidth.min, colW - 60))
+  // 全屏布局：对话列 0 宽（内容满宽）；点标题栏 💬 临时拉出
+  const chatHidden = spec.chatHidden === true && !props.chatPeek
+  const chatW = chatOnly ? 0 : (chatHidden ? 0 : clamp(props.chatW, spec.chatWidth.min, Math.max(spec.chatWidth.min, colW - 60)))
   const topH = hasTop
     ? clamp(props.topH, spec.topHeight?.min ?? 80, Math.max(spec.topHeight?.min ?? 80, rowH - BAR_H - 80))
     : 0
@@ -3581,13 +3720,22 @@ function WorkspaceLayer(props: { spec: LayoutSpec; geom: Geom | null; chatW: num
       {/* 标题栏 */}
       <div className="dsh-wt_splitBar" style={{ position: 'fixed', left: g.left, top: barTop, width: hasLeft || chatFull ? contentW : (hasTop ? colW : contentW), zIndex: 70 }}>
         {spec.id !== 'wt-console' && <span className="dsh-wt_splitTitle">{spec.title}</span>}
-        {!hasLeft && (
+        {!hasLeft && !chatHidden && !chatOnly && (
           <button
             type="button"
             className="dsh-wt_splitFlip"
             title={T('split.flip')}
             onClick={() => splitStore.setChatSide(chatLeft ? 'right' : 'left')}
           >⇄</button>
+        )}
+        {spec.chatHidden === true && (
+          <button
+            type="button"
+            className={'dsh-wt_splitFlip' + (!chatHidden ? ' dsh-wt_splitFlipOn' : '')}
+            title={chatHidden ? '显示对话列' : '隐藏对话列（回到全屏）'}
+            aria-pressed={!chatHidden}
+            onClick={() => splitStore.toggleChatPeek()}
+          >💬</button>
         )}
         <button type="button" className="dsh-wt_splitClose" aria-label="退出分栏（Esc）" onClick={() => splitStore.close()}>✕</button>
       </div>
@@ -3629,7 +3777,8 @@ function WorkspaceLayer(props: { spec: LayoutSpec; geom: Geom | null; chatW: num
           onPointerDown={makeDividerHandler('pane', i)}
         />
       ))}
-      {/* 聊天分隔线（左列布局 = 左/右列边界；其余 = 内容与聊天之间） */}
+      {/* 聊天分隔线（左列布局 = 左/右列边界；其余 = 内容与聊天之间；全屏布局无对话列时不画） */}
+      {!chatHidden && !chatOnly && (
       <div
         className="dsh-wt_splitDivider"
         role="separator"
@@ -3644,6 +3793,7 @@ function WorkspaceLayer(props: { spec: LayoutSpec; geom: Geom | null; chatW: num
         }}
         onPointerDown={makeDividerHandler(hasLeft ? 'left' : 'chat')}
       />
+      )}
       <AnnotationOverlay />
     </>
   )
@@ -3658,6 +3808,7 @@ function SplitWorkspace() {
     spec: splitStore.spec,
     geom: splitStore.geom,
     chatW: splitStore.chatW,
+    chatPeek: splitStore.chatPeek,
     topH: splitStore.topH,
     leftW: splitStore.leftW,
     paneWs: [...splitStore.paneWs],
@@ -3672,6 +3823,7 @@ function SplitWorkspace() {
       poolRef.current.set(spec.id, {
         spec,
         chatW: splitStore.chatW,
+        chatPeek: splitStore.chatPeek,
         topH: splitStore.topH,
         leftW: splitStore.leftW,
         paneWs: [...splitStore.paneWs],
@@ -3688,6 +3840,7 @@ function SplitWorkspace() {
       spec: splitStore.spec,
       geom: splitStore.geom,
       chatW: splitStore.chatW,
+      chatPeek: splitStore.chatPeek,
       topH: splitStore.topH,
       leftW: splitStore.leftW,
       paneWs: [...splitStore.paneWs],
@@ -3726,6 +3879,7 @@ function SplitWorkspace() {
               spec={item.spec}
               geom={isActive ? snap.geom : null}
               chatW={isActive ? snap.chatW : item.chatW}
+              chatPeek={isActive ? snap.chatPeek : item.chatPeek}
               topH={isActive ? snap.topH : item.topH}
               leftW={isActive ? snap.leftW : item.leftW}
               paneWs={isActive ? snap.paneWs : item.paneWs}

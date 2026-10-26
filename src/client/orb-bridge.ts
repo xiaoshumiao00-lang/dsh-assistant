@@ -97,3 +97,71 @@ export function writeBgPref(pref: ModelPref | null): void {
     else localStorage.removeItem(BG_PREF_KEY)
   } catch {}
 }
+
+/* ---------- 悬浮球外观（启用 / 头像）：本插件自己的偏好，不依赖任何外部插件 ---------- */
+
+const BALL_ENABLED_KEY = 'dsh-assistant.ball.enabled.v1'
+const BALL_AVATAR_KEY = 'dsh-assistant.ball.avatar.v1'
+
+export type BallConfig = { enabled: boolean; avatar: string }
+
+function readBallConfig(): BallConfig {
+  let enabled = true
+  let avatar = ''
+  try { enabled = localStorage.getItem(BALL_ENABLED_KEY) !== '0' } catch {}
+  try { avatar = localStorage.getItem(BALL_AVATAR_KEY) ?? '' } catch {}
+  return { enabled, avatar }
+}
+
+let ballConfig: BallConfig = readBallConfig()
+const ballConfigListeners = new Set<() => void>()
+
+/** 悬浮球外观（设置页改、页内球实时跟随）：enabled = 是否显示悬浮球；avatar = data URL（空 = 默认 🔮）。
+ *  enabled/avatar 会同时写宿主（桌面原生球按它启停、换头像），所以设置立刻生效。 */
+export const ballConfigStore = {
+  subscribe(listener: () => void): () => void {
+    ballConfigListeners.add(listener)
+    return () => { ballConfigListeners.delete(listener) }
+  },
+  getSnapshot(): BallConfig {
+    return ballConfig
+  },
+  /** 只采纳（如宿主启动时读回的存档），不回写宿主。 */
+  adopt(patch: Partial<BallConfig>): void {
+    applyLocal(patch)
+  },
+  set(patch: Partial<BallConfig>): void {
+    applyLocal(patch)
+    try {
+      if (patch.enabled !== undefined) {
+        void fetch('/api/assistant/ball', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled: patch.enabled }),
+        }).then((r) => r.json()).then((d) => {
+          // 桌面球停了就立刻让页内球接上（否则要等下一次启动才更新）
+          if (d && typeof d.native === 'boolean') nativeBallStore.set(d.native)
+        }).catch(() => {})
+      }
+      if (patch.avatar !== undefined) {
+        void fetch('/api/assistant/ball-avatar', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ dataUrl: patch.avatar }),
+        }).catch(() => {})
+      }
+    } catch { /* 宿主不可达：本地仍然生效（页内球跟随） */ }
+  },
+}
+
+function applyLocal(patch: Partial<BallConfig>): void {
+  ballConfig = { ...ballConfig, ...patch }
+  try {
+    if (patch.enabled !== undefined) localStorage.setItem(BALL_ENABLED_KEY, patch.enabled ? '1' : '0')
+    if (patch.avatar !== undefined) {
+      if (patch.avatar) localStorage.setItem(BALL_AVATAR_KEY, patch.avatar)
+      else localStorage.removeItem(BALL_AVATAR_KEY)
+    }
+  } catch { /* 存储不可写时仅本次生效 */ }
+  for (const listener of [...ballConfigListeners]) { try { listener() } catch {} }
+}

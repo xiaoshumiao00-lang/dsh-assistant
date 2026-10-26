@@ -9,12 +9,16 @@
  * 浏览器用相对路径 fetch，同源 + 既有登录 cookie 即可，无需额外鉴权字段）：
  *
  *   GET  /.dsh-tuoguan/state
- *        → { off: { "<sessionId>": true }, revision: <递增整数>, updatedAt: <ISO> }
+ *        → { off: { "<sessionId>": true }, on: { "<sessionId>": true }, defaultOn: boolean,
+ *            revision: <递增整数>, updatedAt: <ISO> }
  *   POST /.dsh-tuoguan/state   body: { sessionId: string, on: boolean }
  *        → 写入后返回同一结构；参数非法返回 400
+ *   POST /.dsh-tuoguan/state   body: { defaultOn: boolean }
+ *        → 只改「新会话默认托管状态」（个人助手 → 托管设置），返回同一结构
  *
- * 语义保持不变：`off` 是「被显式关闭的 sessionId 集合」，没被关过 = 托管 ON，
- * 所以新建会话天然处于托管中。
+ * 语义：没被显式动过的会话用 `defaultOn`（缺省 true = 老行为「没关过就托管 ON」）；
+ * 显式开/关只记与默认值不同的会话（`on` / `off` 两张表），所以默认值改动后
+ * 老会话里没显式动过的会跟着变。
  *
  * 持久化文件：`<profile 目录>/dsh-tuoguan-state.json`
  *   profile 目录通过宿主 `profileContext.dir` 解析（不硬编码路径），
@@ -51,8 +55,12 @@ const MAX_SESSION_ID_LENGTH = 256
 /* ---------- 类型 ---------- */
 
 interface TuoguanState {
-  /** 被显式关闭的 sessionId 集合；不在表里 = 托管 ON。 */
+  /** 被「显式关过」的 sessionId 集合（与默认状态相反时才记录）。 */
   off: Record<string, boolean>
+  /** 被「显式开过」的 sessionId 集合（与默认状态相反时才记录；老状态文件没有这一项）。 */
+  on: Record<string, boolean>
+  /** 新会话的默认托管状态（缺省 true = 老行为：没关过就是托管中）。 */
+  defaultOn: boolean
   /** 单调递增的写版本号；客户端据此判断要不要重新 setState。 */
   revision: number
   /** 最近一次写入时间（ISO 8601）。 */
@@ -114,14 +122,28 @@ function normalizeState(raw: unknown): TuoguanState {
     ? Math.floor(record.revision)
     : 0
   const updatedAt = typeof record.updatedAt === 'string' ? record.updatedAt : ''
-  return { off, revision, updatedAt }
+  // 新增字段（2026-10）：显式「开」集合 + 默认状态。老文件没有这两项 → on 为空、默认 ON，
+  // 语义与之前完全一致（没关过 = 托管中）。
+  const onSource = typeof record.on === 'object' && record.on !== null && !Array.isArray(record.on)
+    ? record.on as Record<string, unknown>
+    : {}
+  const on: Record<string, boolean> = {}
+  for (const [key, value] of Object.entries(onSource)) {
+    if (typeof key === 'string' && key !== '' && key.length <= MAX_SESSION_ID_LENGTH && value === true) {
+      on[key] = true
+    }
+  }
+  const defaultOn = typeof record.defaultOn === 'boolean' ? record.defaultOn : true
+  // 同一会话不可能既显式开又显式关：两边都出现时以「关」为准（旧数据只有 off）。
+  for (const key of Object.keys(off)) delete on[key]
+  return { off, on, defaultOn, revision, updatedAt }
 }
 
 function readStateSync(file: string): TuoguanState {
   try {
     return normalizeState(JSON.parse(readFileSync(file, 'utf8')))
   } catch { /* 文件不存在 / JSON 损坏：等价于「谁都没关过」= 全部 ON */
-    return { off: {}, revision: 0, updatedAt: '' }
+    return { off: {}, on: {}, defaultOn: true, revision: 0, updatedAt: '' }
   }
 }
 
@@ -157,20 +179,50 @@ class TuoguanStore {
     return this.enqueue(() => readStateSync(this.file))
   }
 
+  /** 某会话的当前有效状态：显式记录优先，否则用默认值。 */
+  private effective(state: TuoguanState, sessionId: string): boolean {
+    if (state.off[sessionId] === true) return false
+    if (state.on[sessionId] === true) return true
+    return state.defaultOn
+  }
+
   /**
    * 切换某个会话的托管开关。
    * 值没变时不写盘、不涨 revision —— 避免两端反复轮询/重放同一状态造成写放大。
+   * 只把「与默认状态不同」的会话记成显式状态，状态文件不会随会话数无限膨胀。
    */
   setSession(sessionId: string, on: boolean): Promise<TuoguanState> {
     return this.enqueue(() => {
       const current = readStateSync(this.file)
-      const closed = current.off[sessionId] === true
-      if (closed === !on) return current
+      if (this.effective(current, sessionId) === on) return current
       const off: Record<string, boolean> = { ...current.off }
-      if (on) delete off[sessionId]
-      else off[sessionId] = true
+      const onMap: Record<string, boolean> = { ...current.on }
+      delete off[sessionId]
+      delete onMap[sessionId]
+      if (on !== current.defaultOn) {
+        if (on) onMap[sessionId] = true
+        else off[sessionId] = true
+      }
       const next: TuoguanState = {
         off,
+        on: onMap,
+        defaultOn: current.defaultOn,
+        revision: current.revision + 1,
+        updatedAt: new Date().toISOString(),
+      }
+      writeStateSync(this.file, next)
+      return next
+    })
+  }
+
+  /** 改「新会话默认托管状态」；值没变就不写盘。 */
+  setDefault(defaultOn: boolean): Promise<TuoguanState> {
+    return this.enqueue(() => {
+      const current = readStateSync(this.file)
+      if (current.defaultOn === defaultOn) return current
+      const next: TuoguanState = {
+        ...current,
+        defaultOn,
         revision: current.revision + 1,
         updatedAt: new Date().toISOString(),
       }
@@ -266,6 +318,11 @@ async function handleRequest(ctx: any, store: TuoguanStore, req: IncomingMessage
     }
     if (path === STATE_ROUTE && method === 'POST') {
       const body = await readJsonBody(req)
+      // 只改默认状态：{ defaultOn: boolean }（个人助手设置页的「托管默认状态」开关）
+      if (typeof body.defaultOn === 'boolean') {
+        sendJson(res, 200, await store.setDefault(body.defaultOn))
+        return
+      }
       const sessionId = body.sessionId
       const on = body.on
       if (typeof sessionId !== 'string' || sessionId === '' || sessionId.length > MAX_SESSION_ID_LENGTH) {

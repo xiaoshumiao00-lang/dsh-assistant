@@ -10,7 +10,7 @@
 import { apply as worktableApply, inject as worktableInject } from './index'
 import { apply as pocketApply } from './pocket/index.jsx'
 import { makeOrbApi } from './pocket/orb/orb-api.ts'
-import { setAssistantApi, nativeBallStore, controlRoomStore } from './orb-bridge.ts'
+import { setAssistantApi, nativeBallStore, controlRoomStore, ballConfigStore } from './orb-bridge.ts'
 import { ControlRoomOverlay } from './control-room.tsx'
 import { AssistantSettingsHub } from './assistant-settings.tsx'
 import { apply as tuoguanApply } from './tuoguan.tsx'
@@ -47,23 +47,80 @@ export function apply(ctx: any): void {
     ;(window as any).__dshAssistantOpenControlRoom = () => controlRoomStore.setOpen(true)
   } catch {}
 
-  // 是否存在 Electron 原生桌面球（有则隐藏网页内那颗）
+  // 悬浮球状态同步：宿主是「启用/头像」的真值（桌面球在宿主那边启停与换头像）。
+  // - native=true 时页面内那颗球隐藏，避免出现两个球；
+  // - 本地有头像而宿主还没收到（老版本 / 宿主重启丢了 avatar.txt）时补传一次，
+  //   之后只要宿主 already hasAvatar 就不再重复 POST（否则每次都会重启球窗口）。
   try {
-    void fetch('/api/assistant/ball', { cache: 'no-store' })
-      .then((r) => r.json())
-      .then((d) => { nativeBallStore.set(d?.native === true) })
-      .catch(() => {})
+    const syncBallState = (): void => {
+      void fetch('/api/assistant/ball', { cache: 'no-store' })
+        .then((r) => r.json())
+        .then((d) => {
+          nativeBallStore.set(d?.native === true)
+          if (typeof d?.enabled === 'boolean') ballConfigStore.adopt({ enabled: d.enabled })
+          const local = ballConfigStore.getSnapshot()
+          if (local.avatar && d?.hasAvatar !== true) {
+            void fetch('/api/assistant/ball-avatar', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ dataUrl: local.avatar }),
+            }).catch(() => {})
+          }
+        })
+        .catch(() => {})
+    }
+    syncBallState()
+    // 桌面球是异步启动的：刚开页时可能还没起来，补两次 + 低频轮询兜底
+    const timers: number[] = [
+      window.setTimeout(syncBallState, 3000),
+      window.setInterval(syncBallState, 15000),
+    ]
+    try {
+      if (typeof ctx.effect === 'function') {
+        ctx.effect(() => () => { for (const t of timers) { try { window.clearTimeout(t); window.clearInterval(t) } catch {} } }, 'dsh-assistant: ball state sync')
+      }
+    } catch {}
   } catch {}
 
-  // 原生球点击 → 宿主 pending → 这里轮询后打开控制室（1.2s 内响应）
+  // 原生球点击 / 外部指令 → 宿主 pending → 这里轮询后打开控制室（1.2s 内响应）。
+  //
+  // 轮询必须「全局只有一个」并且随插件 disposal 一起清掉：
+  // 客户端 bundle 被 HMR/重新 apply 时会再执行一遍 apply()，而 window.setInterval 不在
+  // ctx.effect 里就永远不会被清 → 旧实例的定时器活着，继续 fetch /api/assistant/ball-click
+  // 把点击「吃掉」，并 setOpen 到**已经卸载**的 controlRoomStore 上。
+  // 表现为：球点了没反应、控制室永远不出现（每次重建 lib/client.js 后必现）。
+  // 所以：新实例先清掉手上一个句柄，再把自己登记进去；dispose 时清自己。
+  //
+  // 不再用 nativeBallStore 做前置条件：该接口同时承担「外部 open-console 指令」，
+  // 没有桌面球的网页/CLI 环境也要能被打开（本机 1.2s 一次 GET，开销可忽略）。
+  const BALL_POLL_KEY = '__dshAssistantBallPoll'
   try {
-    window.setInterval(() => {
-      if (!nativeBallStore.getSnapshot()) return
+    const prev = (window as any)[BALL_POLL_KEY]
+    if (typeof prev === 'number' && prev > 0) { try { window.clearInterval(prev) } catch {} }
+    const timer = window.setInterval(() => {
       void fetch('/api/assistant/ball-click', { cache: 'no-store' })
         .then((r) => r.json())
         .then((d) => { if (d?.open === true) controlRoomStore.setOpen(true) })
         .catch(() => {})
     }, 1200)
+    ;(window as any)[BALL_POLL_KEY] = timer
+    const stop = (): void => {
+      try { window.clearInterval(timer) } catch {}
+      if ((window as any)[BALL_POLL_KEY] === timer) (window as any)[BALL_POLL_KEY] = 0
+    }
+    try { if (typeof ctx.effect === 'function') ctx.effect(() => stop, 'dsh-assistant: ball click poll') } catch {}
+  } catch {}
+
+  // URL 直达：…/?assistant=console 或 …/#console 打开控制室（重开窗口/外部打开时用；
+  // 主窗没有地址栏，平时仍以悬浮球或 open-console 路由为准）。
+  try {
+    const search = String(window.location?.search ?? '')
+    const hash = String(window.location?.hash ?? '')
+    if (/[?&]assistant=console(?:&|$)/.test(search) || hash === '#console') {
+      // 等控制室宿主（无头工作台）挂载后 consoleEnvReady() 才为真；ControlRoomOverlay 内部会自动重试，
+      // 这里只负责把开关置真。
+      controlRoomStore.setOpen(true)
+    }
   } catch {}
 
   worktableApply(ctx)

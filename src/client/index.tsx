@@ -5,7 +5,10 @@ import { isAbs, joinPath, parentPathOf, basenameOf } from './pathutil'
 import { splitStore, SplitWorkspace, setSplitT, setSplitEnv, type LayoutSpec, type SplitPane, type ConsoleCardData, type ProjectSessionItem, type NewSessionOptions } from './split'
 import { BUILTIN_TEMPLATES, freshFlowRun, templateById, saveTemplateStepOverride, composeStepTask, composeStepSpec, effectiveSkill, effectiveInstruction, effectiveConverge, stepBriefOf, isStepBriefConfirmed, migrateFlowRun, OVERLAY_FILE, REPORT_PREFIX, L1_CHECKLIST, parseL1Checklist, isConvergeStep, type FlowRunState, type FlowStepOverride, type FlowStepView, type FlowView, type TemplateDef } from './templates'
 import { VerifyScheduler, composeDiagnosisTask } from './verifyLoop'
-import { defaultProjectFolder, defaultProjectName } from './newProjectDefault'
+import { defaultProjectFolder, defaultProjectName, isAutoProjectFolder } from './newProjectDefault'
+import { ICON_CHOICES, resolveProjectIcon, pickUnusedIcon } from './projectIcons'
+import { focusSessionInHost, sessionFaceState, healBlankSessionIfStuck, type FocusResult } from './sessionFocus'
+import { sessionsUnderFolder } from './sessionFolder'
 
 /** 项目叠加层（L2）可选项：写作语言 */
 const PAPER_LANG_OPTIONS = ['中文写作后翻译英文', '直接写英文', '仅中文投稿']
@@ -156,8 +159,12 @@ const OVER_BOTTOM_PX = 24
 const OVER_TOP_PX = 24
 const OVER_SIDE_PX = 80
 
-/** 拓扑预设（聊天窗恒贴右，PRD §13.2 硬约束）：左右/三栏/左二右一/井字/左品右聊/左1大下3小 */
+/** 拓扑预设（聊天窗恒贴右，PRD §13.2 硬约束）：会话全屏/左右/三栏/左二右一/井字/左品右聊/左1大下3小/全屏内容窗
+ *  chat = 会话全屏：不显示内容窗，官方会话视图占满整宽——新建项目的默认布局（全屏看到的就是会话本身）。
+ *  full = 全屏内容窗（单窗格、不分栏、无对话列，标题栏 💬 可临时拉出对话）：模板项目的流程面板要它，
+ *         需要整页内容时也可手动选；按惯例新预设追加，故排在末尾。 */
 const PRESET_DEFS = [
+  { id: 'chat', leftCount: 0, topCount: 0, contentCount: 1, chatFull: false, chatOnly: true },
   { id: '2h', leftCount: 0, topCount: 0, contentCount: 1, chatFull: false, chatRatio: 0.5 },
   { id: '3h', leftCount: 0, topCount: 0, contentCount: 2, chatFull: false },
   { id: 'l2', leftCount: 0, topCount: 1, contentCount: 1, chatFull: true },
@@ -166,10 +173,15 @@ const PRESET_DEFS = [
   { id: 'l13', leftCount: 0, topCount: 1, contentCount: 3, chatFull: true, topHeightDefault: 420, topHeightRatio: 0.55 },
   { id: 'g4', leftCount: 0, topCount: 2, contentCount: 2, chatFull: true, topHeightRatio: 0.5 },
   { id: 'l23', leftCount: 0, topCount: 2, contentCount: 3, chatFull: true, topHeightRatio: 0.5 },
+  { id: 'full', leftCount: 0, topCount: 0, contentCount: 1, chatFull: false, chatHidden: true },
 ] as const
 
-/** 侧栏图标备选集（emoji）：布局/快捷方式/入驻项目的图标，点击可换（首项 🧱 为布局默认） */
-const EMOJI_SET = ['🧱', '🏠', '🎓', '🚗', '✈️', '🌍', '🏥', '📚', '✏️', '⚙️', '🎨', '🎮', '🌏', '📐', '🧪', '🤖', '📦', '💬']
+/** 新建项目的默认布局预设：会话全屏（整块就是会话本身；内容窗藏在后面，切到别的视图时标签不丢） */
+const DEFAULT_PRESET_ID = 'chat'
+
+/** 侧栏图标备选集（emoji）：布局/快捷方式/入驻项目的图标，点击可换。
+ *  与新建项目的随机图标共用同一套集合（src/client/projectIcons.ts），只有一处真源。 */
+const EMOJI_SET: readonly string[] = ICON_CHOICES
 
 /** 官方工作区头部按钮图标（自 DSH Web GUI 工作区面板取样，fill=currentColor 跟随主题） */
 const ICON_SEARCH = (
@@ -214,6 +226,8 @@ function buildLayout(presetId: string, name: string): LayoutSpec {
     topHeightRatio: (def as any).topHeightRatio ?? 0.35,
     chatSide: 'right',
     chatFullHeight: def.chatFull === true,
+    chatHidden: (def as any).chatHidden === true,
+    chatOnly: (def as any).chatOnly === true,
   }
 }
 
@@ -222,6 +236,14 @@ function presetThumb(defId: string) {
   const cell = (chat: boolean, key: string) => (
     <span key={key} className={'dsh-wt_thumbCell' + (chat ? ' dsh-wt_thumbChat' : '')}>{chat ? '💬' : ''}</span>
   )
+  if (defId === 'chat') {
+    // 会话全屏：整块就是对话（💬 占满）
+    return <span className="dsh-wt_thumb"><span className="dsh-wt_thumbRow">{cell(true, 'a')}</span></span>
+  }
+  if (defId === 'full') {
+    // 全屏内容窗：单个窗格占满（无对话列）
+    return <span className="dsh-wt_thumb"><span className="dsh-wt_thumbRow">{cell(false, 'a')}</span></span>
+  }
   if (defId === '2h') {
     return <span className="dsh-wt_thumb"><span className="dsh-wt_thumbRow">{cell(false, 'a')}{cell(true, 'b')}</span></span>
   }
@@ -353,6 +375,11 @@ function viewForSync(v: any): any {
   return out
 }
 
+/** 同步状态签名：内容等价就不再推（采纳另一端的改动后原样推回去 = 两端互推死循环） */
+function stateSigOf(projects: any, view: any): string {
+  try { return JSON.stringify([projects, view]) } catch { return '' }
+}
+
 function loadView(): ViewState {
   try {
     const raw = localStorage.getItem(PERSIST_KEY)
@@ -448,6 +475,11 @@ function loadProjects(): ProjectsState {
       flows,
       briefs: p.briefs && typeof p.briefs === 'object' ? p.briefs : {},
     }
+    // 墓碑过滤：删过的项目 id 永不复活——旧浏览器缓存、另一端的旧副本里常常还留着它，
+    // 只靠「layouts 里没有」判断的话，任一端一同步就把它们并回来（这就是删不掉的真因）。
+    next.layouts = next.layouts.filter((l) => !next.removed.includes(l.id))
+    next.order = next.order.filter((id) => !next.removed.includes(id))
+    next.hidden = next.hidden.filter((id) => !next.removed.includes(id))
     // 迁移一经发生即落盘：避免每次加载都重复换算（起始步索引的换算是非幂等的）
     if (migrated) {
       try { localStorage.setItem(PROJECTS_KEY, JSON.stringify(next)) } catch {}
@@ -460,29 +492,34 @@ function loadProjects(): ProjectsState {
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), hi)
 
-/** 合并宿主与本地项目数据（首次同步用）：
- *  - 布局按 id 取并集（宿主优先），避免任一端的新项目被覆盖丢失；
- *  - 排序、文件夹、绑定、视图、模板进度：本地兜底、宿主覆盖；
- *  - hidden / removed 取并集。
- * 删除操作要等两端都同步过之后才生效；首次合并宁可多留不可丢。 */
+/** 合并「宿主状态」与「本机 localStorage」：
+ *  - 项目清单以宿主为准（`/api/assistant/state` 是真值，一端删掉另一端才不会复生）；
+ *  - removed（墓碑）取并集：任一端删过的 id 永远不再出现；
+ *  - 绑定/文件夹/进度/改名：宿主优先，本机独有字段兜底补上（老数据不丢）；
+ *  - 快捷方式取并集（纯本地条目）。
+ *  早期版本对 layouts 取并集，后果：手机缓存里还留着已删项目时，一打开就把它们写回宿主，
+ *  表现就是「删了很多次还是全部都出现」。现在改为宿主优先 + 墓碑。 */
 function mergeProjects(server: any, local: any): any {
   const s = server && typeof server === 'object' ? server : {}
   const l = local && typeof local === 'object' ? local : {}
+  const uniq = (a: any, b: any): string[] => Array.from(new Set([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])].filter((x) => typeof x === 'string')))
+  const removed = uniq(s.removed, l.removed)
+  // 宿主还没存过项目（首装/清空）时才用本机清单兜底；正常情况下一律以宿主为准
+  const base = Array.isArray(s.layouts) && s.layouts.length > 0
+    ? s.layouts
+    : (Array.isArray(l.layouts) ? l.layouts : [])
   const layoutList: any[] = []
   const seen = new Set<string>()
-  for (const arr of [Array.isArray(s.layouts) ? s.layouts : [], Array.isArray(l.layouts) ? l.layouts : []]) {
-    for (const x of arr) {
-      if (!x || typeof x.id !== 'string' || seen.has(x.id)) continue
-      seen.add(x.id)
-      layoutList.push(x)
-    }
+  for (const x of base) {
+    if (!x || typeof x.id !== 'string' || seen.has(x.id) || removed.includes(x.id)) continue
+    seen.add(x.id)
+    layoutList.push(x)
   }
   const ids = new Set(layoutList.map((x) => x.id))
   const order: string[] = []
   for (const id of [...(Array.isArray(s.order) ? s.order : []), ...(Array.isArray(l.order) ? l.order : [])]) {
     if (typeof id === 'string' && ids.has(id) && !order.includes(id)) order.push(id)
   }
-  const uniq = (a: any, b: any): string[] => Array.from(new Set([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])].filter((x) => typeof x === 'string')))
   const mergeMap = (a: any, b: any): Record<string, any> => ({ ...(b && typeof b === 'object' ? b : {}), ...(a && typeof a === 'object' ? a : {}) })
   const shortcuts: any[] = []
   const scSeen = new Set<string>()
@@ -492,10 +529,10 @@ function mergeProjects(server: any, local: any): any {
   return {
     order,
     lastUsed: mergeMap(s.lastUsed, l.lastUsed),
-    hidden: uniq(s.hidden, l.hidden),
+    hidden: uniq(s.hidden, l.hidden).filter((id) => !removed.includes(id)),
     nameOverrides: mergeMap(s.nameOverrides, l.nameOverrides),
     iconOverrides: mergeMap(s.iconOverrides, l.iconOverrides),
-    removed: uniq(s.removed, l.removed),
+    removed,
     views: mergeMap(s.views, l.views),
     shortcuts,
     layouts: layoutList,
@@ -504,6 +541,21 @@ function mergeProjects(server: any, local: any): any {
     flows: mergeMap(s.flows, l.flows),
     briefs: mergeMap(s.briefs, l.briefs),
   }
+}
+
+/** 把状态推给宿主：带 baseRevision 做乐观并发。
+ *  宿主 revision 比 base 新 = 另一端已经改过，返回 { conflict, state }，由调用方改成采纳宿主状态，
+ *  不再用本机的旧清单盖掉它（另一端刚删完项目被旧页面盖回去，就是这么发生的）。 */
+async function putRemoteState(projects: any, view: any, baseRevision: number): Promise<{ ok: boolean; conflict: boolean; state: any }> {
+  const r = await fetch('/api/assistant/state', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ projects, view, baseRevision }),
+  })
+  const d = await r.json().catch(() => null)
+  if (r.status === 409) return { ok: false, conflict: true, state: d?.state ?? null }
+  if (!r.ok) throw new Error('HTTP ' + r.status)
+  return { ok: true, conflict: false, state: d?.state ?? null }
 }
 
 type FloatRect = { top: number }
@@ -722,8 +774,8 @@ let previewTimer: number | null = null
 async function coldPreviewOf(face: any): Promise<string> {
   if (!face || typeof face.history !== 'function') return ''
   const r1 = await face.history({ maxMessages: 6 })
-  const evs = r1?.result?.value?.events
-  if (!Array.isArray(evs)) return ''
+  const evs = historyEventsOf(r1)
+  if (evs.length === 0) return ''
   const textOf = (blocks: any): string => {
     let fallback = ''
     if (!Array.isArray(blocks)) return ''
@@ -736,7 +788,7 @@ async function coldPreviewOf(face: any): Promise<string> {
     return fallback
   }
   for (let i = evs.length - 1; i >= 0; i--) {
-    const ev = evs[i]?.event
+    const ev = evs[i]
     if (!ev) continue
     const d = ev.data ?? {}
     let raw = ''
@@ -796,12 +848,12 @@ function lastTextOf(sid: string): string {
   return ''
 }
 
-// ── 控制室卡片「最新进度」：优先显示最后一条工具调用（运行命令 / 读取文件 / 搜索…），
+// ── 控制室卡片「最新进度」：优先显示最后一条工具调用（运行命令 / 读取 / 编辑…），
 //    没有工具调用时退回落款文本。卡片每秒重渲染，所以运行中的会话会持续刷新（流式）。 ──
 const TOOL_LABEL: Record<string, string> = {
   bash: '运行命令', pwsh: '运行命令', shell: '运行命令',
-  read: '读取文件', write: '写入文件', edit: '编辑文件', patch: '编辑文件',
-  grep: '搜索', glob: '查找文件', search: '搜索',
+  read: '读取', write: '写入', edit: '编辑', patch: '编辑',
+  grep: '搜索', glob: '查找', search: '搜索',
   web_search: '搜索网页', web_fetch: '抓取网页',
   subagent: '子代理', task: '子任务', workflow: '运行工作流',
   inspectPlugins: '检查插件', queryRuntime: '查询运行时',
@@ -819,13 +871,26 @@ function firstLineOf(text: string): string {
   return (i < 0 ? s : s.slice(0, i)).trim()
 }
 
-/** 从 argsRaw 里取最有信息量的一行（description / command / path / query…） */
+/** 从 argsRaw 里取最有信息量的一行（description / command / path / query…）
+ *  流式工具调用只有**半截 JSON**（参数还没生成完），解析失败时按字段名抠出已到达的部分，
+ *  否则卡片上会出现 `{"path":"src/cli…` 这种原始碎片。 */
 function summarizeToolArgs(name: string, argsRaw: string): string {
   const raw = String(argsRaw ?? '').trim()
   if (!raw) return ''
   let args: any = null
-  try { args = JSON.parse(raw) } catch { return cleanPreviewText(firstLineOf(raw)).slice(0, 120) }
-  if (!args || typeof args !== 'object') return cleanPreviewText(firstLineOf(raw)).slice(0, 120)
+  try { args = JSON.parse(raw) } catch {
+    for (const key of ['description', 'path', 'file_path', 'command', 'pattern', 'query', 'url']) {
+      const m = raw.match(new RegExp(`"${key}"\\s*:\\s*"([^"\\\\]*(?:\\\\.[^"\\\\]*)*)`, 's'))
+      if (m?.[1]) {
+        let value = m[1]
+        try { value = JSON.parse(`"${value}"`) } catch { /* 半截转义按原文 */ }
+        const clean = cleanPreviewText(firstLineOf(value)).slice(0, 120)
+        if (clean) return clean
+      }
+    }
+    return ''
+  }
+  if (!args || typeof args !== 'object') return ''
   const keys = TOOL_ARG_KEYS[name] ?? []
   for (const k of keys) {
     const v = args[k]
@@ -842,25 +907,98 @@ function toolLineOf(input: any): string {
   if (!input || typeof input !== 'object') return ''
   const root = input.kind === 'tool-call' ? (input.data?.root ?? input.data ?? input) : input
   if (!root || typeof root !== 'object') return ''
-  const isTool = input.kind === 'tool-call' || root.kind === 'tool-call' || root.type === 'tool-call' || !!root.call || typeof root.argsRaw === 'string'
+  const isTool = input.kind === 'tool-call' || input.type === 'tool-call'
+    || root.kind === 'tool-call' || root.type === 'tool-call' || !!root.call || typeof root.argsRaw === 'string'
+    || typeof root.arguments === 'string'
   if (!isTool) return ''
   const name = String(root.call?.name ?? root.name ?? input.toolName ?? input.data?.toolName ?? input.data?.name ?? '').trim()
+  // 会话事件里的工具块用 arguments（JSON 字符串）；节点投影里可能是 call.argsRaw / args / argsRaw
   const argsRaw = typeof root.call?.argsRaw === 'string'
     ? root.call.argsRaw
-    : typeof root.argsRaw === 'string'
-      ? root.argsRaw
-      : typeof root.args === 'string' ? root.args : ''
+    : typeof root.call?.arguments === 'string'
+      ? root.call.arguments
+      : typeof root.argsRaw === 'string'
+        ? root.argsRaw
+        : typeof root.arguments === 'string'
+          ? root.arguments
+          : typeof root.args === 'string' ? root.args : ''
   const summary = summarizeToolArgs(name, argsRaw)
   const label = TOOL_LABEL[name] ?? (name ? '工具调用' : '')
   if (!label) return ''
   return summary ? `${label} · ${summary}` : label
 }
 
-/** 卡片中间显示的「最新一条进度」：工具调用优先，其次最近文本 */
-function latestActivityOf(sid: string): string {
+/** 会话快照里一个节点的内容块：assistant-step 节点把块放在 data.blocks（兼容 data.message.content / 平铺 blocks、content） */
+function blocksOf(node: any): any[] {
+  if (!node || typeof node !== 'object') return []
+  for (const candidate of [
+    node.data?.blocks,
+    node.data?.message?.content,
+    node.data?.content,
+    node.blocks,
+    node.message?.content,
+    node.content,
+  ]) {
+    if (Array.isArray(candidate)) return candidate
+  }
+  return []
+}
+
+/** 取最后一行非空文本（思考块流式输出时，最新的一行就是「此刻在想什么」） */
+function lastLineOf(text: string): string {
+  const lines = String(text ?? '').split('\n').map((s) => s.trim()).filter(Boolean)
+  return lines.length > 0 ? lines[lines.length - 1] : ''
+}
+
+/** 一个内容块 → 卡片进度行：工具调用 > 思考 > 正文；不是可展示内容返回 '' */
+function blockLineOf(block: any): string {
+  const tool = toolLineOf(block)
+  if (tool) return tool
+  const text = typeof block?.text === 'string' ? block.text.trim() : ''
+  if (!text) return ''
+  const kind = String(block?.kind ?? block?.type ?? '')
+  // 思考块与聊天面板同文案（「思考 · …」），取第一行 = 这一块思考在讲什么
+  if (kind === 'reasoning' || kind === 'thinking') {
+    const clean = cleanPreviewText(firstLineOf(text))
+    return clean.length >= 2 ? ('思考 · ' + clean.slice(0, 200)) : ''
+  }
+  const clean = cleanPreviewText(firstLineOf(text))
+  return clean.length >= 2 ? clean.slice(0, 220) : ''
+}
+
+/** 取会话面：直接 binding 拿不到（当前视图没打开过的会话）时，先 retain 一次作用域再取。
+ *  没有这个兜底，控制室里「在后台跑」的会话永远取不到进度，只能显示「正在执行…」。 */
+function sessionFaceOf(sid: string): any | null {
   try {
-    const face = sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.()
+    const sessions = sessionBridge?.sessions as any
+    const direct = sessions?.binding?.(sid)?.session
+    if (direct) return direct
+    if (typeof sessions?.retainAgentScope === 'function') {
+      try { sessions.retainAgentScope(sid) } catch {}
+      return sessions?.binding?.(sid)?.session ?? null
+    }
+  } catch {}
+  return null
+}
+
+/** 卡片中间显示的「最新一条进度」：正在流式的这一轮（partial）优先，其次最后一条已落定节点；
+ *  每块按「工具调用 > 思考 > 正文」取，保持与聊天面板一致（思考显示成「思考 · …」）。 */
+function latestActivityOf(sid: string): string {
+  // 0) 会话事件窗口（最准：与聊天面板同一份数据，正在逐字输出的那一轮也在里面）
+  try {
+    const fromEntries = activityFromSessionEntries(sessionEntriesOf(sid))
+    if (fromEntries) return fromEntries
+  } catch {}
+  try {
+    const face = sessionFaceOf(sid)?.getSnapshot?.()
     if (!face) return ''
+    // 1) 流式中的这一轮：思考/正文还没进 nodes，只有 partial 里有
+    const partialBlocks = Array.isArray(face.partial?.blocks) ? face.partial.blocks : []
+    for (let j = partialBlocks.length - 1; j >= 0; j--) {
+      const line = blockLineOf(partialBlocks[j])
+      if (line) return line
+    }
+    // 2) 已落定的节点：从最后一条往前找
     const rawNodes = face.nodes
     const nodes: any[] = Array.isArray(rawNodes)
       ? rawNodes
@@ -869,31 +1007,34 @@ function latestActivityOf(sid: string): string {
       const n = nodes[i]
       const direct = toolLineOf(n)
       if (direct) return direct
-      const blocks = Array.isArray(n?.blocks) ? n.blocks : (Array.isArray(n?.content) ? n.content : [])
+      const blocks = blocksOf(n)
       for (let j = blocks.length - 1; j >= 0; j--) {
-        const line = toolLineOf(blocks[j])
+        const line = blockLineOf(blocks[j])
         if (line) return line
       }
-      // 文本兜底（同一条节点里优先取 text 块）
-      let raw = ''
-      for (const b of blocks) {
-        const s = typeof b?.text === 'string' ? b.text.trim() : ''
-        if (!s) continue
-        if (b?.type === 'text' || b?.kind === 'text') { raw = s; break }
-        if (!raw) raw = s
-      }
-      if (!raw && typeof n?.text === 'string') raw = n.text
-      if (!raw) continue
-      const clean = cleanPreviewText(raw)
-      if (clean.length >= 6) return clean.slice(0, 220)
     }
   } catch {}
   return ''
 }
 
-/** 控制室卡片「最新进步」缓存：会话 id → 最近一条工具调用/文本。
- *  数据来自会话面 history（只读、零 Token）；控制室打开时每 2.5 秒刷新一次。 */
-const activityCache = new Map<string, string>()
+/** 控制室卡片「最新进度」缓存：会话 id → { 行, 版本, 是否运行中 }。
+ *  数据来自宿主会话日志（follow 只读、零 Token、不激活 Agent）。
+ *  缓存**按日志版本**（会话快照的 updatedAt）而不是按时间失效：同一份日志在任何一台设备上
+ *  都只有同一个版本，手机与电脑因此取到同一行；版本过了没重抓就不显示旧行（宁缺不旧）。 */
+type ActivityEntry = { line: string; key: string; running: boolean }
+const activityCache = new Map<string, ActivityEntry>()
+/** 进度抓取是否在途（1.2s 轮询的并发闸门，避免 RPC 叠加） */
+let activitySweepBusy = false
+
+/** 会话「轮次版本」：宿主列表里的 updatedAt 只在新提示词时前进（= 开新一轮）。
+ *  它变过 = 卡片这一行可能过期；手机与电脑看到的是同一个宿主值，所以两端判断一致。
+ *  运行/结束的切换由旁边的 running 位单独判（宿主 running 位比 updatedAt 更灵敏）。 */
+function activityKeyOf(sid: string): string {
+  try {
+    const e: any = sessionsSnapshotStore.snapshot?.byId?.[sid]
+    return String(Number(e?.updatedAt) || 0)
+  } catch { return '0' }
+}
 
 function toolLineFromEvent(name: string, argsRaw: string): string {
   const label = TOOL_LABEL[name] ?? (name ? '工具调用' : '')
@@ -902,29 +1043,278 @@ function toolLineFromEvent(name: string, argsRaw: string): string {
   return summary ? `${label} · ${summary}` : label
 }
 
-/** 从会话 history 末尾提取最新一条进度（优先 tool/call） */
-async function fetchLatestActivity(sid: string): Promise<string> {
-  try {
-    const face = sessionBridge?.sessions?.binding?.(sid)?.session
-    if (!face || typeof face.history !== 'function') return ''
-    const r = await face.history({ maxMessages: 10 })
-    const evs: any[] = r?.result?.value?.events ?? []
-    for (let i = evs.length - 1; i >= 0; i--) {
-      const ev = evs[i]
-      const type = String(ev?.type ?? '')
-      if (type === 'tool/call' || type === 'tool-call') {
-        const d = ev.data ?? ev
-        const line = toolLineFromEvent(String(d.name ?? d.toolName ?? ''), String(d.arguments ?? d.argsRaw ?? ''))
+/** 把 face.history() 的返回值拉平成事件数组：各版本分别返回
+ *  { result: { value: { events } } } / { value: { records } } / { events } / 直接数组……
+ *  旧代码只认第一种，一旦形状不符就永远取不到活动，卡片只能显示「正在执行…」。
+ *  这里按「events / records / items 数组」做一次浅层 BFS，形状怎么变都能拿到。 */
+function historyEventsOf(result: any): any[] {
+  const flatten = (list: any[]): any[] => {
+    const out: any[] = []
+    for (const entry of list) {
+      if (!entry || typeof entry !== 'object') continue
+      if (Array.isArray(entry.events)) out.push(...entry.events)
+      else if (entry.event && typeof entry.event === 'object') out.push(entry.event)
+      else out.push(entry)
+    }
+    return out
+  }
+  const seen = new Set<any>()
+  let level: any[] = [result]
+  for (let depth = 0; depth < 4 && level.length > 0; depth++) {
+    const next: any[] = []
+    for (const node of level) {
+      if (!node || typeof node !== 'object' || seen.has(node)) continue
+      seen.add(node)
+      for (const key of ['events', 'records', 'items']) {
+        const value = (node as any)[key]
+        if (Array.isArray(value)) return flatten(value)
+      }
+      for (const value of Object.values(node)) {
+        if (value && typeof value === 'object') next.push(value)
+      }
+    }
+    level = next
+  }
+  return []
+}
+
+/** 从事件列表（倒序找）提取最新一条进度：工具调用 > 思考 > 正文。 */
+function activityFromEvents(evs: any[]): string {
+  for (let i = evs.length - 1; i >= 0; i--) {
+    const ev = evs[i]
+    const type = String(ev?.type ?? '')
+    if (type === 'tool/call' || type === 'tool-call') {
+      const d = ev.data ?? ev
+      const line = toolLineFromEvent(String(d.name ?? d.toolName ?? ''), String(d.arguments ?? d.argsRaw ?? ''))
+      if (line) return line
+    }
+    if (type === 'assistant/message') {
+      // 先按「块」取（含 reasoning → 「思考 · …」），取不到再退回纯 text 拼接
+      const blocks = Array.isArray(ev?.data?.blocks) ? ev.data.blocks
+        : Array.isArray(ev?.data?.message?.content) ? ev.data.message.content
+          : Array.isArray(ev?.data?.content) ? ev.data.content : []
+      for (let j = blocks.length - 1; j >= 0; j--) {
+        const line = blockLineOf(blocks[j])
         if (line) return line
       }
-      if (type === 'assistant/message') {
-        const content = ev?.data?.message?.content ?? []
-        const text = (Array.isArray(content) ? content : []).filter((b: any) => b?.type === 'text').map((b: any) => b.text).join(' ')
-        const clean = cleanPreviewText(text)
-        if (clean.length >= 6) return clean.slice(0, 220)
-      }
-      if (type === 'user/message') break
+      const content = ev?.data?.message?.content ?? []
+      const text = (Array.isArray(content) ? content : []).filter((b: any) => b?.type === 'text').map((b: any) => b.text).join(' ')
+      const clean = cleanPreviewText(text)
+      if (clean.length >= 6) return clean.slice(0, 220)
     }
+    // 其它带块的事件（assistant/reasoning、assistant/step …）也照块取
+    const eventBlocks = Array.isArray(ev?.data?.blocks) ? ev.data.blocks : []
+    for (let j = eventBlocks.length - 1; j >= 0; j--) {
+      const line = blockLineOf(eventBlocks[j])
+      if (line) return line
+    }
+    if (type === 'user/message') break
+  }
+  return ''
+}
+
+/** 流式块累加器：按 chunk.index 汇聚 text / reasoning / tool-call 三类块。
+ *  宿主的紧凑记录、聊天面板的 live chunk 都是同一套 chunk，必须用同一套还原逻辑。 */
+type StreamBlockStore = { order: number[]; byIndex: Map<number, any> }
+function createStreamBlockStore(): StreamBlockStore {
+  return { order: [], byIndex: new Map() }
+}
+function streamBlockSlot(store: StreamBlockStore, index: number, type: string): any {
+  const key = Number.isFinite(index) ? index : store.order.length
+  let block = store.byIndex.get(key)
+  if (!block) {
+    block = { type, index: key, text: '', arguments: '', name: '', id: '' }
+    store.byIndex.set(key, block)
+    store.order.push(key)
+  }
+  return block
+}
+/** 一条原始 StreamChunk（text-delta / reasoning-delta / tool-call-delta）→ 累加进块 */
+function applyStreamChunk(store: StreamBlockStore, chunk: any): void {
+  if (!chunk || typeof chunk !== 'object') return
+  const index = Number(chunk.index ?? 0)
+  if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') {
+    const block = streamBlockSlot(store, index, chunk.type === 'text-delta' ? 'text' : 'reasoning')
+    if (typeof chunk.text === 'string') block.text += chunk.text
+    return
+  }
+  if (chunk.type === 'tool-call-delta') {
+    const block = streamBlockSlot(store, index, 'tool-call')
+    if (typeof chunk.id === 'string' && chunk.id) block.id = chunk.id
+    if (typeof chunk.name === 'string' && chunk.name) block.name = chunk.name
+    if (typeof chunk.argumentsDelta === 'string') block.arguments += chunk.argumentsDelta
+  }
+}
+/** 累加器里最后一条可展示内容（工具调用 > 思考 > 正文） */
+function lastLineFromStreamStore(store: StreamBlockStore): string {
+  for (let i = store.order.length - 1; i >= 0; i--) {
+    const block = store.byIndex.get(store.order[i])
+    const line = blockLineOf(block)
+    if (line) return line
+  }
+  return ''
+}
+
+/** 把宿主的「紧凑 chunk 记录」还原成内容块（与 dsh-llm 的 expandAssistantStream 同语义）：
+ *  记录形状：text-chunks / reasoning-chunks / tool-call-chunks（批量）+ chunk（单条 delta）。
+ *  流式中的这一轮只有这个形状，聊天面板也是从它还原的——卡片要显示同一条内容必须走同一套。 */
+function blocksFromCompactStream(records: any[]): any[] {
+  const store = createStreamBlockStore()
+  for (const record of records) {
+    if (!record || typeof record !== 'object') continue
+    const type = String((record as any).type ?? '')
+    if (type === 'text-chunks' || type === 'reasoning-chunks') {
+      const block = streamBlockSlot(store, Number((record as any).index ?? 0), type === 'text-chunks' ? 'text' : 'reasoning')
+      if (Array.isArray((record as any).texts)) block.text += (record as any).texts.join('')
+      continue
+    }
+    if (type === 'tool-call-chunks') {
+      const block = streamBlockSlot(store, Number((record as any).index ?? 0), 'tool-call')
+      if (typeof (record as any).id === 'string' && (record as any).id) block.id = (record as any).id
+      if (typeof (record as any).name === 'string' && (record as any).name) block.name = (record as any).name
+      if (Array.isArray((record as any).args)) block.arguments += (record as any).args.join('')
+      continue
+    }
+    if (type === 'chunk') applyStreamChunk(store, (record as any).chunk)
+  }
+  return store.order.map((key) => store.byIndex.get(key)).filter(Boolean)
+}
+
+/** 已打开会话的本地事件窗口（与聊天面板同一份数据，含当前轮次的 live chunk）。
+ *  binding.getSnapshot() 只有状态位、没有内容；内容在 Session 的 eventSource 里。 */
+function sessionEntriesOf(sid: string): any[] {
+  try {
+    const rec: any = (sessionBridge?.sessions as any)?.binding?.(sid)
+    const session: any = rec?.session ?? rec?.binding ?? rec
+    const snap = session?.eventSource?.getSnapshot?.() ?? session?.events?.getSnapshot?.()
+    const entries = snap?.entries
+    if (Array.isArray(entries)) return entries
+  } catch {}
+  return []
+}
+
+/** 事件窗口 → 最新一条进度：从前往后扫，后出现的工具调用 / 消息 / live chunk 覆盖前一条。
+ *  live chunk（assistant/live-chunk）就是聊天面板里正在逐字输出的那一轮，控制室要显示同一句。 */
+function activityFromSessionEntries(entries: any[]): string {
+  if (!Array.isArray(entries) || entries.length === 0) return ''
+  let lastLine = ''
+  let store = createStreamBlockStore()
+  let attempt = ''
+  for (const entry of entries) {
+    const ev: any = (entry as any)?.event ?? entry
+    if (!ev || typeof ev !== 'object') continue
+    const type = String(ev.type ?? '')
+    if (type === 'user/message' || type === 'turn/start') {
+      lastLine = ''
+      store = createStreamBlockStore()
+      attempt = ''
+      continue
+    }
+    if (type === 'tool/call') {
+      const line = toolLineFromEvent(String(ev.data?.name ?? ev.data?.toolName ?? ''), String(ev.data?.arguments ?? ev.data?.argsRaw ?? ''))
+      if (line) lastLine = line
+      continue
+    }
+    if (type === 'assistant/message') {
+      const blocks = blocksOf(ev)
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        const line = blockLineOf(blocks[i])
+        if (line) { lastLine = line; break }
+      }
+      continue
+    }
+    if (type === 'assistant/live-chunk') {
+      const attemptId = String(ev.data?.attemptId ?? '')
+      if (attemptId !== attempt) { attempt = attemptId; store = createStreamBlockStore() }
+      applyStreamChunk(store, ev.data?.chunk)
+      const line = lastLineFromStreamStore(store)
+      if (line) lastLine = line
+    }
+  }
+  return lastLine
+}
+
+/** 宿主 assistantStream（正在流式输出的那一轮）→ 一行进度。
+ *  优先读 `activeAttempt.stream`（紧凑记录），其次兼容已经展开的 blocks/content。 */
+function streamLineOf(stream: any): string {
+  if (!stream) return ''
+  if (typeof stream === 'string') {
+    const clean = cleanPreviewText(stream)
+    return clean.length >= 2 ? clean.slice(0, 220) : ''
+  }
+  const compact = stream?.activeAttempt?.stream
+  if (Array.isArray(compact)) {
+    const blocks = blocksFromCompactStream(compact)
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const line = blockLineOf(blocks[i])
+      if (line) return line
+    }
+  }
+  const blocks = Array.isArray(stream?.blocks) ? stream.blocks
+    : Array.isArray(stream?.content) ? stream.content
+      : Array.isArray(stream?.message?.content) ? stream.message.content : []
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const line = blockLineOf(blocks[i])
+    if (line) return line
+  }
+  for (const text of [stream?.text, stream?.thinking, stream?.reasoning]) {
+    if (typeof text === 'string') {
+      const clean = cleanPreviewText(text)
+      if (clean.length >= 2) return ('思考 · ' + firstLineOf(clean)).slice(0, 220)
+    }
+  }
+  return ''
+}
+
+/** assistantStream 里这一轮是否已经落定：attempt 起点之后已有同 turn/step 的 assistant 消息。
+ *  流快照与 durable 日志由两条通道发出，偶尔流还停在上一轮（工具调用）而日志已经有最终答复；
+ *  这时必须以日志为准，否则卡片会永久停在「工具调用 · …」。 */
+function streamSettledInEvents(events: any[], attempt: any): boolean {
+  if (!attempt) return false
+  const after = Number(attempt.startedAfterSeq)
+  if (!Number.isFinite(after)) return false
+  const turn = Number(attempt.turn)
+  const step = Number(attempt.step)
+  for (const ev of events) {
+    const seq = Number(ev?.seq)
+    if (!Number.isFinite(seq) || seq <= after) continue
+    if (ev?.type !== 'assistant/message' && ev?.type !== 'assistant/attempt') continue
+    if (Number(ev?.data?.turn) === turn && Number(ev?.data?.step) === step) return true
+  }
+  return false
+}
+
+/** 从会话尾部提取最新一条进度（优先正在流式的这一轮，其次最后一条工具调用/文本）。
+ *  数据源走宿主 follow 开场快照（任意会话可读、带 assistantStream）；取不到再退回会话面。
+ *  tailOnly：只读日志，不碰会话面（空闲卡片用；sessionFaceOf 会 retain 作用域，
+ *  对一堆冷会话逐个调用等于把 Agent 拉起来）。 */
+async function fetchLatestActivity(sid: string, opts: { tailOnly?: boolean } = {}): Promise<string> {
+  try {
+    const api: any = getAssistantApi()
+    if (api && typeof api.sessionTail === 'function') {
+      const tail = await api.sessionTail(sid)
+      if (tail) {
+        const events: any[] = Array.isArray(tail.events) ? tail.events : []
+        const attempt = tail.stream?.activeAttempt
+        const live = !!attempt && !streamSettledInEvents(events, attempt)
+        if (live) {
+          const streamed = streamLineOf(tail.stream)
+          if (streamed) return streamed
+        }
+        const fromTail = activityFromEvents(events)
+        if (fromTail) return fromTail
+        // 日志这一页没有可展示内容（例如只截到工具结果）时，再退回流式这一轮
+        const streamed = streamLineOf(tail.stream)
+        if (streamed) return streamed
+      }
+    }
+  } catch { /* 宿主 follow 不可用 → 走会话面 */ }
+  if (opts.tailOnly) return ''
+  try {
+    const face = sessionFaceOf(sid)
+    if (!face || typeof face.history !== 'function') return ''
+    const r = await face.history({ maxMessages: 10 })
+    return activityFromEvents(historyEventsOf(r))
   } catch {}
   return ''
 }
@@ -1144,6 +1534,34 @@ function retainSessionScope(sid: string): boolean {
   return false
 }
 
+/** 用户可见的失败提示：控制室/分栏里没有全局 toast 组件，而「点了 ＋ 却什么都没发生」
+ *  是最难自查的静默失败——创建会话失败时至少用 alert 说清楚（先 console.warn 留证据）。 */
+function reportUserError(text: string): void {
+  try { console.warn('[dsh-assistant] ' + text) } catch {}
+  try { (window as any).alert?.(text) } catch {}
+}
+
+/** 在指定目录注册（或取回）宿主工作区，返回工作区 id；失败 / 宿主没有该能力返回 null。
+ *
+ *  形状兼容（这是「新建会话默认工作区不对」的根因所在）：
+ *  宿主 0.2 的 ctx.workspaces.create 直接返回 **Remote 信封** `{ ok, value: { workspace, created } }`
+ *  （见 @deepseek-ai/dsh-api-workspace-controller 的 WorkspaceFeed.create → this.remote.create），
+ *  早先的实现却按「顶层 workspaceId」读，于是一律拿到 null。
+ *
+ *  为什么必须注册：宿主 SessionCommandController.create 只有在带 workspaceId 时才会
+ *  `workspace.attachSession(sessionId)`；退化成 {cwd} 建会话时，会话只有 cwd、没有工作区归属
+ *  （会话列表里落在「未分组」，右侧工作区也不是该项目文件夹），用户还得手动重选工作文件夹。 */
+async function workspaceIdAtFolder(folder: string): Promise<string | null> {
+  const ws = sessionBridge?.workspaces as any
+  if (!ws || typeof ws.create !== 'function') return null
+  const res = await ws.create({ path: folder })
+  if (res && typeof res === 'object' && res.ok === false) return null // 宿主拒绝（目录不存在等）
+  const unwrapped = res && typeof res === 'object' && 'value' in res ? (res as any).value : res
+  const view = unwrapped && typeof unwrapped === 'object' && 'workspace' in unwrapped ? unwrapped.workspace : unwrapped
+  const id = view?.workspaceId ?? view?.id ?? null
+  return typeof id === 'string' && id ? id : null
+}
+
 /** 在指定目录注册工作区并建会话：优先 workspace.create({path})（前端工作区可见、不用手动选地址），
  *  失败回退 sessions.create({cwd})。返回会话 id 或 null。可选 title = 会话标题（命名规范见 templates.ts）。
  *  注意：模板项目自动开会话必须走这条路径——仅 {cwd} 建会话时宿主工作区面板为空，会提示「选择一个工作区开始」。 */
@@ -1152,13 +1570,7 @@ async function createSessionAtFolder(folder: string, title?: string): Promise<st
   if (!b || typeof b.sessions?.create !== 'function') return null
   try {
     let workspaceId: string | null = null
-    const ws = b.workspaces as any
-    if (ws && typeof ws.create === 'function') {
-      try {
-        const view = await ws.create({ path: folder })
-        workspaceId = view?.workspaceId ?? view?.id ?? null
-      } catch { /* 工作区注册失败：回退 cwd 建会话 */ }
-    }
+    try { workspaceId = await workspaceIdAtFolder(folder) } catch { /* 工作区注册失败：回退 cwd 建会话 */ }
     const createOpts: any = workspaceId ? { workspaceId } : { cwd: folder }
     const sid = await b.sessions.create(createOpts)
     if (sid && title) void setSessionTitle(sid, title)
@@ -1214,8 +1626,8 @@ export async function createCustomSession(projectId: string, projectName: string
       const d = await r.json()
       if (!r.ok || !d?.ok) throw new Error(d?.error ?? 'mkdir failed')
     } catch { /* 目录建不出来的错误最终由 workspace.create 暴露 */ }
-    const view = await ws.create({ path: full })
-    workspaceId = view?.workspaceId ?? view?.id ?? null
+    // 注意：ws.create 返回的是 remote 信封，必须经 workspaceIdAtFolder 解包（顶层 workspaceId 恒为 undefined）
+    workspaceId = await workspaceIdAtFolder(full)
     if (!workspaceId) throw new Error('workspace create failed')
   }
   // 会话工作目录优先级：显式分组（workspaceId）> 项目文件夹（cwd）> 默认
@@ -1281,6 +1693,91 @@ function openSessionInHost(sessionId: string | null | undefined): boolean {
   console.warn('[dsh-worktable] 宿主未提供会话切换入口（uiWorkspace.openSession / sessions.open 均不可用）')
   return false
 }
+/** 新建会话后的「聚焦」：等它进宿主会话列表 → 必要时重拉列表 → 重试打开 → 校验当前会话
+ *  → 空白会话的历史流若卡在 loading 就重建它（否则主区停在 settling = 纯白）。
+ *
+ *  结果写 window.__dshAssistantLastFocus（完整诊断）并 POST 到 /api/assistant/focus-diag 落盘，
+ *  出问题时不用开 DevTools 也能拿到状态。 */
+async function focusNewSession(sessionId: string): Promise<FocusResult> {
+  const r = await focusSessionInHost(sessionBridge, sessionId)
+  const diag = { ...r, at: Date.now(), dom: focusDomProbe() }
+  try { (window as any).__dshAssistantLastFocus = diag } catch {}
+  if (!r.opened || !r.settled) console.warn('[dsh-assistant] 新会话聚焦未完全就绪：', JSON.stringify(diag))
+  void postFocusDiag(diag)
+  return r
+}
+
+/** 主区渲染状态的最小探针（只读 DOM 属性，不碰会话内容） */
+function focusDomProbe(): Record<string, unknown> {
+  try {
+    const root = document.querySelector('[data-phase]')
+    const content = document.querySelector('[data-conversation-content]')
+    const composer = document.querySelector('[data-conversation-region="composer"]')
+    return {
+      phase: root?.getAttribute('data-phase') ?? '',
+      contentPhase: content?.getAttribute('data-content-phase') ?? '',
+      session: content?.getAttribute('data-conversation-session') ?? '',
+      hasComposer: !!composer,
+      composerVisible: composer ? composer.getBoundingClientRect().height > 0 : false,
+      text: String(content?.textContent ?? '').trim().slice(0, 80),
+    }
+  } catch { return {} }
+}
+
+/** 把聚焦诊断追加到宿主日志（宿主不可用时静默） */
+async function postFocusDiag(diag: Record<string, unknown>): Promise<void> {
+  try {
+    await fetch('/api/assistant/focus-diag', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ diag, at: new Date().toISOString() }),
+    })
+  } catch { /* 诊断失败不影响主流程 */ }
+}
+
+/** 空白会话白屏自愈看门狗：不是插件新建、而是用户从侧栏点开一条「历史流卡在 loading」的
+ *  空白会话时，UI 同样会停在 settling（纯白）。这里每 2s 看一次当前会话：空白 + loading
+ *  持续 2.5s 就 resync 一次（同一会话最多 3 次）。没卡住时只读一个快照，开销可忽略。 */
+const blankStuckSince = new Map<string, { since: number; tries: number }>()
+
+async function healStuckCurrentSession(): Promise<void> {
+  const b = sessionBridge
+  if (!b) return
+  let cur = ''
+  try { cur = String(b.uiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? b.list?.getSnapshot?.()?.current ?? '') } catch { return }
+  if (!cur) return
+  const st = sessionFaceState(b, cur)
+  if (!st || !st.blank || st.openState !== 'loading') { blankStuckSince.delete(cur); return }
+  const rec = blankStuckSince.get(cur)
+  const now = Date.now()
+  if (!rec) { blankStuckSince.set(cur, { since: now, tries: 0 }); return }
+  if (now - rec.since < 2500 || rec.tries >= 3) return
+  rec.since = now
+  rec.tries += 1
+  const healed = await healBlankSessionIfStuck(b, cur)
+  if (healed) console.warn('[dsh-assistant] 空白会话历史流卡住，已重建（第 ' + rec.tries + ' 次）：' + cur)
+  void postFocusDiag({ kind: 'watchdog-resync', sessionId: cur, healed, openState: st.openState, tries: rec.tries, dom: focusDomProbe(), at: Date.now() })
+}
+/** 新建会话的「预设 + 模型」补齐（部署默认预设 / 继承用户当前模型）。
+ *
+ *  时机很重要：必须在会话被 UI **打开之后**再跑。这两个 RPC 会让宿主在建会话与主区挂载
+ *  之间重启一次该会话的 Agent，客户端的 history 流于是可能永远停在 `loading`；而 UI 的
+ *  ConversationRoot 在这种状态下的 data-phase = settling
+ *  （`shellPhase==='blank' && openState==='loading' && summaryBlank!==true`），
+ *  CSS 把 composerSeat 设成 visibility:hidden，会话头 hideChrome —— 主区就是一片纯白，
+ *  只剩左上角的侧栏折叠图标。这就是「新建会话跳过去白屏」的根因之一。
+ *  宿主原生的「新建会话」也是先挂载会话、再让用户选模型，顺序一致。 */
+async function applyNewSessionDefaults(sessionId: string): Promise<void> {
+  if (!sessionId) return
+  try { await ensureSessionPreset(sessionId) } catch {}
+  try { await ensureSessionModel(sessionId) } catch {}
+}
+
+/** 新建会话失败提示的统一文案（工作文件夹缺失/不可写是最常见原因） */
+function newSessionFailedText(folder: string): string {
+  return '新建会话失败：没能在这个项目的文件夹下创建会话。' + (folder ? '\n工作文件夹：' + folder : '') + '\n请确认该文件夹存在且可写，然后重试。'
+}
+
 let lastSessionScopeId = ''
 
 /** 会话作用域快照（模块级；apply 里订阅 ctx.sessions.list 写入，组件与引擎只读） */
@@ -1305,9 +1802,22 @@ function cwdOfSession(sid: string | null | undefined): string {
   }
 }
 
-/** 提醒确认（ack）持久化：会话 id → 已确认的状态（'done' | 'need'） */
-function loadNotifyAck(): Record<string, string> {
+/** 某个目录（项目文件夹）下的全部会话 id：含各步骤子目录，排除子代理会话。
+ *  与卡片「会话列表」同一判定口径（Windows 路径大小写不敏感）；判定本体在
+ *  sessionFolder.ts（纯函数，可单测）。卡片的状态灯与中间进度都按「项目关联会话全集」算，
+ *  所以不限定必须是绑定会话。 */
+function sessionIdsUnderFolder(base: string): string[] {
   try {
+    const snap = sessionBridge?.list?.getSnapshot?.()
+    const byId: Record<string, any> = snap?.byId ?? {}
+    const ids: string[] = Array.isArray(snap?.ids) ? snap.ids : Object.keys(byId)
+    return sessionsUnderFolder(ids, byId, base)
+  } catch { /* 快照不可用：返回空，状态退回绑定会话口径 */ }
+  return []
+}
+
+/** 提醒确认（ack）持久化：会话 id → 已确认的状态（'done' | 'need'） */
+function loadNotifyAck(): Record<string, string> {  try {
     const raw = localStorage.getItem('dsh.worktable.notifyAck.v1')
     const p = raw ? JSON.parse(raw) : {}
     return p && typeof p === 'object' ? p : {}
@@ -1675,7 +2185,7 @@ function WorktableSection(props: any) {
       return !v
     })
   }
-  const [wsPreset, setWsPreset] = useState<string>('2h')
+  const [wsPreset, setWsPreset] = useState<string>(DEFAULT_PRESET_ID)
   const [wsName, setWsName] = useState('')
   /** 新建项目弹窗：所选模板 id（'' = 无模板；选模板则按模板流程实例化） */
   const [wsTemplate, setWsTemplate] = useState<string>('')
@@ -1708,14 +2218,20 @@ function WorktableSection(props: any) {
   const pickBusyRef = useRef(false)
   /** 组件卸载后不再应用旧选择结果 */
   const mountedRef = useRef(true)
+  /** 新建项目保存中（防连点：双击「创建项目」会建出两个同目录项目 + 两条会话） */
+  const savingLayoutRef = useRef(false)
   useEffect(() => () => { mountedRef.current = false }, [])
   /** 新建项目弹窗：未选文件夹时默认 = D:\陈潘HBEU\Desktop\删除 下以当前时间戳（YYYYMMDDHHmm）命名的子文件夹
    *  （打开弹窗时计算，弹窗显示的路径即将要创建的路径；保存成功后 wsFolderParent 清空，下次打开生成新时间戳）。
-   *  「选择位置…」与「手动输入」保留，随时可改；父目录不存在时 mkdir 报错，用户可改选其它位置。 */
-  const prefillDefaultFolder = () => {
-    if (wsFolderParent) return
+   *  「选择位置…」与「手动输入」保留，随时可改；父目录不存在时 mkdir 报错，用户可改选其它位置。
+   *  regenerate=true（每次打开弹窗）= 上次自动生成的时间戳已经作废（弹窗没保存就关了），
+   *  必须重新生成：否则再建项目会沿用同一个旧目录，两个项目叠在同一个文件夹里。手动选的路径不动。 */
+  const prefillDefaultFolder = (regenerate = false) => {
+    if (!regenerate && wsFolderParent) return
     void defaultProjectFolder().then((p) => {
-      if (mountedRef.current && !wsFolderParent) setWsFolderParent(p)
+      if (!mountedRef.current) return
+      if (regenerate) setWsFolderParent((cur) => (cur && !isAutoProjectFolder(cur) ? cur : p))
+      else if (!wsFolderParent) setWsFolderParent(p)
     })
   }
   /** 图标选择器：kind + 目标 id + 弹窗锚点坐标（fixed 定位） */
@@ -1772,11 +2288,44 @@ function WorktableSection(props: any) {
 
   // ── 跨端同步（项目 + 控制室视图）：宿主 /api/assistant/state 为真值 ──
   // 手机与电脑各有自己的 localStorage，只靠本地存储永远不同步；这里首次拉取宿主状态，
-  // 之后本地改动去抖推送、每 5 秒轮询另一端的改动。
+  // 之后本地改动去抖推送、每 3 秒轮询另一端的改动。推送带 baseRevision，旧副本不会盖掉新状态；
+  // 推/收按状态签名去重，避免「A 采纳 B 的状态后又把它推回去」的两端互推死循环。
   const syncReadyRef = useRef(false)
-  const syncSkipRef = useRef(0)
   const syncTimerRef = useRef<number | null>(null)
   const syncRevRef = useRef(0)
+  const syncSigRef = useRef('')
+
+  /** 采纳宿主状态（另一端的改动 / 冲突时的真值）：写本地并重载界面；签名同步记下，下一轮不再回声推送 */
+  const adoptRemoteState = (st: any): void => {
+    if (!st || !st.projects) return
+    syncRevRef.current = Number(st.revision) || 0
+    try { localStorage.setItem(PROJECTS_KEY, JSON.stringify(st.projects)) } catch {}
+    if (st.view) { try { localStorage.setItem(PERSIST_KEY, JSON.stringify(st.view)) } catch {} }
+    const nextProjects = loadProjects()
+    const nextView = st.view ? loadView() : viewRef.current
+    setProjects(nextProjects)
+    if (st.view) setView(nextView)
+    syncSigRef.current = stateSigOf(nextProjects, viewForSync(nextView))
+  }
+
+  /** 推送时撞上 revision 冲突（另一端刚改过）：宿主状态 + 本机墓碑合并后再推一次。
+   *  墓碑保证「刚删的项目」不会因为这次冲突又活过来；再次冲突就放弃本机这份改动，直接采纳宿主。 */
+  const reconcileConflict = (st: any): void => {
+    if (!st || !st.projects) return
+    const merged = mergeProjects(st.projects, projectsRef.current.projects)
+    adoptRemoteState({ ...st, projects: merged })
+    void (async () => {
+      try {
+        const vw = viewForSync(st.view ?? viewRef.current)
+        const res = await putRemoteState(merged, vw, Number(st.revision) || 0)
+        if (res.conflict) adoptRemoteState(res.state)
+        else {
+          syncRevRef.current = Number(res.state?.revision) || 0
+          syncSigRef.current = stateSigOf(loadProjects(), vw)
+        }
+      } catch { /* 下次改动再推 */ }
+    })()
+  }
 
   useEffect(() => {
     let alive = true
@@ -1787,29 +2336,27 @@ function WorktableSection(props: any) {
         const d = await r.json()
         const st = d?.state
         if (st && st.projects) {
-          // 两端都可能有尚未同步过的新项目：取并集后再以宿主为准，避免任何一端被覆盖丢失
+          // 清单以宿主为准（并集会把另一端的旧副本并回来，已删项目就永远删不掉），墓碑取并集
           const merged = mergeProjects(st.projects, projectsRef.current.projects)
-          syncSkipRef.current += 1
-          try { localStorage.setItem(PROJECTS_KEY, JSON.stringify(merged)) } catch {}
-          if (st.view) { try { localStorage.setItem(PERSIST_KEY, JSON.stringify(st.view)) } catch {} }
-          if (alive) { setProjects(loadProjects()); setView(loadView()) }
-          // 把并集写回宿主（补上本机独有项目）
-          const res = await fetch('/api/assistant/state', {
-            method: 'PUT',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ projects: merged, view: viewForSync(st.view ?? viewRef.current) }),
-          })
-          const dd = await res.json().catch(() => null)
-          syncRevRef.current = Number(dd?.state?.revision ?? st.revision) || 0
+          if (!alive) return
+          adoptRemoteState({ ...st, projects: merged })
+          const vw = viewForSync(st.view ?? viewRef.current)
+          const res = await putRemoteState(merged, vw, Number(st.revision) || 0)
+          if (res.conflict) { if (alive) reconcileConflict(res.state) }
+          else {
+            syncRevRef.current = Number(res.state?.revision) || 0
+            syncSigRef.current = stateSigOf(loadProjects(), vw)
+          }
         } else {
           // 宿主为空：把本机数据推上去
-          const res = await fetch('/api/assistant/state', {
-            method: 'PUT',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ projects: projectsRef.current.projects, view: viewForSync(viewRef.current) }),
-          })
-          const dd = await res.json().catch(() => null)
-          if (dd?.state?.revision) syncRevRef.current = dd.state.revision
+          const pr = projectsRef.current.projects
+          const vw = viewForSync(viewRef.current)
+          const res = await putRemoteState(pr, vw, 0)
+          if (res.conflict) { if (alive) reconcileConflict(res.state) }
+          else {
+            syncRevRef.current = Number(res.state?.revision) || 0
+            syncSigRef.current = stateSigOf(pr, vw)
+          }
         }
       } catch { /* 宿主不可用：退回纯本地模式 */ }
       if (alive) syncReadyRef.current = true
@@ -1817,52 +2364,96 @@ function WorktableSection(props: any) {
     return () => { alive = false }
   }, [])
 
-  // 控制室打开时：每 2.5 秒从会话 history 抓一次最新进度（运行命令 / 读取文件…），卡片实时刷新
+  // 控制室打开时扫卡片进度：每 1.2 秒一批，数据只来自宿主会话日志（follow 只读、零 Token、不激活 Agent）。
+  // 抓取范围：绑定会话 / 模板步骤会话（**空闲也要跟一次**：一轮结束后卡片必须从「工具调用 · …」
+  // 换成那句最终答复）+ 项目文件夹下正在跑的会话。
+  // 重抓时机：运行中（每轮跟）、刚跑完（settle 优先）、还没抓过、开了新一轮（updatedAt 前进）。
+  // 行缓存带「轮次版本」：版本或运行态对不上就不拿旧行充数——手机上显示最终答复、电脑上却停在
+  // 上一轮工具调用的那种两端不一致，根因就是旧实现把这份缓存当成了永久有效。
   useEffect(() => {
     const iv = window.setInterval(() => {
       try {
         if (!controlRoomStore.getSnapshot()) return
         const pr = projectsRef.current.projects
-        const ids = new Set<string>()
-        for (const pid of Object.keys(pr.bindings)) {
-          const sid = pr.bindings[pid]
-          if (sid) ids.add(sid)
-        }
+        const snapById = sessionsSnapshotStore.snapshot?.byId ?? {}
+        // 与卡片状态灯同一套「在跑」判定：快照 running 位 或 会话面还有未结束的轮次
+        const running = (sid: string): boolean => sessionRunningNow(sid, snapById, () => new Set())
+        const tracked = new Set<string>()
+        for (const sid of Object.values(pr.bindings)) if (sid) tracked.add(sid)
         for (const run of Object.values(pr.flows ?? {})) {
           for (const sid of Object.values(run?.stepSessions ?? {})) {
-            if (typeof sid === 'string' && sid) ids.add(sid)
+            if (typeof sid === 'string' && sid) tracked.add(sid)
           }
         }
-        if (ids.size === 0) return
+        // 项目文件夹下正在跑的会话（用户可能从「会话列表」进去跑，绑定会话是空闲的那条）
+        const projectIds = new Set<string>([...Object.keys(pr.bindings), ...pr.layouts.map((l) => l.id)])
+        for (const pid of projectIds) {
+          const base = pr.folders[pid] || cwdOfSession(pr.bindings[pid])
+          if (!base) continue
+          for (const s of sessionIdsUnderFolder(base)) if (running(s)) tracked.add(s)
+        }
+        // 只挑「需要重抓」的：正在跑（每轮都要跟，流式）/ 没抓过 / 日志又长了一截 / 刚跑完
+        const pending: { sid: string; key: string; wasRunning: boolean; settle: boolean }[] = []
+        for (const sid of tracked) {
+          const entry = activityCache.get(sid)
+          const isRunning = running(sid)
+          const key = activityKeyOf(sid)
+          if (isRunning || !entry || entry.key !== key || entry.running !== isRunning) {
+            // 刚跑完的那张卡优先：用户正等着看这一轮的最终答复
+            pending.push({ sid, key, wasRunning: isRunning, settle: !isRunning && !!entry?.running })
+          }
+        }
+        if (pending.length === 0) return
+        pending.sort((a, b) => Number(b.settle) - Number(a.settle))
+        // 一轮没跑完不叠下一轮（RPC 慢时 setInterval 会追上来，叠加会打满宿主）
+        if (activitySweepBusy) return
+        activitySweepBusy = true
         void (async () => {
           let changed = false
-          for (const sid of ids) {
-            const line = await fetchLatestActivity(sid)
-            if (line && activityCache.get(sid) !== line) { activityCache.set(sid, line); changed = true }
-          }
+          try {
+            // 每轮最多补 6 条：控制室首次打开时卡片可能全都没有缓存，分几轮补，避免瞬间打满宿主
+            for (const item of pending.slice(0, 6)) {
+              // 空闲会话只读日志（follow 不激活 Agent）；运行中的才允许退回会话面
+              const line = await fetchLatestActivity(item.sid, { tailOnly: !item.wasRunning })
+              const prev = activityCache.get(item.sid)
+              // 刚跑完却什么都没抓到（日志读失败/这一轮没有可展示内容）→ 宁可清空走「最近成品消息」，
+              // 也不能把上一轮的工具调用当作最终答复留在卡片上。
+              const settleFailed = !!prev?.running && !item.wasRunning && !line
+              const next: ActivityEntry = {
+                line: settleFailed ? '' : (line || prev?.line || ''),
+                key: item.key,
+                running: item.wasRunning,
+              }
+              if (!prev || prev.line !== next.line || prev.key !== next.key || prev.running !== next.running) {
+                activityCache.set(item.sid, next)
+                changed = true
+              }
+            }
+          } finally { activitySweepBusy = false }
           if (changed) notifyConsole()
         })()
       } catch {}
-    }, 2500)
+    }, 1200)
     return () => window.clearInterval(iv)
   }, [])
 
-  // 本地改动 → 去抖推送（跳过刚采纳宿主状态的那一轮，避免回声）
+  // 本地改动 → 去抖推送（内容与上次同步等价就不推，避免采纳后回声）
   useEffect(() => {
     if (!syncReadyRef.current) return
-    if (syncSkipRef.current > 0) { syncSkipRef.current -= 1; return }
+    if (stateSigOf(projects, viewForSync(view)) === syncSigRef.current) return
     if (syncTimerRef.current != null) window.clearTimeout(syncTimerRef.current)
     syncTimerRef.current = window.setTimeout(() => {
       syncTimerRef.current = null
       void (async () => {
         try {
-          const r = await fetch('/api/assistant/state', {
-            method: 'PUT',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ projects: projectsRef.current.projects, view: viewForSync(viewRef.current) }),
-          })
-          const d = await r.json().catch(() => null)
-          if (d?.state?.revision) syncRevRef.current = Number(d.state.revision) || 0
+          const pr = projectsRef.current.projects
+          const vw = viewForSync(viewRef.current)
+          const res = await putRemoteState(pr, vw, syncRevRef.current)
+          if (res.conflict) reconcileConflict(res.state)
+          else {
+            syncRevRef.current = Number(res.state?.revision) || 0
+            syncSigRef.current = stateSigOf(pr, vw)
+          }
         } catch { /* 离线：本地仍生效，下次改动再推 */ }
       })()
     }, 800)
@@ -1884,15 +2475,10 @@ function WorktableSection(props: any) {
           if (!st || !st.projects) return
           const rev = Number(st.revision) || 0
           if (rev === syncRevRef.current) return
-          syncRevRef.current = rev
-          syncSkipRef.current += 1
-          try { localStorage.setItem(PROJECTS_KEY, JSON.stringify(st.projects)) } catch {}
-          if (st.view) { try { localStorage.setItem(PERSIST_KEY, JSON.stringify(st.view)) } catch {} }
-          setProjects(loadProjects())
-          setView(loadView())
+          adoptRemoteState(st)
         } catch {}
       })()
-    }, 5000)
+    }, 3000)
     return () => window.clearInterval(iv)
   }, [])
 
@@ -1949,6 +2535,9 @@ function WorktableSection(props: any) {
     const norm = (p: unknown) => String(p ?? '').replace(/\\/g, '/').replace(/\/+$/, '')
     const baseN = norm(base)
     if (!baseN) return []
+    // Windows 路径大小写不敏感（盘符 D: / d: 混用很常见）：比对键统一小写，
+    // 但 rel 仍用原串切片（大小写不同 => 长度相同，切片安全）。
+    const baseKey = baseN.toLowerCase()
     const out: ProjectSessionItem[] = []
     for (const sid of ids) {
       const e = byId[sid]
@@ -1956,11 +2545,12 @@ function WorktableSection(props: any) {
       if (e.parentId || e.origin === 'subagent') continue
       const cwd = norm(e.cwd)
       if (!cwd) continue
-      if (cwd !== baseN && !cwd.startsWith(baseN + '/')) continue
+      const key = cwd.toLowerCase()
+      if (key !== baseKey && !key.startsWith(baseKey + '/')) continue
       out.push({
         id: sid,
         title: (typeof e.displayTitle === 'string' && e.displayTitle) || (typeof e.title === 'string' && e.title) || '',
-        rel: cwd === baseN ? '' : cwd.slice(baseN.length + 1),
+        rel: key === baseKey ? '' : cwd.slice(baseN.length + 1),
         current: sid === current,
         running: e.running === true,
         blank: e.blank === true,
@@ -2039,6 +2629,33 @@ function WorktableSection(props: any) {
     return pr.folders[pid] || cwdOfSession(pr.bindings[pid]) || sessionScopeStore.snapshot?.cwd || ''
   }
 
+  /** 控制室卡片的展示顺序（不含内置控制室卡片）：projects.order 里存过序的在前，
+   *  其余按「入驻项目 → 布局项目」的注册序补在后面。卡片网格 / 项目管理面板 / 排序共用这一份。 */
+  const projectDisplayOrder = (): string[] => {
+    const pr = projectsRef.current
+    const ids = [...pr.aliveRegisteredIds, ...pr.projects.layouts.map((l) => l.id)].filter((id) => id !== CONSOLE_ID)
+    const known = new Set(ids)
+    const stored = pr.projects.order.filter((id) => known.has(id))
+    return [...stored, ...ids.filter((id) => !stored.includes(id))]
+  }
+
+  /** 拖动排序：把 dragId 插到 targetId 之前（before=true）或之后。
+   *  只调整控制室卡片顺序（写 projects.order，随状态同步到手机端）。 */
+  const reorderProject = (dragId: string, targetId: string, before: boolean): void => {
+    if (!dragId || !targetId || dragId === targetId) return
+    const list = projectDisplayOrder()
+    const from = list.indexOf(dragId)
+    if (from < 0) return
+    const next = [...list]
+    next.splice(from, 1)
+    let to = next.indexOf(targetId)
+    if (to < 0) return
+    if (!before) to += 1
+    next.splice(to, 0, dragId)
+    persistProjects((prev) => ({ ...prev, order: next }))
+    notifyConsole()
+  }
+
   /** 控制室卡片数据组装（env 闭包调用；只读镜像：状态/时长/子代理/预览全部来自宿主内存快照，零轮询零 Token） */
   const getConsoleCards = (): ConsoleCardData[] => {
     const pr = projectsRef.current
@@ -2089,46 +2706,93 @@ function WorktableSection(props: any) {
       }
       return errs[sid] === '1'
     }
+    // 项目「关联会话」全集（状态灯 / 中间进度 / 运行时长共用）：
+    //   绑定会话 + 模板步骤会话 + **项目文件夹下的全部会话**。
+    //   需求（2026-10-26）：只要有会话正在运行，卡片就必须亮状态（绿=跑、黄=等决策），
+    //   不能只看绑定会话——用户从「会话列表」进去跑任务时，绑定会话可能是空闲的那条。
+    const relatedCache = new Map<string, string[]>()
+    const relatedSidsOf = (pid: string): string[] => {
+      const hit = relatedCache.get(pid)
+      if (hit) return hit
+      const out = sidsOf(pid)
+      const base = pr.projects.folders[pid] || cwdOfSession(out[0])
+      if (base) for (const s of sessionIdsUnderFolder(base)) if (!out.includes(s)) out.push(s)
+      relatedCache.set(pid, out)
+      return out
+    }
+    /** 是否在等用户决策（黄）：pendingInteraction / 待决登记 / 会话面 pending / 子代理待决 */
+    const awaitingOf = (sid: string): boolean => {
+      if (!sid) return false
+      if (sessionAwaitingDecision(sid)) return true
+      if (sessionNotifyState(byId[sid]) === 'need') return true
+      try {
+        const face = faceOf(sid)
+        if (Array.isArray(face?.pending) && face.pending.length > 0) return true
+      } catch {}
+      for (const cid of kidsSetOf(sid)) {
+        if (sessionAwaitingDecision(cid) || (byId[cid] && sessionNotifyState(byId[cid]) === 'need')) return true
+      }
+      return false
+    }
+    /** 关联会话的子代理总数（去重） */
+    const kidsOfAll = (sids: string[]): number => {
+      const all = new Set<string>()
+      for (const s of sids) for (const c of kidsSetOf(s)) all.add(c)
+      return all.size
+    }
+    /** 「此刻在跑」：宿主 running 位为准；已完成且宿主没在跑的不算（避免残留未结束轮次把卡片骗成绿色） */
+    const isRunning = (sid: string): boolean => {
+      const e = byId[sid]
+      if (e?.completed === true && e?.running !== true) return false
+      return sessionRunningNow(sid, byId, kidsSetOf)
+    }
+    /** 最近更新的会话（预览兜底：非运行态的关联会话里挑最新动过的那条） */
+    const freshestOf = (sids: string[]): string | null => {
+      let best: string | null = null
+      let bestAt = -Infinity
+      for (const s of sids) {
+        const at = Number(byId[s]?.updatedAt ?? 0) || 0
+        if (at > bestAt) { bestAt = at; best = s }
+      }
+      return best
+    }
     // 三态判定（同卡片提醒逻辑，但不过滤 ack——监控室永远显示事实状态）
-    // need/done 看绑定会话；busy 汇总项目全部关联会话（含模板各步会话/其子代理/未结束轮次）
+    // 优先级：黄（待决策）> 红（异常终止）> 绿（有会话在跑）> 青（绑定会话已完成）> 空闲
     const statusOf = (pid: string): ConsoleCardData['status'] => {
-      const sids = sidsOf(pid)
-      const sid = sids[0]
-      if (sid) {
-        const e = byId[sid]
-        if (sessionAwaitingDecision(sid) || sessionNotifyState(e) === 'need') return 'need'
-        for (const cid of kidsSetOf(sid)) {
-          if (sessionAwaitingDecision(cid) || (byId[cid] && sessionNotifyState(byId[cid]) === 'need')) return 'need'
-        }
-        try {
-          const face = sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.()
-          if (Array.isArray(face?.pending) && face.pending.length > 0) return 'need'
-        } catch {}
-        // 异常终止优先于「完成」：先清掉新运行留下的旧错误标记，再看错误
-        for (const s of sids) noteAgentError(s, sessionRunningNow(s, byId, kidsSetOf))
-        if (sessionRunningNow(sid, byId, kidsSetOf)) {
-          for (const cid of kidsSetOf(sid)) noteAgentError(cid, true)
-        } else if (noteAgentError(sid, false)) return 'error'
-        for (const cid of kidsSetOf(sid)) {
+      const sids = relatedSidsOf(pid)
+      const bound = pr.projects.bindings[pid]
+      // 黄：任意关联会话在等用户决策（含模板步骤会话 / 子代理）
+      for (const s of sids) if (awaitingOf(s)) return 'need'
+      // 异常终止（红）：会话面 lastAgentError；新一次运行开始 / 用户点开项目确认时清除
+      for (const s of sids) noteAgentError(s, isRunning(s))
+      if (bound) {
+        if (isRunning(bound)) {
+          for (const cid of kidsSetOf(bound)) noteAgentError(cid, true)
+        } else if (noteAgentError(bound, false)) return 'error'
+        for (const cid of kidsSetOf(bound)) {
           if (!byId[cid]?.running && noteAgentError(cid, false)) return 'error'
         }
-        if (e?.completed === true) return 'done'
+      }
+      // 绿：任意关联会话在跑（含子代理与未结束轮次）——必须排在「已完成」之前，
+      // 否则「一条跑完、另一条还在跑」的项目会被显示成已完成（用户看到的假绿/假青）
+      if (sids.some((s) => isRunning(s))) return 'busy'
+      if (bound) {
+        if (byId[bound]?.completed === true) return 'done'
         // 会话面兜底：宿主快照可能滞后或缺少完成字段
         try {
-          const face = sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.()
+          const face = faceOf(bound)
           if (face && face.completed === true) return 'done'
         } catch {}
       }
-      if (sids.some((s) => sessionRunningNow(s, byId, kidsSetOf))) return 'busy'
       return 'idle'
     }
     // 运行时长：工作中会话的后台任务最早 startedAt 起算；无任务时读会话面 turnTimings 未结束轮次
     const runtimeOfPid = (pid: string): number | null => {
-      const sids = sidsOf(pid)
-      if (!sids.some((s) => sessionRunningNow(s, byId, kidsSetOf))) return null
+      const sids = relatedSidsOf(pid)
+      if (!sids.some((s) => isRunning(s))) return null
       let start: number | null = null
       for (const sid of sids) {
-        if (!sessionRunningNow(sid, byId, kidsSetOf)) continue
+        if (!isRunning(sid)) continue
         const jobs = jobsMap[sid] ?? []
         for (const j of jobs) {
           if (j?.status === 'running' && typeof j.startedAt === 'number' && (start == null || j.startedAt < start)) start = j.startedAt
@@ -2159,16 +2823,58 @@ function WorktableSection(props: any) {
       const stepSids = pr.projects.flows?.[id]?.stepSessions
         ? Object.values(pr.projects.flows[id].stepSessions).filter((x): x is string => typeof x === 'string' && !!x)
         : []
-      const previewSid = sid || (stepSids.find((s) => sessionRunningNow(s, byId, kidsSetOf)) ?? stepSids[stepSids.length - 1] ?? null)
+      const related = relatedSidsOf(id)
+      // 子代理（后台跑的 subagent）也是「这个项目在干活」的一部分：它们的实时进度才是用户想看到的，
+      // 父会话在等子代理时自己是空闲的（节点停在一条 subagent 工具调用上）。
+      const kidIds: string[] = []
+      for (const s of related) {
+        for (const c of kidsSetOf(s)) if (!related.includes(c) && !kidIds.includes(c)) kidIds.push(c)
+      }
+      const candidates = [...related, ...kidIds]
+      // 正在跑的会话（可能不止一条）：按最近更新时间排，最新动的那条优先显示
+      const running = candidates.filter((s) => isRunning(s))
+      const runningLive = running.length > 0
+      const runningPick = runningLive
+        ? (sid && running.includes(sid) ? sid : (freshestOf(running) ?? running[0]))
+        : null
       const status = statusOf(id)
+      // 流式进度文本：按「正在跑的 → 绑定会话 → 步骤会话 → 其余关联会话」逐个找，取第一条拿到内容的。
+      // 关键：跑的是子代理会话时它本身没有可读面（未在前台打开），但父会话的历史里有一条
+      // 「子代理 · …」工具调用 —— 所以必须逐个候选回退，不能只看一条会话。
+      const activityText = (() => {
+        const order: string[] = []
+        const push = (value: string | null | undefined): void => { if (value && !order.includes(value)) order.push(value) }
+        push(runningPick)
+        push(sid)
+        for (const s of stepSids) push(s)
+        for (const s of candidates) push(s)
+        for (const s of order) {
+          // 1) 本端打开过的会话：本地事件窗口与聊天详情同源（含逐字输出的 live chunk），最新也最准
+          const live = latestActivityOf(s)
+          if (live) return live
+          // 2) 从宿主日志抓来的那行：只有版本与当前会话一致才用。
+          //    版本落后 = 有一轮新内容还没抓，宁可先不显示，也不能把上一轮的工具调用当成「最新」。
+          const isRun = isRunning(s)
+          const entry = activityCache.get(s)
+          // 缓存只在这两种情况下可信：行还是这一轮的；或是此刻仍在跑（流式行本来就一直在变）
+          if (entry && entry.line && entry.key === activityKeyOf(s) && (!entry.running || isRun)) return entry.line
+          // 3) 冷会话预热的最近一条成品消息（可能是助手的最终答复）
+          const preview = previewCache.get(s)
+          if (preview) return preview
+        }
+        return ''
+      })()
+      const previewText = activityText || ((runningLive || status === 'busy') ? (t('console.liveRunning') || '正在执行…') : '')
       // 发光 = 完成/待决且本轮未被确认；点卡片确认后熄灭
       const glow = !!sid && ((status === 'done' && ackMap[sid] !== 'done') || (status === 'need' && ackMap[sid] !== 'need'))
       return {
         id, name, icon,
         status,
         runtimeMs: runtimeOfPid(id),
-        kids: sid ? kidsSetOf(sid).size : 0,
-        preview: previewSid ? (activityCache.get(previewSid) || latestActivityOf(previewSid) || previewCache.get(previewSid) || '') : '',
+        kids: kidsOfAll(related),
+        preview: previewText,
+        // 流式标记：中间那块进度来自正在跑的那条会话，随活动缓存持续刷新
+        live: runningLive,
         bound: !!sid,
         // 内置项目（控制室）恒提供「＋」：它没有项目文件夹，目录由 newSessionFolderOf 逐级回退解析
         canNewSession: self || !!newSessionFolderOf(id),
@@ -2178,28 +2884,29 @@ function WorktableSection(props: any) {
     }
     const cards: ConsoleCardData[] = []
     cards.push(make(CONSOLE_ID, t('console.name'), CONSOLE_ICON, true))
-    const ids = [...pr.aliveRegisteredIds, ...pr.projects.layouts.map((l) => l.id)]
-    const known = new Set(ids)
-    const stored = pr.projects.order.filter((id) => known.has(id))
-    const ordered = [...stored, ...ids.filter((id) => !stored.includes(id))].filter((id) => id !== CONSOLE_ID)
+    const ordered = projectDisplayOrder()
     for (const id of ordered) {
       if (pr.projects.hidden.includes(id)) continue
       const meta = pr.metas[id]
       const layout = pr.projects.layouts.find((l) => l.id === id)
       if (!meta && !layout) continue
       const name = pr.projects.nameOverrides[id] ?? meta?.name ?? layout?.title ?? id
-      const icon = meta?.icon ?? layout?.icon ?? '🧱'
+      // 图标单一真源：手动/新建时写入的 iconOverrides > 入驻项目自带 > 布局自带 > 按 id 派生固定图标
+      const icon = resolveProjectIcon(id, pr.projects.iconOverrides[id], meta?.icon, layout?.icon)
       cards.push(make(id, name, icon, false))
     }
     if (errsDirty) saveAgentErrors(errs)
     return cards
   }
 
-  /** 打开「添加项目」面板（侧栏 ＋ 与控制室创建卡共用）：未选文件夹时默认 = D:\陈潘HBEU\Desktop\删除 下的当前时间戳子文件夹 */
+  /** 打开「添加项目」面板（侧栏 ＋ 与控制室创建卡共用）：未选文件夹时默认 = D:\陈潘HBEU\Desktop\删除 下的当前时间戳子文件夹
+   *  （每次打开重新生成：上次没保存就关掉的自动目录已经过时，见 prefillDefaultFolder） */
   const openAddPanel = () => {
     setAddOpen(true)
     setViewOptionsOpen(false)
-    prefillDefaultFolder()
+    prefillDefaultFolder(true)
+    // 默认布局 = 全屏（未套模板时每次打开都回到默认；模板会把预设改成它自己的拓扑）
+    if (!wsTemplate) setWsPreset(DEFAULT_PRESET_ID)
   }
 
   // 会话作用域（当前会话 + 工作目录）与后台任务：注入分栏引擎环境
@@ -2337,9 +3044,12 @@ function WorktableSection(props: any) {
             // （openSplit 内部无论 layout 是否存在都会用 preferredSessionOf 判定模板步骤会话）
             actionsRef.current?.openSplit({ id, title: (pr.nameOverrides[id] ?? id), icon: pr.metas?.[id]?.icon ?? '🧱', top: null, main: [], chatWidth: { default: 340, min: 280, max: 600 } } as LayoutSpec)
           } else {
-            // 入驻项目无视图覆盖：仅切换其绑定对话（对齐卡片自带打开行为）
-            const bound = pr.bindings[id]
-            if (bound) openSessionInHost(bound)
+            // 入驻项目无视图覆盖：切到该项目目录下「最近更新」的会话（没有才用绑定对话）
+            const target = preferredSessionOf(id)
+            if (target) {
+              markPluginSessionOpen(target)
+              openSessionInHost(target)
+            }
           }
         },
         onJump: (id) => {
@@ -2349,12 +3059,15 @@ function WorktableSection(props: any) {
           markPluginSessionOpen(sid) // 插件发起的切换：不触发「切会话关项目」联动
           openSessionInHost(sid)
         },
-        onNewSession: (id) => { void openNewProjectSession(id) },
-        onCreateSession: (id, opts) => { void createProjectSession(id, opts) },
+        onNewSession: (id) => openNewProjectSession(id),
+        // 图标选择器：控制室「项目管理」面板的「更换图标」按钮传入锚点元素（below：贴按钮下方，不挡操作列）
+        onPickIcon: (id, anchor, opts) => { try { openIconPick('project', id, anchor, opts) } catch {} },
+        onCreateSession: (id, opts) => createProjectSession(id, opts),
         onPinSession: (sid, pinned) => pinProjectSession(sid, pinned),
         onArchiveSession: (sid, archived) => archiveProjectSession(sid, archived),
         getManageProjects: () => manageProjectsOf(),
         onHideProject: (id, hidden) => hideProject(id, hidden),
+        onReorderProject: (dragId, targetId, before) => reorderProject(dragId, targetId, before),
         onDeleteProject: (id) => deleteProject(id),
         getProjectSessions: (id) => projectSessionsOf(id),
         onOpenSession: (sid) => openProjectSession(sid),
@@ -2603,7 +3316,8 @@ function buildCustomLayoutPrompt(req: string): string {
 }
 
   /** 打开项目应切入的对话：模板流程项目 = 「最新步骤」的专属会话（当前待做步已开会话则用它；
-   *  全部通过时用最近开始/通过的步骤会话）；其余项目 = 绑定会话；都没有 = null */
+   *  全部通过时用最近开始/通过的步骤会话）；其余项目 = 该项目目录下「最近更新」的会话（跳过已归档）；
+   *  都没有 = 退回绑定会话；再没有 = null（调用方会新建一条空白会话）。 */
   const preferredSessionOf = (pid: string): string | null => {
     const pr = projectsRef.current.projects
     const run = pr.flows?.[pid]
@@ -2635,20 +3349,29 @@ function buildCustomLayoutPrompt(req: string): string {
         }
       }
     }
+    // 非模板项目：点项目卡片直接进该项目目录下「最近更新」的会话详情（与「会话列表」同源判定；
+    // 已归档的不算，避免点进去是一条被归档的旧对话）。同一目录下没有任何会话时才退回绑定会话。
+    const latest = projectSessionsOf(pid)
+      .filter((s) => !s.archived)
+      .sort((a, b) => b.updatedAt - a.updatedAt)[0]
+    if (latest) return latest.id
     return pr.bindings[pid] ?? null
   }
 
   /** 在指定文件夹为项目建一个「项目对话」（空白会话）并绑定：cwd/工作区 = 该文件夹。
-   *  在途去重：同项目并发调用只建一个；失败返回 null（不绑定）。 */
-  const createBoundSession = async (pid: string, folder: string): Promise<string | null> => {
+   *  在途去重：同项目并发调用只建一个；失败返回 null（不绑定）。
+   *
+   *  `defaults:false` = 先别跑预设/模型 RPC（见 applyNewSessionDefaults 的注释：这些 RPC 会把
+   *  会话 Agent 在建会话与「打开」之间重启一次，UI 的历史流会卡在 loading → 主区纯白）。
+   *  需要立刻把界面切过去的调用方一律传 false，等切过去之后再补。 */
+  const createBoundSession = async (pid: string, folder: string, options: { defaults?: boolean } = {}): Promise<string | null> => {
     if (projectEnsureBusyRef.current[pid]) return projectEnsureBusyRef.current[pid]
     const task = (async (): Promise<string | null> => {
       let sid: string | null = null
       // folder 为空（内置项目且各处都解析不到目录）：不指定目录建会话，交给宿主默认，保证「＋」始终可用
       try { sid = folder ? await createSessionAtFolder(folder) : await sessionBridge!.sessions.create({}) } catch { return null }
       if (!sid) return null
-      try { await ensureSessionPreset(sid) } catch {}
-      try { await ensureSessionModel(sid) } catch {}
+      if (options.defaults !== false) await applyNewSessionDefaults(sid)
       persistProjects((prev) => ({ ...prev, bindings: { ...prev.bindings, [pid]: sid } }))
       return sid
     })()
@@ -2663,72 +3386,96 @@ function buildCustomLayoutPrompt(req: string): string {
   /** 控制室卡片「＋ 新建会话」：在**该项目对应的目录**下新开一个空白对话——
    *  普通项目 = 该项目自己的文件夹（与建项目时选定的目录一致）；控制室这类内置项目没有项目文件夹，
    *  沿用它当前对话的工作目录（同目录续开）。绑定到该项目（卡片的状态与预览随之跟踪新会话）并自动切过去。 */
-  const openNewProjectSession = async (pid: string): Promise<void> => {
-    controlRoomStore.setOpen(false)
+  const openNewProjectSession = async (pid: string): Promise<boolean> => {
     const folder = newSessionFolderOf(pid)
     // 目标可能是模板项目里尚未「开始此步」的步骤子目录：先幂等建目录，否则宿主工作区注册会失败
     if (folder) { try { await apiMkdir(folder) } catch {} }
-    const sid = await createBoundSession(pid, folder)
-    if (!sid) return
+    // defaults:false —— 预设/模型 RPC 推迟到会话挂载之后（见 applyNewSessionDefaults 注释）
+    const sid = await createBoundSession(pid, folder, { defaults: false })
+    if (!sid) {
+      reportUserError(newSessionFailedText(folder))
+      return false
+    }
+    // 顺序很重要：先把新会话设为当前并让它进列表，再关控制室——否则弹窗一关、
+    // 界面还停在旧会话，看起来就是「点了没反应」。
     markPluginSessionOpen(sid) // 插件发起的切换：不触发「切会话关项目」联动
-    openSessionInHost(sid)
+    const focus = await focusNewSession(sid)
+    if (!focus.opened || !focus.settled) {
+      if (!focus.opened) openSessionInHost(sid)
+      try { await sessionBridge?.sessions?.refresh?.() } catch {}
+      if (!focus.settled) {
+        try { const s: any = sessionBridge?.sessions?.binding?.(sid)?.session; if (s && typeof s.resync === 'function') await s.resync() } catch {}
+      }
+    }
+    controlRoomStore.setOpen(false)
     notifyConsole()
+    void applyNewSessionDefaults(sid)
+    return true
   }
 
   /** 控制室卡片「＋ 新建会话」带模式：标准模式（宿主默认预设）/ computer-use（dsh-orb 电脑操作预设）。
    *  computer-use 支持选前台模型（该会话后续消息用）与后台模型（dsh-orb 后台 Agent，全局）。
-   *  入口：控制室「新建」按钮弹出的小面板（split.tsx NewSessionDialog）。 */
-  const createProjectSession = async (pid: string, opts: NewSessionOptions): Promise<void> => {
-    controlRoomStore.setOpen(false)
+   *  入口：控制室「新建」按钮弹出的小面板（split.tsx NewSessionDialog）。
+   *  返回值 = 是否建成：调用方据此决定「关闭弹窗」还是「留在弹窗让用户重试」。 */
+  const createProjectSession = async (pid: string, opts: NewSessionOptions): Promise<boolean> => {
     const folder = newSessionFolderOf(pid)
     if (folder) { try { await apiMkdir(folder) } catch {} }
     const api = getAssistantApi()
     let sid: string | null = null
+    // 只做「建会话」这一件事：预设/模型 RPC 一律推到会话挂载之后再补（见 applyNewSessionDefaults）。
+    // 后台模型是全局设置，先写不影响新会话的历史流。
     if (opts.mode === 'computer-use' && api) {
       try {
         const res = await api.createSession(folder, 'computer-use', { reuseBlank: false })
         sid = res.sessionId
         if (res.appliedPreset === null) {
-          // dsh-orb 未安装/预设改名：已回退标准模式，明确告知（不静默当成成功）
           try { console.warn('[dsh-assistant] computer-use 预设不可用，已回退标准模式') } catch {}
         }
       } catch (err) {
         console.warn('[dsh-assistant] 新建 computer-use 会话失败：', err)
+        // 预设不存在时**明确告知并停下**：静默建一条标准会话，用户进详情才发现是标准模式。
+        reportUserError('Computer Use 预设不可用：当前宿主里没有名为「computer-use」的 Agent 预设（它由 dsh-orb 之类的插件注册）。请启用对应插件，或改用「标准模式」新建。')
+        return false
       }
-      if (sid) {
-        if (opts.background) {
-          try {
-            await api.selectBackgroundModel(opts.background)
-            writeBgPref({ provider: opts.background.provider, model: opts.background.model, name: opts.background.name ?? opts.background.model })
-          } catch (err) { console.warn('[dsh-assistant] 后台模型写入失败：', err) }
-        }
-        if (opts.front) {
-          try {
-            await api.selectModel(sid, opts.front)
-            writeModelPref('cu', { provider: opts.front.provider, model: opts.front.model, name: opts.front.name ?? opts.front.model })
-          } catch (err) { console.warn('[dsh-assistant] 前台模型选择失败：', err) }
-        }
+      if (sid && opts.background) {
+        try {
+          await api.selectBackgroundModel(opts.background)
+          writeBgPref({ provider: opts.background.provider, model: opts.background.model, name: opts.background.name ?? opts.background.model })
+        } catch (err) { console.warn('[dsh-assistant] 后台模型写入失败：', err) }
       }
     } else {
-      // 标准模式：走工作台原路径（工作区注册 + 默认预设）；选了模型就落到该会话并记住
       try { sid = folder ? await createSessionAtFolder(folder) : await sessionBridge!.sessions.create({}) } catch { sid = null }
-      if (sid) {
-        try { await ensureSessionPreset(sid) } catch {}
-        if (opts.front && api) {
-          try {
-            await api.selectModel(sid, opts.front)
-            writeModelPref('standard', { provider: opts.front.provider, model: opts.front.model, name: opts.front.name ?? opts.front.model })
-          } catch (err) { console.warn('[dsh-assistant] 标准会话选模型失败：', err) }
-        } else {
-          try { await ensureSessionModel(sid) } catch {}
-        }
+    }
+    if (!sid) {
+      reportUserError(newSessionFailedText(folder))
+      return false
+    }
+    persistProjects((prev) => ({ ...prev, bindings: { ...prev.bindings, [pid]: sid as string } }))
+    // ① 先把新会话设为当前（并让它进宿主列表）；② 再关控制室；③ 通知控制室/卡片刷新。
+    markPluginSessionOpen(sid)
+    const focus = await focusNewSession(sid)
+    if (!focus.opened || !focus.settled) {
+      // 兜底：再切一次 + 重拉列表（侧栏立刻能看到它）；仍然 loading 的话把它的历史流重建一次。
+      if (!focus.opened) openSessionInHost(sid)
+      try { await sessionBridge?.sessions?.refresh?.() } catch {}
+      if (!focus.settled) {
+        try { const s: any = sessionBridge?.sessions?.binding?.(sid)?.session; if (s && typeof s.resync === 'function') await s.resync() } catch {}
       }
     }
-    if (!sid) return
-    persistProjects((prev) => ({ ...prev, bindings: { ...prev.bindings, [pid]: sid as string } }))
-    markPluginSessionOpen(sid)
-    openSessionInHost(sid)
+    controlRoomStore.setOpen(false)
     notifyConsole()
+    // 会话已经挂到主区：这时再补预设/前台模型（后台不阻塞关闭控制室）
+    void (async () => {
+      if (opts.front && api) {
+        try {
+          await api.selectModel(sid as string, opts.front)
+          writeModelPref(opts.mode === 'computer-use' ? 'cu' : 'standard', { provider: opts.front.provider, model: opts.front.model, name: opts.front.name ?? opts.front.model })
+          return
+        } catch (err) { console.warn('[dsh-assistant] 新会话选模型失败：', err) }
+      }
+      if (opts.mode !== 'computer-use') await applyNewSessionDefaults(sid as string)
+    })()
+    return true
   }
 
   /** 会话置顶/取消置顶（宿主工作区；失败仅告警） */
@@ -2754,26 +3501,30 @@ function buildCustomLayoutPrompt(req: string): string {
   }
 
   /** 项目管理：控制室里的项目清单（含已隐藏），供「项目管理」面板使用 */
+  /** 项目管理面板的项目列表：顺序与控制室卡片完全一致（上移/下移即时反映到网格）。 */
   const manageProjectsOf = (): { id: string; name: string; icon: string; hidden: boolean }[] => {
     const pr = projectsRef.current
-    const seen = new Set<string>()
-    const out: { id: string; name: string; icon: string; hidden: boolean }[] = []
+    const items = new Map<string, { id: string; name: string; icon: string; hidden: boolean }>()
     for (const l of pr.projects.layouts) {
-      if (!l || typeof l.id !== 'string' || l.id === CONSOLE_ID || seen.has(l.id)) continue
-      seen.add(l.id)
-      out.push({
+      if (!l || typeof l.id !== 'string' || l.id === CONSOLE_ID || items.has(l.id)) continue
+      items.set(l.id, {
         id: l.id,
         name: pr.projects.nameOverrides[l.id] ?? l.title ?? l.id,
-        icon: pr.projects.iconOverrides[l.id] ?? l.icon ?? '🧱',
+        // 图标单一真源：项目管理面板里显示的必须是「卡片真正在用的图标」（手动覆盖 > 入驻 > 布局 > 派生）
+        icon: resolveProjectIcon(l.id, pr.projects.iconOverrides[l.id], pr.metas[l.id]?.icon, l.icon),
         hidden: pr.projects.hidden.includes(l.id),
       })
     }
     for (const id of pr.aliveRegisteredIds) {
-      if (id === CONSOLE_ID || seen.has(id)) continue
-      seen.add(id)
-      out.push({ id, name: pr.projects.nameOverrides[id] ?? pr.metas[id]?.name ?? id, icon: pr.projects.iconOverrides[id] ?? pr.metas[id]?.icon ?? '📦', hidden: pr.projects.hidden.includes(id) })
+      if (id === CONSOLE_ID || items.has(id)) continue
+      items.set(id, {
+        id,
+        name: pr.projects.nameOverrides[id] ?? pr.metas[id]?.name ?? id,
+        icon: resolveProjectIcon(id, pr.projects.iconOverrides[id], pr.metas[id]?.icon, pr.projects.layouts.find((l) => l.id === id)?.icon),
+        hidden: pr.projects.hidden.includes(id),
+      })
     }
-    return out
+    return projectDisplayOrder().map((id) => items.get(id)).filter((x): x is { id: string; name: string; icon: string; hidden: boolean } => !!x)
   }
 
   /** 隐藏 / 恢复项目（只影响控制室显示，不动文件夹与会话） */
@@ -2798,6 +3549,8 @@ function buildCustomLayoutPrompt(req: string): string {
       next.layouts = prev.layouts.filter((l) => l.id !== pid)
       next.order = prev.order.filter((x) => x !== pid)
       next.hidden = prev.hidden.filter((x) => x !== pid)
+      // 墓碑：删过的 id 记下来随状态同步，另一端的旧副本再并回来也复活不了
+      next.removed = prev.removed.includes(pid) ? prev.removed : [...prev.removed, pid]
       next.views = { ...prev.views }; delete next.views[pid]
       next.nameOverrides = { ...prev.nameOverrides }; delete next.nameOverrides[pid]
       next.iconOverrides = { ...prev.iconOverrides }; delete next.iconOverrides[pid]
@@ -4407,19 +5160,35 @@ function buildCustomLayoutPrompt(req: string): string {
   // ── 布局（新建工作区） ── 强制项目文件夹：经「选择位置…」/默认预填选定；路径即为项目文件夹。
   // 名称可选：未填写时默认 = 项目文件夹名（默认文件夹 = 当前时间戳，与文件夹名一致）
   const saveLayout = async () => {
+    // 防连点：一次点击只建一个项目 + 一条项目对话（此前双击会建出两个同目录项目）
+    if (savingLayoutRef.current) return
     const folderPath = wsFolderParent.trim()
     if (!folderPath) { setWsFolderError(true); return }
     if (!isAbs(folderPath)) { setWsFolderError(true); return }
+    savingLayoutRef.current = true
     const name = wsName.trim() || defaultProjectName(folderPath)
     try {
       // 兜底建目录；HTTP 非 2xx 视为失败，不能继续保存（路径可能无效）
       const r = await fetch('/api/worktable/mkdir', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: folderPath }) })
-      if (!r.ok) { setWsFolderError(true); setPickErr((prev) => ({ ...prev, add: t('add.folderCreateFail') })); return }
-    } catch { setWsFolderError(true); setPickErr((prev) => ({ ...prev, add: t('add.folderCreateFail') })); return }
+      if (!r.ok) {
+        setWsFolderError(true); setPickErr((prev) => ({ ...prev, add: t('add.folderCreateFail') }))
+        savingLayoutRef.current = false
+        return
+      }
+    } catch {
+      setWsFolderError(true); setPickErr((prev) => ({ ...prev, add: t('add.folderCreateFail') }))
+      savingLayoutRef.current = false
+      return
+    }
     const tmpl = wsTemplate ? templateById(wsTemplate) : null
-    const layout = buildLayout(wsPreset, name)
+    // 模板项目：流程面板必须可见——默认预设「会话全屏」不含可见内容窗，改走「全屏内容窗」形态
+    const layout = buildLayout(tmpl && wsPreset === DEFAULT_PRESET_ID ? 'full' : wsPreset, name)
+    // 新项目图标：从内置集合里随机取一个「现有项目还没用过」的（不同项目尽量不撞），
+    // 并写进 iconOverrides（随控制室存档同步到手机端）。模板项目不再统一用 📃 之类的模板图标
+    // ——那正是「每新建一个项目图标都长一样」的来源；模板身份由流程面板体现。
+    const usedIcons = projects.layouts.map((l) => resolveProjectIcon(l.id, projects.iconOverrides[l.id], metas[l.id]?.icon, l.icon))
+    layout.icon = pickUnusedIcon(usedIcons)
     if (tmpl) {
-      layout.icon = tmpl.icon
       // 模板实例：主内容窗（窗口1）预置为「流程」窗格（content.url = 项目 id）
       if (layout.main.length > 0) layout.main[0].content = { kind: 'builtin', type: 'flow', url: layout.id }
       // L2 项目叠加层：写作语言 → 项目根 _项目验收叠加.md（工人与验收员必读）
@@ -4443,15 +5212,19 @@ function buildCustomLayoutPrompt(req: string): string {
       ...prev,
       layouts: [...prev.layouts, layout],
       folders: { ...prev.folders, [layout.id]: folderPath },
+      // 随机图标一并落到 iconOverrides：老代码路径/选择器都以它为「显式设置」，且它随存档同步
+      iconOverrides: { ...prev.iconOverrides, [layout.id]: layout.icon as string },
       ...(tmpl ? { flows: { ...(prev.flows ?? {}), [layout.id]: freshFlowRun(tmpl.id, wsStartStep) } } : {}),
     }))
     invalidatePickState() // 保存成功：失效在途选择请求（防止旧选择器稍后返回写回已重置的表单）
     setWsName(''); setWsFolderParent(''); setWsFolderError(false); setWsTemplate(''); setWsStartStep(0)
+    setWsPreset(DEFAULT_PRESET_ID)
     setWsLang(PAPER_LANG_OPTIONS[0])
     setAddOpen(false)
     // 新建即自动进入「项目对话」：空白会话 + 工作目录 = 刚选择的项目文件夹（模板项目同样适用；
     // 之后在流程里点「开始此步」才会另建步骤子目录会话）
     const sid = await createBoundSession(layout.id, folderPath)
+    savingLayoutRef.current = false
     openSplit(layout)
     if (sid) {
       markPluginSessionOpen(sid)
@@ -4468,7 +5241,14 @@ function buildCustomLayoutPrompt(req: string): string {
     persistProjects((prev) => {
       const flows = { ...(prev.flows ?? {}) }
       if (flows[id]) delete flows[id]
-      const next: ProjectsState = { ...prev, layouts: prev.layouts.filter((l) => l.id !== id) }
+      const next: ProjectsState = {
+        ...prev,
+        layouts: prev.layouts.filter((l) => l.id !== id),
+        // 墓碑 + 清排序/隐藏：删掉的项目在另一端、在旧缓存里都不能再冒出来
+        removed: prev.removed.includes(id) ? prev.removed : [...prev.removed, id],
+        order: prev.order.filter((x) => x !== id),
+        hidden: prev.hidden.filter((x) => x !== id),
+      }
       if (Object.keys(flows).length === 0) { if (next.flows) delete next.flows } else next.flows = flows
       if (next.folders[id]) { next.folders = { ...next.folders }; delete next.folders[id] }
       if (next.bindings[id]) { next.bindings = { ...next.bindings }; delete next.bindings[id] }
@@ -4533,8 +5313,12 @@ function buildCustomLayoutPrompt(req: string): string {
     const topCount = (l.top ?? []).length
     const contentCount = l.main.length
     const chatFull = l.chatFullHeight === true
+    const chatHidden = l.chatHidden === true
+    const chatOnly = l.chatOnly === true
     const def = PRESET_DEFS.find((d) =>
-      d.leftCount === leftCount && d.topCount === topCount && d.contentCount === contentCount && d.chatFull === chatFull,
+      d.leftCount === leftCount && d.topCount === topCount && d.contentCount === contentCount
+      && d.chatFull === chatFull && ((d as any).chatHidden === true) === chatHidden
+      && ((d as any).chatOnly === true) === chatOnly,
     )
     return def ? def.id : '2h'
   }
@@ -4547,6 +5331,8 @@ function buildCustomLayoutPrompt(req: string): string {
       const next = {
         ...prev,
         removed: prev.removed.includes(id) ? prev.removed : [...prev.removed, id],
+        // 布局条目也一起清掉：只记墓碑不删 layouts 的话，控制室/项目管理里照样会把这一条列出来
+        layouts: prev.layouts.filter((l) => l.id !== id),
         hidden: prev.hidden.filter((x) => x !== id),
         order: prev.order.filter((x) => x !== id),
       }
@@ -4569,13 +5355,31 @@ function buildCustomLayoutPrompt(req: string): string {
     setRequestDelete(null)
   }
 
-  // ── 图标选择器（布局 / 快捷方式 / 入驻项目的侧栏 emoji 点击可换） ──
-  // anchor：DOM 锚点元素（自己卡片里的 icon 元素或事件 currentTarget）
-  const openIconPick = (kind: 'layout' | 'shortcut' | 'project', id: string, anchor: HTMLElement) => {
+  // ── 图标选择器（布局 / 快捷方式 / 项目的「更换图标」按钮） ──
+  // anchor：DOM 锚点元素（按钮 / 事件 currentTarget）
+  // 位置按视口钳制：手机窄屏（320-430px）下弹窗不会被顶出屏幕。
+  // below = 贴在锚点**下方**并右对齐（项目管理行用：选择器不压住同一行的操作按钮）。
+  const openIconPick = (kind: 'layout' | 'shortcut' | 'project', id: string, anchor: HTMLElement, opts: { below?: boolean } = {}) => {
     const r = anchor.getBoundingClientRect()
-    const x = Math.min(r.right + 8, Math.max(16, window.innerWidth - 284))
-    const y = Math.max(MIN_TOP, Math.min(r.top - 4, window.innerHeight - 316))
-    setIconPick({ kind, id, x, y })
+    const vw = Math.max(1, window.innerWidth)
+    const vh = Math.max(1, window.innerHeight)
+    const w = Math.min(268, Math.max(180, vw - 24))
+    const h = Math.min(360, Math.max(200, vh - 24))
+    let x: number
+    let y: number
+    if (opts.below) {
+      x = Math.min(Math.max(12, r.right - w), Math.max(12, vw - w - 12))
+      y = r.bottom + 6
+      if (y + h > vh - 12) y = Math.max(12, r.top - h - 6)
+    } else {
+      x = r.right + 8
+      if (x + w > vw - 12) x = r.left - w - 8
+      if (x < 12) x = Math.max(12, Math.min(vw - w - 12, r.left + r.width / 2 - w / 2))
+      y = r.top - 4
+      if (y + h > vh - 12) y = vh - h - 12
+      if (y < 12) y = 12
+    }
+    setIconPick({ kind, id, x: Math.round(x), y: Math.round(y) })
   }
   const setLayoutIcon = (id: string, icon: string) => {
     persistProjects((prev) => ({
@@ -4591,6 +5395,9 @@ function buildCustomLayoutPrompt(req: string): string {
   }
   const setProjectIcon = (id: string, icon: string) => {
     persistProjects((prev) => ({ ...prev, iconOverrides: { ...prev.iconOverrides, [id]: icon } }))
+    // 立即通知控制室重渲染：项目管理面板那一行与卡片图标都读同一份 iconOverrides，
+    // 不通知的话选完要等下一次 refresh 才变（跨端同步本来就跟着 persistProjects 走）
+    notifyConsole()
   }
 
   // ── 入驻项目卡片通用 DOM 桥（不写死任何项目名/类名） ──
@@ -4698,14 +5505,8 @@ function buildCustomLayoutPrompt(req: string): string {
         openBindPick(pid, bindBtn)
         return
       }
-      // 图标点击（卡片第一个子元素内） → 打开图标选择器（阻止卡片自身打开项目）
-      const first = card.children[0] as HTMLElement | null
-      if (first && target && first.contains(target)) {
-        e.stopPropagation()
-        e.preventDefault()
-        openIconPick('project', pid, first)
-        return
-      }
+      // 图标不再是按钮（换图标统一走「控制室 → 项目管理 → 更换图标」）：
+      // 点图标不再拦事件，按普通卡片点击处理（打开项目/切绑定会话）。
       // 有视图覆盖 → 用引擎打开该视图（替换卡片自带行为）
       const view = projects.views[pid]
       if (view) {
@@ -5072,6 +5873,7 @@ function buildCustomLayoutPrompt(req: string): string {
                 type="button"
                 className="dsh-wt_preset"
                 data-on={wsPreset === def.id ? 'true' : 'false'}
+                title={def.id === 'chat' ? t('add.presetChat') : def.id === 'full' ? t('add.presetFull') : undefined}
                 onClick={() => setWsPreset(def.id)}
               >
                 {presetThumb(def.id)}
@@ -5125,7 +5927,7 @@ function buildCustomLayoutPrompt(req: string): string {
                   ? (projects.layouts.find((l) => l.id === iconPick.id)?.icon ?? '🧱')
                   : iconPick.kind === 'shortcut'
                     ? (projects.shortcuts.find((s) => s.id === iconPick.id)?.icon ?? '🔗')
-                    : (projects.iconOverrides[iconPick.id] ?? metas[iconPick.id]?.icon ?? '📦')
+                    : resolveProjectIcon(iconPick.id, projects.iconOverrides[iconPick.id], metas[iconPick.id]?.icon, projects.layouts.find((l) => l.id === iconPick.id)?.icon)
                 return (
                   <button
                     key={em}
@@ -5627,6 +6429,13 @@ export function apply(ctx: any) {
     document.head.appendChild(style)
     return () => { style.remove() }
   }, 'dsh-worktable: styles')
+
+  // 空白会话白屏自愈：每 2s 看一次当前会话，卡在 loading 的空白会话重建一次历史流。
+  // （新建会话的聚焦流程自己也兜这个，这里覆盖「用户从侧栏点开一条早已卡住的会话」。）
+  ctx.effect(() => {
+    const timer = window.setInterval(() => { void healStuckCurrentSession() }, 2000)
+    return () => { try { window.clearInterval(timer) } catch {} }
+  }, 'dsh-assistant: blank session open watchdog')
 
   // 绑定按钮 hover 气泡：事件委托 + body 级气泡（跨层显示，不遮挡右侧对话也不盖项目名）
   ctx.effect(() => {

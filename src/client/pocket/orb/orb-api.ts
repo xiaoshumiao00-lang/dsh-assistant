@@ -100,6 +100,33 @@ function clientTimeZone(): string {
   }
 }
 
+/** 取某个目录对应的宿主工作区 id（必要时注册）。
+ *
+ *  为什么必须带工作区建会话：宿主 SessionCommandController.create 只在拿到 workspaceId 时
+ *  才会 `workspace.attachSession(sessionId)`；退化成 `{cwd}` 建会话时，会话只有 cwd、没有工作区归属
+ *  ——控制室从项目卡新建会话后右侧工作区不是该项目的文件夹（用户还得手动重选工作文件夹），
+ *  手机端新建的会话也不落在对应工作区分组里。
+ *
+ *  形状兼容：宿主 0.2 的 ctx.workspaces.create 返回的是 **Remote 信封**
+ *  `{ ok, value: { workspace, created } }`（见 @deepseek-ai/dsh-api-workspace-controller），
+ *  旧实现按顶层 workspaceId 读会恒为 undefined；这里信封 / 嵌套视图 / 裸视图都认。
+ *  宿主拒绝（目录不存在）或该宿主没有 workspaces 能力 → null，由调用方回退 {cwd}。 */
+async function workspaceIdForCwd(ctx: any, cwd: string): Promise<string | null> {
+  let ws: any = null
+  try { ws = ctx.get?.('workspaces') ?? ctx.workspaces } catch { ws = null }
+  if (!ws || typeof ws.create !== 'function') return null
+  try {
+    const res = await ws.create({ path: cwd })
+    if (res && typeof res === 'object' && res.ok === false) return null
+    const value = res && typeof res === 'object' && 'value' in res ? res.value : res
+    const view = value && typeof value === 'object' && 'workspace' in value ? value.workspace : value
+    const id = view?.workspaceId ?? view?.id ?? null
+    return typeof id === 'string' && id ? id : null
+  } catch {
+    return null
+  }
+}
+
 export function makeOrbApi(ctx: any) {
   const rpcCall = (endpoint: string, payload: unknown, signal?: AbortSignal): Promise<any> =>
     ctx.connection.rpc.call(POCKET_RPC_CHANNEL, endpoint, payload, signal)
@@ -239,7 +266,10 @@ export function makeOrbApi(ctx: any) {
           return { sessionId: blank, appliedPreset: row?.agentPreset ?? agentPreset ?? null, reused: true }
         }
       }
-      const base = trimmed ? { cwd: trimmed } : {}
+      // 目录先注册成宿主工作区，再带 workspaceId 建会话（否则会话只有 cwd、没有工作区归属，
+      // 见 workspaceIdForCwd 注释）。注册失败/宿主无此能力 → 回退 {cwd}，行为与旧版一致。
+      const workspaceId = trimmed ? await workspaceIdForCwd(ctx, trimmed) : null
+      const base = workspaceId ? { workspaceId } : trimmed ? { cwd: trimmed } : {}
       const key = `${cwdKey(trimmed) || '__host-default__'}::${String(agentPreset ?? '').trim()}`
       const inflight = creatingByCwd.get(key)
       if (inflight !== undefined) return inflight
@@ -250,7 +280,9 @@ export function makeOrbApi(ctx: any) {
             void ctx.sessions.refresh?.()
             return { sessionId: result.value.sessionId, appliedPreset: agentPreset, reused: false }
           }
-          // 预设不存在（如未装 dsh-orb）→ 回退默认模式；appliedPreset=null 供调用方提示
+          // 预设不存在（computer-use 由 dsh-orb 之类的插件注册，卸载后就没有了）：
+          // **不要静默回退成标准会话** —— 用户会以为建好了 CU 会话，进去却是标准模式。
+          throw new Error(`agent preset unavailable: ${String(agentPreset)}`)
         }
         const sessionId = await ctx.sessions.create(base)
         void ctx.sessions.refresh?.()
@@ -348,6 +380,46 @@ export function makeOrbApi(ctx: any) {
       if (result?.ok === false) throw new Error(result?.error?.message ?? 'transcribe rejected')
       const value = result?.ok === true ? result.value : result
       return String(value?.text ?? '')
+    },
+
+    /**
+     * 读某个会话的尾部（宿主 follow 接口的**开场快照**）。任意会话都能读——包括没在当前
+     * 视图打开、只在后台跑的会话；控制室卡片靠它显示「最新一条进度」。
+     *
+     * 为什么用 follow 而不是 page：
+     *   1. page 必须给一个**已存在的** throughSeq，-1 在宿主里表示「空游标」，
+     *      返回 0 条记录（旧实现就是这么永远取不到进度的）；
+     *   2. 正在流式输出的这一轮只存在于 `assistantStream.activeAttempt.stream`
+     *      （紧凑 chunk 记录），page 根本不返回它——只有 follow 带 assistantStream。
+     * 拿到开场快照后立刻断开（return 会让异步迭代器释放 follow 句柄），不会长期占连接。
+     * 返回 null 表示这个宿主版本没有 follow 接口 / 该会话不可读。
+     */
+    async sessionTail(sessionId: string, maxMessages = 8): Promise<{ events: any[]; stream: any; cursor?: number } | null> {
+      const follow = (ctx.remote.session as any)?.follow
+      if (typeof follow !== 'function') return null
+      const controller = typeof AbortController === 'function' ? new AbortController() : null
+      const timer = controller ? setTimeout(() => { try { controller.abort() } catch {} }, 4000) : null
+      try {
+        const stream = follow.call(ctx.remote.session, {
+          address: { kind: 'session', sessionId },
+          assistantStream: true,
+          maxMessages,
+        }, controller?.signal)
+        for await (const frame of stream) {
+          if (frame?.type !== 'snapshot') continue
+          const records: any[] = Array.isArray(frame.records) ? frame.records : []
+          return {
+            events: records.map((record) => record?.event ?? record).filter(Boolean),
+            stream: frame.assistantStream ?? null,
+            cursor: frame.cursor,
+          }
+        }
+        return null
+      } catch {
+        return null
+      } finally {
+        if (timer != null) clearTimeout(timer)
+      }
     },
 
     /** 模型目录（拍平为展示行；与桌面模型选择同一目录）。 */

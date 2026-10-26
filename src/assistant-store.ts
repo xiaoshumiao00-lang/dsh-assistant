@@ -78,9 +78,14 @@ export function registerAssistantState(ctx: any): void {
     return cached
   }
 
-  const writeState = (projects: any, view: any): Promise<Stored> => {
-    const task = async (): Promise<Stored> => {
+  /** 写状态：带 baseRevision 时做乐观并发控制——宿主 revision 已比 base 新，说明另一端改过，
+   *  返回 { conflict } 让调用方改成采纳宿主状态，而不是用旧副本盖掉另一端的删除/排序。 */
+  const writeState = (projects: any, view: any, baseRevision: number | null): Promise<Stored | { conflict: Stored }> => {
+    const task = async (): Promise<Stored | { conflict: Stored }> => {
       const prev = await readState()
+      if (prev && baseRevision != null && Number.isFinite(baseRevision) && prev.revision > baseRevision) {
+        return { conflict: prev }
+      }
       const next: Stored = {
         projects,
         view,
@@ -118,7 +123,13 @@ export function registerAssistantState(ctx: any): void {
             sendJson(res, 400, { error: 'invalid-projects' })
             return
           }
-          sendJson(res, 200, { ok: true, state: await writeState(body.projects, body.view ?? null) })
+          const base = typeof body.baseRevision === 'number' ? body.baseRevision : null
+          const out = await writeState(body.projects, body.view ?? null, base)
+          if (out && typeof out === 'object' && 'conflict' in out) {
+            sendJson(res, 409, { ok: false, conflict: true, state: (out as { conflict: Stored }).conflict })
+            return
+          }
+          sendJson(res, 200, { ok: true, state: out })
           return
         }
         res.writeHead(405, { allow: 'GET, PUT, POST' })

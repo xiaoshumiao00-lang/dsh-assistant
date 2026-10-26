@@ -1,7 +1,7 @@
 // 悬浮球主页面（全屏）：会话历史 + 目标（新会话/会话）+ 输入区。
 // 发送语义与桌面悬浮球一致：新会话 → 电脑上创建会话并执行；已有会话 → 追加指令。
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import { controlRoomStore, nativeBallStore } from '../../orb-bridge.ts'
+import { controlRoomStore, nativeBallStore, ballConfigStore } from '../../orb-bridge.ts'
 import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, TouchEvent as ReactTouchEvent } from 'react'
 import { Composer } from './Composer.tsx'
 import type { OrbChip, OrbVoiceBridge, SlashItem } from './Composer.tsx'
@@ -45,6 +45,8 @@ export function OrbOverlay({ api, t }: OrbOverlayProps) {
   // 只在 Electron 渲染器里隐藏：手机浏览器与普通桌面浏览器仍需要页内球
   // （原生球在电脑上，点它只会打开电脑上的窗口）。
   const nativeBallFlag = useSyncExternalStore(nativeBallStore.subscribe, nativeBallStore.getSnapshot)
+  // 个人助手设置里的「启用悬浮球 / 悬浮球头像」：改完页内球实时跟随
+  const ballConfig = useSyncExternalStore(ballConfigStore.subscribe, ballConfigStore.getSnapshot)
   const electronShell = typeof navigator !== 'undefined' && /Electron/i.test(navigator.userAgent)
   const nativeBall = nativeBallFlag && electronShell
   // 惰性挂载：悬浮球页首次打开前不渲染（哪怕只是 display:none）——
@@ -57,9 +59,10 @@ export function OrbOverlay({ api, t }: OrbOverlayProps) {
   if (open) mountedRef.current = true
   return (
     <>
-      {!open && !controlRoomOpen && !nativeBall && (
+      {!open && !controlRoomOpen && !nativeBall && ballConfig.enabled && (
         <OrbBall
           label={t('open')}
+          avatar={ballConfig.avatar}
           onOpen={() => {
             // 悬浮球 = 控制室入口（手机/电脑一致）。快捷输入页仍可从抽屉入口打开。
             controlRoomStore.setOpen(true)
@@ -98,7 +101,7 @@ function defaultBall(): BallPoint {
  * 可拖动悬浮球：按住拖到任意位置（松手记住位置），轻点打开悬浮球页。
  * Pointer Events + setPointerCapture，触屏/鼠标通用；拖动时不让页面滚动。
  */
-function OrbBall({ label, onOpen }: { label: string; onOpen: () => void }) {
+function OrbBall({ label, avatar, onOpen }: { label: string; avatar?: string; onOpen: () => void }) {
   const [pos, setPos] = useState<BallPoint>(() => {
     const saved = readLastBall()
     return saved === null ? defaultBall() : clampBall(saved)
@@ -174,7 +177,9 @@ function OrbBall({ label, onOpen }: { label: string; onOpen: () => void }) {
       onPointerCancel={finishDrag}
       onClick={onBallClick}
     >
-      🔮
+      {avatar
+        ? <img src={avatar} alt="" draggable={false} style={{ width: '100%', height: '100%', borderRadius: '50%', objectFit: 'cover', pointerEvents: 'none' }} />
+        : '🔮'}
     </button>
   )
 }
@@ -527,7 +532,13 @@ function OrbPage({ api, t, open }: OrbOverlayProps & { open: boolean }) {
     let timer: number | null = null
     const flush = (): void => {
       timer = null
-      setHistory(api.listSessions(targetIdRef.current))
+      const rows = api.listSessions(targetIdRef.current)
+      setHistory(rows)
+      // 刷新/重挂载后恢复的上次选中会话可能已被删除或归档（列表里不再有它）：
+      // 目标失效就退回「新会话」，否则界面停在一条已不存在的会话上，发送时才报错。
+      // 列表非空才判定（首屏快照未到时 rows 为空，不能误判）。
+      const id = targetIdRef.current
+      if (id !== null && rows.length > 0 && !rows.some((row) => row.sessionId === id)) setTarget({ kind: 'new' })
     }
     const schedule = (): void => {
       if (timer !== null) return
