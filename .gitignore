@@ -1,0 +1,15 @@
+# 构建产物与本地依赖
+node_modules/
+lib/*.map
+
+# 本地测试环境（隔离 DSH_HOME / 无头 Chrome 用户目录）
+.testhome/
+.chrome-test/
+scripts/*.json
+scripts/shot-*.png
+scripts/ball.json
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+*.log

@@ -1,0 +1,12 @@
+{
+  "name": "dsh-assistant",
+  "description": "一体化助手：悬浮球控制室（项目/会话/模板）+ 手机扫码远程访问",
+  "version": "0.1.0",
+  "entry": {
+    "name": "dsh-assistant",
+    "inject": []
+  },
+  "client": {
+    "platform": "web"
+  }
+}
