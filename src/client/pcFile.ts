@@ -25,6 +25,22 @@ export function isPcFileTooLarge(size: number | null | undefined, max = PC_FILE_
   return Number.isFinite(n) && n > max
 }
 
+/**
+ * 宿主把「添加」分组的固定命令名写死，第三方命令只能排在「指令」末尾。
+ * 在空查询菜单里把电脑文件提到首行，并沿用首行分组标题；输入检索词时保持原生排序。
+ */
+export function hoistPcFileMenuItem<T extends { name?: string; section?: string }>(rows: readonly T[], query: string): T[] {
+  const out = [...rows]
+  if (query !== '') return out
+  const index = out.findIndex((row) => row?.name === 'file-pc')
+  if (index <= 0) return out
+  const [item] = out.splice(index, 1)
+  const first = out[0]
+  const moved = { ...item, section: first?.section } as T
+  out.unshift(moved)
+  return out
+}
+
 const EXT_MIME: Record<string, string> = {
   png: 'image/png',
   jpg: 'image/jpeg',

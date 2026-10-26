@@ -1,6 +1,6 @@
 /** 手机端会话「电脑文件」附件纯逻辑回归：node scripts/test-pc-file.mjs */
 import assert from 'node:assert/strict'
-import { PC_FILE_MAX_BYTES, isPcFileTooLarge, pcFileMime, pcFileStartPath, sessionCwdOf } from '../src/client/pcFile.ts'
+import { PC_FILE_MAX_BYTES, hoistPcFileMenuItem, isPcFileTooLarge, pcFileMime, pcFileStartPath, sessionCwdOf } from '../src/client/pcFile.ts'
 
 const cases = []
 
@@ -43,6 +43,36 @@ cases.push(['泛型 octet-stream / 空类型按扩展名补全，图片能进入
   assert.equal(pcFileMime('图纸 final.PNG', ''), 'image/png')
   assert.equal(pcFileMime('说明.docx', null), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
   assert.equal(pcFileMime('no-extension', 'application/octet-stream'), 'application/octet-stream')
+}])
+
+cases.push(['菜单空查询时电脑文件升到首行，并沿用首行分组', () => {
+  const rows = [
+    { name: 'file', section: '添加' },
+    { name: 'goal', section: '添加' },
+    { name: 'compact', section: '指令' },
+    { name: 'file-pc', section: '指令' },
+  ]
+  const out = hoistPcFileMenuItem(rows, '')
+  assert.deepEqual(out.map((row) => row.name), ['file-pc', 'file', 'goal', 'compact'])
+  assert.equal(out[0].section, '添加')
+  assert.deepEqual(rows.map((row) => row.name), ['file', 'goal', 'compact', 'file-pc'], '不得改动宿主返回的原数组')
+}])
+
+cases.push(['没有添加分组时同样置顶；电脑文件已在首位时不重复移动', () => {
+  const rows = [
+    { name: 'compact', section: '指令' },
+    { name: 'file-pc', section: '指令' },
+  ]
+  const out = hoistPcFileMenuItem(rows, '')
+  assert.deepEqual(out.map((row) => row.name), ['file-pc', 'compact'])
+  assert.equal(out[0].section, '指令')
+  const already = [{ name: 'file-pc', section: '指令' }, { name: 'compact', section: '指令' }]
+  assert.deepEqual(hoistPcFileMenuItem(already, ''), already)
+}])
+
+cases.push(['输入检索词时保持宿主原生排序，不强行置顶', () => {
+  const rows = [{ name: 'compact' }, { name: 'file-pc' }]
+  assert.deepEqual(hoistPcFileMenuItem(rows, 'comp').map((row) => row.name), ['compact', 'file-pc'])
 }])
 
 let failed = 0
