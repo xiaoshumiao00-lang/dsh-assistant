@@ -9,6 +9,16 @@ DeepSeek Harness 一体化助手插件：**悬浮球 → 控制室**，外带**�
 
 > 本包整体按 **GPL-2.0** 发布（因为内含 dsh-pocket 的 GPL 代码）。原插件的 LICENSE 与版权归各自作者。
 
+## 界面
+
+| 控制室（电脑 · 自动 5 列） | 控制室（手机 · 自动 2 列） |
+|---|---|
+| ![控制室桌面](docs/screenshots/control-room-desktop.png) | ![控制室手机](docs/screenshots/control-room-mobile.png) |
+
+| 新建会话（Computer Use） | 添加项目（模板 / 布局 / 文件夹） |
+|---|---|
+| ![新建会话](docs/screenshots/new-session-computer-use.png) | ![添加项目](docs/screenshots/add-project.png) |
+
 ## 主要功能
 
 ### 悬浮球 → 全屏控制室（手机 / 电脑一致）
