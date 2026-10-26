@@ -9,7 +9,7 @@ import { ORB_CSS } from './orb.css.ts'
 import { NS, zh, en, type OrbKey } from './locales.ts'
 import { makeOrbApi } from './orb-api.ts'
 import { PcFileCommandIcon, PcFileInputBridge, PcFilePickerOverlay, hasPcFileComposer, isPhoneComposerLayout, pcFilePickerStore } from './PcFileAttach.tsx'
-import { sessionCwdOf } from '../../pcFile.ts'
+import { sessionCwdOf, hoistPcFileMenuItem } from '../../pcFile.ts'
 
 export function orbApply(ctx: any): void {
   const api = makeOrbApi(ctx)
@@ -67,22 +67,45 @@ export function orbApply(ctx: any): void {
 
   try {
     ctx.inject(['commandUi'], (scope: any) => {
-      scope.effect(() => scope.commandUi.register({
-        name: 'file-pc',
-        label: () => tr('pcFiles'),
-        description: () => tr('pcFileAttachDesc'),
-        icon: PcFileCommandIcon,
-        available: (session: any) => isPhoneComposerLayout() && hasPcFileComposer(session?.sessionId),
-        ui: {
-          kind: 'action',
-          run: (session: any) => {
-            const cwd = (() => {
-              try { return sessionCwdOf(ctx.sessions.list.getSnapshot()?.byId?.[session.sessionId]) } catch { return '' }
-            })()
-            pcFilePickerStore.open(session.sessionId, cwd)
+      scope.effect(() => {
+        const dispose = scope.commandUi.register({
+          name: 'file-pc',
+          label: () => tr('pcFiles'),
+          description: () => tr('pcFileAttachDesc'),
+          icon: PcFileCommandIcon,
+          available: (session: any) => isPhoneComposerLayout() && hasPcFileComposer(session?.sessionId),
+          ui: {
+            kind: 'action',
+            run: (session: any) => {
+              const cwd = (() => {
+                try { return sessionCwdOf(ctx.sessions.list.getSnapshot()?.byId?.[session.sessionId]) } catch { return '' }
+              })()
+              pcFilePickerStore.open(session.sessionId, cwd)
+            },
           },
-        },
-      }), 'dsh-assistant: PC file attachment command')
+        })
+        // 宿主菜单把「添加」分组命令名写死，第三方命令只能落在「指令」末尾。
+        // 只包装空查询的候选顺序，把电脑文件提到首行；检索、键盘导航仍按真实数组顺序工作。
+        let restore = () => {}
+        try {
+          const service: any = scope.commandUi
+          const original = service.candidates
+          if (typeof original === 'function') {
+            const wrapped = async function (session: any, req: any) {
+              const rows = await original.call(service, session, req)
+              return Array.isArray(rows) ? hoistPcFileMenuItem(rows, String(req?.query ?? '')) : rows
+            }
+            service.candidates = wrapped
+            restore = () => {
+              if (service.candidates === wrapped) service.candidates = original
+            }
+          }
+        } catch { /* 私有菜单顺序不可写时保持宿主默认顺序，不影响命令本身 */ }
+        return () => {
+          restore()
+          dispose()
+        }
+      }, 'dsh-assistant: PC file attachment command')
     })
   } catch { /* 旧宿主没有 commandUi：不影响悬浮球/设置页 */ }
 
