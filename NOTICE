@@ -13,4 +13,8 @@ dsh-assistant 包含以下第三方代码，按原许可证使用：
 3. dsh-web-mobile（dsh-pocket 内移植）— MIT License
    见 src/client/pocket/mobile/LICENSE.dsh-web-mobile
 
+4. dsh-tuoguan — MIT License
+   https://github.com/xiaoshumiao00-lang/dsh-tuoguan
+   代码位置：src/tuoguan-host.ts、src/client/tuoguan.tsx
+
 本插件整体按 GPL-2.0 发布（见 LICENSE）。

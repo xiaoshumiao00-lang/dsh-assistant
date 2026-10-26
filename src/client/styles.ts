@@ -8,7 +8,14 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_section{box-sizing:border-box;display:flex;flex-direction:column;gap:6px;width:100%;padding:0}',
   // 无头宿主：不在侧栏出现工作台区块，只保留添加项目等 fixed 弹窗
   '.dsh-wt_section[data-headless="true"]{display:contents}',
-  '.dsh-wt_section[data-headless="true"] > *:not(.dsh-wt_pop):not(.dsh-wt_popBackdrop):not(.dsh-wt_iconPop):not(.dsh-wt_confirm):not(.dsh-wt_confirmBackdrop){display:none !important}',
+  '.dsh-wt_section[data-headless="true"] > *:not(.dsh-wt_pop):not(.dsh-wt_popBackdrop):not(.dsh-wt_iconPop):not(.dsh-wt_confirm):not(.dsh-wt_confirmBackdrop):not(.dsh-wt_folderBrowse){display:none !important}',
+  '.dsh-wt_section[data-headless="true"] > .dsh-wt_folderBrowse{z-index:10084 !important}',
+  // 无头宿主的弹窗要盖在全屏控制室（z-index 10070）之上
+  '.dsh-wt_section[data-headless="true"] > .dsh-wt_popBackdrop{z-index:10079 !important}',
+  '.dsh-wt_section[data-headless="true"] > .dsh-wt_pop{z-index:10080 !important}',
+  '.dsh-wt_section[data-headless="true"] > .dsh-wt_confirmBackdrop{z-index:10081 !important}',
+  '.dsh-wt_section[data-headless="true"] > .dsh-wt_confirm{z-index:10082 !important}',
+  '.dsh-wt_section[data-headless="true"] > .dsh-wt_iconPop{z-index:10080 !important}',
   '.dsh-wt_float{min-width:176px;max-width:264px;background:var(--dsw-alias-bg-base,#0b0e14);border:1px solid var(--dsw-alias-border-l2,#3a4150);border-radius:10px;padding:8px;box-shadow:var(--dsw-shadow-lv2,0 8px 24px rgba(0,0,0,.4))}',
   '.dsh-wt_rail{pointer-events:none}',
   '.dsh-wt_railBox{display:flex;flex-wrap:wrap;gap:5px;justify-content:center;padding:5px 3px;border:1px solid var(--dsw-alias-border-l2,#3a4150);border-radius:8px;background:var(--dsw-alias-bg-base,#0b0e14)}',
@@ -581,8 +588,11 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_consoleIcon{flex:none;font-size:31px;line-height:1}',
   '.dsh-wt_consoleName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:20px;font-weight:700;line-height:28px;color:var(--wt-text)}',
   // 卡片底部操作行：会话列表 / 新建会话（都作用于该项目的目录）；平时淡，悬停卡片或按钮时点亮
-  '.dsh-wt_consoleCardOps{flex:none;display:flex;gap:8px;margin-top:auto}',
-  '.dsh-wt_consoleOpBtn{flex:1;min-width:0;display:inline-flex;align-items:center;justify-content:center;gap:5px;height:26px;padding:0 8px;border:1px solid var(--wt-border);border-radius:8px;background:rgba(255,255,255,.05);color:var(--wt-text2);font-size:11px;font-weight:600;line-height:1;font-family:inherit;cursor:pointer;opacity:.62;white-space:nowrap;transition:opacity .14s ease,color .14s ease,border-color .14s ease,background .14s ease}',
+  '.dsh-wt_consoleCardOps{flex:none;display:flex;flex-wrap:wrap;gap:8px;margin-top:auto}',
+  '.dsh-wt_consoleOpBtn{flex:1 1 0;min-width:0;display:inline-flex;align-items:center;justify-content:center;gap:5px;height:26px;padding:0 8px;border:1px solid var(--wt-border);border-radius:8px;background:rgba(255,255,255,.05);color:var(--wt-text2);font-size:11px;font-weight:600;line-height:1;font-family:inherit;cursor:pointer;opacity:.62;white-space:nowrap;transition:opacity .14s ease,color .14s ease,border-color .14s ease,background .14s ease}',
+  '.dsh-wt_consoleOpBtn:first-child{flex:1 0 100%}',
+  '.dsh-wt_consoleOpBtnNew{flex:1 1 0}',
+  '.dsh-wt_consoleOpBtnCu{color:var(--dsw-alias-state-accent-primary,#4f8ef7)}',
   '.dsh-wt_consoleOpBtn>span{min-width:0;overflow:hidden;text-overflow:ellipsis}',
   '.dsh-wt_consoleOpBtn>svg{flex:none}',
   '.dsh-wt_consoleCard:hover .dsh-wt_consoleOpBtn{opacity:1}',
@@ -599,7 +609,7 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_consoleStatus-done{color:var(--dsw-alias-state-accent-primary,#4f8ef7)}',
   '.dsh-wt_consoleStatus-error{color:var(--dsw-alias-state-error,#f85149)}',
   '.dsh-wt_consoleRuntime{flex:none;font-size:17px;font-weight:600;line-height:24px;color:var(--wt-text2);font-variant-numeric:tabular-nums}',
-  '.dsh-wt_consolePreview{display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;font-size:8.5px;line-height:13px;color:var(--wt-text2);word-break:break-word}',
+  '.dsh-wt_consolePreview{display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;font-size:11px;line-height:15px;color:var(--wt-text2);word-break:break-word}',
   '.dsh-wt_consolePreviewNone{color:var(--wt-text3);font-style:italic;-webkit-line-clamp:1}',
   // 三色光效：整卡霓虹描边光晕（像侧栏双圆点的发光质感）——完成=绿、待决=黄；工作=蓝色描边顺时针旋转
   '.dsh-wt_consoleCard-glowDone{border-color:rgba(63,185,80,.9);box-shadow:0 0 8px rgba(63,185,80,.5),0 0 26px rgba(63,185,80,.3),inset 0 0 16px rgba(63,185,80,.07)}',
@@ -619,9 +629,9 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_console[data-wt-theme=light] .dsh-wt_consoleCard-error{border-color:rgba(220,38,38,.9);box-shadow:0 0 10px rgba(220,38,38,.45),0 0 30px rgba(220,38,38,.26)}',
   '.dsh-wt_consoleEmpty{padding:40px 0;text-align:center;font-size:12px;color:var(--wt-text3)}',
   // 手机/窄屏：压缩卡间距与卡片样式（自动列数按 gap 计算，通常 2 列）
-  '@media (max-width:640px){.dsh-wt_consoleGrid{gap:20px;margin-top:22px}.dsh-wt_consoleCard{aspect-ratio:auto;min-height:150px;padding:14px;gap:9px;border-radius:14px}.dsh-wt_consoleStatus{font-size:17px;line-height:24px}.dsh-wt_consolePreview{-webkit-line-clamp:2;font-size:10px;line-height:14px}.dsh-wt_consoleOpBtn{height:26px;padding:0 8px;font-size:10px}.dsh-wt_consoleIcon{font-size:26px}.dsh-wt_consoleName{font-size:15px}.dsh-wt_consoleAddPlus{font-size:26px}.dsh-wt_consoleAddLabel{font-size:13px}}',
-  // 更窄的手机：卡片底部的「会话列表/新建会话」只留图标（避免文字被截成「会…」「新…」）
-  '@media (max-width:480px){.dsh-wt_consoleOpBtn{flex:1;justify-content:center;gap:0}.dsh-wt_consoleOpBtn>span{display:none}}',
+  '@media (max-width:640px){.dsh-wt_consoleGrid{gap:20px;margin-top:22px}.dsh-wt_consoleCard{aspect-ratio:auto;min-height:170px;padding:14px;gap:9px;border-radius:14px}.dsh-wt_consoleStatus{font-size:17px;line-height:24px}.dsh-wt_consolePreview{-webkit-line-clamp:3;font-size:10px;line-height:14px}.dsh-wt_consoleOpBtn{height:26px;padding:0 8px;font-size:10px}.dsh-wt_consoleIcon{font-size:26px}.dsh-wt_consoleName{font-size:15px}.dsh-wt_consoleAddPlus{font-size:26px}.dsh-wt_consoleAddLabel{font-size:13px}}',
+  // 窄屏卡片：会话按钮整行，标准 / CU 两个加号各占一半（标签始终可见）
+  '@media (max-width:480px){.dsh-wt_consoleOpBtn{justify-content:center;gap:4px}}',
   // 创建卡片：虚线 + 居中加号，永远最后一位
   // 创建卡片：玻璃底 + 虚线边，永远最后一位
   '.dsh-wt_consoleAdd{justify-content:center;align-items:center;gap:10px;background:radial-gradient(circle at 50% 42%,rgba(255,255,255,.09),rgba(255,255,255,0) 65%),rgba(18,23,32,.34);border:1.5px dashed var(--wt-borderHover)}',

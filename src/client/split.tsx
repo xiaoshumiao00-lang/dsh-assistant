@@ -6,8 +6,7 @@ import { Terminal } from 'xterm'
 import { FlowPane } from './flow'
 import { TemplateBar } from './templateBar'
 import type { FlowEnv } from './templates'
-import { getAssistantApi } from './orb-bridge'
-import { readLastModel, readLastBackgroundModel, readLastPreset } from './pocket/orb/state'
+import { getAssistantApi, readModelPref, readBgPref } from './orb-bridge'
 import type { OrbModel } from './pocket/orb/orb-api'
 
 import MarkdownIt from 'markdown-it'
@@ -1785,14 +1784,13 @@ export function ConsolePane() {
     setShapeState(s)
     splitEnv?.console?.setShape?.(s)
   }
-  /** 打开「新建会话」面板：预填上次模式与模型，异步拉模型目录 */
-  const openNewSessionPanel = (c: ConsoleCardData) => {
-    const lastPreset = readLastPreset()
+  /** 打开「新建会话」面板：按入口预设模式，预填该模式上次用的模型，异步拉模型目录 */
+  const openNewSessionPanel = (c: ConsoleCardData, mode: 'standard' | 'computer-use' = 'standard') => {
     setNewSessFor({ id: c.id, name: c.name })
-    setNewSessMode(lastPreset === 'computer-use' ? 'computer-use' : 'standard')
-    const lastFront = readLastModel()
+    setNewSessMode(mode)
+    const lastFront = readModelPref(mode === 'computer-use' ? 'cu' : 'standard')
     setNewSessFront(lastFront ? { provider: lastFront.provider, model: lastFront.model, name: lastFront.name } : null)
-    const lastBg = readLastBackgroundModel()
+    const lastBg = readBgPref()
     setNewSessBg(lastBg ? { provider: lastBg.provider, model: lastBg.model, name: lastBg.name } : null)
     setNewSessBusy(false)
     setNewSessModelsLoading(true)
@@ -1814,13 +1812,13 @@ export function ConsolePane() {
       setNewSessModelsLoading(false)
     })()
   }
-  /** 提交「新建会话」：computer-use 才带前台/后台模型 */
+  /** 提交「新建会话」：标准模式也可选前台模型；computer-use 另带后台模型 */
   const submitNewSession = () => {
     if (!newSessFor || newSessBusy) return
     setNewSessBusy(true)
     const opts = {
       mode: newSessMode,
-      front: newSessMode === 'computer-use' ? newSessFront : null,
+      front: newSessFront,
       background: newSessMode === 'computer-use' ? newSessBg : null,
     }
     try {
@@ -2330,18 +2328,32 @@ export function ConsolePane() {
                 <span>{T('console.sessions')}</span>
               </button>
               {c.canNewSession && (
-                <button
-                  type="button"
-                  className="dsh-wt_consoleOpBtn dsh-wt_consoleOpBtnNew"
-                  title={T('console.newSessionTip')}
-                  aria-label={T('console.newSession')}
-                  onClick={(e) => { e.stopPropagation(); if (splitEnv?.console?.onCreateSession) openNewSessionPanel(c); else env?.onNewSession?.(c.id) }}
-                >
-                  <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
-                    <path d="M8 3.4v9.2M3.4 8h9.2" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-                  </svg>
-                  <span>{T('console.newSession')}</span>
-                </button>
+                <>
+                  <button
+                    type="button"
+                    className="dsh-wt_consoleOpBtn dsh-wt_consoleOpBtnNew"
+                    title={T('console.newStandardTip')}
+                    aria-label={T('console.newStandard')}
+                    onClick={(e) => { e.stopPropagation(); if (splitEnv?.console?.onCreateSession) openNewSessionPanel(c, 'standard'); else env?.onNewSession?.(c.id) }}
+                  >
+                    <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
+                      <path d="M8 3.4v9.2M3.4 8h9.2" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+                    </svg>
+                    <span>{T('console.newStandardShort')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="dsh-wt_consoleOpBtn dsh-wt_consoleOpBtnNew dsh-wt_consoleOpBtnCu"
+                    title={T('console.newComputerUseTip')}
+                    aria-label={T('console.newComputerUse')}
+                    onClick={(e) => { e.stopPropagation(); if (splitEnv?.console?.onCreateSession) openNewSessionPanel(c, 'computer-use'); else env?.onNewSession?.(c.id) }}
+                  >
+                    <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
+                      <path d="M8 3.4v9.2M3.4 8h9.2" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+                    </svg>
+                    <span>{T('console.newComputerUseShort')}</span>
+                  </button>
+                </>
               )}
             </div>
           </div>
@@ -2486,22 +2498,14 @@ export function ConsolePane() {
       <div className="dsh-wt_consoleDockWrap">
         <div className="dsh-wt_consoleDock">
           <button type="button" className={'dsh-wt_dockBtn' + (openMenu === 'theme' ? ' dsh-wt_dockBtnOn' : '')} title={T('console.themeLabel')} aria-label={T('console.themeLabel')} onClick={() => setOpenMenu(openMenu === 'theme' ? null : 'theme')}><ThemeIcon mode={themeMode} /></button>
-          <button type="button" className={'dsh-wt_dockBtn' + (openMenu === 'shape' ? ' dsh-wt_dockBtnOn' : '')} title={T('console.shapeLabel')} aria-label={T('console.shapeLabel')} onClick={() => setOpenMenu(openMenu === 'shape' ? null : 'shape')}><svg width="20" height="20" viewBox="0 0 16 16" aria-hidden><rect x="2.2" y="2.2" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" strokeWidth="0.9" /><circle cx="10.6" cy="10.6" r="3.8" fill="none" stroke="currentColor" strokeWidth="0.9" /></svg></button>
           <button type="button" className={'dsh-wt_dockBtn' + (openMenu === 'bg' ? ' dsh-wt_dockBtnOn' : '')} title={T('console.bgLabel')} aria-label={T('console.bgLabel')} onClick={() => { setOpenMenu(openMenu === 'bg' ? null : 'bg'); setBgEdit(null) }}><svg width="18" height="18" viewBox="0 0 16 16" aria-hidden><rect x="2.2" y="3.2" width="11.6" height="9.6" rx="1.6" fill="none" stroke="currentColor" strokeWidth="0.9" /><circle cx="5.9" cy="6.7" r="1.05" fill="none" stroke="currentColor" strokeWidth="0.8" /><path d="M3.4 11.4l3-3 2.3 2.3 1.9-1.9 3 2.6" fill="none" stroke="currentColor" strokeWidth="0.9" /></svg></button>
           <button type="button" className={'dsh-wt_dockBtn' + (openMenu === 'cols' ? ' dsh-wt_dockBtnOn' : '')} title={T('console.colsLabel')} aria-label={T('console.colsLabel')} onClick={() => setOpenMenu(openMenu === 'cols' ? null : 'cols')}><svg width="20" height="20" viewBox="0 0 16 16" aria-hidden><rect x="2.2" y="3.4" width="2.7" height="9.2" rx="0.9" fill="none" stroke="currentColor" strokeWidth="0.9" /><rect x="6.65" y="3.4" width="2.7" height="9.2" rx="0.9" fill="none" stroke="currentColor" strokeWidth="0.9" /><rect x="11.1" y="3.4" width="2.7" height="9.2" rx="0.9" fill="none" stroke="currentColor" strokeWidth="0.9" /></svg></button>
-          <button type="button" className={'dsh-wt_dockBtn' + (annOpen ? ' dsh-wt_dockBtnOn' : '')} title={T('annot.updateTitle')} aria-label={T('annot.updateTitle')} onClick={() => { setOpenMenu(null); setAnnOpen((v) => !v) }}><svg width="18" height="18" viewBox="0 0 16 16" aria-hidden><path d="M2.6 7c0-2.9 2.4-4.9 5.4-4.9s5.4 2 5.4 4.9v2.9l1.2 1.7H1.4l1.2-1.7z" fill="none" stroke="currentColor" strokeWidth="0.9" strokeLinejoin="round" /><path d="M6.2 12.9c.3.7 1 1.2 1.8 1.2s1.5-.5 1.8-1.2" fill="none" stroke="currentColor" strokeWidth="0.9" strokeLinecap="round" /></svg>{updInfo && <span className="dsh-wt_dockBadge" aria-hidden />}</button>
         </div>
         {openMenu === 'theme' && (
           <div className="dsh-wt_drop">
             {themeOpts.map((o) => (
               <button key={o.mode} type="button" className={'dsh-wt_dropItem' + (themeMode === o.mode ? ' dsh-wt_dropItemOn' : '')} onClick={() => setTheme(o.mode)}><ThemeIcon mode={o.mode} size={13} />{T(o.key)}</button>
             ))}
-          </div>
-        )}
-        {openMenu === 'shape' && (
-          <div className="dsh-wt_drop">
-            <button type="button" className={'dsh-wt_dropItem' + (shape === 'square' ? ' dsh-wt_dropItemOn' : '')} onClick={() => onShape('square')}><svg width="13" height="13" viewBox="0 0 16 16" aria-hidden><rect x="4" y="4" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.5" /></svg>{T('console.shapeSquare')}</button>
-            <button type="button" className={'dsh-wt_dropItem' + (shape === 'circle' ? ' dsh-wt_dropItemOn' : '')} onClick={() => onShape('circle')}><svg width="13" height="13" viewBox="0 0 16 16" aria-hidden><circle cx="8" cy="8" r="4.5" fill="none" stroke="currentColor" strokeWidth="1.5" /></svg>{T('console.shapeCircle')}</button>
           </div>
         )}
         {openMenu === 'bg' && (
@@ -2604,56 +2608,62 @@ export function ConsolePane() {
               <span className="dsh-wt_newSessProj" title={newSessFor.name}>{newSessFor.name}</span>
             </div>
             <div className="dsh-wt_modeRow">
-              <button type="button" className={'dsh-wt_modeBtn' + (newSessMode === 'standard' ? ' dsh-wt_modeBtnOn' : '')} onClick={() => setNewSessMode('standard')}>{T('console.modeStandard')}</button>
-              <button type="button" className={'dsh-wt_modeBtn' + (newSessMode === 'computer-use' ? ' dsh-wt_modeBtnOn' : '')} onClick={() => setNewSessMode('computer-use')}>{T('console.modeComputerUse')}</button>
+              <button type="button" className={'dsh-wt_modeBtn' + (newSessMode === 'standard' ? ' dsh-wt_modeBtnOn' : '')} onClick={() => {
+                setNewSessMode('standard')
+                const p = readModelPref('standard')
+                setNewSessFront(p ? { provider: p.provider, model: p.model, name: p.name } : null)
+              }}>{T('console.modeStandard')}</button>
+              <button type="button" className={'dsh-wt_modeBtn' + (newSessMode === 'computer-use' ? ' dsh-wt_modeBtnOn' : '')} onClick={() => {
+                setNewSessMode('computer-use')
+                const p = readModelPref('cu')
+                setNewSessFront(p ? { provider: p.provider, model: p.model, name: p.name } : null)
+              }}>{T('console.modeComputerUse')}</button>
             </div>
             <div className="dsh-wt_modeTip">{newSessMode === 'computer-use' ? T('console.modeComputerUseTip') : T('console.modeStandardTip')}</div>
+            <label className="dsh-wt_modelRow">
+              <span className="dsh-wt_modelLabel">{T('console.frontModel')}</span>
+              <select
+                className="dsh-wt_modelSelect"
+                disabled={newSessModelsLoading}
+                value={newSessFront ? newSessFront.provider + '\u0000' + newSessFront.model : ''}
+                onChange={(e) => {
+                  const v = e.target.value
+                  if (!v) { setNewSessFront(null); return }
+                  const [provider, model] = v.split('\u0000')
+                  const hit = newSessModels.find((m) => m.provider === provider && m.model === model)
+                  setNewSessFront({ provider, model, name: hit?.name })
+                }}
+              >
+                <option value="">{T('console.modelDefault')}</option>
+                {newSessModels.map((m) => (
+                  <option key={m.provider + '\u0000' + m.model} value={m.provider + '\u0000' + m.model}>{m.groupName} · {m.name}</option>
+                ))}
+              </select>
+            </label>
             {newSessMode === 'computer-use' && (
-              <>
-                <label className="dsh-wt_modelRow">
-                  <span className="dsh-wt_modelLabel">{T('console.frontModel')}</span>
-                  <select
-                    className="dsh-wt_modelSelect"
-                    disabled={newSessModelsLoading}
-                    value={newSessFront ? newSessFront.provider + '\u0000' + newSessFront.model : ''}
-                    onChange={(e) => {
-                      const v = e.target.value
-                      if (!v) { setNewSessFront(null); return }
-                      const [provider, model] = v.split('\u0000')
-                      const hit = newSessModels.find((m) => m.provider === provider && m.model === model)
-                      setNewSessFront({ provider, model, name: hit?.name })
-                    }}
-                  >
-                    <option value="">{T('console.modelDefault')}</option>
-                    {newSessModels.map((m) => (
-                      <option key={m.provider + '\u0000' + m.model} value={m.provider + '\u0000' + m.model}>{m.groupName} · {m.name}</option>
-                    ))}
-                  </select>
-                </label>
-                <label className="dsh-wt_modelRow">
-                  <span className="dsh-wt_modelLabel">{T('console.backgroundModel')}</span>
-                  <select
-                    className="dsh-wt_modelSelect"
-                    disabled={newSessModelsLoading}
-                    value={newSessBg ? newSessBg.provider + '\u0000' + newSessBg.model : ''}
-                    onChange={(e) => {
-                      const v = e.target.value
-                      if (!v) { setNewSessBg(null); return }
-                      const [provider, model] = v.split('\u0000')
-                      const hit = newSessModels.find((m) => m.provider === provider && m.model === model)
-                      setNewSessBg({ provider, model, name: hit?.name })
-                    }}
-                  >
-                    <option value="">{T('console.modelDefault')}</option>
-                    {newSessModels.map((m) => (
-                      <option key={m.provider + '\u0000' + m.model} value={m.provider + '\u0000' + m.model}>{m.groupName} · {m.name}</option>
-                    ))}
-                  </select>
-                </label>
-                {newSessModelsLoading && <div className="dsh-wt_modelHint">{T('console.modelLoading')}</div>}
-                {!newSessModelsLoading && newSessModels.length === 0 && <div className="dsh-wt_modelHint">{T('console.modelUnavailable')}</div>}
-              </>
+              <label className="dsh-wt_modelRow">
+                <span className="dsh-wt_modelLabel">{T('console.backgroundModel')}</span>
+                <select
+                  className="dsh-wt_modelSelect"
+                  disabled={newSessModelsLoading}
+                  value={newSessBg ? newSessBg.provider + '\u0000' + newSessBg.model : ''}
+                  onChange={(e) => {
+                    const v = e.target.value
+                    if (!v) { setNewSessBg(null); return }
+                    const [provider, model] = v.split('\u0000')
+                    const hit = newSessModels.find((m) => m.provider === provider && m.model === model)
+                    setNewSessBg({ provider, model, name: hit?.name })
+                  }}
+                >
+                  <option value="">{T('console.modelDefault')}</option>
+                  {newSessModels.map((m) => (
+                    <option key={m.provider + '\u0000' + m.model} value={m.provider + '\u0000' + m.model}>{m.groupName} · {m.name}</option>
+                  ))}
+                </select>
+              </label>
             )}
+            {newSessModelsLoading && <div className="dsh-wt_modelHint">{T('console.modelLoading')}</div>}
+            {!newSessModelsLoading && newSessModels.length === 0 && <div className="dsh-wt_modelHint">{T('console.modelUnavailable')}</div>}
             <div className="dsh-wt_newSessOps">
               <button type="button" className="dsh-wt_btnGhost" onClick={() => setNewSessFor(null)}>{T('console.cancel')}</button>
               <button type="button" className="dsh-wt_btnPrimary" disabled={newSessBusy} onClick={submitNewSession}>{T('console.createSession')}</button>

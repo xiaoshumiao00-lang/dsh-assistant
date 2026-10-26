@@ -12,8 +12,7 @@ const PAPER_LANG_OPTIONS = ['中文写作后翻译英文', '直接写英文', '�
 import { photoStore, kindOf } from './photoStore'
 import { DEFAULT_BG_SVG, b64ToBlob } from './defaultBg'
 import { WAVE_BG_B64 } from './waveBg'
-import { controlRoomStore, getAssistantApi } from './orb-bridge'
-import { writeLastModel, writeLastBackgroundModel, writeLastPreset } from './pocket/orb/state'
+import { controlRoomStore, getAssistantApi, writeModelPref, writeBgPref } from './orb-bridge'
 
 /**
  * dsh-worktable 客户端（v2）：侧边栏底部「工作台」区块。
@@ -723,6 +722,139 @@ function lastTextOf(sid: string): string {
       if (!raw) continue
       const clean = cleanPreviewText(raw)
       if (clean.length >= 8) return clean.slice(0, 220)
+    }
+  } catch {}
+  return ''
+}
+
+// ── 控制室卡片「最新进度」：优先显示最后一条工具调用（运行命令 / 读取文件 / 搜索…），
+//    没有工具调用时退回落款文本。卡片每秒重渲染，所以运行中的会话会持续刷新（流式）。 ──
+const TOOL_LABEL: Record<string, string> = {
+  bash: '运行命令', pwsh: '运行命令', shell: '运行命令',
+  read: '读取文件', write: '写入文件', edit: '编辑文件', patch: '编辑文件',
+  grep: '搜索', glob: '查找文件', search: '搜索',
+  web_search: '搜索网页', web_fetch: '抓取网页',
+  subagent: '子代理', task: '子任务', workflow: '运行工作流',
+  inspectPlugins: '检查插件', queryRuntime: '查询运行时',
+}
+const TOOL_ARG_KEYS: Record<string, string[]> = {
+  bash: ['description', 'command'], pwsh: ['description', 'command'], shell: ['description', 'command'],
+  read: ['path', 'file_path', 'url'], write: ['path', 'file_path'], edit: ['path', 'file_path'], patch: ['path', 'file_path'],
+  grep: ['pattern', 'query'], glob: ['pattern', 'query'], search: ['query', 'pattern'],
+  web_search: ['query'], web_fetch: ['url'],
+}
+
+function firstLineOf(text: string): string {
+  const s = String(text ?? '')
+  const i = s.indexOf('\n')
+  return (i < 0 ? s : s.slice(0, i)).trim()
+}
+
+/** 从 argsRaw 里取最有信息量的一行（description / command / path / query…） */
+function summarizeToolArgs(name: string, argsRaw: string): string {
+  const raw = String(argsRaw ?? '').trim()
+  if (!raw) return ''
+  let args: any = null
+  try { args = JSON.parse(raw) } catch { return cleanPreviewText(firstLineOf(raw)).slice(0, 120) }
+  if (!args || typeof args !== 'object') return cleanPreviewText(firstLineOf(raw)).slice(0, 120)
+  const keys = TOOL_ARG_KEYS[name] ?? []
+  for (const k of keys) {
+    const v = args[k]
+    if (typeof v === 'string' && v.trim()) return cleanPreviewText(firstLineOf(v)).slice(0, 120)
+  }
+  for (const v of Object.values(args)) {
+    if (typeof v === 'string' && v.trim()) return cleanPreviewText(firstLineOf(v)).slice(0, 120)
+  }
+  return ''
+}
+
+/** 一个 tool-call 节点/块 → 「运行命令 · xxx」；不是工具调用返回 '' */
+function toolLineOf(input: any): string {
+  if (!input || typeof input !== 'object') return ''
+  const root = input.kind === 'tool-call' ? (input.data?.root ?? input.data ?? input) : input
+  if (!root || typeof root !== 'object') return ''
+  const isTool = input.kind === 'tool-call' || root.kind === 'tool-call' || root.type === 'tool-call' || !!root.call || typeof root.argsRaw === 'string'
+  if (!isTool) return ''
+  const name = String(root.call?.name ?? root.name ?? input.toolName ?? input.data?.toolName ?? input.data?.name ?? '').trim()
+  const argsRaw = typeof root.call?.argsRaw === 'string'
+    ? root.call.argsRaw
+    : typeof root.argsRaw === 'string'
+      ? root.argsRaw
+      : typeof root.args === 'string' ? root.args : ''
+  const summary = summarizeToolArgs(name, argsRaw)
+  const label = TOOL_LABEL[name] ?? (name ? '工具调用' : '')
+  if (!label) return ''
+  return summary ? `${label} · ${summary}` : label
+}
+
+/** 卡片中间显示的「最新一条进度」：工具调用优先，其次最近文本 */
+function latestActivityOf(sid: string): string {
+  try {
+    const face = sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.()
+    if (!face) return ''
+    const rawNodes = face.nodes
+    const nodes: any[] = Array.isArray(rawNodes)
+      ? rawNodes
+      : rawNodes && typeof rawNodes.values === 'function' ? Array.from(rawNodes.values()) : []
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const n = nodes[i]
+      const direct = toolLineOf(n)
+      if (direct) return direct
+      const blocks = Array.isArray(n?.blocks) ? n.blocks : (Array.isArray(n?.content) ? n.content : [])
+      for (let j = blocks.length - 1; j >= 0; j--) {
+        const line = toolLineOf(blocks[j])
+        if (line) return line
+      }
+      // 文本兜底（同一条节点里优先取 text 块）
+      let raw = ''
+      for (const b of blocks) {
+        const s = typeof b?.text === 'string' ? b.text.trim() : ''
+        if (!s) continue
+        if (b?.type === 'text' || b?.kind === 'text') { raw = s; break }
+        if (!raw) raw = s
+      }
+      if (!raw && typeof n?.text === 'string') raw = n.text
+      if (!raw) continue
+      const clean = cleanPreviewText(raw)
+      if (clean.length >= 6) return clean.slice(0, 220)
+    }
+  } catch {}
+  return ''
+}
+
+/** 控制室卡片「最新进步」缓存：会话 id → 最近一条工具调用/文本。
+ *  数据来自会话面 history（只读、零 Token）；控制室打开时每 2.5 秒刷新一次。 */
+const activityCache = new Map<string, string>()
+
+function toolLineFromEvent(name: string, argsRaw: string): string {
+  const label = TOOL_LABEL[name] ?? (name ? '工具调用' : '')
+  if (!label) return ''
+  const summary = summarizeToolArgs(name, argsRaw)
+  return summary ? `${label} · ${summary}` : label
+}
+
+/** 从会话 history 末尾提取最新一条进度（优先 tool/call） */
+async function fetchLatestActivity(sid: string): Promise<string> {
+  try {
+    const face = sessionBridge?.sessions?.binding?.(sid)?.session
+    if (!face || typeof face.history !== 'function') return ''
+    const r = await face.history({ maxMessages: 10 })
+    const evs: any[] = r?.result?.value?.events ?? []
+    for (let i = evs.length - 1; i >= 0; i--) {
+      const ev = evs[i]
+      const type = String(ev?.type ?? '')
+      if (type === 'tool/call' || type === 'tool-call') {
+        const d = ev.data ?? ev
+        const line = toolLineFromEvent(String(d.name ?? d.toolName ?? ''), String(d.arguments ?? d.argsRaw ?? ''))
+        if (line) return line
+      }
+      if (type === 'assistant/message') {
+        const content = ev?.data?.message?.content ?? []
+        const text = (Array.isArray(content) ? content : []).filter((b: any) => b?.type === 'text').map((b: any) => b.text).join(' ')
+        const clean = cleanPreviewText(text)
+        if (clean.length >= 6) return clean.slice(0, 220)
+      }
+      if (type === 'user/message') break
     }
   } catch {}
   return ''
@@ -1495,6 +1627,13 @@ function WorktableSection(props: any) {
   const [pickErr, setPickErr] = useState<{ add: string; bind: string }>({ add: '', bind: '' })
   const [manualPathFor, setManualPathFor] = useState<'add' | 'bind' | null>(null)
   const [manualPathText, setManualPathText] = useState('')
+  /** 手机/窄屏的「浏览电脑文件夹」弹窗（不触发电脑端系统选择器） */
+  const [browseOpen, setBrowseOpen] = useState(false)
+  const [browsePath, setBrowsePath] = useState('')
+  const [browseEntries, setBrowseEntries] = useState<{ name: string; path: string; isDir: boolean }[]>([])
+  const [browseBusy, setBrowseBusy] = useState(false)
+  const [browseErr, setBrowseErr] = useState('')
+  const browseApplyRef = useRef<((p: string) => void) | null>(null)
   /** 文件夹选择在途锁 + 请求序号（useRef：跨渲染稳定；弹窗关闭/切换目标/手工确认时自增使旧请求失效） */
   const pickSeqRef = useRef(0)
   const pickBusyRef = useRef(false)
@@ -1561,6 +1700,126 @@ function WorktableSection(props: any) {
   /** 视图状态最新快照（供 env 闭包读取控制室主题） */
   const viewRef = useRef(view)
   viewRef.current = view
+
+  // ── 跨端同步（项目 + 控制室视图）：宿主 /api/assistant/state 为真值 ──
+  // 手机与电脑各有自己的 localStorage，只靠本地存储永远不同步；这里首次拉取宿主状态，
+  // 之后本地改动去抖推送、每 5 秒轮询另一端的改动。
+  const syncReadyRef = useRef(false)
+  const syncSkipRef = useRef(0)
+  const syncTimerRef = useRef<number | null>(null)
+  const syncRevRef = useRef(0)
+
+  useEffect(() => {
+    let alive = true
+    void (async () => {
+      try {
+        const r = await fetch('/api/assistant/state', { cache: 'no-store' })
+        if (!r.ok) throw new Error('HTTP ' + r.status)
+        const d = await r.json()
+        const st = d?.state
+        const serverLayouts = Array.isArray(st?.projects?.layouts) ? st.projects.layouts.length : -1
+        const localLayouts = projectsRef.current.projects.layouts.length
+        if (st && st.projects && !(serverLayouts === 0 && localLayouts > 0)) {
+          // 宿主已有真值：以宿主为准
+          syncSkipRef.current += 1
+          try { localStorage.setItem(PROJECTS_KEY, JSON.stringify(st.projects)) } catch {}
+          if (st.view) { try { localStorage.setItem(PERSIST_KEY, JSON.stringify(st.view)) } catch {} }
+          if (alive) { setProjects(loadProjects()); setView(loadView()) }
+          syncRevRef.current = Number(st.revision) || 0
+        } else {
+          // 宿主为空（或只被另一端以空数据初始化过）而本机有项目：把本机数据推上去
+          const res = await fetch('/api/assistant/state', {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ projects: projectsRef.current.projects, view: viewRef.current }),
+          })
+          const dd = await res.json().catch(() => null)
+          if (dd?.state?.revision) syncRevRef.current = dd.state.revision
+        }
+      } catch { /* 宿主不可用：退回纯本地模式 */ }
+      if (alive) syncReadyRef.current = true
+    })()
+    return () => { alive = false }
+  }, [])
+
+  // 控制室打开时：每 2.5 秒从会话 history 抓一次最新进度（运行命令 / 读取文件…），卡片实时刷新
+  useEffect(() => {
+    const iv = window.setInterval(() => {
+      try {
+        if (!controlRoomStore.getSnapshot()) return
+        const pr = projectsRef.current.projects
+        const ids = new Set<string>()
+        for (const pid of Object.keys(pr.bindings)) {
+          const sid = pr.bindings[pid]
+          if (sid) ids.add(sid)
+        }
+        for (const run of Object.values(pr.flows ?? {})) {
+          for (const sid of Object.values(run?.stepSessions ?? {})) {
+            if (typeof sid === 'string' && sid) ids.add(sid)
+          }
+        }
+        if (ids.size === 0) return
+        void (async () => {
+          let changed = false
+          for (const sid of ids) {
+            const line = await fetchLatestActivity(sid)
+            if (line && activityCache.get(sid) !== line) { activityCache.set(sid, line); changed = true }
+          }
+          if (changed) notifyConsole()
+        })()
+      } catch {}
+    }, 2500)
+    return () => window.clearInterval(iv)
+  }, [])
+
+  // 本地改动 → 去抖推送（跳过刚采纳宿主状态的那一轮，避免回声）
+  useEffect(() => {
+    if (!syncReadyRef.current) return
+    if (syncSkipRef.current > 0) { syncSkipRef.current -= 1; return }
+    if (syncTimerRef.current != null) window.clearTimeout(syncTimerRef.current)
+    syncTimerRef.current = window.setTimeout(() => {
+      syncTimerRef.current = null
+      void (async () => {
+        try {
+          const r = await fetch('/api/assistant/state', {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ projects: projectsRef.current.projects, view: viewRef.current }),
+          })
+          const d = await r.json().catch(() => null)
+          if (d?.state?.revision) syncRevRef.current = Number(d.state.revision) || 0
+        } catch { /* 离线：本地仍生效，下次改动再推 */ }
+      })()
+    }, 800)
+    return () => {
+      if (syncTimerRef.current != null) { window.clearTimeout(syncTimerRef.current); syncTimerRef.current = null }
+    }
+  }, [projects, view])
+
+  // 轮询另一端的改动（页面可见时）
+  useEffect(() => {
+    const iv = window.setInterval(() => {
+      if (!syncReadyRef.current || document.visibilityState !== 'visible') return
+      if (syncTimerRef.current != null) return
+      void (async () => {
+        try {
+          const r = await fetch('/api/assistant/state', { cache: 'no-store' })
+          const d = await r.json()
+          const st = d?.state
+          if (!st || !st.projects) return
+          const rev = Number(st.revision) || 0
+          if (rev === syncRevRef.current) return
+          syncRevRef.current = rev
+          syncSkipRef.current += 1
+          try { localStorage.setItem(PROJECTS_KEY, JSON.stringify(st.projects)) } catch {}
+          if (st.view) { try { localStorage.setItem(PERSIST_KEY, JSON.stringify(st.view)) } catch {} }
+          setProjects(loadProjects())
+          setView(loadView())
+        } catch {}
+      })()
+    }, 5000)
+    return () => window.clearInterval(iv)
+  }, [])
 
   /** 模板项目「最新阶段」的步骤子目录（判定顺序与 preferredSessionOf 同源，保证
    *  新建对话落在「打开该项目时切到的那一步」目录里）：
@@ -1829,7 +2088,7 @@ function WorktableSection(props: any) {
         status,
         runtimeMs: runtimeOfPid(id),
         kids: sid ? kidsSetOf(sid).size : 0,
-        preview: sid ? (lastTextOf(sid) || previewCache.get(sid) || '') : '',
+        preview: sid ? (activityCache.get(sid) || latestActivityOf(sid) || previewCache.get(sid) || '') : '',
         bound: !!sid,
         // 内置项目（控制室）恒提供「＋」：它没有项目文件夹，目录由 newSessionFolderOf 逐级回退解析
         canNewSession: self || !!newSessionFolderOf(id),
@@ -1978,7 +2237,7 @@ function WorktableSection(props: any) {
           if (previewTimer != null) { window.clearTimeout(previewTimer); previewTimer = null }
           sweepPreviews()
         },
-        onAdd: () => { controlRoomStore.setOpen(false); openAddPanel() },
+        onAdd: () => { openAddPanel() },
         onOpen: (id) => {
           if (id === CONSOLE_ID) return
           controlRoomStore.setOpen(false)
@@ -2337,7 +2596,6 @@ function buildCustomLayoutPrompt(req: string): string {
     const api = getAssistantApi()
     let sid: string | null = null
     if (opts.mode === 'computer-use' && api) {
-      writeLastPreset('computer-use')
       try {
         const res = await api.createSession(folder, 'computer-use', { reuseBlank: false })
         sid = res.sessionId
@@ -2352,23 +2610,29 @@ function buildCustomLayoutPrompt(req: string): string {
         if (opts.background) {
           try {
             await api.selectBackgroundModel(opts.background)
-            writeLastBackgroundModel({ provider: opts.background.provider, model: opts.background.model, name: opts.background.name ?? opts.background.model })
+            writeBgPref({ provider: opts.background.provider, model: opts.background.model, name: opts.background.name ?? opts.background.model })
           } catch (err) { console.warn('[dsh-assistant] 后台模型写入失败：', err) }
         }
         if (opts.front) {
           try {
             await api.selectModel(sid, opts.front)
-            writeLastModel({ provider: opts.front.provider, model: opts.front.model, name: opts.front.name ?? opts.front.model })
+            writeModelPref('cu', { provider: opts.front.provider, model: opts.front.model, name: opts.front.name ?? opts.front.model })
           } catch (err) { console.warn('[dsh-assistant] 前台模型选择失败：', err) }
         }
       }
     } else {
-      // 标准模式：走工作台原路径（工作区注册 + 默认预设/模型继承）
-      writeLastPreset('')
+      // 标准模式：走工作台原路径（工作区注册 + 默认预设）；选了模型就落到该会话并记住
       try { sid = folder ? await createSessionAtFolder(folder) : await sessionBridge!.sessions.create({}) } catch { sid = null }
       if (sid) {
         try { await ensureSessionPreset(sid) } catch {}
-        try { await ensureSessionModel(sid) } catch {}
+        if (opts.front && api) {
+          try {
+            await api.selectModel(sid, opts.front)
+            writeModelPref('standard', { provider: opts.front.provider, model: opts.front.model, name: opts.front.name ?? opts.front.model })
+          } catch (err) { console.warn('[dsh-assistant] 标准会话选模型失败：', err) }
+        } else {
+          try { await ensureSessionModel(sid) } catch {}
+        }
       }
     }
     if (!sid) return
@@ -2562,6 +2826,44 @@ function buildCustomLayoutPrompt(req: string): string {
     fetchSessionGroups().then((res) => setBindGroups(res.groups)).catch(() => setBindGroups([]))
   }, [])
 
+  /** 手机/窄屏：浏览**电脑**上的目录（不触发电脑端系统弹窗）。 */
+  const browseTo = async (p: string) => {
+    const target = String(p || '').trim() || 'D:\\'
+    setBrowseBusy(true)
+    setBrowseErr('')
+    try {
+      const list = await wtListDir(target)
+      if (!list) {
+        setBrowseErr('无法读取该目录')
+        setBrowseEntries([])
+      } else {
+        setBrowsePath(target)
+        setBrowseEntries(list.filter((e) => e.isDir))
+      }
+    } finally {
+      setBrowseBusy(false)
+    }
+  }
+  const openFolderBrowser = (initial: string, apply: (p: string) => void) => {
+    browseApplyRef.current = apply
+    setBrowseOpen(true)
+    void browseTo(initial)
+  }
+  const closeFolderBrowser = () => {
+    setBrowseOpen(false)
+    setBrowseEntries([])
+    setBrowseErr('')
+    browseApplyRef.current = null
+  }
+  /** 当前设备是否适合用「浏览电脑文件夹」代替系统选择器（手机 / 窄屏 / 粗指针） */
+  const useInAppFolderBrowser = (): boolean => {
+    try {
+      if (typeof window === 'undefined') return false
+      if (window.innerWidth < 1024) return true
+      return !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches)
+    } catch { return false }
+  }
+
   /** 弹出系统文件夹选择窗（宿主 pickDirectory）；选中后回调。
    *  - useRef 在途锁 + 请求序号：真实防重入；手工确认/新请求会使旧请求失效，旧弹窗返回后丢弃
    *  - 返回 null = 用户取消：不报错
@@ -2572,6 +2874,11 @@ function buildCustomLayoutPrompt(req: string): string {
    *      ③ 0.1.2 新能力不可用 → 提示改用「手动输入」 */
   const pickFolder = async (target: 'add' | 'bind', apply: (p: string) => void) => {
     if (pickBusyRef.current) return
+    // 手机/窄屏：不触发电脑端的系统文件夹对话框，改为在手机上浏览电脑目录
+    if (useInAppFolderBrowser()) {
+      openFolderBrowser(wsFolderParent || 'D:\\', apply)
+      return
+    }
     // 解析本次选择器调用路径
     const ws = sessionBridge?.workspaces as any
     const legacy = ws && typeof ws.pickDirectory === 'function'
@@ -4506,6 +4813,58 @@ function buildCustomLayoutPrompt(req: string): string {
           <button type="button" className="dsh-wt_searchClear" aria-label={t('search.close')}
             onClick={() => persistView({ searchOpen: false, query: '' })}>✕</button>
         </div>
+      )}
+
+      {browseOpen && (
+        <>
+          <div className="dsh-wt_popBackdrop" style={{ zIndex: 10083 }} onClick={closeFolderBrowser} />
+          <div
+            role="region"
+            aria-label="选择电脑上的文件夹"
+            className="dsh-wt_folderBrowse"
+            style={{
+              position: 'fixed', left: '50%', top: '50%', transform: 'translate(-50%, -50%)', zIndex: 10084,
+              width: 'min(460px, calc(100vw - 24px))', maxHeight: '72vh', display: 'flex', flexDirection: 'column', gap: 10,
+              padding: 14, borderRadius: 14, background: 'var(--dsw-alias-bg-layer-1, #fff)',
+              color: 'var(--dsw-alias-label-primary, #111)', border: '1px solid var(--dsw-alias-border-l1, rgba(0,0,0,.12))',
+              boxShadow: '0 24px 64px rgba(0,0,0,.4)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+              <b style={{ fontSize: 14 }}>选择电脑上的文件夹</b>
+              <span style={{ fontSize: 11, opacity: .6 }}>浏览的是运行 DSH 的这台电脑</span>
+            </div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button type="button" className="dsh-wt_btnGhost" onClick={() => { const up = parentPathOf(browsePath); if (up && up !== browsePath) void browseTo(up) }}>↑ 上一级</button>
+              <input readOnly value={browsePath} style={{ flex: 1, minWidth: 0, padding: '6px 9px', borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1, rgba(0,0,0,.15))', background: 'transparent', color: 'inherit', font: 'inherit', fontSize: 12 }} />
+              <button type="button" className="dsh-wt_btnGhost" onClick={() => void browseTo(browsePath)}>刷新</button>
+            </div>
+            <div style={{ flex: 1, minHeight: 140, maxHeight: 330, overflow: 'auto', border: '1px solid var(--dsw-alias-border-l1, rgba(0,0,0,.1))', borderRadius: 10 }}>
+              {browseBusy ? (
+                <div style={{ padding: 18, textAlign: 'center', fontSize: 12, opacity: .6 }}>读取中…</div>
+              ) : browseErr ? (
+                <div style={{ padding: 18, textAlign: 'center', fontSize: 12, opacity: .7 }}>{browseErr}</div>
+              ) : browseEntries.length === 0 ? (
+                <div style={{ padding: 18, textAlign: 'center', fontSize: 12, opacity: .55 }}>没有子文件夹</div>
+              ) : browseEntries.map((e) => (
+                <button
+                  key={e.path}
+                  type="button"
+                  onClick={() => void browseTo(e.path)}
+                  style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '9px 12px', border: 0, borderBottom: '1px solid var(--dsw-alias-border-l1, rgba(0,0,0,.06))', background: 'transparent', color: 'inherit', font: 'inherit', fontSize: 13, textAlign: 'left', cursor: 'pointer' }}
+                >
+                  <span aria-hidden>📁</span>
+                  <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{e.name}</span>
+                  <span aria-hidden style={{ opacity: .4 }}>›</span>
+                </button>
+              ))}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button type="button" className="dsh-wt_btnGhost" onClick={closeFolderBrowser}>取消</button>
+              <button type="button" className="dsh-wt_btnPrimary" onClick={() => { browseApplyRef.current?.(browsePath); closeFolderBrowser() }}>选择此文件夹</button>
+            </div>
+          </div>
+        </>
       )}
 
       {addOpen && <div className="dsh-wt_popBackdrop" onClick={() => { invalidatePickState(); setAddOpen(false) }} />}

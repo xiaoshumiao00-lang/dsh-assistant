@@ -11,11 +11,13 @@ import { ConsolePane, consoleEnvReady } from './split'
 import { controlRoomStore } from './orb-bridge'
 
 const CR_CSS = `
-.dsh-assistant-cr{position:fixed;inset:0;width:100vw;max-width:none !important;height:100dvh;max-height:none !important;z-index:10070;display:flex;flex-direction:column;background:#0a0d13;padding:0;overflow:hidden}
+.dsh-assistant-cr{position:fixed;left:0;right:0;bottom:0;top:var(--dsh-frame-top-clearance,0px);width:auto;max-width:none !important;max-height:none !important;z-index:10070;display:flex;flex-direction:column;background:#0a0d13;padding:0;overflow:hidden}
 .dsh-assistant-crInner{position:relative;flex:1;min-height:0;display:flex;flex-direction:column}
 .dsh-assistant-crInner>.dsh-wt_console{flex:1;min-height:0;border-radius:0;padding:14px 14px calc(14px + env(safe-area-inset-bottom))}
 .dsh-assistant-crClose{position:absolute;top:calc(10px + env(safe-area-inset-top));right:12px;z-index:5;width:34px;height:34px;border-radius:50%;border:1px solid rgba(255,255,255,.18);background:rgba(20,26,36,.72);color:#e6e8eb;font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center;cursor:pointer;backdrop-filter:blur(8px)}
 .dsh-assistant-crClose:hover{background:rgba(40,50,66,.85)}
+/* 电脑端：右上角避开 Windows 窗口的 最小化/最大化/关闭（标题栏高度已由 top 让出） */
+@media (min-width:1024px){.dsh-assistant-crClose{top:calc(14px + env(safe-area-inset-top));right:14px}}
 .dsh-assistant-crWait{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:#9aa4b2;font-size:13px;padding:24px;text-align:center}
 .dsh-assistant-crWait button{padding:8px 16px;border-radius:9px;border:1px solid rgba(255,255,255,.18);background:rgba(79,142,247,.18);color:#e6e8eb;font:inherit;font-size:12px;cursor:pointer}
 @media (max-width:640px){

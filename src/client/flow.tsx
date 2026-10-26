@@ -279,16 +279,7 @@ export function FlowPane(props: { projectId: string }) {
             </div>
           </div>
         )}
-        {view.allDone && <div className="dsh-wt_flowAllDone">🎉 模板流程全部完成！交付物在各步骤子目录（见 <b>{view.folder}</b>）；每步目录里的 <b>_本步要求.md</b> 都带有最新的项目全貌（进度 / 各步核心信息与文件结构），可随时打开查看。</div>}
-        {!view.allDone && curStep && (
-          <div className="dsh-wt_flowHint">
-            当前步骤：<b>{curStep.icon} {curStep.title}</b>。{curStep.blocks && curStep.blocks.length > 0
-              ? (curStep.blocks.some((b) => b.converge)
-                ? <>先点「<b>📝 任务定义</b>」写清<b>要做什么 / 产出什么</b>（未填不会开工）→ 再点「▶ 开始此步」→ <b>迭代收敛模式</b>：任务自动发入本步专属会话，工人产出 → 每轮由独立裁判（新会话）按 _rubric.md JSON 评分，仅当新分高于旧分才采纳、否则回退保留最佳版本；循环至达标／达轮次上限／连续无改进。收敛后你只需点「✓ 通过」终审。中途异常可点「⏯ 继续本步」一键续跑（进度不丢）。</>
-                : <>先点本步「<b>📝 初始信息</b>」确认/修改针对性提示词（默认已按本步任务预填，<b>未确认不会开工</b>）→ 再点「▶ 开始此步」→ <b>自动模式</b>：任务自动发入本步专属会话，工人按「分块交付与验收协议」逐块交付；每轮由独立验收员会话（stage-verifier）自动核验——PASS 自动推进、FAIL 自动打回（连续 3 轮暂停并给出可执行方案）；全部块通过后你只需点「✓ 通过」终审。中途任务异常中止可点「⏯ 继续本步」一键续跑（进度不丢）。</>)
-              : <>点「▶ 开始此步」→ 创建子目录 <b>{curStep.dir}/</b> 并把任务/硬性要求写入该目录 <b>_本步要求.md</b>，然后自动切到该步专属会话。在会话里发出开始指令（例如「先读 _本步要求.md，然后执行本步」）即开工。AI 交付后点「✓ 通过」解锁下一步。</>}
-          </div>
-        )}
+        {view.allDone && <div className="dsh-wt_flowAllDone">🎉 全部步骤已完成。交付物在各步骤子目录（<b>{view.folder}</b>）。</div>}
       </div>
 
       <div className="dsh-wt_flowList">
