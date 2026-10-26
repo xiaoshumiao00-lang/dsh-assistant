@@ -47,3 +47,14 @@ export function defaultProjectName(folderPath: string): string {
   const b = basenameOf(folderPath.trim().replace(/[\\/]+$/, ''))
   return b || stampFolderName()
 }
+
+/** 是否是本插件自动生成的默认项目文件夹（默认父目录下的 YYYYMMDDHHmm / YYYYMMDDHHmm-n）。
+ *  Windows 下大小写不敏感、`/` 与 `\` 混用，比对键统一成小写反斜杠后再判。
+ *  用途：弹窗关了没保存时这个时间戳已经过时，重开必须重新生成，否则两个项目会落到同一个文件夹。 */
+export function isAutoProjectFolder(folderPath: string): boolean {
+  const key = (p: string): string => String(p ?? '').trim().replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase()
+  const target = key(folderPath)
+  const parent = key(DEFAULT_NEW_PROJECT_PARENT)
+  if (!target || !parent || !target.startsWith(parent + '\\')) return false
+  return /^\d{12}(-\d+)?$/.test(target.slice(parent.length + 1))
+}

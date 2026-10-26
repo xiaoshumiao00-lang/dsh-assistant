@@ -5,8 +5,8 @@
  *                     react / @deepseek-ai/* 由宿主模块系统提供，保持 external）
  */
 import { build } from 'esbuild'
-import { readFileSync, mkdirSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { readFileSync, mkdirSync, copyFileSync } from 'node:fs'
+import { dirname, join, resolve as pathResolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -54,4 +54,41 @@ await build({
   define: { __WT_VERSION__: JSON.stringify(pkg.version) },
 })
 
-console.log('[dsh-assistant build] done: lib/index.js, lib/client.js')
+// ── 内嵌 Computer Use（源自 dsh-orb 的 MIT 代码，见 vendor/computer-use/LICENSE.dsh-orb）──
+// 官方 @deepseek-ai/* 包必须与宿主共用同一份实例（类/工具 registry 的身份），所以
+// 用 shim 在运行时从正在运行的 DSH 里加载（Electron 的 app.asar 路径也可解析）。
+// koffi / zod 是本包自己的依赖（node_modules 内），保持 external。
+const cuAlias = {
+  '@deepseek-ai/dsh-attachment': pathResolve(here, 'src/cu-shims/dsh-attachment.mjs'),
+  '@deepseek-ai/dsh-brand': pathResolve(here, 'src/cu-shims/dsh-brand.mjs'),
+  '@deepseek-ai/dsh-llm': pathResolve(here, 'src/cu-shims/dsh-llm.mjs'),
+  '@deepseek-ai/dsh-session': pathResolve(here, 'src/cu-shims/dsh-session.mjs'),
+  '@deepseek-ai/dsh-tools': pathResolve(here, 'src/cu-shims/dsh-tools.mjs'),
+  '@deepseek-ai/schemastery': pathResolve(here, 'src/cu-shims/schemastery.mjs'),
+}
+const cuBuilds = [
+  ['vendor/computer-use/index.js', 'lib/computer-use.js'],
+  ['vendor/computer-use/code-agent.js', 'lib/computer-use-code-agent.js'],
+  ['vendor/computer-use/code-agent-registry.js', 'lib/computer-use-code-agent-registry.js'],
+]
+for (const [entry, outfile] of cuBuilds) {
+  await build({
+    entryPoints: [join(here, entry)],
+    outfile,
+    bundle: true,
+    sourcemap: 'external',
+    logLevel: 'info',
+    platform: 'node',
+    format: 'esm',
+    target: ['node22'],
+    alias: cuAlias,
+    external: ['node:*', 'koffi', 'zod'],
+    define: { __WT_VERSION__: JSON.stringify(pkg.version) },
+  })
+}
+// macOS 抓屏 helper 由 backend 用 import.meta.url 相对定位：打包后要跟到 lib/ 下
+for (const asset of ['macos-sck-capture', 'libmacos-sck-capture.dylib']) {
+  try { copyFileSync(join(here, 'vendor/computer-use', asset), join(here, 'lib', asset)) } catch { /* 平台无关，缺失不阻断 */ }
+}
+
+console.log('[dsh-assistant build] done: lib/index.js, lib/client.js, lib/computer-use*.js')

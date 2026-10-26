@@ -29,6 +29,11 @@ function profileDir(ctx: any): string {
   return dshHome()
 }
 
+/** 悬浮球状态/头像所在的 profile 子目录（宿主侧与设置页共用）。 */
+export function ballProfileDir(ctx: any): string {
+  return join(profileDir(ctx), 'dsh-assistant-ball')
+}
+
 /** 找一个可用的 Electron 可执行文件（优先复用 dsh-orb 已下载的运行时）。 */
 function findElectron(): string | null {
   const candidates = [
@@ -124,7 +129,7 @@ export interface DesktopBallHandle {
   takeClick: () => boolean
 }
 
-export async function startDesktopBall(ctx: any): Promise<DesktopBallHandle | null> {
+export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {}): Promise<DesktopBallHandle | null> {
   // 非 Windows 暂不提供（路径/打包未验证）；Electron 渲染器内也不需要（有页面球）
   if (process.platform !== 'win32') return null
   const exe = findElectron()
@@ -139,7 +144,13 @@ export async function startDesktopBall(ctx: any): Promise<DesktopBallHandle | nu
     mkdirSync(dir, { recursive: true })
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'dsh-assistant-ball', version: '1.0.0', main: 'main.js' }), 'utf8')
     writeFileSync(join(dir, 'main.js'), HELPER_MAIN, 'utf8')
-    writeFileSync(join(dir, 'index.html'), BALL_HTML, 'utf8')
+    // 头像：把 data URL 塞进球体的 DOM（只认 data:image/*，避免把奇怪内容写进 HTML）
+    const avatar = String(opts.avatar ?? '').trim()
+    const safeAvatar = avatar.startsWith('data:image/') ? avatar.replace(/"/g, '&quot;') : ''
+    const avatarScript = safeAvatar
+      ? `<script>document.getElementById('b').innerHTML=${JSON.stringify(`<img src="${safeAvatar}" style="width:100%;height:100%;border-radius:50%;object-fit:cover;pointer-events:none" alt="">`)}</script>`
+      : ''
+    writeFileSync(join(dir, 'index.html'), BALL_HTML.replace('</body>', `${avatarScript}</body>`), 'utf8')
   } catch (err) {
     try { console.error('[dsh-assistant] 写悬浮球 helper 失败：', err) } catch {}
     return null

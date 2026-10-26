@@ -1,4 +1,81 @@
-# dsh-assistant：控制室（/api/worktable/*）+ 手机访问代理（/dsh-pocket RPC）同一个插件包
+# dsh-assistant：控制室（/api/worktable/*）+ 手机访问代理（/dsh-pocket RPC）+ Computer Use 预设
+#
+# Computer Use 预设与 GUI 工具已内嵌进本包（vendor/computer-use，源自 dsh-orb 的 MIT 代码，
+# 见 vendor/computer-use/LICENSE.dsh-orb），所以删掉 dsh-orb 后「＋ CU」新建的会话仍是
+# Computer Use 模式。原生桌面悬浮球小窗仍由本插件自己的 desktop-ball 提供（页面内那颗 🔮 球不依赖任何外部插件）。
 - insert:
     - id: dsh-assistant
       name: dsh-assistant
+    - id: assistant-preset-computer-use
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: computer-use
+        name: Computer Use 模式
+        description: 精简工具集：Shell、网页检索与抓取、桌面 GUI 操作、向用户提问。
+        order: 5
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              # 新版 DSH 的 system-prompt 只注册 provider/model 两个模板变量，
+              # 这里不能再写 {{cwd}}（否则整轮报 unknown prompt variable 直接失败）。
+              # 工作目录由运行时上下文自动携带。
+              prefix: >-
+                You are a desktop GUI agent powered by the {{model}} model.
+                You operate the screen and decide each stretch yourself.
+                Do visible GUI, and a search or command that will answer or feed the next click, in this chat.
+                A second search that you expect will hit the point stays here.
+                When you are still digging through files, searches, or commands, or the user asked for a file, document, spreadsheet, or site, send that stretch to code_agent.
+                Omit cwd so the tool mints a subdirectory, unless the user named a path or this folder.
+                If the user said this folder and Finder is not frontmost, ask instead of calling code_agent.
+                After code_agent accepts, tell the user the background agent is running.
+                Continue a GUI action in this turn only when it does not need that result; otherwise end the turn.
+                Call code_agent_status or code_agent_stop when the user asks about or stops background work.
+                When a plugin notice reports that work finished, decide again: do remaining GUI, or call code_agent with that session_id for another stretch, then tell the user the short conclusion.
+                If the notice says the user stopped that background session, tell the user briefly and do not call code_agent for it again unless the user asks.
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          # 技能目录显式覆盖：与标准模式完全一致（含用户技能 ~/.dsh/skills、~/.agents/skills 与项目级）
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+            config:
+              includeDefaultRoots: true
+              customSkillDirs: []
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: tool-computer-use
+            name: 'dsh-assistant/computer-use'
+            config:
+              postActionWaitMs: 600
+          - id: tool-code-agent
+            name: 'dsh-assistant/computer-use/code-agent'
+    - id: assistant-code-agent-registry
+      name: 'dsh-assistant/computer-use/code-agent-registry'

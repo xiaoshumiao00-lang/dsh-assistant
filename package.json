@@ -11,15 +11,22 @@
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./computer-use": "./lib/computer-use.js",
+    "./computer-use/code-agent": "./lib/computer-use-code-agent.js",
+    "./computer-use/code-agent-registry": "./lib/computer-use-code-agent-registry.js"
   },
   "files": [
     "lib/index.js",
     "lib/client.js",
+    "lib/computer-use.js",
+    "lib/computer-use-code-agent.js",
+    "lib/computer-use-code-agent-registry.js",
     "cordis.patch.yml",
     "dsh.plugin.json",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "vendor"
   ],
   "dsh": {
     "bundle": {
@@ -39,10 +46,13 @@
   },
   "scripts": {
     "build": "node build.mjs",
-    "check": "node --check lib/index.js && node --check lib/client.js"
+    "check": "node --check lib/index.js && node --check lib/client.js",
+    "test": "node scripts/test-session-focus.mjs && node scripts/test-session-folder.mjs"
   },
   "dependencies": {
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "koffi": "^3.3.1",
+    "zod": "^4.4.3"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",

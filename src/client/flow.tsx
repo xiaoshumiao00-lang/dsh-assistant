@@ -10,6 +10,7 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import { cachedSkillOptions, loadSkillOptions, type FlowEnv, type FlowStepOverride, type FlowStepView, type FlowView, type SkillOption } from './templates'
+import { joinPath } from './pathutil'
 
 function flowEnv(): FlowEnv | undefined {
   try {
@@ -142,7 +143,8 @@ export function FlowPane(props: { projectId: string }) {
     if (opening) return
     const folder = view.folder
     if (!folder) { flash('⚠️ 该项目未设置文件夹，无法打开目录'); return }
-    const dir = folder.replace(/[\\/]+$/, '') + '/' + st.dir
+    // 按项目文件夹原有的分隔符风格拼接（Windows 上不要拼出 D:\a/01_content 这种混用路径）
+    const dir = joinPath(folder, st.dir)
     setOpening(st.id)
     try {
       try {

@@ -244,10 +244,11 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_projects [data-wt-id][data-on=true]{border-color:var(--dsw-alias-state-accent-primary,#4f8ef7);background:var(--dsw-alias-fill-l1,rgba(255,255,255,.05))}',
   // 标签精简：项目卡片只留名称一行，小字描述行去掉
   '.dsh-wt_projects [data-wt-id] > :nth-child(2) > :nth-child(2){display:none}',
-  // 图标选择弹窗（固定定位，点击项目/布局/快捷方式的图标唤出）
-  '.dsh-wt_iconPop{position:fixed;z-index:81;width:256px;padding:8px;border:1px solid var(--dsw-alias-border-l2,#3a4150);border-radius:10px;background:var(--dsw-alias-bg-base,#0b0e14);box-shadow:var(--dsw-shadow-lv2,0 8px 24px rgba(0,0,0,.4))}',
+  // 图标选择弹窗（固定定位，由「项目管理 → 更换图标」等按钮唤出）
+  // 手机窄屏安全：宽度不超视口（-24px），高度超了内部滚动，不会被顶出屏幕
+  '.dsh-wt_iconPop{position:fixed;z-index:81;box-sizing:border-box;width:min(268px,calc(100vw - 24px));max-height:calc(100vh - 24px);overflow:auto;padding:8px;border:1px solid var(--dsw-alias-border-l2,#3a4150);border-radius:10px;background:var(--dsw-alias-bg-base,#0b0e14);box-shadow:var(--dsw-shadow-lv2,0 8px 24px rgba(0,0,0,.4))}',
   '.dsh-wt_iconPopTitle{font-size:10px;letter-spacing:.05em;color:var(--dsw-alias-label-tertiary,#6e7683);padding:1px 4px 6px}',
-  '.dsh-wt_iconGrid{display:grid;grid-template-columns:repeat(6,1fr);gap:4px}',
+  '.dsh-wt_iconGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(36px,1fr));gap:4px}',
   '.dsh-wt_iconCell{display:flex;align-items:center;justify-content:center;aspect-ratio:1;border:1px solid transparent;border-radius:6px;background:transparent;font-size:17px;line-height:1;cursor:pointer;padding:0}',
   '.dsh-wt_iconCell:hover{background:var(--dsw-alias-fill-l1,rgba(255,255,255,.05));border-color:var(--dsw-alias-border-l2,#3a4150)}',
   '.dsh-wt_iconCell[data-on=true]{background:var(--dsw-alias-fill-l1,rgba(255,255,255,.08));border-color:var(--dsw-alias-state-accent-primary,#4f8ef7)}',
@@ -370,6 +371,7 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_paneWipText{font-size:11px}',
   '.dsh-wt_splitFlip{flex:none;display:flex;align-items:center;justify-content:center;width:20px;height:20px;padding:0;border:none;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary,#9aa4b2);font-size:13px;cursor:pointer}',
   '.dsh-wt_splitFlip:hover{color:var(--dsw-alias-label-primary,#e6e8eb);background:var(--dsw-alias-fill-l1,rgba(255,255,255,.06))}',
+  '.dsh-wt_splitFlipOn{color:var(--dsw-alias-state-accent-primary,#4f8ef7)}',
   // + 右侧弹出面板
   '.dsh-wt_popBackdrop{position:fixed;left:0;top:0;right:0;bottom:0;z-index:79;background:transparent}',
   // 删除二次确认（fixed 居中模态，压在弹窗之上）
@@ -575,7 +577,7 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_console[data-wt-shape=circle] .dsh-wt_consoleCard-glowNeed::before{border-radius:50%}',
   '.dsh-wt_consoleGrid{display:flex;flex-wrap:wrap;justify-content:center;gap:64px;align-content:start;margin-top:clamp(32px,9vh,110px);width:100%;max-width:calc(var(--wt-cols,3)*242px + (var(--wt-cols,3) - 1)*64px);margin-left:auto;margin-right:auto}',
   '.dsh-wt_consoleCols{display:inline-flex;align-items:center;gap:8px;padding:2px 8px;border:1px solid var(--wt-border);border-radius:999px;background:var(--wt-card);color:var(--wt-text3);font-size:11px}',
-  '.dsh-wt_consoleCard{position:relative;box-sizing:border-box;flex:none;width:calc((100% - (var(--wt-cols,3) - 1)*64px)/var(--wt-cols,3));display:flex;flex-direction:column;gap:14px;aspect-ratio:1/1;min-height:192px;padding:21px;background:linear-gradient(135deg,rgba(255,255,255,.22) 0%,rgba(255,255,255,.07) 30%,rgba(255,255,255,.01) 60%,rgba(0,0,0,.07) 100%),rgba(18,23,32,.24);border:1px solid transparent;border-radius:16px;box-shadow:0 10px 28px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.13);cursor:pointer;transition:transform .14s ease,box-shadow .14s ease;overflow:hidden;backdrop-filter:blur(var(--wt-cardBlur,0px)) saturate(1.15)}',
+  '.dsh-wt_consoleCard{position:relative;box-sizing:border-box;flex:none;width:calc((100% - (var(--wt-cols,3) - 1)*64px)/var(--wt-cols,3));display:flex;flex-direction:column;gap:14px;aspect-ratio:1/1;min-height:248px;padding:21px;background:linear-gradient(135deg,rgba(255,255,255,.22) 0%,rgba(255,255,255,.07) 30%,rgba(255,255,255,.01) 60%,rgba(0,0,0,.07) 100%),rgba(18,23,32,.24);border:1px solid transparent;border-radius:16px;box-shadow:0 10px 28px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.13);cursor:pointer;transition:transform .14s ease,box-shadow .14s ease;overflow:hidden;backdrop-filter:blur(var(--wt-cardBlur,0px)) saturate(1.15)}',
   // 玻璃边缘：四角黑白渐变描边（左上/右下=白，右上/左下=黑），1px 环挖空实现
   '.dsh-wt_consoleCard::after{content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;background:conic-gradient(from 45deg,rgba(0,0,0,.4) 0deg,rgba(255,255,255,.55) 90deg,rgba(0,0,0,.4) 180deg,rgba(255,255,255,.55) 270deg,rgba(0,0,0,.4) 360deg);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);mask-composite:exclude;pointer-events:none;opacity:.5}',
   '.dsh-wt_console[data-wt-theme=light] .dsh-wt_consoleCard{background:linear-gradient(135deg,rgba(255,255,255,1) 0%,rgba(255,255,255,.65) 30%,rgba(255,255,255,.12) 60%,rgba(31,41,55,.06) 100%),rgba(255,255,255,.34);box-shadow:0 10px 28px rgba(31,41,55,.18),inset 0 1px 0 rgba(255,255,255,1);backdrop-filter:blur(var(--wt-cardBlur,0px)) saturate(1.15)}',
@@ -590,7 +592,8 @@ export const css = xtermCss + '\n' + [
   // 卡片底部操作行：会话列表 / 新建会话（都作用于该项目的目录）；平时淡，悬停卡片或按钮时点亮
   '.dsh-wt_consoleCardOps{flex:none;display:flex;flex-wrap:wrap;gap:8px;margin-top:auto}',
   '.dsh-wt_consoleOpBtn{flex:1 1 0;min-width:0;display:inline-flex;align-items:center;justify-content:center;gap:5px;height:26px;padding:0 8px;border:1px solid var(--wt-border);border-radius:8px;background:rgba(255,255,255,.05);color:var(--wt-text2);font-size:11px;font-weight:600;line-height:1;font-family:inherit;cursor:pointer;opacity:.62;white-space:nowrap;transition:opacity .14s ease,color .14s ease,border-color .14s ease,background .14s ease}',
-  '.dsh-wt_consoleOpBtn:first-child{flex:1 0 100%}',
+  // 操作行：上面「标准 / CU」各占一半，下面「会话列表」独占一整行（按钮顺序见 split.tsx）
+  '.dsh-wt_consoleOpBtnFull{flex:1 0 100%}',
   '.dsh-wt_consoleOpBtnNew{flex:1 1 0}',
   '.dsh-wt_consoleOpBtnCu{color:var(--dsw-alias-state-accent-primary,#4f8ef7)}',
   '.dsh-wt_consoleOpBtn>span{min-width:0;overflow:hidden;text-overflow:ellipsis}',
@@ -609,8 +612,14 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_consoleStatus-done{color:var(--dsw-alias-state-accent-primary,#4f8ef7)}',
   '.dsh-wt_consoleStatus-error{color:var(--dsw-alias-state-error,#f85149)}',
   '.dsh-wt_consoleRuntime{flex:none;font-size:17px;font-weight:600;line-height:24px;color:var(--wt-text2);font-variant-numeric:tabular-nums}',
-  '.dsh-wt_consolePreview{display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;font-size:11px;line-height:15px;color:var(--wt-text2);word-break:break-word}',
+  // 预览必须始终留出高度：窄卡（窗口小时 1:1 卡片高度 < 内容总高）里 flex 会把预览压成 0 高，
+  // 卡片中间就出现一条空白带（这就是「进行中但看不到最新会话内容」的根因）。
+  '.dsh-wt_consolePreview{position:relative;z-index:1;flex:1 1 auto;min-height:32px;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;font-size:11px;line-height:15px;color:var(--wt-text2);word-break:break-word}',
   '.dsh-wt_consolePreviewNone{color:var(--wt-text3);font-style:italic;-webkit-line-clamp:1}',
+  // 流式进度：预览来自「正在跑」的会话时，末尾跟一个呼吸光标（颜色与绿状态一致）
+  '.dsh-wt_consolePreviewLive{color:var(--wt-text)}',
+  '.dsh-wt_consoleCaret{color:var(--dsw-alias-state-success,#3fb950);margin-left:1px;font-style:normal;animation:dsh-wt_caret 1.05s steps(1,end) infinite}',
+  '@keyframes dsh-wt_caret{0%,49%{opacity:1}50%,100%{opacity:.12}}',
   // 三色光效：整卡霓虹描边光晕（像侧栏双圆点的发光质感）——完成=绿、待决=黄；工作=蓝色描边顺时针旋转
   '.dsh-wt_consoleCard-glowDone{border-color:rgba(63,185,80,.9);box-shadow:0 0 8px rgba(63,185,80,.5),0 0 26px rgba(63,185,80,.3),inset 0 0 16px rgba(63,185,80,.07)}',
   '.dsh-wt_consoleCard-glowNeed{border-color:rgba(210,153,34,.95);box-shadow:0 0 8px rgba(210,153,34,.5),0 0 26px rgba(210,153,34,.3),inset 0 0 16px rgba(210,153,34,.08)}',
@@ -629,7 +638,7 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_console[data-wt-theme=light] .dsh-wt_consoleCard-error{border-color:rgba(220,38,38,.9);box-shadow:0 0 10px rgba(220,38,38,.45),0 0 30px rgba(220,38,38,.26)}',
   '.dsh-wt_consoleEmpty{padding:40px 0;text-align:center;font-size:12px;color:var(--wt-text3)}',
   // 手机/窄屏：压缩卡间距与卡片样式（自动列数按 gap 计算，通常 2 列）
-  '@media (max-width:640px){.dsh-wt_consoleGrid{gap:20px;margin-top:22px}.dsh-wt_consoleCard{aspect-ratio:auto;min-height:170px;padding:14px;gap:9px;border-radius:14px}.dsh-wt_consoleStatus{font-size:17px;line-height:24px}.dsh-wt_consolePreview{-webkit-line-clamp:3;font-size:10px;line-height:14px}.dsh-wt_consoleOpBtn{height:26px;padding:0 8px;font-size:10px}.dsh-wt_consoleIcon{font-size:26px}.dsh-wt_consoleName{font-size:15px}.dsh-wt_consoleAddPlus{font-size:26px}.dsh-wt_consoleAddLabel{font-size:13px}}',
+  '@media (max-width:640px){.dsh-wt_consoleGrid{gap:20px;margin-top:22px}.dsh-wt_consoleCard{aspect-ratio:auto;min-height:208px;padding:14px;gap:9px;border-radius:14px}.dsh-wt_consoleStatus{font-size:17px;line-height:24px}.dsh-wt_consolePreview{-webkit-line-clamp:3;min-height:28px;font-size:10px;line-height:14px}.dsh-wt_consoleOpBtn{height:26px;padding:0 8px;font-size:10px}.dsh-wt_consoleIcon{font-size:26px}.dsh-wt_consoleName{font-size:15px}.dsh-wt_consoleAddPlus{font-size:26px}.dsh-wt_consoleAddLabel{font-size:13px}}',
   // 窄屏卡片：会话按钮整行，标准 / CU 两个加号各占一半（标签始终可见）
   '@media (max-width:480px){.dsh-wt_consoleOpBtn{justify-content:center;gap:4px}}',
   // 创建卡片：虚线 + 居中加号，永远最后一位
@@ -685,7 +694,7 @@ export const css = xtermCss + '\n' + [
   '@media (hover:none),(max-width:640px){.dsh-wt_sessOps{position:static;transform:none;opacity:1;pointer-events:auto;background:transparent;padding:0;margin-left:auto}.dsh-wt_sessItem:hover .dsh-wt_sessRel{opacity:1}.dsh-wt_sessRel{display:none}.dsh-wt_sessOp{width:26px;height:26px}}',
   // 新建会话面板（标准 / computer-use + 前后台模型）
   '.dsh-wt_newSessMask{position:fixed;inset:0;z-index:70;display:flex;align-items:center;justify-content:center;padding:18px;background:rgba(4,7,12,.55);backdrop-filter:blur(2px)}',
-  '.dsh-wt_newSess{width:min(420px,100%);max-height:calc(100vh - 40px);overflow:auto;display:flex;flex-direction:column;gap:11px;padding:18px;border:1px solid var(--wt-borderHover);border-radius:16px;background:var(--wt-card);box-shadow:0 24px 64px rgba(0,0,0,.5);color:var(--wt-text)}',
+  '.dsh-wt_newSess{width:min(480px,100%);max-height:calc(100vh - 40px);overflow:auto;display:flex;flex-direction:column;gap:11px;padding:18px;border:1px solid var(--wt-borderHover);border-radius:16px;background:var(--wt-card);box-shadow:0 24px 64px rgba(0,0,0,.5);color:var(--wt-text)}',
   '.dsh-wt_newSessHead{display:flex;align-items:baseline;gap:8px;min-width:0}',
   '.dsh-wt_newSessTitle{flex:none;font-size:14px;font-weight:700}',
   '.dsh-wt_newSessProj{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--wt-text3)}',
@@ -705,15 +714,28 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_btnGhost:hover{color:var(--wt-text);border-color:var(--wt-borderHover)}',
   '.dsh-wt_btnPrimary{border-color:transparent;background:var(--dsw-alias-state-accent-primary,#4f8ef7);color:#fff}',
   '.dsh-wt_btnPrimary:disabled{opacity:.55;cursor:default}',
-  // 项目管理面板：项目行 + 隐藏/删除
-  '.dsh-wt_manageList{display:flex;flex-direction:column;gap:6px;max-height:52vh;overflow:auto}',
-  '.dsh-wt_manageRow{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--wt-border,rgba(0,0,0,.12));border-radius:10px;background:rgba(255,255,255,.03)}',
+  // 项目管理面板：项目行 + 更换图标/隐藏/删除
+  // 布局：图标 | 名称(可省略) | 操作区（三个按钮成组，gap 6px，不粘连；不换行、不被裁切）
+  // 窄屏（手机）：名称独占一行、操作区留到第二行靠右，列表自身可滚
+  '.dsh-wt_manageList{display:flex;flex-direction:column;gap:6px;max-height:52vh;overflow:auto;-webkit-overflow-scrolling:touch}',
+  '.dsh-wt_manageRow{display:flex;flex-wrap:nowrap;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--wt-border,rgba(0,0,0,.12));border-radius:10px;background:rgba(255,255,255,.03)}',
   '.dsh-wt_manageRowHidden{opacity:.62}',
   '.dsh-wt_manageIcon{flex:none;font-size:18px;line-height:1}',
-  '.dsh-wt_manageName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--wt-text,inherit)}',
-  '.dsh-wt_manageBtn{flex:none;padding:5px 10px;border:1px solid var(--wt-border,rgba(0,0,0,.15));border-radius:8px;background:transparent;color:var(--wt-text2,inherit);font:inherit;font-size:11px;cursor:pointer}',
+  '.dsh-wt_manageName{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--wt-text,inherit)}',
+  '.dsh-wt_manageOps{flex:none;display:flex;align-items:center;gap:8px;margin-left:auto}',
+  // 关键：基础样式里 .dsh-wt_manageBtn 是「图标按钮」的 20px 方块（width/height:20px），
+  // 这里是带文字的按钮，必须显式复位宽高（否则文字溢出 20px 盒、和相邻按钮叠在一起）。
+  '.dsh-wt_manageBtn{flex:none;width:auto;height:auto;min-width:0;display:inline-flex;align-items:center;justify-content:center;gap:4px;padding:5px 10px;border:1px solid var(--wt-border,rgba(0,0,0,.15));border-radius:8px;background:transparent;color:var(--wt-text2,inherit);font:inherit;font-size:11px;line-height:16px;white-space:nowrap;cursor:pointer}',
   '.dsh-wt_manageBtn:hover{border-color:var(--dsw-alias-state-accent-primary,#4f8ef7);color:var(--dsw-alias-state-accent-primary,#4f8ef7)}',
+  // 拖动排序：行首 ⋮⋮ 抓手 + 拖动中/落点提示（目标行上/下边缘高亮线）
+  '.dsh-wt_manageGrip{flex:none;width:18px;display:inline-flex;align-items:center;justify-content:center;color:var(--wt-text3,rgba(140,148,160,.95));font-size:13px;line-height:1;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;border-radius:6px}',
+  '.dsh-wt_manageGrip:active{cursor:grabbing}',
+  '.dsh-wt_manageRowDragging{opacity:.55}',
+  '.dsh-wt_manageRowDropBefore{box-shadow:inset 0 2px 0 var(--dsw-alias-state-accent-primary,#4f8ef7)}',
+  '.dsh-wt_manageRowDropAfter{box-shadow:inset 0 -2px 0 var(--dsw-alias-state-accent-primary,#4f8ef7)}',
+  '.dsh-wt_manageIconPick{color:var(--wt-text,inherit)}',
   '.dsh-wt_manageDel:hover{border-color:#f85149;color:#f85149}',
+  '@media (max-width:640px){.dsh-wt_manageRow{flex-wrap:wrap;gap:6px;padding:7px 8px}.dsh-wt_manageName{flex:1 1 100%;order:-1;font-size:12.5px}.dsh-wt_manageOps{flex:1 1 100%;justify-content:flex-end}.dsh-wt_manageBtn{padding:7px 10px;font-size:11.5px}}',
   '.dsh-wt_consoleAddLabel{font-size:17px;font-weight:600;color:var(--wt-text2)}',
   '.dsh-wt_consoleAdd:hover .dsh-wt_consoleAddLabel{color:var(--dsw-alias-state-accent-primary,#4f8ef7)}',
   // 控制室入口卡：统筹主程序的差异化（渐变底 + 微光；无描边，颜色更亮更饱和）

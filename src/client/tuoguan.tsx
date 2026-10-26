@@ -35,6 +35,10 @@ import { Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
  * v1 存的是开启白名单，语义相反，故换 key 不迁移。
  */
 const LS_KEY = 'dsh-tuoguan.v2'
+/** 离线兜底：被「显式开启」的 Session 集合（只在默认关闭时才需要记录，2026-10 新增）。 */
+const LS_ON_KEY = 'dsh-tuoguan.on.v2'
+/** 离线兜底：新会话默认托管状态（'1' 开 / '0' 关；缺省 = 开）。 */
+const LS_DEFAULT_KEY = 'dsh-tuoguan.default.v2'
 
 /** host 真值路由（同源相对路径；登录 cookie 自动带上）。 */
 const STATE_ROUTE = '/.dsh-tuoguan/state'
@@ -64,6 +68,10 @@ interface PendingLike {
 /** host 返回的状态形状。 */
 interface RemoteState {
   off: Record<string, boolean>
+  /** 显式开启（脱离默认关闭）的会话；老 host 不返回 → 视为空表。 */
+  on: Record<string, boolean>
+  /** 新会话默认托管状态；老 host 不返回 → 默认开启（老行为）。 */
+  defaultOn: boolean
   revision: number
   updatedAt: string
 }
@@ -133,10 +141,10 @@ function dismissToast(): void {
 
 /* ---------- 托管状态存储（host 真值 + localStorage 兜底缓存） ---------- */
 
-function loadOffCache(): Record<string, boolean> {
+function loadMap(key: string): Record<string, boolean> {
   if (typeof localStorage === 'undefined') return {}
   try {
-    const raw = localStorage.getItem(LS_KEY)
+    const raw = localStorage.getItem(key)
     if (raw) {
       const parsed = JSON.parse(raw) as unknown
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
@@ -151,13 +159,45 @@ function loadOffCache(): Record<string, boolean> {
   return {}
 }
 
+function loadOffCache(): Record<string, boolean> {
+  return loadMap(LS_KEY)
+}
+
 function saveOffCache(off: Record<string, boolean>): void {
   try {
     if (typeof localStorage !== 'undefined') localStorage.setItem(LS_KEY, JSON.stringify(off))
   } catch { /* 存储不可写时仅在内存生效 */ }
 }
 
+function loadOnCache(): Record<string, boolean> {
+  return loadMap(LS_ON_KEY)
+}
+
+function saveOnCache(on: Record<string, boolean>): void {
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem(LS_ON_KEY, JSON.stringify(on))
+  } catch { /* 存储不可写时仅在内存生效 */ }
+}
+
+/** 新会话默认托管状态：缺省开（与老行为一致）。 */
+function loadDefaultCache(): boolean {
+  try {
+    if (typeof localStorage !== 'undefined') return localStorage.getItem(LS_DEFAULT_KEY) !== '0'
+  } catch { /* 忽略 */ }
+  return true
+}
+
+function saveDefaultCache(on: boolean): void {
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem(LS_DEFAULT_KEY, on ? '1' : '0')
+  } catch { /* 忽略 */ }
+}
+
 let offSessions: Record<string, boolean> = loadOffCache()
+/** 显式开启（默认关闭时才需要）：与 offSessions 互斥。 */
+let onSessions: Record<string, boolean> = loadOnCache()
+/** 新会话默认托管状态（host 真值优先；首帧用本地缓存）。 */
+let defaultOn: boolean = loadDefaultCache()
 /** -1 = 尚未从 host 取到真值（此时渲染的是 localStorage 缓存）。 */
 let revision = -1
 /** false = host 路由不可用（旧 host 代码未重启 / 宿主无 webServer），已降级为仅本机。 */
@@ -167,7 +207,21 @@ let degradeNoticeShown = false
 
 const listeners = new Set<() => void>()
 
+/**
+ * 订阅快照：每次状态变化都换一个新对象（useSyncExternalStore 靠引用比较判断要不要重渲染，
+ * 只改默认值而不换对象会让托管按钮停在旧状态）。
+ */
+let snapCache: { off: Record<string, boolean>; on: Record<string, boolean>; defaultOn: boolean } = {
+  off: offSessions, on: onSessions, defaultOn,
+}
+const EMPTY_SNAPSHOT = { off: {}, on: {}, defaultOn: true }
+
+function touch(): void {
+  snapCache = { off: offSessions, on: onSessions, defaultOn }
+}
+
 function emit(): void {
+  touch()
   for (const fn of listeners) fn()
 }
 
@@ -176,13 +230,19 @@ function subscribe(fn: () => void): () => void {
   return () => { listeners.delete(fn) }
 }
 
-function snapshot(): Record<string, boolean> {
-  return offSessions
+function snapshot(): { off: Record<string, boolean>; on: Record<string, boolean>; defaultOn: boolean } {
+  return snapCache
 }
 
-/** 默认开启：只要该 Session 没被显式关过，就处于托管中。 */
+/**
+ * 某个会话当前是否处于托管中：显式开/关优先，其余跟着「默认状态」走。
+ * 默认状态 = 开时，没动过的会话都在托管中（工作台模板会话也走这条，行为不变）。
+ */
 function isOn(sessionId: string | undefined): boolean {
-  return typeof sessionId === 'string' && !offSessions[sessionId]
+  if (typeof sessionId !== 'string' || sessionId === '') return false
+  if (offSessions[sessionId] === true) return false
+  if (onSessions[sessionId] === true) return true
+  return defaultOn
 }
 
 function normalizeRemote(raw: unknown): RemoteState | null {
@@ -196,8 +256,20 @@ function normalizeRemote(raw: unknown): RemoteState | null {
   for (const [key, value] of Object.entries(offSource)) {
     if (typeof key === 'string' && key !== '' && value === true) off[key] = true
   }
+  const onSource = typeof record.on === 'object' && record.on !== null && !Array.isArray(record.on)
+    ? record.on as Record<string, unknown>
+    : {}
+  const on: Record<string, boolean> = {}
+  for (const [key, value] of Object.entries(onSource)) {
+    if (typeof key === 'string' && key !== '' && value === true) on[key] = true
+  }
+  for (const key of Object.keys(off)) delete on[key]
+  // 老 host（未重启、还没有 defaultOn 字段）不覆盖本地的默认值，否则设置页会每 2.5s 被轮询回 ON。
+  const nextDefaultOn = typeof record.defaultOn === 'boolean' ? record.defaultOn : defaultOn
   return {
     off,
+    on,
+    defaultOn: nextDefaultOn,
     revision: Math.floor(record.revision),
     updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : '',
   }
@@ -210,7 +282,11 @@ function adoptRemote(raw: unknown): void {
   if (state.revision === revision) return
   revision = state.revision
   offSessions = state.off
+  onSessions = state.on
+  defaultOn = state.defaultOn
   saveOffCache(state.off)
+  saveOnCache(state.on)
+  saveDefaultCache(state.defaultOn)
   emit()
 }
 
@@ -277,12 +353,21 @@ async function pullState(): Promise<void> {
  */
 function setSession(sessionId: string, on: boolean): void {
   const previousOff = offSessions
+  const previousOn = onSessions
   const previousRevision = revision
-  const optimistic: Record<string, boolean> = { ...previousOff }
-  if (on) delete optimistic[sessionId]
-  else optimistic[sessionId] = true
-  offSessions = optimistic
-  saveOffCache(optimistic)
+  const offNext: Record<string, boolean> = { ...previousOff }
+  const onNext: Record<string, boolean> = { ...previousOn }
+  delete offNext[sessionId]
+  delete onNext[sessionId]
+  // 只记「与默认不同」的显式状态，和 host 端保持同一套语义
+  if (on !== defaultOn) {
+    if (on) onNext[sessionId] = true
+    else offNext[sessionId] = true
+  }
+  offSessions = offNext
+  onSessions = onNext
+  saveOffCache(offNext)
+  saveOnCache(onNext)
   emit()
 
   if (!hostReachable) return
@@ -304,13 +389,80 @@ function setSession(sessionId: string, on: boolean): void {
       adoptRemote(await response.json())
     } catch (error) {
       offSessions = previousOff
+      onSessions = previousOn
       revision = previousRevision
       saveOffCache(previousOff)
+      saveOnCache(previousOn)
       emit()
       console.warn('[dsh-tuoguan] POST 托管状态失败：', error instanceof Error ? error.message : error)
       showToast('托管状态同步失败，已回滚')
     }
   })()
+}
+
+/**
+ * 改「新会话默认托管状态」（个人助手 → 托管设置）：乐观更新 + POST { defaultOn }。
+ * 只影响没有显式开/关记录过的会话；已有显式状态的会话保持原样。
+ */
+function setDefault(on: boolean): void {
+  if (defaultOn === on) return
+  const previous = defaultOn
+  defaultOn = on
+  saveDefaultCache(on)
+  emit()
+
+  if (!hostReachable) return
+
+  void (async () => {
+    try {
+      const response = await fetch(STATE_ROUTE, {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({ defaultOn: on }),
+      })
+      const fallback = DEGRADE_MESSAGES[response.status]
+      if (fallback !== undefined) {
+        degrade(fallback.reason, fallback.notice)
+        return
+      }
+      // 旧 host 还没接 { defaultOn } 这个 body（会回 400 invalid-session）：保留本机设置，
+      // 提示重启一次 DSH 让 host 端生效，别把它当失败回滚掉。
+      if (response.status === 400) {
+        degrade(
+          'host 尚未支持「托管默认状态」（HTTP 400）',
+          '⚠️ 默认托管状态已在本机生效；重启一次 DSH 后才会同步到其它端',
+        )
+        return
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      adoptRemote(await response.json())
+    } catch (error) {
+      defaultOn = previous
+      saveDefaultCache(previous)
+      emit()
+      console.warn('[dsh-tuoguan] POST 托管默认状态失败：', error instanceof Error ? error.message : error)
+      showToast('托管默认状态同步失败，已回滚')
+    }
+  })()
+}
+
+/* ---------- 设置页接口（个人助手 → 托管） ---------- */
+
+/** 设置页用：新会话默认托管状态。 */
+export function tuoguanDefaultOn(): boolean {
+  return defaultOn
+}
+
+/** 设置页用：改新会话默认托管状态（写 host，跨端同步）。 */
+export function setTuoguanDefault(on: boolean): void {
+  setDefault(on)
+}
+
+/** 设置页用：订阅默认状态变化（组件内调用）。 */
+export function useTuoguanDefaultOn(): boolean {
+  useSyncExternalStore(subscribe, snapshot, () => EMPTY_SNAPSHOT)
+  return defaultOn
 }
 
 /* ---------- 轮询：让另一端在几秒内跟随 ---------- */
@@ -377,7 +529,7 @@ function takeOverPreviousInstance(): void {
 }
 
 function useTuoguan(sessionId: string | undefined): boolean {
-  useSyncExternalStore(subscribe, snapshot, () => ({}))
+  useSyncExternalStore(subscribe, snapshot, () => EMPTY_SNAPSHOT)
   return isOn(sessionId)
 }
 
