@@ -14,6 +14,7 @@ import { orbStore, clearLastModel, readLastBall, readLastCwd, readLastModel, rea
 import { noteOpenSession, noteOrbSwallow } from './diag.ts'
 import { isStandardPreset, presetKey, sessionModel, templateFromSession } from './session-plan.ts'
 import type { BallPoint } from './state.ts'
+import { DEFAULT_ORB_AVATAR } from './defaultAvatar.ts'
 
 type Target = { kind: 'new' } | { kind: 'session'; id: string }
 
@@ -62,7 +63,7 @@ export function OrbOverlay({ api, t }: OrbOverlayProps) {
       {!open && !controlRoomOpen && !nativeBall && ballConfig.enabled && (
         <OrbBall
           label={t('open')}
-          avatar={ballConfig.avatar}
+          avatar={ballConfig.avatar || DEFAULT_ORB_AVATAR}
           onOpen={() => {
             // 悬浮球 = 控制室入口（手机/电脑一致）。快捷输入页仍可从抽屉入口打开。
             controlRoomStore.setOpen(true)
