@@ -53,20 +53,36 @@ export function apply(ctx: any, config: any = {}): () => void {
     try { ctx.logger?.('dsh-assistant')?.error?.('state store failed: %s', String(err)) } catch {}
   }
 
-  // ── 桌面原生悬浮球（Electron 宿主；网页/CLI 自动跳过） ──
+  // ── 桌面原生悬浮球（独立 Electron 小窗；网页/CLI 自动回退页内球） ──
   let nativeBall = false
-  try {
-    const dispose = startDesktopBall(ctx)
-    if (typeof dispose === 'function') { nativeBall = true; disposers.push(dispose) }
-  } catch (err) {
-    try { ctx.logger?.('dsh-assistant')?.error?.('desktop ball failed: %s', String(err)) } catch {}
-  }
+  let ballHandle: any = null
+  void startDesktopBall(ctx)
+    .then((handle) => {
+      if (!handle) return
+      ballHandle = handle
+      nativeBall = true
+      disposers.push(() => { try { handle.dispose() } catch {} })
+      try { ctx.logger?.('dsh-assistant')?.info?.('desktop ball started') } catch {}
+    })
+    .catch((err) => {
+      try { ctx.logger?.('dsh-assistant')?.error?.('desktop ball failed: %s', String(err)) } catch {}
+    })
   try {
     ctx.webServer?.register?.({
       kind: 'exact',
       path: '/api/assistant/ball',
       handler: (_req: any, res: any) => {
         const payload = JSON.stringify({ native: nativeBall })
+        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+        res.end(payload)
+      },
+    })
+    ctx.webServer?.register?.({
+      kind: 'exact',
+      path: '/api/assistant/ball-click',
+      handler: (_req: any, res: any) => {
+        const open = ballHandle ? ballHandle.takeClick() === true : false
+        const payload = JSON.stringify({ open })
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
         res.end(payload)
       },

@@ -705,6 +705,15 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_btnGhost:hover{color:var(--wt-text);border-color:var(--wt-borderHover)}',
   '.dsh-wt_btnPrimary{border-color:transparent;background:var(--dsw-alias-state-accent-primary,#4f8ef7);color:#fff}',
   '.dsh-wt_btnPrimary:disabled{opacity:.55;cursor:default}',
+  // 项目管理面板：项目行 + 隐藏/删除
+  '.dsh-wt_manageList{display:flex;flex-direction:column;gap:6px;max-height:52vh;overflow:auto}',
+  '.dsh-wt_manageRow{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--wt-border,rgba(0,0,0,.12));border-radius:10px;background:rgba(255,255,255,.03)}',
+  '.dsh-wt_manageRowHidden{opacity:.62}',
+  '.dsh-wt_manageIcon{flex:none;font-size:18px;line-height:1}',
+  '.dsh-wt_manageName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--wt-text,inherit)}',
+  '.dsh-wt_manageBtn{flex:none;padding:5px 10px;border:1px solid var(--wt-border,rgba(0,0,0,.15));border-radius:8px;background:transparent;color:var(--wt-text2,inherit);font:inherit;font-size:11px;cursor:pointer}',
+  '.dsh-wt_manageBtn:hover{border-color:var(--dsw-alias-state-accent-primary,#4f8ef7);color:var(--dsw-alias-state-accent-primary,#4f8ef7)}',
+  '.dsh-wt_manageDel:hover{border-color:#f85149;color:#f85149}',
   '.dsh-wt_consoleAddLabel{font-size:17px;font-weight:600;color:var(--wt-text2)}',
   '.dsh-wt_consoleAdd:hover .dsh-wt_consoleAddLabel{color:var(--dsw-alias-state-accent-primary,#4f8ef7)}',
   // 控制室入口卡：统筹主程序的差异化（渐变底 + 微光；无描边，颜色更亮更饱和）

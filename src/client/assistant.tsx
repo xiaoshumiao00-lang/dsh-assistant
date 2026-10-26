@@ -55,6 +55,17 @@ export function apply(ctx: any): void {
       .catch(() => {})
   } catch {}
 
+  // 原生球点击 → 宿主 pending → 这里轮询后打开控制室（1.2s 内响应）
+  try {
+    window.setInterval(() => {
+      if (!nativeBallStore.getSnapshot()) return
+      void fetch('/api/assistant/ball-click', { cache: 'no-store' })
+        .then((r) => r.json())
+        .then((d) => { if (d?.open === true) controlRoomStore.setOpen(true) })
+        .catch(() => {})
+    }, 1200)
+  } catch {}
+
   worktableApply(ctx)
   pocketApply(ctx)
   // 托管（原 dsh-tuoguan）：composer 右侧开关 + 提问/审批自动应答 + 跨端同步

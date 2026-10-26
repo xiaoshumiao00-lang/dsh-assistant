@@ -330,6 +330,29 @@ function normHsl(v: any): { h: number; s: number; l: number } | undefined {
   }
 }
 
+// ── 控制室列数：按设备独立（电脑 5 列 / 手机 2 列互不影响）──
+// 列数是设备本地偏好，不参与跨端同步；view.consoleCols 只作为旧存档迁移来源。
+const IS_MOBILE_DEVICE = typeof navigator !== 'undefined'
+  && /Android|iPhone|iPod|iPad|Mobile|Windows Phone/i.test(navigator.userAgent)
+const CONSOLE_COLS_KEY = 'dsh-assistant.consoleCols.' + (IS_MOBILE_DEVICE ? 'mobile' : 'desktop')
+function readConsoleColsLocal(): number | null {
+  try {
+    const raw = localStorage.getItem(CONSOLE_COLS_KEY)
+    if (raw === null) return null
+    const n = Number(raw)
+    return Number.isFinite(n) && n >= 0 && n <= 5 ? Math.round(n) : null
+  } catch { return null }
+}
+function writeConsoleColsLocal(n: number): void {
+  try { localStorage.setItem(CONSOLE_COLS_KEY, String(Math.max(0, Math.min(5, Math.round(n))))) } catch {}
+}
+/** 跨端同步的视图：剔除只属于本机的列数 */
+function viewForSync(v: any): any {
+  const out = { ...(v ?? {}) }
+  delete out.consoleCols
+  return out
+}
+
 function loadView(): ViewState {
   try {
     const raw = localStorage.getItem(PERSIST_KEY)
@@ -1774,7 +1797,7 @@ function WorktableSection(props: any) {
           const res = await fetch('/api/assistant/state', {
             method: 'PUT',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ projects: merged, view: st.view ?? viewRef.current }),
+            body: JSON.stringify({ projects: merged, view: viewForSync(st.view ?? viewRef.current) }),
           })
           const dd = await res.json().catch(() => null)
           syncRevRef.current = Number(dd?.state?.revision ?? st.revision) || 0
@@ -1783,7 +1806,7 @@ function WorktableSection(props: any) {
           const res = await fetch('/api/assistant/state', {
             method: 'PUT',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ projects: projectsRef.current.projects, view: viewRef.current }),
+            body: JSON.stringify({ projects: projectsRef.current.projects, view: viewForSync(viewRef.current) }),
           })
           const dd = await res.json().catch(() => null)
           if (dd?.state?.revision) syncRevRef.current = dd.state.revision
@@ -1836,7 +1859,7 @@ function WorktableSection(props: any) {
           const r = await fetch('/api/assistant/state', {
             method: 'PUT',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ projects: projectsRef.current.projects, view: viewRef.current }),
+            body: JSON.stringify({ projects: projectsRef.current.projects, view: viewForSync(viewRef.current) }),
           })
           const d = await r.json().catch(() => null)
           if (d?.state?.revision) syncRevRef.current = Number(d.state.revision) || 0
@@ -2132,6 +2155,11 @@ function WorktableSection(props: any) {
     const ackMap = loadNotifyAck()
     const make = (id: string, name: string, icon: string, self: boolean): ConsoleCardData => {
       const sid = pr.projects.bindings[id]
+      // 模板项目的任务跑在「步骤会话」里，绑定会话可能为空：预览取正在跑/最近一步的步骤会话
+      const stepSids = pr.projects.flows?.[id]?.stepSessions
+        ? Object.values(pr.projects.flows[id].stepSessions).filter((x): x is string => typeof x === 'string' && !!x)
+        : []
+      const previewSid = sid || (stepSids.find((s) => sessionRunningNow(s, byId, kidsSetOf)) ?? stepSids[stepSids.length - 1] ?? null)
       const status = statusOf(id)
       // 发光 = 完成/待决且本轮未被确认；点卡片确认后熄灭
       const glow = !!sid && ((status === 'done' && ackMap[sid] !== 'done') || (status === 'need' && ackMap[sid] !== 'need'))
@@ -2140,7 +2168,7 @@ function WorktableSection(props: any) {
         status,
         runtimeMs: runtimeOfPid(id),
         kids: sid ? kidsSetOf(sid).size : 0,
-        preview: sid ? (activityCache.get(sid) || latestActivityOf(sid) || previewCache.get(sid) || '') : '',
+        preview: previewSid ? (activityCache.get(previewSid) || latestActivityOf(previewSid) || previewCache.get(previewSid) || '') : '',
         bound: !!sid,
         // 内置项目（控制室）恒提供「＋」：它没有项目文件夹，目录由 newSessionFolderOf 逐级回退解析
         canNewSession: self || !!newSessionFolderOf(id),
@@ -2229,8 +2257,14 @@ function WorktableSection(props: any) {
         getCards: () => getConsoleCards(),
         getTheme: () => viewRef.current.consoleTheme ?? 'system',
         setTheme: (th: 'dark' | 'light' | 'system') => persistView({ consoleTheme: th }),
-        getCols: () => viewRef.current.consoleCols ?? 0,
-        setCols: (n: number) => persistView({ consoleCols: n }),
+        getCols: () => {
+          const local = readConsoleColsLocal()
+          if (local !== null) return local
+          const legacy = viewRef.current.consoleCols
+          if (typeof legacy === 'number') { writeConsoleColsLocal(legacy); return legacy }
+          return 0
+        },
+        setCols: (n: number) => { writeConsoleColsLocal(n) },
         getShape: () => viewRef.current.consoleShape ?? 'square',
         setShape: (s: 'square' | 'circle') => persistView({ consoleShape: s }),
         getBg: () => viewRef.current.consoleBg ?? 'glow',
@@ -2319,6 +2353,9 @@ function WorktableSection(props: any) {
         onCreateSession: (id, opts) => { void createProjectSession(id, opts) },
         onPinSession: (sid, pinned) => pinProjectSession(sid, pinned),
         onArchiveSession: (sid, archived) => archiveProjectSession(sid, archived),
+        getManageProjects: () => manageProjectsOf(),
+        onHideProject: (id, hidden) => hideProject(id, hidden),
+        onDeleteProject: (id) => deleteProject(id),
         getProjectSessions: (id) => projectSessionsOf(id),
         onOpenSession: (sid) => openProjectSession(sid),
         onDeleteSession: (sid) => deleteProjectSession(sid),
@@ -2714,6 +2751,64 @@ function buildCustomLayoutPrompt(req: string): string {
       ? (api?.archiveSession(sid) ?? ws?.archiveSession?.(sid))
       : (api?.unarchiveSession(sid) ?? ws?.unarchiveSession?.(sid))
     Promise.resolve(run).catch((err) => console.warn('[dsh-assistant] 归档失败：', err)).finally(() => notifyConsole())
+  }
+
+  /** 项目管理：控制室里的项目清单（含已隐藏），供「项目管理」面板使用 */
+  const manageProjectsOf = (): { id: string; name: string; icon: string; hidden: boolean }[] => {
+    const pr = projectsRef.current
+    const seen = new Set<string>()
+    const out: { id: string; name: string; icon: string; hidden: boolean }[] = []
+    for (const l of pr.projects.layouts) {
+      if (!l || typeof l.id !== 'string' || l.id === CONSOLE_ID || seen.has(l.id)) continue
+      seen.add(l.id)
+      out.push({
+        id: l.id,
+        name: pr.projects.nameOverrides[l.id] ?? l.title ?? l.id,
+        icon: pr.projects.iconOverrides[l.id] ?? l.icon ?? '🧱',
+        hidden: pr.projects.hidden.includes(l.id),
+      })
+    }
+    for (const id of pr.aliveRegisteredIds) {
+      if (id === CONSOLE_ID || seen.has(id)) continue
+      seen.add(id)
+      out.push({ id, name: pr.projects.nameOverrides[id] ?? pr.metas[id]?.name ?? id, icon: pr.projects.iconOverrides[id] ?? pr.metas[id]?.icon ?? '📦', hidden: pr.projects.hidden.includes(id) })
+    }
+    return out
+  }
+
+  /** 隐藏 / 恢复项目（只影响控制室显示，不动文件夹与会话） */
+  const hideProject = (pid: string, hidden: boolean): void => {
+    persistProjects((prev) => ({
+      ...prev,
+      hidden: hidden ? Array.from(new Set([...prev.hidden, pid])) : prev.hidden.filter((x) => x !== pid),
+    }))
+    notifyConsole()
+  }
+
+  /** 删除项目条目（不删磁盘文件夹/会话；模板进度、绑定、文件夹映射一并清掉），带确认 */
+  const deleteProject = (pid: string): void => {
+    const pr = projectsRef.current.projects
+    const layout = pr.layouts.find((l) => l.id === pid)
+    const name = pr.nameOverrides[pid] ?? layout?.title ?? pid
+    let ok = true
+    try { ok = window.confirm(`删除项目「${name}」？\n只删除控制室里的项目条目，磁盘文件夹与会话记录不会删除。`) } catch {}
+    if (!ok) return
+    persistProjects((prev) => {
+      const next: any = { ...prev }
+      next.layouts = prev.layouts.filter((l) => l.id !== pid)
+      next.order = prev.order.filter((x) => x !== pid)
+      next.hidden = prev.hidden.filter((x) => x !== pid)
+      next.views = { ...prev.views }; delete next.views[pid]
+      next.nameOverrides = { ...prev.nameOverrides }; delete next.nameOverrides[pid]
+      next.iconOverrides = { ...prev.iconOverrides }; delete next.iconOverrides[pid]
+      next.bindings = { ...prev.bindings }; delete next.bindings[pid]
+      next.folders = { ...prev.folders }; delete next.folders[pid]
+      next.flows = { ...(prev.flows ?? {}) }; delete next.flows[pid]
+      next.briefs = { ...(prev.briefs ?? {}) }; delete next.briefs[pid]
+      return next
+    })
+    if (splitStore.active && splitStore.spec?.id === pid) { try { splitStore.close() } catch {} }
+    notifyConsole()
   }
 
   /** 为「还没有专属会话」的项目自动补一个项目对话：空白会话、工作目录 = 项目文件夹
