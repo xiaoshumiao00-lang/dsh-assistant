@@ -705,6 +705,16 @@ const NARROW_RULES = `
     box-shadow: 0 -4px 28px rgba(0, 0, 0, .18) !important;
   }
 
+  /* 「＋」命令菜单必须压在会话头、抽屉、悬浮球之上。宿主给 composerSeat
+     的 z-index 只有 7/9（菜单打开时 9），菜单自身再高也逃不出这个层叠上下文；
+     这里只在菜单展开期间抬高座位的层叠层级，关闭后自动恢复原状。 */
+  [data-phase] [data-composer-seat]:has([data-trigger-menu]) {
+    z-index: 4000 !important;
+  }
+  [data-phase] [data-trigger-menu] {
+    z-index: 4001 !important;
+  }
+
   /* --- Session header on mobile ---
      Layout goal: [toggle] [session title] [mode badge] in a row, with the
      Session log capsule removed from the header (relocated to the drawer
