@@ -9,6 +9,7 @@ import { defaultProjectFolder, defaultProjectName, isAutoProjectFolder } from '.
 import { ICON_CHOICES, resolveProjectIcon, pickUnusedIcon } from './projectIcons'
 import { focusSessionInHost, sessionFaceState, healBlankSessionIfStuck, type FocusResult } from './sessionFocus'
 import { sessionsUnderFolder, normalizeFolderPath } from './sessionFolder'
+import { hasPendingInteraction, sessionStatusSourceOf } from './sessionStatus'
 
 /** 项目叠加层（L2）可选项：写作语言 */
 const PAPER_LANG_OPTIONS = ['中文写作后翻译英文', '直接写英文', '仅中文投稿']
@@ -576,7 +577,7 @@ function findSidebar(start: HTMLElement | null): HTMLElement | null {
 const registryStore: { ids: string[]; listeners: Set<() => void> } = { ids: [], listeners: new Set() }
 
 /** 自定义窗口 → 宿主会话桥（apply 时注入；不可用时 CustomPane 降级提示）
- *  pendingInteractions：宿主「等待用户决策」登记（独立于会话列表/face 快照；防御式解析，可能为空） */
+ *  pendingInteractions：旧版宿主状态源（新版通过 clientCtx.get('uiSession').sessionStatus 读取） */
 let sessionBridge: { sessions: any; conversation: any; list: any; workspaces: any; uiWorkspace: any; pendingInteractions: any } | null = null
 /** 客户端根 ctx（apply 时保存；用于运行时探测 0.1.2 的 remote.directoryPicker 等新服务，不硬写 inject） */
 let clientCtx: any = null
@@ -1931,24 +1932,25 @@ function clearNotifyAck(sid: string) {
   } catch {}
 }
 
-/** 宿主「等待用户决策」登记（uiSession.pendingInteractions：Map 会话→待处理交互）。
- *  会话列表(byId)与 face 快照都不带该信息，必须订阅这个可观察量才能感知
- *  「对话停在询问用户决策」（kind: question/approval/plan/duplicate 均算）。 */
+/** 宿主会话状态登记（uiSession.sessionStatus：Map 会话→{ running, pendingInteraction, … }）。
+ *  会话列表(byId)与 face 快照都不带待提问状态，必须订阅这个可观察量；
+ *  旧版 pendingInteractions 只存待决项，sessionStatusSourceOf 会一并兼容。 */
 const pendingInteractionsStore: { map: ReadonlyMap<string, any> | null; listeners: Set<() => void>; source: (() => void) | null } = {
   map: null, listeners: new Set(), source: null,
 }
 function findPendingInteractions(): any {
   try {
-    const s = sessionBridge?.sessions
-    if (s && typeof s.pendingInteractions === 'object' && s.pendingInteractions != null) return s.pendingInteractions
+    const direct = sessionStatusSourceOf(sessionBridge?.sessions)
+    if (direct) return direct
     const b = sessionBridge?.pendingInteractions
-    if (b != null && typeof b === 'object') return b
-    const c = sessionBridge?.conversation
-    if (c && typeof c.pendingInteractions === 'object' && c.pendingInteractions != null) return c.pendingInteractions
+    if (b && typeof b.getSnapshot === 'function' && typeof b.subscribe === 'function') return b
+    const fromConversation = sessionStatusSourceOf(sessionBridge?.conversation)
+    if (fromConversation) return fromConversation
     for (const key of ['uiSession', 'sessions', 'session']) {
       try {
         const svc = clientCtx?.get?.(key)
-        if (svc && typeof svc.pendingInteractions === 'object' && svc.pendingInteractions != null) return svc.pendingInteractions
+        const source = sessionStatusSourceOf(svc)
+        if (source) return source
       } catch {}
     }
   } catch {}
@@ -1956,30 +1958,25 @@ function findPendingInteractions(): any {
 }
 function refreshPendingInteractions(): void {
   try {
-    const pi = findPendingInteractions()
-    const m = pi && typeof pi.getSnapshot === 'function' ? pi.getSnapshot() : null
+    const source = findPendingInteractions()
+    const m = source?.getSnapshot?.()
     pendingInteractionsStore.map = m instanceof Map ? (m as ReadonlyMap<string, any>) : null
   } catch { pendingInteractionsStore.map = null }
   pendingInteractionsStore.listeners.forEach((l) => { try { l() } catch {} })
 }
-/** 订阅宿主登记（幂等；无该服务则静默降级——待决策通道保持旧行为：不亮黄） */
+/** 订阅宿主登记（幂等；无该服务时保留会话面 pending 的兜底通道）。 */
 function wirePendingInteractionsSource(): void {
   if (pendingInteractionsStore.source) return
   try {
-    const pi = findPendingInteractions()
-    if (!pi || typeof pi.subscribe !== 'function') return
-    pendingInteractionsStore.source = pi.subscribe(() => refreshPendingInteractions())
+    const source = findPendingInteractions()
+    if (!source) return
+    pendingInteractionsStore.source = source.subscribe(() => refreshPendingInteractions())
     refreshPendingInteractions()
   } catch {}
 }
-/** 该会话是否正等待用户决策（宿主 pendingInteractions 有登记即视为待决） */
+/** 该会话是否正等待用户决策（提问/审批等 pendingInteraction 非空即视为待决）。 */
 function sessionAwaitingDecision(sid: string | undefined): boolean {
-  if (!sid) return false
-  try {
-    const m = pendingInteractionsStore.map
-    if (m && m.has(sid)) return true
-  } catch {}
-  return false
+  return hasPendingInteraction(pendingInteractionsStore.map, sid)
 }
 
 /** 会话状态 → 提醒类型：待决(黄) 优先于 完成(绿)——等待用户判断时 pendingInteraction 与
