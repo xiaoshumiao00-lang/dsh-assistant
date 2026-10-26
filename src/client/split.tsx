@@ -372,8 +372,14 @@ type SplitEnv = {
   flow?: FlowEnv
 }
 let splitEnv: SplitEnv | null = null
+const splitEnvListeners = new Set<() => void>()
 export function setSplitEnv(env: SplitEnv | null) {
   splitEnv = env
+  for (const listener of [...splitEnvListeners]) { try { listener() } catch {} }
+}
+export function subscribeSplitEnv(listener: () => void): () => void {
+  splitEnvListeners.add(listener)
+  return () => { splitEnvListeners.delete(listener) }
 }
 /** 控制室面板是否已拿到工作台环境（侧栏工作台区块挂载后会注入）。
  *  悬浮球控制室用它做兜底：极端情况下侧栏被完全卸载，面板会提示而不是空白。 */
@@ -1738,11 +1744,31 @@ function ConsoleVideo(props: { src: string; style?: CSSProperties }) {
   )
 }
 
+/** 运行秒表独立刷新：只重渲染这一小段文本，不让整个控制室每秒重建全部卡片。 */
+function ConsoleRuntime({ value }: { value: number }) {
+  const [elapsed, setElapsed] = useState(value)
+  useEffect(() => {
+    setElapsed(value)
+    const mountedAt = Date.now()
+    const iv = window.setInterval(() => {
+      if (document.visibilityState === 'visible') setElapsed(value + Date.now() - mountedAt)
+    }, 1000)
+    return () => window.clearInterval(iv)
+  }, [value])
+  const seconds = Math.max(0, Math.floor(elapsed / 1000))
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  const s = seconds % 60
+  const text = h > 0
+    ? h + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0')
+    : m + ':' + String(s).padStart(2, '0')
+  return <span className="dsh-wt_consoleRuntime">{text}</span>
+}
+
 /** 控制室面板：项目卡片网格（每行 3 张、超出换行）；数据由工作台组装推送（纯读镜像）。
  *  主题：dark/light 直接生效；system = 跟随宿主 html 的 color-scheme（DSH 深色/白色/跟随系统都会反映到它） */
 export function ConsolePane() {
   const [, setTick] = useState(0)
-  const [now, setNow] = useState(() => Date.now())
   const [cols, setColsState] = useState<number>(() => splitEnv?.console?.getCols?.() ?? 0)
   const [autoCols, setAutoCols] = useState(3)
   const [shape, setShapeState] = useState<'square' | 'circle'>(() => splitEnv?.console?.getShape?.() ?? 'square')
@@ -1819,6 +1845,9 @@ export function ConsolePane() {
   const [newSessFront, setNewSessFront] = useState<{ provider: string; model: string; name?: string } | null>(null)
   const [newSessBg, setNewSessBg] = useState<{ provider: string; model: string; name?: string } | null>(null)
   const [newSessBusy, setNewSessBusy] = useState(false)
+  const newSessRequestRef = useRef(0)
+  const newSessModelsRef = useRef<OrbModel[]>([])
+  const newSessBgRequestRef = useRef<Promise<unknown> | null>(null)
   /** 行内重命名：正在编辑的会话 id 与输入草稿 */
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editDraft, setEditDraft] = useState('')
@@ -1827,6 +1856,16 @@ export function ConsolePane() {
   const [autoCheckOn, setAutoCheckOn] = useState<boolean>(() => getAutoCheck())
   const updBusyRef = useRef(false)
   const photoUrlRef = useRef<string>('')
+  const photoUrlsRef = useRef<Set<string>>(new Set())
+  const trackPhotoUrl = (url: string): void => { if (url) photoUrlsRef.current.add(url) }
+  const releasePhotoUrl = (url: string): void => {
+    if (!url || !photoUrlsRef.current.delete(url)) return
+    try { URL.revokeObjectURL(url) } catch {}
+  }
+  const releaseAllPhotoUrls = (): void => {
+    for (const url of photoUrlsRef.current) { try { URL.revokeObjectURL(url) } catch {} }
+    photoUrlsRef.current.clear()
+  }
   const [openMenu, setOpenMenu] = useState<string | null>(null)
   const [bgEdit, setBgEdit] = useState<'plain' | 'glow' | 'photo' | null>(null)
   const [plainHsl, setPlainHslState] = useState<{ h: number; s: number; l: number }>(() => {
@@ -1884,8 +1923,21 @@ export function ConsolePane() {
     setShapeState(s)
     splitEnv?.console?.setShape?.(s)
   }
-  /** 打开「新建会话」面板：按入口预设模式，预填该模式上次用的模型，异步拉模型目录 */
+  /** 后台模型独立加载，绝不卡住前台目录或标准模式。 */
+  const loadNewSessionBackground = (requestId: number): void => {
+    const api = getAssistantApi()
+    if (!api?.backgroundModel) return
+    const task = api.backgroundModel()
+    newSessBgRequestRef.current = task
+    void task.then((bg) => {
+      if (!bg || newSessRequestRef.current !== requestId || newSessBgRequestRef.current !== task) return
+      const found = newSessModelsRef.current.find((m) => m.provider === bg.provider && m.model === bg.model)
+      setNewSessBg({ provider: bg.provider, model: bg.model, name: found?.name ?? bg.model })
+    }).catch(() => {})
+  }
+  /** 打开面板立即显示缓存目录，同时后台刷新；catalog 与后台模型互不阻塞。 */
   const openNewSessionPanel = (c: ConsoleCardData, mode: 'standard' | 'computer-use' = 'standard') => {
+    const requestId = ++newSessRequestRef.current
     setNewSessFor({ id: c.id, name: c.name })
     setNewSessMode(mode)
     const lastFront = readModelPref(mode === 'computer-use' ? 'cu' : 'standard')
@@ -1893,23 +1945,19 @@ export function ConsolePane() {
     const lastBg = readBgPref()
     setNewSessBg(lastBg ? { provider: lastBg.provider, model: lastBg.model, name: lastBg.name } : null)
     setNewSessBusy(false)
-    setNewSessModelsLoading(true)
+    const cached = newSessModelsRef.current
+    setNewSessModels(cached)
+    setNewSessModelsLoading(cached.length === 0)
+    if (mode === 'computer-use') loadNewSessionBackground(requestId)
     const api = getAssistantApi()
     void (async () => {
       try {
         const cat = await api?.modelCatalog?.()
         const models = cat?.models ?? []
-        setNewSessModels(models)
-        // 后台模型以主机设置为准（悬浮球设置同一份配置），回读校正本地缓存
-        try {
-          const bg = await api?.backgroundModel?.()
-          if (bg) {
-            const found = models.find((m) => m.provider === bg.provider && m.model === bg.model)
-            setNewSessBg({ provider: bg.provider, model: bg.model, name: found?.name ?? bg.model })
-          }
-        } catch {}
-      } catch {}
-      setNewSessModelsLoading(false)
+        newSessModelsRef.current = models
+        if (newSessRequestRef.current === requestId) setNewSessModels(models)
+      } catch { /* 保留缓存；没有缓存时按不可用提示 */ }
+      if (newSessRequestRef.current === requestId) setNewSessModelsLoading(false)
     })()
   }
   /** 提交「新建会话」：标准模式也可选前台模型；computer-use 另带后台模型。
@@ -1959,6 +2007,7 @@ export function ConsolePane() {
     if (rec) { id = rec.id; url = rec.url; kind = rec.kind } else {
       url = URL.createObjectURL(file)
     }
+    trackPhotoUrl(url)
     photoUrlRef.current = url
     setPhotoIdLocal(id)
     if (id) setPhotoList((prev) => [{ id, kind, url }, ...prev])
@@ -1969,7 +2018,7 @@ export function ConsolePane() {
   /** 删除一条媒体：当前使用的那条被删 → 切到最新一条；删光 → 回到流光背景 */
   const removePhotoById = async (p: { id: string; kind: 'photo' | 'video'; url: string }) => {
     try { await splitEnv?.console?.removePhoto?.(p.id) } catch {}
-    try { URL.revokeObjectURL(p.url) } catch {}
+    releasePhotoUrl(p.url)
     const nextList = photoList.filter((x) => x.id !== p.id)
     setPhotoList(nextList)
     if (photoId === p.id) {
@@ -2223,7 +2272,9 @@ export function ConsolePane() {
   useEffect(() => {
     let alive = true
     splitEnv?.console?.getPhotoLib?.().then((lib) => {
-      if (!alive) return
+      // 异步返回时面板已关闭：这一批 URL 从未被使用，也要立即释放。
+      if (!alive) { for (const item of lib.list) { try { URL.revokeObjectURL(item.url) } catch {} } return }
+      for (const item of lib.list) trackPhotoUrl(item.url)
       setPhotoList(lib.list)
       const active = lib.list.find((p) => p.id === lib.activeId) ?? lib.list[0] ?? null
       if (active) {
@@ -2240,14 +2291,8 @@ export function ConsolePane() {
     if (!photoId) return
     setPhotoHslState(splitEnv?.console?.getPhotoHsl?.(photoId) ?? { h: 0, s: 100, l: 100 })
   }, [photoId])
-  // 面板卸载时释放对象 URL
-  useEffect(() => () => { if (photoUrlRef.current) { try { URL.revokeObjectURL(photoUrlRef.current) } catch {} } }, [])
-  // 运行时长的分钟级刷新：每秒重渲染一次（仅控制室开着时存在）
-  useEffect(() => {
-    const iv = window.setInterval(() => setNow(Date.now()), 1000)
-    return () => window.clearInterval(iv)
-  }, [])
-  void now
+  // 面板卸载时释放本次媒体库创建的全部对象 URL（不只当前背景那一张）。
+  useEffect(() => () => releaseAllPhotoUrls(), [])
   const env = splitEnv?.console
   const cards = env ? env.getCards() : []
   const resolvedTheme: 'dark' | 'light' = (() => {
@@ -2276,13 +2321,6 @@ export function ConsolePane() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resolvedTheme])
-  const fmtDur = (ms: number) => {
-    const s = Math.max(0, Math.floor(ms / 1000))
-    const h = Math.floor(s / 3600)
-    const m = Math.floor((s % 3600) / 60)
-    const ss = s % 60
-    return h > 0 ? h + ':' + String(m).padStart(2, '0') + ':' + String(ss).padStart(2, '0') : m + ':' + String(ss).padStart(2, '0')
-  }
   /** 打开卡片「会话列表」浮层：取该项目目录下的全部会话（含模板各步骤子目录与已归档项），定位到按钮正下方 */
   const openSessionList = (anchor: HTMLElement, c: ConsoleCardData) => {
     const items = splitEnv?.console?.getProjectSessions?.(c.id) ?? []
@@ -2415,7 +2453,7 @@ export function ConsolePane() {
             <div className="dsh-wt_consoleDivider" aria-hidden />
             <div className="dsh-wt_consoleStatusRow">
               <span className={'dsh-wt_consoleStatus dsh-wt_consoleStatus-' + c.status}>{statusLabel[c.status]}</span>
-              {c.runtimeMs != null && <span className="dsh-wt_consoleRuntime">{fmtDur(c.runtimeMs)}</span>}
+              {c.runtimeMs != null && <ConsoleRuntime value={c.runtimeMs} />}
             </div>
             {(c.status === 'busy' || c.status === 'error' || (c.glow && c.status === 'need')) && <span className="dsh-wt_consoleSweep" aria-hidden />}
             <div className={'dsh-wt_consolePreview' + (c.preview ? '' : ' dsh-wt_consolePreviewNone') + (c.live ? ' dsh-wt_consolePreviewLive' : '')} title={c.preview}>
@@ -2795,6 +2833,7 @@ export function ConsolePane() {
               }}>{T('console.modeStandard')}</button>
               <button type="button" className={'dsh-wt_modeBtn' + (newSessMode === 'computer-use' ? ' dsh-wt_modeBtnOn' : '')} onClick={() => {
                 setNewSessMode('computer-use')
+                loadNewSessionBackground(newSessRequestRef.current)
                 const p = readModelPref('cu')
                 setNewSessFront(p ? { provider: p.provider, model: p.model, name: p.name } : null)
               }}>{T('console.modeComputerUse')}</button>

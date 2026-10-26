@@ -40,6 +40,7 @@ await build({
   entryPoints: [join(here, 'src/client/assistant.tsx')],
   outfile: 'lib/client.js',
   bundle: true,
+  minify: true,
   sourcemap: 'external',
   logLevel: 'info',
   platform: 'browser',

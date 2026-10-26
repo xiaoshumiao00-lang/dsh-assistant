@@ -7,7 +7,7 @@
 // 入口：手机/电脑上的悬浮球（dsh-pocket 那颗）现在打开这里，而不再打开快捷输入页；
 // 快捷输入页仍保留在抽屉底部入口里，功能不删。
 import { useEffect, useState, useSyncExternalStore } from 'react'
-import { ConsolePane, consoleEnvReady } from './split'
+import { ConsolePane, consoleEnvReady, subscribeSplitEnv } from './split'
 import { controlRoomStore } from './orb-bridge'
 
 const CR_CSS = `
@@ -47,13 +47,12 @@ export function ControlRoomOverlay() {
     return () => document.removeEventListener('keydown', onKey)
   }, [open])
 
-  // 侧栏工作台区块可能晚于悬浮球挂载（或用户折叠了侧栏）：轮询到它就绪再渲染面板
+  // 工作台环境注入时立即就绪；不再用 700ms 轮询给首次打开额外加一拍。
   useEffect(() => {
     if (!open || ready) return
-    const timer = window.setInterval(() => {
-      if (consoleEnvReady()) setReady(true)
-    }, 700)
-    return () => window.clearInterval(timer)
+    const check = (): void => { if (consoleEnvReady()) setReady(true) }
+    check()
+    return subscribeSplitEnv(check)
   }, [open, ready])
 
   if (!open) return null

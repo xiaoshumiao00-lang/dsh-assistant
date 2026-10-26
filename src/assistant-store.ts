@@ -114,7 +114,16 @@ export function registerAssistantState(ctx: any): void {
       if (path !== STATE_ROUTE) { sendJson(res, 404, { error: 'not-found' }); return }
       try {
         if (req.method === 'GET' || req.method === 'HEAD') {
-          sendJson(res, 200, { ok: true, state: await readState() })
+          const state = await readState()
+          const params = new URL(req.url ?? '/', 'http://127.0.0.1').searchParams
+          const rawSince = params.get('sinceRevision')
+          const since = rawSince === null ? Number.NaN : Number(rawSince)
+          if (state && Number.isFinite(since) && state.revision === since) {
+            res.writeHead(204, { 'cache-control': 'no-store' })
+            res.end()
+            return
+          }
+          sendJson(res, 200, { ok: true, state })
           return
         }
         if (req.method === 'PUT' || req.method === 'POST') {

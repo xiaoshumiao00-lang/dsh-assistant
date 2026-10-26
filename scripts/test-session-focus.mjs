@@ -243,6 +243,41 @@ cases.push(['resync 也救不回来 → 上限 2 次、settled=false', async () 
   assert.equal(r.openState, 'loading')
 }])
 
+// 12. 性能回归：onOpened 必须先于空白历史修复触发，界面不用等 resync 才切换
+cases.push(['打开确认先回调 → 历史修复不阻塞界面切换', async () => {
+  const c = clock()
+  const list = listOf(['new-fast'])
+  list.byId['new-fast'].blank = true
+  const selection = { current: '', getSnapshot() { return { sessionId: this.current } }, set(v) { this.current = v } }
+  let state = 'loading'
+  let resyncs = 0
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const session = {
+    getSnapshot: () => ({ openState: state, blank: true }),
+    resync: async () => { resyncs++; await gate; state = 'open' },
+  }
+  const bridge = {
+    list: { getSnapshot: () => list },
+    sessions: { retainAgentScope() {}, binding: () => ({ session }) },
+    uiWorkspace: { openSession(id) { selection.set(id) }, selection },
+  }
+  let openedCalls = 0
+  const pending = focusSessionInHost(bridge, 'new-fast', { ...c, onOpened: () => { openedCalls++ } })
+  for (let i = 0; i < 30 && resyncs === 0; i++) await Promise.resolve()
+  assert.equal(openedCalls, 1)
+  assert.equal(resyncs, 1)
+  let completed = false
+  void pending.then(() => { completed = true })
+  await Promise.resolve()
+  assert.equal(completed, false)
+  release()
+  const r = await pending
+  assert.equal(r.opened, true)
+  assert.equal(r.settled, true)
+  assert.equal(r.openState, 'open')
+}])
+
 let failed = 0
 for (const [name, fn] of cases) {
   try {

@@ -127,6 +127,8 @@ app.on('window-all-closed', () => { try { app.quit() } catch {} })
 export interface DesktopBallHandle {
   dispose: () => void
   takeClick: () => boolean
+  /** 点击发生时即时唤醒长轮询；pendingClick 仍保留，兼顾尚未等待的客户端。 */
+  onClick: (listener: () => void) => () => void
 }
 
 export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {}): Promise<DesktopBallHandle | null> {
@@ -158,6 +160,7 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
 
   const token = randomBytes(16).toString('hex')
   let pendingClick = false
+  const clickListeners = new Set<() => void>()
   let child: any = null
   const authSockets = new Set<any>()
 
@@ -178,7 +181,10 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
           else { try { sock.destroy() } catch {} }
           continue
         }
-        if (text === 'click') pendingClick = true
+        if (text === 'click') {
+          pendingClick = true
+          for (const listener of [...clickListeners]) { try { listener() } catch {} }
+        }
       }
     })
     sock.on('timeout', () => { if (!authed) { try { sock.destroy() } catch {} } })
@@ -222,12 +228,20 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
   // 退出清理：helper 的 socket 断开后会自行退出；这里再兜底 kill 一次
   const dispose = () => {
     pendingClick = false
+    clickListeners.clear()
     for (const s of authSockets) { try { s.destroy() } catch {} }
     try { server.close() } catch {}
     try { child?.kill() } catch {}
     child = null
   }
-  return { dispose, takeClick: () => { const v = pendingClick; pendingClick = false; return v } }
+  return {
+    dispose,
+    takeClick: () => { const v = pendingClick; pendingClick = false; return v },
+    onClick: (listener) => {
+      clickListeners.add(listener)
+      return () => { clickListeners.delete(listener) }
+    },
+  }
 }
 
 export { BALL_HTML }
