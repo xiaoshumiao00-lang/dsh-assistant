@@ -1,0 +1,63 @@
+{
+  "name": "dsh-assistant",
+  "description": "DeepSeek Harness 一体化助手：悬浮球 → 控制室（项目/会话/模板）+ 手机扫码远程访问（局域网/公网）。合并 dsh-worktable 与 dsh-pocket 的能力。",
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "GPL-2.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "dsh.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-primitives",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-session-log-export"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node --check lib/index.js && node --check lib/client.js"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-client-locale": "*",
+    "@deepseek-ai/dsh-host-webserver": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true },
+    "@deepseek-ai/dsh-host-webserver": { "optional": true },
+    "@deepseek-ai/dsh-client-locale": { "optional": true }
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "highlight.js": "^11.12.0",
+    "markdown-it": "^15.0.0",
+    "xterm": "^5.3.0"
+  }
+}

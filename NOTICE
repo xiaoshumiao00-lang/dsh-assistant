@@ -1,0 +1,16 @@
+dsh-assistant 包含以下第三方代码，按原许可证使用：
+
+1. dsh-worktable — MIT License
+   https://github.com/xiaoshumiao00-lang/dsh-worktable
+   Copyright (c) 2026 dsh-worktable contributors
+   代码位置：src/index.ts、src/client/**（含 split/templates/verifyLoop/flow/styles 等）、template/
+
+2. dsh-pocket — GNU General Public License v2.0
+   https://github.com/shaobeichen/dsh-pocket
+   Copyright (c) dsh-pocket contributors
+   代码位置：src/pocket-host/**、src/client/pocket/**（含 mobile/ 下 MIT 的 dsh-web-mobile 移植）
+
+3. dsh-web-mobile（dsh-pocket 内移植）— MIT License
+   见 src/client/pocket/mobile/LICENSE.dsh-web-mobile
+
+本插件整体按 GPL-2.0 发布（见 LICENSE）。

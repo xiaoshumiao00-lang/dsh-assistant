@@ -1,0 +1,4 @@
+# dsh-assistant：控制室（/api/worktable/*）+ 手机访问代理（/dsh-pocket RPC）同一个插件包
+- insert:
+    - id: dsh-assistant
+      name: dsh-assistant
