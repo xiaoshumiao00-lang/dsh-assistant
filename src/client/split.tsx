@@ -300,6 +300,12 @@ type SplitEnv = {
     onArchiveSession?: (sessionId: string, archived: boolean) => void
     /** 卡片「＋」新建会话：可指定标准 / computer-use 模式与前台、后台模型 */
     onCreateSession?: (id: string, opts: NewSessionOptions) => void | Promise<void>
+    /** 项目管理：全部项目（含已隐藏） */
+    getManageProjects?: () => { id: string; name: string; icon: string; hidden: boolean }[]
+    /** 隐藏 / 恢复项目（只影响控制室显示） */
+    onHideProject?: (id: string, hidden: boolean) => void
+    /** 删除项目条目（不删磁盘文件夹/会话） */
+    onDeleteProject?: (id: string) => void
     /** 点发光卡片：确认（熄灭光）再打开 */
     onAck: (id: string) => void
     /** 冷会话消息预热（打开控制室时拉最近消息） */
@@ -1713,6 +1719,7 @@ export function ConsolePane() {
   const [sessShowArchived, setSessShowArchived] = useState(false)
   /** 新建会话面板：项目 id/名称 + 模式 + 前台/后台模型 */
   const [newSessFor, setNewSessFor] = useState<{ id: string; name: string } | null>(null)
+  const [manageOpen, setManageOpen] = useState(false)
   const [newSessMode, setNewSessMode] = useState<'standard' | 'computer-use'>('standard')
   const [newSessModels, setNewSessModels] = useState<OrbModel[]>([])
   const [newSessModelsLoading, setNewSessModelsLoading] = useState(false)
@@ -2500,6 +2507,9 @@ export function ConsolePane() {
           <button type="button" className={'dsh-wt_dockBtn' + (openMenu === 'theme' ? ' dsh-wt_dockBtnOn' : '')} title={T('console.themeLabel')} aria-label={T('console.themeLabel')} onClick={() => setOpenMenu(openMenu === 'theme' ? null : 'theme')}><ThemeIcon mode={themeMode} /></button>
           <button type="button" className={'dsh-wt_dockBtn' + (openMenu === 'bg' ? ' dsh-wt_dockBtnOn' : '')} title={T('console.bgLabel')} aria-label={T('console.bgLabel')} onClick={() => { setOpenMenu(openMenu === 'bg' ? null : 'bg'); setBgEdit(null) }}><svg width="18" height="18" viewBox="0 0 16 16" aria-hidden><rect x="2.2" y="3.2" width="11.6" height="9.6" rx="1.6" fill="none" stroke="currentColor" strokeWidth="0.9" /><circle cx="5.9" cy="6.7" r="1.05" fill="none" stroke="currentColor" strokeWidth="0.8" /><path d="M3.4 11.4l3-3 2.3 2.3 1.9-1.9 3 2.6" fill="none" stroke="currentColor" strokeWidth="0.9" /></svg></button>
           <button type="button" className={'dsh-wt_dockBtn' + (openMenu === 'cols' ? ' dsh-wt_dockBtnOn' : '')} title={T('console.colsLabel')} aria-label={T('console.colsLabel')} onClick={() => setOpenMenu(openMenu === 'cols' ? null : 'cols')}><svg width="20" height="20" viewBox="0 0 16 16" aria-hidden><rect x="2.2" y="3.4" width="2.7" height="9.2" rx="0.9" fill="none" stroke="currentColor" strokeWidth="0.9" /><rect x="6.65" y="3.4" width="2.7" height="9.2" rx="0.9" fill="none" stroke="currentColor" strokeWidth="0.9" /><rect x="11.1" y="3.4" width="2.7" height="9.2" rx="0.9" fill="none" stroke="currentColor" strokeWidth="0.9" /></svg></button>
+          <button type="button" className={'dsh-wt_dockBtn' + (manageOpen ? ' dsh-wt_dockBtnOn' : '')} title={T('console.manage')} aria-label={T('console.manage')} onClick={() => { setOpenMenu(null); setManageOpen((v) => !v) }}>
+            <svg width="18" height="18" viewBox="0 0 16 16" aria-hidden><path d="M3 4.6h10M3 8h10M3 11.4h6" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /><circle cx="12.4" cy="11.4" r="1.5" fill="none" stroke="currentColor" strokeWidth="1.1" /></svg>
+          </button>
         </div>
         {openMenu === 'theme' && (
           <div className="dsh-wt_drop">
@@ -2598,6 +2608,40 @@ export function ConsolePane() {
           </div>
         )}
       </div>
+
+      {/* 项目管理：隐藏 / 恢复 / 删除（只删控制室条目，不删文件夹与会话） */}
+      {manageOpen && (
+        <div className="dsh-wt_newSessMask" onClick={() => setManageOpen(false)}>
+          <div className="dsh-wt_newSess" role="region" aria-label={T('console.manage')} onClick={(e) => e.stopPropagation()}>
+            <div className="dsh-wt_newSessHead">
+              <span className="dsh-wt_newSessTitle">{T('console.manage')}</span>
+              <span className="dsh-wt_newSessProj">{T('console.manageHint')}</span>
+            </div>
+            <div className="dsh-wt_manageList">
+              {(() => {
+                const list = splitEnv?.console?.getManageProjects?.() ?? []
+                if (list.length === 0) return <div className="dsh-wt_modelHint">{T('console.manageEmpty')}</div>
+                return list.map((p) => (
+                  <div key={p.id} className={'dsh-wt_manageRow' + (p.hidden ? ' dsh-wt_manageRowHidden' : '')}>
+                    <span className="dsh-wt_manageIcon" aria-hidden>{p.icon}</span>
+                    <span className="dsh-wt_manageName" title={p.name}>{p.name}</span>
+                    {p.hidden && <span className="dsh-wt_sessTag">{T('console.hiddenTag')}</span>}
+                    <button type="button" className="dsh-wt_manageBtn" onClick={() => splitEnv?.console?.onHideProject?.(p.id, !p.hidden)}>
+                      {p.hidden ? T('console.show') : T('console.hide')}
+                    </button>
+                    <button type="button" className="dsh-wt_manageBtn dsh-wt_manageDel" onClick={() => splitEnv?.console?.onDeleteProject?.(p.id)}>
+                      {T('console.deleteProject')}
+                    </button>
+                  </div>
+                ))
+              })()}
+            </div>
+            <div className="dsh-wt_newSessOps">
+              <button type="button" className="dsh-wt_btnPrimary" onClick={() => setManageOpen(false)}>{T('console.manageClose')}</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 新建会话面板：标准 / computer-use（后者可选前台与后台模型） */}
       {newSessFor && (
