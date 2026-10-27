@@ -4,6 +4,7 @@ import { readdirSync, realpathSync } from 'node:fs'
 import { readdir, readFile, stat } from 'node:fs/promises'
 import { dirname, resolve as pathResolve, sep } from 'node:path'
 import { createRequire } from 'node:module'
+import { manageWebRoutes } from './web-routes'
 import { homedir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -379,13 +380,15 @@ async function listSkills(ctx: any, cwd: string): Promise<{ skills: SkillEntry[]
 }
 
 export function apply(ctx: Context) {
-  const webServer = (ctx as any).webServer
-  if (!webServer) {
+  const server = (ctx as any).webServer
+  if (!server) {
     ctx.logger?.warn('[dsh-worktable] ctx.webServer 不可用（headless profile？），跳过服务端路由')
     return
   }
-
-  webServer.register({
+  const routes = manageWebRoutes(server)
+  const webServer = routes.webServer
+  try {
+    webServer.register({
     kind: 'exact',
     path: HEALTH_PATH,
     handler: (_req: any, res: any) => {
@@ -651,4 +654,10 @@ export function apply(ctx: Context) {
   })
 
   setupTerminal(webServer, ctx)
+  return routes.dispose
+  } catch (err) {
+    // apply 中途失败也不能留下半套路由，否则下一次 HMR 会被自己的残留卡死。
+    routes.dispose()
+    throw err
+  }
 }

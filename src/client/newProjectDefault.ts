@@ -1,7 +1,7 @@
 /** 新建项目对话框的默认项目文件夹：用户不手动选择文件夹时，
  *  自动在 D:\陈潘HBEU\Desktop\删除 下新建一个以当前时间命名（YYYYMMDDHHmm）的子文件夹。
  *  纯函数 + 宿主目录列检查，无 react 依赖，可 node 单元测试。 */
-import { joinPath, basenameOf } from './pathutil'
+import { joinPath, basenameOf } from './pathutil.ts'
 
 /** 新建项目默认父目录（用户指定 2026-09-27） */
 export const DEFAULT_NEW_PROJECT_PARENT = 'D:\\陈潘HBEU\\Desktop\\删除'
@@ -57,4 +57,23 @@ export function isAutoProjectFolder(folderPath: string): boolean {
   const parent = key(DEFAULT_NEW_PROJECT_PARENT)
   if (!target || !parent || !target.startsWith(parent + '\\')) return false
   return /^\d{12}(-\d+)?$/.test(target.slice(parent.length + 1))
+}
+
+/**
+ * 手机端「选择位置」抽屉的起始目录：
+ *   - 空值 → 默认父目录（D:\陈潘HBEU\Desktop\删除）；
+ *   - 本插件自动生成的**待创建**时间戳目录 → 默认父目录：这个目录要等保存时才 mkdir，
+ *     直接把它当起点会让宿主 fs.list 抛 ENOENT，选择器一打开就是「无法读取目录」；
+ *   - 其它（用户手动选过 / 已存在的真实目录）→ 原样，从那里继续往下浏览。
+ */
+export function projectFolderBrowseStart(
+  folderPath: string | null | undefined,
+  fallback: string = DEFAULT_NEW_PROJECT_PARENT,
+): string {
+  const wanted = String(folderPath ?? '').trim()
+  if (!wanted) return fallback
+  // 自动目录（时间戳子目录）的父目录按定义就是默认父目录：直接给规范化的默认父目录，
+  // 免得尾分隔符 / 正反斜杠混写时算出一个带混合分隔符的路径。
+  if (isAutoProjectFolder(wanted)) return DEFAULT_NEW_PROJECT_PARENT
+  return wanted
 }

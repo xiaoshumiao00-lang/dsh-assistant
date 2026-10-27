@@ -1,7 +1,7 @@
 {
   "name": "dsh-assistant",
   "description": "DeepSeek Harness 一体化助手：悬浮球 → 控制室（项目/会话/模板）+ 手机扫码远程访问（局域网/公网）。合并 dsh-worktable 与 dsh-pocket 的能力。",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "engines": {
     "node": ">=22"
   },
@@ -10,6 +10,7 @@
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./pocket": "./lib/pocket.js",
     "./client": "./lib/client.js",
     "./package.json": "./package.json",
     "./computer-use": "./lib/computer-use.js",
@@ -18,6 +19,7 @@
   },
   "files": [
     "lib/index.js",
+    "lib/pocket.js",
     "lib/client.js",
     "lib/computer-use.js",
     "lib/computer-use-code-agent.js",
@@ -46,8 +48,8 @@
   },
   "scripts": {
     "build": "node build.mjs",
-    "check": "node --check lib/index.js && node --check lib/client.js",
-    "test": "node scripts/test-session-focus.mjs && node scripts/test-session-folder.mjs && node scripts/test-session-status.mjs && node scripts/test-session-index.mjs && node scripts/test-pc-file.mjs && node scripts/test-split-entry.mjs && node scripts/test-coordinate-mode.mjs && node scripts/test-console-filter.mjs"
+    "check": "node --check lib/index.js && node --check lib/pocket.js && node --check lib/client.js",
+    "test": "node scripts/test-web-routes.mjs && node scripts/test-pocket-session.mjs && node scripts/test-pocket-runtime.mjs && node scripts/test-mobile-boot.mjs && node scripts/test-mobile-proxy.mjs && node scripts/test-session-focus.mjs && node scripts/test-session-folder.mjs && node scripts/test-session-status.mjs && node scripts/test-session-index.mjs && node scripts/test-pc-file.mjs && node scripts/test-new-project-default.mjs && node scripts/test-clipboard.mjs && node scripts/test-split-entry.mjs && node scripts/test-coordinate-mode.mjs && node scripts/test-console-filter.mjs"
   },
   "dependencies": {
     "qrcode": "^1.5.4",

@@ -4,6 +4,8 @@
 import xtermCss from 'xterm/css/xterm.css'
 
 export const css = xtermCss + '\n' + [
+  // 隐藏每轮结尾的「已编辑 N 个文件」改动卡片（保留代码视图、轨迹与右侧 review）
+  '[data-changed-files]{display:none !important}',
   // 区块整体
   '.dsh-wt_section{box-sizing:border-box;display:flex;flex-direction:column;gap:6px;width:100%;padding:0}',
   // 无头宿主：不在侧栏出现工作台区块，只保留添加项目等 fixed 弹窗

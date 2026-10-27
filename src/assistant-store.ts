@@ -9,6 +9,7 @@
  */
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { manageWebRoutes } from './web-routes'
 
 const STATE_ROUTE = '/api/assistant/state'
 const STATE_FILENAME = 'dsh-assistant-state.json'
@@ -59,9 +60,11 @@ function normalize(raw: any): Stored | null {
   }
 }
 
-export function registerAssistantState(ctx: any): void {
-  const webServer = ctx?.webServer
-  if (!webServer || typeof webServer.register !== 'function') return
+export function registerAssistantState(ctx: any): () => void {
+  const server = ctx?.webServer
+  if (!server || typeof server.register !== 'function') return () => void 0
+  const routes = manageWebRoutes(server)
+  const webServer = routes.webServer
   const file = join(profileDir(ctx), STATE_FILENAME)
   let cached: Stored | null = null
   let loaded = false
@@ -149,4 +152,5 @@ export function registerAssistantState(ctx: any): void {
       }
     },
   })
+  return routes.dispose
 }

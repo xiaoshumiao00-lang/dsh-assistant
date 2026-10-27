@@ -1,7 +1,12 @@
 // 电脑路径浏览器（底部抽屉）：浏览的一定是**本地电脑**的目录/文件（fs.list 主机端执行）。
 // mode='dir' → 只列目录，底部「选择此目录」；mode='file' → 列目录+文件，点文件即选中。
-import { useEffect, useState } from 'react'
+//
+// 复用方：悬浮球项目目录 / 会话输入框「电脑文件」附件 / 工作台新建项目「选择位置」
+// （三者共用同一套跨盘、面包屑、桌面快捷方式逻辑，不再各写一份浏览弹窗）。
+import { useEffect, useRef, useState } from 'react'
 import type { OrbKey } from './locales.ts'
+import { parentPathOf } from '../../pathutil.ts'
+import { copyTextToClipboard } from '../../clipboard.ts'
 
 export interface FsEntry {
   name: string
@@ -51,28 +56,74 @@ export function PathBrowser({ mode, api, startPath, t, onPick, onPickDir, onClos
   const [path, setPath] = useState(startPath)
   const [listing, setListing] = useState<FsListing | null>(null)
   const [error, setError] = useState<string | null>(null)
+  /** 起始路径不存在/读不了、已自动退到上级目录的提示（只在首次定位时出现） */
+  const [fellBack, setFellBack] = useState(false)
+  /** 起始路径（mount 时定）：只在还停在起点时允许自动上退；用户自己导航后一律按结果报错 */
+  const initialPathRef = useRef(startPath)
+  /** 地址栏复制反馈：idle 显示「复制地址」，done/fail 短暂显示结果后复位 */
+  const [copyState, setCopyState] = useState<'idle' | 'done' | 'fail'>('idle')
+  const copyTimerRef = useRef<number | null>(null)
+  useEffect(() => () => {
+    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current)
+  }, [])
 
   useEffect(() => {
     let live = true
     setError(null)
     setListing(null)
-    api.listFs(path, { includeFiles: mode === 'file' }).then(
-      (result) => {
-        if (live) setListing(result as FsListing)
-      },
-      (err) => {
-        if (live) setError(err?.message ?? String(err))
-      },
-    )
+    setFellBack(false)
+    // 起点允许逐级上退：新建项目的默认文件夹是「待创建」的时间戳目录，
+    // 会话 cwd 也可能已被删除——直接报「无法读取目录」会让选择器成为死路。
+    const allowFallback = path === initialPathRef.current
+    void (async () => {
+      let target = path
+      let stepped = false
+      for (;;) {
+        try {
+          const result = (await api.listFs(target, { includeFiles: mode === 'file' })) as FsListing
+          if (!live) return
+          setListing(result)
+          setFellBack(stepped)
+          return
+        } catch (err) {
+          if (!live) return
+          const parent = parentPathOf(target)
+          if (allowFallback && parent && parent !== target) {
+            target = parent
+            stepped = true
+            continue
+          }
+          setError(err?.message ?? String(err))
+          return
+        }
+      }
+    })()
     return () => {
       live = false
     }
   }, [path, mode])
 
   const upOne = (): void => {
-    if (!listing) return
+    // 列表没读出来（含首次定位失败）时按字符串取上级，保证「上一级」始终能当退路。
+    if (!listing) {
+      const parent = parentPathOf(path)
+      if (parent !== path) setPath(parent)
+      return
+    }
     const parent = listing.crumbs.length >= 2 ? listing.crumbs[listing.crumbs.length - 2].path : listing.path
     if (parent !== listing.path) setPath(parent)
+  }
+
+  /** 地址栏当前展示/复制的绝对路径：优先用主机返回的规范化路径，读不到时退回导航中的路径 */
+  const currentPath = listing?.path || path
+
+  /** 一键复制当前地址（http 页面没有 Clipboard API 时由 copyTextToClipboard 兜底） */
+  const copyCurrentPath = async (): Promise<void> => {
+    if (currentPath === '') return
+    const copied = await copyTextToClipboard(currentPath)
+    setCopyState(copied ? 'done' : 'fail')
+    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current)
+    copyTimerRef.current = window.setTimeout(() => setCopyState('idle'), 1600)
   }
 
   return (
@@ -86,6 +137,21 @@ export function PathBrowser({ mode, api, startPath, t, onPick, onPickDir, onClos
           <div data-pocket-orb="target-path">{mode === 'file' ? t('pcFileHint') : t('pickDir')}</div>
           <button type="button" data-pocket-orb="header-btn" onClick={onClose}>{t('cancel')}</button>
         </div>
+        {/* 地址栏：显示当前绝对路径，点一下即复制（手机上 http 页面由 execCommand 兜底） */}
+        {currentPath !== '' && (
+          <button
+            type="button"
+            data-pocket-orb="path-bar"
+            data-copied={copyState}
+            title={currentPath}
+            onClick={() => { void copyCurrentPath() }}
+          >
+            <span data-pocket-orb="path-text">{currentPath}</span>
+            <span data-pocket-orb="path-copy">
+              {copyState === 'done' ? t('copied') : copyState === 'fail' ? t('copyFailed') : t('copyPath')}
+            </span>
+          </button>
+        )}
         {/* 盘符切换条：跨盘浏览（C:\ D:\ E:\ …），当前盘高亮 */}
         {listing && listing.drives.length > 0 && (
           <div data-pocket-orb="crumbs">
@@ -113,6 +179,7 @@ export function PathBrowser({ mode, api, startPath, t, onPick, onPickDir, onClos
           </div>
         )}
         <div data-pocket-orb="sheet-list">
+          {fellBack && <div data-pocket-orb="sheet-status" role="status">{t('fallbackUp')}</div>}
           {error !== null && <div data-pocket-orb="sheet-status">{error}</div>}
           {actionError != null && actionError !== '' && (
             <div data-pocket-orb="sheet-status" role="alert" style={{ color: 'var(--dsw-alias-state-error-primary,#d54941)' }}>{actionError}</div>

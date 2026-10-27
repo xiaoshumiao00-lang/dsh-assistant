@@ -8,6 +8,13 @@
 //
 // 识别方式：不依赖 dsh-web 的 hash 类名（每次构建都变），只认「文本像文件路径的
 // <button>/<a>」——文件链接按钮的文案就是路径（如 lib/proxy.mjs / /Users/.../x.ts）。
+//
+// 例外：本插件自己的界面（[data-pocket-orb] 子树：悬浮球页、电脑路径浏览器、
+// 电脑文件选择器）一律不碰。那里的「文案就是路径」的按钮是地址栏和面包屑盘符，
+// 既不该被拦成「手机上打不开」，也不该被塞一个多余的第二复制按钮——它们自己
+// 就带复制，守卫再插一个等于把地址栏撑成两行。
+
+import { copyTextToClipboard } from '../../clipboard.ts'
 
 /** 手机上点击文件时弹出的提示。 */
 const GUARD_MSG = '手机上无法直接打开电脑上的文件'
@@ -33,30 +40,13 @@ function looksLikeFilePath(text: string | null): boolean {
   return false
 }
 
-/** 写剪贴板：优先 navigator.clipboard，非安全上下文（局域网 http）回退 execCommand。 */
-async function copyText(text: string): Promise<boolean> {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text)
-      return true
-    }
-  } catch { /* 回退 */ }
-  try {
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.style.position = 'fixed'
-    ta.style.top = '-9999px'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.focus()
-    ta.select()
-    const okCopy = document.execCommand('copy')
-    ta.remove()
-    return okCopy
-  } catch {
-    return false
-  }
+/** 是否本插件自己的界面（悬浮球页 / 电脑路径浏览器 / 电脑文件选择器）：
+ *  这些按钮的文案本身就是路径（地址栏、面包屑盘符），守卫既不拦截也不注入复制按钮。 */
+function isOwnUi(el: HTMLElement): boolean {
+  return el.closest('[data-pocket-orb]') !== null
 }
+
+/** 写剪贴板统一走 clipboard.ts（http 页面走 execCommand 兜底，iOS 选中整段）。 */
 
 export function startFileGuard(
   readFile: (path: string) => Promise<ReadFileResponse>,
@@ -107,6 +97,7 @@ export function startFileGuard(
     if (target === null) return
     const el = target.closest('button, a') as HTMLElement | null
     if (el === null) return
+    if (isOwnUi(el)) return // 本插件的路径浏览器/悬浮球：地址栏、面包屑不是文件链接
     if (!looksLikeFilePath(el.textContent)) return
     event.preventDefault()
     event.stopImmediatePropagation()
@@ -126,6 +117,7 @@ export function startFileGuard(
   const processLink = (el: HTMLElement): void => {
     if (el.getAttribute('data-mobile-nav-copy') === '1') return
     if (el.getAttribute('data-mobile-nav') === 'copy-file') return
+    if (isOwnUi(el)) return // 地址栏/面包屑自己有复制，别再插一个
     const txt = (el.textContent ?? '').trim()
     if (!looksLikeFilePath(txt)) return
     el.setAttribute('data-mobile-nav-copy', '1')
@@ -146,7 +138,7 @@ export function startFileGuard(
           return
         }
         const content = res.value?.content ?? ''
-        const copied = await copyText(content)
+        const copied = await copyTextToClipboard(content)
         if (copied) {
           const kb = Math.max(1, Math.round((res.value?.size ?? content.length) / 1024))
           showToast(`已复制文件内容（${kb} KB）`)
@@ -195,6 +187,12 @@ export function startFileGuard(
     if (scheduled) return
     scheduled = true
     window.setTimeout(flushAdditions, 400)
+  }
+
+  // 旧版本曾把「复制」按钮插到地址栏/面包屑旁（它们也在 [data-pocket-orb] 里）：
+  // 启动时先清掉，避免热更或旧页面残留把抽屉撑成两行。
+  for (const stale of document.querySelectorAll<HTMLElement>('[data-pocket-orb] [data-mobile-nav="copy-file"]')) {
+    stale.remove()
   }
 
   scanAll()

@@ -1,8 +1,7 @@
-// 悬浮球装配层：注入样式/词典，注册悬浮球入口、会话输入框「电脑文件」桥与选择器：
-//   sidebar.footer.action → 抽屉底部「悬浮球」入口（OrbEntry）
+// 悬浮球装配层：注入样式/词典、会话输入框「电脑文件」桥与选择器：
 //   shell.overlay         → 悬浮球页 / 电脑文件选择器
 //   conversation.input.left → 登记官方附件写入面（不可见）
-import { OrbEntry } from './OrbEntry.tsx'
+// 手机抽屉底部不再注册旧「悬浮球」入口，避免误入已停用的旧操作流程。
 import { OrbOverlay } from './OrbOverlay.tsx'
 import { installBootGuard } from './boot-guard.ts'
 import { ORB_CSS } from './orb.css.ts'
@@ -131,18 +130,4 @@ export function orbApply(ctx: any): void {
     ),
   )
 
-  ctx.slots.inject('sidebar.footer.action', () =>
-    ctx.slots.register(
-      {
-        name: 'sidebar.footer.action',
-        id: 'pocket-orb-entry',
-        order: 20,
-        locale: NS,
-        // layout 服务按"可能不存在"处理：浏览器端某些 composition 没挂它，
-        // 裸调会让整个 slot entry 被宿主的边界吞掉（悬浮球直接消失，且没有任何报错）。
-        inject: () => ({ toggleSidebar: () => { try { ctx.layout?.toggleSidebar?.() } catch { /* 没给 layout 服务：忽略 */ } } }),
-      },
-      OrbEntry,
-    ),
-  )
 }

@@ -5,7 +5,7 @@
  *                     react / @deepseek-ai/* 由宿主模块系统提供，保持 external）
  */
 import { build } from 'esbuild'
-import { readFileSync, mkdirSync, copyFileSync } from 'node:fs'
+import { readFileSync, mkdirSync, copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { dirname, join, resolve as pathResolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -92,4 +92,30 @@ for (const asset of ['macos-sck-capture', 'libmacos-sck-capture.dylib']) {
   try { copyFileSync(join(here, 'vendor/computer-use', asset), join(here, 'lib', asset)) } catch { /* 平台无关，缺失不阻断 */ }
 }
 
-console.log('[dsh-assistant build] done: lib/index.js, lib/client.js, lib/computer-use*.js')
+// 手机访问独立构建：先在同层级临时目录生成，内容真正变化才替换正式产物。
+// 这样工作台 / 客户端构建不会触碰 pocket 的 mtime，DSH 也就不会重载手机服务。
+const pocketBuildDir = mkdtempSync(join(here, '.pocket-build-'))
+const pocketOut = join(here, 'lib/pocket.js')
+const pocketMap = join(here, 'lib/pocket.js.map')
+try {
+  await build({
+    entryPoints: [join(here, 'src/pocket.ts')],
+    outfile: join(pocketBuildDir, 'pocket.js'),
+    bundle: true,
+    sourcemap: 'external',
+    logLevel: 'info',
+    platform: 'node',
+    format: 'esm',
+    target: ['node22'],
+    external: ['@deepseek-ai/*', 'node:*', 'ws', 'qrcode'],
+  })
+  const next = readFileSync(join(pocketBuildDir, 'pocket.js'))
+  if (!existsSync(pocketOut) || !readFileSync(pocketOut).equals(next)) {
+    copyFileSync(join(pocketBuildDir, 'pocket.js'), pocketOut)
+    copyFileSync(join(pocketBuildDir, 'pocket.js.map'), pocketMap)
+  }
+} finally {
+  rmSync(pocketBuildDir, { recursive: true, force: true })
+}
+
+console.log('[dsh-assistant build] done: lib/index.js, lib/pocket.js, lib/client.js, lib/computer-use*.js')

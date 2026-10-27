@@ -17,6 +17,8 @@ import { createGzip, createBrotliCompress, constants as zlibConstants } from 'no
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { appendDiagnostic, diagnosticSummary, readDiagnosticTail } from './diagnostics.mjs';
 import { attachWsDeflate, negotiatePermessageDeflate } from './ws-deflate.mjs';
+import { optimizeMobileBoot } from './mobile-boot.mjs';
+import { createMobileBatchStore } from './mobile-batch.mjs';
 
 const DEFAULT_UPSTREAM = { host: '127.0.0.1', port: 3080 };
 
@@ -145,10 +147,9 @@ export function advancedNoticeScript() {
 // ---------- 可选访问令牌认证（issue #13 + #33） ----------
 // 只对受保护 Host（公网隧道 + 局域网按开关）强制。
 // 登录成功后种 HttpOnly 持久 cookie（Max-Age 30 天）→ SPA 内部 API/WS 自动携带。
-// 会话保持（issue #33）：cookie 值 = sha256(PIN:sessionKey)——sessionKey 是 dsh web
-// 进程级随机密钥（lib/index.js 每次启动生成）。于是：
-//   - 电脑 dsh web 一直开着 → 手机输一次密码后长期免输（持久 cookie）
-//   - dsh web 重启/更新 → sessionKey 变化 → 旧 cookie 失效 → 手机重新输入
+// 会话保持：cookie 值 = sha256(PIN:sessionKey)；sessionKey 由入口安全生成并持久化，
+// HMR / dsh web 重启后保持不变，因此手机输一次密码后长期免输（最长 30 天）。
+// 修改 PIN 仍会改变 cookie 派生值，使旧登录立即失效。
 const TOKEN_COOKIE = 'dsh_pocket_token';
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 天（秒）
 
@@ -899,6 +900,7 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
   const handshake = createHandshakeTracker(
     typeof handshakeLimit === 'number' ? { max: handshakeLimit } : {},
   );
+  const mobileBatches = createMobileBatchStore({ upstream, rewriteHeaders: loopbackAuthority, log });
   const server = createServer((req, res) => {
     let urlPath = '';
     try { urlPath = new URL(req.url ?? '/', 'http://diag.invalid').pathname; } catch { urlPath = ''; }
@@ -1088,6 +1090,9 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
       }
     }
     const headers = loopbackAuthority({ ...req.headers }, upstream);
+    // HTML 必须取未压缩版本：注入与移动首屏精简都只能安全改写纯文本。
+    // 上游 HTML 仅几十 KB，identity 的额外字节远小于误下放数 MB 旧插件 batch。
+    if (isHtmlRequest(req)) headers['accept-encoding'] = 'identity';
     // dsh web 浏览器会话 token（issue #77）：首屏根路径补一次，换回绑定 authority 的 cookie
     const launchTok = (typeof launchToken === 'function' ? launchToken() : '') || '';
     // 先清掉历史遗留的 dsh-desktop-* 参数（issue #75），再补 launch token
@@ -1125,6 +1130,7 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
       res.end(handshakeBlockedPageHtml());
       return;
     }
+    if (mobileBatches.handle(req, res)) return;
     const proxyReq = httpRequest(
       { host: upstream.host, port: upstream.port, method: req.method, path: upstreamPath, headers, agent: false },
       (proxyRes) => {
@@ -1193,6 +1199,14 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
           proxyRes.on('data', (c) => chunks.push(c));
           proxyRes.on('end', () => {
             let html = Buffer.concat(chunks).toString('utf8');
+            let mobileBootLean = false;
+            const ua = String(req.headers['user-agent'] ?? '');
+            const fullPlugins = new URL(req.url ?? '/', 'http://pocket.invalid').searchParams.get('dsh-full-plugins') === '1';
+            if (/(?:Android|iPhone|iPad|HarmonyOS|Mobile)/i.test(ua) && !fullPlugins) {
+              const optimized = optimizeMobileBoot(html, { createBatch: mobileBatches.register });
+              html = optimized.html;
+              mobileBootLean = optimized.changed;
+            }
             if (!html.includes(INJECT_MARK)) {
               html = html.replace(/<head[^>]*>/i, (m) => `${m}${injectHtml}`);
             }
@@ -1205,6 +1219,7 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
             // 必须禁用缓存——否则手机/中间层（nginx 等）拿到没有补丁的旧
             // 文档后，isLoopback 修复不生效且难以排查（表现为"改了没效果"）。
             outHeaders['cache-control'] = 'no-store';
+            if (mobileBootLean) outHeaders['x-dsh-pocket-mobile-boot'] = 'lean';
             delete outHeaders['etag'];
             delete outHeaders['last-modified'];
             delete outHeaders['expires'];
