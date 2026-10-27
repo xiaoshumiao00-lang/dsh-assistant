@@ -2,14 +2,16 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, use
 import { css } from './styles'
 import { NS, zh, en, type WorktableKey } from './locales'
 import { isAbs, joinPath, parentPathOf, basenameOf } from './pathutil'
-import { splitStore, SplitWorkspace, setSplitT, setSplitEnv, type LayoutSpec, type SplitPane, type ConsoleCardData, type ProjectSessionItem, type NewSessionOptions } from './split'
+import { splitStore, SplitWorkspace, setSplitT, setSplitEnv, RUNNING_CARD_ID, type LayoutSpec, type SplitPane, type ConsoleCardData, type ProjectSessionItem, type NewSessionOptions } from './split'
+import { splitOpenIntent } from './splitEntry'
 import { BUILTIN_TEMPLATES, freshFlowRun, templateById, saveTemplateStepOverride, composeStepTask, composeStepSpec, effectiveSkill, effectiveInstruction, effectiveConverge, stepBriefOf, isStepBriefConfirmed, migrateFlowRun, OVERLAY_FILE, REPORT_PREFIX, L1_CHECKLIST, parseL1Checklist, isConvergeStep, type FlowRunState, type FlowStepOverride, type FlowStepView, type FlowView, type TemplateDef } from './templates'
 import { VerifyScheduler, composeDiagnosisTask } from './verifyLoop'
 import { defaultProjectFolder, defaultProjectName, isAutoProjectFolder } from './newProjectDefault'
 import { ICON_CHOICES, resolveProjectIcon, pickUnusedIcon } from './projectIcons'
 import { focusSessionInHost, sessionFaceState, healBlankSessionIfStuck, type FocusResult } from './sessionFocus'
-import { sessionsUnderFolder, normalizeFolderPath } from './sessionFolder'
-import { hasPendingInteraction, sessionStatusSourceOf } from './sessionStatus'
+import { sessionsUnderFolder, normalizeFolderPath, unownedSessionIds, transientVisibility } from './sessionFolder'
+import { hasPendingInteraction, sessionStatusSourceOf, pendingInteractionSignature } from './sessionStatus'
+import { sessionSnapshotIndexOf, invalidateSessionSnapshotIndex } from './sessionIndex'
 
 /** 项目叠加层（L2）可选项：写作语言 */
 const PAPER_LANG_OPTIONS = ['中文写作后翻译英文', '直接写英文', '仅中文投稿']
@@ -707,6 +709,34 @@ async function ensureSessionModel(sessionId: string): Promise<void> {
 const CONSOLE_ID = 'wt-console'
 const CONSOLE_ICON = '🖥️'
 
+/** 临时项目卡片「正在运行」：收纳不属于任何项目文件夹的会话（不写入项目状态，随会话出现/消失）。
+ *  名称按用户指定使用「正在运行」。 */
+const RUNNING_CARD_NAME = '正在运行'
+const RUNNING_CARD_ICON = '⚡'
+/** 已结束会话在临时卡片上**一直保留到手动「收工」**。
+ *  下面两个窗口不是保留期，只是没有观察到「跑 → 停」时，用提示词时间判断是否首次收纳的兜底窗口。 */
+const TRANSIENT_DONE_FALLBACK_MS = 30 * 60 * 1000
+const TRANSIENT_ERROR_FALLBACK_MS = 12 * 60 * 60 * 1000
+const TRANSIENT_DISMISS_KEY = 'dsh.assistant.transientDismissed.v1'
+
+/** 临时卡片的一行（getConsoleCards 每次从宿主会话快照实时组装） */
+type TransientRow = {
+  id: string
+  title: string
+  cwd: string
+  updatedAt: number
+  /** 正在运行（含子代理在跑） */
+  running: boolean
+  /** 停在等用户决策 */
+  awaiting: boolean
+  /** 已完成（宿主 completed 位 / 会话面兜底） */
+  done: boolean
+  /** 异常终止（会话面 lastAgentError，沿用项目卡片的持久化标记） */
+  error: boolean
+  /** 已结束且不在运行/待决（一直保留到手动「收工」） */
+  finished: boolean
+}
+
 /** 控制室布局是否健全：主窗格首格存在 console 类型标签（旧版关标签的坏存档没有它） */
 function specHasConsoleTab(spec: LayoutSpec | undefined): boolean {
   return !!spec?.main?.[0]?.tabs?.some((t) => t.content?.kind === 'builtin' && t.content.type === 'console')
@@ -809,7 +839,10 @@ async function sweepPreviews() {
   previewSweepBusy = true
   let changed = false
   try {
-    const sids = Array.from(new Set(Object.values(projectBindingsRef.current).filter((x): x is string => !!x)))
+    const sids = Array.from(new Set([
+      ...Object.values(projectBindingsRef.current),
+      ...transientTrackedIdsRef.current,
+    ].filter((x): x is string => typeof x === 'string' && !!x)))
     for (const sid of sids) {
       const row = sessionsSnapshotStore.snapshot?.byId?.[sid]
       const key = activityKeyOf(sid) + ':' + String(!!row?.running) + ':' + String(!!row?.completed)
@@ -1207,10 +1240,19 @@ function sessionEntriesOf(sid: string): any[] {
  *  live chunk（assistant/live-chunk）就是聊天面板里正在逐字输出的那一轮，控制室要显示同一句。 */
 function activityFromSessionEntries(entries: any[]): string {
   if (!Array.isArray(entries) || entries.length === 0) return ''
+  // 最近一次用户消息 / 新轮次会清空此前的进度，因此旧轮次不可能影响最终结果。
+  // 先倒序定位边界，只还原当前轮次，避免流式期间反复重放整段历史。
+  let start = 0
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const ev: any = (entries[i] as any)?.event ?? entries[i]
+    const type = String(ev?.type ?? '')
+    if (type === 'user/message' || type === 'turn/start') { start = i + 1; break }
+  }
   let lastLine = ''
   let store = createStreamBlockStore()
   let attempt = ''
-  for (const entry of entries) {
+  for (let i = start; i < entries.length; i++) {
+    const entry = entries[i]
     const ev: any = (entry as any)?.event ?? entry
     if (!ev || typeof ev !== 'object') continue
     const type = String(ev.type ?? '')
@@ -1859,6 +1901,90 @@ function clearAgentErrors(ids: string[]) {
   for (const id of ids) if (map[id]) { delete map[id]; dirty = true }
   if (dirty) saveAgentErrors(map)
 }
+
+/** 临时卡片不重复收纳的目录：**有卡片存在**的项目文件夹 + 无文件夹项目的绑定会话目录。
+ *  后者与项目卡片 relatedSidsOf 的目录基准同源（项目没有文件夹时，卡片按绑定会话的 cwd 看会话），
+ *  避免同一批会话既出现在项目卡片上、又出现在临时卡片上。
+ *  已删除（removed）或没有卡片（不在 layouts / 注册表）的残留项目不算：它们已经没有任何卡片能看到这些会话。 */
+function projectOwnedFolders(state: { projects: ProjectsState; aliveRegisteredIds: string[] }): string[] {
+  const pr = state.projects
+  const removed = new Set(pr.removed ?? [])
+  const known = new Set<string>([CONSOLE_ID, ...state.aliveRegisteredIds, ...pr.layouts.map((l) => l.id)])
+  const out = new Set<string>()
+  for (const [pid, folder] of Object.entries(pr.folders)) {
+    if (removed.has(pid) || !known.has(pid)) continue
+    if (typeof folder === 'string' && folder) out.add(folder)
+  }
+  for (const [pid, sid] of Object.entries(pr.bindings)) {
+    if (removed.has(pid) || !known.has(pid)) continue
+    if (pr.folders[pid]) continue
+    const cwd = cwdOfSession(sid)
+    if (cwd) out.add(cwd)
+  }
+  return [...out]
+}
+
+/** 临时卡片「收工」记录：会话 id → 收工时间戳。
+ *  与结束时间比较：收工只压住这一轮；同一会话下一轮结束时结束时间更晚，卡片会重新出现。
+ *  收工只是把这一轮结果从临时卡片移除，不删会话、不影响侧栏。 */
+function loadTransientDismissed(): Record<string, number> {
+  try {
+    const p = JSON.parse(localStorage.getItem(TRANSIENT_DISMISS_KEY) ?? '{}')
+    if (!p || typeof p !== 'object') return {}
+    const out: Record<string, number> = {}
+    for (const [sid, at] of Object.entries<any>(p)) {
+      const n = Number(at)
+      if (typeof sid === 'string' && sid && Number.isFinite(n) && n > 0) out[sid] = n
+    }
+    return out
+  } catch { return {} }
+}
+function saveTransientDismissed(map: Record<string, number>) {
+  try {
+    // 只留最近 7 天：收工时已同时删除结束时刻，旧收工记录被清掉也不会让卡片复活
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000
+    const pruned: Record<string, number> = {}
+    for (const [sid, at] of Object.entries(map)) if (at >= cutoff) pruned[sid] = at
+    localStorage.setItem(TRANSIENT_DISMISS_KEY, JSON.stringify(pruned))
+  } catch {}
+}
+/** 临时卡片上「跑 → 停」的结束时刻（会话 id → ms）。
+ *  不能用宿主 updatedAt：它只在新提示词时前进（= 开新一轮），长任务跑完后会被误判成「很久前就结束了」。
+ *  这里由全局生命周期跟踪器在观察到一次 running=true → false 时记下当时时间，并持久化，
+ *  这样控制室关着、甚至宿主重启后，仍能识别出「这是卡片收纳过、已结束的会话」。
+ *  不按时间清理：卡片要一直保留到用户手动收工。 */
+const TRANSIENT_FINISH_KEY = 'dsh.assistant.transientFinished.v1'
+function loadTransientFinished(): Map<string, number> {
+  const out = new Map<string, number>()
+  try {
+    const p = JSON.parse(localStorage.getItem(TRANSIENT_FINISH_KEY) ?? '{}')
+    if (p && typeof p === 'object') {
+      for (const [sid, at] of Object.entries<any>(p)) {
+        const n = Number(at)
+        if (typeof sid === 'string' && sid && Number.isFinite(n) && n > 0) out.set(sid, n)
+      }
+    }
+  } catch {}
+  return out
+}
+const transientLifecycle = {
+  /** 上一份快照里的运行态（首次见到某会话 = 建立基线，不伪造「刚结束」） */
+  prevRunning: new Map<string, boolean>(),
+  /** 已观察到的结束时刻；同一会话开始新一轮时删除，用户收工时也删除 */
+  finishedAt: loadTransientFinished(),
+}
+let transientFinishDirty = false
+function saveTransientFinished(): void {
+  if (!transientFinishDirty) return
+  transientFinishDirty = false
+  try {
+    const obj: Record<string, number> = {}
+    for (const [sid, at] of transientLifecycle.finishedAt) obj[sid] = at
+    localStorage.setItem(TRANSIENT_FINISH_KEY, JSON.stringify(obj))
+  } catch {}
+}
+/** 临时卡片当前会话 id（供 1.2s 进度抓取与冷预览复用；getConsoleCards 每次刷新） */
+const transientTrackedIdsRef: { current: string[] } = { current: [] }
 /** 自动挂载：已消费过完成事件的会话集（一次完成只挂载一次） */
 const mountConsumedRef: { current: Set<string> } = { current: new Set<string>() }
 /** 待挂载（项目未打开时暂存）：projectId → 挂载内容；刷新后从 localStorage 恢复 */
@@ -1938,6 +2064,7 @@ function clearNotifyAck(sid: string) {
 const pendingInteractionsStore: { map: ReadonlyMap<string, any> | null; listeners: Set<() => void>; source: (() => void) | null } = {
   map: null, listeners: new Set(), source: null,
 }
+let pendingInteractionIdsSig: string | null = null
 function findPendingInteractions(): any {
   try {
     const direct = sessionStatusSourceOf(sessionBridge?.sessions)
@@ -1962,6 +2089,11 @@ function refreshPendingInteractions(): void {
     const m = source?.getSnapshot?.()
     pendingInteractionsStore.map = m instanceof Map ? (m as ReadonlyMap<string, any>) : null
   } catch { pendingInteractionsStore.map = null }
+  // sessionStatus 也包含 running 等高频字段；只有「待决会话集合」变化才重绘。
+  // map 已先行更新，卡片下次因其它快照刷新时仍读取最新真值。
+  const sig = pendingInteractionSignature(pendingInteractionsStore.map)
+  if (sig === pendingInteractionIdsSig) return
+  pendingInteractionIdsSig = sig
   pendingInteractionsStore.listeners.forEach((l) => { try { l() } catch {} })
 }
 /** 订阅宿主登记（幂等；无该服务时保留会话面 pending 的兜底通道）。 */
@@ -2043,6 +2175,8 @@ function syncSessionScope(list: any) {
     // 完整快照 + 通知监听（项目卡片提醒镜像）
     try {
       sessionsSnapshotStore.snapshot = snap
+      // 每次宿主通知重建一次共享索引；随后卡片、生命周期与侧栏提醒共同复用。
+      invalidateSessionSnapshotIndex()
       sessionsSnapshotStore.listeners.forEach((l) => { try { l() } catch {} })
     } catch {}
     // 项目×对话联动：项目打开期间切到「非该项目绑定」的会话 → 自动关项目（保留用户新选的会话）
@@ -2285,9 +2419,11 @@ function WorktableSection(props: any) {
     { projects, metas, aliveRegisteredIds: registeredIds },
   )
   /** 控制室动作引用（每渲染同步，供 env 闭包读取） */
-  const actionsRef = useRef<{ openSplit: (spec: LayoutSpec) => void; openConsole: (explicitBound?: string | null) => void } | null>(null)
+  const actionsRef = useRef<{ openSplit: (spec: LayoutSpec, opts?: { enter?: boolean }) => void; openConsole: (explicitBound?: string | null) => void } | null>(null)
   /** 提醒确认动作引用（每渲染同步；env 闭包用） */
   const ackRef = useRef<((projectId: string) => void) | null>(null)
+  /** 临时卡片「正在运行」的最新镜像（getConsoleCards 刷新；会话列表 / 点开 / 新建会话复用） */
+  const transientRowsRef = useRef<TransientRow[]>([])
   /** 视图状态最新快照（供 env 闭包读取控制室主题） */
   const viewRef = useRef(view)
   viewRef.current = view
@@ -2300,6 +2436,7 @@ function WorktableSection(props: any) {
   const syncTimerRef = useRef<number | null>(null)
   const syncRevRef = useRef(0)
   const syncSigRef = useRef('')
+  const syncPollBusyRef = useRef(false)
 
   /** 采纳宿主状态（另一端的改动 / 冲突时的真值）：写本地并重载界面；签名同步记下，下一轮不再回声推送 */
   const adoptRemoteState = (st: any): void => {
@@ -2398,6 +2535,9 @@ function WorktableSection(props: any) {
           if (!base) continue
           for (const s of sessionIdsUnderFolder(base)) if (running(s)) tracked.add(s)
         }
+        // 临时卡片「正在运行」的游离会话：运行中跟流式进度，刚结束抓最终答复；
+        // 与项目卡片共用同一套缓存（按日志版本 + 运行态去重，不会每个 tick 重复抓）。
+        for (const sid of transientTrackedIdsRef.current) tracked.add(sid)
         // 只挑「需要重抓」的：正在跑（每轮都要跟，流式）/ 没抓过 / 日志又长了一截 / 刚跑完
         const pending: { sid: string; key: string; wasRunning: boolean; settle: boolean }[] = []
         for (const sid of tracked) {
@@ -2473,10 +2613,13 @@ function WorktableSection(props: any) {
   useEffect(() => {
     const iv = window.setInterval(() => {
       if (!syncReadyRef.current || document.visibilityState !== 'visible') return
-      if (syncTimerRef.current != null) return
+      if (syncTimerRef.current != null || syncPollBusyRef.current) return
+      syncPollBusyRef.current = true
       void (async () => {
+        const ctrl = new AbortController()
+        const timeout = window.setTimeout(() => ctrl.abort(), 8000)
         try {
-          const r = await fetch('/api/assistant/state?sinceRevision=' + encodeURIComponent(String(syncRevRef.current)), { cache: 'no-store' })
+          const r = await fetch('/api/assistant/state?sinceRevision=' + encodeURIComponent(String(syncRevRef.current)), { cache: 'no-store', signal: ctrl.signal })
           if (r.status === 204) return
           const d = await r.json()
           const st = d?.state
@@ -2485,6 +2628,10 @@ function WorktableSection(props: any) {
           if (rev === syncRevRef.current) return
           adoptRemoteState(st)
         } catch {}
+        finally {
+          window.clearTimeout(timeout)
+          syncPollBusyRef.current = false
+        }
       })()
     }, 3000)
     return () => window.clearInterval(iv)
@@ -2526,12 +2673,6 @@ function WorktableSection(props: any) {
    *  内置控制室没有项目文件夹，则用它自己对话所在的目录。子代理会话不列出。 */
   const projectSessionsOf = (pid: string): ProjectSessionItem[] => {
     const pr = projectsRef.current.projects
-    const base = pr.folders[pid] || cwdOfSession(pr.bindings[pid]) || ''
-    if (!base) return []
-    const snap = sessionBridge?.list?.getSnapshot?.()
-    const byId: Record<string, any> = snap?.byId ?? {}
-    const ids: string[] = Array.isArray(snap?.ids) ? snap.ids : Object.keys(byId)
-    const current: string = snap?.current ?? ''
     // 置顶/归档状态：宿主工作区集合（归档的会话默认不进列表，由浮层「显示已归档」开关控制）
     let archived: Set<string> = new Set()
     let pinned: Set<string> = new Set()
@@ -2540,6 +2681,31 @@ function WorktableSection(props: any) {
       if (Array.isArray(wsnap?.archivedSessionIds)) archived = new Set(wsnap.archivedSessionIds.map(String))
       if (Array.isArray(wsnap?.pinnedSessionIds)) pinned = new Set(wsnap.pinnedSessionIds.map(String))
     } catch {}
+    // 临时卡片：没有项目文件夹，列表直接取 getConsoleCards 刚算好的游离会话镜像
+    if (pid === RUNNING_CARD_ID) {
+      const snap = sessionBridge?.list?.getSnapshot?.()
+      const current: string = snap?.current ?? ''
+      const out = transientRowsRef.current.map((r) => ({
+        id: r.id,
+        title: r.title,
+        rel: normalizeFolderPath(r.cwd),
+        current: r.id === current,
+        running: r.running,
+        blank: false,
+        updatedAt: r.updatedAt,
+        pinned: pinned.has(r.id),
+        archived: false,
+        finished: r.finished,
+      }))
+      out.sort((a, b) => (Number(!!b.pinned) - Number(!!a.pinned)) || (b.updatedAt - a.updatedAt))
+      return out
+    }
+    const base = pr.folders[pid] || cwdOfSession(pr.bindings[pid]) || ''
+    if (!base) return []
+    const snap = sessionBridge?.list?.getSnapshot?.()
+    const byId: Record<string, any> = snap?.byId ?? {}
+    const ids: string[] = Array.isArray(snap?.ids) ? snap.ids : Object.keys(byId)
+    const current: string = snap?.current ?? ''
     const norm = (p: unknown) => String(p ?? '').replace(/\\/g, '/').replace(/\/+$/, '')
     const baseN = norm(base)
     if (!baseN) return []
@@ -2572,6 +2738,110 @@ function WorktableSection(props: any) {
       return (b.updatedAt - a.updatedAt) || a.rel.localeCompare(b.rel)
     })
     return out
+  }
+
+  /** 全局（不要求控制室打开）跟踪游离会话的「跑 → 停」：
+   *  首次见到只建立基线；观察到 running 变 false 时记结束时间；新一轮开始删除旧结束时间。
+   *  数据持久化，宿主重启后仍能按真实结束时间为临时卡片保留结果。 */
+  const trackTransientLifecycles = (): void => {
+    const snap = sessionsSnapshotStore.snapshot
+    if (!snap) return
+    const byId: Record<string, any> = snap.byId ?? {}
+    const ids: string[] = Array.isArray(snap.ids) ? snap.ids : Object.keys(byId)
+    const pr = projectsRef.current.projects
+    const owned = new Set<string>()
+    const removed = new Set(pr.removed ?? [])
+    const known = new Set<string>([CONSOLE_ID, ...projectsRef.current.aliveRegisteredIds, ...pr.layouts.map((l) => l.id)])
+    for (const [pid, sid] of Object.entries(pr.bindings)) {
+      if (removed.has(pid) || !known.has(pid)) continue
+      if (typeof sid === 'string' && sid) owned.add(sid)
+    }
+    for (const [pid, run] of Object.entries(pr.flows ?? {})) {
+      if (removed.has(pid) || !known.has(pid)) continue
+      for (const sid of Object.values(run?.stepSessions ?? {})) if (typeof sid === 'string' && sid) owned.add(sid)
+    }
+    let archived = new Set<string>()
+    try {
+      const wsnap = sessionBridge?.workspaces?.list?.getSnapshot?.()
+      if (Array.isArray(wsnap?.archivedSessionIds)) archived = new Set(wsnap.archivedSessionIds.map(String))
+    } catch {}
+    const folders = projectOwnedFolders(projectsRef.current)
+    const roots = unownedSessionIds(ids, byId, folders, owned, archived)
+    const present = new Set(roots)
+    // 与卡片同一个「在跑」口径：根会话在跑 / 子代理在跑 / 会话面还有未结束轮次
+    const { kidsByParent } = sessionSnapshotIndexOf(snap)
+    const noKids = new Set<string>()
+    const kidsOf = (sid: string): Set<string> => kidsByParent.get(sid) ?? noKids
+    const now = Date.now()
+    for (const sid of roots) {
+      const entry = byId[sid]
+      // 与卡片同一口径：宿主明确 completed 且不在 running 时，残留的未结束轮次不算「还在跑」
+      const running = (entry?.completed === true && entry?.running !== true)
+        ? false
+        : sessionRunningNow(sid, byId, kidsOf)
+      // 停在「等用户决策」不算结束：否则等很久后再回答并秒完成，卡片会因旧结束时间过期而看不到结果
+      const awaiting = sessionAwaitingDecision(sid)
+      const active = running || awaiting
+      const prev = transientLifecycle.prevRunning.get(sid)
+      if (active) {
+        transientLifecycle.prevRunning.set(sid, true)
+        if (transientLifecycle.finishedAt.delete(sid)) transientFinishDirty = true
+      } else {
+        if (prev === true) {
+          transientLifecycle.finishedAt.set(sid, now)
+          transientFinishDirty = true
+        }
+        transientLifecycle.prevRunning.set(sid, false)
+      }
+    }
+    for (const sid of transientLifecycle.prevRunning.keys()) {
+      if (!present.has(sid)) transientLifecycle.prevRunning.delete(sid)
+    }
+    // 已被项目卡片 / 归档收编的会话不再属于临时卡片：清掉旧结束记录，避免以后解除绑定时在卡片里“复活”
+    for (const sid of transientLifecycle.finishedAt.keys()) {
+      if (!present.has(sid) && byId[sid]) {
+        transientLifecycle.finishedAt.delete(sid)
+        transientFinishDirty = true
+      }
+    }
+    saveTransientFinished()
+  }
+
+  /** 临时卡片「＋」新建会话的目录：优先正在跑的那条游离会话所在目录，
+   *  否则当前会话目录（同目录续开）；都取不到时交给宿主默认目录。 */
+  const transientFolder = (): string => {
+    const rows = transientRowsRef.current
+    const pool = rows.filter((r) => r.running || r.awaiting)
+    const sorted = [...(pool.length > 0 ? pool : rows)].sort((a, b) => b.updatedAt - a.updatedAt)
+    return sorted[0]?.cwd || sessionScopeStore.snapshot?.cwd || ''
+  }
+
+  /** 临时卡片「收工」：把已结束的会话从卡片移除并清掉其异常标记；运行中/待决的一律不动。
+   *  这是临时卡片唯一的移除方式（不再按时间自动消失）。 */
+  const dismissTransient = (ids: string[]): void => {
+    const rows = transientRowsRef.current
+    const finished = new Set(rows.filter((r) => r.finished).map((r) => r.id))
+    const target = ids.filter((sid) => finished.has(sid))
+    if (target.length === 0) return
+    const now = Date.now()
+    const map = loadTransientDismissed()
+    for (const sid of target) map[sid] = now
+    saveTransientDismissed(map)
+    // 删掉结束时刻：即使 7 天后 dismissed 记录被清理，也不会因为旧的结束时刻再次出现
+    for (const sid of target) if (transientLifecycle.finishedAt.delete(sid)) transientFinishDirty = true
+    saveTransientFinished()
+    clearAgentErrors(target)
+    transientRowsRef.current = rows.filter((r) => !target.includes(r.id))
+    notifyConsole()
+  }
+
+  /** 临时卡片点开/点发光：确认本轮完成/待决（只熄光，不移除；移除走「收工」）。 */
+  const ackTransientCard = (): void => {
+    for (const r of transientRowsRef.current) {
+      if (r.awaiting) saveNotifyAck(r.id, 'need')
+      else if (r.done) saveNotifyAck(r.id, 'done')
+    }
+    clearAgentErrors(transientRowsRef.current.filter((r) => r.error).map((r) => r.id))
   }
 
   /** 从「会话列表」进入某个会话：宿主照常加载它的历史，可直接继续对话；不改项目绑定（只切会话） */
@@ -2631,6 +2901,8 @@ function WorktableSection(props: any) {
    *  ④ 当前会话的工作目录（兜底）。
    *  返回 '' = 都取不到，此时创建会话交给宿主默认目录（控制室卡片仍要保证「＋」可用）。 */
   const newSessionFolderOf = (pid: string): string => {
+    // 临时卡片没有项目文件夹：在「正在跑的那条游离会话」目录续开；会让新任务继续落在这张卡片里
+    if (pid === RUNNING_CARD_ID) return transientFolder()
     const pr = projectsRef.current.projects
     const stepDir = latestStepDirOf(pid)
     if (stepDir) return stepDir
@@ -2641,7 +2913,7 @@ function WorktableSection(props: any) {
    *  其余按「入驻项目 → 布局项目」的注册序补在后面。卡片网格 / 项目管理面板 / 排序共用这一份。 */
   const projectDisplayOrder = (): string[] => {
     const pr = projectsRef.current
-    const ids = [...pr.aliveRegisteredIds, ...pr.projects.layouts.map((l) => l.id)].filter((id) => id !== CONSOLE_ID)
+    const ids = [...pr.aliveRegisteredIds, ...pr.projects.layouts.map((l) => l.id)].filter((id) => id !== CONSOLE_ID && id !== RUNNING_CARD_ID)
     const known = new Set(ids)
     const stored = pr.projects.order.filter((id) => known.has(id))
     return [...stored, ...ids.filter((id) => !stored.includes(id))]
@@ -2671,31 +2943,16 @@ function WorktableSection(props: any) {
     const byId: Record<string, any> = snap?.byId ?? {}
     const jobsMap: Record<string, any[]> = snap?.jobsBySession ?? {}
     const now = Date.now()
-    // 一次建立父子索引，整张网格复用；旧实现每问一次子代理就重扫全部会话，
-    // 项目 × 会话 × 子代理三层叠加后，手机上每秒都在做大量无效扫描。
-    const kidsByParent = new Map<string, Set<string>>()
-    const addKid = (parent: unknown, child: unknown): void => {
-      if (typeof parent !== 'string' || !parent || typeof child !== 'string' || !child) return
-      let set = kidsByParent.get(parent)
-      if (!set) { set = new Set<string>(); kidsByParent.set(parent, set) }
-      set.add(child)
-    }
-    for (const [cid, ce] of Object.entries<any>(byId)) addKid(ce?.parentId, cid)
-    for (const [parent, value] of Object.entries<any>(snap?.subagentsByParent ?? {})) {
-      const arr = Array.isArray(value) ? value : (value?.entries ?? value?.items ?? [])
-      if (Array.isArray(arr)) for (const child of arr) addKid(parent, child?.sessionId ?? child?.id)
-    }
+    // 同一张网格里项目卡片、临时卡片会共享会话；本轮组装内复用判定与进度，
+    // 避免同一会话被重复扫描事件窗口 / 会话面。缓存不跨快照，语义保持实时。
+    const runningMemo = new Map<string, boolean>()
+    const awaitingMemo = new Map<string, boolean>()
+    const activityMemo = new Map<string, string>()
+    // 父子 / 目录索引按宿主快照共享：卡片、临时会话生命周期和侧栏提醒只构建一次。
+    const { kidsByParent, folderRows, snapshotIds } = sessionSnapshotIndexOf(snap)
     const noKids = new Set<string>()
     const kidsSetOf = (sid: string): Set<string> => kidsByParent.get(sid) ?? noKids
-    // 目录同样只规范化一次；各项目从自己缓存的目录结果取会话，不重复处理整张快照。
-    const folderRows: { id: string; key: string }[] = []
-    const snapshotIds: string[] = Array.isArray(snap?.ids) ? snap.ids : Object.keys(byId)
-    for (const id of snapshotIds) {
-      const entry = byId[id]
-      if (!entry || entry.parentId || entry.origin === 'subagent') continue
-      const cwd = normalizeFolderPath(entry.cwd)
-      if (cwd) folderRows.push({ id, key: cwd.toLowerCase() })
-    }
+    // 各项目从自己缓存的目录结果取会话，不重复过滤整张快照。
     const folderCache = new Map<string, string[]>()
     const sessionIdsForFolder = (base: string): string[] => {
       const normalized = normalizeFolderPath(base)
@@ -2761,16 +3018,22 @@ function WorktableSection(props: any) {
     /** 是否在等用户决策（黄）：pendingInteraction / 待决登记 / 会话面 pending / 子代理待决 */
     const awaitingOf = (sid: string): boolean => {
       if (!sid) return false
-      if (sessionAwaitingDecision(sid)) return true
-      if (sessionNotifyState(byId[sid]) === 'need') return true
-      try {
-        const face = faceOf(sid)
-        if (Array.isArray(face?.pending) && face.pending.length > 0) return true
-      } catch {}
-      for (const cid of kidsSetOf(sid)) {
-        if (sessionAwaitingDecision(cid) || (byId[cid] && sessionNotifyState(byId[cid]) === 'need')) return true
+      const cached = awaitingMemo.get(sid)
+      if (cached !== undefined) return cached
+      let result = sessionAwaitingDecision(sid) || sessionNotifyState(byId[sid]) === 'need'
+      if (!result) {
+        try {
+          const face = faceOf(sid)
+          result = Array.isArray(face?.pending) && face.pending.length > 0
+        } catch {}
       }
-      return false
+      if (!result) {
+        for (const cid of kidsSetOf(sid)) {
+          if (sessionAwaitingDecision(cid) || (byId[cid] && sessionNotifyState(byId[cid]) === 'need')) { result = true; break }
+        }
+      }
+      awaitingMemo.set(sid, result)
+      return result
     }
     /** 关联会话的子代理总数（去重） */
     const kidsOfAll = (sids: string[]): number => {
@@ -2780,9 +3043,14 @@ function WorktableSection(props: any) {
     }
     /** 「此刻在跑」：宿主 running 位为准；已完成且宿主没在跑的不算（避免残留未结束轮次把卡片骗成绿色） */
     const isRunning = (sid: string): boolean => {
+      const cached = runningMemo.get(sid)
+      if (cached !== undefined) return cached
       const e = byId[sid]
-      if (e?.completed === true && e?.running !== true) return false
-      return sessionRunningNow(sid, byId, kidsSetOf)
+      const result = e?.completed === true && e?.running !== true
+        ? false
+        : sessionRunningNow(sid, byId, kidsSetOf)
+      runningMemo.set(sid, result)
+      return result
     }
     /** 最近更新的会话（预览兜底：非运行态的关联会话里挑最新动过的那条） */
     const freshestOf = (sids: string[]): string | null => {
@@ -2825,36 +3093,64 @@ function WorktableSection(props: any) {
       return 'idle'
     }
     // 运行时长：工作中会话的后台任务最早 startedAt 起算；无任务时读会话面 turnTimings 未结束轮次
+    const runningStartOf = (sid: string): number | null => {
+      let start: number | null = null
+      const jobs = jobsMap[sid] ?? []
+      for (const j of jobs) {
+        if (j?.status === 'running' && typeof j.startedAt === 'number' && (start == null || j.startedAt < start)) start = j.startedAt
+      }
+      if (start != null) return start
+      try {
+        const face = sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.()
+        const timings = face?.turnTimings
+        if (timings instanceof Map) {
+          for (const t of Array.from(timings.values()).reverse()) {
+            if (t && typeof t.startTime === 'number' && t.endTime == null) { start = t.startTime; break }
+          }
+        } else if (timings && typeof timings === 'object') {
+          for (const k of Object.keys(timings).reverse()) {
+            const t = (timings as any)[k]
+            if (t && typeof t.startTime === 'number' && t.endTime == null) { start = t.startTime; break }
+          }
+        }
+      } catch {}
+      return start
+    }
     const runtimeOfPid = (pid: string): number | null => {
       const sids = relatedSidsOf(pid)
       if (!sids.some((s) => isRunning(s))) return null
       let start: number | null = null
       for (const sid of sids) {
         if (!isRunning(sid)) continue
-        const jobs = jobsMap[sid] ?? []
-        for (const j of jobs) {
-          if (j?.status === 'running' && typeof j.startedAt === 'number' && (start == null || j.startedAt < start)) start = j.startedAt
-        }
-        if (start == null) {
-          try {
-            const face = sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.()
-            const timings = face?.turnTimings
-            if (timings instanceof Map) {
-              for (const t of Array.from(timings.values()).reverse()) {
-                if (t && typeof t.startTime === 'number' && t.endTime == null) { start = t.startTime; break }
-              }
-            } else if (timings && typeof timings === 'object') {
-              for (const k of Object.keys(timings).reverse()) {
-                const t = (timings as any)[k]
-                if (t && typeof t.startTime === 'number' && t.endTime == null) { start = t.startTime; break }
-              }
-            }
-          } catch {}
-        }
+        const s = runningStartOf(sid)
+        if (s != null && (start == null || s < start)) start = s
       }
       return start != null ? Math.max(0, now - start) : null
     }
     const ackMap = loadNotifyAck()
+    /** 按给定会话顺序取「最新一条进度」：本端事件窗口 → 宿主日志行（版本匹配）→ 冷会话成品消息。
+     *  项目卡片与临时卡片共用，避免两套判定漂移。 */
+    const activityTextOf = (order: string[]): string => {
+      for (const s of order) {
+        // 1) 本端打开过的会话：本地事件窗口与聊天详情同源（含逐字输出的 live chunk），最新也最准
+        let live = activityMemo.get(s)
+        if (live === undefined) {
+          live = latestActivityOf(s)
+          activityMemo.set(s, live)
+        }
+        if (live) return live
+        // 2) 从宿主日志抓来的那行：只有版本与当前会话一致才用。
+        //    版本落后 = 有一轮新内容还没抓，宁可先不显示，也不能把上一轮的工具调用当成「最新」。
+        const isRun = isRunning(s)
+        const entry = activityCache.get(s)
+        // 缓存只在这两种情况下可信：行还是这一轮的；或是此刻仍在跑（流式行本来就一直在变）
+        if (entry && entry.line && entry.key === activityKeyOf(s) && (!entry.running || isRun)) return entry.line
+        // 3) 冷会话预热的最近一条成品消息（可能是助手的最终答复）
+        const preview = previewCache.get(s)
+        if (preview) return preview
+      }
+      return ''
+    }
     const make = (id: string, name: string, icon: string, self: boolean): ConsoleCardData => {
       const sid = pr.projects.bindings[id]
       // 模板项目的任务跑在「步骤会话」里，绑定会话可能为空：预览取正在跑/最近一步的步骤会话
@@ -2879,29 +3175,13 @@ function WorktableSection(props: any) {
       // 流式进度文本：按「正在跑的 → 绑定会话 → 步骤会话 → 其余关联会话」逐个找，取第一条拿到内容的。
       // 关键：跑的是子代理会话时它本身没有可读面（未在前台打开），但父会话的历史里有一条
       // 「子代理 · …」工具调用 —— 所以必须逐个候选回退，不能只看一条会话。
-      const activityText = (() => {
-        const order: string[] = []
-        const push = (value: string | null | undefined): void => { if (value && !order.includes(value)) order.push(value) }
-        push(runningPick)
-        push(sid)
-        for (const s of stepSids) push(s)
-        for (const s of candidates) push(s)
-        for (const s of order) {
-          // 1) 本端打开过的会话：本地事件窗口与聊天详情同源（含逐字输出的 live chunk），最新也最准
-          const live = latestActivityOf(s)
-          if (live) return live
-          // 2) 从宿主日志抓来的那行：只有版本与当前会话一致才用。
-          //    版本落后 = 有一轮新内容还没抓，宁可先不显示，也不能把上一轮的工具调用当成「最新」。
-          const isRun = isRunning(s)
-          const entry = activityCache.get(s)
-          // 缓存只在这两种情况下可信：行还是这一轮的；或是此刻仍在跑（流式行本来就一直在变）
-          if (entry && entry.line && entry.key === activityKeyOf(s) && (!entry.running || isRun)) return entry.line
-          // 3) 冷会话预热的最近一条成品消息（可能是助手的最终答复）
-          const preview = previewCache.get(s)
-          if (preview) return preview
-        }
-        return ''
-      })()
+      const order: string[] = []
+      const push = (value: string | null | undefined): void => { if (value && !order.includes(value)) order.push(value) }
+      push(runningPick)
+      push(sid)
+      for (const s of stepSids) push(s)
+      for (const s of candidates) push(s)
+      const activityText = activityTextOf(order)
       const previewText = activityText || ((runningLive || status === 'busy') ? (t('console.liveRunning') || '正在执行…') : '')
       // 发光 = 完成/待决且本轮未被确认；点卡片确认后熄灭
       const glow = !!sid && ((status === 'done' && ackMap[sid] !== 'done') || (status === 'need' && ackMap[sid] !== 'need'))
@@ -2920,8 +3200,122 @@ function WorktableSection(props: any) {
         glow,
       }
     }
+    // ── 临时卡片「正在运行」：不属于任何项目文件夹 / 绑定 / 模板步骤的会话 ──
+    // 出现：只要有游离会话在跑 / 等决策 → 常驻。
+    // 结束：一直保留在卡片上，直到用户手动「收工」；不再按时间自动消失。
+    //       会话本身仍完整保留在侧栏，不删除任何记录。
+    transientRowsRef.current = []
+    transientTrackedIdsRef.current = []
+    const transientRows: TransientRow[] = []
+    try {
+      const owned = new Set<string>()
+      const removed = new Set(pr.projects.removed ?? [])
+      const known = new Set<string>([CONSOLE_ID, ...pr.aliveRegisteredIds, ...pr.projects.layouts.map((l) => l.id)])
+      for (const [pid, sid] of Object.entries(pr.projects.bindings)) {
+        if (removed.has(pid) || !known.has(pid)) continue
+        if (typeof sid === 'string' && sid) owned.add(sid)
+      }
+      for (const [pid, run] of Object.entries(pr.projects.flows ?? {})) {
+        if (removed.has(pid) || !known.has(pid)) continue
+        for (const sid of Object.values(run?.stepSessions ?? {})) if (typeof sid === 'string' && sid) owned.add(sid)
+      }
+      let archived = new Set<string>()
+      try {
+        const wsnap = sessionBridge?.workspaces?.list?.getSnapshot?.()
+        if (Array.isArray(wsnap?.archivedSessionIds)) archived = new Set(wsnap.archivedSessionIds.map(String))
+      } catch {}
+      const folders = projectOwnedFolders(pr)
+      const roots = unownedSessionIds(snapshotIds, byId, folders, owned, archived)
+      const dismissed = loadTransientDismissed()
+      for (const sid of roots) {
+        const entry = byId[sid]
+        if (!entry) continue
+        const running = isRunning(sid)
+        const awaiting = awaitingOf(sid)
+        const updatedAt = Number(entry.updatedAt) || 0
+        let done = entry.completed === true
+        if (!done) {
+          try { done = faceOf(sid)?.completed === true } catch {}
+        }
+        const error = noteAgentError(sid, running)
+        // 可见性（收工 / 空白会话 / 结束收纳）统一由纯函数判定，便于单测与两端一致
+        const vis = transientVisibility({
+          running,
+          awaiting,
+          done,
+          error,
+          blank: entry.blank === true,
+          updatedAt,
+          observedFinishedAt: transientLifecycle.finishedAt.get(sid) ?? 0,
+          dismissedAt: Number(dismissed[sid]) || 0,
+          now,
+          doneFallbackMs: TRANSIENT_DONE_FALLBACK_MS,
+          errorFallbackMs: TRANSIENT_ERROR_FALLBACK_MS,
+        })
+        if (!vis.show) continue
+        transientRows.push({
+          id: sid,
+          title: (typeof entry.displayTitle === 'string' && entry.displayTitle)
+            || (typeof entry.title === 'string' && entry.title) || '',
+          cwd: typeof entry.cwd === 'string' ? entry.cwd : '',
+          updatedAt,
+          running,
+          awaiting,
+          done,
+          error,
+          finished: vis.finished,
+        })
+      }
+    } catch { /* 临时卡片计算失败不影响已创建项目的卡片 */ }
+    transientRows.sort((a, b) => {
+      const rank = (r: TransientRow): number => (r.awaiting ? 0 : r.running ? 1 : r.error ? 2 : 3)
+      return (rank(a) - rank(b)) || (b.updatedAt - a.updatedAt) || a.id.localeCompare(b.id)
+    })
+    transientRowsRef.current = transientRows
+    transientTrackedIdsRef.current = transientRows.map((r) => r.id)
+    let transientCard: ConsoleCardData | null = null
+    if (transientRows.length > 0) {
+      const activeRows = transientRows.filter((r) => r.awaiting || r.running)
+      const pick = (activeRows.length > 0 ? activeRows : transientRows)[0]
+      const order: string[] = []
+      const push = (value: string | null | undefined): void => { if (value && !order.includes(value)) order.push(value) }
+      push(pick?.id)
+      for (const r of transientRows) push(r.id)
+      for (const r of transientRows) for (const cid of kidsSetOf(r.id)) push(cid)
+      const text = activityTextOf(order)
+      const anyNeed = transientRows.some((r) => r.awaiting)
+      const anyBusy = transientRows.some((r) => r.running)
+      const anyError = transientRows.some((r) => r.error)
+      const anyDone = transientRows.some((r) => r.done)
+      const status: ConsoleCardData['status'] = anyNeed ? 'need' : anyBusy ? 'busy' : anyError ? 'error' : anyDone ? 'done' : 'idle'
+      let start: number | null = null
+      for (const r of transientRows) {
+        if (!r.running) continue
+        const s = runningStartOf(r.id)
+        if (s != null && (start == null || s < start)) start = s
+      }
+      const glow = (status === 'need' && transientRows.some((r) => r.awaiting && ackMap[r.id] !== 'need'))
+        || (status === 'done' && transientRows.some((r) => r.done && ackMap[r.id] !== 'done'))
+      transientCard = {
+        id: RUNNING_CARD_ID,
+        name: RUNNING_CARD_NAME,
+        icon: RUNNING_CARD_ICON,
+        status,
+        runtimeMs: start != null ? Math.max(0, now - start) : null,
+        kids: kidsOfAll(transientRows.map((r) => r.id)),
+        preview: text || ((anyBusy || anyNeed) ? (t('console.liveRunning') || '正在执行…') : ''),
+        live: anyBusy,
+        bound: true,
+        canNewSession: true,
+        self: false,
+        glow,
+        count: transientRows.length,
+        temp: true,
+      }
+    }
     const cards: ConsoleCardData[] = []
     cards.push(make(CONSOLE_ID, t('console.name'), CONSOLE_ICON, true))
+    if (transientCard) cards.push(transientCard)
     const ordered = projectDisplayOrder()
     const layoutById = new Map(pr.projects.layouts.map((layout) => [layout.id, layout]))
     for (const id of ordered) {
@@ -3064,7 +3458,15 @@ function WorktableSection(props: any) {
         setGlowHsl: (v: { h: number; s: number; l: number }) => persistView({ consoleBgGlowHsl: { ...v } }),
         getPhotoHsl: (id: string) => viewRef.current.consoleBgPhotoHsls?.[id] ?? { h: 0, s: 100, l: 100 },
         setPhotoHsl: (id: string, v: { h: number; s: number; l: number }) => persistView({ consoleBgPhotoHsls: { ...(viewRef.current.consoleBgPhotoHsls ?? {}), [id]: { ...v } } }),
-        onAck: (id) => { ackRef.current?.(id); setNotifyTick((t) => t + 1); notifyConsole() },
+        onAck: (id) => {
+          if (id === RUNNING_CARD_ID) {
+            ackTransientCard()
+            setNotifyTick((t) => t + 1)
+            notifyConsole()
+            return
+          }
+          ackRef.current?.(id); setNotifyTick((t) => t + 1); notifyConsole()
+        },
         refreshPreviews: () => {
           if (previewTimer != null) { window.clearTimeout(previewTimer); previewTimer = null }
           sweepPreviews()
@@ -3072,16 +3474,29 @@ function WorktableSection(props: any) {
         onAdd: () => { openAddPanel() },
         onOpen: (id) => {
           if (id === CONSOLE_ID) return
+          if (id === RUNNING_CARD_ID) {
+            const rows = transientRowsRef.current
+            if (rows.length === 0) { controlRoomStore.setOpen(false); return }
+            const pick = rows[0]
+            // 只打开最近一条；不自动收工——结束后一直保留，直到用户手动点「收工」
+            controlRoomStore.setOpen(false)
+            if (pick) {
+              markPluginSessionOpen(pick.id)
+              openSessionInHost(pick.id)
+            }
+            return
+          }
           controlRoomStore.setOpen(false)
           const pr = projectsRef.current.projects
           const layout = pr.layouts.find((l) => l.id === id)
           const view = pr.views[id]
           if (view || layout) {
-            actionsRef.current?.openSplit((view ?? layout) as LayoutSpec)
+            // 控制室卡片 = 进入项目：即使该项目的分栏已经开着（多半被控制室遮住），也保持打开
+            actionsRef.current?.openSplit((view ?? layout) as LayoutSpec, { enter: true })
           } else if (pr.flows?.[id]) {
             // 模板流程项目但缺 layout 记录：仍进入 split 工作区并切到模板最新步骤会话
             // （openSplit 内部无论 layout 是否存在都会用 preferredSessionOf 判定模板步骤会话）
-            actionsRef.current?.openSplit({ id, title: (pr.nameOverrides[id] ?? id), icon: pr.metas?.[id]?.icon ?? '🧱', top: null, main: [], chatWidth: { default: 340, min: 280, max: 600 } } as LayoutSpec)
+            actionsRef.current?.openSplit({ id, title: (pr.nameOverrides[id] ?? id), icon: pr.metas?.[id]?.icon ?? '🧱', top: null, main: [], chatWidth: { default: 340, min: 280, max: 600 } } as LayoutSpec, { enter: true })
           } else {
             // 入驻项目无视图覆盖：切到该项目目录下「最近更新」的会话（没有才用绑定对话）
             const target = preferredSessionOf(id)
@@ -3111,6 +3526,7 @@ function WorktableSection(props: any) {
         getProjectSessions: (id) => projectSessionsOf(id),
         onOpenSession: (sid) => openProjectSession(sid),
         onDeleteSession: (sid) => deleteProjectSession(sid),
+        onDismissTransient: (ids) => dismissTransient(ids),
         onRenameSession: (sid, title) => renameProjectSession(sid, title),
         onForkSession: (sid) => forkProjectSession(sid),
       },
@@ -3411,7 +3827,10 @@ function buildCustomLayoutPrompt(req: string): string {
       try { sid = folder ? await createSessionAtFolder(folder) : await sessionBridge!.sessions.create({}) } catch { return null }
       if (!sid) return null
       if (options.defaults !== false) await applyNewSessionDefaults(sid)
-      persistProjects((prev) => ({ ...prev, bindings: { ...prev.bindings, [pid]: sid } }))
+      // 临时卡片「正在运行」是虚拟项目：新会话不绑定到任何真实项目，否则日后会被当成项目会话
+      if (pid !== RUNNING_CARD_ID) {
+        persistProjects((prev) => ({ ...prev, bindings: { ...prev.bindings, [pid]: sid } }))
+      }
       return sid
     })()
     projectEnsureBusyRef.current[pid] = task
@@ -3474,7 +3893,7 @@ function buildCustomLayoutPrompt(req: string): string {
       } catch (err) {
         console.warn('[dsh-assistant] 新建 computer-use 会话失败：', err)
         // 预设不存在时**明确告知并停下**：静默建一条标准会话，用户进详情才发现是标准模式。
-        reportUserError('Computer Use 预设不可用：当前宿主里没有名为「computer-use」的 Agent 预设（它由 dsh-orb 之类的插件注册）。请启用对应插件，或改用「标准模式」新建。')
+        reportUserError('Computer Use 预设不可用：当前宿主里没有名为「computer-use」的 Agent 预设（它由 dsh-orb 之类的插件注册）。请启用对应插件，或改用「普通对话」新建。')
         return false
       }
       if (sid && opts.background) {
@@ -3493,7 +3912,10 @@ function buildCustomLayoutPrompt(req: string): string {
       reportUserError(newSessionFailedText(folder))
       return false
     }
-    persistProjects((prev) => ({ ...prev, bindings: { ...prev.bindings, [pid]: sid as string } }))
+    // 临时卡片不写入项目绑定：它只是「没在任何项目文件夹里」的会话集合，绑定会把新会话藏出卡片
+    if (pid !== RUNNING_CARD_ID) {
+      persistProjects((prev) => ({ ...prev, bindings: { ...prev.bindings, [pid]: sid as string } }))
+    }
     // ① 先把新会话设为当前（并让它进宿主列表）；② 再关控制室；③ 通知控制室/卡片刷新。
     markPluginSessionOpen(sid)
     const focus = await focusNewSession(sid, () => {
@@ -3623,10 +4045,25 @@ function buildCustomLayoutPrompt(req: string): string {
 
   /** 分栏工作区入口（M1 引擎）：项目卡片调用 openSplit(spec) 打开声明式布局；
    * 若该 id 存在视图覆盖（用户在设置里变更过视图），用覆盖布局替换打开。
-   * 若项目有归属会话（模板流程 = 最新步骤会话 / 其它 = 绑定会话），打开后右侧对话窗自动切过去。 */
-  const openSplit = useCallback(async (spec: LayoutSpec) => {
+   * 若项目有归属会话（模板流程 = 最新步骤会话 / 其它 = 绑定会话），打开后右侧对话窗自动切过去。
+   *
+   *  `enter: true` = 「进入项目」语义（控制室卡片用）：同一项目已经开着时保持打开，
+   *  不再走 splitStore 的反选关闭——控制室是覆盖层，工作区明明开着却被它挡住看不见，
+   *  此时点卡片若反选关闭，用户看到的就是布局消失、只剩普通会话界面。 */
+  const openSplit = useCallback(async (spec: LayoutSpec, opts: { enter?: boolean } = {}) => {
     engineIdsRef.current.add(spec.id)
-    const opened = splitStore.open(projects.views[spec.id] ?? spec)
+    const intent = splitOpenIntent(splitStore.active ? splitStore.spec?.id ?? null : null, spec.id, opts.enter === true)
+    const alreadyOpen = intent !== 'open'
+    let opened = intent === 'keep' ? true : splitStore.open(projects.views[spec.id] ?? spec)
+    // 会话视图还没挂载时（刚新建会话 / 正在切会话的 settling 过渡态）findConversationRoot 取不到根，
+    // splitStore.open 会静默返回 false：用户点了项目卡却停在普通会话界面。等根容器出现后补开一次。
+    if (!opened && !alreadyOpen) {
+      for (let i = 0; i < 10 && !opened; i++) {
+        await new Promise<void>((resolve) => { window.setTimeout(resolve, 80) })
+        if (splitStore.active) { opened = splitStore.spec?.id === spec.id; break }
+        opened = splitStore.open(projects.views[spec.id] ?? spec)
+      }
+    }
     // 说明：splitStore.open 在同一项目重复点击时是「反选关闭」（返回 true 但 active 变 false）。
     // 我们要的是「点击项目卡 = 进入项目」，因此只有真正处于打开态才做绑定/模板步骤会话切换；
     // 对模板流程项目，无论 layout 是否存在，都按 preferredSessionOf 切到最新步骤会话。
@@ -3955,13 +4392,23 @@ function buildCustomLayoutPrompt(req: string): string {
       setNotifyTick((t) => t + 1)
       notifyConsole()
       notifyFlow()
+      // 临时卡片「正在运行」的生命周期：即使控制室没开也要记录「跑 → 停」的真实结束时间
+      trackTransientLifecycles()
       if (splitStore.active && splitStore.spec?.id === CONSOLE_ID) schedulePreviewSweep()
     }
     sessionsSnapshotStore.listeners.add(l)
     // 宿主「待用户决策」登记变化（问题出现/被回答常不伴随会话列表变动，必须单独订阅）
-    const bump = () => { setNotifyTick((t) => t + 1); notifyConsole(); notifyFlow() }
+    const bump = () => {
+      setNotifyTick((t) => t + 1)
+      notifyConsole()
+      notifyFlow()
+      // 待决出现/被回答也会改变「是否算结束」，同步更新生命周期
+      try { trackTransientLifecycles() } catch {}
+    }
     pendingInteractionsStore.listeners.add(bump)
     refreshPendingInteractions() // 初始拉取一次当前登记（wire 之外再兜底）
+    // 初次挂载：用当前快照建立游离会话基线（不把历史会话伪造成「刚结束」）
+    try { trackTransientLifecycles() } catch {}
     return () => {
       sessionsSnapshotStore.listeners.delete(l)
       pendingInteractionsStore.listeners.delete(bump)
@@ -3969,7 +4416,14 @@ function buildCustomLayoutPrompt(req: string): string {
   }, [])
 
   // 项目表变化 → 控制室卡片刷新（打开中的面板即时更新）
-  useEffect(() => { notifyConsole(); notifyFlow() }, [projects])
+  useEffect(() => {
+    notifyConsole()
+    notifyFlow()
+    try { trackTransientLifecycles() } catch {}
+  }, [projects])
+
+  // 入驻项目的名称/图标与注册集合也是卡片数据源；本地 UI 重绘不再兼任失效信号。
+  useEffect(() => { notifyConsole() }, [metas, registeredIds])
 
   /** 执行产物清单挂载：项目开着 → 锁定各「窗口N」；未开 → 待挂载（打开项目时补挂）。
    *  清单支持单窗口对象（旧格式）与多窗口 JSON 数组（新格式，每元素 {window,path,kind}）。
@@ -4124,23 +4578,11 @@ function buildCustomLayoutPrompt(req: string): string {
     return () => { cancelled = true }
   }, [projects.folders, applyWidgetManifest])
 
-  /** 当前快照的子代理索引：每个渲染版本只扫一次，提醒态与操作回调共同复用。 */
-  const sessionKidsIndex = useMemo(() => {
-    const index = new Map<string, Set<string>>()
-    const add = (parent: unknown, child: unknown): void => {
-      if (typeof parent !== 'string' || !parent || typeof child !== 'string' || !child) return
-      let set = index.get(parent)
-      if (!set) { set = new Set<string>(); index.set(parent, set) }
-      set.add(child)
-    }
-    const snap = sessionsSnapshotStore.snapshot
-    for (const [cid, entry] of Object.entries<any>(snap?.byId ?? {})) add(entry?.parentId, cid)
-    for (const [parent, value] of Object.entries<any>(snap?.subagentsByParent ?? {})) {
-      const arr = Array.isArray(value) ? value : (value?.entries ?? value?.items ?? [])
-      if (Array.isArray(arr)) for (const child of arr) add(parent, child?.sessionId ?? child?.id)
-    }
-    return index
-  }, [notifyTick])
+  /** 当前快照的子代理索引：与控制室卡片、临时会话生命周期共享同一构建结果。 */
+  const sessionKidsIndex = useMemo(
+    () => sessionSnapshotIndexOf(sessionsSnapshotStore.snapshot).kidsByParent,
+    [notifyTick],
+  )
   const emptyKids = useMemo(() => new Set<string>(), [])
   const collectKids = useCallback((sid: string): Set<string> => sessionKidsIndex.get(sid) ?? emptyKids, [sessionKidsIndex, emptyKids])
 
@@ -5451,9 +5893,11 @@ function buildCustomLayoutPrompt(req: string): string {
   // 1) 位置映射：给每张卡片标 data-wt-id，图标覆盖写到卡片第一个子元素（通用结构约定）；
   // 2) 委托点击（捕获阶段）：卡片图标 → 图标选择器；有视图覆盖的项目 → 用引擎打开该视图。
   useEffect(() => {
+    // 无头宿主只提供数据与弹窗，侧栏卡片被 CSS 隐藏；不监听聊天 DOM。
+    if (headless) return
+    const box = rootRef.current?.querySelector<HTMLElement>('.dsh-wt_projects') ?? null
+    if (!box) return
     const sync = () => {
-      const box = document.querySelector<HTMLElement>('.dsh-wt_projects')
-      if (!box) return
       // 子座位把所有卡片包在一个无类容器里：直接取卡片按钮（DOM 序 = 注册序），排除自渲染的布局卡
       const cards = Array.from(box.querySelectorAll<HTMLElement>('button:not(.dsh-wt_layout)'))
       cards.forEach((el, i) => {
@@ -5529,12 +5973,14 @@ function buildCustomLayoutPrompt(req: string): string {
       })
     }
     sync()
+    // 只观察项目容器；聊天流式更新不再触发整页 childList 回调与卡片扫描。
     const mo = new MutationObserver(sync)
-    mo.observe(document.body, { childList: true, subtree: true })
+    mo.observe(box, { childList: true, subtree: true })
     return () => mo.disconnect()
-  }, [aliveRegisteredIds, projects.iconOverrides, projects.views, activeSplitId, projects.bindings, bindNotifyMap, needNowMap])
+  }, [headless, wide, aliveRegisteredIds, projects.iconOverrides, projects.views, activeSplitId, projects.bindings, bindNotifyMap, needNowMap])
 
   useEffect(() => {
+    if (headless) return
     const onDocClick = (e: MouseEvent) => {
       const target = e.target as HTMLElement | null
       const card = target && target.closest
@@ -5569,7 +6015,7 @@ function buildCustomLayoutPrompt(req: string): string {
     }
     document.addEventListener('click', onDocClick, true)
     return () => document.removeEventListener('click', onDocClick, true)
-  }, [projects.views, openSplit, reportUsed, openBindPick])
+  }, [headless, projects.views, openSplit, reportUsed, openBindPick])
 
   const query = view.query.trim()
   const queryLower = query.toLowerCase()

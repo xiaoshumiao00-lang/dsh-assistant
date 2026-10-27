@@ -350,13 +350,14 @@ function resolveStampCapability() {
 * official 0.1.7 refuses unknown required events — only keeps the encoding in
 * process memory. History adopt / resume (an `session/end-seed` is already in
 * the log) and a log that already has the record are left unchanged.
-* Headless/Web omit `orbCoordinateMode` and do not record anything.
-* @param ctx - plugin context; optional `orbCoordinateMode` is Desktop-only.
+* Headless/Web omit `orbCoordinateMode` and do not record anything. The
+* dsh-assistant bundle provides `assistantCoordinateMode` instead, so prefer it.
+* @param ctx - plugin context; optional `assistantCoordinateMode` / `orbCoordinateMode` is Desktop-only.
 * @param session - newly created Computer Use session.
 */
 function stampCoordinateMode(ctx, session) {
 	if (hasCoordinateModeEvent(session) || hasEndSeed(session)) return;
-	const service = ctx.get("orbCoordinateMode");
+	const service = ctx.get("assistantCoordinateMode") ?? ctx.get("orbCoordinateMode");
 	if (service === void 0) return;
 	const mode = service.currentMode();
 	sessionModeCache.set(session, mode);

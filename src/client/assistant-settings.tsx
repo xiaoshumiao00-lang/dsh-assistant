@@ -5,8 +5,11 @@
  * - Computer Use：**不依赖 dsh-orb**。模型直接取宿主模型目录
  *   （ctx.remote.session.modelCatalog），选择结果写进本插件自己的偏好
  *   （dsh-assistant.model.cu.v1 / dsh-assistant.model.background.v1）——就是
- *   「＋ CU」新建会话与后台 code_agent 会用的那份配置。Computer Use 能力本身
+ *   「＋ 电脑操作」新建会话与后台 code_agent 会用的那份配置。Computer Use 能力本身
  *   由 DSH 内置的 computer-use 预设提供，不需要额外插件。
+ *   「使用千分比坐标」原在 dsh-orb 设置里，现迁到这里：写宿主
+ *   /api/assistant/coordinate-mode（profile 的 millifraction-coordinates.json），
+ *   新建 Computer Use 会话时由 assistantCoordinateMode 服务决定点击坐标系。
  * - 托管：新会话默认是否开启托管（写 `/.dsh-tuoguan/state`，跨端同步）。
  */
 import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
@@ -133,6 +136,53 @@ function ComputerUsePanel() {
   const [error, setError] = useState('')
   const [front, setFront] = useState<Choice | null>(() => readModelPref('cu'))
   const [background, setBackground] = useState<Choice | null>(() => readBgPref())
+  // 千分比坐标（dsh-orb 迁入）：true = 0–1000 比例，false = 截图像素。
+  const [milli, setMilli] = useState<boolean | null>(null)
+  const [milliBusy, setMilliBusy] = useState(false)
+  const [milliNote, setMilliNote] = useState('')
+  const [milliError, setMilliError] = useState(false)
+
+  const loadCoordinateMode = (): void => {
+    setMilliNote('')
+    setMilliError(false)
+    void fetch('/api/assistant/coordinate-mode', { cache: 'no-store' })
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        return r.json()
+      })
+      .then((d) => {
+        if (typeof d?.enabled === 'boolean') setMilli(d.enabled)
+        else throw new Error('bad payload')
+      })
+      .catch(() => {
+        setMilli(null)
+        setMilliNote('坐标设置接口还没加载：重启 DSH Desktop 后可用。')
+      })
+  }
+  const pickMilli = (next: boolean): void => {
+    setMilliBusy(true)
+    setMilliNote('')
+    setMilliError(false)
+    void fetch('/api/assistant/coordinate-mode', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: next }),
+    })
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        return r.json()
+      })
+      .then((d) => {
+        setMilli(typeof d?.enabled === 'boolean' ? d.enabled : next)
+        setMilliNote('已保存：新建的 Computer Use 会话按新坐标方式点击（已开会话不变）。')
+      })
+      .catch((err: unknown) => {
+        setMilliError(true)
+        setMilliNote(`保存失败：${err instanceof Error ? err.message : String(err)}`)
+      })
+      .finally(() => setMilliBusy(false))
+  }
+  useEffect(() => { loadCoordinateMode() }, [])
 
   const load = () => {
     setState('loading')
@@ -200,7 +250,7 @@ function ComputerUsePanel() {
         <div style={row}>
           <div>
             <div style={title}>启用悬浮球</div>
-            <p style={desc}>关闭后页面右下角的悬浮球隐藏（控制室仍可从设置页或 ?assistant=console 打开）。</p>
+            <p style={desc}>关闭后界面内悬浮球与桌面外悬浮球一起隐藏（控制室仍可从设置页或 ?assistant=console 打开）。桌面端默认窗口内、窗口外各一颗，点击都打开控制室。</p>
           </div>
           <Toggle checked={ball.enabled} label="启用悬浮球" onChange={(enabled) => ballConfigStore.set({ enabled })} />
         </div>
@@ -232,7 +282,7 @@ function ComputerUsePanel() {
         <div style={row}>
           <div>
             <div style={title}>前台模型（Computer Use 会话）</div>
-            <p style={desc}>从项目卡片「＋ CU」新建会话时默认用它；只影响之后新建的会话。</p>
+            <p style={desc}>从项目卡片「＋ 电脑操作」新建会话时默认用它；只影响之后新建的会话。</p>
           </div>
           <ModelSelect
             label="前台模型"
@@ -260,6 +310,33 @@ function ComputerUsePanel() {
             onPick={pickBackground}
           />
         </div>
+      </div>
+
+      <div style={card}>
+        <div style={row}>
+          <div>
+            <div style={title}>使用千分比坐标（0–1000）</div>
+            <p style={desc}>
+              打开：模型按截图的 0–1000 比例给点击位置（x=500 是画面中线）。
+              关闭：按截图原始像素给位置。<b>GUI 点击经常偏就关掉它</b>，再新建一个 Computer Use 会话。
+            </p>
+          </div>
+          <Toggle
+            checked={milli ?? true}
+            disabled={milli === null || milliBusy}
+            label="使用千分比坐标"
+            onChange={pickMilli}
+          />
+        </div>
+        {milli !== null ? (
+          <p style={{ ...desc, marginTop: 8 }}>
+            当前：{milli ? '千分比 0–1000' : '截图像素'}。坐标方式在会话创建时固定，只影响之后新建的会话；
+            已打开的会话保持原样。
+          </p>
+        ) : null}
+        {milliNote ? (
+          <p style={milliError ? errText : { ...desc, marginTop: 4 }}>{milliNote}</p>
+        ) : null}
       </div>
 
       {state === 'loading' ? <p style={desc}>正在读取模型目录…</p> : null}

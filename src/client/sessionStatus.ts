@@ -23,3 +23,14 @@ export function hasPendingInteraction(map: ReadonlyMap<string, any> | null | und
     return false
   }
 }
+
+/** 待决会话集合签名：忽略 running 等高频但与本插件提醒无关的字段变化。 */
+export function pendingInteractionSignature(map: ReadonlyMap<string, any> | null | undefined): string {
+  if (!map) return ''
+  const ids: string[] = []
+  try {
+    for (const sid of map.keys()) if (hasPendingInteraction(map, sid)) ids.push(sid)
+  } catch { return '' }
+  ids.sort()
+  return ids.join('\u0000')
+}

@@ -1,12 +1,13 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
 import { parentPathOf } from './pathutil'
+import { filterWorkingCards } from './consoleFilter'
 import { CHANGELOG_V030 } from './changelog'
 import { LOCAL_VERSION, checkUpdate, getAutoCheck, readCache, setAutoCheck as storeAutoCheck, setSkipVersion, type UpdateInfo, type UpdateStatus } from './updateCheck'
 import { Terminal } from 'xterm'
 import { FlowPane } from './flow'
 import { TemplateBar } from './templateBar'
 import type { FlowEnv } from './templates'
-import { getAssistantApi, readModelPref, readBgPref } from './orb-bridge'
+import { getAssistantApi, readModelPref, readBgPref, writeModelPref, writeBgPref } from './orb-bridge'
 import type { OrbModel } from './pocket/orb/orb-api'
 
 import MarkdownIt from 'markdown-it'
@@ -221,6 +222,9 @@ export type SplitJob = {
   startedAt: number
   finishedAt?: number
 }
+/** 控制室「临时运行卡片」的保留 id（不写入项目状态；数据由 index.tsx 从宿主会话快照实时组装） */
+export const RUNNING_CARD_ID = 'wt-running'
+
 /** 控制室卡片数据（index.tsx 组装；纯读镜像，零轮询零 Token） */
 export type ConsoleCardData = {
   id: string
@@ -244,6 +248,10 @@ export type ConsoleCardData = {
   self: boolean
   /** 完成/待决且未被确认：卡片发对应色光（点击确认后熄灭） */
   glow: boolean
+  /** 临时卡片「正在运行」收纳的会话数（只在临时卡片上有值） */
+  count?: number
+  /** 临时卡片：不属于任何项目文件夹的会话集合（点开 / 新建 / 会话列表走专门逻辑） */
+  temp?: boolean
 }
 
 /** 项目目录下的一个会话（控制室卡片「会话列表」浮层用；数据由 index.tsx 从宿主会话快照组装） */
@@ -265,6 +273,8 @@ export type ProjectSessionItem = {
   pinned?: boolean
   /** 已归档（工作区归档 = 从列表移除、磁盘日志保留；可恢复） */
   archived?: boolean
+  /** 已结束（临时卡片专用：运行结束、一直保留到手动「收工」） */
+  finished?: boolean
 }
 
 /** 新建会话选项：标准模式 = 宿主默认预设；computer-use = dsh-orb 的电脑操作预设。 */
@@ -274,6 +284,45 @@ export type NewSessionOptions = {
   front?: { provider: string; model: string; name?: string } | null
   /** 后台模型（dsh-orb 设置里的后台 Agent 模型，全局生效） */
   background?: { provider: string; model: string; name?: string } | null
+}
+
+/** 新建会话面板里可选的模型（与 OrbModel 同形，但 name 可缺省）。 */
+type NewSessModel = { provider: string; model: string; name?: string }
+
+/** 模型选择键（provider + model；select 的 value 用）。 */
+const newSessModelKey = (m: { provider: string; model: string } | null | undefined): string =>
+  m ? m.provider + '\u0000' + m.model : ''
+
+/** 两个模型选择是否指向同一模型。 */
+const sameNewSessModel = (a: NewSessModel | null | undefined, b: NewSessModel | null | undefined): boolean =>
+  !!a && !!b && a.provider === b.provider && a.model === b.model
+
+/** 从模型目录里挑一个**具体**模型：按 preferences 顺序取第一个仍存在的；
+ *  都不存在时用目录默认，再不行用第一个。目录为空（还没加载 / 不可用）时保留第一个非空偏好。
+ *  面板因此永远不会出现「默认」空选项：要么是上次用过的模型，要么是目录里真实存在的模型。 */
+function pickNewSessModel(
+  models: OrbModel[],
+  preferences: (NewSessModel | null | undefined)[] = [],
+  fallback?: { provider: string; model: string } | null,
+): NewSessModel | null {
+  const available = models.filter((m) => m && m.provider && m.model)
+  if (available.length === 0) {
+    for (const pref of preferences) {
+      if (pref && pref.provider && pref.model) return { ...pref }
+    }
+    return null
+  }
+  for (const pref of preferences) {
+    if (!pref) continue
+    const hit = available.find((m) => m.provider === pref.provider && m.model === pref.model)
+    if (hit) return { provider: hit.provider, model: hit.model, name: hit.name }
+  }
+  if (fallback && fallback.provider && fallback.model) {
+    const hit = available.find((m) => m.provider === fallback.provider && m.model === fallback.model)
+    if (hit) return { provider: hit.provider, model: hit.model, name: hit.name }
+  }
+  const first = available[0]
+  return { provider: first.provider, model: first.model, name: first.name }
 }
 
 type SplitEnv = {
@@ -305,6 +354,8 @@ type SplitEnv = {
     onOpenSession?: (sessionId: string) => void
     /** 删除某条会话（宿主归档：从各列表移除，磁盘日志保留；运行中的会话不入列删除） */
     onDeleteSession?: (sessionId: string) => void
+    /** 临时卡片「正在运行」：把已结束的会话从卡片移除（不删除会话） */
+    onDismissTransient?: (sessionIds: string[]) => void
     /** 重命名某条会话（宿主按 id 解析会话实例改名，无需打开会话） */
     onRenameSession?: (sessionId: string, title: string) => void
     /** 分叉某条会话：宿主在同目录建子会话并返回其 id（失败返回 null；切换由调用方负责） */
@@ -1768,7 +1819,7 @@ function ConsoleRuntime({ value }: { value: number }) {
 /** 控制室面板：项目卡片网格（每行 3 张、超出换行）；数据由工作台组装推送（纯读镜像）。
  *  主题：dark/light 直接生效；system = 跟随宿主 html 的 color-scheme（DSH 深色/白色/跟随系统都会反映到它） */
 export function ConsolePane() {
-  const [, setTick] = useState(0)
+  const [cardsRevision, setCardsRevision] = useState(0)
   const [cols, setColsState] = useState<number>(() => splitEnv?.console?.getCols?.() ?? 0)
   const [autoCols, setAutoCols] = useState(3)
   const [shape, setShapeState] = useState<'square' | 'circle'>(() => splitEnv?.console?.getShape?.() ?? 'square')
@@ -1787,12 +1838,14 @@ export function ConsolePane() {
   const [glowSpeed, setGlowSpeedState] = useState<number>(() => splitEnv?.console?.getGlowSpeed?.() ?? 50)
   const [annOpen, setAnnOpen] = useState(false)
   /** 卡片「会话列表」浮层：该项目目录下的会话 + 锚点坐标（点某一项即进入该会话，历史保留可继续） */
-  const [sessPop, setSessPop] = useState<{ name: string; x: number; y: number; items: ProjectSessionItem[] } | null>(null)
+  const [sessPop, setSessPop] = useState<{ name: string; x: number; y: number; items: ProjectSessionItem[]; transient?: boolean } | null>(null)
   /** 会话列表是否显示已归档项 */
   const [sessShowArchived, setSessShowArchived] = useState(false)
   /** 新建会话面板：项目 id/名称 + 模式 + 前台/后台模型 */
   const [newSessFor, setNewSessFor] = useState<{ id: string; name: string } | null>(null)
   const [manageOpen, setManageOpen] = useState(false)
+  /** 只看进行中：底部工具条漏斗按钮一键切换，藏掉空闲 / 已完成的项目卡片（不写存档，重开控制室回到全部） */
+  const [onlyWorking, setOnlyWorking] = useState(false)
   /** 项目管理：拖动排序（pointer 事件，鼠标/触屏通用）。targetId/before = 落点提示（目标行上/下边缘高亮）。 */
   const [manageDrag, setManageDrag] = useState<{ id: string; targetId: string; before: boolean } | null>(null)
   const manageDragIdRef = useRef<string | null>(null)
@@ -1848,6 +1901,36 @@ export function ConsolePane() {
   const newSessRequestRef = useRef(0)
   const newSessModelsRef = useRef<OrbModel[]>([])
   const newSessBgRequestRef = useRef<Promise<unknown> | null>(null)
+  /** 当前模式镜像：异步目录回调里用最新模式，避免切模式后被旧模式的选择覆盖。 */
+  const newSessModeRef = useRef<'standard' | 'computer-use'>('standard')
+  newSessModeRef.current = newSessMode
+  /** 宿主模型目录的默认模型（没有上次选择时用它，不再给「默认」空选项）。 */
+  const newSessCatalogDefaultRef = useRef<{ provider: string; model: string } | null>(null)
+  /** 用户是否手动改过后台模型：改过之后异步加载的后台设置不再覆盖。 */
+  const newSessBgTouchedRef = useRef(false)
+  /** 当前宿主会话正在用的模型——用户「上一次选择的模型」的最准来源。 */
+  const currentSessionModel = (): NewSessModel | null => {
+    const api = getAssistantApi()
+    const sid = splitEnv?.getScope?.()?.sessionId ?? ''
+    if (!api || !sid) return null
+    try {
+      const row = api.sessionRow(sid)
+      const sel = row?.modelSelection?.next ?? row?.modelSelection?.lastUsed
+      if (sel?.provider && sel.model) return { provider: sel.provider, model: sel.model, name: sel.model }
+    } catch {}
+    return null
+  }
+  /** 上次在这个面板里给某种模式选的模型（标准 / 电脑操作分开存）。 */
+  const modelPrefOf = (mode: 'standard' | 'computer-use'): NewSessModel | null =>
+    readModelPref(mode === 'computer-use' ? 'cu' : 'standard')
+  /** 前台模型偏好顺序：
+   *  普通对话 = 当前会话正在用的 → 面板上次选的 → 目录默认 → 目录第一个；
+   *  电脑操作 = 设置页/面板上次选的 CU 前台模型 → 当前会话 → 目录默认 → 目录第一个
+   *  （设置页的「前台模型（Computer Use 会话）」是显式配置，不应被当前会话覆盖）。 */
+  const frontPreferences = (mode: 'standard' | 'computer-use'): (NewSessModel | null)[] =>
+    mode === 'computer-use'
+      ? [modelPrefOf(mode), currentSessionModel()]
+      : [currentSessionModel(), modelPrefOf(mode)]
   /** 行内重命名：正在编辑的会话 id 与输入草稿 */
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editDraft, setEditDraft] = useState('')
@@ -1931,35 +2014,108 @@ export function ConsolePane() {
     newSessBgRequestRef.current = task
     void task.then((bg) => {
       if (!bg || newSessRequestRef.current !== requestId || newSessBgRequestRef.current !== task) return
-      const found = newSessModelsRef.current.find((m) => m.provider === bg.provider && m.model === bg.model)
-      setNewSessBg({ provider: bg.provider, model: bg.model, name: found?.name ?? bg.model })
+      // 用户已经手动选过后台模型：异步结果不再覆盖
+      if (newSessBgTouchedRef.current) return
+      const next = pickNewSessModel(newSessModelsRef.current, [
+        { provider: bg.provider, model: bg.model, name: bg.model },
+      ], newSessCatalogDefaultRef.current)
+      if (next) setNewSessBg(next)
     }).catch(() => {})
+  }
+  /** 加载完整模型目录：先读官方模型选择器已经缓存的全局 catalog（最可靠），
+   *  再试直接 Remote；都拿不到就短重试。移动端页面刚启动时 Remote 可能还没注入，
+   *  只试一次会让下拉里只剩当前会话那一个模型。 */
+  const loadNewSessionCatalog = (requestId: number): void => {
+    void (async () => {
+      const apply = (models: OrbModel[], def: { provider: string; model: string } | null): boolean => {
+        if (newSessRequestRef.current !== requestId) return true
+        if (models.length === 0) return false
+        newSessModelsRef.current = models
+        if (def) newSessCatalogDefaultRef.current = def
+        setNewSessModels(models)
+        setNewSessFront((prev) => pickNewSessModel(
+          models,
+          [prev, ...frontPreferences(newSessModeRef.current)],
+          def ?? newSessCatalogDefaultRef.current,
+        ))
+        setNewSessModelsLoading(false)
+        return true
+      }
+      for (let attempt = 0; attempt < 6; attempt++) {
+        if (newSessRequestRef.current !== requestId) return
+        const api = getAssistantApi()
+        if (api) {
+          // 1) 官方模型选择器的共享目录（通常已由官方输入框加载，移动端最可靠）
+          try {
+            const official = api.officialModelCatalog?.(splitEnv?.getScope?.()?.sessionId ?? '')
+            if (official && apply(official.models, official.default)) return
+          } catch { /* 官方目录不可用时继续走 Remote */ }
+          // 2) 直接 Remote + 官方/HTTP 兜底（api.modelCatalog 内部已处理超时）
+          try {
+            const cat = await api.modelCatalog()
+            const models = (cat?.models ?? []).filter((m) => m && m.provider && m.model)
+            const def = cat?.default && cat.default.provider && cat.default.model ? cat.default : null
+            if (apply(models, def)) return
+          } catch { /* 网络/宿主暂不可用 */ }
+          // 官方目录可能还在首次加载：稍等再读一次，避免刚打开面板时只剩一个模型
+          await new Promise((resolve) => setTimeout(resolve, 500))
+          if (newSessRequestRef.current !== requestId) return
+          try {
+            const official = api.officialModelCatalog?.(splitEnv?.getScope?.()?.sessionId ?? '')
+            if (official && apply(official.models, official.default)) return
+          } catch { /* 仍不可用：交给重试按钮 */ }
+          // API 已就绪但目录仍为空：不再空转，直接给「重试」入口
+          break
+        }
+        // api 还没注入（移动端刚打开页面）：等它出现
+        await new Promise((resolve) => setTimeout(resolve, 300))
+      }
+      if (newSessRequestRef.current === requestId) setNewSessModelsLoading(false)
+    })()
   }
   /** 打开面板立即显示缓存目录，同时后台刷新；catalog 与后台模型互不阻塞。 */
   const openNewSessionPanel = (c: ConsoleCardData, mode: 'standard' | 'computer-use' = 'standard') => {
     const requestId = ++newSessRequestRef.current
     setNewSessFor({ id: c.id, name: c.name })
     setNewSessMode(mode)
-    const lastFront = readModelPref(mode === 'computer-use' ? 'cu' : 'standard')
-    setNewSessFront(lastFront ? { provider: lastFront.provider, model: lastFront.model, name: lastFront.name } : null)
-    const lastBg = readBgPref()
-    setNewSessBg(lastBg ? { provider: lastBg.provider, model: lastBg.model, name: lastBg.name } : null)
-    setNewSessBusy(false)
+    newSessBgTouchedRef.current = false
     const cached = newSessModelsRef.current
+    setNewSessFront(pickNewSessModel(cached, frontPreferences(mode), newSessCatalogDefaultRef.current))
+    setNewSessBg(pickNewSessModel(cached, [readBgPref()], newSessCatalogDefaultRef.current))
+    setNewSessBusy(false)
     setNewSessModels(cached)
     setNewSessModelsLoading(cached.length === 0)
     if (mode === 'computer-use') loadNewSessionBackground(requestId)
-    const api = getAssistantApi()
-    void (async () => {
-      try {
-        const cat = await api?.modelCatalog?.()
-        const models = cat?.models ?? []
-        newSessModelsRef.current = models
-        if (newSessRequestRef.current === requestId) setNewSessModels(models)
-      } catch { /* 保留缓存；没有缓存时按不可用提示 */ }
-      if (newSessRequestRef.current === requestId) setNewSessModelsLoading(false)
-    })()
+    loadNewSessionCatalog(requestId)
   }
+  /** 模型目录仍为空时的手动重试（移动端 Remote 刚就绪时很好用） */
+  const reloadNewSessionModels = (): void => {
+    if (!newSessFor) return
+    setNewSessModelsLoading(true)
+    loadNewSessionCatalog(newSessRequestRef.current)
+  }
+  // 模型目录刷新 / 切换模式后，保证前台选择始终是目录里的具体模型（不出现空值）
+  useEffect(() => {
+    if (!newSessFor) return
+    setNewSessFront((prev) => {
+      if (prev && newSessModels.some((m) => sameNewSessModel(m, prev))) return prev
+      const next = pickNewSessModel(
+        newSessModels,
+        [prev, ...frontPreferences(newSessMode)],
+        newSessCatalogDefaultRef.current,
+      )
+      return next && !sameNewSessModel(next, prev) ? next : prev
+    })
+  }, [newSessFor, newSessModels, newSessMode])
+  // 电脑操作模式的后台模型同样补成具体模型；异步设置先到也以它为初值
+  useEffect(() => {
+    if (!newSessFor || newSessMode !== 'computer-use') return
+    setNewSessBg((prev) => {
+      if (prev && newSessModels.some((m) => sameNewSessModel(m, prev))) return prev
+      const next = pickNewSessModel(newSessModels, [prev, readBgPref()], newSessCatalogDefaultRef.current)
+      return next && !sameNewSessModel(next, prev) ? next : prev
+    })
+  }, [newSessFor, newSessMode, newSessModels])
   /** 提交「新建会话」：标准模式也可选前台模型；computer-use 另带后台模型。
    *  建会话是异步的（注册工作区 + 建会话 + 切到新会话约 1s），面板必须留到有结果：
    *  成功才关、失败留在原处并复位按钮——否则「点了创建会话，界面没动」看起来像没反应。 */
@@ -1967,10 +2123,21 @@ export function ConsolePane() {
     if (!newSessFor || newSessBusy) return
     const target = newSessFor
     setNewSessBusy(true)
+    // 面板里没有「默认」空选项：即使目录还没加载完，也带上当前会话/上次选择的模型
+    const front = newSessFront ?? pickNewSessModel(
+      newSessModels,
+      frontPreferences(newSessMode),
+      newSessCatalogDefaultRef.current,
+    )
+    const background = newSessMode === 'computer-use'
+      ? (newSessBg ?? pickNewSessModel(newSessModels, [readBgPref()], newSessCatalogDefaultRef.current))
+      : null
+    if (front) writeModelPref(newSessMode === 'computer-use' ? 'cu' : 'standard', { provider: front.provider, model: front.model, name: front.name ?? front.model })
+    if (background) writeBgPref({ provider: background.provider, model: background.model, name: background.name ?? background.model })
     const opts = {
       mode: newSessMode,
-      front: newSessFront,
-      background: newSessMode === 'computer-use' ? newSessBg : null,
+      front,
+      background,
     }
     const close = () => setNewSessFor((cur) => (cur && cur.id === target.id ? null : cur))
     try {
@@ -2248,10 +2415,24 @@ export function ConsolePane() {
   useEffect(() => {
     const env = splitEnv?.console
     if (!env) return
-    const bump = () => { setTick((t) => t + 1); setThemeMode(env.getTheme?.() ?? 'system') }
+    // 流式会话可能在一个事件循环里连续推多次；按动画帧合并，只重绘最新状态。
+    // 数据读取仍由 getCards 在渲染时完成，不丢弃状态，也不改变卡片刷新语义。
+    let frame: number | null = null
+    const flush = () => {
+      frame = null
+      setCardsRevision((v) => v + 1)
+    }
+    const bump = () => {
+      setThemeMode(env.getTheme?.() ?? 'system')
+      if (frame != null) return
+      frame = window.requestAnimationFrame(flush)
+    }
     const un = env.subscribe(bump)
     bump()
-    return un
+    return () => {
+      un()
+      if (frame != null) window.cancelAnimationFrame(frame)
+    }
   }, [])
   // 跟随系统：监听 OS 深浅切换（仅 themeMode==='system' 时影响渲染）
   useEffect(() => {
@@ -2294,7 +2475,11 @@ export function ConsolePane() {
   // 面板卸载时释放本次媒体库创建的全部对象 URL（不只当前背景那一张）。
   useEffect(() => () => releaseAllPhotoUrls(), [])
   const env = splitEnv?.console
-  const cards = env ? env.getCards() : []
+  // 输入重命名、拖动排序、调节背景等本地 UI 更新不重扫会话事件；
+  // 只有控制台数据通知（cardsRevision）才重新组装卡片。
+  const cards = useMemo(() => env ? env.getCards() : [], [env, cardsRevision])
+  /** 网格实际渲染的卡片：开启「只看进行中」时只留绿/黄/红，其余照常。 */
+  const shownCards = useMemo(() => filterWorkingCards(cards, onlyWorking), [cards, onlyWorking])
   const resolvedTheme: 'dark' | 'light' = (() => {
     if (themeMode !== 'system') return themeMode
     try {
@@ -2328,9 +2513,20 @@ export function ConsolePane() {
     const w = 360
     const x = Math.max(8, Math.min(Math.round(r.left), Math.max(8, window.innerWidth - w - 8)))
     const y = Math.min(Math.round(r.bottom + 6), Math.max(8, window.innerHeight - 140))
-    setSessPop({ name: c.name, x, y, items })
+    setSessPop({ name: c.name, x, y, items, transient: c.temp === true })
     setSessShowArchived(false)
     setEditingId(null)
+  }
+  /** 临时卡片「收工」：只移除已结束的会话（运行中的继续留着），会话本身不删除 */
+  const dismissTransientFinished = () => {
+    if (!sessPop?.transient) return
+    const pop = sessPop
+    const ids = pop.items.filter((i) => i.finished).map((i) => i.id)
+    if (ids.length === 0) return
+    splitEnv?.console?.onDismissTransient?.(ids)
+    const rest = pop.items.filter((i) => !i.finished)
+    if (rest.length === 0) setSessPop(null)
+    else setSessPop({ ...pop, items: rest })
   }
   /** 行内重命名：进入编辑（草稿=现标题，全选） */
   const startSessRename = (e: ReactMouseEvent, s: ProjectSessionItem) => {
@@ -2387,6 +2583,13 @@ export function ConsolePane() {
     return () => document.removeEventListener('keydown', onKey)
   }, [sessPop, editingId])
   const statusLabel: Record<string, string> = { idle: T('console.idle'), busy: T('console.busy'), need: T('console.need'), done: T('console.done'), error: T('console.error') }
+  // select 的显示值：始终给一个具体模型（与提交时的回退顺序一致），不再出现「默认」空项
+  const newSessFrontShown = newSessFor
+    ? (newSessFront ?? pickNewSessModel(newSessModels, frontPreferences(newSessMode), newSessCatalogDefaultRef.current))
+    : null
+  const newSessBgShown = newSessFor
+    ? (newSessBg ?? pickNewSessModel(newSessModels, [readBgPref()], newSessCatalogDefaultRef.current))
+    : null
   const themeOpts: { mode: 'dark' | 'light' | 'system'; key: string }[] = [
     { mode: 'dark', key: 'console.themeDark' },
     { mode: 'light', key: 'console.themeLight' },
@@ -2427,18 +2630,19 @@ export function ConsolePane() {
           </div>
         ) : (
         <div ref={gridRef} className="dsh-wt_consoleGrid" style={{ ['--wt-cols' as any]: effectiveCols, ...(cols === 0 ? { maxWidth: '100%' } : {}) }}>
-        {cards.map((c) => (
+        {shownCards.map((c) => (
           <div
             key={c.id}
             data-flip={c.id}
             role={c.self ? undefined : 'button'}
             tabIndex={c.self ? -1 : 0}
             className={'dsh-wt_consoleCard' + (c.self ? ' dsh-wt_consoleCardSelf' : '')
+              + (c.temp ? ' dsh-wt_consoleCard-temp' : '')
               + (c.status === 'busy' ? ' dsh-wt_consoleCard-busy' : '')
               + (c.status === 'error' ? ' dsh-wt_consoleCard-error' : '')
               + (c.glow && c.status === 'done' ? ' dsh-wt_consoleCard-glowDone' : '')
               + (c.glow && c.status === 'need' ? ' dsh-wt_consoleCard-glowNeed' : '')}
-            title={c.name}
+            title={c.temp ? T('console.tempCardTip') + ' · ' + c.name : c.name}
             onClick={() => {
               if (c.self || !env) return
               if (c.glow) env.onAck?.(c.id) // 点发光卡片：先确认熄光，再进入
@@ -2449,6 +2653,9 @@ export function ConsolePane() {
               {/* 图标只是标识，不再是按钮：换图标统一走「控制室下方工具条 → 项目管理 → 更换图标」 */}
               <span className="dsh-wt_consoleIcon" aria-hidden>{c.icon}</span>
               <span className="dsh-wt_consoleName">{c.name}</span>
+              {c.count != null && c.count > 0 && (
+                <span className="dsh-wt_consoleCount" title={T('console.tempCountTip', { n: String(c.count) })}>{c.count}</span>
+              )}
             </div>
             <div className="dsh-wt_consoleDivider" aria-hidden />
             <div className="dsh-wt_consoleStatusRow">
@@ -2460,7 +2667,7 @@ export function ConsolePane() {
               {c.preview || (c.bound ? T('console.noPreview') : T('console.unboundShort'))}
               {c.live && c.preview ? <span className="dsh-wt_consoleCaret" aria-hidden>▍</span> : null}
             </div>
-            {/* 卡片底部操作行：上面「标准 / CU」两个新建会话按钮，下面「会话列表」 */}
+            {/* 卡片底部操作行：两个醒目的一键新建（对话 / 电脑操作），下面「会话列表」 */}
             <div className="dsh-wt_consoleCardOps">
               {c.canNewSession && (
                 <>
@@ -2471,10 +2678,14 @@ export function ConsolePane() {
                     aria-label={T('console.newStandard')}
                     onClick={(e) => { e.stopPropagation(); if (splitEnv?.console?.onCreateSession) openNewSessionPanel(c, 'standard'); else env?.onNewSession?.(c.id) }}
                   >
-                    <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
-                      <path d="M8 3.4v9.2M3.4 8h9.2" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-                    </svg>
-                    <span>{T('console.newStandardShort')}</span>
+                    <span className="dsh-wt_consoleOpMain">
+                      <svg width="13" height="13" viewBox="0 0 16 16" aria-hidden>
+                        <circle cx="8" cy="8" r="7" fill="currentColor" opacity=".16" />
+                        <path d="M8 4.5v7M4.5 8h7" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" />
+                      </svg>
+                      <span>{T('console.newShort')}</span>
+                    </span>
+                    <span className="dsh-wt_consoleOpSub">{T('console.newStandardShort')}</span>
                   </button>
                   <button
                     type="button"
@@ -2483,10 +2694,14 @@ export function ConsolePane() {
                     aria-label={T('console.newComputerUse')}
                     onClick={(e) => { e.stopPropagation(); if (splitEnv?.console?.onCreateSession) openNewSessionPanel(c, 'computer-use'); else env?.onNewSession?.(c.id) }}
                   >
-                    <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
-                      <path d="M8 3.4v9.2M3.4 8h9.2" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-                    </svg>
-                    <span>{T('console.newComputerUseShort')}</span>
+                    <span className="dsh-wt_consoleOpMain">
+                      <svg width="13" height="13" viewBox="0 0 16 16" aria-hidden>
+                        <circle cx="8" cy="8" r="7" fill="currentColor" opacity=".16" />
+                        <path d="M8 4.5v7M4.5 8h7" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" />
+                      </svg>
+                      <span>{T('console.newShort')}</span>
+                    </span>
+                    <span className="dsh-wt_consoleOpSub">{T('console.newComputerUseShort')}</span>
                   </button>
                 </>
               )}
@@ -2519,7 +2734,11 @@ export function ConsolePane() {
           <span className="dsh-wt_consoleAddPlus" aria-hidden>＋</span>
           <span className="dsh-wt_consoleAddLabel">{T('console.addProject')}</span>
         </div>
-        {cards.length === 0 && <div className="dsh-wt_consoleEmpty">{T('console.empty')}</div>}
+        {shownCards.length === 0 && (
+          <div className="dsh-wt_consoleEmpty">
+            {onlyWorking && cards.length > 0 ? T('console.onlyWorkingEmpty') : T('console.empty')}
+          </div>
+        )}
         </div>
         )}
 
@@ -2527,14 +2746,19 @@ export function ConsolePane() {
       {sessPop && (
         <>
           <div className="dsh-wt_sessMask" onClick={() => { setSessPop(null); setEditingId(null) }} />
-          <div className="dsh-wt_sessPop" style={{ left: sessPop.x, top: sessPop.y }} role="dialog" aria-label={T('console.sessionsTitle')}>
+          <div className="dsh-wt_sessPop" style={{ left: sessPop.x, top: sessPop.y }} role="dialog" aria-label={sessPop.transient ? T('console.transientTitle') : T('console.sessionsTitle')}>
             <div className="dsh-wt_sessHead">
-              <span className="dsh-wt_sessTitle">{T('console.sessionsTitle')}</span>
+              <span className="dsh-wt_sessTitle">{sessPop.transient ? T('console.transientTitle') : T('console.sessionsTitle')}</span>
               <span className="dsh-wt_sessProj" title={sessPop.name}>{sessPop.name}</span>
+              {sessPop.transient && sessPop.items.some((i) => i.finished) && (
+                <button type="button" className="dsh-wt_sessDone" onClick={dismissTransientFinished} title={T('console.dismissFinishedTip')}>
+                  {T('console.dismissFinished')}
+                </button>
+              )}
               <span className="dsh-wt_sessCount">{sessPop.items.filter((i) => sessShowArchived || !i.archived).length}</span>
             </div>
             {sessPop.items.filter((i) => sessShowArchived || !i.archived).length === 0 ? (
-              <div className="dsh-wt_sessEmpty">{T('console.sessionsEmpty')}</div>
+              <div className="dsh-wt_sessEmpty">{sessPop.transient ? T('console.transientEmpty') : T('console.sessionsEmpty')}</div>
             ) : (
               <div className="dsh-wt_sessList">
                 {sessPop.items.filter((i) => sessShowArchived || !i.archived).map((s) => (
@@ -2545,8 +2769,18 @@ export function ConsolePane() {
                     className={'dsh-wt_sessItem' + (s.current ? ' dsh-wt_sessItemCur' : '') + (s.archived ? ' dsh-wt_sessItemArchived' : '')}
                     title={s.title}
                     data-editing={editingId === s.id || undefined}
-                    onClick={() => { setSessPop(null); splitEnv?.console?.onOpenSession?.(s.id) }}
-                    onKeyDown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && editingId == null) { e.preventDefault(); setSessPop(null); splitEnv?.console?.onOpenSession?.(s.id) } }}
+                    onClick={() => {
+                      // 只打开会话；不移出卡片——结束后一直保留到手动「收工」
+                      setSessPop(null)
+                      splitEnv?.console?.onOpenSession?.(s.id)
+                    }}
+                    onKeyDown={(e) => {
+                      if ((e.key === 'Enter' || e.key === ' ') && editingId == null) {
+                        e.preventDefault()
+                        setSessPop(null)
+                        splitEnv?.console?.onOpenSession?.(s.id)
+                      }
+                    }}
                   >
                     {s.pinned && (
                       <span className="dsh-wt_sessPin" title={T('console.pin')} aria-hidden>
@@ -2573,6 +2807,7 @@ export function ConsolePane() {
                       <span className="dsh-wt_sessName">{s.title || T('console.untitled')}</span>
                     )}
                     {s.archived && <span className="dsh-wt_sessTag">{T('console.archivedTag')}</span>}
+                    {s.finished && !s.archived && <span className="dsh-wt_sessTag dsh-wt_sessFinishedTag">{T('console.finishedTag')}</span>}
                     {!s.archived && <span className="dsh-wt_sessRel">{s.rel || T('console.sessionRoot')}</span>}
                     {editingId == null && (
                       <span className="dsh-wt_sessOps" onClick={(e) => e.stopPropagation()}>
@@ -2641,6 +2876,9 @@ export function ConsolePane() {
                 {sessShowArchived ? T('console.hideArchived') : T('console.showArchived')} ({sessPop.items.filter((i) => i.archived).length})
               </button>
             )}
+            {sessPop.transient && (
+              <div className="dsh-wt_sessHint">{T('console.transientHint')}</div>
+            )}
           </div>
         </>
       )}
@@ -2650,6 +2888,21 @@ export function ConsolePane() {
           <button type="button" className={'dsh-wt_dockBtn' + (openMenu === 'theme' ? ' dsh-wt_dockBtnOn' : '')} title={T('console.themeLabel')} aria-label={T('console.themeLabel')} onClick={() => setOpenMenu(openMenu === 'theme' ? null : 'theme')}><ThemeIcon mode={themeMode} /></button>
           <button type="button" className={'dsh-wt_dockBtn' + (openMenu === 'bg' ? ' dsh-wt_dockBtnOn' : '')} title={T('console.bgLabel')} aria-label={T('console.bgLabel')} onClick={() => { setOpenMenu(openMenu === 'bg' ? null : 'bg'); setBgEdit(null) }}><svg width="18" height="18" viewBox="0 0 16 16" aria-hidden><rect x="2.2" y="3.2" width="11.6" height="9.6" rx="1.6" fill="none" stroke="currentColor" strokeWidth="0.9" /><circle cx="5.9" cy="6.7" r="1.05" fill="none" stroke="currentColor" strokeWidth="0.8" /><path d="M3.4 11.4l3-3 2.3 2.3 1.9-1.9 3 2.6" fill="none" stroke="currentColor" strokeWidth="0.9" /></svg></button>
           <button type="button" className={'dsh-wt_dockBtn' + (openMenu === 'cols' ? ' dsh-wt_dockBtnOn' : '')} title={T('console.colsLabel')} aria-label={T('console.colsLabel')} onClick={() => setOpenMenu(openMenu === 'cols' ? null : 'cols')}><svg width="20" height="20" viewBox="0 0 16 16" aria-hidden><rect x="2.2" y="3.4" width="2.7" height="9.2" rx="0.9" fill="none" stroke="currentColor" strokeWidth="0.9" /><rect x="6.65" y="3.4" width="2.7" height="9.2" rx="0.9" fill="none" stroke="currentColor" strokeWidth="0.9" /><rect x="11.1" y="3.4" width="2.7" height="9.2" rx="0.9" fill="none" stroke="currentColor" strokeWidth="0.9" /></svg></button>
+          {/* 一键隐藏未工作的项目卡片：亮起 = 只看进行中（绿/黄/红），再点一下显示全部 */}
+          <button
+            type="button"
+            className={'dsh-wt_dockBtn' + (onlyWorking ? ' dsh-wt_dockFilterOn' : '')}
+            title={onlyWorking ? T('console.onlyWorkingOnTip') : T('console.onlyWorkingOffTip')}
+            aria-label={T('console.onlyWorking')}
+            aria-pressed={onlyWorking}
+            onClick={() => { setOpenMenu(null); setOnlyWorking((v) => !v) }}
+          >
+            <svg width="18" height="18" viewBox="0 0 16 16" aria-hidden>
+              <path d="M1.6 8Q4.4 3.9 8 3.9T14.4 8Q11.6 12.1 8 12.1T1.6 8Z" fill="currentColor" fillOpacity={onlyWorking ? 0.16 : 0} stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+              <circle cx="8" cy="8" r="2.15" fill="currentColor" fillOpacity={onlyWorking ? 0.9 : 0} stroke="currentColor" strokeWidth="1.2" />
+            </svg>
+            {onlyWorking && shownCards.length > 0 && <span className="dsh-wt_dockCount" aria-hidden>{shownCards.length}</span>}
+          </button>
           <button type="button" className={'dsh-wt_dockBtn' + (manageOpen ? ' dsh-wt_dockBtnOn' : '')} title={T('console.manage')} aria-label={T('console.manage')} onClick={() => { setOpenMenu(null); setManageOpen((v) => !v) }}>
             <svg width="18" height="18" viewBox="0 0 16 16" aria-hidden><path d="M3 4.6h10M3 8h10M3 11.4h6" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /><circle cx="12.4" cy="11.4" r="1.5" fill="none" stroke="currentColor" strokeWidth="1.1" /></svg>
           </button>
@@ -2817,7 +3070,7 @@ export function ConsolePane() {
         </div>
       )}
 
-      {/* 新建会话面板：标准 / computer-use（后者可选前台与后台模型） */}
+      {/* 新建会话面板：普通对话 / 电脑操作（后者可选前台与后台模型） */}
       {newSessFor && (
         <div className="dsh-wt_newSessMask" onClick={() => setNewSessFor(null)}>
           <div className="dsh-wt_newSess" role="region" aria-label={T('console.newSessionTitle')} onClick={(e) => e.stopPropagation()}>
@@ -2828,14 +3081,14 @@ export function ConsolePane() {
             <div className="dsh-wt_modeRow">
               <button type="button" className={'dsh-wt_modeBtn' + (newSessMode === 'standard' ? ' dsh-wt_modeBtnOn' : '')} onClick={() => {
                 setNewSessMode('standard')
-                const p = readModelPref('standard')
-                setNewSessFront(p ? { provider: p.provider, model: p.model, name: p.name } : null)
+                setNewSessFront(pickNewSessModel(newSessModelsRef.current, frontPreferences('standard'), newSessCatalogDefaultRef.current))
               }}>{T('console.modeStandard')}</button>
               <button type="button" className={'dsh-wt_modeBtn' + (newSessMode === 'computer-use' ? ' dsh-wt_modeBtnOn' : '')} onClick={() => {
                 setNewSessMode('computer-use')
+                newSessBgTouchedRef.current = false
+                setNewSessFront(pickNewSessModel(newSessModelsRef.current, frontPreferences('computer-use'), newSessCatalogDefaultRef.current))
+                setNewSessBg(pickNewSessModel(newSessModelsRef.current, [readBgPref()], newSessCatalogDefaultRef.current))
                 loadNewSessionBackground(newSessRequestRef.current)
-                const p = readModelPref('cu')
-                setNewSessFront(p ? { provider: p.provider, model: p.model, name: p.name } : null)
               }}>{T('console.modeComputerUse')}</button>
             </div>
             <div className="dsh-wt_modeTip">{newSessMode === 'computer-use' ? T('console.modeComputerUseTip') : T('console.modeStandardTip')}</div>
@@ -2843,17 +3096,24 @@ export function ConsolePane() {
               <span className="dsh-wt_modelLabel">{T('console.frontModel')}</span>
               <select
                 className="dsh-wt_modelSelect"
-                disabled={newSessModelsLoading}
-                value={newSessFront ? newSessFront.provider + '\u0000' + newSessFront.model : ''}
+                disabled={newSessModelsLoading && newSessModels.length === 0}
+                value={newSessModelKey(newSessFrontShown)}
                 onChange={(e) => {
                   const v = e.target.value
                   if (!v) { setNewSessFront(null); return }
                   const [provider, model] = v.split('\u0000')
                   const hit = newSessModels.find((m) => m.provider === provider && m.model === model)
-                  setNewSessFront({ provider, model, name: hit?.name })
+                  const next = { provider, model, name: hit?.name ?? model }
+                  setNewSessFront(next)
+                  writeModelPref(newSessMode === 'computer-use' ? 'cu' : 'standard', next)
                 }}
               >
-                <option value="">{T('console.modelDefault')}</option>
+                {newSessFrontShown && !newSessModels.some((m) => sameNewSessModel(m, newSessFrontShown)) && (
+                  <option value={newSessModelKey(newSessFrontShown)}>{newSessFrontShown.name ?? newSessFrontShown.model}</option>
+                )}
+                {!newSessFrontShown && newSessModels.length === 0 && (
+                  <option value="" disabled>{newSessModelsLoading ? T('console.modelLoading') : T('console.modelUnavailable')}</option>
+                )}
                 {newSessModels.map((m) => (
                   <option key={m.provider + '\u0000' + m.model} value={m.provider + '\u0000' + m.model}>{m.groupName} · {m.name}</option>
                 ))}
@@ -2864,17 +3124,25 @@ export function ConsolePane() {
                 <span className="dsh-wt_modelLabel">{T('console.backgroundModel')}</span>
                 <select
                   className="dsh-wt_modelSelect"
-                  disabled={newSessModelsLoading}
-                  value={newSessBg ? newSessBg.provider + '\u0000' + newSessBg.model : ''}
+                  disabled={newSessModelsLoading && newSessModels.length === 0}
+                  value={newSessModelKey(newSessBgShown)}
                   onChange={(e) => {
                     const v = e.target.value
                     if (!v) { setNewSessBg(null); return }
                     const [provider, model] = v.split('\u0000')
                     const hit = newSessModels.find((m) => m.provider === provider && m.model === model)
-                    setNewSessBg({ provider, model, name: hit?.name })
+                    const next = { provider, model, name: hit?.name ?? model }
+                    newSessBgTouchedRef.current = true
+                    setNewSessBg(next)
+                    writeBgPref(next)
                   }}
                 >
-                  <option value="">{T('console.modelDefault')}</option>
+                  {newSessBgShown && !newSessModels.some((m) => sameNewSessModel(m, newSessBgShown)) && (
+                    <option value={newSessModelKey(newSessBgShown)}>{newSessBgShown.name ?? newSessBgShown.model}</option>
+                  )}
+                  {!newSessBgShown && newSessModels.length === 0 && (
+                    <option value="" disabled>{newSessModelsLoading ? T('console.modelLoading') : T('console.modelUnavailable')}</option>
+                  )}
                   {newSessModels.map((m) => (
                     <option key={m.provider + '\u0000' + m.model} value={m.provider + '\u0000' + m.model}>{m.groupName} · {m.name}</option>
                   ))}
@@ -2882,7 +3150,12 @@ export function ConsolePane() {
               </label>
             )}
             {newSessModelsLoading && <div className="dsh-wt_modelHint">{T('console.modelLoading')}</div>}
-            {!newSessModelsLoading && newSessModels.length === 0 && <div className="dsh-wt_modelHint">{T('console.modelUnavailable')}</div>}
+            {!newSessModelsLoading && newSessModels.length === 0 && (
+              <div className="dsh-wt_modelHint">
+                {T('console.modelUnavailable')}
+                <button type="button" className="dsh-wt_modelRetry" onClick={reloadNewSessionModels}>{T('console.modelRetry')}</button>
+              </div>
+            )}
             <div className="dsh-wt_newSessOps">
               <button type="button" className="dsh-wt_btnGhost" disabled={newSessBusy} onClick={() => setNewSessFor(null)}>{T('console.cancel')}</button>
               <button type="button" className="dsh-wt_btnPrimary" disabled={newSessBusy} onClick={submitNewSession}>{newSessBusy ? T('console.creatingSession') : T('console.createSession')}</button>

@@ -12,6 +12,7 @@ import * as worktable from './index'
 import * as pocket from './pocket-host/index.js'
 import * as tuoguan from './tuoguan-host'
 import { registerAssistantState } from './assistant-store'
+import { registerCoordinateMode } from './coordinate-mode'
 import { startDesktopBall, ballProfileDir } from './desktop-ball'
 import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -64,6 +65,15 @@ export function apply(ctx: any, config: any = {}): () => void {
   // ── 跨端状态半部（项目 / 控制室视图） ──
   try { registerAssistantState(ctx) } catch (err) {
     try { ctx.logger?.('dsh-assistant')?.error?.('state store failed: %s', String(err)) } catch {}
+  }
+
+  // ── Computer Use 坐标模式（千分比 0–1000 / 截图像素；设置页可切换） ──
+  // 内嵌 computer-use 在新会话创建时读 assistantCoordinateMode 服务，决定点击坐标系。
+  try {
+    const dispose = registerCoordinateMode(ctx)
+    if (typeof dispose === 'function') disposers.push(dispose)
+  } catch (err) {
+    try { ctx.logger?.('dsh-assistant')?.error?.('coordinate mode failed: %s', String(err)) } catch {}
   }
 
   // ── 桌面原生悬浮球（独立 Electron 小窗；网页/CLI 自动回退页内球） ──
@@ -187,7 +197,15 @@ export function apply(ctx: any, config: any = {}): () => void {
       kind: 'exact',
       path: '/api/assistant/ball-avatar',
       handler: (req: any, res: any) => {
-        if (String(req.method ?? 'GET').toUpperCase() !== 'POST') {
+        const method = String(req.method ?? 'GET').toUpperCase()
+        // GET：界面内悬浮球启动时拉一次宿主头像，保证窗口内/窗口外两颗球长得一样
+        if (method === 'GET') {
+          const payload = JSON.stringify({ avatar: ballState.avatar })
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          res.end(payload)
+          return
+        }
+        if (method !== 'POST') {
           res.writeHead(405)
           res.end()
           return
@@ -205,6 +223,29 @@ export function apply(ctx: any, config: any = {}): () => void {
           res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
           res.end(JSON.stringify({ ok: true, hasAvatar: !!ballState.avatar }))
         })
+      },
+    })
+    // 模型目录的 HTTP 兜底：移动端页面经公网代理时，客户端 Remote 偶发调用不到
+    // session/modelCatalog，新建会话面板就只剩当前模型。这里直接在 Host 侧读同一份目录，
+    // 客户端用同源 fetch 就能列出全部模型。
+    ctx.webServer?.register?.({
+      kind: 'exact',
+      path: '/api/assistant/models',
+      handler: (_req: any, res: any) => {
+        void (async () => {
+          try {
+            const controller: any = ctx.get?.('sessionController') ?? ctx.sessionController
+            const catalog = await controller?.modelCatalog?.()
+            if (!catalog) throw new Error('model catalog unavailable')
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+            res.end(JSON.stringify({ ok: true, catalog }))
+          } catch (err) {
+            try {
+              res.writeHead(503, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+              res.end(JSON.stringify({ ok: false, error: String((err as any)?.message ?? err) }))
+            } catch { /* 客户端已断开 */ }
+          }
+        })()
       },
     })
     ctx.webServer?.register?.({

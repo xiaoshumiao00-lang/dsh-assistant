@@ -194,6 +194,59 @@ export function makeOrbApi(ctx: any) {
     try { return ctx.remote?.speech } catch { return undefined }
   }
 
+  /** 官方模型选择器已经加载的共享目录（全局 catalog / 当前会话目录）。
+   *  直接 Remote 还没就绪或失败时用它兜底，保证「所有模型」都能列出来，
+   *  而不是只剩当前会话那一个。宿主没有 ui-model-selection / 目录尚未加载时返回 null。 */
+  const officialCatalogOf = (sessionId?: string | null): { default: { provider: string; model: string } | null; models: OrbModel[] } | null => {
+    try {
+      const resolver: any = ctx.get?.('modelDirectories') ?? (ctx as any).modelDirectories
+      if (!resolver) return null
+      let value: any = null
+      try {
+        const state = resolver.catalog?.store?.getSnapshot?.()
+        value = state?.value ?? null
+        if (!value) {
+          try { void resolver.catalog?.load?.() } catch { /* 目录自己会在就绪后通知 */ }
+        }
+      } catch { /* 私有目录形状变化时退回 per-session 目录 */ }
+      if ((!value || !Array.isArray(value.groups) || value.groups.length === 0) && sessionId) {
+        try {
+          const dir = resolver.directoryFor?.(sessionId)
+          const state = dir?.store?.getSnapshot?.()
+          if (state && Array.isArray(state.groups) && state.groups.length > 0) {
+            value = { groups: state.groups, default: null }
+          } else {
+            try { void dir?.load?.() } catch { /* 下次重试再读 */ }
+          }
+        } catch { /* 会话尚未绑定/已销毁 */ }
+      }
+      const groups = value?.groups
+      if (!Array.isArray(groups) || groups.length === 0) return null
+      const models: OrbModel[] = []
+      for (const group of groups) {
+        if (!group?.id) continue
+        for (const model of group.models ?? []) {
+          if (!model?.id) continue
+          models.push({
+            provider: String(group.id),
+            model: String(model.id),
+            name: String(model.name || model.id),
+            groupName: String(group.name || group.id),
+            description: typeof model.description === 'string' ? model.description : undefined,
+          })
+        }
+      }
+      if (models.length === 0) return null
+      const d = value?.default
+      return {
+        default: d && typeof d.provider === 'string' && typeof d.model === 'string'
+          ? { provider: d.provider, model: d.model }
+          : null,
+        models,
+      }
+    } catch { return null }
+  }
+
   return {
     /** 浏览电脑目录/文件（includeFiles=true 含文件，附件选择器用）。 */
     async listFs(path: string, opts: { includeFiles?: boolean; cwd?: string } = {}) {
@@ -422,24 +475,78 @@ export function makeOrbApi(ctx: any) {
       }
     },
 
-    /** 模型目录（拍平为展示行；与桌面模型选择同一目录）。 */
+    /** 模型目录（拍平为展示行；与桌面模型选择同一目录）。
+     *  Remote 失败/为空时自动退回官方模型选择器已缓存的目录，保证列表完整。 */
     async modelCatalog(): Promise<{ default: { provider: string; model: string }; models: OrbModel[] }> {
-      const result = await ctx.remote.session.modelCatalog()
-      const value = result?.ok === true ? result.value : result
-      const groups = value?.groups ?? []
-      const models: OrbModel[] = []
-      for (const group of groups) {
-        for (const model of group.models ?? []) {
-          models.push({
-            provider: group.id,
-            model: model.id,
-            name: model.name || model.id,
-            groupName: group.name || group.id,
-            description: model.description,
-          })
+      try {
+        // Remote 偶发不返回（移动端代理/连接刚建立）：1.5s 内拿不到就换官方目录 / HTTP
+        const result = await Promise.race([
+          ctx.remote.session.modelCatalog(),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
+        ])
+        const value = result?.ok === true ? result.value : result
+        const groups = value?.groups ?? []
+        const models: OrbModel[] = []
+        for (const group of groups) {
+          for (const model of group.models ?? []) {
+            models.push({
+              provider: group.id,
+              model: model.id,
+              name: model.name || model.id,
+              groupName: group.name || group.id,
+              description: model.description,
+            })
+          }
         }
+        if (models.length > 0) return { default: value?.default ?? { provider: '', model: '' }, models }
+      } catch { /* 退回官方目录 */ }
+      const official = officialCatalogOf()
+      if (official?.models.length) {
+        return { default: official.default ?? { provider: '', model: '' }, models: official.models }
       }
-      return { default: value?.default ?? { provider: '', model: '' }, models }
+      // 最后兜底：同源 HTTP（移动端经公网代理时 Remote 可能不可用；Host 侧读同一份目录）
+      try {
+        if (typeof fetch === 'function') {
+          const ctl = typeof AbortController === 'function' ? new AbortController() : null
+          const timer = ctl ? setTimeout(() => { try { ctl.abort() } catch {} }, 2500) : null
+          try {
+            const res = await fetch('/api/assistant/models', {
+              cache: 'no-store',
+              headers: { accept: 'application/json' },
+              signal: ctl?.signal,
+            })
+            if (res.ok) {
+              const body = await res.json().catch(() => null)
+              const catalog = body?.catalog ?? body
+              const groups = catalog?.groups ?? []
+              const models: OrbModel[] = []
+              for (const group of groups) {
+                for (const model of group?.models ?? []) {
+                  if (!group?.id || !model?.id) continue
+                  models.push({
+                    provider: String(group.id),
+                    model: String(model.id),
+                    name: String(model.name || model.id),
+                    groupName: String(group.name || group.id),
+                    description: typeof model.description === 'string' ? model.description : undefined,
+                  })
+                }
+              }
+              if (models.length > 0) {
+                return { default: catalog?.default ?? { provider: '', model: '' }, models }
+              }
+            }
+          } finally {
+            if (timer != null) clearTimeout(timer)
+          }
+        }
+      } catch { /* HTTP 兜底也失败：返回空，由调用方提示 */ }
+      return { default: { provider: '', model: '' }, models: [] }
+    },
+
+    /** 官方模型选择器已经加载的共享目录（全局 catalog / 当前会话目录）。 */
+    officialModelCatalog(sessionId?: string | null) {
+      return officialCatalogOf(sessionId)
     },
 
     /** 选择模型（作用于该会话的后续消息）。 */

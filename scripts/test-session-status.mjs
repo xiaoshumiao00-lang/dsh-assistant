@@ -1,6 +1,6 @@
 /** 控制室「等待提问」状态回归：node scripts/test-session-status.mjs */
 import assert from 'node:assert/strict'
-import { hasPendingInteraction, sessionStatusSourceOf } from '../src/client/sessionStatus.ts'
+import { hasPendingInteraction, sessionStatusSourceOf, pendingInteractionSignature } from '../src/client/sessionStatus.ts'
 
 const cases = []
 const question = { kind: 'question', questions: [{ id: 'q1' }] }
@@ -47,6 +47,31 @@ cases.push(['旧版原始交互 Map / 缺失会话 / 异常 Map 均按各自语�
   assert.equal(hasPendingInteraction(null, 's1'), false)
   assert.equal(hasPendingInteraction(new Map([['s1', question]]), undefined), false)
   assert.equal(hasPendingInteraction({ get() { throw new Error('broken') } }, 's1'), false)
+}])
+
+cases.push(['待决签名只看待决集合：running 字段与 Map 顺序变化不触发重绘', () => {
+  const a = new Map([
+    ['s1', { running: false, pendingInteraction: question }],
+    ['s2', { running: false, pendingInteraction: null }],
+  ])
+  const b = new Map([
+    ['s2', { running: true, pendingInteraction: undefined }],
+    ['s1', { running: true, pendingInteraction: question }],
+  ])
+  assert.equal(pendingInteractionSignature(a), 's1')
+  assert.equal(pendingInteractionSignature(a), pendingInteractionSignature(b))
+}])
+
+cases.push(['待决签名在提问新增 / 回答清除时变化，兼容旧版原始交互 Map', () => {
+  const pending = new Map([['s1', { running: true, pendingInteraction: question }]])
+  const before = pendingInteractionSignature(pending)
+  pending.set('s2', { running: true, pendingInteraction: question })
+  assert.notEqual(pendingInteractionSignature(pending), before)
+  pending.get('s1').pendingInteraction = null
+  pending.get('s2').pendingInteraction = undefined
+  assert.equal(pendingInteractionSignature(pending), '')
+  assert.equal(pendingInteractionSignature(new Map([['legacy', question]])), 'legacy')
+  assert.equal(pendingInteractionSignature(null), '')
 }])
 
 let failed = 0
