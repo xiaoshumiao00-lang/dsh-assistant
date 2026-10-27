@@ -1,7 +1,7 @@
 // 悬浮球主页面（全屏）：会话历史 + 目标（新会话/会话）+ 输入区。
 // 发送语义与桌面悬浮球一致：新会话 → 电脑上创建会话并执行；已有会话 → 追加指令。
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import { controlRoomStore, nativeBallStore, ballConfigStore } from '../../orb-bridge.ts'
+import { controlRoomStore, ballConfigStore } from '../../orb-bridge.ts'
 import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, TouchEvent as ReactTouchEvent } from 'react'
 import { Composer } from './Composer.tsx'
 import type { OrbChip, OrbVoiceBridge, SlashItem } from './Composer.tsx'
@@ -40,16 +40,13 @@ export interface OrbOverlayProps {
 /** 开关门面：关闭时右下角悬浮球按钮（可拖动）+ 页面隐藏（不卸载，草稿保住）。 */
 export function OrbOverlay({ api, t }: OrbOverlayProps) {
   const open = useSyncExternalStore(orbStore.subscribe, orbStore.getSnapshot)
-  // 控制室打开时把球收起来（否则会浮在全屏控制室上面）
+  // 控制室打开时球**不收起**：球自己就是控制室的开/关按钮（点一下开、再点一下关），
+  // 打开期间只把层级抬到控制室之上（见 BALL_Z_RAISED），否则会被全屏控制室盖住。
   const controlRoomOpen = useSyncExternalStore(controlRoomStore.subscribe, controlRoomStore.getSnapshot)
-  // Electron 宿主有原生桌面球（可拖到 DSH 窗口外）时，隐藏网页内这颗，避免两个球。
-  // 只在 Electron 渲染器里隐藏：手机浏览器与普通桌面浏览器仍需要页内球
-  // （原生球在电脑上，点它只会打开电脑上的窗口）。
-  const nativeBallFlag = useSyncExternalStore(nativeBallStore.subscribe, nativeBallStore.getSnapshot)
-  // 个人助手设置里的「启用悬浮球 / 悬浮球头像」：改完页内球实时跟随
+  // 个人助手设置里的「启用悬浮球 / 悬浮球头像」：改完页内球实时跟随。
+  // 桌面端现在**同时**保留界面内这颗球与窗口外的原生球（两者功能相同：点一下打开控制室）；
+  // 不再因为存在原生球而隐藏界面内这颗——用户希望界面里也有一个入口。
   const ballConfig = useSyncExternalStore(ballConfigStore.subscribe, ballConfigStore.getSnapshot)
-  const electronShell = typeof navigator !== 'undefined' && /Electron/i.test(navigator.userAgent)
-  const nativeBall = nativeBallFlag && electronShell
   // 惰性挂载：悬浮球页首次打开前不渲染（哪怕只是 display:none）——
   // 会话历史可能有数百行，常驻在手机 WebView 里会白占几 MB 内存与上万个 DOM 节点，
   // 正是「详情页一崩就整页 reload」时最不该存在的负担。打开过一次后保持挂载，
@@ -60,13 +57,15 @@ export function OrbOverlay({ api, t }: OrbOverlayProps) {
   if (open) mountedRef.current = true
   return (
     <>
-      {!open && !controlRoomOpen && !nativeBall && ballConfig.enabled && (
+      {!open && ballConfig.enabled && (
         <OrbBall
           label={t('open')}
           avatar={ballConfig.avatar || DEFAULT_ORB_AVATAR}
-          onOpen={() => {
-            // 悬浮球 = 控制室入口（手机/电脑一致）。快捷输入页仍可从抽屉入口打开。
-            controlRoomStore.setOpen(true)
+          raised={controlRoomOpen}
+          onToggle={() => {
+            // 悬浮球 = 控制室开关（手机/电脑一致）：没开就打开，开着就关闭。
+            // 快捷输入页仍可从抽屉入口打开。
+            controlRoomStore.setOpen(!controlRoomOpen)
           }}
         />
       )}
@@ -78,6 +77,9 @@ export function OrbOverlay({ api, t }: OrbOverlayProps) {
 /** 球体直径与贴边留白（与 orb.css 保持一致）。 */
 const BALL_SIZE = 52
 const BALL_EDGE = 8
+/** 控制室打开期间球的层级：必须高于 .dsh-assistant-cr（10070），
+ *  否则全屏控制室会把球整颗盖住，变成「点一下就消失」。 */
+const BALL_Z_RAISED = 10080
 /** 判定为「拖拽」而非「点击」的位移阈值（px）。 */
 const DRAG_THRESHOLD = 6
 
@@ -91,18 +93,29 @@ function clampBall(point: BallPoint): BallPoint {
   }
 }
 
-/** 默认位置：右下角（原固定位置）。 */
+/** 默认位置：右下角。桌面端比手机再抬高一些，避开底部输入区（球可拖动并记住位置）。 */
 function defaultBall(): BallPoint {
   const w = typeof window === 'undefined' ? 375 : window.innerWidth
   const h = typeof window === 'undefined' ? 800 : window.innerHeight
-  return clampBall({ x: w - BALL_SIZE - 14, y: h - BALL_SIZE - 84 })
+  const desktop = w >= 1024
+  return clampBall({
+    x: w - BALL_SIZE - (desktop ? 24 : 14),
+    y: h - BALL_SIZE - (desktop ? 180 : 84),
+  })
 }
 
 /**
- * 可拖动悬浮球：按住拖到任意位置（松手记住位置），轻点打开悬浮球页。
+ * 可拖动悬浮球：按住拖到任意位置（松手记住位置），轻点开/关控制室。
  * Pointer Events + setPointerCapture，触屏/鼠标通用；拖动时不让页面滚动。
+ * @param raised - 控制室正开着（此时球要压在控制室之上，点一下是「关闭」）
+ * @param onToggle - 轻点：取反控制室的开关状态
  */
-function OrbBall({ label, avatar, onOpen }: { label: string; avatar?: string; onOpen: () => void }) {
+function OrbBall({ label, avatar, raised = false, onToggle }: {
+  label: string
+  avatar?: string
+  raised?: boolean
+  onToggle: () => void
+}) {
   const [pos, setPos] = useState<BallPoint>(() => {
     const saved = readLastBall()
     return saved === null ? defaultBall() : clampBall(saved)
@@ -159,19 +172,25 @@ function OrbBall({ label, avatar, onOpen }: { label: string; avatar?: string; on
       suppressClickRef.current = false
       return
     }
+    // 打开时才需要护栏：关闭是回到原本就在的界面，不存在「新界面被同一次点击穿透」。
+    const opening = !raised
     const rect = event.currentTarget.getBoundingClientRect()
-    // 乐观打开：同步翻状态，页面在这一轮渲染就挂出来，不等任何异步结果
-    onOpen()
-    armClickGuard({ x: rect.left, y: rect.top, w: rect.width, h: rect.height }, { onSwallow: noteOrbSwallow })
+    // 乐观切换：同步翻状态，界面在这一轮渲染就变化，不等任何异步结果
+    onToggle()
+    if (opening) {
+      armClickGuard({ x: rect.left, y: rect.top, w: rect.width, h: rect.height }, { onSwallow: noteOrbSwallow })
+    }
   }
 
+  // 控制室打开期间把球抬到控制室之上（10070）；关闭态用 CSS 的默认层级（3200），
+  // 不改变手机端「＋ 命令菜单压住悬浮球」等既有层叠关系。
   return (
     <button
       type="button"
       data-pocket-orb="ball"
       aria-label={label}
       title={label}
-      style={{ left: `${pos.x}px`, top: `${pos.y}px` }}
+      style={{ left: `${pos.x}px`, top: `${pos.y}px`, zIndex: raised ? BALL_Z_RAISED : undefined }}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={finishDrag}

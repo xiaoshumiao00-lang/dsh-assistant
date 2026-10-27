@@ -433,7 +433,7 @@ export const css = xtermCss + '\n' + [
   // 流光玻璃背景：30px 网格不变；网格下层是缓慢漂移的模糊彩光光晕
   '.dsh-wt_consoleBg{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:0}',
   '.dsh-wt_consoleBg::after{content:"";position:absolute;inset:0;background-image:linear-gradient(var(--wt-grid) 1px,transparent 1px),linear-gradient(90deg,var(--wt-grid) 1px,transparent 1px);background-size:30px 30px}',
-  '.dsh-wt_blob{position:absolute;width:56vmax;height:56vmax;border-radius:50%;filter:blur(64px);opacity:.45;mix-blend-mode:screen}',
+  '.dsh-wt_blob{position:absolute;width:56vmax;height:56vmax;border-radius:50%;filter:blur(64px);opacity:.45;mix-blend-mode:screen;will-change:transform}',
   '.dsh-wt_blob1{background:radial-gradient(circle,#ff5f9e,transparent 66%);top:-18%;left:-14%;animation:wtBlob1 calc(13s * var(--wt-glowScale,1)) ease-in-out infinite alternate}',
   '.dsh-wt_blob2{background:radial-gradient(circle,#7a5cff,transparent 66%);top:4%;right:-20%;animation:wtBlob2 calc(17s * var(--wt-glowScale,1)) ease-in-out infinite alternate}',
   '.dsh-wt_blob3{background:radial-gradient(circle,#00c2ff,transparent 66%);bottom:-22%;left:14%;animation:wtBlob3 calc(11s * var(--wt-glowScale,1)) ease-in-out infinite alternate}',
@@ -444,7 +444,7 @@ export const css = xtermCss + '\n' + [
   '@keyframes wtBlob4{from{transform:translate(0,0) scale(1)}to{transform:translate(-10vw,-10vh) scale(1.12)}}',
   '.dsh-wt_console[data-wt-theme=light] .dsh-wt_blob{opacity:.28}',
   '.dsh-wt_consoleGrid{position:relative;z-index:1}',
-  // 底部中央玻璃 dock：4 个 ghost 按钮（图标常显，hover 才浮现圆角矩形）+ 统一下拉面板（宽度 = dock 宽 150px）
+  // 底部中央玻璃 dock：5 个 ghost 按钮（图标常显，hover 才浮现圆角矩形）+ 统一下拉面板（宽度 = dock 宽 150px）
   '.dsh-wt_consoleScroll{flex:1;min-height:0;overflow:auto;padding-bottom:10px}',
   '.dsh-wt_announceCtr{display:flex;min-height:100%;align-items:center;justify-content:center;box-sizing:border-box}',
   '.dsh-wt_announceCtr .dsh-wt_announce{margin:auto}',
@@ -481,6 +481,11 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_dockBtnOn{background:rgba(255,255,255,.22)}',
   '.dsh-wt_console[data-wt-theme=light] .dsh-wt_dockBtn:hover{background:rgba(27,31,36,.10)}',
   '.dsh-wt_console[data-wt-theme=light] .dsh-wt_dockBtnOn{background:rgba(27,31,36,.14)}',
+  // 「只看进行中」：亮蓝色底 + 实心漏斗 + 右上角数量，一眼看出当前是筛选态
+  '.dsh-wt_dockFilterOn{background:rgba(79,142,247,.26);color:#cfe0ff}',
+  '.dsh-wt_console[data-wt-theme=light] .dsh-wt_dockFilterOn{background:rgba(79,142,247,.16);color:#2f6fe0}',
+  '.dsh-wt_dockCount{position:absolute;top:-3px;right:-4px;min-width:14px;height:14px;padding:0 3px;box-sizing:border-box;border-radius:7px;background:#4f8ef7;color:#fff;font-size:9px;font-weight:700;line-height:14px;text-align:center;font-variant-numeric:tabular-nums;pointer-events:none;box-shadow:0 0 0 1.5px rgba(10,13,19,.7)}',
+  '.dsh-wt_console[data-wt-theme=light] .dsh-wt_dockCount{box-shadow:0 0 0 1.5px rgba(255,255,255,.9)}',
   '.dsh-wt_dropMask{position:fixed;inset:0;z-index:9;background:transparent;border:none}',
   '.dsh-wt_drop{position:absolute;bottom:calc(100% - 4px);left:50%;transform:translateX(-50%);width:186px;box-sizing:border-box;padding:5px;border-radius:12px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.16);box-shadow:0 8px 24px rgba(0,0,0,.4);backdrop-filter:blur(14px) saturate(1.3);z-index:11;display:flex;flex-direction:column;gap:2px}',
   '.dsh-wt_dropItem{width:100%;padding:6px 9px;border:none;border-radius:7px;background:transparent;color:var(--wt-text2);font:inherit;font-size:12px;line-height:17px;cursor:pointer;display:flex;align-items:center;gap:7px;text-align:left}',
@@ -545,7 +550,7 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_hbarLine:hover::before{height:14px;background:#fff}',
   '.dsh-wt_hbarKnob{position:absolute;top:50%;transform:translate(-50%,-50%);width:16px;height:16px;border-radius:50%;background:#fff;border:2px solid rgba(79,142,247,.8);box-shadow:0 1px 4px rgba(0,0,0,.4);z-index:3;pointer-events:none;transition:left .25s cubic-bezier(.22,.61,.36,1)}',
   // 工作中的卡片流光：光带加长羽化 + 光层超出卡片（移动时不露整齐边缘），每 ~3.2s 从左上斜扫到右下
-  '.dsh-wt_consoleSweep{position:absolute;inset:-30%;border-radius:inherit;pointer-events:none;background:linear-gradient(115deg,rgba(255,255,255,.01) 0%,rgba(255,255,255,.045) 30%,rgba(255,255,255,.13) 50%,rgba(255,255,255,.045) 70%,rgba(255,255,255,.01) 100%);opacity:0;animation:consoleSweep 3.2s ease-in-out infinite}',
+  '.dsh-wt_consoleSweep{position:absolute;inset:-30%;border-radius:inherit;pointer-events:none;background:linear-gradient(115deg,rgba(255,255,255,.01) 0%,rgba(255,255,255,.045) 30%,rgba(255,255,255,.13) 50%,rgba(255,255,255,.045) 70%,rgba(255,255,255,.01) 100%);opacity:0;animation:consoleSweep 3.2s ease-in-out infinite;will-change:transform,opacity}',
   '.dsh-wt_console[data-wt-theme=light] .dsh-wt_consoleSweep{background:linear-gradient(115deg,rgba(255,255,255,.1) 0%,rgba(255,255,255,.3) 30%,rgba(255,255,255,.55) 50%,rgba(255,255,255,.3) 70%,rgba(255,255,255,.1) 100%)}',
   '@keyframes consoleSweep{0%{opacity:0;transform:translate(-12%,-12%)}35%{opacity:1}55%{opacity:1}92%,100%{opacity:0;transform:translate(12%,12%)}}',
   '.dsh-wt_console[data-wt-theme=light]{--wt-bg:#eef1f5;--wt-card:#ffffff;--wt-cardHover:#f7f9fb;--wt-border:#d8dee6;--wt-borderHover:#b9c4d2;--wt-grid:rgba(27,31,36,.07);--wt-text:#1c2128;--wt-text2:#57606a;--wt-text3:#8b949e;--wt-chip:rgba(27,31,36,.07);--wt-shadow:0 6px 20px rgba(31,41,55,.10)}',
@@ -589,19 +594,32 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_consoleCardHead{display:flex;align-items:center;gap:13px;min-width:0}',
   '.dsh-wt_consoleIcon{flex:none;font-size:31px;line-height:1}',
   '.dsh-wt_consoleName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:20px;font-weight:700;line-height:28px;color:var(--wt-text)}',
-  // 卡片底部操作行：会话列表 / 新建会话（都作用于该项目的目录）；平时淡，悬停卡片或按钮时点亮
+  // 临时卡片「正在运行」的会话数徽标（与其他项目卡片同一套头部布局，只是多一个计数）
+  '.dsh-wt_consoleCount{flex:none;min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:rgba(255,255,255,.14);color:var(--wt-text2);font-size:11px;font-weight:700;line-height:20px;text-align:center;font-variant-numeric:tabular-nums}',
+  '.dsh-wt_console[data-wt-theme=light] .dsh-wt_consoleCount{background:rgba(31,41,55,.09)}',
+  // 卡片底部操作行：两个醒目的一键新建（对话 / 电脑操作）+ 会话列表；新建按钮常亮，一眼能看出是「新建」
   '.dsh-wt_consoleCardOps{flex:none;display:flex;flex-wrap:wrap;gap:8px;margin-top:auto}',
-  '.dsh-wt_consoleOpBtn{flex:1 1 0;min-width:0;display:inline-flex;align-items:center;justify-content:center;gap:5px;height:26px;padding:0 8px;border:1px solid var(--wt-border);border-radius:8px;background:rgba(255,255,255,.05);color:var(--wt-text2);font-size:11px;font-weight:600;line-height:1;font-family:inherit;cursor:pointer;opacity:.62;white-space:nowrap;transition:opacity .14s ease,color .14s ease,border-color .14s ease,background .14s ease}',
-  // 操作行：上面「标准 / CU」各占一半，下面「会话列表」独占一整行（按钮顺序见 split.tsx）
+  '.dsh-wt_consoleOpBtn{flex:1 1 0;min-width:0;display:inline-flex;align-items:center;justify-content:center;gap:5px;height:26px;padding:0 8px;border:1px solid var(--wt-border);border-radius:8px;background:rgba(255,255,255,.05);color:var(--wt-text2);font-size:11px;font-weight:600;line-height:1;font-family:inherit;cursor:pointer;opacity:.62;white-space:nowrap;transition:opacity .14s ease,color .14s ease,border-color .14s ease,background .14s ease,box-shadow .14s ease}',
   '.dsh-wt_consoleOpBtnFull{flex:1 0 100%}',
-  '.dsh-wt_consoleOpBtnNew{flex:1 1 0}',
-  '.dsh-wt_consoleOpBtnCu{color:var(--dsw-alias-state-accent-primary,#4f8ef7)}',
+  // 新建按钮：常亮 + 大号加号徽标 + 高对比色块；对话=蓝，电脑操作=紫
+  '.dsh-wt_consoleOpBtnNew{flex:1 1 0;height:38px;padding:3px 4px;flex-direction:column;gap:1px;font-size:12px;font-weight:700;line-height:1;opacity:1;color:#dce9ff;border-color:rgba(96,165,250,.55);background:linear-gradient(180deg,rgba(59,130,246,.30),rgba(59,130,246,.14));box-shadow:inset 0 1px 0 rgba(255,255,255,.14)}',
+  '.dsh-wt_consoleOpBtnCu{color:#eadcff;border-color:rgba(167,139,250,.55);background:linear-gradient(180deg,rgba(139,92,246,.30),rgba(139,92,246,.14))}',
+  '.dsh-wt_consoleOpMain{display:inline-flex;align-items:center;justify-content:center;gap:3px;max-width:100%;font-size:12px;font-weight:700;line-height:16px}',
+  '.dsh-wt_consoleOpMain>svg{flex:none}',
+  '.dsh-wt_consoleOpMain>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+  '.dsh-wt_consoleOpSub{max-width:100%;font-size:10px;font-weight:600;line-height:13px;opacity:.9;letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
   '.dsh-wt_consoleOpBtn>span{min-width:0;overflow:hidden;text-overflow:ellipsis}',
   '.dsh-wt_consoleOpBtn>svg{flex:none}',
   '.dsh-wt_consoleCard:hover .dsh-wt_consoleOpBtn{opacity:1}',
   '.dsh-wt_consoleOpBtn:hover{opacity:1;color:var(--dsw-alias-state-accent-primary,#4f8ef7);border-color:var(--dsw-alias-state-accent-primary,#4f8ef7);background:rgba(79,142,247,.16)}',
+  '.dsh-wt_consoleOpBtnNew:hover{opacity:1;color:#fff;border-color:#7cb3ff;background:linear-gradient(180deg,rgba(59,130,246,.58),rgba(59,130,246,.32));box-shadow:0 0 0 1px rgba(124,179,255,.25),inset 0 1px 0 rgba(255,255,255,.22)}',
+  '.dsh-wt_consoleOpBtnCu:hover{color:#fff;border-color:#b79cff;background:linear-gradient(180deg,rgba(139,92,246,.60),rgba(139,92,246,.34));box-shadow:0 0 0 1px rgba(183,156,255,.25),inset 0 1px 0 rgba(255,255,255,.22)}',
   '.dsh-wt_console[data-wt-theme=light] .dsh-wt_consoleOpBtn{background:rgba(31,41,55,.05)}',
   '.dsh-wt_console[data-wt-theme=light] .dsh-wt_consoleOpBtn:hover{background:rgba(79,142,247,.14)}',
+  '.dsh-wt_console[data-wt-theme=light] .dsh-wt_consoleOpBtnNew{color:#1d4ed8;border-color:rgba(37,99,235,.40);background:linear-gradient(180deg,rgba(59,130,246,.20),rgba(59,130,246,.09));box-shadow:inset 0 1px 0 rgba(255,255,255,.85)}',
+  '.dsh-wt_console[data-wt-theme=light] .dsh-wt_consoleOpBtnNew:hover{color:#fff;border-color:#2563eb;background:linear-gradient(180deg,rgba(37,99,235,.92),rgba(37,99,235,.78))}',
+  '.dsh-wt_console[data-wt-theme=light] .dsh-wt_consoleOpBtnCu{color:#6d28d9;border-color:rgba(124,58,237,.36);background:linear-gradient(180deg,rgba(139,92,246,.18),rgba(139,92,246,.08))}',
+  '.dsh-wt_console[data-wt-theme=light] .dsh-wt_consoleOpBtnCu:hover{color:#fff;border-color:#7c3aed;background:linear-gradient(180deg,rgba(124,58,237,.90),rgba(124,58,237,.76))}',
   '.dsh-wt_console[data-wt-shape=circle] .dsh-wt_consoleCardOps{justify-content:center;gap:10px}',
   '.dsh-wt_console[data-wt-shape=circle] .dsh-wt_consoleOpBtn{flex:none;padding:0 10px}',
   '.dsh-wt_consoleDivider{flex:none;height:1px;background:var(--wt-border)}',
@@ -636,9 +654,9 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_consoleCard-error{border-color:rgba(248,81,73,.95);box-shadow:0 0 10px rgba(248,81,73,.5),0 0 30px rgba(248,81,73,.32),inset 0 0 16px rgba(248,81,73,.07);animation:dsh-wt-consoleError 1.3s ease-in-out infinite}',
   '@keyframes dsh-wt-consoleError{0%,100%{box-shadow:0 0 8px rgba(248,81,73,.4),0 0 24px rgba(248,81,73,.24),inset 0 0 14px rgba(248,81,73,.06)}50%{box-shadow:0 0 14px rgba(248,81,73,.72),0 0 40px rgba(248,81,73,.42),inset 0 0 18px rgba(248,81,73,.1)}}',
   '.dsh-wt_console[data-wt-theme=light] .dsh-wt_consoleCard-error{border-color:rgba(220,38,38,.9);box-shadow:0 0 10px rgba(220,38,38,.45),0 0 30px rgba(220,38,38,.26)}',
-  '.dsh-wt_consoleEmpty{padding:40px 0;text-align:center;font-size:12px;color:var(--wt-text3)}',
+  '.dsh-wt_consoleEmpty{flex:0 0 100%;padding:40px 0;text-align:center;font-size:12px;color:var(--wt-text3)}',
   // 手机/窄屏：压缩卡间距与卡片样式（自动列数按 gap 计算，通常 2 列）
-  '@media (max-width:640px){.dsh-wt_consoleGrid{gap:20px;margin-top:22px}.dsh-wt_consoleCard{aspect-ratio:auto;min-height:208px;padding:14px;gap:9px;border-radius:14px}.dsh-wt_consoleStatus{font-size:17px;line-height:24px}.dsh-wt_consolePreview{-webkit-line-clamp:3;min-height:28px;font-size:10px;line-height:14px}.dsh-wt_consoleOpBtn{height:26px;padding:0 8px;font-size:10px}.dsh-wt_consoleIcon{font-size:26px}.dsh-wt_consoleName{font-size:15px}.dsh-wt_consoleAddPlus{font-size:26px}.dsh-wt_consoleAddLabel{font-size:13px}}',
+  '@media (max-width:640px){.dsh-wt_consoleGrid{gap:20px;margin-top:22px}.dsh-wt_consoleCard{aspect-ratio:auto;min-height:208px;padding:14px;gap:9px;border-radius:14px}.dsh-wt_consoleStatus{font-size:17px;line-height:24px}.dsh-wt_consolePreview{-webkit-line-clamp:3;min-height:28px;font-size:10px;line-height:14px}.dsh-wt_consoleOpBtn{height:26px;padding:0 8px;font-size:10px}.dsh-wt_consoleOpBtnNew{height:38px;font-size:11px}.dsh-wt_consoleIcon{font-size:26px}.dsh-wt_consoleName{font-size:15px}.dsh-wt_consoleAddPlus{font-size:26px}.dsh-wt_consoleAddLabel{font-size:13px}}',
   // 窄屏卡片：会话按钮整行，标准 / CU 两个加号各占一半（标签始终可见）
   '@media (max-width:480px){.dsh-wt_consoleOpBtn{justify-content:center;gap:4px}}',
   // 创建卡片：虚线 + 居中加号，永远最后一位
@@ -689,6 +707,11 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_sessMore{align-self:center;margin-top:2px;padding:3px 10px;border:1px solid var(--wt-border);border-radius:999px;background:var(--wt-chip);color:var(--wt-text3);font:inherit;font-size:10px;cursor:pointer}',
   '.dsh-wt_sessMore:hover{color:var(--wt-text);border-color:var(--wt-borderHover)}',
   '.dsh-wt_sessTag{flex:none;padding:1px 6px;border-radius:999px;background:rgba(210,153,34,.16);color:var(--dsw-alias-state-warning,#d29922);font-size:9px;line-height:15px}',
+  // 临时卡片：已结束标记 + 浮层顶部「收工」按钮 + 底部保留策略说明
+  '.dsh-wt_sessFinishedTag{background:rgba(79,142,247,.14);color:var(--dsw-alias-state-accent-primary,#4f8ef7)}',
+  '.dsh-wt_sessDone{flex:none;height:20px;padding:0 8px;border:1px solid rgba(79,142,247,.55);border-radius:999px;background:rgba(79,142,247,.14);color:var(--dsw-alias-state-accent-primary,#4f8ef7);font:inherit;font-size:10px;font-weight:700;line-height:18px;white-space:nowrap;cursor:pointer}',
+  '.dsh-wt_sessDone:hover{background:rgba(79,142,247,.24)}',
+  '.dsh-wt_sessHint{padding:2px 4px 0;font-size:10px;line-height:1.5;color:var(--wt-text3)}',
   // 手机上会话列表改用底部抽屉（贴底、左右各留 8px，避免锚点浮层超出屏宽）
   '@media (max-width:640px){.dsh-wt_sessPop{left:8px !important;right:8px;top:auto !important;bottom:calc(8px + env(safe-area-inset-bottom));width:auto;max-height:70vh}}',
   '@media (hover:none),(max-width:640px){.dsh-wt_sessOps{position:static;transform:none;opacity:1;pointer-events:auto;background:transparent;padding:0;margin-left:auto}.dsh-wt_sessItem:hover .dsh-wt_sessRel{opacity:1}.dsh-wt_sessRel{display:none}.dsh-wt_sessOp{width:26px;height:26px}}',
@@ -709,6 +732,8 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_modelSelect:focus{border-color:var(--dsw-alias-state-accent-primary,#4f8ef7)}',
   '.dsh-wt_console[data-wt-theme=light] .dsh-wt_modelSelect{background:#fff}',
   '.dsh-wt_modelHint{font-size:10px;line-height:1.5;color:var(--wt-text3)}',
+  '.dsh-wt_modelRetry{margin-left:8px;padding:0;border:none;background:none;color:var(--dsw-alias-state-accent-primary,#4f8ef7);font:inherit;font-size:10px;font-weight:700;cursor:pointer;text-decoration:underline}',
+  '.dsh-wt_modelRetry:hover{opacity:.8}',
   '.dsh-wt_newSessOps{display:flex;justify-content:flex-end;gap:8px;margin-top:2px}',
   '.dsh-wt_btnGhost,.dsh-wt_btnPrimary{padding:8px 16px;border-radius:9px;font:inherit;font-size:12px;font-weight:600;cursor:pointer;border:1px solid var(--wt-border);background:transparent;color:var(--wt-text2)}',
   '.dsh-wt_btnGhost:hover{color:var(--wt-text);border-color:var(--wt-borderHover)}',

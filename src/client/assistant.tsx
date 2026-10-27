@@ -55,12 +55,19 @@ export function apply(ctx: any): void {
   } catch {}
 
   // 悬浮球状态同步：宿主是「启用/头像」的真值（桌面球在宿主那边启停与换头像）。
-  // - native=true 时页面内那颗球隐藏，避免出现两个球；
+  // - 桌面端界面内球与窗口外原生球并存（两颗都打开控制室）；native 只用于状态同步/诊断；
   // - 本地有头像而宿主还没收到（老版本 / 宿主重启丢了 avatar.txt）时补传一次，
   //   之后只要宿主 already hasAvatar 就不再重复 POST（否则每次都会重启球窗口）。
   try {
+    // 宿主头像只在本次页面生命周期拉一次：界面内球与窗口外原生球共用同一个头像
+    let hostAvatarWanted = true
+    let ballSyncBusy = false
     const syncBallState = (): void => {
-      void fetch('/api/assistant/ball', { cache: 'no-store' })
+      if (ballSyncBusy) return
+      ballSyncBusy = true
+      const ctrl = new AbortController()
+      const timeout = window.setTimeout(() => ctrl.abort(), 8000)
+      void fetch('/api/assistant/ball', { cache: 'no-store', signal: ctrl.signal })
         .then((r) => r.json())
         .then((d) => {
           nativeBallStore.set(d?.native === true)
@@ -72,9 +79,24 @@ export function apply(ctx: any): void {
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ dataUrl: local.avatar }),
             }).catch(() => {})
+          } else if (!local.avatar && d?.hasAvatar === true && hostAvatarWanted) {
+            // 本机还没存头像、宿主已有（例如在手机上设过）：拉回来，两颗球显示同一张图
+            hostAvatarWanted = false
+            void fetch('/api/assistant/ball-avatar', { cache: 'no-store' })
+              .then((r) => r.json())
+              .then((a) => {
+                const avatar = typeof a?.avatar === 'string' ? a.avatar : ''
+                if (avatar.startsWith('data:image/')) ballConfigStore.adopt({ avatar })
+                else hostAvatarWanted = true
+              })
+              .catch(() => { hostAvatarWanted = true })
           }
         })
         .catch(() => {})
+        .finally(() => {
+          window.clearTimeout(timeout)
+          ballSyncBusy = false
+        })
     }
     syncBallState()
     // 桌面球是异步启动的：刚开页时可能还没起来，补两次 + 低频轮询兜底

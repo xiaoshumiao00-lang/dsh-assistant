@@ -33,7 +33,8 @@ export function getAssistantApi(): OrbApi | null {
   return assistantApi
 }
 
-/** 是否存在 Electron 原生桌面球（存在时网页内那颗球隐藏，避免两个球）。 */
+/** 是否存在 Electron 原生桌面球（窗口外那颗）。桌面端界面内球仍常驻，两颗球功能相同；
+ *  这个标记保留给设置页/诊断显示原生球状态，不再用于隐藏界面内球。 */
 let nativeBall = false
 const nativeListeners = new Set<() => void>()
 export const nativeBallStore = {
@@ -155,7 +156,10 @@ export const ballConfigStore = {
 }
 
 function applyLocal(patch: Partial<BallConfig>): void {
-  ballConfig = { ...ballConfig, ...patch }
+  const next = { ...ballConfig, ...patch }
+  // 宿主每 15 秒回读同一状态时不再制造新快照；set() 的远端同步仍照常执行。
+  if (next.enabled === ballConfig.enabled && next.avatar === ballConfig.avatar) return
+  ballConfig = next
   try {
     if (patch.enabled !== undefined) localStorage.setItem(BALL_ENABLED_KEY, patch.enabled ? '1' : '0')
     if (patch.avatar !== undefined) {
