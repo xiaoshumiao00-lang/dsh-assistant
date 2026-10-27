@@ -6,7 +6,11 @@ import { splitStore, SplitWorkspace, setSplitT, setSplitEnv, RUNNING_CARD_ID, ty
 import { splitOpenIntent } from './splitEntry'
 import { BUILTIN_TEMPLATES, freshFlowRun, templateById, saveTemplateStepOverride, composeStepTask, composeStepSpec, effectiveSkill, effectiveInstruction, effectiveConverge, stepBriefOf, isStepBriefConfirmed, migrateFlowRun, OVERLAY_FILE, REPORT_PREFIX, L1_CHECKLIST, parseL1Checklist, isConvergeStep, type FlowRunState, type FlowStepOverride, type FlowStepView, type FlowView, type TemplateDef } from './templates'
 import { VerifyScheduler, composeDiagnosisTask } from './verifyLoop'
-import { defaultProjectFolder, defaultProjectName, isAutoProjectFolder } from './newProjectDefault'
+import { defaultProjectFolder, defaultProjectName, isAutoProjectFolder, projectFolderBrowseStart } from './newProjectDefault'
+import { ProjectFolderSheet } from './projectFolderSheet'
+import type { FsBrowserApi } from './pocket/orb/PathBrowser.tsx'
+import { NS as ORB_NS, zh as ORB_ZH, type OrbKey } from './pocket/orb/locales.ts'
+import { POCKET_ENDPOINTS, POCKET_RPC_CHANNEL } from './pocket/api.js'
 import { ICON_CHOICES, resolveProjectIcon, pickUnusedIcon } from './projectIcons'
 import { focusSessionInHost, sessionFaceState, healBlankSessionIfStuck, type FocusResult } from './sessionFocus'
 import { sessionsUnderFolder, normalizeFolderPath, unownedSessionIds, transientVisibility } from './sessionFolder'
@@ -583,6 +587,8 @@ const registryStore: { ids: string[]; listeners: Set<() => void> } = { ids: [], 
 let sessionBridge: { sessions: any; conversation: any; list: any; workspaces: any; uiWorkspace: any; pendingInteractions: any } | null = null
 /** 客户端根 ctx（apply 时保存；用于运行时探测 0.1.2 的 remote.directoryPicker 等新服务，不硬写 inject） */
 let clientCtx: any = null
+/** 悬浮球（pocketOrb）词典绑定：项目文件夹选择器复用的是悬浮球的路径浏览器，文案跟它走 */
+let orbT: ((key: string, params?: Record<string, string>) => string) | null = null
 
 /** 宿主 API 客户端（apply 时从 connection 服务取；agentPresets/sessions 用于修复新会话继承失效模型的 bug） */
 let hostApi: { agentPresets?: any; sessions?: any } | null = null
@@ -1643,6 +1649,30 @@ async function wtListDir(abs: string): Promise<{ name: string; path: string; isD
   }
 }
 
+/** 「选择位置」的目录列表：与「会话输入框 → 电脑文件」附件走同一条 pocket RPC（fs.list），
+ *  直接拿到盘符、面包屑、系统桌面目录与条目元数据——不再走只有单层条目的 /api/worktable/fs。 */
+let folderFsApi: FsBrowserApi | null = null
+function hostFolderFsApi(): FsBrowserApi {
+  if (folderFsApi) return folderFsApi
+  folderFsApi = {
+    async listFs(path, opts) {
+      const conn = (() => {
+        try { return (clientCtx?.connection ?? clientCtx?.get?.('connection')) || null } catch { return null }
+      })()
+      const rpc = conn && conn.rpc && typeof conn.rpc.call === 'function' ? conn.rpc : null
+      if (!rpc) throw new Error('当前环境不支持浏览电脑目录')
+      const res = await rpc.call(POCKET_RPC_CHANNEL, POCKET_ENDPOINTS.fsList, {
+        path,
+        includeFiles: opts?.includeFiles === true,
+        cwd: opts?.cwd,
+      })
+      if (res && res.ok === true) return res.value
+      throw new Error(res?.error?.message ?? 'fs.list 失败')
+    },
+  }
+  return folderFsApi
+}
+
 /** 本地文本文件读取（/api/worktable/file；失败返回 null） */
 async function wtReadText(abs: string): Promise<string | null> {
   try {
@@ -2262,6 +2292,22 @@ function WorktableSection(props: any) {
     if (params) for (const [k, v] of Object.entries(params)) s = s.replace('{' + k + '}', v)
     return s
   }
+  /** 项目文件夹浏览器的文案：优先悬浮球词典（与「电脑文件」附件选择器完全同词），缺失回退 zh */
+  const orbText = (key: OrbKey): string => {
+    if (!orbT) {
+      // 悬浮球词典是在另一个 ctx.inject 回调里注册的：首次打开时才绑定，拿不到就回退 zh
+      try {
+        const bound = clientCtx?.locale?.bind?.(ORB_NS)
+        if (typeof bound === 'function') orbT = bound
+      } catch { /* 无 locale 服务 */ }
+    }
+    try {
+      const text = orbT?.(key)
+      // 词典还没注册时宿主会把 key 原样返回：别把 pickDir 这种键名显示给用户
+      if (typeof text === 'string' && text !== '' && text !== key) return text
+    } catch { /* 回退 zh */ }
+    return (ORB_ZH as Record<string, string>)[key] ?? String(key)
+  }
 
   const [view, setView] = useState<ViewState>(loadView)
   const [notifyTick, setNotifyTick] = useState(0)
@@ -2346,12 +2392,9 @@ function WorktableSection(props: any) {
   const [pickErr, setPickErr] = useState<{ add: string; bind: string }>({ add: '', bind: '' })
   const [manualPathFor, setManualPathFor] = useState<'add' | 'bind' | null>(null)
   const [manualPathText, setManualPathText] = useState('')
-  /** 手机/窄屏的「浏览电脑文件夹」弹窗（不触发电脑端系统选择器） */
+  /** 手机/窄屏的「浏览电脑文件夹」抽屉（与「电脑文件」附件同一个 PathBrowser，不触发电脑端系统选择器） */
   const [browseOpen, setBrowseOpen] = useState(false)
-  const [browsePath, setBrowsePath] = useState('')
-  const [browseEntries, setBrowseEntries] = useState<{ name: string; path: string; isDir: boolean }[]>([])
-  const [browseBusy, setBrowseBusy] = useState(false)
-  const [browseErr, setBrowseErr] = useState('')
+  const [browseStart, setBrowseStart] = useState('')
   const browseApplyRef = useRef<((p: string) => void) | null>(null)
   /** 文件夹选择在途锁 + 请求序号（useRef：跨渲染稳定；弹窗关闭/切换目标/手工确认时自增使旧请求失效） */
   const pickSeqRef = useRef(0)
@@ -4207,33 +4250,16 @@ function buildCustomLayoutPrompt(req: string): string {
     fetchSessionGroups().then((res) => setBindGroups(res.groups)).catch(() => setBindGroups([]))
   }, [])
 
-  /** 手机/窄屏：浏览**电脑**上的目录（不触发电脑端系统弹窗）。 */
-  const browseTo = async (p: string) => {
-    const target = String(p || '').trim() || 'D:\\'
-    setBrowseBusy(true)
-    setBrowseErr('')
-    try {
-      const list = await wtListDir(target)
-      if (!list) {
-        setBrowseErr('无法读取该目录')
-        setBrowseEntries([])
-      } else {
-        setBrowsePath(target)
-        setBrowseEntries(list.filter((e) => e.isDir))
-      }
-    } finally {
-      setBrowseBusy(false)
-    }
-  }
-  const openFolderBrowser = (initial: string, apply: (p: string) => void) => {
+  /** 手机/窄屏：用与「会话输入框 → 电脑文件」同一套路径浏览器选项目文件夹（不触发电脑端系统弹窗）。
+   *  startAt 不存在（默认文件夹是待创建的时间戳目录）时由 PathBrowser 自动退到最近的可读上级。 */
+  const openFolderBrowser = (startAt: string, apply: (p: string) => void) => {
     browseApplyRef.current = apply
+    setBrowseStart(String(startAt ?? '').trim())
     setBrowseOpen(true)
-    void browseTo(initial)
   }
   const closeFolderBrowser = () => {
     setBrowseOpen(false)
-    setBrowseEntries([])
-    setBrowseErr('')
+    setBrowseStart('')
     browseApplyRef.current = null
   }
   /** 当前设备是否适合用「浏览电脑文件夹」代替系统选择器（手机 / 窄屏 / 粗指针） */
@@ -4253,11 +4279,12 @@ function buildCustomLayoutPrompt(req: string): string {
    *      ① 0.1.1-rc.2：ctx.workspaces.pickDirectory() → string | null
    *      ② 0.1.2-rc.1：ctx remote.directoryPicker.pick() → { ok, value, error }（value 即路径或 null）
    *      ③ 0.1.2 新能力不可用 → 提示改用「手动输入」 */
-  const pickFolder = async (target: 'add' | 'bind', apply: (p: string) => void) => {
+  const pickFolder = async (target: 'add' | 'bind', apply: (p: string) => void, startAt = '') => {
     if (pickBusyRef.current) return
-    // 手机/窄屏：不触发电脑端的系统文件夹对话框，改为在手机上浏览电脑目录
+    // 手机/窄屏：不触发电脑端的系统文件夹对话框，改为在手机上浏览电脑目录（同一套 PathBrowser）。
+    // 默认项目文件夹是「待创建」的时间戳目录，不存在 → 从它的父目录开始浏览，避免一进来就报错。
     if (useInAppFolderBrowser()) {
-      openFolderBrowser(wsFolderParent || 'D:\\', apply)
+      openFolderBrowser(projectFolderBrowseStart(startAt || wsFolderParent), apply)
       return
     }
     // 解析本次选择器调用路径
@@ -4323,6 +4350,8 @@ function buildCustomLayoutPrompt(req: string): string {
     setManualPathFor(null)
     setManualPathText('')
     setPickErr({ add: '', bind: '' })
+    // 手机端的目录抽屉属于「选择位置」这个动作：目标弹窗关了就不能留一个孤立的抽屉
+    closeFolderBrowser()
   }
 
   /** 手工输入绝对路径（选择器不可用/失败的降级入口）：必须通过 isAbs，并失效在途系统选择请求 */
@@ -4340,12 +4369,13 @@ function buildCustomLayoutPrompt(req: string): string {
     setPickErr((prev) => ({ ...prev, [target]: '' }))
   }
 
-  /** 绑定弹窗「更改」：弹窗选择文件夹，直接作为项目文件夹 */
+  /** 绑定弹窗「更改」：弹窗选择文件夹，直接作为项目文件夹（从项目当前文件夹开始浏览） */
   const changeBindFolder = () => {
     if (!bindPick || pickBusyRef.current) return
+    const current = projects.folders[bindPick.id] || ''
     pickFolder('bind', (p) => {
       persistProjects((prev) => ({ ...prev, folders: { ...prev.folders, [bindPick.id]: p } }))
-    })
+    }, current)
   }
 
   /** 绑定 / 解绑会话（弹窗保持打开，绑定结果即时显示在「绑定对话」框里） */
@@ -6255,56 +6285,19 @@ function buildCustomLayoutPrompt(req: string): string {
         </div>
       )}
 
+      {/* 选择项目文件夹：与「会话输入框 → 电脑文件」同一个 PathBrowser（跨盘 / 面包屑 / 桌面 / 当前目录确认） */}
       {browseOpen && (
-        <>
-          <div className="dsh-wt_popBackdrop" style={{ zIndex: 10083 }} onClick={closeFolderBrowser} />
-          <div
-            role="region"
-            aria-label="选择电脑上的文件夹"
-            className="dsh-wt_folderBrowse"
-            style={{
-              position: 'fixed', left: '50%', top: '50%', transform: 'translate(-50%, -50%)', zIndex: 10084,
-              width: 'min(460px, calc(100vw - 24px))', maxHeight: '72vh', display: 'flex', flexDirection: 'column', gap: 10,
-              padding: 14, borderRadius: 14, background: 'var(--dsw-alias-bg-layer-1, #fff)',
-              color: 'var(--dsw-alias-label-primary, #111)', border: '1px solid var(--dsw-alias-border-l1, rgba(0,0,0,.12))',
-              boxShadow: '0 24px 64px rgba(0,0,0,.4)',
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
-              <b style={{ fontSize: 14 }}>选择电脑上的文件夹</b>
-              <span style={{ fontSize: 11, opacity: .6 }}>浏览的是运行 DSH 的这台电脑</span>
-            </div>
-            <div style={{ display: 'flex', gap: 6 }}>
-              <button type="button" className="dsh-wt_btnGhost" onClick={() => { const up = parentPathOf(browsePath); if (up && up !== browsePath) void browseTo(up) }}>↑ 上一级</button>
-              <input readOnly value={browsePath} style={{ flex: 1, minWidth: 0, padding: '6px 9px', borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1, rgba(0,0,0,.15))', background: 'transparent', color: 'inherit', font: 'inherit', fontSize: 12 }} />
-              <button type="button" className="dsh-wt_btnGhost" onClick={() => void browseTo(browsePath)}>刷新</button>
-            </div>
-            <div style={{ flex: 1, minHeight: 140, maxHeight: 330, overflow: 'auto', border: '1px solid var(--dsw-alias-border-l1, rgba(0,0,0,.1))', borderRadius: 10 }}>
-              {browseBusy ? (
-                <div style={{ padding: 18, textAlign: 'center', fontSize: 12, opacity: .6 }}>读取中…</div>
-              ) : browseErr ? (
-                <div style={{ padding: 18, textAlign: 'center', fontSize: 12, opacity: .7 }}>{browseErr}</div>
-              ) : browseEntries.length === 0 ? (
-                <div style={{ padding: 18, textAlign: 'center', fontSize: 12, opacity: .55 }}>没有子文件夹</div>
-              ) : browseEntries.map((e) => (
-                <button
-                  key={e.path}
-                  type="button"
-                  onClick={() => void browseTo(e.path)}
-                  style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '9px 12px', border: 0, borderBottom: '1px solid var(--dsw-alias-border-l1, rgba(0,0,0,.06))', background: 'transparent', color: 'inherit', font: 'inherit', fontSize: 13, textAlign: 'left', cursor: 'pointer' }}
-                >
-                  <span aria-hidden>📁</span>
-                  <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{e.name}</span>
-                  <span aria-hidden style={{ opacity: .4 }}>›</span>
-                </button>
-              ))}
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-              <button type="button" className="dsh-wt_btnGhost" onClick={closeFolderBrowser}>取消</button>
-              <button type="button" className="dsh-wt_btnPrimary" onClick={() => { browseApplyRef.current?.(browsePath); closeFolderBrowser() }}>选择此文件夹</button>
-            </div>
-          </div>
-        </>
+        <ProjectFolderSheet
+          startPath={browseStart}
+          api={hostFolderFsApi()}
+          t={orbText}
+          onPick={(picked) => {
+            const apply = browseApplyRef.current
+            closeFolderBrowser()
+            if (apply) apply(picked)
+          }}
+          onClose={closeFolderBrowser}
+        />
       )}
 
       {addOpen && <div className="dsh-wt_popBackdrop" onClick={() => { invalidatePickState(); setAddOpen(false) }} />}

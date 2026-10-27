@@ -64,6 +64,8 @@ DeepSeek Harness 一体化助手插件：**悬浮球 → 控制室**，外加**�
 ### 手机访问（原 dsh-pocket 全套）
 
 - 设置 →「个人助手」→ 手机访问：局域网 / 公网二维码、访问密码、SSH 固定隧道、移动端布局。
+- 手机访问使用独立 Cordis 生命周期；个人助手其他模块热重载不会重启代理 / SSH，登录会话密钥持久化，更新与重启不再强制手机重登。
+- 手机默认只精简桌面原生能力、埋点与开发期 HMR；系统设置、Skill、自动化任务、记忆系统等用户功能完整保留。需要完整插件树时仍可在地址加 `?dsh-full-plugins=1`。
 - 独立的「手机访问」设置页签已删除，内容收进「个人助手」。
 
 ### 托管（原 dsh-tuoguan）
@@ -97,13 +99,17 @@ npm run check   # node --check 两个产物
 
 ## 目录
 
-- `src/assistant.ts`：宿主入口（工作台 + 手机访问 + 托管 + 跨端状态 + 桌面球）
+- `src/assistant.ts`：宿主入口（工作台 + 托管 + 跨端状态 + 桌面球；手机访问已拆为独立入口）
 - `src/index.ts`：原工作台宿主（/api/worktable/*）
-- `src/pocket-host/`：原 dsh-pocket 宿主（代理 / 隧道 / RPC）
+- `src/pocket.ts` + `lib/pocket.js`：手机访问独立 Cordis 入口（`dsh-assistant/pocket`），独立构建、独立生命周期
+- `src/web-routes.ts`：webServer 路由集中登记与注销，防热重载重复注册导致 apply 中途失败
+- `src/pocket-host/`：原 dsh-pocket 宿主（代理 / 隧道 / RPC）；含 `runtime.mjs`（跨 HMR 复用运行实例）、`mobile-boot.mjs`（手机端模块精简与批次权重）、`mobile-batch.mjs`（本地合包 + gzip/Brotli）
 - `src/tuoguan-host.ts`：原 dsh-tuoguan 宿主（/.dsh-tuoguan/state）
 - `src/assistant-store.ts`：项目 / 视图跨端同步
 - `src/desktop-ball.ts`：Electron 原生桌面悬浮球
 - `src/client/index.tsx`：工作台客户端（控制室 / 分栏 / 模板流程）
+- `src/client/projectFolderSheet.tsx`：新建 / 更改项目文件夹的「选择位置」（复用悬浮球那套 PathBrowser）
+- `src/client/clipboard.ts`：剪贴板写入（安全上下文走 Clipboard API，http 页面同步 execCommand 兜底）
 - `src/client/control-room.tsx`：悬浮球打开的全屏控制室
 - `src/client/assistant-settings.tsx`：设置「个人助手」
 - `src/client/tuoguan.tsx`：托管开关与自动应答

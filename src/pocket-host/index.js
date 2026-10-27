@@ -15,9 +15,10 @@ import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { writeFile, readFile, mkdir, rm } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { randomBytes, randomInt } from 'node:crypto';
+import { randomBytes, randomInt, createHash } from 'node:crypto';
 
 import { createPocketService } from './service.mjs';
+import { acquirePocketRuntime, releasePocketRuntime } from './runtime.mjs';
 import { installPocketRpc } from './web-rpc.js';
 import { restartHost } from './restart.js';
 import { advancedNoticeScript, DEFAULT_INJECT, classifyHost } from './proxy.mjs';
@@ -43,12 +44,22 @@ function currentVersion() {
 /** 进程启动时加载的版本（模块加载瞬间固化；用于识别「磁盘已更新但进程还是旧代码」）。 */
 const loadedVersion = currentVersion();
 
+/** 当前手机服务代码的内容身份：构建产物没变时，HMR 必须复用正在运行的代理。 */
+const runtimeRevision = (() => {
+  try {
+    return createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex');
+  } catch {
+    return loadedVersion;
+  }
+})();
+
 // ---------- 访问密码（issue #13 + #18 + #33） ----------
 // 公网与局域网**分开**：各自 8 位，存本机 $DSH_HOME/dsh-pocket/。
 // 公网密码（token）：默认每次开启公网时轮换（旧链接作废）；**用户自定义后不再轮换**；
 // 局域网密码（token-lan）：默认手动刷新（设置页按钮）；自定义后刷新会换回随机值。
-// 会话保持（issue #33）：登录 cookie 绑定进程级 sessionKey（见 apply）——
-// dsh web 重启/更新后 sessionKey 变化 → 手机需重新输入。
+// 会话保持：登录 cookie 绑定安装级 sessionKey（见 apply）。密钥安全随机生成一次并
+// 持久化到 dsh-pocket/session-key，因此 HMR / DSH 重启不会把已登录手机踢下线；
+// 修改访问密码仍会自然使旧 cookie 失效。
 // 密码规则：8 位英文字母（大小写）或数字（自动生成的为 8 位数字，自定义可为字母+数字）。
 const PIN_RE = /^[a-zA-Z0-9]{8}$/;
 function writePinToFile(p, fresh) {
@@ -74,6 +85,16 @@ function readPin(p) {
  */
 function newPin() {
   return String(randomInt(10_000_000, 100_000_000));
+}
+
+/** 安装级登录会话密钥：只生成一次，HMR / 进程重启后继续沿用。 */
+export function getPocketSessionKey(home) {
+  const p = join(home, 'dsh-pocket', 'session-key');
+  try {
+    const existing = readFileSync(p, 'utf8').trim();
+    if (/^[a-f0-9]{32}$/.test(existing)) return existing;
+  } catch { /* 首次启动，下面生成 */ }
+  return writePinToFile(p, randomBytes(16).toString('hex'));
 }
 
 // --- 公网密码 ---
@@ -312,7 +333,7 @@ export function apply(ctx, config = {}, internals = {}) {
     logger.warn('dsh-pocket: DSH Desktop advanced mode — phone access unsupported, injecting notice | 桌面端 advanced 模式：手机访问暂不支持，已注入提示');
   }
 
-  const service = internals.service ?? createPocketService({
+  const runtime = internals.service ? null : acquirePocketRuntime(runtimeRevision, () => createPocketService({
     dshPort,
     // 端口（issue #70）：插件模式优先级 settings.proxyPort > cordis patch config.port > 3081。
     // 3081 被占时 createPocketService 内部 EADDRINUSE 抛错，按 DSH 插件启动失败处理（用户改端口重启即可）。
@@ -339,9 +360,8 @@ export function apply(ctx, config = {}, internals = {}) {
     // 公网的判定是 fail closed：除了 loopback/私网 Host，一切陌生域名（含自建
     // 命名隧道的固定域名）都按公网处理、强制公网密码。
     auth: {
-      // sessionKey：进程级随机密钥——登录 cookie 绑定它（会话保持，issue #33）：
-      // dsh web 重启/更新后 sessionKey 变化 → 手机需重新输入
-      sessionKey: randomBytes(16).toString('hex'),
+      // 安装级 sessionKey：HMR / DSH 重启不再让手机重新登录；PIN 修改仍会使 cookie 失效。
+      sessionKey: getPocketSessionKey(pocketHome),
       getToken: (host) => tokenForHost(host),
       isProtected: (host) => {
         if (isLanOverrideHost(host)) return lanAuthEnabled();
@@ -379,7 +399,8 @@ export function apply(ctx, config = {}, internals = {}) {
       logger.info('dsh-pocket: public access PIN refreshed | 公网访问密码已更新（自定义密码不受影响）');
       return fresh;
     },
-  });
+  }));
+  const service = internals.service ?? runtime.service;
 
   const disposers = [];
   const disposeRpc = installPocketRpc(ctx, {
@@ -436,8 +457,9 @@ export function apply(ctx, config = {}, internals = {}) {
 
   ctx.effect(() => async () => {
     for (const d of disposers.reverse()) { try { d(); } catch { /* 忽略 */ } }
-    await service.dispose();
-  }, 'dsh-pocket: stop proxy and tunnel');
+    if (runtime) releasePocketRuntime(runtime)
+    else await service.dispose()
+  }, 'dsh-pocket: release runtime (graceful HMR handoff)');
 }
 
 export { name, inject, readRestartNotice, consumeRestartNotice };

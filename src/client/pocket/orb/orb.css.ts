@@ -560,7 +560,15 @@ export const ORB_CSS = `
   z-index: 20;
 }
 
-/* 电脑路径浏览器（底部抽屉） */
+/* 电脑路径浏览器（底部抽屉）
+ * 这套抽屉也被工作台「选择位置」复用（渲染在 [data-pocket-orb="page"] 之外），
+ * 所以 border-box 与文字色必须自己兜住，不能指望 page 上的全局规则。 */
+[data-pocket-orb="sheet"],
+[data-pocket-orb="sheet"] *,
+[data-pocket-orb="sheet"] *::before,
+[data-pocket-orb="sheet"] *::after {
+  box-sizing: border-box;
+}
 [data-pocket-orb="sheet-mask"] {
   position: absolute;
   inset: 0;
@@ -577,6 +585,7 @@ export const ORB_CSS = `
   display: flex;
   flex-direction: column;
   background: var(--dsw-alias-bg-layer-1, #fff);
+  color: var(--dsw-alias-label-primary, inherit);
   border-radius: 16px 16px 0 0;
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
@@ -586,6 +595,51 @@ export const ORB_CSS = `
   gap: 8px;
   padding: 12px;
   border-bottom: 1px solid var(--dsw-alias-border-l2, #e5e7eb);
+}
+/* 地址栏：整条可点 = 一键复制当前绝对路径；右侧文字给出「复制地址 / 已复制 / 复制失败」反馈 */
+[data-pocket-orb="path-bar"] {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 12px 0;
+  padding: 6px 10px;
+  border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, .12));
+  border-radius: 9px;
+  background: var(--dsw-alias-fill-l1, rgba(0, 0, 0, .04));
+  color: var(--dsw-alias-label-secondary, #6b7280);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 18px;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+[data-pocket-orb="path-bar"]:active {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .08));
+}
+[data-pocket-orb="path-text"] {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* 路径从盘符开始读：避免长路径把叶子目录挤掉时看起来像从中间开始 */
+  direction: ltr;
+  unicode-bidi: plaintext;
+}
+[data-pocket-orb="path-copy"] {
+  flex: none;
+  /* 「复制地址 / 已复制 / 复制失败」字数不同：留固定宽度，路径文字不跟着跳 */
+  min-width: 4em;
+  text-align: right;
+  font-weight: 600;
+  color: var(--dsw-alias-brand-primary, #4f6ef7);
+}
+[data-pocket-orb="path-bar"][data-copied="done"] [data-pocket-orb="path-copy"] {
+  color: var(--dsw-alias-state-success-primary, #2e7d32);
+}
+[data-pocket-orb="path-bar"][data-copied="fail"] [data-pocket-orb="path-copy"] {
+  color: var(--dsw-alias-state-error-primary, #d54941);
 }
 [data-pocket-orb="crumbs"] {
   display: flex;

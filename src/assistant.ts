@@ -2,18 +2,18 @@
  * dsh-assistant 服务端入口：把既有能力装进同一个插件包。
  *
  *   1. 工作台（源自 dsh-worktable）：/api/worktable/* 文件与站点路由、原生皮肤模板；
- *   2. 手机访问（源自 dsh-pocket）：局域网/公网代理、二维码、SSH 固定隧道、文件 RPC；
+ *   2. 手机访问：独立入口 src/pocket.ts，避免工作台热重载造成断线与重登；
  *   3. 托管（源自 dsh-tuoguan）：/.dsh-tuoguan/state 跨端托管开关（提问/审批自动应答）。
  *
  * 各半部彼此独立（路由前缀不同、数据目录不同），这里只负责按顺序 apply 与卸载。
  * 不修改原插件的任何代码：它们仍可单独安装/使用。
  */
 import * as worktable from './index'
-import * as pocket from './pocket-host/index.js'
 import * as tuoguan from './tuoguan-host'
 import { registerAssistantState } from './assistant-store'
 import { registerCoordinateMode } from './coordinate-mode'
 import { startDesktopBall, ballProfileDir } from './desktop-ball'
+import { manageWebRoutes } from './web-routes'
 import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join as joinPathNode } from 'node:path'
@@ -30,11 +30,14 @@ function appendFocusDiag(raw: string): void {
 
 export const name = 'dsh-assistant'
 
-/** 并集：工作台要 webServer/sessions，手机访问要 connection/webServer，托管要 webServer。 */
-export const inject = ['webServer', 'sessions', 'connection']
+/** 工作台要 webServer/sessions，托管与设置路由要 webServer；手机访问由独立入口注入 connection。 */
+export const inject = ['webServer', 'sessions']
 
 export function apply(ctx: any, config: any = {}): () => void {
   const disposers: Array<() => void> = []
+  const routes = manageWebRoutes(ctx.webServer)
+  const webServer = routes.webServer
+  disposers.push(routes.dispose)
 
   // ── 工作台半部 ──
   try {
@@ -42,15 +45,6 @@ export function apply(ctx: any, config: any = {}): () => void {
     if (typeof dispose === 'function') disposers.push(dispose)
   } catch (err) {
     try { ctx.logger?.('dsh-assistant')?.error?.('worktable half failed: %s', String(err)) } catch {}
-    throw err
-  }
-
-  // ── 手机访问半部 ──
-  try {
-    const dispose = (pocket as any).apply?.(ctx, config, {})
-    if (typeof dispose === 'function') disposers.push(dispose)
-  } catch (err) {
-    try { ctx.logger?.('dsh-assistant')?.error?.('pocket half failed: %s', String(err)) } catch {}
     throw err
   }
 
@@ -63,7 +57,10 @@ export function apply(ctx: any, config: any = {}): () => void {
   }
 
   // ── 跨端状态半部（项目 / 控制室视图） ──
-  try { registerAssistantState(ctx) } catch (err) {
+  try {
+    const dispose = registerAssistantState(ctx)
+    if (typeof dispose === 'function') disposers.push(dispose)
+  } catch (err) {
     try { ctx.logger?.('dsh-assistant')?.error?.('state store failed: %s', String(err)) } catch {}
   }
 
@@ -172,7 +169,7 @@ export function apply(ctx: any, config: any = {}): () => void {
   // 置位后由页面下一次轮询 /api/assistant/ball-click 取走并打开控制室。
   // 用途：桌面球点不开/没有球（网页、CLI）时，用一条 curl 即可打开，便于验收与排障。
   try {
-    ctx.webServer?.register?.({
+    webServer.register({
       kind: 'exact',
       path: '/api/assistant/ball',
       handler: (req: any, res: any) => {
@@ -193,7 +190,7 @@ export function apply(ctx: any, config: any = {}): () => void {
       },
     })
     // 悬浮球头像：data URL 存到 profile（球体窗口重启后立刻用新头像）
-    ctx.webServer?.register?.({
+    webServer.register({
       kind: 'exact',
       path: '/api/assistant/ball-avatar',
       handler: (req: any, res: any) => {
@@ -228,7 +225,7 @@ export function apply(ctx: any, config: any = {}): () => void {
     // 模型目录的 HTTP 兜底：移动端页面经公网代理时，客户端 Remote 偶发调用不到
     // session/modelCatalog，新建会话面板就只剩当前模型。这里直接在 Host 侧读同一份目录，
     // 客户端用同源 fetch 就能列出全部模型。
-    ctx.webServer?.register?.({
+    webServer.register({
       kind: 'exact',
       path: '/api/assistant/models',
       handler: (_req: any, res: any) => {
@@ -248,7 +245,7 @@ export function apply(ctx: any, config: any = {}): () => void {
         })()
       },
     })
-    ctx.webServer?.register?.({
+    webServer.register({
       kind: 'exact',
       path: '/api/assistant/open-console',
       handler: (_req: any, res: any) => {
@@ -262,7 +259,7 @@ export function apply(ctx: any, config: any = {}): () => void {
     // 新建会话聚焦诊断：客户端把 {opened, inList, openState, settled, resyncs, dom…} POST 过来，
     // 这里追加到 ~/.dsh/dsh-assistant-focus.log。用来自查「切过去白屏」这种只能看渲染状态的问题，
     // 不需要用户打开 DevTools。只写诊断，不读任何会话内容。
-    ctx.webServer?.register?.({
+    webServer.register({
       kind: 'exact',
       path: '/api/assistant/focus-diag',
       handler: (req: any, res: any) => {
@@ -282,7 +279,7 @@ export function apply(ctx: any, config: any = {}): () => void {
         }
       },
     })
-    ctx.webServer?.register?.({
+    webServer.register({
       kind: 'exact',
       path: '/api/assistant/ball-click',
       handler: (req: any, res: any) => {

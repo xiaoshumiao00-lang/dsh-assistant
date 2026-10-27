@@ -17,6 +17,7 @@
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { manageWebRoutes } from './web-routes.ts'
 
 export const COORDINATE_MODE_ROUTE = '/api/assistant/coordinate-mode'
 
@@ -111,6 +112,8 @@ export function registerCoordinateMode(ctx: any): () => void {
   }
 
   const disposers: Array<() => void> = []
+  const routes = manageWebRoutes(ctx.webServer)
+  disposers.push(routes.dispose)
   // 服务名专用，避免和 dsh-orb 的 orbCoordinateMode 撞名；内嵌 computer-use 优先读它。
   try {
     if (ctx?.get?.('assistantCoordinateMode') === undefined && typeof ctx?.provide === 'function') {
@@ -122,7 +125,7 @@ export function registerCoordinateMode(ctx: any): () => void {
   }
 
   try {
-    ctx.webServer.register({
+    routes.webServer.register({
       kind: 'exact',
       path: COORDINATE_MODE_ROUTE,
       handler: async (req: any, res: any) => {

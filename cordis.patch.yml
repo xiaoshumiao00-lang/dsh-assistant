@@ -6,6 +6,9 @@
 - insert:
     - id: dsh-assistant
       name: dsh-assistant
+    # 手机访问独立生命周期：工作台 / 客户端热重载不再断开代理、SSH 与登录会话。
+    - id: dsh-assistant-pocket
+      name: 'dsh-assistant/pocket'
     - id: assistant-preset-computer-use
       name: '@deepseek-ai/dsh-agent-preset'
       config:

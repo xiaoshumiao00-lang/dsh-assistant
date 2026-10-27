@@ -259,6 +259,39 @@ export function mobileApply(ctx): void {
     }
   }, 'dsh-mobile-nav: styles')
 
+  // 微信内置浏览器的顶部栏直接显示 document.title。宿主会把它改成
+  // 「当前会话名 — DeepSeek Harness」，长会话名因此占满手机顶部；手机布局固定为产品名。
+  // 只观察 head，宿主再次写入会话标题时就地改回；切回电脑布局后交还宿主原标题。
+  safeEffect(() => {
+    const PRODUCT_TITLE = 'DeepSeek Harness'
+    let hostTitle = document.title || PRODUCT_TITLE
+    const syncTitle = (): void => {
+      if (!narrow.matches) {
+        hostTitle = document.title
+        return
+      }
+      if (document.title === PRODUCT_TITLE) return
+      hostTitle = document.title || hostTitle
+      document.title = PRODUCT_TITLE
+    }
+    const onLayoutChange = (): void => {
+      if (narrow.matches) {
+        syncTitle()
+      } else if (document.title === PRODUCT_TITLE) {
+        document.title = hostTitle
+      }
+    }
+    const observer = new MutationObserver(syncTitle)
+    observer.observe(document.head, { childList: true, subtree: true, characterData: true })
+    narrow.addEventListener('change', onLayoutChange)
+    syncTitle()
+    return () => {
+      observer.disconnect()
+      narrow.removeEventListener('change', onLayoutChange)
+      if (document.title === PRODUCT_TITLE && hostTitle !== PRODUCT_TITLE) document.title = hostTitle
+    }
+  }, 'dsh-mobile-nav: fixed product title')
+
   // Phone chrome: KEEP the system status bar (no fullscreen) and make it
   // blend into the page. On narrow screens:
   // - The viewport meta gains viewport-fit=cover, so env(safe-area-inset-top)
