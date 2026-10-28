@@ -12,6 +12,17 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { createServer } from 'node:net'
+import { focusDesktopMainWindow } from './desktop-focus'
+
+const DESKTOP_BALL_SINGLETON = '__dshAssistantDesktopBallSingleton'
+type DesktopBallSingleton = { generation: number; handle: DesktopBallHandle | null }
+
+/** 插件热重载会创建新模块实例；注册表放在 globalThis 上，确保新实例接管前停掉旧桌面球。 */
+function desktopBallSingleton(): DesktopBallSingleton {
+  const root = globalThis as any
+  if (!root[DESKTOP_BALL_SINGLETON]) root[DESKTOP_BALL_SINGLETON] = { generation: 0, handle: null }
+  return root[DESKTOP_BALL_SINGLETON]
+}
 
 function dshHome(): string {
   return process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -99,7 +110,9 @@ app.whenReady().then(() => {
   } catch {}
   win = new BrowserWindow({
     width: 72, height: 72, x, y, frame: false, transparent: true, resizable: false,
-    skipTaskbar: true, hasShadow: false, alwaysOnTop: true, focusable: true, show: false,
+    // 不能聚焦：否则 Windows 会在第一次点击时先激活小球，Chromium 不派发 mousedown，
+    // 表现为“点一下没反应/只停在会话详情”，第二下才打开控制室。
+    skipTaskbar: true, hasShadow: false, alwaysOnTop: true, focusable: false, show: false,
     webPreferences: { nodeIntegration: true, contextIsolation: false, sandbox: false, devTools: false },
   })
   win.setAlwaysOnTop(true, 'screen-saver')
@@ -139,6 +152,10 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
     try { console.error('[dsh-assistant] 桌面悬浮球：未找到 Electron 运行时（跳过）') } catch {}
     return null
   }
+  const singleton = desktopBallSingleton()
+  const generation = ++singleton.generation
+  try { singleton.handle?.dispose() } catch {}
+  singleton.handle = null
   try { console.error('[dsh-assistant] 桌面悬浮球：使用', exe) } catch {}
 
   const dir = join(profileDir(ctx), 'dsh-assistant-ball')
@@ -182,8 +199,11 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
           continue
         }
         if (text === 'click') {
+          // 先让长轮询把“打开控制室”送到页面，再在下一拍恢复主窗焦点；
+          // 即使 Win32 聚焦调用很慢，也不会把这次点击卡在宿主事件循环里。
           pendingClick = true
           for (const listener of [...clickListeners]) { try { listener() } catch {} }
+          setImmediate(() => { try { focusDesktopMainWindow() } catch {} })
         }
       }
     })
@@ -202,6 +222,8 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
     port = Number((server.address() as any)?.port) || 0
   } catch { try { server.close() } catch {} return null }
   if (!port) { try { server.close() } catch {} return null }
+  // 多次设置保存/热重载可能并发进入；等待监听期间若已有更新请求，本次直接取消。
+  if (generation !== singleton.generation) { try { server.close() } catch {} return null }
 
   try {
     // 关键：DSH Desktop 的宿主进程带 ELECTRON_RUN_AS_NODE=1，直接继承会让 electron.exe
@@ -225,16 +247,22 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
     return null
   }
 
-  // 退出清理：helper 的 socket 断开后会自行退出；这里再兜底 kill 一次
+  // 退出清理：helper 的 socket 断开后会自行退出；这里再兜底 kill 一次。
+  // 旧上下文的 dispose 只碰自己的 child，不会误停全局注册表中更新的桌面球。
+  let disposed = false
+  let handle: DesktopBallHandle
   const dispose = () => {
+    if (disposed) return
+    disposed = true
     pendingClick = false
     clickListeners.clear()
     for (const s of authSockets) { try { s.destroy() } catch {} }
     try { server.close() } catch {}
     try { child?.kill() } catch {}
     child = null
+    if (singleton.handle === handle) singleton.handle = null
   }
-  return {
+  handle = {
     dispose,
     takeClick: () => { const v = pendingClick; pendingClick = false; return v },
     onClick: (listener) => {
@@ -242,6 +270,8 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
       return () => { clickListeners.delete(listener) }
     },
   }
+  singleton.handle = handle
+  return handle
 }
 
 export { BALL_HTML }
