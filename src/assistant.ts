@@ -105,10 +105,12 @@ export function apply(ctx: any, config: any = {}): () => void {
     return open
   }
   const wakeClickWaiters = (): void => {
-    // 一次点击只交给一个页面，保持旧接口的「取走」语义；其余页面继续等待。
-    for (const waiter of [...clickWaiters]) {
-      if (takeOpenClick()) finishClickWaiter(waiter, true)
-    }
+    if (clickWaiters.size === 0) return
+    if (!takeOpenClick()) return
+    // 点击要广播给所有正在等待的页面。页面重载/插件 HMR 可能短暂留下旧等待者；
+    // 旧逻辑只交给第一个等待者，旧连接把点击“取走”后，真正可见的页面就收不到，
+    // 表现为“偶尔点了悬浮球却停在会话详情”。
+    for (const waiter of [...clickWaiters]) finishClickWaiter(waiter, true)
   }
   disposers.push(() => { for (const waiter of [...clickWaiters]) finishClickWaiter(waiter, false) })
 
