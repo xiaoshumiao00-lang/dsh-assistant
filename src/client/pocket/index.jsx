@@ -68,11 +68,17 @@ export function PocketSettingsTab({ rpcCall, t }) {
   const [isDesktop, setIsDesktop] = useState(false); // DSH Desktop（Electron）环境：更新/重启由桌面版管理
   const [now, setNow] = useState(Date.now()); // 每秒 tick，驱动倒计时
 
-  // 进行中操作的「已等待 X 秒」倒计时
+  // 只有正在显示的倒计时才需要 1Hz tick；空闲设置页不再每秒重渲染整张卡。
+  const ticking = updateInfo?.updating === true
+    || updateInfo?.restarting === true
+    || ['downloading', 'starting', 'registering'].includes(tunnelState?.phase)
+    || Number(status?.sshTunnel?.nextRetryAt) > 0;
   useEffect(() => {
+    if (!ticking) return;
+    setNow(Date.now());
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
-  }, []);
+  }, [ticking]);
   const elapsed = (startedAt) => (startedAt ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000)) : 0);
 
   const call = async (endpoint, payload) => {

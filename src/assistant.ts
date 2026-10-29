@@ -12,6 +12,7 @@ import * as worktable from './index'
 import * as tuoguan from './tuoguan-host'
 import { registerAssistantState } from './assistant-store'
 import { registerCoordinateMode } from './coordinate-mode'
+import { CONSOLE_SEA01_ROUTE, serveConsoleSea01 } from './consoleAsset'
 import { startDesktopBall, ballProfileDir } from './desktop-ball'
 import { manageWebRoutes } from './web-routes'
 import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
@@ -223,6 +224,12 @@ export function apply(ctx: any, config: any = {}): () => void {
           res.end(JSON.stringify({ ok: true, hasAvatar: !!ballState.avatar }))
         })
       },
+    })
+    // 控制室预置背景按需下载：不占首屏 client bundle；仅首次初始化空媒体库时请求。
+    webServer.register({
+      kind: 'exact',
+      path: CONSOLE_SEA01_ROUTE,
+      handler: (req: any, res: any) => { void serveConsoleSea01(req, res) },
     })
     // 模型目录的 HTTP 兜底：移动端页面经公网代理时，客户端 Remote 偶发调用不到
     // session/modelCatalog，新建会话面板就只剩当前模型。这里直接在 Host 侧读同一份目录，

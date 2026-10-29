@@ -47,6 +47,8 @@ export type TemplateBlockDef = {
   acceptance: string[]
   /** true = 重复块（如逐图/逐章）：同一验收清单对多轮交付逐轮验收，直到工人写 _完成_<id>.md */
   repeatable?: boolean
+  /** true = 本块**免验收**：工人覆写交付标记后直接进入下一块，不派验收员（2026-10-28 用户要求整模板免验收） */
+  noVerify?: boolean
   /** 迭代收敛配置：存在时本块走「工人+裁判」双 Agent 收敛环（而非一轮验收）。
    *  工人产出 → 裁判独立上下文 JSON 评分 → 仅当新分>旧分才采纳，否则回退保留最佳版本 →
    *  循环至达标 / 达轮次上限 / 连续 plateau 轮无改进。 */
@@ -63,13 +65,11 @@ export type ConvergeConfig = {
   plateau: number
 }
 
-/** 质量基线文件（所有工人与验收员共用度量衡；L2 项目叠加层见项目根 _项目验收叠加.md）
- *  基线资产目录命名规范：顶层 `NN-名称.md`（01 个人写作基准 / 02 十步L1验收清单 / 03 出版级图表验收清单 /
- *  04 使用说明 / 05 改造验收报告 / 06 采访问卷）；素材目录 `年份-月-简称`。
- *  改名前务必同步三处：本文件常量、stage-verifier 技能「必读基线」、论文写作模板/00-索引.md。 */
-export const BASELINE_PERSONAL = 'D:\\dsh-worktable\\论文写作模板\\01-个人写作基准.md'
-export const BASELINE_FIGURES = 'D:\\dsh-worktable\\论文写作模板\\03-出版级图表验收清单.md'
-export const L1_CHECKLIST = 'D:\\dsh-worktable\\论文写作模板\\02-十步验收标准.md'
+/** 质量基线文件（工人共用度量衡；L2 项目叠加层见项目根 _项目验收叠加.md）
+ *  2026-10-28：dsh-worktable 已退役，基线改由独立技能 paper-10step 提供（以后只维护那份）。 */
+export const BASELINE_PERSONAL = 'C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\references\\01-个人写作基准.md'
+export const BASELINE_FIGURES = 'C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\references\\03-出版级图表自纠清单.md'
+export const L1_CHECKLIST = 'C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\references\\02-十步自纠清单.md'
 export const OVERLAY_FILE = '_项目验收叠加.md'
 
 /** 解析 02-十步验收标准.md，返回每个步骤的条目数组（key = 步骤 id，如 'polish'）。
@@ -303,9 +303,9 @@ export const PAPER_TEMPLATE: TemplateDef = {
       title: '初稿撰写',
       icon: '📝',
       dir: '06-初稿撰写',
-      deliverable: '撰写论文全部章节：06-摘要.md、06-引言.md、06-方法.md、06-结果与讨论.md、06-结论.md。',
+      deliverable: '按第 2 步《02-论文框架.md》的实际章节逐章撰写：06-摘要.md + 06-Ch<NN>-<章名>.md（一章一个文件，不套固定章节）。',
       skill: 'aca-02-writing',
-      instruction: '以计算结果为基础撰写；引言块开工前必须加载 /aca-03-introduction；全文遵守《个人写作基准》的语言与数字纪律；图表引用第 4 步统一编号。',
+      instruction: '章节与顺序一律以第 2 步《02-论文框架.md》为准（框架有几章就写几个文件，不套「摘要/引言/方法/结果/结论」的固定章节）：一章一个 06-Ch<NN>-<章名>.md，章号与章名照抄框架；摘要单独 06-摘要.md。以第 5 步计算结果和第 4 步预期结果清单为基础撰写；写引言章时加载 /aca-03-introduction；全文遵守《个人写作基准》的语言与数字纪律；图表引用第 4 步统一编号。',
       briefDefault: '论文语言：【中文/英文】；目标期刊与篇幅：【期刊名，正文约 N 字/词】。\n写作体例与引用格式：【如：序号制 [N] / APA；目标期刊《作者指南》链接或文件】。\n各章特殊要求——引言：【研究背景侧重、必须交代的工程背景】；方法：【公式推导深度、符号约定】；结果与讨论：【突出哪些对比、讨论深度】；结论：【条数与写法偏好】。\n摘要字数与结构要求：【如：200-250 词，Background-Method-Result-Conclusion】。\n关键术语与符号约定：【列出必用术语表/符号表】。\n必须引用或禁止引用的文献：【…】。',
       blocks: [
         {
@@ -316,31 +316,10 @@ export const PAPER_TEMPLATE: TemplateDef = {
           acceptance: [],
         },
         {
-          id: '引言',
-          title: '引言',
-          deliverable: '产物：06-引言.md（开工前加载 /aca-03-introduction 并严格执行）',
-          files: ['06-引言.md'],
-          acceptance: [],
-        },
-        {
-          id: '方法',
-          title: '理论/方法',
-          deliverable: '产物：06-方法.md',
-          files: ['06-方法.md'],
-          acceptance: [],
-        },
-        {
-          id: '结果与讨论',
-          title: '结果与讨论',
-          deliverable: '产物：06-结果与讨论.md（按第 4 步清单逐节）',
-          files: ['06-结果与讨论.md'],
-          acceptance: [],
-        },
-        {
-          id: '结论',
-          title: '结论',
-          deliverable: '产物：06-结论.md',
-          files: ['06-结论.md'],
+          id: '章节',
+          title: '按框架逐章',
+          deliverable: '产物：06-Ch<NN>-<章名>.md（章名与顺序以第 2 步 02-论文框架.md 为准，一章一个文件）',
+          files: ['06-Ch<NN>-<章名>.md'],
           acceptance: [],
         },
       ],
@@ -450,6 +429,16 @@ export const PAPER_TEMPLATE: TemplateDef = {
       ],
     },
   ],
+}
+
+/* 【2026-10-28 用户硬性要求】论文写作模板**全流程免验收**：
+ * 所有块置 noVerify —— 工人覆写交付标记即完成，调度器直接进入下一块，不创建验收员会话；
+ * 末块交付后进「待终审」，由用户点「✓ 通过」。自纠清单仍写进 _本步要求.md 作为交付前自查依据。
+ * 想恢复某一步的验收：把该步 id 加进 KEEP_VERIFY_STEPS（留空 = 全部免验收）。 */
+const KEEP_VERIFY_STEPS = new Set<string>([])
+for (const s of PAPER_TEMPLATE.steps) {
+  if (KEEP_VERIFY_STEPS.has(s.id)) continue
+  for (const b of s.blocks ?? []) b.noVerify = true
 }
 
 /* ─────────────────────────── 内建迭代收敛模板（工人+裁判双 Agent 收敛环） ───────────────────────────
@@ -1158,14 +1147,16 @@ export function composeStepTask(opts: {
   L.push('4. 自核须与实测一致：凡本步有对应工具（`tools/` 下）的项，一律**贴出工具输出**再下结论；自报数字与实测不符、或自述"未改数据"而实测有改动，按未交付处理。')
   const blocks = step.blocks ?? []
   if (blocks.length > 0) {
+    const freeBlocks = blocks.filter((b) => b.noVerify)
     L.push('')
-    L.push(`自动验收协议（本步 ${blocks.length} 块，逐块交付、逐块独立验收）：`)
-    blocks.forEach((b, i) => L.push(`  ${i + 1}. ${b.title}${b.repeatable ? '（重复块：每轮交付一个对象）' : ''}${b.skill ? `　技能 /${String(b.skill).replace(/^\s*\//, '')}` : ''}`))
-    L.push('  ① 按 _本步要求.md 中该块「验收清单」逐条自纠后交付；')
+    L.push(freeBlocks.length === blocks.length
+      ? `分块交付协议（本步 ${blocks.length} 块，**全部免验收**：交付即完成，不派验收员）：`
+      : `分块交付协议（本步 ${blocks.length} 块，${freeBlocks.length} 块免验收）：`)
+    blocks.forEach((b, i) => L.push(`  ${i + 1}. ${b.title}${b.noVerify ? '（免验收：交付即完成）' : ''}${b.repeatable ? '（重复块：每轮交付一个对象）' : ''}${b.skill ? `　技能 /${String(b.skill).replace(/^\s*\//, '')}` : ''}`))
+    L.push('  ① 按 _本步要求.md 中该块条目逐条自纠后交付（免验收块同样要自纠到位，只是不再有人复核）；')
     L.push('  ② 覆写交付标记 _交付_<块id>.md（内容 = 本轮对象 + 产物清单 + 逐条自核结果）；')
-    L.push('  ③ 【立即停止】等独立验收员核验（结果由系统自动回传）——不要自行判断通过、不要抢跑下一块；')
-    L.push('  ④ 【一轮验收】每块**只验收 1 轮**：PASS → 自动进入下一块；FAIL → 按该轮报告把 FAIL + ADVISORY 指令**一次改完**，覆写交付标记后**系统自动进入下一块**（本块不再复验）。因此交付前务必自纠到底——本块没有第二次验证兜底，漏改项会作为遗留问题记入报告与 _本步摘要.md 交用户终审。')
-    L.push('  ⑤ 全部块 PASS → 写 _本步摘要.md（结论要点 / 关键数据 / 产物清单 / 遗留事项），然后等用户终审。')
+    L.push('  ③ 【免验收】覆写交付标记后系统**自动进入下一块**，不停等、不需要等任何"通过"结果；')
+    L.push('  ④ 全部块交付完毕 → 写 _本步摘要.md（结论要点 / 关键数据 / 产物清单 / 遗留事项），然后等用户终审。')
   }
   L.push('')
   L.push('开工前必读（按序读完再动手）：')
@@ -1176,10 +1167,10 @@ export function composeStepTask(opts: {
   L.push(`${n}. ${folder}/${OVERLAY_FILE}（L2 项目叠加层，若存在：写作语言等特殊要求）`)
   L.push('')
   L.push('随本步可用的成品工具（第 8 步用；其它步按需）：')
-  L.push('- `D:\\dsh-worktable\\tools\\mdplan.py` —— 由「原稿 × 章稿 md」机械生成 `08-修改清单.json`，内置 5 项审计（运算符删除 / 数学相邻空格 / 唯一命中 / find 非空 / 模拟执行）。**禁止凭记忆或凭上下文摘要转录改动**（必漏整段重写）')
-  L.push('- `D:\\dsh-worktable\\tools\\fixup.py` —— 引擎做不到的事：符号 OMML 化（pandoc 就地插入）、公式内符号改写、同串多格手工红标；`--emit-manual` 自动产出重放差异声明')
-  L.push('- `D:\\dsh-worktable\\tools\\verify_docx.py` —— 交付前 9 项核验（指纹 / 段落属性全等 / 标红正确 / 域与修订 / 重放预算 / 清稿=章稿 / 标点前空格 / 数值改动登记 / 敏感单元）')
-  L.push('- `D:\\dsh-worktable\\tools\\redline_selfcheck.py`、`count_words.py`、`prose_lint.py` —— 红标自检、字数主口径、行文可疑句定位')
+  L.push('- `C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\scripts\\mdplan.py` —— 由「原稿 × 章稿 md」机械生成 `08-修改清单.json`，内置 5 项审计（运算符删除 / 数学相邻空格 / 唯一命中 / find 非空 / 模拟执行）。**禁止凭记忆或凭上下文摘要转录改动**（必漏整段重写）')
+  L.push('- `C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\scripts\\fixup.py` —— 引擎做不到的事：符号 OMML 化（pandoc 就地插入）、公式内符号改写、同串多格手工红标；`--emit-manual` 自动产出重放差异声明')
+  L.push('- `C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\scripts\\verify_docx.py` —— 交付前 9 项核验（指纹 / 段落属性全等 / 标红正确 / 域与修订 / 重放预算 / 清稿=章稿 / 标点前空格 / 数值改动登记 / 敏感单元）')
+  L.push('- `C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\scripts\\redline_selfcheck.py`、`count_words.py`、`prose_lint.py` —— 红标自检、字数主口径、行文可疑句定位')
   L.push('')
   L.push('开工第一步 —— 三级标准对照体检（每个块开工前必做，不得跳过、不得直接开改）：')
   L.push('  ① 拿验收标准（02-十步验收标准.md）+ L2 项目叠加层 + 质量基线（含第 9 节红线）+ 本步技能规程，逐条比对本块现有产物（或待优化的原始稿件）：每条给出「达标 / 不达标」；')
@@ -1217,16 +1208,20 @@ export function composeStepSpec(opts: {
   const blocks = step.blocks ?? []
   if (blocks.length > 0) {
     L.push('')
-    L.push('## 本步验收标准（来自 02-十步验收标准.md，实时读取；验收员逐条核验，你必须逐条自纠）')
+    L.push((blocks).every((b) => b.noVerify)
+      ? '## 本步自纠清单（来自 02-十步自纠清单.md，实时读取；本步免验收——没有验收员，须在交付时逐条给出自核结果）'
+      : '## 本步验收标准（来自 02-十步验收标准.md，实时读取；验收员逐条核验，你必须逐条自纠）')
     if (l1Entries && l1Entries.length > 0) {
       l1Entries.forEach((e, i) => L.push(`${i + 1}. ${e}`))
     }
     blocks.forEach((b, i) => {
       L.push('')
-      L.push(`### 块 ${i + 1} · ${b.title}${b.repeatable ? '（重复块：逐对象验收）' : ''}`)
+      L.push(`### 块 ${i + 1} · ${b.title}${b.noVerify ? '（免验收：交付即完成）' : ''}${b.repeatable ? '（重复块：逐对象验收）' : ''}`)
       if (b.skill) L.push(`本块技能：/${String(b.skill).replace(/^\s*\//, '')}`)
       if (b.files && b.files.length > 0) L.push(`产物文件：${b.files.join('、')}`)
-      L.push('验收标准：见上方「本步验收标准（来自 02-十步验收标准.md，实时读取）」中对应块条目。')
+      L.push(b.noVerify
+        ? '本块免验收：不派验收员，覆写交付标记后自动进入下一块；上方条目是你交付前逐条自纠的依据，须给出自核结果。'
+        : '验收标准：见上方「本步验收标准（来自 02-十步验收标准.md，实时读取）」中对应块条目。')
     })
   }
   return L.join('\n')

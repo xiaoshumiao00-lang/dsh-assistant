@@ -21,6 +21,7 @@
     "lib/index.js",
     "lib/pocket.js",
     "lib/client.js",
+    "lib/console-sea01.jpg",
     "lib/computer-use.js",
     "lib/computer-use-code-agent.js",
     "lib/computer-use-code-agent-registry.js",
@@ -49,7 +50,7 @@
   "scripts": {
     "build": "node build.mjs",
     "check": "node --check lib/index.js && node --check lib/pocket.js && node --check lib/client.js",
-    "test": "node scripts/test-web-routes.mjs && node scripts/test-pocket-session.mjs && node scripts/test-pocket-runtime.mjs && node scripts/test-mobile-boot.mjs && node scripts/test-mobile-proxy.mjs && node scripts/test-session-focus.mjs && node scripts/test-session-folder.mjs && node scripts/test-session-status.mjs && node scripts/test-session-index.mjs && node scripts/test-pc-file.mjs && node scripts/test-new-project-default.mjs && node scripts/test-clipboard.mjs && node scripts/test-split-entry.mjs && node scripts/test-coordinate-mode.mjs && node scripts/test-console-filter.mjs"
+    "test": "node scripts/test-web-routes.mjs && node scripts/test-console-assets.mjs && node scripts/test-split-observer.mjs && node scripts/test-model-settings-notice.mjs && node scripts/test-pocket-session.mjs && node scripts/test-pocket-runtime.mjs && node scripts/test-mobile-boot.mjs && node scripts/test-mobile-proxy.mjs && node scripts/test-session-focus.mjs && node scripts/test-session-folder.mjs && node scripts/test-session-status.mjs && node scripts/test-session-index.mjs && node scripts/test-pc-file.mjs && node scripts/test-new-project-default.mjs && node scripts/test-clipboard.mjs && node scripts/test-split-entry.mjs && node scripts/test-coordinate-mode.mjs && node scripts/test-console-filter.mjs"
   },
   "dependencies": {
     "qrcode": "^1.5.4",

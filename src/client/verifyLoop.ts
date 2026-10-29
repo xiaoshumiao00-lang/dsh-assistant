@@ -181,15 +181,20 @@ export function composeReviseTask(opts: { stepLabel: string; block: TemplateBloc
   ].join('\n')
 }
 
-/** PASS 后发给工人的"继续下一块"指令 */
-export function composeNextBlockTask(stepLabel: string, block: TemplateBlockDef): string {
-  return [
+/** PASS 后发给工人的"继续下一块"指令。prevSkipped = 上一块是免验收块 */
+export function composeNextBlockTask(stepLabel: string, block: TemplateBlockDef, prevSkipped = false): string {
+  const lines = [
     msgHead(stepLabel, '下一块', block.id),
     '',
-    `上一块已通过验收。继续交付本块：「${block.title}」。`,
+    prevSkipped
+      ? `上一块已交付（免验收，未跑验收员）。继续交付本块：「${block.title}」。`
+      : `上一块已通过验收。继续交付本块：「${block.title}」。`,
     `交付物：${block.deliverable}`,
-    '流程照旧：按 _本步要求.md 中该块的验收清单逐条自纠 → 覆写交付标记 → 停止等验收。',
-  ].join('\n')
+  ]
+  lines.push(block.noVerify
+    ? '本块免验收：按 _本步要求.md 中该块条目逐条自纠 → 覆写交付标记 → 系统**自动进入下一块**（不要停等验收）。'
+    : '流程照旧：按 _本步要求.md 中该块的验收清单逐条自纠 → 覆写交付标记 → 停止等验收。')
+  return lines.join('\n')
 }
 
 /** repeat 块 PASS 且未全部完成时的"继续下一个对象"指令 */
@@ -203,12 +208,12 @@ export function composeContinueRepeatTask(stepLabel: string, block: TemplateBloc
   ].join('\n')
 }
 
-/** 全部通过（含 repeat 完成标记确认）后的收尾提示 */
+/** 全部交付完成（含免验收块）后的收尾提示 */
 export function composeFinishTask(stepLabel: string): string {
   return [
     msgHead(stepLabel, '收尾', '写本步摘要'),
     '',
-    '本步全部交付块已通过独立验收。请写 _本步摘要.md（①本步结论/要点 ②关键数据/参数/术语 ③产出文件清单 ④遗留事项与给后续步骤的提示），然后输出一句话总结等用户在面板点「✓ 通过」。',
+    '本步全部交付块已完成（验收块已通过独立验收／免验收块按自核交付）。请写 _本步摘要.md（①本步结论/要点 ②关键数据/参数/术语 ③产出文件清单 ④遗留事项与给后续步骤的提示），然后输出一句话总结等用户在面板点「✓ 通过」。',
   ].join('\n')
 }
 
@@ -228,7 +233,7 @@ export function composeFinalReviseTask(opts: { stepLabel: string; block: Templat
     '③ 【交付前核对】交付标记中逐条列出：本轮指令是否全部落地 + 已 PASS 项是否仍成立 + 验收标准对照结果。',
     '',
     '⚠️ 本块没有第二次验收，所以请务必**自证**（交付标记里贴出证据，不要只写"已改"）：',
-    '· 有对应工具的项（`D:\\dsh-worktable\\tools\\` 下 mdplan / verify_docx / redline_selfcheck / count_words / prose_lint）一律**贴出工具输出**；',
+    '· 有对应工具的项（`C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\scripts\\` 下 mdplan / verify_docx / redline_selfcheck / count_words / prose_lint）一律**贴出工具输出**；',
     '· 报告点名的每一处，给出「位置 ｜ 改前 ｜ 改后 ｜ 证据」对照行；',
     '· 明确列出**仍未落实**的项及原因（交用户终审），不得静默跳过、不得把未达标写成已完成。',
   ].join('\n')
@@ -583,6 +588,13 @@ export class VerifyScheduler {
     const marker = await this.deps.readFile(`${stepDir}/${deliveryMarkerName(block.id)}`)
     // 标记非空即视为新交付：派任务给工人时已清空标记（见 tickVerifying），工人必须覆写才算交付
     if (marker && marker.trim()) {
+      // 【免验收块】交付即完成：不派验收员、不占验收轮次，直接推进下一块（或收尾）
+      if (block.noVerify) {
+        if (st.stalled) this.deps.patchVerify(projectId, stepId, (cur) => cur ? { ...cur, stalled: false } : cur)
+        await this.advanceAfterBlock(projectId, stepId, stepDir, step, block, st,
+          { verdict: 'PASS', failCount: 0 }, false, true)
+        return
+      }
       // 已达验收轮次上限：最后一次改稿交付后**强制收尾**，不再派验收员
       if (st.finalRevise) {
         await this.advanceAfterBlock(projectId, stepId, stepDir, step, block, st,
@@ -1052,14 +1064,17 @@ export class VerifyScheduler {
   private async advanceAfterBlock(
     projectId: string, stepId: string, stepDir: string, step: TemplateDef['steps'][number],
     block: TemplateBlockDef, st: StepVerifyState,
-    vd: { verdict: 'PASS' | 'FAIL'; failCount: number }, forced: boolean,
+    vd: { verdict: 'PASS' | 'FAIL'; failCount: number }, forced: boolean, skipped = false,
   ): Promise<void> {
     const run = this.deps.getRun(projectId)
     const workerSid = st.workerSid ?? (run ? this.deps.getWorkerSid(run, stepId) : undefined)
     const label = this.deps.getStepLabel(stepId)
     const blocks = step.blocks ?? []
     const passedCount = st.passedCount + 1
-    const lastVerdict = { verdict: vd.verdict, failCount: vd.failCount, at: Date.now() }
+    const lastVerdict = {
+      verdict: vd.verdict, failCount: vd.failCount, at: Date.now(),
+      ...(skipped ? { skipped: true } : {}),
+    }
     if (!workerSid) {
       this.deps.notify(projectId, `⚠️ 工人会话丢失（步骤「${step.title}」），已暂停：请在面板点「⏯ 继续本步」`, 'err')
       this.deps.patchVerify(projectId, stepId, (cur) => cur ? { ...cur, phase: 'paused', pauseReason: 'worker-gone', lastVerdict } : cur)
@@ -1072,7 +1087,7 @@ export class VerifyScheduler {
       const okSend = await this.deps.sendToSession(workerSid, composeContinueRepeatTask(label, block, passedCount))
       this.deps.patchVerify(projectId, stepId, (cur) => cur ? {
         ...cur, phase: 'working', passedCount, verifyAttempts: 0,
-        round: cur.round + 1, stepRound: stRoundOf(cur) + 1, // 换对象：块内轮次与累计轮次都 +1
+        round: cur.round + 1, stepRound: stRoundOf(cur) + (skipped ? 0 : 1), // 换对象：块内轮次与累计轮次都 +1（免验收块不占轮次）
         finalRevise: false, // 换对象即重置"已派改稿"标记，否则新对象首轮交付会被误判已改完而直接推进
         lastVerdict, verifierSid: undefined, stalled: false, workerDispatchedAt: Date.now(),
       } : cur)
@@ -1085,16 +1100,18 @@ export class VerifyScheduler {
       // 【顺序铁律】两块标记都在发指令前清空（含下一块，防同名残留）
       await this.deps.writeFile(`${stepDir}/${deliveryMarkerName(block.id)}`, '') // 清空当前块标记防重复触发
       await this.deps.writeFile(`${stepDir}/${deliveryMarkerName(next.id)}`, '') // 清空下一块标记防同名残留
-      const okSend = await this.deps.sendToSession(workerSid, composeNextBlockTask(label, next))
+      const okSend = await this.deps.sendToSession(workerSid, composeNextBlockTask(label, next, skipped))
       this.deps.patchVerify(projectId, stepId, (cur) => cur ? {
         ...cur, phase: 'working', blockIdx: nextIdx, passedCount: 0, verifyAttempts: 0,
         round: 1, // 块内轮次重置（一轮验收：每块只验收 1 轮）
-        stepRound: stRoundOf(cur) + 1, // 累计轮次继续递增，绝不回退 → 面板/会话标题不会显示"回到第 1 轮"
+        stepRound: stRoundOf(cur) + (skipped ? 0 : 1), // 累计轮次继续递增，绝不回退 → 面板/会话标题不会显示"回到第 1 轮"
         lastVerdict, verifierSid: undefined, stalled: false, finalRevise: false, workerDispatchedAt: Date.now(),
       } : cur)
       if (okSend) this.deps.notify(projectId, forced
         ? `🔁 步骤「${step.title}」块「${block.title}」验收未过但已按报告改完（遗留项见最新验收报告），开始下一块「${next.title}」`
-        : `✅ 步骤「${step.title}」块「${block.title}」通过，开始下一块「${next.title}」`, forced ? 'info' : 'ok')
+        : skipped
+          ? `⏭ 步骤「${step.title}」块「${block.title}」已交付（免验收），开始下一块「${next.title}」`
+          : `✅ 步骤「${step.title}」块「${block.title}」通过，开始下一块「${next.title}」`, forced ? 'info' : 'ok')
       return
     }
     // 全部块完成 → 等用户终审
@@ -1107,7 +1124,9 @@ export class VerifyScheduler {
     this.deps.onStepPassed(projectId)
     this.deps.notify(projectId, forced
       ? `🔁 步骤「${step.title}」验收未过但已按报告改完（本块不再复验）：请打开各块最新 _验收_*.md 查看遗留项并人工确认，无误后点「✓ 通过」（要返工可点「🔄 重置」）`
-      : `🎉 步骤「${step.title}」全部块通过独立验收！请在面板点「✓ 通过」终审（验收报告与产出在本步骤目录）`, forced ? 'info' : 'ok')
+      : skipped
+        ? `⏭ 步骤「${step.title}」各块已全部交付（本步免验收，未跑验收员）：请打开产物终审，无误后点「✓ 通过」`
+        : `🎉 步骤「${step.title}」全部块通过独立验收！请在面板点「✓ 通过」终审（验收报告与产出在本步骤目录）`, forced || skipped ? 'info' : 'ok')
   }
 
   /* ─────────────────────── 用户主动停止 / 恢复（面板「⏹ 停止」/「⏯ 继续本步」） ─────────────────────── */
