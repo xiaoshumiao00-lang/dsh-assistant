@@ -14,6 +14,8 @@ import { POCKET_ENDPOINTS, POCKET_RPC_CHANNEL } from './pocket/api.js'
 import { ICON_CHOICES, resolveProjectIcon, pickUnusedIcon } from './projectIcons'
 import { focusSessionInHost, sessionFaceState, healBlankSessionIfStuck, type FocusResult } from './sessionFocus'
 import { sessionsUnderFolder, normalizeFolderPath, unownedSessionIds, transientVisibility } from './sessionFolder'
+import { assistantHomeDir } from './assistant-entry'
+import { ASSISTANT_PROJECT_ID, ASSISTANT_CARD_NAME, ASSISTANT_CARD_ICON, shouldAddAssistantCard, withAssistantCard } from './assistant-card'
 import { hasPendingInteraction, sessionStatusSourceOf, pendingInteractionSignature } from './sessionStatus'
 import { sessionSnapshotIndexOf, invalidateSessionSnapshotIndex } from './sessionIndex'
 
@@ -714,6 +716,10 @@ async function ensureSessionModel(sessionId: string): Promise<void> {
 /** 控制室（工作台自己）项目：固定 id、固定排项目列表第一位、不可删除 */
 const CONSOLE_ID = 'wt-console'
 const CONSOLE_ICON = '🖥️'
+
+/** 私人助手卡片：助手目录（~/.dsh/assistant）在控制室里的一张**普通项目卡**——
+ *  和别的卡一样有状态灯 / 实时进度 / 会话列表 / ＋新建；不塞进「正在运行」临时卡片。
+ *  id 固定：删除后写进 removed 墓碑，跨端同步，且不再自动重建。见 assistant-card.ts。 */
 
 /** 临时项目卡片「正在运行」：收纳不属于任何项目文件夹的会话（不写入项目状态，随会话出现/消失）。
  *  名称按用户指定使用「正在运行」。 */
@@ -4082,6 +4088,28 @@ function buildCustomLayoutPrompt(req: string): string {
     if (splitStore.active && splitStore.spec?.id === pid) { try { splitStore.close() } catch {} }
     notifyConsole()
   }
+
+  /** 私人助手卡片自愈：助手目录必须出现在控制室里，且是一张普通项目卡。
+   *  - 首次（或用户清了状态）自动创建：布局=会话全屏、图标 🤖、排第一；
+   *  - 已存在（按文件夹比对，不按 id）就不再建，避免与用户手工添加的项目重复；
+   *  - 用户删过（removed 墓碑）不重建：删卡片是他的明确选择。 */
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    let alive = true
+    void (async () => {
+      const home = await assistantHomeDir()
+      if (!alive || !home) return
+      if (!shouldAddAssistantCard(projectsRef.current.projects as any, home)) return
+      const layout = buildLayout(DEFAULT_PRESET_ID, ASSISTANT_CARD_NAME)
+      layout.id = ASSISTANT_PROJECT_ID
+      layout.icon = ASSISTANT_CARD_ICON
+      persistProjects((prev) => withAssistantCard(prev as any, home, layout) as any)
+      notifyConsole()
+    })().catch(() => { /* 宿主没提供助手目录（旧版/非桌面）：不建卡 */ })
+    return () => { alive = false }
+    // 只在挂载时做一次：之后用户怎么改名/换图标/删除都不再干预。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   /** 为「还没有专属会话」的项目自动补一个项目对话：空白会话、工作目录 = 项目文件夹
    * （与用户建项目时选择的文件夹一致），建好即绑定到该项目。
