@@ -1,7 +1,7 @@
 {
   "name": "dsh-assistant",
   "description": "DeepSeek Harness 一体化助手：悬浮球 → 控制室（项目/会话/模板）+ 手机扫码远程访问（局域网/公网）。合并 dsh-worktable 与 dsh-pocket 的能力。",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "engines": {
     "node": ">=22"
   },

@@ -2493,6 +2493,12 @@ function WorktableSection(props: any) {
   const syncRevRef = useRef(0)
   const syncSigRef = useRef('')
   const syncPollBusyRef = useRef(false)
+  /** 首次同步已完成（宿主状态已采纳）：私人助手卡片的建卡要等这个，否则会被采纳覆盖吃掉。 */
+  const [syncReady, setSyncReady] = useState(false)
+  /** 助手目录（宿主 /api/assistant/home）。 */
+  const [assistantHome, setAssistantHome] = useState('')
+  /** 私人助手卡片建卡尝试次数：被踩掉后允许补几次，不无限重试。 */
+  const assistantCardTriesRef = useRef(0)
 
   /** 采纳宿主状态（另一端的改动 / 冲突时的真值）：写本地并重载界面；签名同步记下，下一轮不再回声推送 */
   const adoptRemoteState = (st: any): void => {
@@ -2559,6 +2565,7 @@ function WorktableSection(props: any) {
         }
       } catch { /* 宿主不可用：退回纯本地模式 */ }
       if (alive) syncReadyRef.current = true
+      if (alive) setSyncReady(true)
     })()
     return () => { alive = false }
   }, [])
@@ -4092,24 +4099,34 @@ function buildCustomLayoutPrompt(req: string): string {
   /** 私人助手卡片自愈：助手目录必须出现在控制室里，且是一张普通项目卡。
    *  - 首次（或用户清了状态）自动创建：布局=会话全屏、图标 🤖、排第一；
    *  - 已存在（按文件夹比对，不按 id）就不再建，避免与用户手工添加的项目重复；
-   *  - 用户删过（removed 墓碑）不重建：删卡片是他的明确选择。 */
+   *  - 用户删过（removed 墓碑）不重建：删卡片是他的明确选择。
+   *
+   * 为什么不是「挂载时跑一次」：首次同步是**宿主状态覆盖本地**（adoptRemoteState），
+   * 挂载那一下建的卡会被这次覆盖吃掉，之后再也不重建——这正是 v0.2.7 第一版
+   * 在真机上「卡片一直不出现」的原因。现在等 syncReady 之后再加，并且按
+   * layouts/removed 变化重试（最多 6 次），保证被采纳覆盖后还能补回来。 */
   useEffect(() => {
     if (typeof window === 'undefined') return
     let alive = true
-    void (async () => {
-      const home = await assistantHomeDir()
-      if (!alive || !home) return
-      if (!shouldAddAssistantCard(projectsRef.current.projects as any, home)) return
-      const layout = buildLayout(DEFAULT_PRESET_ID, ASSISTANT_CARD_NAME)
-      layout.id = ASSISTANT_PROJECT_ID
-      layout.icon = ASSISTANT_CARD_ICON
-      persistProjects((prev) => withAssistantCard(prev as any, home, layout) as any)
-      notifyConsole()
-    })().catch(() => { /* 宿主没提供助手目录（旧版/非桌面）：不建卡 */ })
+    void assistantHomeDir()
+      .then((home) => { if (alive && home) setAssistantHome(home) })
+      .catch(() => { /* 宿主没提供助手目录（旧版/非桌面）：不建卡 */ })
     return () => { alive = false }
-    // 只在挂载时做一次：之后用户怎么改名/换图标/删除都不再干预。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  useEffect(() => {
+    if (!syncReady || !assistantHome) return
+    if (!shouldAddAssistantCard(projects as any, assistantHome)) return
+    if (assistantCardTriesRef.current >= 6) return
+    assistantCardTriesRef.current += 1
+    const layout = buildLayout(DEFAULT_PRESET_ID, ASSISTANT_CARD_NAME)
+    layout.id = ASSISTANT_PROJECT_ID
+    layout.icon = ASSISTANT_CARD_ICON
+    persistProjects((prev) => withAssistantCard(prev as any, assistantHome, layout) as any)
+    notifyConsole()
+    // projects.layouts.length / removed.length：被宿主状态覆盖（卡片被吃）或另一端点删除时重新评估
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syncReady, assistantHome, projects.layouts.length, projects.removed.length])
 
   /** 为「还没有专属会话」的项目自动补一个项目对话：空白会话、工作目录 = 项目文件夹
    * （与用户建项目时选择的文件夹一致），建好即绑定到该项目。
