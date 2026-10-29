@@ -68,13 +68,31 @@ cursor:grab;transition:transform .12s ease}
 </style></head><body><div id="b">🔮</div><script>
 const { ipcRenderer } = require('electron')
 const b = document.getElementById('b')
-let down = false, sx = 0, sy = 0, moved = 0
-b.addEventListener('mousedown', (e) => { if (e.button !== 0) return; down = true; moved = 0; sx = e.screenX; sy = e.screenY; ipcRenderer.send('ball-down', { x: sx, y: sy }) })
-window.addEventListener('mousemove', (e) => { if (!down) return; moved = Math.max(moved, Math.hypot(e.screenX - sx, e.screenY - sy)); ipcRenderer.send('ball-move', { x: e.screenX, y: e.screenY }) })
-window.addEventListener('mouseup', () => { if (!down) return; down = false; ipcRenderer.send('ball-up', { moved }) })
+let down = false, sx = 0, sy = 0, moved = 0, lpTimer = null, lpFired = false
+const clearLp = () => { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null } }
+b.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return
+  down = true; moved = 0; sx = e.screenX; sy = e.screenY; lpFired = false
+  ipcRenderer.send('ball-down', { x: sx, y: sy })
+  // 长按 600ms = 私人助手；移动超过阈值即取消（拖动优先）。
+  clearLp()
+  lpTimer = setTimeout(() => { lpTimer = null; if (moved >= 6) return; lpFired = true; ipcRenderer.send('ball-long-press') }, 600)
+})
+window.addEventListener('mousemove', (e) => {
+  if (!down) return
+  moved = Math.max(moved, Math.hypot(e.screenX - sx, e.screenY - sy))
+  if (moved >= 6) clearLp()
+  ipcRenderer.send('ball-move', { x: e.screenX, y: e.screenY })
+})
+window.addEventListener('mouseup', () => {
+  if (!down) return
+  down = false; clearLp()
+  if (lpFired) { lpFired = false; return }
+  ipcRenderer.send('ball-up', { moved })
+})
 </script></body></html>`
 
-const HELPER_MAIN = `const { app, BrowserWindow, ipcMain, screen } = require('electron')
+const HELPER_MAIN = `const { app, BrowserWindow, ipcMain, screen, globalShortcut } = require('electron')
 const net = require('net')
 const fs = require('fs')
 const path = require('path')
@@ -132,16 +150,24 @@ app.whenReady().then(() => {
     const moved = Number(p && p.moved) || 0
     if (moved < 5) send('click')
   })
+  // 长按球 = 私人助手：和轻点（控制室）走不同的意图。
+  ipcMain.on('ball-long-press', () => { send('assistant') })
+  // 桌面全局热键：窗口不在前台也能唤起助手。
+  try {
+    globalShortcut.register('Control+Alt+A', () => { send('assistant') })
+  } catch {}
   connect()
 })
 app.on('window-all-closed', () => { try { app.quit() } catch {} })
+app.on('will-quit', () => { try { globalShortcut.unregisterAll() } catch {} })
 `
 
 export interface DesktopBallHandle {
   dispose: () => void
-  takeClick: () => boolean
-  /** 点击发生时即时唤醒长轮询；pendingClick 仍保留，兼顾尚未等待的客户端。 */
-  onClick: (listener: () => void) => () => void
+  /** 取走一次待处理意图：轻点 = console，长按/热键 = assistant；没有则 null。 */
+  takeClick: () => 'console' | 'assistant' | null
+  /** 意图发生时即时唤醒长轮询；pendingIntent 仍保留，兼顾尚未等待的客户端。 */
+  onClick: (listener: (intent: 'console' | 'assistant') => void) => () => void
 }
 
 export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {}): Promise<DesktopBallHandle | null> {
@@ -176,8 +202,9 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
   }
 
   const token = randomBytes(16).toString('hex')
-  let pendingClick = false
-  const clickListeners = new Set<() => void>()
+  /** 桌面球送来的意图：轻点 = console，长按 / 全局热键 = assistant。 */
+  let pendingIntent: 'console' | 'assistant' | null = null
+  const clickListeners = new Set<(intent: 'console' | 'assistant') => void>()
   let child: any = null
   const authSockets = new Set<any>()
 
@@ -198,11 +225,12 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
           else { try { sock.destroy() } catch {} }
           continue
         }
-        if (text === 'click') {
-          // 先让长轮询把“打开控制室”送到页面，再在下一拍恢复主窗焦点；
+        if (text === 'click' || text === 'assistant') {
+          // 先让长轮询把意图送到页面，再在下一拍恢复主窗焦点；
           // 即使 Win32 聚焦调用很慢，也不会把这次点击卡在宿主事件循环里。
-          pendingClick = true
-          for (const listener of [...clickListeners]) { try { listener() } catch {} }
+          const intent = text === 'assistant' ? 'assistant' : 'console'
+          pendingIntent = intent
+          for (const listener of [...clickListeners]) { try { listener(intent) } catch {} }
           setImmediate(() => { try { focusDesktopMainWindow() } catch {} })
         }
       }
@@ -254,7 +282,7 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
   const dispose = () => {
     if (disposed) return
     disposed = true
-    pendingClick = false
+    pendingIntent = null
     clickListeners.clear()
     for (const s of authSockets) { try { s.destroy() } catch {} }
     try { server.close() } catch {}
@@ -264,7 +292,7 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
   }
   handle = {
     dispose,
-    takeClick: () => { const v = pendingClick; pendingClick = false; return v },
+    takeClick: () => { const v = pendingIntent; pendingIntent = null; return v },
     onClick: (listener) => {
       clickListeners.add(listener)
       return () => { clickListeners.delete(listener) }

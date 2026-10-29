@@ -29,6 +29,17 @@ export function TemplateBar() {
           <span className="dsh-wt_tplChipName">{t.name}</span>
         </button>
       ))}
+      {/* 私人助手兜底入口：长按悬浮球之外，控制室里也能直接找它（不开项目卡片） */}
+      <button
+        type="button"
+        className="dsh-wt_tplChip dsh-wt_tplChipAssistant"
+        style={{ marginLeft: 'auto' }}
+        title="私人助手：记得你做过的事，日常小事直接说，不用建项目卡片（长按悬浮球 / Ctrl+Alt+A 同效）"
+        onClick={() => { try { (window as any).__dshAssistantOpen?.() } catch { /* 老宿主无入口 */ } }}
+      >
+        <span className="dsh-wt_tplChipIcon" aria-hidden>🤖</span>
+        <span className="dsh-wt_tplChipName">私人助手</span>
+      </button>
       {openId && <TemplateDetail templateId={openId} onClose={() => setOpenId(null)} onSaved={bump} />}
     </div>
   )

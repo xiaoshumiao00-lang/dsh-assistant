@@ -15,6 +15,7 @@ import { noteOpenSession, noteOrbSwallow } from './diag.ts'
 import { isStandardPreset, presetKey, sessionModel, templateFromSession } from './session-plan.ts'
 import type { BallPoint } from './state.ts'
 import { DEFAULT_ORB_AVATAR } from './defaultAvatar.ts'
+import { openAssistant } from '../../assistant-entry.ts'
 
 type Target = { kind: 'new' } | { kind: 'session'; id: string }
 
@@ -67,6 +68,11 @@ export function OrbOverlay({ api, t }: OrbOverlayProps) {
             // 快捷输入页仍可从抽屉入口打开。
             controlRoomStore.setOpen(!controlRoomOpen)
           }}
+          onLongPress={() => {
+            // 长按 = 私人助手：单击进控制室的行为完全不变，助手走这条独立入口。
+            controlRoomStore.setOpen(false)
+            void openAssistant()
+          }}
         />
       )}
       {mountedRef.current && <OrbPage api={api} t={t} open={open} />}
@@ -82,6 +88,8 @@ const BALL_EDGE = 8
 const BALL_Z_RAISED = 10080
 /** 判定为「拖拽」而非「点击」的位移阈值（px）。 */
 const DRAG_THRESHOLD = 6
+/** 长按判定时长（ms）：按住不动到这个时长 = 私人助手；移动超过阈值即取消。 */
+const LONG_PRESS_MS = 600
 
 /** 把球位置夹在视口内（含安全边距）。 */
 function clampBall(point: BallPoint): BallPoint {
@@ -105,16 +113,19 @@ function defaultBall(): BallPoint {
 }
 
 /**
- * 可拖动悬浮球：按住拖到任意位置（松手记住位置），轻点开/关控制室。
+ * 可拖动悬浮球：按住拖到任意位置（松手记住位置），轻点开/关控制室，
+ * **长按 600ms 打开私人助手**（单击行为保持不变）。
  * Pointer Events + setPointerCapture，触屏/鼠标通用；拖动时不让页面滚动。
  * @param raised - 控制室正开着（此时球要压在控制室之上，点一下是「关闭」）
  * @param onToggle - 轻点：取反控制室的开关状态
+ * @param onLongPress - 长按：打开私人助手（不经过任何项目卡片）
  */
-function OrbBall({ label, avatar, raised = false, onToggle }: {
+function OrbBall({ label, avatar, raised = false, onToggle, onLongPress }: {
   label: string
   avatar?: string
   raised?: boolean
   onToggle: () => void
+  onLongPress?: () => void
 }) {
   const [pos, setPos] = useState<BallPoint>(() => {
     const saved = readLastBall()
@@ -123,8 +134,21 @@ function OrbBall({ label, avatar, raised = false, onToggle }: {
   const dragRef = useRef<{ sx: number; sy: number; ox: number; oy: number; moved: boolean } | null>(null)
   /** 拖动收尾后浏览器还会补一个 click：标记它，别当成「点开悬浮球」。 */
   const suppressClickRef = useRef(false)
+  /** 长按计时器与「这次按压已经触发过长按」标记：抬起后的 click 要吞掉。 */
+  const longPressTimerRef = useRef<number | null>(null)
+  const longPressFiredRef = useRef(false)
   const posRef = useRef(pos)
   posRef.current = pos
+
+  const clearLongPress = (): void => {
+    if (longPressTimerRef.current !== null) {
+      window.clearTimeout(longPressTimerRef.current)
+      longPressTimerRef.current = null
+    }
+  }
+
+  // 组件卸载/球隐藏时清掉计时器，避免卸载后还去开助手。
+  useEffect(() => clearLongPress, [])
 
   // 视口变化（旋屏 / 键盘弹出 / 地址栏收起）后仍保持在屏内。
   useEffect(() => {
@@ -137,6 +161,17 @@ function OrbBall({ label, avatar, raised = false, onToggle }: {
     if (event.button !== undefined && event.button !== 0) return
     event.currentTarget.setPointerCapture(event.pointerId)
     dragRef.current = { sx: event.clientX, sy: event.clientY, ox: pos.x, oy: pos.y, moved: false }
+    longPressFiredRef.current = false
+    clearLongPress()
+    if (onLongPress) {
+      longPressTimerRef.current = window.setTimeout(() => {
+        longPressTimerRef.current = null
+        // 按住期间没有移动才算长按；拖动由 onPointerMove 先清掉计时器。
+        if (dragRef.current?.moved === true) return
+        longPressFiredRef.current = true
+        onLongPress()
+      }, LONG_PRESS_MS)
+    }
   }
 
   const onPointerMove = (event: ReactPointerEvent<HTMLButtonElement>): void => {
@@ -146,6 +181,7 @@ function OrbBall({ label, avatar, raised = false, onToggle }: {
     const dy = event.clientY - drag.sy
     if (!drag.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD) return
     drag.moved = true
+    clearLongPress()
     setPos(clampBall({ x: drag.ox + dx, y: drag.oy + dy }))
   }
 
@@ -154,6 +190,7 @@ function OrbBall({ label, avatar, raised = false, onToggle }: {
    * 命中测试用的是「已经换掉的界面」——一次点击被处理两遍（穿透到刚挂载的
    * 悬浮球页面，或还没画出来时穿透到电脑端界面上的按钮）。 */
   const finishDrag = (event: ReactPointerEvent<HTMLButtonElement>): void => {
+    clearLongPress()
     const drag = dragRef.current
     dragRef.current = null
     if (drag === null) return
@@ -170,6 +207,11 @@ function OrbBall({ label, avatar, raised = false, onToggle }: {
   const onBallClick = (event: ReactMouseEvent<HTMLButtonElement>): void => {
     if (suppressClickRef.current) {
       suppressClickRef.current = false
+      return
+    }
+    // 这次按压已经作为「长按 → 助手」处理过：抬起补发的 click 不能再开控制室。
+    if (longPressFiredRef.current) {
+      longPressFiredRef.current = false
       return
     }
     // 打开时才需要护栏：关闭是回到原本就在的界面，不存在「新界面被同一次点击穿透」。
