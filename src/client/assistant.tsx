@@ -17,6 +17,7 @@ import { apply as tuoguanApply } from './tuoguan.tsx'
 import { POCKET_RPC_CHANNEL } from './pocket/api.js'
 import { NS as POCKET_NS } from './pocket/pocket-locales.js'
 import { installComposerMenuToggle } from './composerMenu'
+import { openAssistant, assistantUrlIntent } from './assistant-entry.ts'
 
 export const name = 'dsh-assistant'
 
@@ -52,6 +53,11 @@ export function apply(ctx: any): void {
     }
     // 桌面原生悬浮球点击时，主进程会执行这段 JS
     ;(window as any).__dshAssistantOpenControlRoom = () => controlRoomStore.setOpen(true)
+    // 私人助手入口（长按悬浮球 / 全局热键 / 控制室顶栏都落到这里）
+    ;(window as any).__dshAssistantOpen = () => {
+      controlRoomStore.setOpen(false)
+      void openAssistant()
+    }
   } catch {}
 
   // 悬浮球状态同步：宿主是「启用/头像」的真值（桌面球在宿主那边启停与换头像）。
@@ -134,7 +140,15 @@ export function apply(ctx: any): void {
           const r = await fetch('/api/assistant/ball-click?wait=1', { cache: 'no-store', signal: controller.signal })
           const d = await r.json()
           if (stopped) break
-          if (d?.open === true) controlRoomStore.setOpen(true)
+          if (d?.open === true) {
+            // 宿主会在响应里带上这次唤起的意图：控制室 / 私人助手
+            if (String(d?.intent ?? 'console') === 'assistant') {
+              controlRoomStore.setOpen(false)
+              void openAssistant()
+            } else {
+              controlRoomStore.setOpen(true)
+            }
+          }
           needsDelay = d?.longPoll !== true
         } catch {
           needsDelay = true
@@ -169,6 +183,8 @@ export function apply(ctx: any): void {
       // 这里只负责把开关置真。
       controlRoomStore.setOpen(true)
     }
+    // 私人助手直达：…/?assistant=chat 或 …/#assistant
+    if (assistantUrlIntent()) void openAssistant()
   } catch {}
 
   worktableApply(ctx)

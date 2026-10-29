@@ -15,6 +15,7 @@ import { registerCoordinateMode } from './coordinate-mode'
 import { CONSOLE_SEA01_ROUTE, serveConsoleSea01 } from './consoleAsset'
 import { startDesktopBall, ballProfileDir } from './desktop-ball'
 import { manageWebRoutes } from './web-routes'
+import { registerAssistantHome } from './assistant-home'
 import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join as joinPathNode } from 'node:path'
@@ -30,6 +31,9 @@ function appendFocusDiag(raw: string): void {
 }
 
 export const name = 'dsh-assistant'
+
+/** 供测试直接验证路由：仅导出注册函数，不改变插件行为。 */
+export { registerAssistantHome } from './assistant-home'
 
 /** 工作台要 webServer/sessions，托管与设置路由要 webServer；手机访问由独立入口注入 connection。 */
 export const inject = ['webServer', 'sessions']
@@ -85,35 +89,42 @@ export function apply(ctx: any, config: any = {}): () => void {
 
   // 点击事件用长轮询推给页面：有等待者时立刻响应，没有时仍保留一次性 pending。
   // 与旧的 1.2s 定时轮询相比，点击延迟不再取决于下一次轮询何时发生。
-  let pendingOpenConsole = false
+  // intent 区分这次唤起要开哪块：'console' = 控制室（轻点球），'assistant' = 私人助手（长按球 / 全局热键）。
+  type Intent = 'console' | 'assistant'
+  let pendingOpen: Intent | null = null
   type ClickWaiter = { res: any; timer: ReturnType<typeof setTimeout> | null; done: boolean }
   const clickWaiters = new Set<ClickWaiter>()
-  const sendClick = (res: any, open: boolean): void => {
+  const sendClick = (res: any, intent: Intent | null): void => {
     if (res?.destroyed || res?.writableEnded) return
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-    res.end(JSON.stringify({ open, longPoll: true }))
+    res.end(JSON.stringify({ open: intent !== null, intent: intent ?? 'console', longPoll: true }))
   }
-  const finishClickWaiter = (waiter: ClickWaiter, open: boolean, respond = true): void => {
+  const finishClickWaiter = (waiter: ClickWaiter, intent: Intent | null, respond = true): void => {
     if (waiter.done) return
     waiter.done = true
     if (waiter.timer) clearTimeout(waiter.timer)
     clickWaiters.delete(waiter)
-    if (respond) { try { sendClick(waiter.res, open) } catch {} }
+    if (respond) { try { sendClick(waiter.res, intent) } catch {} }
   }
-  const takeOpenClick = (): boolean => {
-    let open = ballHandle ? ballHandle.takeClick() === true : false
-    if (pendingOpenConsole) { pendingOpenConsole = false; open = true }
-    return open
+  const takeOpenClick = (): Intent | null => {
+    const native = ballHandle ? ballHandle.takeClick() : null
+    if (pendingOpen !== null) {
+      const intent = pendingOpen
+      pendingOpen = null
+      return intent
+    }
+    return native === 'assistant' ? 'assistant' : native === 'console' ? 'console' : null
   }
   const wakeClickWaiters = (): void => {
     if (clickWaiters.size === 0) return
-    if (!takeOpenClick()) return
+    const intent = takeOpenClick()
+    if (intent === null) return
     // 点击要广播给所有正在等待的页面。页面重载/插件 HMR 可能短暂留下旧等待者；
     // 旧逻辑只交给第一个等待者，旧连接把点击“取走”后，真正可见的页面就收不到，
     // 表现为“偶尔点了悬浮球却停在会话详情”。
-    for (const waiter of [...clickWaiters]) finishClickWaiter(waiter, true)
+    for (const waiter of [...clickWaiters]) finishClickWaiter(waiter, intent)
   }
-  disposers.push(() => { for (const waiter of [...clickWaiters]) finishClickWaiter(waiter, false) })
+  disposers.push(() => { for (const waiter of [...clickWaiters]) finishClickWaiter(waiter, null) })
 
   const readBallState = (): { enabled: boolean; avatar: string } => {
     let enabled = true
@@ -254,13 +265,26 @@ export function apply(ctx: any, config: any = {}): () => void {
         })()
       },
     })
+    // 打开控制室（外部唤起，不依赖悬浮球）
     webServer.register({
       kind: 'exact',
       path: '/api/assistant/open-console',
       handler: (_req: any, res: any) => {
-        pendingOpenConsole = true
+        pendingOpen = 'console'
         wakeClickWaiters()
         const payload = JSON.stringify({ ok: true, opened: true })
+        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+        res.end(payload)
+      },
+    })
+    // 打开私人助手（桌面全局热键 Ctrl+Alt+A 走这里；页面不在前台时也能唤起）
+    webServer.register({
+      kind: 'exact',
+      path: '/api/assistant/open-assistant',
+      handler: (_req: any, res: any) => {
+        pendingOpen = 'assistant'
+        wakeClickWaiters()
+        const payload = JSON.stringify({ ok: true, opened: true, intent: 'assistant' })
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
         res.end(payload)
       },
@@ -292,16 +316,19 @@ export function apply(ctx: any, config: any = {}): () => void {
       kind: 'exact',
       path: '/api/assistant/ball-click',
       handler: (req: any, res: any) => {
-        if (takeOpenClick()) { sendClick(res, true); return }
+        const pending = takeOpenClick()
+        if (pending !== null) { sendClick(res, pending); return }
         const wantsWait = /[?&]wait=1(?:&|$)/.test(String(req.url ?? ''))
-        if (!wantsWait) { sendClick(res, false); return }
+        if (!wantsWait) { sendClick(res, null); return }
         const waiter: ClickWaiter = { res, timer: null, done: false }
         // 15 秒空响应一次，兼容代理/浏览器超时；客户端收到后立即发起下一次等待。
-        waiter.timer = setTimeout(() => finishClickWaiter(waiter, false), 15000)
+        waiter.timer = setTimeout(() => finishClickWaiter(waiter, null), 15000)
         clickWaiters.add(waiter)
-        req.on('close', () => finishClickWaiter(waiter, false, false))
+        req.on('close', () => finishClickWaiter(waiter, null, false))
       },
     })
+    // 私人助手的家：固定目录 + AGENTS.md 人设 + journal / notes（会话据此创建）
+    disposers.push(registerAssistantHome(ctx))
   } catch {}
 
   void applyBall()

@@ -5,6 +5,7 @@
 
 import { POCKET_RPC_CHANNEL, POCKET_ENDPOINTS } from '../api.js'
 import { cwdKey, findReusableBlank, presetKey, visibleHistory } from './session-plan.ts'
+import { focusSessionInHost } from '../../sessionFocus.ts'
 
 /** 创建中的会话（按目录去重）。模块级：悬浮球页面即使被重复挂载出多个实例，
  * 同一目录的并发创建也共用同一个在途请求，不会叠出成串的空白会话。 */
@@ -601,6 +602,15 @@ export function makeOrbApi(ctx: any) {
     /** 把主界面切到该会话（与点侧栏会话行等效）。 */
     openSession(sessionId: string): void {
       ctx.uiWorkspace?.openSession?.(sessionId)
+    },
+
+    /** 稳健版「切过去」：刚建出来的会话在宿主列表里可能还差一拍，
+     *  直接 openSession 会抛 unknown session。走 sessionFocus 的重试/重拉/resync 链路。 */
+    async focusSession(sessionId: string): Promise<{ opened: boolean; inList: boolean }> {
+      let uw: any = null
+      try { uw = ctx.uiWorkspace ?? ctx.get?.('uiWorkspace') ?? null } catch { uw = null }
+      const result = await focusSessionInHost({ sessions: ctx.sessions, list: ctx.sessions?.list, uiWorkspace: uw }, sessionId)
+      return { opened: result.opened === true, inList: result.inList === true }
     },
 
     /** 重命名会话（走 sessions.using → binding.session.rename）。 */
