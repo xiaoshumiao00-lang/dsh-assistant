@@ -1,20 +1,24 @@
 /**
- * 私人助手的入口：把主界面切到「助手常驻会话」，而不是开一张项目卡片。
+ * 私人助手的入口：每次打开**新开一条会话**，不再复用上一条。
  *
- * 三条入口共用这一个动作（长按悬浮球 / 桌面全局热键 / 控制室顶栏按钮）：
- *   1. 助手会话固定落在助手家目录（宿主 /api/assistant/home 给出，目录里有 AGENTS.md 人设）；
- *   2. 优先续上一次那条助手会话（localStorage 记 id），不每条消息新建；
- *   3. 会话还没进宿主列表时走 sessionFocus 的重试链路，避免「点了没反应」。
+ * 为什么不是「一个常驻会话」：会话越长，上下文越大、越慢越贵，而且一旦 compaction 掉细节，
+ * 助手反而忘事。真正让它「记得你」的是记忆（USER.md / MEMORY.md / assistant AGENTS.md / journal），
+ * 不是那条会话的上下文。所以：
+ *   - 每次进入 = 助手家目录里开一条**新会话**（同目录同模式的空白会话会被复用，不堆空白）；
+ *   - 默认走 computer-use 模式（能看屏幕、点界面），不可用时退回标准模式；
+ *   - 模型沿用**上一次这条会话实际在用的模型**，没有记录时退回本机上次选过的模型。
  *
- * 为什么不做专门的聊天 UI：DSH 自己的会话面板就是最好的聊天界面（工具卡片、
- * 附件、语音、中断都在），助手只是「固定在某个目录的一条会话」。
+ * 三条入口共用这一个动作（长按悬浮球 / 桌面全局热键 / 控制室顶栏按钮）。
  */
-import { getAssistantApi } from './orb-bridge'
+import { getAssistantApi, readModelPref } from './orb-bridge'
+import { sessionModel } from './pocket/orb/session-plan.ts'
 
-/** 上次打开的助手会话 id。 */
+/** 上次打开的助手会话 id（只用于记住模型，不再复用它开新会话）。 */
 const SESSION_KEY = 'dsh.assistant.sessionId'
 /** 助手家目录缓存（宿主路由每次都会确保目录存在）。 */
 const HOME_KEY = 'dsh.assistant.home'
+/** 默认模式：桌面 GUI（dsh-orb 注册的 computer-use 预设）。 */
+const ASSISTANT_PRESET = 'computer-use'
 
 function readKey(key: string): string {
   try { return String(localStorage.getItem(key) ?? '') } catch { return '' }
@@ -54,8 +58,8 @@ export async function assistantHomeDir(): Promise<string> {
 let opening: Promise<boolean> | null = null
 
 /**
- * 打开私人助手。
- * @param opts.forceNew - 忽略上次的会话，在助手目录里开一条新的。
+ * 打开私人助手（每次新会话）。
+ * @param opts.forceNew - 连「同目录同模式的空白会话复用」也不要，强制建一条全新的。
  * @returns 是否已经把主界面切过去。
  */
 export async function openAssistant(opts: { forceNew?: boolean } = {}): Promise<boolean> {
@@ -63,16 +67,33 @@ export async function openAssistant(opts: { forceNew?: boolean } = {}): Promise<
   const run = (async (): Promise<boolean> => {
     const api = getAssistantApi()
     if (!api) return false
-    const saved = readKey(SESSION_KEY)
-    if (!opts.forceNew && saved && api.sessionRow(saved) !== null) {
-      const focused = await api.focusSession(saved)
-      if (focused.opened) return true
-    }
     const home = await assistantHomeDir()
     if (!home) return false
-    // 同目录同模式已有空白会话时 createSession 会复用，不会每次留一串空白会话。
-    const created = await api.createSession(home)
+
+    // 1) 先从上一条助手会话读出「上一次实际用的模型」——比本地偏好更准：
+    //    用户可能直接在对话页的模型胶囊里换过，那个选择只落在会话上。
+    const previousId = readKey(SESSION_KEY)
+    const previousRow = previousId ? api.sessionRow(previousId) : null
+    const remembered = previousRow !== null ? sessionModel(previousRow) : null
+    const fallback = readModelPref('cu') ?? readModelPref('standard')
+    const wanted = remembered ?? fallback
+
+    // 2) 新会话：默认 computer-use；预设不存在（dsh-orb 被停用）时退回标准模式。
+    let created: { sessionId: string; appliedPreset: string | null; reused: boolean }
+    try {
+      created = await api.createSession(home, ASSISTANT_PRESET, { reuseBlank: opts.forceNew !== true })
+    } catch {
+      created = await api.createSession(home, undefined, { reuseBlank: opts.forceNew !== true })
+    }
     writeKey(SESSION_KEY, created.sessionId)
+
+    // 3) 把上次的模型落到新会话上：失败不阻塞打开（会话仍能用默认模型）。
+    if (wanted) {
+      try {
+        await api.selectModel(created.sessionId, { provider: wanted.provider, model: wanted.model })
+      } catch { /* 模型已下线/宿主拒绝：保持会话默认 */ }
+    }
+
     const focused = await api.focusSession(created.sessionId)
     return focused.opened
   })()
@@ -88,3 +109,6 @@ export function assistantUrlIntent(): boolean {
     return /[?&]assistant=chat(?:&|$)/.test(search) || hash === '#assistant'
   } catch { return false }
 }
+
+/** 助手会话默认预设（诊断/测试用）。 */
+export const ASSISTANT_AGENT_PRESET = ASSISTANT_PRESET
