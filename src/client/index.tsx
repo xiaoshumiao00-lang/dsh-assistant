@@ -20,8 +20,8 @@ import { sessionSnapshotIndexOf, invalidateSessionSnapshotIndex } from './sessio
 /** 项目叠加层（L2）可选项：写作语言 */
 const PAPER_LANG_OPTIONS = ['中文写作后翻译英文', '直接写英文', '仅中文投稿']
 import { photoStore, kindOf } from './photoStore'
-import { DEFAULT_BG_SVG, b64ToBlob } from './defaultBg'
-import { WAVE_BG_B64 } from './waveBg'
+import { DEFAULT_BG_SVG } from './defaultBg'
+import { loadWaveBgBlob } from './waveBg'
 import { controlRoomStore, getAssistantApi, writeModelPref, writeBgPref } from './orb-bridge'
 
 /**
@@ -2354,7 +2354,14 @@ function WorktableSection(props: any) {
       updateCheckingRef.current = false
     }
   }, [])
-  useEffect(() => { if (updateCheckOn) void checkUpdates() }, [updateCheckOn, checkUpdates])
+  // headless 的更新 UI 不在首屏：保留原仓库/节流/重试语义，仅延后 2 秒让开首屏资源。
+  // 非 headless 侧栏仍立即检查；控制室的独立更新检查逻辑不变。
+  useEffect(() => {
+    if (!updateCheckOn) return
+    if (!headless) { void checkUpdates(); return }
+    const timer = window.setTimeout(() => { void checkUpdates() }, 2000)
+    return () => window.clearTimeout(timer)
+  }, [headless, updateCheckOn, checkUpdates])
   const copyUpgradeAi = async () => {
     const ok = await copyText(UPGRADE_AI)
     if (ok) { setUpdateCopied(true); setTimeout(() => setUpdateCopied(false), 2200) }
@@ -3457,8 +3464,10 @@ function WorktableSection(props: any) {
           // 首次使用：媒体库为空且未预置过 → 注入默认背景示例图（极小 SVG，可删）
           if (records.length === 0 && localStorage.getItem('dsh.worktable.defaultBgSeeded.v1') !== '1') {
             try {
+              // 先取回独立 JPEG 资源，再按原顺序写入两条默认记录；网络失败不产生半份预置。
+              const waveBlob = await loadWaveBgBlob()
               await photoStore.add(new Blob([DEFAULT_BG_SVG], { type: 'image/svg+xml' }))
-              await photoStore.add(b64ToBlob(WAVE_BG_B64, 'image/jpeg'))
+              await photoStore.add(waveBlob)
               localStorage.setItem('dsh.worktable.defaultBgSeeded.v1', '1')
               records = await photoStore.list().catch(() => [])
             } catch {}
@@ -3563,6 +3572,7 @@ function WorktableSection(props: any) {
         onPinSession: (sid, pinned) => pinProjectSession(sid, pinned),
         onArchiveSession: (sid, archived) => archiveProjectSession(sid, archived),
         getManageProjects: () => manageProjectsOf(),
+        onRenameProject: (id, name) => renameProject(id, name),
         onHideProject: (id, hidden) => hideProject(id, hidden),
         onReorderProject: (dragId, targetId, before) => reorderProject(dragId, targetId, before),
         onDeleteProject: (id) => deleteProject(id),
@@ -4858,9 +4868,13 @@ function buildCustomLayoutPrompt(req: string): string {
   }
 
   const renameProject = (id: string, name: string) => {
+    const trimmed = name.trim()
     persistProjects((prev) => {
+      const current = prev.nameOverrides[id]
+      // 名字没变就不写：避免每次打开/收起改名框都触发一次控制室重渲染
+      if ((current ?? '') === trimmed) return prev
       const next = { ...prev.nameOverrides }
-      if (name.trim()) next[id] = name
+      if (trimmed) next[id] = trimmed
       else delete next[id]
       return { ...prev, nameOverrides: next }
     })
@@ -5918,6 +5932,33 @@ function buildCustomLayoutPrompt(req: string): string {
     notifyConsole()
   }
 
+  // 绑定按钮 hover 气泡只服务可见的非 headless 侧栏卡片。
+  // 生产 headless 不安装 document mouseover/mouseout/scroll/click 空监听。
+  useEffect(() => {
+    if (headless) return
+    const over = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null
+      const btn = target && target.closest ? (target.closest('.dsh-wt_bindBtn') as HTMLElement | null) : null
+      if (btn) showBindTip(btn)
+    }
+    const out = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null
+      if (target && target.closest && target.closest('.dsh-wt_bindBtn')) hideBindTip()
+    }
+    const hide = () => hideBindTip()
+    document.addEventListener('mouseover', over, true)
+    document.addEventListener('mouseout', out, true)
+    document.addEventListener('scroll', hide, true)
+    document.addEventListener('click', hide, true)
+    return () => {
+      document.removeEventListener('mouseover', over, true)
+      document.removeEventListener('mouseout', out, true)
+      document.removeEventListener('scroll', hide, true)
+      document.removeEventListener('click', hide, true)
+      if (bindTipEl) { bindTipEl.remove(); bindTipEl = null }
+    }
+  }, [headless])
+
   // ── 入驻项目卡片通用 DOM 桥（不写死任何项目名/类名） ──
   // 卡片按子座位注册顺序渲染，与 aliveRegisteredIds 一一对应：
   // 1) 位置映射：给每张卡片标 data-wt-id，图标覆盖写到卡片第一个子元素（通用结构约定）；
@@ -6108,20 +6149,22 @@ function buildCustomLayoutPrompt(req: string): string {
 
   // 停靠/折叠变化时立即重测；停靠期间每 2s 轮询（悬浮面板自身可移动）
   useEffect(() => {
+    if (headless) return
     if (!isFloat) measureBottomOverlay()
-  }, [isFloat, wide, measureBottomOverlay])
+  }, [headless, isFloat, wide, measureBottomOverlay])
 
   useEffect(() => {
+    if (headless) return
     const timer = window.setInterval(() => {
       if (!floatRef.current) measureBottomOverlay()
     }, 2000)
     return () => window.clearInterval(timer)
-  }, [measureBottomOverlay])
+  }, [headless, measureBottomOverlay])
 
   const dockedStyle = !isFloat && bottomInset > 0 ? { marginBottom: bottomInset } : undefined
 
   // + 弹窗：向右弹出、锚定 sidebar 右边缘与工作台区块顶部（视口内钳制）
-  const sectionTop = rootRef.current?.getBoundingClientRect().top ?? 100
+  const sectionTop = headless ? 0 : (rootRef.current?.getBoundingClientRect().top ?? 100)
   const popLeft = sidebarRight != null
     ? Math.min(sidebarRight + 8, Math.max(16, window.innerWidth - 344))
     : 16
@@ -6922,30 +6965,7 @@ export function apply(ctx: any) {
     return () => { try { window.clearInterval(timer) } catch {} }
   }, 'dsh-assistant: blank session open watchdog')
 
-  // 绑定按钮 hover 气泡：事件委托 + body 级气泡（跨层显示，不遮挡右侧对话也不盖项目名）
-  ctx.effect(() => {
-    const over = (e: MouseEvent) => {
-      const t = e.target as HTMLElement | null
-      const btn = t && t.closest ? (t.closest('.dsh-wt_bindBtn') as HTMLElement | null) : null
-      if (btn) showBindTip(btn)
-    }
-    const out = (e: MouseEvent) => {
-      const t = e.target as HTMLElement | null
-      if (t && t.closest && t.closest('.dsh-wt_bindBtn')) hideBindTip()
-    }
-    const hide = () => hideBindTip()
-    document.addEventListener('mouseover', over, true)
-    document.addEventListener('mouseout', out, true)
-    document.addEventListener('scroll', hide, true)
-    document.addEventListener('click', hide, true)
-    return () => {
-      document.removeEventListener('mouseover', over, true)
-      document.removeEventListener('mouseout', out, true)
-      document.removeEventListener('scroll', hide, true)
-      document.removeEventListener('click', hide, true)
-      if (bindTipEl) { bindTipEl.remove(); bindTipEl = null }
-    }
-  }, 'dsh-worktable: bind tip')
+  // 绑定按钮 hover 委托已迁入非 headless WorktableSection；生产首屏不挂空监听。
 
   // locale 词典（宿主 locale 服务缺席时由 t 的回退分支兜底）
   ctx.effect(() => {

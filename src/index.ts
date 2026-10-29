@@ -160,18 +160,20 @@ async function readJsonBody(req: any): Promise<any> {
 async function listDirectory(path: string) {
   const abs = pathResolve(path)
   const dirents = await readdir(abs, { withFileTypes: true })
-  // mtimeMs：供客户端「最近文件活动」探测（工人看门狗随进度判断 stalled）——逐项 stat 失败（权限/竞态删除）留 0
-  const raw = await Promise.all(dirents.map(async (d) => {
+  // 排序只依赖目录项名称/类型：先取最终要展示的 500 项，再为它们补 mtime。
+  // 大目录下避免为必然被截掉的项做无意义 stat；返回顺序与字段保持不变。
+  const sorted = [...dirents].sort((a, b) => {
+    if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1
+    return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+  })
+  const truncated = sorted.length > MAX_ENTRIES
+  const visible = truncated ? sorted.slice(0, MAX_ENTRIES) : sorted
+  const entries = await Promise.all(visible.map(async (d) => {
     let mtimeMs = 0
     try { mtimeMs = (await stat(abs + sep + d.name)).mtimeMs } catch { /* ignore */ }
     return { name: d.name, path: abs + sep + d.name, isDir: d.isDirectory(), hidden: d.name.startsWith('.'), mtimeMs }
   }))
-  const entries = raw.sort((a, b) => {
-    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
-    return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
-  })
-  const truncated = entries.length > MAX_ENTRIES
-  return { path: abs, entries: truncated ? entries.slice(0, MAX_ENTRIES) : entries, truncated }
+  return { path: abs, entries, truncated }
 }
 
 function gitExec(args: string[], cwd: string): Promise<string> {

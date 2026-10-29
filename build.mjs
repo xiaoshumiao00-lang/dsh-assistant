@@ -87,6 +87,9 @@ for (const [entry, outfile] of cuBuilds) {
     define: { __WT_VERSION__: JSON.stringify(pkg.version) },
   })
 }
+// 控制室预置背景作为独立同源资源按需下载，不内联进首屏 client bundle。
+copyFileSync(join(here, 'src/console-sea01.jpg'), join(here, 'lib/console-sea01.jpg'))
+
 // macOS 抓屏 helper 由 backend 用 import.meta.url 相对定位：打包后要跟到 lib/ 下
 for (const asset of ['macos-sck-capture', 'libmacos-sck-capture.dylib']) {
   try { copyFileSync(join(here, 'vendor/computer-use', asset), join(here, 'lib', asset)) } catch { /* 平台无关，缺失不阻断 */ }

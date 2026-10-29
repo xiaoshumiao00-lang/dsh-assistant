@@ -762,7 +762,10 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_manageRowDropAfter{box-shadow:inset 0 -2px 0 var(--dsw-alias-state-accent-primary,#4f8ef7)}',
   '.dsh-wt_manageIconPick{color:var(--wt-text,inherit)}',
   '.dsh-wt_manageDel:hover{border-color:#f85149;color:#f85149}',
-  '@media (max-width:640px){.dsh-wt_manageRow{flex-wrap:wrap;gap:6px;padding:7px 8px}.dsh-wt_manageName{flex:1 1 100%;order:-1;font-size:12.5px}.dsh-wt_manageOps{flex:1 1 100%;justify-content:flex-end}.dsh-wt_manageBtn{padding:7px 10px;font-size:11.5px}}',
+  // 控制室「项目管理」里的改名输入框：弹窗底是半透明面板，给个可见的输入框轮廓（侧栏那版保持无边框）
+  '.dsh-wt_newSess .dsh-wt_manageInput{flex:1 1 auto;min-width:0;padding:4px 7px;border:1px solid var(--dsw-alias-state-accent-primary,#4f8ef7);border-radius:8px;background:var(--dsw-alias-fill-l1,rgba(255,255,255,.05));font-size:12px;line-height:18px;box-sizing:border-box}',
+  '.dsh-wt_newSess .dsh-wt_manageName{cursor:text}',
+  '@media (max-width:640px){.dsh-wt_manageRow{flex-wrap:wrap;gap:6px;padding:7px 8px}.dsh-wt_manageName{flex:1 1 100%;order:-1;font-size:12.5px}.dsh-wt_newSess .dsh-wt_manageInput{flex:1 1 100%;order:-1;font-size:12.5px}.dsh-wt_manageOps{flex:1 1 100%;justify-content:flex-end}.dsh-wt_manageBtn{padding:7px 10px;font-size:11.5px}}',
   '.dsh-wt_consoleAddLabel{font-size:17px;font-weight:600;color:var(--wt-text2)}',
   '.dsh-wt_consoleAdd:hover .dsh-wt_consoleAddLabel{color:var(--dsw-alias-state-accent-primary,#4f8ef7)}',
   // 控制室入口卡：统筹主程序的差异化（渐变底 + 微光；无描边，颜色更亮更饱和）

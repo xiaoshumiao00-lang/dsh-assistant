@@ -4,6 +4,7 @@ import { MobileNavToggle } from './MobileNavToggle.tsx'
 import { MobileNavOverlay } from './MobileNavOverlay.tsx'
 import { MobileDrawerFooter } from './MobileDrawerFooter.tsx'
 import { startFileGuard } from './fileGuard.ts'
+import { createModelSettingsNoticePatcher } from './modelSettingsNotice.ts'
 import { MOBILE_CSS } from './mobile.css.ts'
 import { POCKET_RPC_CHANNEL, POCKET_ENDPOINTS } from '../api.js'
 import { NS, en, zh } from './locales.ts'
@@ -490,13 +491,19 @@ export function mobileApply(ctx): void {
         seen.set(sel, visible)
       }
     }
-    const observer = new MutationObserver(check)
+    let frame: number | null = null
+    const schedule = (): void => {
+      if (frame !== null) return
+      frame = window.requestAnimationFrame(() => { frame = null; check() })
+    }
+    const observer = new MutationObserver(schedule)
     // Visibility flips come through inline style mutations (suite) or the
     // explorer-open marker on the frame; class changes are watched too.
     observer.observe(document.body, { attributes: true, subtree: true, attributeFilter: ['style', 'class', 'data-aionui-explorer-open'] })
     check()
     return () => {
       observer.disconnect()
+      if (frame !== null) window.cancelAnimationFrame(frame)
     }
   }, 'dsh-mobile-nav: sheet rise animation replay')
 
@@ -545,37 +552,25 @@ export function mobileApply(ctx): void {
   // 文本替换成「去电脑端修改」的引导提示（仅手机，桌面端不受影响）。
   safeEffect(() => {
     if (!narrow.matches) return () => {}
-    const PHRASES = ['加载提供方目录失败', 'Settings are unavailable in this browser']
-    const NOTICE = '手机上不支持模型设置，请去电脑端修改设置'
-    // 只遍历**文本节点**，不做「每个元素都读一次 textContent」。
-    // 旧实现对 body * 逐元素读 textContent（每个元素都会复制整棵子树的文本），
-    // 在 2 万节点的会话详情上是 O(N²)；实测单次 ~19ms，渲染期每 500ms 一次，
-    // 是手机 WebView 最大的 CPU 尖峰之一。TreeWalker 只看文本本身，O(文本节点数)。
-    const patchText = (node: Text): void => {
-      const value = node.nodeValue ?? ''
-      if (value === '' || !PHRASES.some((p) => value.includes(p))) return
-      const el = node.parentElement
-      if (el === null || el.dataset?.dshpModelNotice === '1') return
-      if (el.closest('[data-dshp-model-notice]') !== null) return
-      el.textContent = NOTICE
-      el.dataset.dshpModelNotice = '1'
-    }
-    const patch = (): void => {
-      // 后台标签页/页面不可见时完全不扫：省电，也避免和渲染抢 CPU。
-      if (document.hidden) return
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
-      let node = walker.nextNode()
-      while (node !== null) {
-        patchText(node as Text)
-        node = walker.nextNode()
-      }
-    }
-    // 1.5s 合并一次：这条提示只在设置页出现，不需要实时。
-    const schedule = throttleByFrame(patch, 1500)
-    const observer = new MutationObserver(schedule)
+    const patcher = createModelSettingsNoticePatcher()
+    // 1.5s 合并一次：提示更新节奏不变，但扫描范围从 document.body 降为实际变更节点。
+    const schedule = throttleByFrame(patcher.flush, 1500)
+    const observer = new MutationObserver((mutations) => {
+      if (patcher.collect(mutations)) schedule()
+    })
     observer.observe(document.body, { childList: true, subtree: true, characterData: true })
-    patch()
-    return () => observer.disconnect()
+    const onVisibility = (): void => {
+      if (document.hidden) return
+      // 后台期间到达的文本在恢复时补齐；随后清空并处理仍连接的增量节点。
+      patcher.patchAll()
+      patcher.flush()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    patcher.patchAll()
+    return () => {
+      observer.disconnect()
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
   }, 'dsh-mobile-nav: replace model-settings load error with mobile hint')
 
   // ── 阶段 4：effect 全部登记完毕 ────────────────────────────────────────

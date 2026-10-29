@@ -1,6 +1,7 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
 import { parentPathOf } from './pathutil'
 import { filterWorkingCards } from './consoleFilter'
+import { observeExternalSplit } from './splitObserver'
 import { CHANGELOG_V030 } from './changelog'
 import { LOCAL_VERSION, checkUpdate, getAutoCheck, readCache, setAutoCheck as storeAutoCheck, setSkipVersion, type UpdateInfo, type UpdateStatus } from './updateCheck'
 import { Terminal } from 'xterm'
@@ -17,10 +18,15 @@ import hljsJavascript from 'highlight.js/lib/languages/javascript'
 import hljsCss from 'highlight.js/lib/languages/css'
 import hljsJson from 'highlight.js/lib/languages/json'
 
-hljs.registerLanguage('typescript', hljsTypescript)
-hljs.registerLanguage('javascript', hljsJavascript)
-hljs.registerLanguage('css', hljsCss)
-hljs.registerLanguage('json', hljsJson)
+let hljsReady = false
+function ensureHljsReady(): void {
+  if (hljsReady) return
+  hljs.registerLanguage('typescript', hljsTypescript)
+  hljs.registerLanguage('javascript', hljsJavascript)
+  hljs.registerLanguage('css', hljsCss)
+  hljs.registerLanguage('json', hljsJson)
+  hljsReady = true
+}
 
 /**
  * dsh-worktable 乐高式工作区 M1：通用分栏引擎（PRD §13）。
@@ -369,6 +375,8 @@ type SplitEnv = {
     onCreateSession?: (id: string, opts: NewSessionOptions) => void | Promise<boolean | void>
     /** 项目管理：全部项目（含已隐藏） */
     getManageProjects?: () => { id: string; name: string; icon: string; hidden: boolean }[]
+    /** 重命名项目（写 nameOverrides；空名 = 恢复默认名） */
+    onRenameProject?: (id: string, name: string) => void
     /** 隐藏 / 恢复项目（只影响控制室显示） */
     onHideProject?: (id: string, hidden: boolean) => void
     /** 拖动排序：把 dragId 插到 targetId 之前（before=true）或之后 */
@@ -1064,6 +1072,9 @@ export const splitStore: SplitState = {
     })
     this.yieldObserver.observe(viewArea, { attributes: true, attributeFilter: ['style'] })
     this.active = true
+    // 外来分栏浮层只会在本工作区打开时需要互斥；空闲/首屏不观察 body 全子树。
+    stopExternalSplitObserver?.()
+    stopExternalSplitObserver = observeExternalSplit(() => { if (splitStore.active) splitStore.close() })
     this.notify()
     return true
   },
@@ -1518,6 +1529,8 @@ export const splitStore: SplitState = {
     this.fallback = null
     this.yieldObserver?.disconnect()
     this.yieldObserver = null
+    stopExternalSplitObserver?.()
+    stopExternalSplitObserver = null
     this.root = null
     this.header = null
     this.viewArea = null
@@ -1539,15 +1552,8 @@ export const splitStore: SplitState = {
   },
 }
 
-/** 跨插件互操作桥：自带分栏实现的插件其浮层（.ta_split）出现 = 其引擎打开 → 本引擎让位。
- * 不改动对方插件代码，仅在 DOM 层观察其浮层挂载。 */
-if (typeof document !== 'undefined' && document.body) {
-  const taObserver = new MutationObserver(() => {
-    if (!splitStore.active) return
-    if (document.querySelector('.ta_split')) splitStore.close()
-  })
-  taObserver.observe(document.body, { childList: true, subtree: true })
-}
+/** 外来分栏互斥观察器按 splitStore 生命周期安装；分栏未开启时零 body 观察器。 */
+let stopExternalSplitObserver: (() => void) | null = null
 
 /** 分配各窗宽度（最后一个拿余量） */
 function allocate(panes: SplitPane[], ws: number[], total: number) {
@@ -1891,6 +1897,25 @@ export function ConsolePane() {
     setManageDrag(null)
     if (!dragId || !drop || drop.targetId === dragId) return
     splitEnv?.console?.onReorderProject?.(dragId, drop.targetId, drop.before)
+  }
+  /** 项目管理：正在改名的行 id（输入框非受控，提交时读 DOM 值；Esc = 放弃） */
+  const [renameId, setRenameId] = useState<string | null>(null)
+  const renameCancelRef = useRef(false)
+  const renameInputRef = useRef<HTMLInputElement | null>(null)
+  /** 开始改名：清掉上一次的放弃标记 */
+  const beginRename = (id: string): void => {
+    renameCancelRef.current = false
+    setRenameId(id)
+  }
+  /** 结束改名（blur / Enter）：空名 = 清掉覆盖、恢复默认名 */
+  const endRename = (): void => {
+    const id = renameId
+    const canceled = renameCancelRef.current
+    renameCancelRef.current = false
+    const value = (renameInputRef.current?.value ?? '').trim()
+    setRenameId(null)
+    if (!id || canceled) return
+    splitEnv?.console?.onRenameProject?.(id, value)
   }
   const [newSessMode, setNewSessMode] = useState<'standard' | 'computer-use'>('standard')
   const [newSessModels, setNewSessModels] = useState<OrbModel[]>([])
@@ -3039,7 +3064,28 @@ export function ConsolePane() {
                       onPointerCancel={endManageDrag}
                     >⋮⋮</span>
                     <span className="dsh-wt_manageIcon" aria-hidden>{p.icon}</span>
-                    <span className="dsh-wt_manageName" title={p.name}>{p.name}</span>
+                    {renameId === p.id ? (
+                      <input
+                        ref={renameInputRef}
+                        className="dsh-wt_manageInput"
+                        defaultValue={p.name}
+                        placeholder={T('console.renamePh')}
+                        aria-label={T('console.rename')}
+                        autoFocus
+                        onFocus={(e) => e.currentTarget.select()}
+                        onBlur={endRename}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur() }
+                          else if (e.key === 'Escape') { e.preventDefault(); renameCancelRef.current = true; e.currentTarget.blur() }
+                        }}
+                      />
+                    ) : (
+                      <span
+                        className="dsh-wt_manageName"
+                        title={T('console.renameTip')}
+                        onDoubleClick={() => beginRename(p.id)}
+                      >{p.name}</span>
+                    )}
                     {p.hidden && <span className="dsh-wt_sessTag">{T('console.hiddenTag')}</span>}
                     <div className="dsh-wt_manageOps">
                       <button
@@ -3052,6 +3098,13 @@ export function ConsolePane() {
                           splitEnv?.console?.onPickIcon?.(p.id, e.currentTarget as HTMLElement, { below: true })
                         }}
                       >🎨 {T('console.changeIconShort')}</button>
+                      <button
+                        type="button"
+                        className="dsh-wt_manageBtn"
+                        title={T('console.renameTip')}
+                        aria-label={T('console.rename')}
+                        onClick={() => beginRename(p.id)}
+                      >{T('console.rename')}</button>
                       <button type="button" className="dsh-wt_manageBtn" onClick={() => splitEnv?.console?.onHideProject?.(p.id, !p.hidden)}>
                         {p.hidden ? T('console.show') : T('console.hide')}
                       </button>
@@ -3433,7 +3486,12 @@ function TerminalPane() {
   return <div ref={hostRef} className="dsh-wt_termHost" />
 }
 
-const mdRenderer = new MarkdownIt({ linkify: true })
+let mdRenderer: MarkdownIt | null = null
+function markdownHtml(text: string): string {
+  // Markdown 只在首次预览 .md 时初始化，DSH 首屏不构造 renderer。
+  if (!mdRenderer) mdRenderer = new MarkdownIt({ linkify: true })
+  return mdRenderer.render(text)
+}
 
 const IMAGE_EXTS = /[.](png|jpe?g|gif|webp|svg|bmp|ico)$/i
 const MD_EXTS = /[.](md|markdown|mdown)$/i
@@ -3466,7 +3524,10 @@ function escapeHtml(s: string): string {
 function codeHtml(text: string, ext: string): string {
   const lang = CODE_LANGS[ext] ?? ''
   if (lang) {
-    try { return hljs.highlight(text, { language: lang }).value } catch { return escapeHtml(text) }
+    try {
+      ensureHljsReady()
+      return hljs.highlight(text, { language: lang }).value
+    } catch { return escapeHtml(text) }
   }
   return escapeHtml(text)
 }
@@ -3536,7 +3597,7 @@ function TextViewer(props: { path: string; fileUrl: string; isMd: boolean }) {
             <div className="dsh-wt_fileView">
               <div
                 className="dsh-wt_md"
-                dangerouslySetInnerHTML={{ __html: mdRenderer.render(text) }}
+                dangerouslySetInnerHTML={{ __html: markdownHtml(text) }}
                 onClick={(e: any) => {
                   const a = e.target && e.target.closest ? (e.target.closest('a') as HTMLAnchorElement | null) : null
                   if (!a) return

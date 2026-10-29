@@ -407,8 +407,8 @@ export function FlowPane(props: { projectId: string }) {
                                   {b.acceptance.map((a, ai) => <li key={ai}>{a}</li>)}
                                 </ul>
                               ) : (
-                                <div className="dsh-wt_flowBlockDeliv" title="验收标准已改为文件驱动：唯一来源是 D:\dsh-worktable\论文写作模板\02-十步验收标准.md，改动立即生效（无需重新构建）。开工时该步全部条目会自动写入本步 _本步要求.md。">
-                                  验收标准见《02-十步验收标准.md》对应步骤（实时读取，修改立即生效）——开工后完整条目在 <code>_本步要求.md</code> 的「本步验收标准」小节。
+                                <div className="dsh-wt_flowBlockDeliv" title="自纠清单已改为文件驱动：唯一来源是 C:\Users\Administrator\.dsh\skills\paper-10step\references\02-十步自纠清单.md，改动立即生效（无需重新构建）。开工时该步全部条目会自动写入本步 _本步要求.md。">
+                                  自纠清单见《02-十步自纠清单.md》对应步骤（实时读取，修改立即生效）——开工后完整条目在 <code>_本步要求.md</code> 的「本步自纠清单」小节。
                                 </div>
                               )}
                             </div>

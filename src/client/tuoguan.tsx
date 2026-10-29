@@ -319,30 +319,46 @@ const DEGRADE_MESSAGES: Record<number, { reason: string; notice: string } | unde
   },
 }
 
-/** 拉取 host 真值。 */
-async function pullState(): Promise<void> {
-  try {
-    const response = await fetch(STATE_ROUTE, {
-      method: 'GET',
-      cache: 'no-store',
-      headers: { accept: 'application/json' },
-    })
-    const fallback = DEGRADE_MESSAGES[response.status]
-    if (fallback !== undefined) {
-      degrade(fallback.reason, fallback.notice)
-      return
+/** 拉取 host 真值：轮询/焦点/页面恢复共用 single-flight，单次 8 秒超时，避免慢请求叠满主线程。 */
+let pullPromise: Promise<void> | null = null
+let pullController: AbortController | null = null
+function pullState(): Promise<void> {
+  if (pullPromise) return pullPromise
+  const controller = new AbortController()
+  pullController = controller
+  const timeout = setTimeout(() => controller.abort(), 8000)
+  const run = (async (): Promise<void> => {
+    try {
+      const response = await fetch(STATE_ROUTE, {
+        method: 'GET',
+        cache: 'no-store',
+        headers: { accept: 'application/json' },
+        signal: controller.signal,
+      })
+      const fallback = DEGRADE_MESSAGES[response.status]
+      if (fallback !== undefined) {
+        degrade(fallback.reason, fallback.notice)
+        return
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      adoptRemote(await response.json())
+      if (!hostReachable) {
+        hostReachable = true
+        degradeNoticeShown = false
+        console.log('[dsh-tuoguan] host 状态同步已恢复')
+      }
+    } catch (error) {
+      // 拉取失败只静默保留上次状态（网络抖动、宿主重启瞬间），不打扰用户。
+      console.warn('[dsh-tuoguan] GET 托管状态失败：', error instanceof Error ? error.message : error)
     }
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    adoptRemote(await response.json())
-    if (!hostReachable) {
-      hostReachable = true
-      degradeNoticeShown = false
-      console.log('[dsh-tuoguan] host 状态同步已恢复')
-    }
-  } catch (error) {
-    // 拉取失败只静默保留上次状态（网络抖动、宿主重启瞬间），不打扰用户。
-    console.warn('[dsh-tuoguan] GET 托管状态失败：', error instanceof Error ? error.message : error)
-  }
+  })()
+  pullPromise = run
+  void run.finally(() => {
+    clearTimeout(timeout)
+    if (pullPromise === run) pullPromise = null
+    if (pullController === controller) pullController = null
+  })
+  return run
 }
 
 /**
@@ -509,6 +525,7 @@ function startSync(): void {
 }
 
 function stopSync(): void {
+  pullController?.abort()
   for (const detach of detachListeners.splice(0).reverse()) {
     try { detach() } catch { /* 卸载竞态无需处理 */ }
   }
