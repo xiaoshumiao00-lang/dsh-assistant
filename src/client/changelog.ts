@@ -1,20 +1,22 @@
-/** 更新公告正文（v0.2.5：手机访问独立生命周期不掉线、手机首屏合包提速、路由注册防泄漏、项目文件夹选择统一用路径浏览器、http 复制兜底） */
-export const CHANGELOG_VERSION = 'v0.2.5'
-export const CHANGELOG_V030 = `更新公告 · v0.2.5
+/**
+ * 更新公告：正文与版本都由构建时注入（build.mjs 读 CHANGELOG.md 当前版本那一节 + package.json 版本号）。
+ *
+ * 这里以前是手写死的常量（'v0.2.5' 一整段公告），而发布版本早已走到 0.2.10：
+ * 公告与实现对不上就是误导。现在 CHANGELOG.md 是唯一版本源，缺当前版本那一节直接构建失败。
+ */
+declare const __WT_VERSION__: string
+declare const __WT_ANNOUNCE__: string
 
-🛠️ 本版本更新
+/** 当前插件版本（与 package.json / dsh.plugin.json 一致） */
+export const ANNOUNCE_VERSION = typeof __WT_VERSION__ === 'undefined' ? 'dev' : __WT_VERSION__
 
-【手机访问不再掉线】手机访问改成独立入口（dsh-assistant/pocket），有自己的一套 Cordis 生命周期：改工作台、控制室、客户端代码触发的热重载**不再**重启代理与 SSH 隧道，个人助手其他模块更新也不影响手机连接。登录密钥改为安装级持久化，DSH 重启 / 更新后手机不必重新输入访问密码（改密码仍会正常使旧登录失效）。
+/** 公告正文（CHANGELOG.md 里当前版本那一节） */
+export const ANNOUNCE_BODY = typeof __WT_ANNOUNCE__ === 'undefined' ? '' : String(__WT_ANNOUNCE__)
 
-【手机首屏更快】手机端只精简桌面原生能力、埋点与开发期 HMR——设置、Skill、自动化任务、记忆系统等用户功能全部保留，不再过度裁剪。模块在代理里本地合并成少量 JS，再一次性 gzip / Brotli 下发，公网隧道下首屏等待明显缩短。需要完整插件树时在网址后面加 ?dsh-full-plugins=1。
+/** 公告标题行，控制室直接照用 */
+export const ANNOUNCE_HEAD = `更新公告 · v${ANNOUNCE_VERSION}`
 
-【路由注册不再泄漏】个人助手的全部 web 路由集中登记、统一注销：热重载不会再因为「路由重复」让插件启动到一半失败（此前症状是主界面还在、但代理 / SSH / 手机设置全部消失），旧版本泄漏在宿主里的路由也会被自动替换清理。
-
-【选文件夹只用一套浏览器】手机端「新建项目 / 更改文件夹」的位置选择，改成与「会话输入框 → 电脑文件」完全同一套路径浏览器：可跨盘符、有面包屑、有桌面快捷目录；起始目录不存在（默认文件夹是待创建的时间戳目录）时自动退到最近的可读上级并给出提示；关掉选择弹窗时抽屉一并关闭，不留孤立窗口。
-
-【复制更可靠】手机经局域网 / 隧道以 http 打开时没有剪贴板 API：现在在点击回调里同步兜底，iOS 也不再只复制第一行；路径浏览器地址栏可一键复制当前路径，成功 / 失败都有反馈。悬浮球自己的地址栏与面包屑不再被插入多余的复制按钮，旧版本残留会自动清除。
-
-【手机顶部标题】微信内置浏览器顶部不再被长会话名占满：手机端标题固定显示产品名，切回电脑布局时把原标题交还宿主。
-
-───────
-`
+/** 旧名兼容：曾经这里是手写死的一整段公告，保留名字避免外部引用编译失败 */
+export const CHANGELOG_V030 = ANNOUNCE_BODY
+/** 旧名兼容：版本号现在跟版本源走 */
+export const CHANGELOG_VERSION = ANNOUNCE_VERSION

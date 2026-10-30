@@ -1,7 +1,9 @@
 /**
- * 个人助手设置：手机访问 / Computer Use / 托管（默认状态），统一收在一处。
+ * 个人助手设置：手机访问 / 它记下了什么（记忆）/ Computer Use / 托管（默认状态），统一收在一处。
  *
  * - 手机访问：直接复用 pocket 的实现（同一个 RPC、同一份配置）。
+ * - 它记下了什么：读宿主 GET /api/assistant{,-memory} 的条目与体积，能删某一条 / 清空一侧
+ *   （写回要重启 DSH Desktop 才生效，见 assistant-memory-panel.tsx 顶部说明）。
  * - Computer Use：**不依赖 dsh-orb**。模型直接取宿主模型目录
  *   （ctx.remote.session.modelCatalog），选择结果写进本插件自己的偏好
  *   （dsh-assistant.model.cu.v1 / dsh-assistant.model.background.v1）——就是
@@ -17,8 +19,11 @@ import { PocketSettingsTab } from './pocket/index.jsx'
 import { setTuoguanDefault, useTuoguanDefaultOn } from './tuoguan.tsx'
 import { getAssistantApi, readModelPref, writeModelPref, readBgPref, writeBgPref, ballConfigStore } from './orb-bridge.ts'
 import { DEFAULT_ORB_AVATAR } from './pocket/orb/defaultAvatar.ts'
+import { AssistantMemoryPanel } from './assistant-memory-panel.tsx'
+import { showFirstRunGuide } from './firstRunGuide.ts'
+import { downloadText } from './download.ts'
 
-type HubSection = 'phone' | 'cu' | 'tuoguan'
+type HubSection = 'phone' | 'memory' | 'cu' | 'tuoguan'
 
 const segWrap: Record<string, any> = {
   display: 'flex', gap: 6, margin: '2px 0 12px', padding: 3,
@@ -379,8 +384,104 @@ function TuoguanPanel() {
   )
 }
 
+/** 本机认识的预设 id：布局预设（src/client/index.tsx 的 PRESET_DEFS）+ 会话预设（standard / computer-use）。
+ *  导入档案包时按这份名单判「本机没有的预设」，缺了要明确提示，不静默。 */
+const KNOWN_PRESET_IDS = ['chat', '2h', '3h', 'l2', 'grid', 't3', 'l13', 'g4', 'l23', 'full', 'standard', 'computer-use']
+function knownPresetIds(): string[] { return KNOWN_PRESET_IDS }
+
 export function AssistantSettingsHub({ rpcCall, t }: { rpcCall?: any; t?: any }) {
   const [section, setSection] = useState<HubSection>('phone')
+  const [diagnosticsLine, setDiagnosticsLine] = useState('')
+  const [diagnosticsBusy, setDiagnosticsBusy] = useState(false)
+
+  /** P1-A：导出诊断包（脱敏）→ 落 ~/.dsh/assistant/outputs/，把路径显示出来给你复制 */
+  const exportDiagnosticsBundle = async (): Promise<void> => {
+    if (diagnosticsBusy) return
+    setDiagnosticsBusy(true)
+    setDiagnosticsLine('正在收诊断包…')
+    try {
+      const res = await fetch('/api/assistant/diagnostics/export', { method: 'POST', cache: 'no-store' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || !data?.ok) {
+        setDiagnosticsLine(`没导出来：${data?.error ?? res.status}（旧宿主没有这条路由的话，需要重启 DSH Desktop 升级插件）`)
+        return
+      }
+      setDiagnosticsLine(
+        `已写到：${data.savedPath}\n体积 ${data.bytes} 字节 · 脱敏替换 ${data.redactedReplacements} 处 · 想要完整包就在浏览器里下载：`
+      )
+      try {
+        const fileSlug = String(data.savedPath ?? '').split(/[\\/]/).pop() || 'dsh-assistant-diagnostics.json'
+        const view = await fetch('/api/assistant/diagnostics', { cache: 'no-store' }).then((r) => r.text())
+        downloadText(fileSlug, view)
+      } catch { /* 下载失败不影响：文件已经落盘了 */ }
+    } catch (err) {
+      setDiagnosticsLine('没导出来：' + String(err))
+    } finally {
+      setDiagnosticsBusy(false)
+    }
+  }
+
+  const [archiveLine, setArchiveLine] = useState('')
+  const [archiveBusy, setArchiveBusy] = useState(false)
+
+  const runImport = async (rawText: string): Promise<void> => {
+    if (archiveBusy) return
+    setArchiveBusy(true)
+    setArchiveLine('正在导入…')
+    try {
+      const res = await fetch('/api/assistant/archive/import', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ bundle: JSON.parse(rawText), knownPresets: knownPresetIds() }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || !data?.ok) { setArchiveLine(`导入被拒：${data?.error ?? res.status}`); return }
+      const written = (data.written ?? []).map((item) => `${item.area}/${item.relPath}`).join('、') || '没有新文件'
+      const skipped = (data.skipped ?? []).map((item) => `${item.relPath}（${item.why}）`).slice(0, 8).join('、') || '无'
+      const kept = (data.keptBoth ?? []).map((item) => `${item.relPath} → ${item.wroteAs}`).join('、') || '无'
+      const missing = Array.isArray(data.missingPresets) && data.missingPresets.length
+        ? `⚠️ 本机没有这些预设：${data.missingPresets.join('、')}`
+        : ''
+      const tombstone = data.tombstonesIgnored ? `删除墓碑：共 ${data.tombstonesIgnored} 项，一律没写回` : ''
+      const backup = `备份目录：${data.backupDir ?? '（dryRun：没建备份）'}`
+      const report = [
+        `导入了 ${data.totals?.items ?? 0} 项 / ${data.totals?.bytes ?? 0} 字节`,
+        `新增：${written}`,
+        `跳过：${skipped}`,
+        `冲突另存：${kept}`,
+        backup,
+        tombstone,
+        missing,
+      ].filter((line) => line !== '')
+      setArchiveLine(report.join('\n'))
+    } catch (err) {
+      setArchiveLine('导入失败：' + String(err))
+    } finally {
+      setArchiveBusy(false)
+    }
+  }
+
+  const exportArchive = async (): Promise<void> => {
+    if (archiveBusy) return
+    setArchiveBusy(true)
+    setArchiveLine('正在打包…')
+    try {
+      const res = await fetch('/api/assistant/archive/export', { method: 'POST', cache: 'no-store' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || !data?.ok) { setArchiveLine(`没导出：${data?.error ?? res.status}（旧宿主没有这条路由，需要重启 DSH Desktop）`); return }
+      const rel = `assistant/exports/${String(data.savedPath ?? '').split(/[\\/]/).pop()}`
+      setArchiveLine(`已写到：${data.savedPath}\n可复制的相对路径（相对 .dsh）：${rel}\n体积 ${data.bytes} 字节 · ${data.items} 个文件`)
+      try {
+        const bundle = await fetch('/api/assistant/archive', { cache: 'no-store' }).then((r) => r.text())
+        downloadText('dsh-assistant-archive.json', bundle)
+      } catch { /* 下载失败不影响：文件已经落盘 */ }
+    } catch (err) {
+      setArchiveLine('没导出：' + String(err))
+    } finally {
+      setArchiveBusy(false)
+    }
+  }
+
   const tab = (id: HubSection, label: string) => (
     <button
       type="button"
@@ -394,6 +495,7 @@ export function AssistantSettingsHub({ rpcCall, t }: { rpcCall?: any; t?: any })
     <div style={{ padding: '2px 2px 14px' }}>
       <div style={segWrap}>
         {tab('phone', '📱 手机访问')}
+        {tab('memory', '🧠 它记下了什么')}
         {tab('cu', '🔮 Computer Use')}
         {tab('tuoguan', '🤝 托管')}
       </div>
@@ -402,8 +504,55 @@ export function AssistantSettingsHub({ rpcCall, t }: { rpcCall?: any; t?: any })
           ? <PocketSettingsTab rpcCall={rpcCall} t={t} />
           : <div style={{ padding: 12, fontSize: 12, opacity: .6 }}>手机访问设置不可用（宿主 RPC 未就绪）</div>
       )}
+      {section === 'memory' && <AssistantMemoryPanel />}
       {section === 'cu' && <ComputerUsePanel />}
       {section === 'tuoguan' && <TuoguanPanel />}
+
+      <p style={{ ...desc, padding: '0 2px', marginTop: 12 }}>
+        <button
+          type="button"
+          style={selectStyle}
+          onClick={() => { try { showFirstRunGuide({ auto: false }) } catch { /* 非浏览器环境 */ } }}
+        >
+          重新看一遍首启引导（三屏）
+        </button>
+        <button
+          type="button"
+          style={{ ...selectStyle, marginLeft: 8 }}
+          disabled={diagnosticsBusy}
+          onClick={() => void exportDiagnosticsBundle()}
+        >
+          🧰 导出诊断包（脱敏）
+        </button>
+        <button
+          type="button"
+          style={{ ...selectStyle, marginLeft: 8 }}
+          disabled={archiveBusy}
+          onClick={() => void exportArchive()}
+        >
+          📦 导出助手档案
+        </button>
+        <label style={{ ...selectStyle, marginLeft: 8, display: 'inline-flex', alignItems: 'center', cursor: 'pointer' }}>
+          📥 导入助手档案
+          <input
+            type="file"
+            accept="application/json,.json"
+            style={{ display: 'none' }}
+            disabled={archiveBusy}
+            onChange={(event) => {
+              const file = event.target.files?.[0]
+              if (!file) return
+              const reader = new FileReader()
+              reader.onload = () => void runImport(String(reader.result ?? ''))
+              reader.onerror = () => setArchiveLine('读那个文件失败了')
+              reader.readAsText(file)
+              event.target.value = ''
+            }}
+          />
+        </label>
+      </p>
+      {diagnosticsLine && <p style={{ ...desc, padding: '0 2px', marginTop: 0, whiteSpace: 'pre-wrap' }}>{diagnosticsLine}</p>}
+      {archiveLine && <p style={{ ...desc, padding: '0 2px', marginTop: 0, whiteSpace: 'pre-wrap' }}>{archiveLine}</p>}
     </div>
   )
 }

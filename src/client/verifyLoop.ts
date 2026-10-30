@@ -16,7 +16,7 @@
  */
 
 import {
-  BASELINE_FIGURES, BASELINE_PERSONAL, OVERLAY_FILE,
+  baselineFiguresPath, baselinePersonalPath, paperScriptsDir, OVERLAY_FILE,
   deliveryMarkerName, doneMarkerName, reportName, stRoundOf,
   scoreReportName, bestName, isConvergeStep, effectiveConverge,
   type ConvergeConfig, type FlowRunState, type StepVerifyState, type TemplateBlockDef, type TemplateDef,
@@ -141,9 +141,9 @@ export function composeVerifyTask(opts: {
     lines.push(`   本块条目（另附）：`)
     block.acceptance.forEach((a, i) => lines.push(`   ${i + 1}. ${a}`))
   }
-  lines.push(`2. 个人写作基准：${BASELINE_PERSONAL}（含 §9 技能强制规则红线）`)
+  lines.push(`2. 个人写作基准：${baselinePersonalPath()}（含 §9 技能强制规则红线）`)
   lines.push(`3. 项目叠加层：项目根 ${OVERLAY_FILE}（若存在）`)
-  if (/图|表|figure/i.test(block.title + block.id)) lines.push(`4. 出版级图表验收清单：${BASELINE_FIGURES}`)
+  if (/图|表|figure/i.test(block.title + block.id)) lines.push(`4. 出版级图表验收清单：${baselineFiguresPath()}`)
   lines.push('')
   lines.push('验收铁律（违反任一条 = 本轮验收无效）：')
   lines.push('0. **一轮验收——你的报告是本块唯一一次验收**：每块只验收 1 轮。若你判 FAIL，工人只有一次改稿机会，改完**直接进入下一块**、本块不再复验；你本轮没报出的问题不会有人再查，只会变成用户终审时的遗留问题。因此宁可清单长，不可漏项。术语/缩写/一致性类必须给「类别清单 + 出现次数 + 全部位置」再判定，只点名 1-2 处就判 PASS 是最常见的漏报原因。')
@@ -233,7 +233,7 @@ export function composeFinalReviseTask(opts: { stepLabel: string; block: Templat
     '③ 【交付前核对】交付标记中逐条列出：本轮指令是否全部落地 + 已 PASS 项是否仍成立 + 验收标准对照结果。',
     '',
     '⚠️ 本块没有第二次验收，所以请务必**自证**（交付标记里贴出证据，不要只写"已改"）：',
-    '· 有对应工具的项（`C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\scripts\\` 下 mdplan / verify_docx / redline_selfcheck / count_words / prose_lint）一律**贴出工具输出**；',
+    `· 有对应工具的项（\`${paperScriptsDir()}\` 下 mdplan / verify_docx / redline_selfcheck / count_words / prose_lint）一律**贴出工具输出**；`,
     '· 报告点名的每一处，给出「位置 ｜ 改前 ｜ 改后 ｜ 证据」对照行；',
     '· 明确列出**仍未落实**的项及原因（交用户终审），不得静默跳过、不得把未达标写成已完成。',
   ].join('\n')
@@ -388,7 +388,7 @@ export function composeDiagnosisTask(opts: {
   lines.push(`   当前项目起始步为第 ${currentStart} 步；若你的建议不同，以你的判断为准。`)
   lines.push('5. 报告写完后，只回复一句话总结（整体状态 + 建议从第几步进入），不要提问。')
   lines.push('')
-  lines.push(`质量基线（判定"距投稿差距"的依据）：${BASELINE_PERSONAL}`)
+  lines.push(`质量基线（判定"距投稿差距"的依据）：${baselinePersonalPath()}`)
   return lines.join('\n')
 }
 

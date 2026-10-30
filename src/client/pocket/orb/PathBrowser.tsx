@@ -132,7 +132,7 @@ export function PathBrowser({ mode, api, startPath, t, onPick, onPickDir, onClos
       <div data-pocket-orb="sheet">
         <div data-pocket-orb="sheet-head">
           <button type="button" data-pocket-orb="header-btn" onClick={upOne}>{t('upOne')}</button>
-          {/* 「桌面」= 系统真实桌面目录（支持重定向，如 D:\陈潘HBEU\Desktop） */}
+          {/* 「桌面」= 系统真实桌面目录（Windows 上可能是重定向后的目录） */}
           <button type="button" data-pocket-orb="header-btn" onClick={() => setPath(listing?.desktop ?? listing?.home ?? '')}>{t('home')}</button>
           <div data-pocket-orb="target-path">{mode === 'file' ? t('pcFileHint') : t('pickDir')}</div>
           <button type="button" data-pocket-orb="header-btn" onClick={onClose}>{t('cancel')}</button>

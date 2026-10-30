@@ -22,7 +22,7 @@ import { acquirePocketRuntime, releasePocketRuntime } from './runtime.mjs';
 import { installPocketRpc } from './web-rpc.js';
 import { restartHost } from './restart.js';
 import { advancedNoticeScript, DEFAULT_INJECT, classifyHost } from './proxy.mjs';
-import { lanEnabled, setLanEnabled, lanAuthEnabled, setLanAuthEnabled, lanIpOverride, setLanIpOverride, pinCustom, setPinCustom, tunnelMode, setTunnelMode, tunnelToken, setTunnelToken, tunnelHostname, setTunnelHostname, resetSettings, proxyPort, cloudflaredPath, sshTunnelConfig, setSshTunnelConfig } from './settings.mjs';
+import { lanEnabled, setLanEnabled, lanAuthEnabled, setLanAuthEnabled, lanIpOverride, setLanIpOverride, pinCustom, setPinCustom, tunnelMode, setTunnelMode, tunnelToken, setTunnelToken, tunnelHostname, setTunnelHostname, resetSettings, proxyPort, cloudflaredPath, sshTunnelConfig, setSshTunnelConfig, ensureFirstRunSettings } from './settings.mjs';
 
 const name = 'dsh-pocket';
 const inject = ['connection', 'webServer'];
@@ -295,6 +295,15 @@ export function apply(ctx, config = {}, internals = {}) {
     return join(homedir(), '.dsh');
   })();
   logger.info('dsh-pocket: home = %s | 配置目录', pocketHome);
+
+  // 首启默认（P0-5）：全新安装没有 settings.json → 写一份「局域网关闭 + 局域网要密码」的默认值。
+  // 已有 settings.json 一律不动：升级不会把用户正在用的局域网访问突然关掉。
+  const firstRun = ensureFirstRunSettings();
+  if (firstRun) {
+    logger.info('dsh-pocket: first run defaults written — 局域网访问默认关闭，设置页里开一下才扫码 (settings.json) | 首启安全默认');
+  } else {
+    logger.info(`dsh-pocket: lanEnabled = ${lanEnabled() ? 'on' : 'off'} | 局域网访问状态`);
+  }
 
   // cloudflared 自定义路径（issue #45）：远程 Linux 服务器下载源全失败时，
   // 让用户能在 settings.json 写死一个已经存在的二进制路径，绕过自动下载。

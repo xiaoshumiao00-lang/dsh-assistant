@@ -4,44 +4,24 @@
 // （同音字/近音字），这类错误模型自己修不了，但用一张确定的替换表可以修干净。
 //
 // 原则：只纠正"几乎不可能写对"的形近/音近写法，不做通用错别字猜测——
-// 猜错比不猜更糟。新增词直接往下加一行。
-// 数据来源：本人微信常用联系人（2026-10-25 截取会话列表）+ 日常专业/业务词。
+// 猜错比不猜更糟。
+//
+// 仓库里只留**通用**词表（专业 / 业务 / 产品名）。任何「只有本人才有意义」的词
+// （人名、校院名、自家店名）都从本机配置文件读：
+//   ~/.dsh/assistant/config.json → { "asrTerms": [{ "pattern": "示例人|示例人二", "replace": "示例规范名" }] }
+// 宿主把它下发给页面（GET /api/assistant/config），页面缓存后调用 applyPersonalTerms()。
+// 详见 README「本机个人化配置」。
 
 type Rule = [pattern: RegExp, replacement: string]
 
+/** 本机个人化词表（宿主下发）：正则源串 + 标志位。 */
+export interface PersonalTerm {
+  pattern: string
+  replace: string
+  flags?: string
+}
+
 const RULES: Rule[] = [
-  // ── 本人与常用联系人（微信会话列表里出现的真实人名） ──────────────────
-  [/陈攀|陈盘|陈番|晨潘|秦潘|陈判/g, '陈潘'],
-  [/潘军任|潘俊仁|潘君仁|盘君稔|潘君忍/g, '潘君稔'],
-  [/刘静文|刘静雯雯|刘婧雯|刘晋文|刘晋雯|刘劲文/g, '刘静雯'],
-  [/梁鸿俊|梁宏俊|梁红俊|梁洪骏/g, '梁鸿骏'],
-  [/朱垒|朱蕾|朱雷/g, '朱磊'],
-  [/路亚尼|陆亚妮|陆亚尼/g, '路亚妮'],
-  [/汪影|汪莹|王颖/g, '汪颖'],
-  [/罗桌|罗卓卓|罗倬/g, '罗卓'],
-  [/曲婷|屈亭|屈庭/g, '屈婷'],
-  [/蔡子含|蔡紫涵|蔡子寒/g, '蔡子涵'],
-  [/刘茂航|刘茂杭|刘懋杭/g, '刘懋航'],
-  [/五彩|伍采/g, '伍彩'],
-  [/高科|高可|高珂珂/g, '高珂'],
-  [/谢凡|谢帆帆|解帆/g, '谢帆'],
-  [/李文龙|李文隆/g, '李文龙'],
-  [/黄浩|黄皓|黄昊/g, '黄浩'],
-  [/黄民水|黄明水/g, '黄民水'],
-  [/胡坚|胡剑|胡建/g, '胡坚'],
-  [/罗明星|罗明新/g, '罗明星'],
-  [/侯博文|侯博闻/g, '侯博文'],
-
-  // ── 单位 / 地点 / 业务 ────────────────────────────────────────────
-  [/湖北工程学[园远原院]|湖北工学院|湖北工程学院校/g, '湖北工程学院'],
-  [/土木学[园远]|土木学完/g, '土木学院'],
-  [/科发[园远源]/g, '科发院'],
-  [/智能建造[系西细]/g, '智能建造系'],
-  [/聚开心|聚開心|聚凯心/g, '聚开心'],
-  [/羲趴馆|熙趴馆|西趴馆|羲趴官/g, '羲趴馆'],
-  [/轰趴馆|轰趴官|轰趴管|红趴馆/g, '轰趴馆'],
-  [/孝感市?孝南区?/g, '孝感市孝南区'],
-
   // ── 专业术语（土木 / 结构 / AI） ──────────────────────────────────
   [/托扑优化|拓朴优化|拓扑优华|托普优化/g, '拓扑优化'],
   [/磷石膏|林石膏|临石膏|邻石膏|磷石高/g, '磷石膏'],
@@ -69,10 +49,38 @@ const RULES: Rule[] = [
   [/微信支付|微信支[付服]/g, '微信支付'],
 ]
 
-/** 对一段转写文字做术语纠正（幂等，可重复调用）。 */
+/** 人名 / 校院名 / 自家店名等本机词表：仓库默认**空**，本机配置文件里填。 */
+let personalRules: Rule[] = []
+
+/** 把本机词表编译成 RegExp（坏正则直接跳过，不整批失败）。 */
+export function compilePersonalTerms(terms: PersonalTerm[]): Rule[] {
+  const out: Rule[] = []
+  for (const term of terms ?? []) {
+    const pattern = String(term?.pattern ?? '')
+    const replacement = String(term?.replace ?? '')
+    if (!pattern || !replacement) continue
+    try {
+      out.push([new RegExp(pattern, term.flags && /^[a-z]*$/.test(term.flags) ? term.flags : 'g'), replacement])
+    } catch { /* 本机配置文件里的正则写坏了：忽略这条，其它继续 */ }
+  }
+  return out
+}
+
+/** 页面拿到宿主下发的本机词表后调用（幂等，可以重复调用）。 */
+export function applyPersonalTerms(terms: PersonalTerm[]): void {
+  personalRules = compilePersonalTerms(terms)
+}
+
+/** 测试/展示用：当前生效的个人化词表数量。 */
+export function personalTermCount(): number {
+  return personalRules.length
+}
+
+/** 对一段转写文字做术语纠正（幂等，可重复调用）。本机词表在通用词表之后应用。 */
 export function fixTerms(text: string): string {
   let out = text
   for (const [pattern, replacement] of RULES) out = out.replace(pattern, replacement)
+  for (const [pattern, replacement] of personalRules) out = out.replace(pattern, replacement)
   return out
 }
 

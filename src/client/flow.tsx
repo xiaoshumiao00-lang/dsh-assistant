@@ -9,7 +9,7 @@
  * 数据与动作经宿主注入的 flow 桥（window.__dshCustomEnv.flow，index.tsx 实现）。
  */
 import { useEffect, useRef, useState } from 'react'
-import { cachedSkillOptions, loadSkillOptions, type FlowEnv, type FlowStepOverride, type FlowStepView, type FlowView, type SkillOption } from './templates'
+import { cachedSkillOptions, l1ChecklistPath, loadSkillOptions, type FlowEnv, type FlowStepOverride, type FlowStepView, type FlowView, type SkillOption } from './templates'
 import { joinPath } from './pathutil'
 
 function flowEnv(): FlowEnv | undefined {
@@ -143,7 +143,7 @@ export function FlowPane(props: { projectId: string }) {
     if (opening) return
     const folder = view.folder
     if (!folder) { flash('⚠️ 该项目未设置文件夹，无法打开目录'); return }
-    // 按项目文件夹原有的分隔符风格拼接（Windows 上不要拼出 D:\a/01_content 这种混用路径）
+    // 按项目文件夹原有的分隔符风格拼接（Windows 上不要拼出 D:\a\b 里混进 / 的分隔符）
     const dir = joinPath(folder, st.dir)
     setOpening(st.id)
     try {
@@ -407,7 +407,7 @@ export function FlowPane(props: { projectId: string }) {
                                   {b.acceptance.map((a, ai) => <li key={ai}>{a}</li>)}
                                 </ul>
                               ) : (
-                                <div className="dsh-wt_flowBlockDeliv" title="自纠清单已改为文件驱动：唯一来源是 C:\Users\Administrator\.dsh\skills\paper-10step\references\02-十步自纠清单.md，改动立即生效（无需重新构建）。开工时该步全部条目会自动写入本步 _本步要求.md。">
+                                <div className="dsh-wt_flowBlockDeliv" title={`自纠清单已改为文件驱动：唯一来源是 ${l1ChecklistPath()}（本机技能目录，运行时解析），改动立即生效（无需重新构建）。开工时该步全部条目会自动写入本步 _本步要求.md。`}>
                                   自纠清单见《02-十步自纠清单.md》对应步骤（实时读取，修改立即生效）——开工后完整条目在 <code>_本步要求.md</code> 的「本步自纠清单」小节。
                                 </div>
                               )}

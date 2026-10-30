@@ -5,6 +5,7 @@
  * - 内置模板为常量（BUILTIN_TEMPLATES）；后续「模板库」可编辑/导入/导出，执行逻辑不变。
  * - 移植友好：模板是数据不是代码；新增模板不改任何接线文件。
  */
+import { skillFileOf } from './assistant-config.ts'
 
 export type TemplateStepDef = {
   /** 步骤 id（语义稳定，勿与序号混淆） */
@@ -66,11 +67,31 @@ export type ConvergeConfig = {
 }
 
 /** 质量基线文件（工人共用度量衡；L2 项目叠加层见项目根 _项目验收叠加.md）
- *  2026-10-28：dsh-worktable 已退役，基线改由独立技能 paper-10step 提供（以后只维护那份）。 */
-export const BASELINE_PERSONAL = 'C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\references\\01-个人写作基准.md'
-export const BASELINE_FIGURES = 'C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\references\\03-出版级图表自纠清单.md'
-export const L1_CHECKLIST = 'C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\references\\02-十步自纠清单.md'
+ *  2026-10-28：dsh-worktable 已退役，基线改由独立技能 paper-10step 提供（以后只维护那份）。
+ *  2026-10-30（商业化 P0-1）：技能文件路径改成运行时解析——仓库里不再有
+ *  `C:\Users\<用户名>\.dsh\skills\...` 这类本机绝对路径。根目录来自本机配置
+ *  （`~/.dsh/assistant/config.json` → skillRoot），没有配置时用通用回落 `~/.dsh/skills`。 */
+export const PAPER_SKILL = 'paper-10step'
 export const OVERLAY_FILE = '_项目验收叠加.md'
+
+/** 技能根 + 相对路径 → 本机可读路径（Windows 与 POSIX 分隔符按根目录风格走）。 */
+export function paperPath(...parts: string[]): string {
+  return skillFileOf([PAPER_SKILL, ...parts].join('/'))
+}
+
+export function baselinePersonalPath(): string {
+  return paperPath('references', '01-个人写作基准.md')
+}
+export function baselineFiguresPath(): string {
+  return paperPath('references', '03-出版级图表自纠清单.md')
+}
+export function l1ChecklistPath(): string {
+  return paperPath('references', '02-十步自纠清单.md')
+}
+/** 技能 scripts/ 目录（mdplan / verify_docx / redline_selfcheck / count_words / prose_lint） */
+export function paperScriptsDir(): string {
+  return paperPath('scripts')
+}
 
 /** 解析 02-十步验收标准.md，返回每个步骤的条目数组（key = 步骤 id，如 'polish'）。
  *  文件格式：## 第 N 步 · 步骤标题 ... 之后连续的 - [ ] 条目直到下一个 ## 或文件结束。
@@ -1161,16 +1182,17 @@ export function composeStepTask(opts: {
   L.push('')
   L.push('开工前必读（按序读完再动手）：')
   L.push(`1. ${stepDir}/_本步要求.md —— 本步完整要求 + 各块验收清单（来自 02-十步验收标准.md，实时读取）+ 项目全貌`)
-  L.push(`2. ${BASELINE_PERSONAL} —— 质量基线（含第 9 节「技能强制规则红线汇总」：结构逻辑 / 语言红线 / 公式与符号 / 引用与文献 / 处理边界 / 13 项质量门控）`)
+  L.push(`2. ${baselinePersonalPath()} —— 质量基线（含第 9 节「技能强制规则红线汇总」：结构逻辑 / 语言红线 / 公式与符号 / 引用与文献 / 处理边界 / 13 项质量门控）`)
   let n = 3
-  if (needsFigureBaseline(step)) { L.push(`${n}. ${BASELINE_FIGURES}`); n++ }
+  if (needsFigureBaseline(step)) { L.push(`${n}. ${baselineFiguresPath()}`); n++ }
   L.push(`${n}. ${folder}/${OVERLAY_FILE}（L2 项目叠加层，若存在：写作语言等特殊要求）`)
   L.push('')
   L.push('随本步可用的成品工具（第 8 步用；其它步按需）：')
-  L.push('- `C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\scripts\\mdplan.py` —— 由「原稿 × 章稿 md」机械生成 `08-修改清单.json`，内置 5 项审计（运算符删除 / 数学相邻空格 / 唯一命中 / find 非空 / 模拟执行）。**禁止凭记忆或凭上下文摘要转录改动**（必漏整段重写）')
-  L.push('- `C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\scripts\\fixup.py` —— 引擎做不到的事：符号 OMML 化（pandoc 就地插入）、公式内符号改写、同串多格手工红标；`--emit-manual` 自动产出重放差异声明')
-  L.push('- `C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\scripts\\verify_docx.py` —— 交付前 9 项核验（指纹 / 段落属性全等 / 标红正确 / 域与修订 / 重放预算 / 清稿=章稿 / 标点前空格 / 数值改动登记 / 敏感单元）')
-  L.push('- `C:\\Users\\Administrator\\.dsh\\skills\\paper-10step\\scripts\\redline_selfcheck.py`、`count_words.py`、`prose_lint.py` —— 红标自检、字数主口径、行文可疑句定位')
+  L.push(`- \`${paperPath('scripts', 'mdplan.py')}\` —— 由「原稿 × 章稿 md」机械生成 \`08-修改清单.json\`，内置 5 项审计（运算符删除 / 数学相邻空格 / 唯一命中 / find 非空 / 模拟执行）。**禁止凭记忆或凭上下文摘要转录改动**（必漏整段重写）`)
+  L.push(`- \`${paperPath('scripts', 'fixup.py')}\` —— 引擎做不到的事：符号 OMML 化（pandoc 就地插入）、公式内符号改写、同串多格手工红标；\`--emit-manual\` 自动产出重放差异声明`)
+  L.push(`- \`${paperPath('scripts', 'verify_docx.py')}\` —— 交付前 9 项核验（指纹 / 段落属性全等 / 标红正确 / 域与修订 / 重放预算 / 清稿=章稿 / 标点前空格 / 数值改动登记 / 敏感单元）`)
+  L.push(`- \`${paperPath('scripts', 'redline_selfcheck.py')}\`、\`count_words.py\`、\`prose_lint.py\` —— 红标自检、字数主口径、行文可疑句定位`)
+  L.push(`（技能目录来自本机配置，运行时解析：\`${paperScriptsDir()}\`）`)
   L.push('')
   L.push('开工第一步 —— 三级标准对照体检（每个块开工前必做，不得跳过、不得直接开改）：')
   L.push('  ① 拿验收标准（02-十步验收标准.md）+ L2 项目叠加层 + 质量基线（含第 9 节红线）+ 本步技能规程，逐条比对本块现有产物（或待优化的原始稿件）：每条给出「达标 / 不达标」；')
