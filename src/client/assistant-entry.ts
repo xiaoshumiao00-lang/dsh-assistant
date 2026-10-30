@@ -10,7 +10,7 @@
  *
  * 三条入口共用这一个动作（长按悬浮球 / 桌面全局热键 / 控制室顶栏按钮）。
  */
-import { getAssistantApi, readModelPref } from './orb-bridge'
+import { getAssistantApi, readModelPref, exitWorkspace } from './orb-bridge'
 import { sessionModel } from './pocket/orb/session-plan.ts'
 
 /** 上次打开的助手会话 id（只用于记住模型，不再复用它开新会话）。 */
@@ -67,6 +67,10 @@ export async function openAssistant(opts: { forceNew?: boolean } = {}): Promise<
   const run = (async (): Promise<boolean> => {
     const api = getAssistantApi()
     if (!api) return false
+    // 0) 先退出项目分栏工作区：助手永远是「单一会话布局」。
+    //    用户先在论文写作模板项目里（流程窗格 + 对话列）时，只切会话是收不掉工作区的
+    //    （分栏的联动兜底也依赖同一时刻的会话快照，时序上更不可靠），这里显式收一次。
+    exitWorkspace()
     const home = await assistantHomeDir()
     if (!home) return false
 

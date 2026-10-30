@@ -23,6 +23,17 @@ export const controlRoomStore = {
   },
 }
 
+/** 「先离开当前项目分栏工作区」的出口：由工作台在 apply 时登记。
+ *  私人助手是**单一会话布局**，打开前必须收起项目分栏（否则会顶在项目流程窗格旁边，
+ *  看起来像「项目还在左右分屏」）。用回调注册而不是直接 import 分栏引擎，避免模块环。 */
+let workspaceExit: (() => void) | null = null
+export function setWorkspaceExit(fn: (() => void) | null): void {
+  workspaceExit = fn
+}
+export function exitWorkspace(): void {
+  try { workspaceExit?.() } catch {}
+}
+
 /** 工作台侧要用的宿主 API（模型目录/选模型/后台模型/建会话带预设）。
  *  由 assistant 客户端入口在 apply 时创建一次；控制室与工作台共用。 */
 let assistantApi: OrbApi | null = null

@@ -4,6 +4,7 @@ import { NS, zh, en, type WorktableKey } from './locales'
 import { isAbs, joinPath, parentPathOf, basenameOf } from './pathutil'
 import { splitStore, SplitWorkspace, setSplitT, setSplitEnv, RUNNING_CARD_ID, type LayoutSpec, type SplitPane, type ConsoleCardData, type ProjectSessionItem, type NewSessionOptions } from './split'
 import { splitOpenIntent } from './splitEntry'
+import { sessionLeavesProject } from './projectExit'
 import { BUILTIN_TEMPLATES, freshFlowRun, templateById, saveTemplateStepOverride, composeStepTask, composeStepSpec, effectiveSkill, effectiveInstruction, effectiveConverge, stepBriefOf, isStepBriefConfirmed, migrateFlowRun, OVERLAY_FILE, REPORT_PREFIX, L1_CHECKLIST, parseL1Checklist, isConvergeStep, type FlowRunState, type FlowStepOverride, type FlowStepView, type FlowView, type TemplateDef } from './templates'
 import { VerifyScheduler, composeDiagnosisTask } from './verifyLoop'
 import { defaultProjectFolder, defaultProjectName, isAutoProjectFolder, projectFolderBrowseStart } from './newProjectDefault'
@@ -24,7 +25,7 @@ const PAPER_LANG_OPTIONS = ['中文写作后翻译英文', '直接写英文', '�
 import { photoStore, kindOf } from './photoStore'
 import { DEFAULT_BG_SVG } from './defaultBg'
 import { loadWaveBgBlob } from './waveBg'
-import { controlRoomStore, getAssistantApi, writeModelPref, writeBgPref } from './orb-bridge'
+import { controlRoomStore, getAssistantApi, writeModelPref, writeBgPref, setWorkspaceExit } from './orb-bridge'
 
 /**
  * dsh-worktable 客户端（v2）：侧边栏底部「工作台」区块。
@@ -663,7 +664,7 @@ async function ensureSessionModel(sessionId: string): Promise<void> {
     let effort: string | undefined
     // ① 无条件继承用户当前会话的选择（用户正在用哪个模型，新会话就用哪个）
     try {
-      const cur = sessionBridge?.list?.getSnapshot?.()?.current
+      const cur = currentSessionId()
       if (cur && cur !== sessionId) {
         const cRes = await api.models({ sessionId: cur })
         if (cRes?.result?.ok) {
@@ -1388,7 +1389,7 @@ async function fetchSessionGroups(): Promise<{ groups: { title: string; sessions
   try {
     const snap = sessionBridge?.list?.getSnapshot?.()
     const byId = snap?.byId ?? {}
-    const current = snap?.current ?? ''
+    const current = currentSessionId(snap?.current ?? '')
     // 子代理会话（后台产生的，用户面板看不到）排除
     const subKids = new Set<string>()
     try {
@@ -1868,6 +1869,41 @@ function newSessionFailedText(folder: string): string {
 
 let lastSessionScopeId = ''
 
+/** 当前会话 id（跨宿主版本适配）。
+ *
+ *  DSH 0.2 起「当前会话」的选择在 ui-workspace 服务里（`uiWorkspace.openSession` 写
+ *  `selection = { sessionId }`，主视图 retain 它）；`sessions.list` 快照
+ *  （{ ids, byId, phase, projectionsBySession }）**已经不再带 current 字段**。
+ *  旧代码一律读 `snap.current`，在 0.2 上恒为空串 —— 于是：
+ *    ① 项目 × 对话联动（切到项目外的会话 → 自动收起项目）从未触发；
+ *    ② 会话列表的「当前」高亮永远是空；
+ *    ③ 关项目时「回切打开前的会话」拿不到 prev。
+ *  本函数按「选择快照 → sessions.current（绑定源）→ 旧宿主 list.current」依次兜底。 */
+function currentSessionId(fallback = ''): string {
+  try {
+    const uw = sessionBridge?.uiWorkspace ?? (() => { try { return clientCtx?.get?.('uiWorkspace') ?? null } catch { return null } })()
+    const sid = String(uw?.selection?.getSnapshot?.()?.sessionId ?? uw?.mainReference?.sessionId ?? '')
+    if (sid) return sid
+  } catch {}
+  try {
+    const binding = sessionBridge?.sessions?.current?.getSnapshot?.()
+    const sid = String(binding?.sessionId ?? binding?.key ?? '')
+    if (sid) return sid
+  } catch {}
+  try {
+    const sid = String(sessionBridge?.list?.getSnapshot?.()?.current ?? '')
+    if (sid) return sid
+  } catch {}
+  // 最后兜底：ui-workspace 的选择快照持久化在 localStorage（dsh.sessions.current），
+  // 宿主服务还没注入时也能读到「最后打开的那条会话」。
+  try {
+    const raw = localStorage.getItem('dsh.sessions.current')
+    const sid = raw ? String(JSON.parse(raw)?.sessionId ?? '') : ''
+    if (sid) return sid
+  } catch {}
+  return String(fallback ?? '')
+}
+
 /** 会话作用域快照（模块级；apply 里订阅 ctx.sessions.list 写入，组件与引擎只读） */
 const sessionScopeStore: {
   snapshot: { sessionId: string; cwd: string; jobs: any[]; subagents: any[] } | null
@@ -2194,7 +2230,7 @@ function sessionRunningNow(sid: string | undefined, byId: Record<string, any>, k
 function syncSessionScope(list: any) {
   try {
     const snap = list.getSnapshot()
-    const current: string = snap?.current ?? ''
+    const current: string = currentSessionId(snap?.current ?? '')
     const entry = snap?.byId?.[current] ?? snap?.items?.find((it: any) => it.sessionId === current) ?? null ?? null
     const cat = snap?.subagentsByParent?.[current]
     let subagents: any[] = []
@@ -2215,17 +2251,29 @@ function syncSessionScope(list: any) {
       invalidateSessionSnapshotIndex()
       sessionsSnapshotStore.listeners.forEach((l) => { try { l() } catch {} })
     } catch {}
-    // 项目×对话联动：项目打开期间切到「非该项目绑定」的会话 → 自动关项目（保留用户新选的会话）
+    // 项目×对话联动：项目打开期间切到「项目之外」的会话 → 自动收起项目（保留用户新选的会话）。
+    // 判定按项目文件夹（见 projectExit.ts）：模板项目内部各步会话互切不算离开，
+    // 长按悬浮球打开的私人助手（cwd = ~/.dsh/assistant）则一定离开。
     try {
       if (current !== lastSessionScopeId) {
         lastSessionScopeId = current
         if (current && splitStore.active && splitStore.spec) {
-          const attached = projectAttachRef.attached
-          if (attached && current !== attached) {
-            // 插件自身发起的切换（新建/发送到会话）不关项目——用户要继续在项目里跟新对话沟通
-            const pluginSwitch = pluginOpenedSessionsRef.current.has(current)
-            pluginOpenedSessionsRef.current.delete(current)
-            if (!pluginSwitch) {
+          const pid = splitStore.spec.id
+          // 插件自身发起的切换（新建/发送到会话/模板步骤）不关项目——用户要继续在项目里跟新对话沟通
+          const pluginSwitch = pluginOpenedSessionsRef.current.has(current)
+          pluginOpenedSessionsRef.current.delete(current)
+          if (!pluginSwitch) {
+            const pr = projectsRef.current?.projects ?? null
+            const isConsole = pid === CONSOLE_ID
+            const leaves = sessionLeavesProject({
+              sessionId: current,
+              attached: projectAttachRef.attached,
+              bound: isConsole ? null : (pr?.bindings?.[pid] ?? null),
+              folder: isConsole ? '' : (pr?.folders?.[pid] ?? ''),
+              cwd: cwdOfSession(current),
+              isConsole,
+            })
+            if (leaves) {
               suppressRestoreRef.current = true
               splitStore.close()
             }
@@ -2747,7 +2795,7 @@ function WorktableSection(props: any) {
     // 临时卡片：没有项目文件夹，列表直接取 getConsoleCards 刚算好的游离会话镜像
     if (pid === RUNNING_CARD_ID) {
       const snap = sessionBridge?.list?.getSnapshot?.()
-      const current: string = snap?.current ?? ''
+      const current = currentSessionId(snap?.current ?? '')
       const out = transientRowsRef.current.map((r) => ({
         id: r.id,
         title: r.title,
@@ -2768,7 +2816,7 @@ function WorktableSection(props: any) {
     const snap = sessionBridge?.list?.getSnapshot?.()
     const byId: Record<string, any> = snap?.byId ?? {}
     const ids: string[] = Array.isArray(snap?.ids) ? snap.ids : Object.keys(byId)
-    const current: string = snap?.current ?? ''
+    const current: string = currentSessionId(snap?.current ?? '')
     const norm = (p: unknown) => String(p ?? '').replace(/\\/g, '/').replace(/\/+$/, '')
     const baseN = norm(base)
     if (!baseN) return []
@@ -4168,7 +4216,7 @@ function buildCustomLayoutPrompt(req: string): string {
     if (opened && splitStore.active && splitStore.spec?.id === spec.id) {
       // 记录打开前会话（关项目时回切）与该项目「归属会话」（切到别的会话 = 自动关项目）
       let prev: string | null = null
-      try { prev = sessionBridge?.list?.getSnapshot?.()?.current ?? null } catch {}
+      try { prev = currentSessionId() || null } catch {}
       projectAttachRef.sessionId = prev
       let target = preferredSessionOf(spec.id)
       // 还没有任何专属会话的新项目：自动新建空白会话并绑定（工作目录 = 项目文件夹），
@@ -4222,7 +4270,7 @@ function buildCustomLayoutPrompt(req: string): string {
     splitStore.open(spec)
     if (splitStore.active && splitStore.spec?.id === CONSOLE_ID) {
       let prev: string | null = null
-      try { prev = sessionBridge?.list?.getSnapshot?.()?.current ?? null } catch {}
+      try { prev = currentSessionId() || null } catch {}
       projectAttachRef.sessionId = prev
       const bound = explicitBound !== undefined ? explicitBound : projectsRef.current.projects.bindings[CONSOLE_ID]
       projectAttachRef.attached = bound ?? prev
@@ -7038,7 +7086,28 @@ export function apply(ctx: any) {
     syncSessionScope(sessionsList)
     const disposeScope = sessionsList.subscribe(() => syncSessionScope(sessionsList))
     ctx.effect(() => disposeScope, 'dsh-worktable: session scope watch')
+    // 0.2 的「当前会话」在 ui-workspace 的选择快照里，切会话不一定伴随列表快照变化：
+    // 单独订阅一次，项目 × 对话联动与会话作用域才不会漏拍。
+    try {
+      ctx.inject(['uiWorkspace'], (apiCtx: any) => {
+        const uw = apiCtx?.uiWorkspace ?? (() => { try { return apiCtx?.get?.('uiWorkspace') ?? null } catch { return null } })()
+        const sel = uw?.selection
+        if (!sel || typeof sel.subscribe !== 'function') return
+        const disposeSel = sel.subscribe(() => { if (sessionsList) syncSessionScope(sessionsList) })
+        ctx.effect(() => () => { try { disposeSel() } catch {} }, 'dsh-worktable: session selection watch')
+      })
+    } catch {}
   }
+
+  // 「离开项目工作区」出口（私人助手等入口打开前调用）：分栏收起 + 不把会话回切到项目里。
+  ctx.effect(() => {
+    setWorkspaceExit(() => {
+      if (!splitStore.active) return
+      suppressRestoreRef.current = true
+      try { splitStore.close() } catch {}
+    })
+    return () => setWorkspaceExit(null)
+  }, 'dsh-assistant: leave project workspace')
 
   // 分栏工作区浮层（M1 通用引擎，shell.overlay 座位）
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
