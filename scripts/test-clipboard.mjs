@@ -51,9 +51,9 @@ cases.push(['Clipboard API 可用：直接写入，不碰 DOM', async () => {
   const result = await withDom({
     navigator: { clipboard: { writeText: async (text) => { seen.push(text) } } },
     document: { createElement: () => { throw new Error('不该走 DOM 兜底') } },
-  }, () => copyTextToClipboard('D:\\陈潘HBEU\\项目 A'))
+  }, () => copyTextToClipboard('D:\\Users\\me\\项目 A'))
   assert.equal(result, true)
-  assert.deepEqual(seen, ['D:\\陈潘HBEU\\项目 A'])
+  assert.deepEqual(seen, ['D:\\Users\\me\\项目 A'])
 }])
 
 cases.push(['安全上下文但 Clipboard API 被拒 → textarea + execCommand 兜底', async () => {
@@ -61,12 +61,12 @@ cases.push(['安全上下文但 Clipboard API 被拒 → textarea + execCommand 
   const result = await withDom({
     navigator: { clipboard: { writeText: async () => { throw new Error('NotAllowedError') } } },
     document: doc,
-  }, () => copyTextToClipboard('D:\\陈潘HBEU\\Desktop\\删除'))
+  }, () => copyTextToClipboard('D:\\Users\\me\\Desktop\\默认项目父目录'))
   assert.equal(result, true)
-  assert.equal(doc.el.value, 'D:\\陈潘HBEU\\Desktop\\删除')
+  assert.equal(doc.el.value, 'D:\\Users\\me\\Desktop\\默认项目父目录')
   assert.deepEqual(doc.calls.filter((c) => c[0] === 'execCommand'), [['execCommand', 'copy']])
   // iOS Safari 只默认选第一行：必须显式给出整个选区
-  assert.deepEqual(doc.calls.filter((c) => c[0] === 'range'), [['range', 0, 'D:\\陈潘HBEU\\Desktop\\删除'.length]])
+  assert.deepEqual(doc.calls.filter((c) => c[0] === 'range'), [['range', 0, 'D:\\Users\\me\\Desktop\\默认项目父目录'.length]])
   // 临时节点必须收掉，不能留在页面里
   assert.deepEqual(doc.calls.filter((c) => c[0] === 'remove'), [['remove']])
 }])
@@ -85,7 +85,7 @@ cases.push(['非安全上下文（手机 http）：不碰 Clipboard API，直接
     window: { isSecureContext: false },
     navigator: { clipboard: { writeText: async () => { apiCalls += 1 } } },
     document: doc,
-  }, () => copyTextToClipboard('D:\\陈潘HBEU\\Desktop\\删除'))
+  }, () => copyTextToClipboard('D:\\Users\\me\\Desktop\\默认项目父目录'))
   assert.equal(result, true)
   // 走 await 之后就不是用户手势了，iOS 会拒：必须是点击回调里同步那一份
   assert.equal(apiCalls, 0)

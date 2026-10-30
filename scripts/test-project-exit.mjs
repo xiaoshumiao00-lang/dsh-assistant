@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict'
 import { sessionLeavesProject } from '../src/client/projectExit.ts'
 
-const FOLDER = 'D:\\陈潘HBEU\\论文\\论文写作模板'
+const FOLDER = 'D:\\Users\\me\\论文\\论文写作模板'
 
 const cases = []
 
@@ -37,7 +37,7 @@ cases.push(['项目文件夹根目录的会话 → 不算离开', () => {
 
 cases.push(['私人助手会话（cwd = ~/.dsh/assistant）→ 离开项目', () => {
   assert.equal(sessionLeavesProject({
-    sessionId: 'assistant-1', attached: 'step-05', folder: FOLDER, cwd: 'C:\\Users\\Administrator\\.dsh\\assistant',
+    sessionId: 'assistant-1', attached: 'step-05', folder: FOLDER, cwd: 'C:\\Users\\me\\.dsh\\assistant',
   }), true)
 }])
 

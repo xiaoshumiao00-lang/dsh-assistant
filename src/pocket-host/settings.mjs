@@ -1,17 +1,21 @@
 // dsh-pocket 设置持久化（$DSH_HOME/dsh-pocket/settings.json）
 //
 // 当前项：
-//   - lanEnabled        局域网访问总开关（默认开启）：关闭后局域网扫码/链接直接失效（代理拒绝局域网 Host）
-//   - lanAuthEnabled    局域网访问密码开关（issue #24），默认开启
+//   - lanEnabled        局域网访问总开关：关闭后局域网扫码/链接直接失效（代理拒绝局域网 Host）
+//   - lanAuthEnabled    局域网访问密码开关（issue #24）
 //   - publicPinCustom   公网密码是否用户自定义（issue #33），自定义后不自动轮换
 //   - lanPinCustom      局域网密码是否用户自定义（issue #33）
 //   - tunnelMode        公网隧道模式（issue #66）：'quick'（默认，随机 trycloudflare.com）| 'named'（固定域名）
 //   - tunnelToken       Cloudflare 命名隧道 Token（issue #66，秘密；文件 0o600，RPC 不回显）
 //   - tunnelHostname    命名隧道绑定的固定域名（issue #66，如 pocket.example.com）
-// 默认**开启**（安全优先）：局域网扫码也要输 8 位密码；
-// 用户可关闭——关闭后局域网扫码直连（仅同一网络内的设备能访问），公网不受影响（永远要密码）。
+//
+// 默认值分两种情形（v0.2.11 起，P0-5）：
+//   - **全新安装**（没有 settings.json）：局域网访问默认**关闭**，要扫码先在设置里开；
+//     局域网密码默认**开启**（开着局域网就必须带密码），公网永远要密码。
+//   - **旧安装**（settings.json 已存在但缺某个键）：按老语义办（局域网开启、密码开启），
+//     升级不会把用户已经在用的局域网访问突然关掉。
 
-import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -39,9 +43,38 @@ function writeSettings(s) {
   return s;
 }
 
-/** 局域网访问总开关：默认开启（文件缺失/损坏都视为开启）。 */
+/** 设置文件是否存在（决定「全新安装」还是「旧安装」的默认值）。损坏的文件按旧安装办，不静默改行为。 */
+export function settingsFileExists() {
+  try {
+    return statSync(settingsPath()).isFile()
+  } catch { return false }
+}
+
+function hasOwn(settings, key) {
+  return Object.prototype.hasOwnProperty.call(settings ?? {}, key)
+}
+
+/**
+ * 首启落盘（P0-5）：没有 settings.json 时写一份「安全默认」并把选择显式记录下来，
+ * 这样升级以后不会再有「缺键 = 猜默认值」的空间。旧安装（文件已存在）一律不写、不改。
+ * @returns {object | null} 写了默认文件返回对象，已有文件返回 null
+ */
+export function ensureFirstRunSettings() {
+  try {
+    if (settingsFileExists()) return null
+    return writeSettings({ lanEnabled: false, lanAuthEnabled: true })
+  } catch { return null }
+}
+
+/** 局域网访问总开关：
+ *  - 没有 settings.json（全新安装）→ 关闭（要扫码得先在设置里开一下）
+ *  - 有 settings.json 但缺这个键（旧安装）→ 保持老语义：开启
+ *  - 有明确值 → 照它的
+ */
 export function lanEnabled() {
-  return readSettings().lanEnabled !== false;
+  const s = readSettings()
+  if (!hasOwn(s, 'lanEnabled')) return settingsFileExists() ? true : false
+  return s.lanEnabled !== false
 }
 
 /** 设置局域网访问总开关，返回新状态（持久化）。 */
@@ -52,9 +85,14 @@ export function setLanEnabled(on) {
   return s.lanEnabled;
 }
 
-/** 局域网访问密码开关：默认开启（文件缺失/损坏都视为开启）。 */
+/** 局域网访问密码开关：
+ *  新安装默认开启（开着局域网就要带密码）；旧安装缺这个键时保持老语义（开启）。
+ *  关掉后局域网扫码直连（只有同一网络内的设备能访问）；公网永远要密码，不受这项影响。
+ */
 export function lanAuthEnabled() {
-  return readSettings().lanAuthEnabled !== false;
+  const s = readSettings()
+  if (!hasOwn(s, 'lanAuthEnabled')) return true // 新装与旧装都是「要密码」
+  return s.lanAuthEnabled !== false
 }
 
 /** 设置局域网访问密码开关，返回新状态（持久化）。 */

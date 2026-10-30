@@ -2,8 +2,8 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, use
 import { parentPathOf } from './pathutil'
 import { filterWorkingCards } from './consoleFilter'
 import { observeExternalSplit } from './splitObserver'
-import { CHANGELOG_V030 } from './changelog'
-import { LOCAL_VERSION, checkUpdate, getAutoCheck, readCache, setAutoCheck as storeAutoCheck, setSkipVersion, type UpdateInfo, type UpdateStatus } from './updateCheck'
+import { ANNOUNCE_BODY, ANNOUNCE_HEAD } from './changelog'
+import { LOCAL_VERSION, UPGRADE_AI, checkUpdate, getAutoCheck, readCache, setAutoCheck as storeAutoCheck, setSkipVersion, type UpdateInfo, type UpdateStatus } from './updateCheck'
 import { Terminal } from 'xterm'
 import { FlowPane } from './flow'
 import { TemplateBar } from './templateBar'
@@ -644,9 +644,8 @@ function boxPayload(x0: number, y0: number, x1: number, y1: number): { primary: 
   return { primary, line, candidates, limited, src }
 }
 
-/** 更新方法：复制给 AI 的升级指令（插件不自更新；升级由用户或其 Agent 执行 + 重启） */
-const UPGRADE_CMD = 'dsh plugin --profile web add "https://github.com/Aisland-SJL/dsh-worktable/releases/latest/download/dsh-worktable.tgz"'
-const UPGRADE_AI = '帮我升级 dsh-worktable：执行 ' + UPGRADE_CMD + '，完成后提醒我重启 dsh web 并刷新页面'
+/** 更新方法：唯一的更新源在 updateCheck.ts（UPGRADE_CMD / UPGRADE_AI 从那里导入）。
+ *  这里曾自己写死过一条指向退役仓库、profile 也不对的升级命令，已删。 */
 
 async function copyTextSafe(text: string): Promise<boolean> {
   try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); return true } } catch {}
@@ -2650,7 +2649,9 @@ export function ConsolePane() {
             )}
             {updStatus === 'failed' && <div className="dsh-wt_announceStatus">{T('annot.checkFail')}</div>}
             {updStatus === 'uptodate' && !updInfo && <div className="dsh-wt_announceStatus">{T('annot.latest')}</div>}
-            <div className="dsh-wt_announceBody">{CHANGELOG_V030}</div>
+            {ANNOUNCE_BODY
+              ? <div className="dsh-wt_announceBody">{`${ANNOUNCE_HEAD}\n${ANNOUNCE_BODY}`}</div>
+              : <div className="dsh-wt_announceBody">{`更新公告 · v${LOCAL_VERSION}\n（本包没有随版本发布的公告正文；见 GitHub Releases 页面。）`}</div>}
           </div>
           </div>
         ) : (

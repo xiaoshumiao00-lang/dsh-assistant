@@ -16,6 +16,10 @@ import { CONSOLE_SEA01_ROUTE, serveConsoleSea01 } from './consoleAsset'
 import { startDesktopBall, ballProfileDir } from './desktop-ball'
 import { manageWebRoutes } from './web-routes'
 import { registerAssistantHome } from './assistant-home'
+import { registerAssistantConfigRoutes } from './assistant-config'
+import { registerAssistantDiagnostics } from './assistant-diagnostics'
+import { registerAssistantArchive } from './assistant-archive'
+import { assistantConfigTestSurface } from './assistant-config'
 import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join as joinPathNode } from 'node:path'
@@ -34,6 +38,12 @@ export const name = 'dsh-assistant'
 
 /** 供测试直接验证路由：仅导出注册函数，不改变插件行为。 */
 export { registerAssistantHome } from './assistant-home'
+export { assistantConfigTestSurface } from './assistant-config'
+export { assistantMemoryTestSurface } from './assistant-memory'
+export { registerAssistantDiagnostics, assistantDiagnosticsTestSurface, redactText, renderDiagnosticsBundle, writeDiagnosticsBundle } from './assistant-diagnostics'
+export { registerAssistantArchive, assistantArchiveTestSurface, collectArchive, writeArchiveBundle, importArchiveBundle, ARCHIVE_FORMAT } from './assistant-archive'
+/** 目录 allowlist 与终端环境变量（供 scripts/test-path-guard.mjs 直接验） */
+export { expandHome, defaultAllowedRoots, createPathGuard, minimalTermEnv, isDirectory } from './path-guard'
 
 /** 工作台要 webServer/sessions，托管与设置路由要 webServer；手机访问由独立入口注入 connection。 */
 export const inject = ['webServer', 'sessions']
@@ -329,6 +339,12 @@ export function apply(ctx: any, config: any = {}): () => void {
     })
     // 私人助手的家：固定目录 + AGENTS.md 人设 + journal / notes（会话据此创建）
     disposers.push(registerAssistantHome(ctx))
+    // 本机个人化配置（默认项目父目录 / 技能根 / 人名词表 / 人设注入）
+    disposers.push(registerAssistantConfigRoutes(ctx))
+    // 一键导出诊断包（P1-A）：脱敏后落 ~/.dsh/assistant/outputs/
+    disposers.push(registerAssistantDiagnostics(ctx))
+    // 助手档案导出 / 导入（P1-B）：单一 JSON 清单，导入前先备份、按文件夹判重、不覆盖墓碑
+    disposers.push(registerAssistantArchive(ctx))
   } catch {}
 
   void applyBall()

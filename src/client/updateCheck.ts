@@ -1,7 +1,39 @@
-/** 更新检查核心（控制室公告页使用；设置面板保留自身实现，后续版本统一去重）。键与设置面板共用。 */
+/**
+ * 唯一的更新源与升级指令（P0-4 闭环）：
+ * 控制室公告页、工作台分栏页、更新检查全部走这里，不再各写各的仓库名。
+ * 历史里这里同时存在过三个更新源（两个已退役的旧仓库 + 本仓库），
+ * 现在只有 dsh-assistant 这一个；旧的更新源名字不再出现在代码里，避免按名字 grep 时分不清真假。
+ */
 declare const __WT_VERSION__: string
 export const LOCAL_VERSION = typeof __WT_VERSION__ === 'undefined' ? 'dev' : __WT_VERSION__
-const UPDATE_REPO = 'xiaoshumiao00-lang/Paper-Workspace'
+
+/** 插件仓库（GitHub Releases 是版本源） */
+export const UPDATE_REPO = 'xiaoshumiao00-lang/dsh-assistant'
+/** 插件安装名 / 发布 tgz 文件名（与 package.json、dsh.plugin.json 同名） */
+export const PLUGIN_NAME = 'dsh-assistant'
+export const LATEST_TGZ = `https://github.com/${UPDATE_REPO}/releases/latest/download/${PLUGIN_NAME}.tgz`
+
+/** 当前页面的宿主 profile：dsh-assistant 装在 desktop（DSH Desktop），网页构建装在 web。
+ *  认不出来就用 desktop —— 这是本插件的主 profile。 */
+export function detectProfile(): 'web' | 'desktop' {
+  try {
+    const marker = String((globalThis as any).__DSH_PROFILE__ ?? '').trim().toLowerCase()
+    if (marker === 'web' || marker === 'desktop') return marker
+  } catch { /* 没有全局标记 */ }
+  try {
+    const path = String(globalThis.location?.pathname ?? '')
+    const match = path.match(/\/profiles\/(web|desktop)(?:\/|$)/)
+    if (match) return match[1] as 'web' | 'desktop'
+  } catch { /* 非浏览器环境 */ }
+  return 'desktop'
+}
+
+/** 升级指令：插件不自更新，升级由用户或其 Agent 执行 + 重启。 */
+export function upgradeCommand(profile: string = detectProfile()): string {
+  return `dsh plugin --profile ${profile} add "${LATEST_TGZ}"`
+}
+export const UPGRADE_CMD = upgradeCommand()
+export const UPGRADE_AI = `帮我升级 ${PLUGIN_NAME}：执行 ${upgradeCommand()}，完成后提醒我重启 DSH 并刷新页面`
 
 export type UpdateStatus = 'idle' | 'checking' | 'uptodate' | 'failed'
 export type UpdateInfo = { latest: string; notes: string; url: string }

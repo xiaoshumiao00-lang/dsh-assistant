@@ -17,6 +17,32 @@ if (pluginManifest.version !== pkg.version) {
   throw new Error('dsh-assistant build: package.json version (' + pkg.version + ') != dsh.plugin.json version (' + pluginManifest.version + ') — 发版前先统一两处版本号')
 }
 
+/**
+ * 更新公告由 CHANGELOG.md 生成（P0-4：公告与版本源同处，不再手写常量）。
+ * 取当前版本那一节（## [x.y.z] … 到下一个 ## 之前）。
+ */
+function extractAnnouncement(markdown, version) {
+  const lines = String(markdown).split(/\r?\n/)
+  const escaped = String(version).replace(/\./g, '\\.')
+  const heading = new RegExp(`^##\\s+\\[${escaped}\\]`)
+  const start = lines.findIndex((line) => heading.test(line))
+  if (start === -1) return ''
+  let end = lines.length
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^##\s/.test(lines[i])) { end = i; break }
+  }
+  return lines.slice(start + 1, end).join('\n').trim()
+}
+
+const changelogPath = join(here, 'CHANGELOG.md')
+if (!existsSync(changelogPath)) {
+  throw new Error('dsh-assistant build: 仓库根目录缺少 CHANGELOG.md —— 控制室的更新公告由它生成')
+}
+const announcement = extractAnnouncement(readFileSync(changelogPath, 'utf8'), pkg.version)
+if (!announcement) {
+  throw new Error(`dsh-assistant build: CHANGELOG.md 里没有 "## [${pkg.version}]" 这一节 —— 更新公告必须跟版本源一起维护`)
+}
+
 const clientBanner = {
   js: "window.__ModuleLoader__.load({ id: 'dsh-assistant', factory: (require) => { var module = { exports: {} }; var exports = module.exports;",
 }
@@ -51,8 +77,8 @@ await build({
   loader: { '.css': 'text', '.png': 'dataurl' }, // xterm.css 内联；悬浮球默认头像内联为 data URL
   banner: clientBanner,
   footer: clientFooter,
-  // 客户端自报版本（随 package.json version 走，发版即自动一致）
-  define: { __WT_VERSION__: JSON.stringify(pkg.version) },
+  // 客户端自报版本（随 package.json version 走，发版即自动一致）；公告正文来自 CHANGELOG.md 当前版本那一节
+  define: { __WT_VERSION__: JSON.stringify(pkg.version), __WT_ANNOUNCE__: JSON.stringify(announcement) },
 })
 
 // ── 内嵌 Computer Use（源自 dsh-orb 的 MIT 代码，见 vendor/computer-use/LICENSE.dsh-orb）──

@@ -18,6 +18,9 @@ import { POCKET_RPC_CHANNEL } from './pocket/api.js'
 import { NS as POCKET_NS } from './pocket/pocket-locales.js'
 import { installComposerMenuToggle } from './composerMenu'
 import { openAssistant, assistantUrlIntent } from './assistant-entry.ts'
+import { loadAssistantConfig } from './assistant-config.ts'
+import { applyPersonalTerms } from './pocket/orb/asr-terms.ts'
+import { shouldAutoShow, showFirstRunGuide } from './firstRunGuide.ts'
 
 export const name = 'dsh-assistant'
 
@@ -28,6 +31,14 @@ export const inject = Array.from(new Set([
 ]))
 
 export function apply(ctx: any): void {
+  // 本机个人化配置（默认项目父目录 / 技能根 / 人名词表）：仓库里不写死任何本机值。
+  // 拿到宿主下发的配置后缓存起来，并把本机词表交给语音转写。
+  try {
+    void loadAssistantConfig()
+      .then((config) => { if (config?.asrTerms?.length) applyPersonalTerms(config.asrTerms) })
+      .catch(() => { /* 旧宿主没有这条路由：用缓存或通用回落 */ })
+  } catch { /* 非浏览器环境 */ }
+
   // 输入框「＋」菜单：再次点加号关闭（宿主原生只在点外部时关）。
   try {
     const dispose = installComposerMenuToggle()
@@ -210,4 +221,16 @@ export function apply(ctx: any): void {
     label: () => '个人助手',
     inject: () => ({ rpcCall, t: pocketT }),
   }, AssistantSettingsHub), 'dsh-assistant: settings hub')
+
+  // 一次性首启引导（P0-6）：只有第一次用这个插件会弹一次（状态 'never'）。
+  // 看完 / 后一跳 / 关掉都写进 localStorage，以后不再自动弹；设置页里能重看。
+  try {
+    if (typeof document === 'undefined') return
+    if (!shouldAutoShow()) return
+    // 晚 1.2 秒：别把用户正在点的东西（控制室 / 球）盖在脚下
+    const timer = setTimeout(() => {
+      try { showFirstRunGuide({ auto: true }) } catch { /* 引导失败不影响助手 */ }
+    }, 1200)
+    timer.unref?.()
+  } catch { /* 非浏览器环境 */ }
 }

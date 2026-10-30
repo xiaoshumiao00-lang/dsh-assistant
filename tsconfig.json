@@ -1,0 +1,20 @@
+{
+  "_comment": "只用于 npm run typecheck（tsc --noEmit）。构建本身走 esbuild（build.mjs），不读这份 tsconfig。",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": false,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "noUnusedLocals": false,
+    "esModuleInterop": true,
+    "allowJs": false,
+    "types": []
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx"],
+  "exclude": ["node_modules", "lib", "src/pocket-host", "src/cu-shims"]
+}

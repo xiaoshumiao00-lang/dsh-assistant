@@ -24,7 +24,7 @@
  *   profile 目录通过宿主 `profileContext.dir` 解析（不硬编码路径），
  *   取不到时退到 `homePaths.home`，再退到 `process.cwd()`。
  *   例如 desktop profile 下为
- *   `C:\Users\Administrator\.dsh\profiles\desktop\dsh-tuoguan-state.json`。
+ *   `<用户目录>/.dsh/profiles/desktop/dsh-tuoguan-state.json`。
  *
  * 并发：所有读写走同一个 Promise 队列串行化，落盘用 tmp + rename 原子替换，
  *   两个客户端同时点也不会写坏文件。

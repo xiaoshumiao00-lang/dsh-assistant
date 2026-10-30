@@ -5,7 +5,7 @@ import { PC_FILE_MAX_BYTES, hoistPcFileMenuItem, isPcFileTooLarge, pcFileMime, p
 const cases = []
 
 cases.push(['默认从会话项目文件夹开始，保留盘符与中文路径', () => {
-  assert.equal(pcFileStartPath('D:\\陈潘HBEU\\项目 A'), 'D:\\陈潘HBEU\\项目 A')
+  assert.equal(pcFileStartPath('D:\\Users\\me\\项目 A'), 'D:\\Users\\me\\项目 A')
   assert.equal(pcFileStartPath('  C:/work  '), 'C:/work')
 }])
 

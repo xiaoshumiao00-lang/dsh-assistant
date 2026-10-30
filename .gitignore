@@ -12,6 +12,13 @@ scripts/ball.json
 # 本地备份
 .backup-*/
 
+# 本机个人化配置（正常位置在 ~/.dsh/assistant/config.json，不入库；
+# 这里也挡住有人把配置文件塞进仓库根目录）
+config.json
+assistant-config.local.json
+dsh-assistant-config.json
+.testhome/**/config.json
+
 # 编辑器 / 系统
 .DS_Store
 Thumbs.db

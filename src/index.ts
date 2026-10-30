@@ -5,6 +5,7 @@ import { readdir, readFile, stat } from 'node:fs/promises'
 import { dirname, resolve as pathResolve, sep } from 'node:path'
 import { createRequire } from 'node:module'
 import { manageWebRoutes } from './web-routes'
+import { createPathGuard, minimalTermEnv, type PathGuard } from './path-guard'
 import { homedir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -48,8 +49,9 @@ function resolveDshHomeSafe(): string {
 }
 
 /**
- * dsh-worktable 服务端：健康路由 + 工作区内容窗的数据路由。
- * 参考 dsh-better-sidebar 的架构——内容窗能力由本插件自己的服务端路由提供：
+ * 工作台半部的服务端实现（源自 dsh-worktable）。它不是插件入口——入口是 src/assistant.ts；
+ * 这里只导出 apply()，由 assistant.ts 调用来注册 /api/worktable/* 路由。
+ * 自名与包名 / dsh.plugin.json 保持一致（路由前缀仍用 /api/worktable/*，客户端与已装版本都依赖它）。
  *   - POST /api/worktable/fs     目录列表（资源管理器窗）
  *   - POST /api/worktable/git    git 状态（源代码管理窗）
  *   - WS   /api/worktable/term   node-pty 终端流（终端窗；依赖宿主 node_modules 中的
@@ -59,7 +61,8 @@ function resolveDshHomeSafe(): string {
 declare const __WT_VERSION__: string
 const PLUGIN_VERSION = typeof __WT_VERSION__ === 'undefined' ? 'dev' : __WT_VERSION__
 
-export const name = 'dsh-worktable'
+export const name = 'dsh-assistant'
+export const PLUGIN_SELF = 'dsh-assistant/worktable'
 export const inject = ['webServer', 'sessions']
 
 export const HEALTH_PATH = '/api/worktable/health'
@@ -200,14 +203,15 @@ async function gitStatus(cwd: string) {
   }
 }
 
-/** 终端 WebSocket 升级路由（同步注册 + ctx.effect，同 better-sidebar；node-pty 缺失时不注册） */
-function setupTerminal(webServer: any, ctx: any) {
+/** 终端 WebSocket 升级路由（同步注册 + ctx.effect，同 better-sidebar；node-pty 缺失时不注册）。
+ *  P0-5：终端 cwd 走目录 allowlist；env 不再整包 process.env 交给 shell（最小环境变量白名单）。 */
+function setupTerminal(webServer: any, ctx: any, guard: PathGuard) {
   if (typeof webServer.registerUpgrade !== 'function') return
   const wsMod = loadPkg('ws')
   const ptyMod = loadPkg('node-pty')
-  ctx.logger?.info?.('[dsh-worktable] term deps: ws=' + (wsMod ? 'ok' : 'MISSING') + ' node-pty=' + (ptyMod ? 'ok' : 'MISSING'))
+  ctx.logger?.info?.(`[${PLUGIN_SELF}] term deps: ws=${wsMod ? 'ok' : 'MISSING'} node-pty=${ptyMod ? 'ok' : 'MISSING'}`)
   if (!wsMod || !ptyMod) {
-    ctx.logger?.warn('[dsh-worktable] 终端路由未注册：ws/node-pty 不可用')
+    ctx.logger?.warn(`[${PLUGIN_SELF}] 终端路由未注册：ws/node-pty 不可用`)
     return
   }
   const WebSocketServer = wsMod.WebSocketServer ?? wsMod.default?.WebSocketServer
@@ -226,12 +230,20 @@ function setupTerminal(webServer: any, ctx: any) {
       wss.handleUpgrade(req, socket, head, (ws: any) => {
         const u = new URL(req.url ?? '/', 'http://dsh.internal')
         const cwd = serverCwd(ctx, u.searchParams.get('sessionId') || undefined, u.searchParams.get('cwd') || undefined)
+        const cwdCheck = guard.check(cwd)
+        if (!cwdCheck.ok) {
+          // 越界：不开 shell，直接把说明写进终端窗
+          try { ws.send('\r\n[worktable] 终端拒绝：' + cwdCheck.reason + '（不在目录 allowlist 内）') } catch {}
+          try { ws.close() } catch {}
+          ctx.logger?.warn?.(`[${PLUGIN_SELF}] term 越界拒绝：${cwdCheck.reason}`)
+          return
+        }
         const cols = clampDim(Number(u.searchParams.get('cols')), 80)
         const rows = clampDim(Number(u.searchParams.get('rows')), 24)
         let term: any = null
         try {
           const shell = spawnShell()
-          term = pty.spawn(shell.cmd, shell.args, { name: 'xterm-256color', cols, rows, cwd, env: process.env })
+          term = pty.spawn(shell.cmd, shell.args, { name: 'xterm-256color', cols, rows, cwd, env: minimalTermEnv() })
         } catch (err) {
           try { ws.send('\r\n[worktable] 终端启动失败：' + String(err)) } catch {}
           try { ws.close() } catch {}
@@ -253,7 +265,7 @@ function setupTerminal(webServer: any, ctx: any) {
         ws.on('close', () => { try { term.kill() } catch {} })
       })
     },
-  }), 'dsh-worktable: terminal upgrade')
+  }), `${PLUGIN_SELF}: terminal upgrade`)
 }
 
 /* ─────────────────────────── 技能目录扫描（回退路径） ─────────────────────────── */
@@ -374,7 +386,7 @@ async function listSkills(ctx: any, cwd: string): Promise<{ skills: SkillEntry[]
       }
     }
   } catch (err) {
-    ctx?.logger?.warn?.('[dsh-worktable] ctx.skills 不可用，回退扫描技能目录：' + String(err))
+    ctx?.logger?.warn?.(`[${PLUGIN_SELF}] ctx.skills 不可用，回退扫描技能目录：` + String(err))
   }
   if (fromService.length > 0) return { skills: fromService, source: 'service', skipped: [] }
   const scanned = await scanSkillDirs(cwd)
@@ -384,17 +396,35 @@ async function listSkills(ctx: any, cwd: string): Promise<{ skills: SkillEntry[]
 export function apply(ctx: Context) {
   const server = (ctx as any).webServer
   if (!server) {
-    ctx.logger?.warn('[dsh-worktable] ctx.webServer 不可用（headless profile？），跳过服务端路由')
+    ctx.logger?.warn(`[${PLUGIN_SELF}] ctx.webServer 不可用（headless profile？），跳过服务端路由`)
     return
   }
   const routes = manageWebRoutes(server)
   const webServer = routes.webServer
+
+  // 目录 allowlist（P0-5）：内容窗的数据路由只碰允许根以内的路径。
+  const guard = createPathGuard()
+  ctx.logger?.info?.(`[${PLUGIN_SELF}] 目录 allowlist: ${guard.open ? '全放行（allowAllLocalPaths）' : guard.roots.join(' | ')}`)
+  /** 越界统一拒绝：403 + 日志（说明差哪个根，便于加 allowedRoots） */
+  const denyOutside = (res: any, rawPath: string, routeName: string): boolean => {
+    const check = guard.check(rawPath)
+    if (check.ok) return false
+    ctx.logger?.warn?.(`[${PLUGIN_SELF}] ${routeName} 越界拒绝：${check.reason}`)
+    json(res, 403, {
+      ok: false,
+      error: 'outside-allowlist',
+      path: check.target,
+      hint: '在 ~/.dsh/assistant/config.json 的 allowedRoots 里加上这个目录（或把它本身放进已允许根），再重启 DSH',
+    })
+    return true
+  }
+
   try {
     webServer.register({
     kind: 'exact',
     path: HEALTH_PATH,
     handler: (_req: any, res: any) => {
-      json(res, 200, { plugin: 'dsh-worktable', version: PLUGIN_VERSION, ok: true })
+      json(res, 200, { plugin: name, half: PLUGIN_SELF, version: PLUGIN_VERSION, ok: true })
     },
   })
 
@@ -407,6 +437,7 @@ export function apply(ctx: Context) {
         const u = new URL(req.url ?? '/', 'http://dsh.internal')
         const p = u.searchParams.get('path') || ''
         if (!p) { json(res, 400, { error: 'missing path' }); return }
+        if (denyOutside(res, p, 'file')) return
         const abs = pathResolve(p)
         const stat = await import('node:fs/promises').then((m) => m.stat(abs))
         if (stat.size > 20 * 1024 * 1024) { json(res, 413, { error: 'file too large' }); return }
@@ -461,6 +492,7 @@ export function apply(ctx: Context) {
         const rootToken = decodeURIComponent(segs.shift() ?? '')
         const rel = segs.map((s) => { try { return decodeURIComponent(s) } catch { return s } }).join('/')
         if (!rootToken) { json(res, 400, { error: 'missing root' }); return }
+        if (denyOutside(res, rootToken, 'site')) return
         const root = pathResolve(rootToken)
         let abs = pathResolve(root, rel)
         if (abs !== root && !abs.startsWith(root + sep)) { json(res, 403, { error: 'outside root' }); return }
@@ -491,6 +523,7 @@ export function apply(ctx: Context) {
         const path = typeof body.path === 'string' && body.path
           ? body.path
           : serverCwd(ctx, body.sessionId, body.cwd)
+        if (denyOutside(res, path, 'fs')) return
         json(res, 200, await listDirectory(path))
       } catch (err) {
         json(res, 500, { path: '', entries: [], truncated: false, error: String(err) })
@@ -510,10 +543,11 @@ export function apply(ctx: Context) {
         if (req.method !== 'GET') { res.writeHead(405); res.end(); return }
         const u = new URL(req.url ?? '/', 'http://dsh.internal')
         const cwd = serverCwd(ctx, u.searchParams.get('sessionId') || undefined, u.searchParams.get('cwd') || undefined)
+        if (denyOutside(res, cwd, 'skills')) return
         const { skills, source, skipped } = await listSkills(ctx, cwd)
         if (skipped.length > 0) {
           // 与宿主行为一致：非法技能名（非 kebab-case）的技能不会被注册，故不进下拉；仅记日志便于排查
-          ctx?.logger?.info?.('[dsh-worktable] 技能目录中以下条目因技能名非法不可用（不影响其它技能）：' + skipped.join('；'))
+          ctx?.logger?.info?.(`[${PLUGIN_SELF}] 技能目录中以下条目因技能名非法不可用（不影响其它技能）：` + skipped.join('；'))
         }
         skills.sort((a, b) => a.name.localeCompare(b.name))
         json(res, 200, { ok: true, source, cwd, count: skills.length, skipped, skills })
@@ -581,6 +615,7 @@ export function apply(ctx: Context) {
         const p = typeof body.path === 'string' ? body.path : ''
         const content = typeof body.content === 'string' ? body.content : ''
         if (!p) { json(res, 400, { error: 'missing path' }); return }
+        if (denyOutside(res, p, 'write')) return
         if (content.length > 20 * 1024 * 1024) { json(res, 413, { error: 'content too large' }); return }
         const abs = pathResolve(p)
         await import('node:fs/promises').then((m) => m.writeFile(abs, content, 'utf8'))
@@ -601,6 +636,7 @@ export function apply(ctx: Context) {
         const body = await readJsonBody(req)
         const p = typeof body.path === 'string' ? body.path.trim() : ''
         if (!p) { json(res, 400, { error: 'missing path' }); return }
+        if (denyOutside(res, p, 'mkdir')) return
         const abs = pathResolve(p)
         const fsx = await import('node:fs/promises')
         const parent = dirname(abs)
@@ -619,6 +655,7 @@ export function apply(ctx: Context) {
     handler: async (req: any, res: any) => {
       const body = await readJsonBody(req)
       const cwd = serverCwd(ctx, body.sessionId, body.cwd)
+      if (denyOutside(res, cwd, 'git')) return
       json(res, 200, await gitStatus(cwd))
     },
   })
@@ -633,6 +670,7 @@ export function apply(ctx: Context) {
         const body = await readJsonBody(req)
         const p = typeof body.path === 'string' ? body.path.trim() : ''
         if (!p) { json(res, 400, { error: 'missing path' }); return }
+        if (denyOutside(res, p, 'open-folder')) return
         const abs = pathResolve(p)
         const fsx = await import('node:fs/promises')
         try {
@@ -655,7 +693,7 @@ export function apply(ctx: Context) {
     },
   })
 
-  setupTerminal(webServer, ctx)
+  setupTerminal(webServer, ctx, guard)
   return routes.dispose
   } catch (err) {
     // apply 中途失败也不能留下半套路由，否则下一次 HMR 会被自己的残留卡死。

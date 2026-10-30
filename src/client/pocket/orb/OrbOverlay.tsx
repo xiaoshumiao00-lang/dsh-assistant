@@ -623,7 +623,7 @@ function OrbPage({ api, t, open }: OrbOverlayProps & { open: boolean }) {
     if (!open) setHistoryLimit(HISTORY_PAGE)
   }, [open])
 
-  // 系统真实桌面目录（支持重定向，如 D:\陈潘HBEU\Desktop）：
+  // 系统真实桌面目录（Windows 上可能是重定向后的目录；宿主 /api/worktable/fs 的 listing.desktop 提供）：
   // 新会话默认项目目录 + 路径浏览器（目录/电脑文件）默认起点。已有选择时不覆盖。
   useEffect(() => {
     let live = true

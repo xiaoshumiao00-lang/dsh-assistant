@@ -9,7 +9,7 @@ import {
   shouldAddAssistantCard, withAssistantCard, hasAssistantFolder,
 } from '../src/client/assistant-card.ts'
 
-const home = 'C:\\Users\\Administrator\\.dsh\\assistant'
+const home = 'C:\\Users\\me\\.dsh\\assistant'
 const empty = () => ({ layouts: [], folders: {}, iconOverrides: {}, order: [], removed: [] })
 const layout = { id: ASSISTANT_PROJECT_ID, title: '私人助手', icon: ASSISTANT_CARD_ICON }
 
@@ -27,7 +27,7 @@ assert.equal(hasAssistantFolder(added, home), true)
 assert.equal(first.layouts.length, 0)
 
 // 2. 同目录已有项目（别的 id、分隔符/大小写不同）→ 不重复建
-const manual = { ...empty(), layouts: [{ id: 'layout-x' }], folders: { 'layout-x': 'c:/users/administrator/.dsh/ASSISTANT/' } }
+const manual = { ...empty(), layouts: [{ id: 'layout-x' }], folders: { 'layout-x': 'c:/users/me/.dsh/ASSISTANT/' } }
 assert.equal(shouldAddAssistantCard(manual, home), false)
 assert.equal(withAssistantCard(manual, home, layout), manual, '返回同一对象，调用方据此跳过写盘')
 

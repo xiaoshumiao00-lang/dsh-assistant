@@ -5,10 +5,11 @@ import { isAbs, joinPath, parentPathOf, basenameOf } from './pathutil'
 import { splitStore, SplitWorkspace, setSplitT, setSplitEnv, RUNNING_CARD_ID, type LayoutSpec, type SplitPane, type ConsoleCardData, type ProjectSessionItem, type NewSessionOptions } from './split'
 import { splitOpenIntent } from './splitEntry'
 import { sessionLeavesProject } from './projectExit'
-import { BUILTIN_TEMPLATES, freshFlowRun, templateById, saveTemplateStepOverride, composeStepTask, composeStepSpec, effectiveSkill, effectiveInstruction, effectiveConverge, stepBriefOf, isStepBriefConfirmed, migrateFlowRun, OVERLAY_FILE, REPORT_PREFIX, L1_CHECKLIST, parseL1Checklist, isConvergeStep, type FlowRunState, type FlowStepOverride, type FlowStepView, type FlowView, type TemplateDef } from './templates'
+import { BUILTIN_TEMPLATES, freshFlowRun, templateById, saveTemplateStepOverride, composeStepTask, composeStepSpec, effectiveSkill, effectiveInstruction, effectiveConverge, stepBriefOf, isStepBriefConfirmed, migrateFlowRun, OVERLAY_FILE, REPORT_PREFIX, l1ChecklistPath, parseL1Checklist, isConvergeStep, type FlowRunState, type FlowStepOverride, type FlowStepView, type FlowView, type TemplateDef } from './templates'
 import { VerifyScheduler, composeDiagnosisTask } from './verifyLoop'
 import { defaultProjectFolder, defaultProjectName, isAutoProjectFolder, projectFolderBrowseStart } from './newProjectDefault'
 import { ProjectFolderSheet } from './projectFolderSheet'
+import { showToast } from './toast.ts'
 import type { FsBrowserApi } from './pocket/orb/PathBrowser.tsx'
 import { NS as ORB_NS, zh as ORB_ZH, type OrbKey } from './pocket/orb/locales.ts'
 import { POCKET_ENDPOINTS, POCKET_RPC_CHANNEL } from './pocket/api.js'
@@ -26,7 +27,6 @@ import { photoStore, kindOf } from './photoStore'
 import { DEFAULT_BG_SVG } from './defaultBg'
 import { loadWaveBgBlob } from './waveBg'
 import { controlRoomStore, getAssistantApi, writeModelPref, writeBgPref, setWorkspaceExit } from './orb-bridge'
-
 /**
  * dsh-worktable 客户端（v2）：侧边栏底部「工作台」区块。
  * 结构：分隔线 → [≡ 手柄][工作台][搜索/视图选项/添加+] → 项目卡片区（子座位）。
@@ -43,12 +43,11 @@ import { controlRoomStore, getAssistantApi, writeModelPref, writeBgPref, setWork
 type OrderBy = 'manual' | 'recent'
 type DockMode = 'footer' | 'float'
 
-// ── 更新检查（客户端直连 GitHub Releases API，只读 GET；失败静默）──
-declare const __WT_VERSION__: string
-const LOCAL_VERSION = typeof __WT_VERSION__ === 'undefined' ? 'dev' : __WT_VERSION__
-const UPDATE_REPO = 'xiaoshumiao00-lang/dsh-assistant'
-const UPGRADE_CMD = 'dsh plugin --profile desktop add "https://github.com/xiaoshumiao00-lang/dsh-assistant/releases/latest/download/dsh-assistant.tgz"'
-const UPGRADE_AI = '帮我升级 dsh-assistant：执行 ' + UPGRADE_CMD + '，完成后提醒我重启 DSH Desktop 并刷新页面'
+// ── 更新检查：仓库、版本、升级指令、缓存全部来自 updateCheck（P0-4：唯一的更新源）──
+import {
+  LOCAL_VERSION, UPDATE_REPO, UPGRADE_CMD, UPGRADE_AI, checkUpdate,
+  getAutoCheck, setAutoCheck, setSkipVersion, readCache, type UpdateInfo,
+} from './updateCheck'
 // 更新提示图标（手绘 SVG，避免 emoji 跨平台渲染差异）
 const ICON_SYNC = (
   <svg viewBox="0 0 16 16" aria-hidden>
@@ -64,17 +63,6 @@ const ICON_SPARK = (
     <path d="M12.6 11.2l.5 1.3 1.3.5-1.3.5-.5 1.3-.5-1.3-1.3-.5 1.3-.5z" fill="currentColor" />
   </svg>
 )
-type UpdateInfo = { latest: string; notes: string; url: string }
-function cmpVer(a: string, b: string): number {
-  const pa = a.split('.').map(Number)
-  const pb = b.split('.').map(Number)
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const x = pa[i] ?? 0
-    const y = pb[i] ?? 0
-    if (x !== y) return x - y
-  }
-  return 0
-}
 async function copyText(text: string): Promise<boolean> {
   try {
     if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); return true }
@@ -1530,7 +1518,7 @@ export type NewSessionGroup = { kind: 'none' } | { kind: 'existing'; workspaceId
 /** 插件知识包：附在窗口任务提示词里，让接收方跳过对插件源码的重新侦察，直接干活 */
 const KNOWLEDGE_PACK = [
   '【插件知识包·请直接采用，不要重新侦察插件源码】',
-  '- dsh-worktable 是 DeepSeek Harness 的自建容器插件（工作台：侧边栏里的项目应用抽屉；不了解的细节可直接向用户提问）。',
+  '- dsh-assistant（工作台）是 DeepSeek Harness 的自建插件：控制室 + 项目应用 + 手机访问 + 私人助手；不了解的细节可直接向用户提问。',
   '- 窗口（内容窗）模型：每个窗 = 一个标签页；未指派时显示选择器（浏览器/动画/资源管理器/终端/✨自定义）；',
   '  窗内容还可放 iframe 网页与文件预览（.md/.txt/.tsx/.css/.html 等）。',
   '- 窗口可装载的形式：HTML 单文件（交互 UI，放项目文件夹后在资源管理器点击渲染）、网页 URL、',
@@ -1540,7 +1528,7 @@ const KNOWLEDGE_PACK = [
   '  界面即可与 DSH 原生风格一致；自造样式控制在最小范围。',
   '- 服务端能力：/api/worktable/fs（列目录）、/api/worktable/write（写文件）、/api/worktable/mkdir（建目录）、',
   '  /api/worktable/git（git 状态）、/api/worktable/site（静态托管）。',
-  '- 改完插件在 01_content 目录执行 npm run build；重启 dsh web 或浏览器 F5 生效。',
+  '- 改完插件在插件仓库根目录（本机安装是指向源码仓库的 junction）执行 npm run build；纯客户端改动刷新页面即生效，宿主改动需要重启 DSH。',
   '- 所有产出文件一律放进本任务标注的项目文件夹，保持用户目录干净。',
   '- 标注协议：收到「📌 标注-窗口N …（坐标/元素/框内文字…）…」= 工作台标注（窗口编号约定：左栏→顶行→主行，从 1 起）。',
   '  处理：标注已标明框选区域与「最可能目标」时直接作答、不要二次询问（仅当确实无法从标注定位时才问一次）；能查看截图或打开窗口则先核实再回答。',
@@ -1554,8 +1542,8 @@ function buildWindowTaskText(projectId: string, projectName: string, windowLabel
     : '本项目暂未设置专属文件夹：产出文件先向用户确认存放位置，不要随便写。'
   const lines = [
     '【工作台自定义窗口任务】',
-    '以下内容由 dsh-worktable（工作台）插件' + (mode === 'new' ? '自动发送' : '发送') + '：用户想把「' + projectName + '」项目中的「' + win + '」窗口打造成他想要的内容。',
-    '1. dsh-worktable 是侧边栏底部的自建「工作台」插件（官方文档没有它的说明，不了解之处可直接向用户提问）。',
+    '以下内容由 dsh-assistant（工作台）插件' + (mode === 'new' ? '自动发送' : '发送') + '：用户想把「' + projectName + '」项目中的「' + win + '」窗口打造成他想要的内容。',
+    '1. dsh-assistant 是本插件的当前名字（工作台能力源自已合并的 dsh-worktable；官方文档没有它的说明，不了解之处可直接向用户提问）。',
     '2. 用户需求：' + requirement,
     '3. ' + folderLine,
     '4. 产出形式请按任务类型选择（不要一律用 HTML）：',
@@ -2370,46 +2358,28 @@ function WorktableSection(props: any) {
   const [registeredIds, setRegisteredIds] = useState<string[]>(() => [...registryStore.ids])
   const [addOpen, setAddOpen] = useState(false)
   const [viewOptionsOpen, setViewOptionsOpen] = useState(false)
-  // 更新检查：徽标 / 更新卡 / 版本行共用；节流一天一次，忽略按版本号存 localStorage
+  // 更新检查：徽标 / 更新卡 / 版本行共用；节流、重试、缓存都在 updateCheck（这里只留 UI 状态）
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
-  const [updateCheckOn, setUpdateCheckOn] = useState<boolean>(() => localStorage.getItem('dsh.worktable.updateCheck.v1') !== '0')
+  const [updateCheckOn, setUpdateCheckOn] = useState<boolean>(() => getAutoCheck())
   const [updateCopied, setUpdateCopied] = useState(false)
-  const [updateStatus, setUpdateStatus] = useState<'idle' | 'checking' | 'uptodate' | 'failed'>('idle')
+  const [updateStatus, setUpdateStatus] = useState<'idle' | 'checking' | 'uptodate' | 'failed'>(() => readCache().status)
   const updateCheckingRef = useRef(false)
   const updateAliveRef = useRef(true)
   useEffect(() => () => { updateAliveRef.current = false }, [])
   const checkUpdates = useCallback(async (force = false) => {
     if (updateCheckingRef.current) return // 防重入：并发点击只保留一个 in-flight
-    const last = Number(localStorage.getItem('dsh.worktable.lastUpdateCheck.v1') ?? '0')
-    if (!force && Date.now() - last < 24 * 3600 * 1000) return // 自动检查节流；手动「立即检查」绕过节流
     updateCheckingRef.current = true
     setUpdateStatus('checking')
     try {
-      let d: { tag_name?: string; body?: string; html_url?: string } | null = null
-      for (let attempt = 0; attempt < 3 && !d && updateAliveRef.current; attempt++) {
-        const ctrl = new AbortController()
-        const timer = setTimeout(() => ctrl.abort(), 8000) // 单次 8s 超时，计入下一轮重试
-        try {
-          const r = await fetch('https://api.github.com/repos/' + UPDATE_REPO + '/releases/latest', { headers: { Accept: 'application/vnd.github+json' }, cache: 'no-store', signal: ctrl.signal })
-          if (r.ok) d = await r.json() as { tag_name?: string; body?: string; html_url?: string }
-          else if (r.status === 403 || r.status === 404) break // 限流/不存在：不再重试
-        } catch { /* 网络抖动/超时：下一轮重试 */ }
-        finally { clearTimeout(timer) }
-      }
+      const result = await checkUpdate(force) // 一天一次节流、8s×3 重试、跳过版本都在 updateCheck 里
       if (!updateAliveRef.current) return // 组件已卸载：不再更新状态
-      if (!d) { setUpdateStatus('failed'); return }
-      localStorage.setItem('dsh.worktable.lastUpdateCheck.v1', String(Date.now()))
-      const tag = (d.tag_name ?? '').replace(/^v/, '')
-      if (!tag || cmpVer(tag, LOCAL_VERSION) <= 0) { setUpdateStatus('uptodate'); return }
-      if ((localStorage.getItem('dsh.worktable.skipVersion.v1') ?? '') === tag) { setUpdateStatus('uptodate'); return }
-      setUpdateInfo({ latest: tag, notes: (d.body ?? '').slice(0, 800), url: d.html_url ?? '' })
-      setUpdateStatus('uptodate')
+      setUpdateStatus(result.status)
+      setUpdateInfo(result.info)
     } finally {
       updateCheckingRef.current = false
     }
   }, [])
-  // headless 的更新 UI 不在首屏：保留原仓库/节流/重试语义，仅延后 2 秒让开首屏资源。
-  // 非 headless 侧栏仍立即检查；控制室的独立更新检查逻辑不变。
+  // headless 的更新 UI 不在首屏：保留原节流/重试语义，仅延后 2 秒让开首屏资源。
   useEffect(() => {
     if (!updateCheckOn) return
     if (!headless) { void checkUpdates(); return }
@@ -2422,13 +2392,13 @@ function WorktableSection(props: any) {
   }
   const skipUpdate = () => {
     if (updateInfo) {
-      localStorage.setItem('dsh.worktable.skipVersion.v1', updateInfo.latest)
+      setSkipVersion(updateInfo.latest)
       setUpdateInfo(null)
     }
   }
   const toggleUpdateCheck = () => {
     setUpdateCheckOn((v) => {
-      localStorage.setItem('dsh.worktable.updateCheck.v1', v ? '0' : '1')
+      setAutoCheck(!v)
       return !v
     })
   }
@@ -2465,7 +2435,7 @@ function WorktableSection(props: any) {
   /** 新建项目保存中（防连点：双击「创建项目」会建出两个同目录项目 + 两条会话） */
   const savingLayoutRef = useRef(false)
   useEffect(() => () => { mountedRef.current = false }, [])
-  /** 新建项目弹窗：未选文件夹时默认 = D:\陈潘HBEU\Desktop\删除 下以当前时间戳（YYYYMMDDHHmm）命名的子文件夹
+  /** 新建项目弹窗：未选文件夹时默认 = 本机默认项目父目录（配置文件里的 newProjectParent）下以当前时间戳（YYYYMMDDHHmm）命名的子文件夹
    *  （打开弹窗时计算，弹窗显示的路径即将要创建的路径；保存成功后 wsFolderParent 清空，下次打开生成新时间戳）。
    *  「选择位置…」与「手动输入」保留，随时可改；父目录不存在时 mkdir 报错，用户可改选其它位置。
    *  regenerate=true（每次打开弹窗）= 上次自动生成的时间戳已经作废（弹窗没保存就关了），
@@ -2547,6 +2517,14 @@ function WorktableSection(props: any) {
   const [assistantHome, setAssistantHome] = useState('')
   /** 私人助手卡片建卡尝试次数：被踩掉后允许补几次，不无限重试。 */
   const assistantCardTriesRef = useRef(0)
+  /** 建卡失败的可见提示（P0-6）：只报一次，不每次重试都刷屏。 */
+  const cardNoticeShownRef = useRef(false)
+  const warnCardOnce = (reason: string): void => {
+    try { console.warn('[dsh-assistant] 助手建卡失败：', reason) } catch { /* 没有 console */ }
+    if (cardNoticeShownRef.current) return
+    cardNoticeShownRef.current = true
+    try { showToast('⚠️ 私人助手建卡失败：' + reason, 8000) } catch { /* 非浏览器环境 */ }
+  }
 
   /** 采纳宿主状态（另一端的改动 / 冲突时的真值）：写本地并重载界面；签名同步记下，下一轮不再回声推送 */
   const adoptRemoteState = (st: any): void => {
@@ -3443,7 +3421,7 @@ function WorktableSection(props: any) {
     return cards
   }
 
-  /** 打开「添加项目」面板（侧栏 ＋ 与控制室创建卡共用）：未选文件夹时默认 = D:\陈潘HBEU\Desktop\删除 下的当前时间戳子文件夹
+  /** 打开「添加项目」面板（侧栏 ＋ 与控制室创建卡共用）：未选文件夹时默认 = 本机默认项目父目录下的当前时间戳子文件夹
    *  （每次打开重新生成：上次没保存就关掉的自动目录已经过时，见 prefillDefaultFolder） */
   const openAddPanel = () => {
     setAddOpen(true)
@@ -3860,11 +3838,11 @@ function bindInfoOf(groups: { title: string; sessions: { id: string; title: stri
  *  零泄漏硬约束：禁止写入用户的个人工作区分组名/项目名/私人路径——本提示词会被发给别人的 DSH。 */
 function buildCustomLayoutPrompt(req: string): string {
   return [
-    '【为 dsh-worktable（工作台）插件增加一个新的布局预设】',
+    '【为 dsh-assistant（工作台）插件增加一个新的布局预设】',
     '',
-    '背景：dsh-worktable 是 DeepSeek Harness 的自建容器插件（本机仓库 dsh-worktable；不了解的细节可直接向用户提问）。',
+    '背景：dsh-assistant 是 DeepSeek Harness 的自建插件（控制室 + 工作台项目 + 手机访问 + 私人助手；不了解的细节可直接向用户提问）。',
     '侧边栏「工作台」区块管理项目，每个项目打开后是一个平铺工作区（若干内容窗 + 右侧对话窗）。',
-    '布局预设定义在 01_content/src/client/index.tsx 的 PRESET_DEFS 数组，选择器缩略图在 presetThumb() 函数。',
+    '布局预设定义在插件仓库的 src/client/index.tsx 的 PRESET_DEFS 数组，选择器缩略图在 presetThumb() 函数。',
     '',
     '任务：按下方「用户需求」新增一个布局预设。',
     '',
@@ -3876,7 +3854,7 @@ function buildCustomLayoutPrompt(req: string): string {
     '5. 窗格最小宽 200、聊天窗最小宽 240，引擎有钳制，无需配置。',
     '6. 在 presetThumb(defId) 里为新 id 增加一个缩略图分支（用 dsh-wt_thumb / dsh-wt_thumbCol / dsh-wt_thumbRow / cell()；聊天窗用 cell(true) 的蓝色 💬 格）。',
     '7. 现有预设的顺序与内容不要改动：2h / 3h / l2 / grid / t3 / l13 / g4 / l23。',
-    '8. 改完在 01_content 目录执行 npm run build 重新打包，浏览器 F5 即生效。',
+    '8. 改完插件在插件仓库根目录执行 npm run build 重新打包；纯客户端改动刷新页面即生效，宿主改动要重启 DSH。',
     '9. 需求若超出以上字段的表达能力（例如三行、嵌套分栏），按现有引擎模型做最接近的实现，并在回复里说明取舍。',
     '',
     '用户需求：',
@@ -4158,19 +4136,30 @@ function buildCustomLayoutPrompt(req: string): string {
     let alive = true
     void assistantHomeDir()
       .then((home) => { if (alive && home) setAssistantHome(home) })
-      .catch(() => { /* 宿主没提供助手目录（旧版/非桌面）：不建卡 */ })
+      .catch((err) => {
+        // P0-6：不再静默 —— 建卡为什么没成，至少要让用户看见（一次，不刷屏）
+        warnCardOnce('助手目录不可用，助手卡片没有建起来：' + String(err?.message ?? err))
+      })
     return () => { alive = false }
   }, [])
 
   useEffect(() => {
     if (!syncReady || !assistantHome) return
     if (!shouldAddAssistantCard(projects as any, assistantHome)) return
-    if (assistantCardTriesRef.current >= 6) return
+    if (assistantCardTriesRef.current >= 6) {
+      warnCardOnce('助手卡片一直建不起来（试过 6 次，宿主状态每次把它吃掉）。设置 → 个人助手 里有解释。')
+      return
+    }
     assistantCardTriesRef.current += 1
     const layout = buildLayout(DEFAULT_PRESET_ID, ASSISTANT_CARD_NAME)
     layout.id = ASSISTANT_PROJECT_ID
     layout.icon = ASSISTANT_CARD_ICON
-    persistProjects((prev) => withAssistantCard(prev as any, assistantHome, layout) as any)
+    try {
+      persistProjects((prev) => withAssistantCard(prev as any, assistantHome, layout) as any)
+    } catch (err: any) {
+      warnCardOnce('写项目状态失败，助手卡片没建成：' + String(err?.message ?? err))
+      return
+    }
     notifyConsole()
     // projects.layouts.length / removed.length：被宿主状态覆盖（卡片被吃）或另一端点删除时重新评估
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -5336,7 +5325,7 @@ function buildCustomLayoutPrompt(req: string): string {
     const backfill = await buildPriorStepsBackfill(folder, tmpl, idx)
     let l1Entries: string[] | undefined
     try {
-      const l1Content = await wtReadText(L1_CHECKLIST)
+      const l1Content = await wtReadText(l1ChecklistPath())
       if (l1Content) {
         const l1Map = parseL1Checklist(l1Content)
         l1Entries = l1Map.get(stepId)
@@ -6399,7 +6388,7 @@ function buildCustomLayoutPrompt(req: string): string {
             onClick={() => {
               invalidatePickState()
               setAddOpen((v) => !v); setViewOptionsOpen(false)
-              // 未选文件夹时默认 = D:\陈潘HBEU\Desktop\删除 下的当前时间戳子文件夹（仅空时预填）
+              // 未选文件夹时默认 = 本机默认项目父目录下的当前时间戳子文件夹（仅空时预填）
               prefillDefaultFolder()
             }}
           >{ICON_ADD}</button>
@@ -6590,6 +6579,7 @@ function buildCustomLayoutPrompt(req: string): string {
                   {updateCopied ? '✓ ' + t('update.copied') : <>{ICON_SPARK} {t('update.copyAi')}</>}
                 </button>
                 <button type="button" className="dsh-wt_updateBtn" onClick={skipUpdate}>{t('update.skip')}</button>
+                <button type="button" className="dsh-wt_updateBtn" onClick={() => { try { window.open('https://github.com/' + UPDATE_REPO + '/releases/latest', '_blank') } catch { /* 浏览器弹窗被拦：用户自己开 */ } }}>Releases 页</button>
               </div>
               <div className="dsh-wt_updateHint">{t('update.upgradeHint')}</div>
             </div>
