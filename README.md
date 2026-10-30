@@ -60,8 +60,10 @@ DeepSeek Harness 一体化助手插件：**悬浮球 → 控制室**，外加**�
 - **跨端同步**：项目、文件夹、绑定、模板进度与控制室视图存宿主（`/api/assistant/state`），手机与电脑第一次打开就一致，之后改动 5 秒内互推。
 - 添加项目保留模板库（空白 / 论文写作 / 迭代收敛）+ 布局 + 文件夹；不选时按时间 `YYYYMMDDHHmm` 自动新建。
 - **「添加项目」不跳出控制室**：弹窗浮在控制室之上；手机端「选择位置」打开的是**电脑文件夹浏览器**（不再触发电脑端系统对话框）。
+- **项目 × 对话联动（v0.2.10 修复）**：项目开着时，切到**项目之外**的会话会自动收起项目、回到普通会话布局。判定按「项目 = 文件夹」：模板项目里在各步会话之间来回切**不算离开**（它们都在项目文件夹下），私人助手（`~/.dsh/assistant`）则一定算离开。
+- **当前会话识别适配 DSH 0.2（v0.2.10）**：0.2 起「当前会话」落在 `uiWorkspace.selection` 快照里，`sessions.list` 快照不再有 `current` 字段；插件按 `selection` → `sessions.current` → 旧 `list.current` → `localStorage dsh.sessions.current` 依次兜底，并新增订阅 `uiWorkspace.selection`。此前恒读到空串，联动、会话列表「当前」高亮、关项目回切 prev 全部失效。
 
-### 私人助手（v0.2.9）
+### 私人助手（v0.2.10）
 
 不用开项目卡片，直接找「会记得你做过什么」的助手。
 
@@ -72,12 +74,13 @@ DeepSeek Harness 一体化助手插件：**悬浮球 → 控制室**，外加**�
 - **助手住在固定目录** `~/.dsh/assistant/`：`AGENTS.md`（人设 + 「什么时候直接做、什么时候建卡」+ 记忆规则，只在缺失时写入，不覆盖手改）、`journal/YYYY-MM-DD.md`（收工日志）、`notes/`（长期档案）、`outputs/`（杂物间）。
 - **家目录不会越用越臃肿**：会话日志根本不在这个目录（DSH 存在 `~/.dsh/sessions/<目录编码>/`），这里只有记忆资产 + 临时产物。`outputs/` 里超过 **14 天**的文件由插件每 6 小时自动清一次（`POST /api/assistant/tidy` 也可手动清），`journal/` `notes/` `AGENTS.md` 一概不碰。要长期保留的产物应该建卡，落进项目文件夹。
 - **每次打开都是新会话**：上下文不随使用无限增长；「记得你」靠 USER/MEMORY/AGENTS/journal 这套记忆，不靠一条会话的上下文。同目录同模式的空白会话会被复用，不堆空白；历史会话都在卡片「会话列表」里可回看。
+- **助手永远是单一会话布局（v0.2.10）**：打开助手前会先收起当前项目分栏工作区。此前在论文写作模板项目里长按悬浮球进助手，流程窗格 + 对话列一直挂着，看起来像「项目还在左右分屏」。
 - **默认 computer-use 模式**（能看屏幕、点界面）；dsh-orb 被停用时自动退回标准模式。
 - **默认沿用上一次的模型**：先读上一条助手会话实际在用的模型（用户可能在对话页换过），没有记录时退回本机上次选过的模型。
 - **记忆闭环**：热记忆（`USER.md` / `MEMORY.md` 每轮注入）+ 人设里的收工蒸馏（写 journal、更新记忆、纠正即覆盖）+ `mnemon` 检索；记忆真值在 `~/.mnemon/runtime/`。
 - 宿主路由：`GET /api/assistant/home`、`GET /api/assistant/memory`、`GET|POST /api/assistant/tidy`、`GET|POST /api/assistant/open-assistant`（热键/外部唤起，带 intent 复用悬浮球长轮询）。
 - 直达：`…/?assistant=chat` 或 `…/#assistant`。
-- **升级后需重启一次 DSH Desktop**：宿主新增的路由、全局热键与桌面球长按都要宿主重启才生效（只刷新页面只能拿到新客户端）。
+- **升级后需重启一次 DSH Desktop**：宿主新增的路由、全局热键与桌面球长按都要宿主重启才生效（只刷新页面只能拿到新客户端）。v0.2.10 改的全是客户端，刷新页面即可生效；**只要动过宿主侧代码（路由 / 热键 / 服务），就必须重启 DSH Desktop**。
 
 ### 手机访问（原 dsh-pocket 全套）
 
@@ -126,6 +129,7 @@ npm run check   # node --check 两个产物
 - `src/assistant-store.ts`：项目 / 视图跨端同步
 - `src/desktop-ball.ts`：Electron 原生桌面悬浮球
 - `src/client/index.tsx`：工作台客户端（控制室 / 分栏 / 模板流程）
+- `src/client/projectExit.ts`：「当前会话是否已离开这个项目」的纯判定（按项目文件夹，零依赖，`scripts/test-project-exit.mjs` 单测）
 - `src/client/projectFolderSheet.tsx`：新建 / 更改项目文件夹的「选择位置」（复用悬浮球那套 PathBrowser）
 - `src/client/clipboard.ts`：剪贴板写入（安全上下文走 Clipboard API，http 页面同步 execCommand 兜底）
 - `src/client/control-room.tsx`：悬浮球打开的全屏控制室
