@@ -1083,7 +1083,7 @@ function latestActivityOf(sid: string): string {
     if (fromEntries) return fromEntries
   } catch {}
   try {
-    const face = sessionFaceOf(sid)?.getSnapshot?.()
+    const face = sessionFaceSnapshotOf(sid)
     if (!face) return ''
     // 1) 流式中的这一轮：思考/正文还没进 nodes，只有 partial 里有
     const partialBlocks = Array.isArray(face.partial?.blocks) ? face.partial.blocks : []
