@@ -61,7 +61,7 @@ export function cachedJsonWrite(key: string, value: any): void {
   }
 }
 
-/** 显作废（外部改过这份键、或测试重置时用）。 */
+/** 显式作废（外部改过这份键、或测试重置时用）。 */
 export function invalidateCached(key: string): void {
   cache.delete(key)
 }

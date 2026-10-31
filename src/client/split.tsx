@@ -1,5 +1,6 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
 import { parentPathOf } from './pathutil'
+import { cachedJsonRead, cachedJsonWrite } from './localStore'
 import { filterWorkingCards } from './consoleFilter'
 import { sortSessionsByActivity } from './sessionRank'
 import { domGate, createGatedThrottle } from './compositionGate'
@@ -123,6 +124,8 @@ type SplitState = {
   observer: ResizeObserver | null
   fallback: MutationObserver | null
   yieldObserver: MutationObserver | null
+  /** 拖分隔线时合并落盘用的定时器 id（null = 没有待写的值） */
+  persistTimer: number | null
   lastMarginLeft: string
   lastMarginRight: string
   lastMarginTop: string
@@ -151,6 +154,9 @@ type SplitState = {
   /** 全屏布局：显示/隐藏对话列（仅内存态） */
   toggleChatPeek(): void
   persist(): void
+  /** 拖分隔线期间的落盘合并：值先进内存，松手 / 页面收尾再写一次 localStorage */
+  schedulePersist(): void
+  flushPersist(): void
   subscribe(fn: () => void): () => void
   notify(): void
 }
@@ -879,11 +885,18 @@ function resolveAnchor(root: HTMLElement): { header: HTMLElement | null; viewAre
   return { header, viewArea: second ?? first! }
 }
 
+/** 存档表（layoutId → 尺寸）读缓存：开布局 / 落盘都要读这一张表，内容没变不再重复 parse */
+function readPersistedMap(): Record<string, any> {
+  return cachedJsonRead(PERSIST_KEY, (raw) => {
+    if (!raw) return {}
+    const p = JSON.parse(raw)
+    return p && typeof p === 'object' ? p as Record<string, any> : {}
+  })
+}
+
 function loadSaved(layoutId: string): { chatW: number; chatWManual: boolean; topH: number; leftW: number; paneWs: number[]; topWs: number[]; leftWs: number[] } | null {
   try {
-    const raw = localStorage.getItem(PERSIST_KEY)
-    if (!raw) return null
-    const s = JSON.parse(raw)?.[layoutId]
+    const s = readPersistedMap()[layoutId]
     if (!s || typeof s !== 'object') return null
     return {
       chatW: Number.isFinite(s.chatW) ? s.chatW : -1,
@@ -901,10 +914,10 @@ function loadSaved(layoutId: string): { chatW: number; chatWManual: boolean; top
 
 function persistSaved(layoutId: string, s: { chatW: number; chatWManual: boolean; topH: number; leftW: number; paneWs: number[]; topWs: number[]; leftWs: number[] }) {
   try {
-    const raw = localStorage.getItem(PERSIST_KEY)
-    const all = raw ? JSON.parse(raw) : {}
+    // 缓存跟上刚写的内容：紧接着读不用重新 parse
+    const all = readPersistedMap()
     all[layoutId] = s
-    localStorage.setItem(PERSIST_KEY, JSON.stringify(all))
+    cachedJsonWrite(PERSIST_KEY, all)
   } catch {}
 }
 
@@ -936,6 +949,7 @@ export const splitStore: SplitState = {
   observer: null,
   fallback: null,
   yieldObserver: null,
+  persistTimer: null,
   lastMarginLeft: '',
   lastMarginRight: '',
   lastMarginTop: '',
@@ -1213,7 +1227,7 @@ export const splitStore: SplitState = {
     const hi = Math.max(spec.chatWidth.min, colW - minContent)
     this.chatW = clamp(Math.round(w), spec.chatWidth.min, hi)
     this.applyMargin()
-    this.persist()
+    this.schedulePersist()
     this.notify()
   },
 
@@ -1226,7 +1240,7 @@ export const splitStore: SplitState = {
     const hi = Math.max(lo, rowH - BAR_H - 80)
     this.topH = clamp(Math.round(h), lo, hi)
     this.applyMargin()
-    this.persist()
+    this.schedulePersist()
     this.notify()
   },
 
@@ -1239,7 +1253,7 @@ export const splitStore: SplitState = {
     const hi = Math.max(lo, colW - 260)
     this.leftW = clamp(Math.round(w), lo, hi)
     this.applyMargin()
-    this.persist()
+    this.schedulePersist()
     this.notify()
   },
 
@@ -1258,7 +1272,7 @@ export const splitStore: SplitState = {
     const next = this.paneWs.slice()
     next[i] = clamp(Math.round(w), lo, hi)
     this.paneWs = next
-    this.persist()
+    this.schedulePersist()
     this.notify()
   },
 
@@ -1275,7 +1289,7 @@ export const splitStore: SplitState = {
     const next = this.topWs.slice()
     next[i] = clamp(Math.round(w), lo, hi)
     this.topWs = next
-    this.persist()
+    this.schedulePersist()
     this.notify()
   },
 
@@ -1523,7 +1537,26 @@ export const splitStore: SplitState = {
     persistSaved(this.spec.id, { chatW: this.chatW, chatWManual: this.chatWManual, topH: this.topH, leftW: this.leftW, paneWs: this.paneWs, topWs: this.topWs, leftWs: this.leftWs })
   },
 
+  /** 拖分隔线时不逐事件落盘（读整张表 + parse + stringify + 写，每帧一次），改成合并写 */
+  schedulePersist() {
+    if (this.persistTimer != null) return
+    this.persistTimer = window.setTimeout(() => {
+      this.persistTimer = null
+      this.persist()
+    }, 180)
+  },
+
+  /** 立即补写（松手 / 页面收尾用） */
+  flushPersist() {
+    if (this.persistTimer == null) return
+    window.clearTimeout(this.persistTimer)
+    this.persistTimer = null
+    this.persist()
+  },
+
   close() {
+    // 拖到一半就关窗 / 换布局：先把没写完的存档补上（spec 即将置空，persist 会跳过）
+    this.flushPersist()
     if (this.root && this.root.isConnected) {
       if (this.savedWidthVar) this.root.style.setProperty('--dsh-chat-user-width', this.savedWidthVar)
       else this.root.style.removeProperty('--dsh-chat-user-width')
@@ -1585,27 +1618,51 @@ function makeDividerHandler(kind: 'left' | 'chat' | 'top' | 'pane' | 'topPane', 
     e.preventDefault()
     const target = e.currentTarget as HTMLElement
     try { target.setPointerCapture(e.pointerId) } catch {}
-    const onMove = (ev: PointerEvent) => {
+    // 分隔线拖拽：原来每个指针事件都跑一遍「换算宽 → 写 margin → 落盘 → 通知整棵工作区重渲染」。
+    // 同一帧里来多个指针事件（高频指针 + 高刷屏更明显）就会做几倍的工作，拖起来掉帧。
+    // 合并成「每帧一次」：宽度照最新指针位置算，最后一帧补一次落点，松手再补写存档。
+    let pending: { x: number; y: number } | null = null
+    let frame: number | null = null
+    const apply = (x: number, y: number) => {
       const g = splitStore.geom
       if (!g) return
       if (kind === 'left') {
-        splitStore.setLeftW(ev.clientX - g.left)
+        splitStore.setLeftW(x - g.left)
       } else if (kind === 'chat') {
-        splitStore.setChatW(g.right - ev.clientX)
+        splitStore.setChatW(g.right - x)
       } else if (kind === 'top') {
-        splitStore.setTopH(ev.clientY - g.top - BAR_H)
+        splitStore.setTopH(y - g.top - BAR_H)
       } else if (kind === 'pane' && index != null) {
         const prefix = splitStore.paneWs.slice(0, index).reduce((a, b) => a + b, 0) + index * GAP
-        splitStore.setPaneW(index, ev.clientX - (g.left + prefix))
+        splitStore.setPaneW(index, x - (g.left + prefix))
       } else if (kind === 'topPane' && index != null) {
         const prefix = splitStore.topWs.slice(0, index).reduce((a, b) => a + b, 0) + index * GAP
-        splitStore.setTopW(index, ev.clientX - (g.left + prefix))
+        splitStore.setTopW(index, x - (g.left + prefix))
       }
+    }
+    const onMove = (ev: PointerEvent) => {
+      pending = { x: ev.clientX, y: ev.clientY }
+      if (frame != null) return
+      frame = window.requestAnimationFrame(() => {
+        frame = null
+        const p = pending
+        pending = null
+        if (p) apply(p.x, p.y)
+      })
     }
     const onUp = () => {
       target.removeEventListener('pointermove', onMove)
       target.removeEventListener('pointerup', onUp)
       target.removeEventListener('pointercancel', onUp)
+      if (frame != null) {
+        window.cancelAnimationFrame(frame)
+        frame = null
+        // 松手时最后一帧没跑过：补上，落点不丢
+        const p = pending
+        pending = null
+        if (p) apply(p.x, p.y)
+      }
+      splitStore.flushPersist()
     }
     target.addEventListener('pointermove', onMove)
     target.addEventListener('pointerup', onUp)
