@@ -140,11 +140,14 @@ export function Composer({
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const imageInputRef = useRef<HTMLInputElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
-  /** 录音态：elapsed 秒 + 实时电平（0~1）。null = 没在录音。 */
+  /** 录音态：null = 没在录音。计时文本与 12 根波形条由「录音条自己按帧写 DOM」维护（见 meterRef），
+   *  这份状态只在开始 / 结束各设一次：原来每 120ms setState 会把整棵 Composer（输入框、附件、/ 弹层）重渲染 500 次，
+   *  最长 60 秒的录音期间就是连续掉帧；DOM 直写只动那两行元素。 */
   const [rec, setRec] = useState<{ elapsed: number; level: number } | null>(null)
   const [transcribing, setTranscribing] = useState(false)
   const captureRef = useRef<MicCapture | null>(null)
-  const tickRef = useRef<number | null>(null)
+  const meterRef = useRef<{ raf: number | null; guard: number | null; lastPaint: number } | null>(null)
+  const recRowRef = useRef<HTMLDivElement | null>(null)
   const audioInputRef = useRef<HTMLInputElement | null>(null)
 
   /** 把转写结果接到草稿后面（已有内容结尾是标点/空白就不再补空格）。 */
@@ -196,10 +199,25 @@ export function Composer({
     }
   }
 
-  const stopTick = (): void => {
-    if (tickRef.current !== null) {
-      window.clearInterval(tickRef.current)
-      tickRef.current = null
+  const stopMeter = (): void => {
+    const meter = meterRef.current
+    meterRef.current = null
+    if (meter === null) return
+    if (meter.raf !== null) window.cancelAnimationFrame(meter.raf)
+    if (meter.guard !== null) window.clearInterval(meter.guard)
+  }
+
+  /** 波形条与计时文本：同一棵录音条，按帧写（120ms 与原节奏一致） */
+  const paintMeter = (capture: MicCapture, startedAt: number): void => {
+    const row = recRowRef.current
+    if (row === null) return
+    const elapsed = Math.floor((Date.now() - startedAt) / 1000)
+    const level = capture.level()
+    const timeEl = row.querySelector('[data-pocket-orb="rec-time"]')
+    if (timeEl !== null) timeEl.textContent = `${elapsed}s`
+    const bars = row.querySelectorAll('[data-pocket-orb="rec-bar"]')
+    for (let i = 0; i < bars.length; i++) {
+      ;(bars[i] as HTMLElement).style.height = `${Math.round(4 + 20 * level * (0.55 + 0.45 * Math.sin(i * 1.7 + elapsed)))}px`
     }
   }
 
@@ -209,7 +227,7 @@ export function Composer({
     const capture = captureRef.current
     if (capture === null) return
     captureRef.current = null
-    stopTick()
+    stopMeter()
     setRec(null)
     setTranscribing(true)
     try {
@@ -230,7 +248,7 @@ export function Composer({
     const capture = captureRef.current
     if (capture === null) return
     captureRef.current = null
-    stopTick()
+    stopMeter()
     capture.cancel()
     setRec(null)
   }
@@ -272,12 +290,26 @@ export function Composer({
     setRec({ elapsed: 0, level: 0 })
     const startedAt = Date.now()
     const limit = voice.maxSeconds || 60
-    tickRef.current = window.setInterval(() => {
-      const elapsed = Math.floor((Date.now() - startedAt) / 1000)
-      setRec((cur) => (cur === null ? cur : { ...cur, elapsed, level: capture.level() }))
+    const meter = { raf: null as number | null, guard: null as number | null, lastPaint: 0 }
+    meterRef.current = meter
+    const paint = (): void => {
+      if (meterRef.current !== meter) return
+      const now = Date.now()
+      // 与原节奏一致（原一轮就是 120ms 一次电平），只到点才写那两行 DOM
+      if (now - meter.lastPaint >= 120) {
+        meter.lastPaint = now
+        paintMeter(capture, startedAt)
+      }
       // 到上限自动收：Host 会拒收超长音频，不能等用户自己发现。
-      if (elapsed >= limit) void finishRecording()
-    }, 120)
+      if (Math.floor((now - startedAt) / 1000) >= limit) { void finishRecording(); return }
+      meter.raf = window.requestAnimationFrame(paint)
+    }
+    meter.raf = window.requestAnimationFrame(paint)
+    // 页面被盖到后台时 rAF 会停摆：这条轻量计时器只管「超时自动收」，不碰 React 状态
+    meter.guard = window.setInterval(() => {
+      if (meterRef.current !== meter) return
+      if (Math.floor((Date.now() - startedAt) / 1000) >= limit) void finishRecording()
+    }, 250)
   }
 
   const onMicClick = (): void => {
@@ -287,19 +319,46 @@ export function Composer({
 
   // 卸载时必须释放麦克风，否则轨道会一直亮着录音指示灯。
   useEffect(() => () => {
-    stopTick()
+    stopMeter()
     captureRef.current?.cancel()
     captureRef.current = null
   }, [])
 
   // 自适应增高（40vh 封顶）。
+  // 原来每按一个键都做一次「读高度 → 写高度 → 再读 scrollHeight」的强制同步布局；
+  // 按得快的样子：先写死高度再量 scrollHeight 就是 layout 抖动。合并成同一帧只量一次。
+  const viewportHRef = useRef(0)
+  const autosizeFrameRef = useRef<number | null>(null)
   const autosize = (): void => {
     const el = textareaRef.current
     if (el === null) return
+    if (viewportHRef.current <= 0) viewportHRef.current = window.innerHeight
     el.style.height = 'auto'
-    el.style.height = `${Math.min(el.scrollHeight, window.innerHeight * 0.4)}px`
+    el.style.height = `${Math.min(el.scrollHeight, viewportHRef.current * 0.4)}px`
   }
-  useEffect(autosize, [value])
+  const autosizeSoon = (): void => {
+    if (autosizeFrameRef.current !== null) return
+    autosizeFrameRef.current = window.requestAnimationFrame(() => {
+      autosizeFrameRef.current = null
+      autosize()
+    })
+  }
+  useEffect(() => { autosizeSoon() }, [value])
+  // 键盘弹出 / 旋屏：40vh 封顶跟着视口走（原实现是每次按键顺手读 innerHeight，这里改成读一次 + 监听）
+  useEffect(() => {
+    const onResize = (): void => {
+      viewportHRef.current = window.innerHeight
+      autosizeSoon()
+    }
+    window.addEventListener('resize', onResize)
+    return () => {
+      window.removeEventListener('resize', onResize)
+      if (autosizeFrameRef.current !== null) {
+        window.cancelAnimationFrame(autosizeFrameRef.current)
+        autosizeFrameRef.current = null
+      }
+    }
+  }, [])
 
   // / 弹层：首行以 / 开头时弹出，按输入过滤（命令 + 技能，与桌面一致）。
   const slashMatch = value.match(/^\/([a-z0-9_-]*)/i)
@@ -378,7 +437,7 @@ export function Composer({
         </span>
         <div data-pocket-orb="input-shell">
           {rec !== null ? (
-            <div data-pocket-orb="rec-row">
+            <div data-pocket-orb="rec-row" ref={recRowRef}>
               <span data-pocket-orb="rec-dot" aria-hidden="true" />
               <span data-pocket-orb="rec-time">{rec.elapsed}s</span>
               <span data-pocket-orb="rec-bars" aria-hidden="true">
