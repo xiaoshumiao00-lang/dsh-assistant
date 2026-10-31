@@ -17,6 +17,7 @@ import { apply as tuoguanApply } from './tuoguan.tsx'
 import { POCKET_RPC_CHANNEL } from './pocket/api.js'
 import { NS as POCKET_NS } from './pocket/pocket-locales.js'
 import { installComposerMenuToggle } from './composerMenu'
+import { installCompositionGate } from './compositionGate'
 import { openAssistant, assistantUrlIntent } from './assistant-entry.ts'
 import { loadAssistantConfig } from './assistant-config.ts'
 import { applyPersonalTerms } from './pocket/orb/asr-terms.ts'
@@ -44,6 +45,14 @@ export function apply(ctx: any): void {
     const dispose = installComposerMenuToggle()
     ctx.effect(() => dispose, 'dsh-assistant: composer menu toggle')
   } catch { /* 非浏览器环境或旧宿主无输入框时忽略 */ }
+
+  // 组合输入 / 抽屉动画闸门：用户在输入框里打字（尤其手机语音输入法的实时转写）
+  // 或抽屉正在开合时，插件自己的整页扫描、DOM 补丁、日志抓取轮询一律让路。
+  // 见 src/client/compositionGate.ts（判据与单测）。
+  try {
+    const off = installCompositionGate()
+    ctx.effect(() => off, 'dsh-assistant: composition gate')
+  } catch { /* 旧宿主没有 composition 事件也不该影响装配 */ }
 
   // 控制室/工作台共用一套宿主调用（模型目录、选模型、后台模型、带预设建会话）。
   // 必须等 remote.session / uiWorkspace 等 Remote 服务注入后再建 API——直接拿根 ctx

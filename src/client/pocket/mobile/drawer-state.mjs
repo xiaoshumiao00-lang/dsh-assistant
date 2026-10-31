@@ -17,6 +17,8 @@
 //
 // 纯函数 + 依赖注入（storage / findFrame / expandSidebar），node 单测不需要 DOM。
 
+import { domGate, INTERACTION_PAUSE_MS } from '../../compositionGate.ts'
+
 /** localStorage key：值为 'open' | 'closed'；读不到一律按 'closed'（默认关）。 */
 export const DRAWER_PREF_KEY = 'dsh-pocket.drawer'
 
@@ -188,6 +190,8 @@ export function createDrawerController({
       // 也会在 auto 布局里和用户自己的切换互相打架 —— 现在不再这么用。
       try { expandSidebar() } catch { /* 宿主没给 layout 服务：抽屉照样能开 */ }
     }
+    // 与抽屉 chrome 同一条纪律：开合动画窗口里插件自己的扫描/补丁让路。
+    domGate?.pause?.(INTERACTION_PAUSE_MS)
     open = next === true
     setDrawerMarker(frame, open)
     writeDrawerPref(open, storage)

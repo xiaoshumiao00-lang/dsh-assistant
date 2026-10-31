@@ -683,6 +683,8 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_sessItemCur{background:rgba(79,142,247,.14);color:var(--wt-text)}',
   '.dsh-wt_sessDot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--wt-text3)}',
   '.dsh-wt_sessDotRun{background:var(--dsw-alias-state-accent-primary,#4f8ef7);box-shadow:0 0 6px rgba(79,142,247,.85)}',
+  // 黄点（等你回答）排在蓝点之后声明：原生 UI 与卡片状态灯都是「黄优先于蓝」，列表镜像必须一致
+  '.dsh-wt_sessDotNeed{background:var(--dsw-alias-state-warning,#d29922);box-shadow:0 0 6px rgba(210,153,34,.85)}',
   '.dsh-wt_sessName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
   '.dsh-wt_sessRel{flex:none;max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;color:var(--wt-text3);transition:opacity .12s}',
   '.dsh-wt_sessEmpty{padding:16px 6px;text-align:center;font-size:11px;color:var(--wt-text3)}',

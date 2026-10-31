@@ -119,6 +119,27 @@ patcher.flush()
 assert.equal(hiddenTarget.dataset.dshpModelNotice, '1')
 assert.equal(hiddenTarget.children[0].nodeValue, NOTICE)
 
+// 输入框那一棵树里的节点一律不进队列（宿主 Lexical 每个字都在换文本节点）：
+// 手机语音输入法的实时转写期间，这些 mutation 每秒都来一打。
+const composerText = { nodeType: 3, nodeValue: 'lib/proxy.mjs', isConnected: true }
+composerText.parentElement = { closest: (sel) => (sel === '[data-composer-card]' ? {} : null) }
+assert.equal(patcher.collect([{ type: 'childList', addedNodes: [composerText] }]
+), false, '输入框里的节点不该进队列')
+assert.equal(patcher.collect([{ type: 'characterData', target: composerText }]
+), false, '输入框里的文本节点改不动，也不该排进队列')
+patcher.flush()
+assert.equal(composerText.nodeValue, 'lib/proxy.mjs', '输入框里的文本一字不改')
+
+// 队列有上限：长会话流式渲染期间只留最新 800 个节点，绝不无界增长。
+walkerRoots.length = 0
+visited = 0
+const many = Array.from({ length: 900 }, () => element([text('普通流式内容')]))
+patcher.collect(many.map((node) => ({ type: 'childList', addedNodes: [node] })
+))
+patcher.flush()
+assert.equal(walkerRoots.length, 800, '队列必须封顶，处理量不跟着渲染跑')
+assert.equal(visited, 800, '封顶后只扫留下的 800 份新节点，不跟着整篇渲染跑')
+
 delete globalThis.document
 delete globalThis.Node
 delete globalThis.NodeFilter

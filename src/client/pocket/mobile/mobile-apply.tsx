@@ -22,8 +22,13 @@ import {
   shouldShowLayoutBadge,
 } from './layout-mode.mjs'
 import { createDrawerController, findFrame } from './drawer-state.mjs'
+import { startFeaturePresenceWatch } from './featurePresence.mjs'
 import { mountDrawerChrome, showHealToast } from './drawer-chrome.ts'
+import { domGate, createGatedThrottle, insideComposer, setVoiceReporter, createVoiceTally } from '../../compositionGate.ts'
 import { reportMobileError, reportMobileStage, schedulePostMobileProbes } from '../orb/diag.ts'
+
+/** dsh-web-ui 的 explorer/preview 列最长等待窗口：过了就不为它保留整页观察。 */
+const AIONUI_PRESENCE_MS = 15000
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -42,20 +47,13 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
  * 一帧里可能有成百上千条 mutation 记录，原样触发就是 O(N×M) 的 CPU 尖峰——
  * 页面越重越卡，正是长会话详情把 WebView 顶到被系统杀掉、整页 reload 的推手之一。
  * 合并成每帧/每 300~500ms 一次后，观察者本身的开销可以忽略。
+ *
+ * 2026-10-31：这条老节流器不再自己算时间，统一交给 createGatedThrottle ——
+ * 用户在输入框里打字（含手机语音输入法的实时转写）或抽屉正在开合时它先让路，
+ * 到点不跑但也不丢：批次留到窗口结束照样补跑。
  */
 function throttleByFrame(run: () => void, waitMs = 300): () => void {
-  let timer: number | null = null
-  let last = 0
-  return () => {
-    if (timer !== null) return
-    const now = Date.now()
-    const delay = Math.max(0, Math.min(waitMs, last + waitMs - now))
-    timer = window.setTimeout(() => {
-      timer = null
-      last = Date.now()
-      run()
-    }, delay)
-  }
+  return createGatedThrottle({ run, gate: domGate, waitMs })
 }
 
 /**
@@ -172,6 +170,86 @@ export function mobileApply(ctx): void {
     }, label)
   }
 
+  /**
+   * 「宿主真的有 dsh-web-ui 那两列」才挂的整页观察者容器。
+   * 本机跑的是纯 DeepSeek Harness：没有 [data-aionui-*] 列，原来这三个观察者等于
+   * 永久挂着，每次 DOM 变更都排一批 querySelector + getComputedStyle —— 抽屉开合卡顿
+   * 与语音输入中途被打断都有一部分来自这里。见 featurePresence.mjs。
+   */
+  const presenceWatches: Array<{ recheck: () => void }> = []
+  const gatedPageObserver = (
+    label: string,
+    selectors: string[],
+    install: () => (void | (() => void)),
+    options: { timeoutMs?: number } = {},
+  ): void => {
+    safeEffect(() => {
+      if (!narrow.matches) return () => {}
+      let inner: (() => void) | null = null
+      let installed = false
+      const stopInner = (): void => {
+        const dispose = inner
+        inner = null
+        installed = false
+        try { dispose?.() } catch (error) { reportMobileError(`${label} (observer off)`, error) }
+      }
+      const watch = startFeaturePresenceWatch({
+        selectors,
+        timeoutMs: options.timeoutMs,
+        onActive: () => {
+          if (installed) return () => {}
+          installed = true
+          try {
+            const dispose = install()
+            inner = typeof dispose === 'function' ? dispose : null
+          } catch (error) {
+            reportMobileError(label, error)
+          }
+          return stopInner
+        },
+      })
+      presenceWatches.push(watch)
+      return () => {
+        const slot = presenceWatches.indexOf(watch)
+        if (slot >= 0) presenceWatches.splice(slot, 1)
+        watch.dispose()
+        stopInner()
+      }
+    }, label)
+  }
+
+  safeEffect(() => {
+    const onPresenceChange = (): void => {
+      for (const watch of presenceWatches) {
+        try { watch.recheck() } catch { /* 重新确认失败不影响布局切换 */ }
+      }
+    }
+    narrow.addEventListener('change', onPresenceChange)
+    return () => narrow.removeEventListener('change', onPresenceChange)
+  }, 'dsh-mobile-nav: presence re-arm on layout change')
+
+  // 语音探针：把「说几个词就自己停」变成诊断流水里的数字（说了几段 / 进去多少字 /
+  // 有几段没等到 compositionend 就被中止）。探针只读不写，见 compositionGate.ts。
+  // 可疑中止立刻发一条；正常打字每 20 段合并发一条，不把 beacon 打成每敲一下一发。
+  safeEffect(() => {
+    const tally = createVoiceTally()
+    const flush = (): void => {
+      const snapshot = tally.snapshot()
+      if (snapshot.n === 0) return
+      tally.reset()
+      reportMobileStage('voice-compose', snapshot)
+    }
+    setVoiceReporter((sample) => {
+      if (tally.bump(sample)) flush()
+    })
+    return () => {
+      setVoiceReporter(null)
+      try {
+        flush()
+      } catch { /* 收尾上报失败不影响卸载 */ }
+    }
+  }, 'dsh-mobile-nav: voice composition probe')
+
   // 词典先注册（slot 贡献用 locale: NS 拿 t；渲染发生在 apply 返回之后，
   // 但注册失败要让 beacon 看得见，否则三个入口会带着缺失的词典渲染）。
   safeEffect(() => ctx.locale.register(NS, { zh, en }), 'dsh-mobile-nav: dictionaries')
@@ -239,6 +317,10 @@ export function mobileApply(ctx): void {
       } catch (error) {
         reportMobileError('downloadSessionLog', error)
       }
+    },
+    // 开抽屉的实测延迟上报（点击 → 真的开始滑）：诊断包里看得见，别只凭猜判断卡顿来源。
+    onMeasure: (info) => {
+      reportMobileStage('drawer-open', { ms: info.ms, up: info.upgrade === true })
     },
   }), 'dsh-mobile-nav: drawer chrome')
 
@@ -375,15 +457,22 @@ export function mobileApply(ctx): void {
     const check = () => {
       const has = document.querySelector('[data-aionui-explorer-col]') !== null
       frame()?.setAttribute('data-mobile-nav-explorer', has ? '1' : '0')
+      return has
     }
-    const schedule = throttleByFrame(check, 400)
-    check()
-    const timer = window.setTimeout(check, 1500) // 宿主懒渲染：稍后再查一次
-    const observer = new MutationObserver(schedule)
-    observer.observe(document.body, { childList: true, subtree: true })
+    // 原来这里是「body 全量 childList 观察者 + 每批变更查一次」：本机是纯 DeepSeek
+    // Harness，永远等不到那两列，观察者却永久挂着，每次打字 / 流式渲染都排一次整页扫描。
+    // 换成有界轮询：窗口内查得到就标记 '1'，查不到就不再观察（零成本）。
+    if (check()) return () => {}
+    const watch = startFeaturePresenceWatch({
+      selectors: ['[data-aionui-explorer-col]'],
+      timeoutMs: AIONUI_PRESENCE_MS,
+      onActive: () => { check(); return () => {} },
+    })
+    presenceWatches.push(watch)
     return () => {
-      window.clearTimeout(timer)
-      observer.disconnect()
+      const slot = presenceWatches.indexOf(watch)
+      if (slot >= 0) presenceWatches.splice(slot, 1)
+      watch.dispose()
     }
   }, 'dsh-mobile-nav: explorer availability (issue #48)')
 
@@ -395,8 +484,7 @@ export function mobileApply(ctx): void {
   // the user actually taps a file row in the explorer sheet, and clears it
   // whenever the suite hides the column again (collapse chevron / tab
   // close), so a restored-but-unwanted sheet never appears.
-  safeEffect(() => {
-    if (!narrow.matches) return () => {}
+  gatedPageObserver('dsh-mobile-nav: preview sheet open marker', ['[data-aionui-preview-col]'], () => {
     const frame = (): HTMLElement | null => document.querySelector('[data-mobile-nav="frame"]')
     const onTap = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null
@@ -409,7 +497,7 @@ export function mobileApply(ctx): void {
       if (pv === null) return
       if (getComputedStyle(pv).visibility === 'hidden') frame()?.removeAttribute('data-aionui-preview-open')
     }
-    const schedule = throttleByFrame(sync, 300)
+    const schedule = createGatedThrottle({ run: sync, gate: domGate, waitMs: 300 })
     document.addEventListener('click', onTap, true)
     const observer = new MutationObserver(schedule)
     observer.observe(document.body, { attributes: true, subtree: true, attributeFilter: ['style'] })
@@ -418,7 +506,7 @@ export function mobileApply(ctx): void {
       document.removeEventListener('click', onTap, true)
       observer.disconnect()
     }
-  }, 'dsh-mobile-nav: preview sheet open marker')
+  })
 
   // The official conversation status row (turns / steps / LLM time / TTFT /
   // cache) has a hashed class, so the stylesheet cannot target it directly.
@@ -440,6 +528,9 @@ export function mobileApply(ctx): void {
         const text = (el.textContent ?? '').trim()
         if (!/^TPS\s+\d/.test(text)) continue
         if (el.children.length > 0) continue
+        // 一律不碰编辑器自己（contenteditable）里的节点：把里面的东西搬出去 = 宿主
+        // Lexical 重建树节点 = 手机语音 / 拼音输入当场中断。
+        if (insideComposer(el, '[contenteditable="true"]')) continue
         stats.appendChild(el)
         return
       }
@@ -454,7 +545,9 @@ export function mobileApply(ctx): void {
         return
       }
     }
-    const schedule = throttleByFrame(mark, 300)
+    // createGatedThrottle：用户在输入框里打字（含语音实时转写）或抽屉正在开合时不跑，
+    // 到点了也不会丢——它会自己重来，统计行照样折叠。
+    const schedule = createGatedThrottle({ run: mark, gate: domGate, waitMs: 300 })
     const observer = new MutationObserver(schedule)
     observer.observe(document.body, { childList: true, subtree: true })
     mark()
@@ -468,8 +561,7 @@ export function mobileApply(ctx): void {
   // sheets would only animate on first mount. Replay the rise animation
   // with the Web Animations API each time a column turns visible, then
   // leave the resting state to the stylesheet.
-  safeEffect(() => {
-    if (!narrow.matches) return () => {}
+  gatedPageObserver('dsh-mobile-nav: sheet rise animation replay', ['[data-aionui-explorer-col]', '[data-aionui-preview-col]'], () => {
     const cols = ['[data-aionui-explorer-col]', '[data-aionui-preview-col]']
     const seen = new Map<string, boolean>()
     const play = (el: Element): void => {
@@ -505,7 +597,7 @@ export function mobileApply(ctx): void {
       observer.disconnect()
       if (frame !== null) window.cancelAnimationFrame(frame)
     }
-  }, 'dsh-mobile-nav: sheet rise animation replay')
+  })
 
   // 移动端文件守卫（issue #17 修正）：手机上点 dsh-web 渲染的文件链接会触发桌面
   // 端 workspaces.openPath(open ...) —— 既打不开（路径在电脑上），又会抛
@@ -554,7 +646,8 @@ export function mobileApply(ctx): void {
     if (!narrow.matches) return () => {}
     const patcher = createModelSettingsNoticePatcher()
     // 1.5s 合并一次：提示更新节奏不变，但扫描范围从 document.body 降为实际变更节点。
-    const schedule = throttleByFrame(patcher.flush, 1500)
+    // 走闸门版本：用户正在输入框里打字 / 抽屉开合时先让路，队列不丢（见 compositionGate.ts）。
+    const schedule = createGatedThrottle({ run: () => patcher.flush(), gate: domGate, waitMs: 1500, skipMs: 1500 })
     const observer = new MutationObserver((mutations) => {
       if (patcher.collect(mutations)) schedule()
     })

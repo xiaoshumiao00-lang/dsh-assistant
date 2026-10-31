@@ -1,6 +1,8 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
 import { parentPathOf } from './pathutil'
 import { filterWorkingCards } from './consoleFilter'
+import { sortSessionsByActivity } from './sessionRank'
+import { domGate, createGatedThrottle } from './compositionGate'
 import { observeExternalSplit } from './splitObserver'
 import { ANNOUNCE_BODY, ANNOUNCE_HEAD } from './changelog'
 import { LOCAL_VERSION, UPGRADE_AI, checkUpdate, getAutoCheck, readCache, setAutoCheck as storeAutoCheck, setSkipVersion, type UpdateInfo, type UpdateStatus } from './updateCheck'
@@ -271,6 +273,8 @@ export type ProjectSessionItem = {
   current: boolean
   /** 是否正在运行 */
   running: boolean
+  /** 正在等你回答（黄点优先于蓝点；与卡片状态灯同一口径） */
+  awaiting?: boolean
   /** 空白会话（还没有消息） */
   blank: boolean
   /** 最近更新毫秒时间戳（未知为 0） */
@@ -1053,12 +1057,19 @@ export const splitStore: SplitState = {
     this.observer.observe(root)
     // 兜底：会话根被替换/子结构变化（如 hero→active 头部出现）时 RO 可能不再回调，
     // 用 body 级 MutationObserver 驱动重锚定；锚点未变时静默（避免流式消息期间高频刷新）
-    this.fallback = new MutationObserver(() => {
-      const r = this.root
-      if (!(r && r.isConnected)) { this.syncAnchor(); return }
-      const anchor = resolveAnchor(r)
-      if (anchor.header !== this.header || anchor.viewArea !== this.viewArea) this.syncAnchor()
+    // 2026-10-31：这一路的 resolveAnchor 是「会话根子树里找锚点」扫描，手机长会话下
+    // 用户一边打字一边语音转写就是一批批扫描。合并 300ms 一次，组合 / 抽屉开合时让路。
+    const fallbackRun = createGatedThrottle({
+      run: () => {
+        const r = this.root
+        if (!(r && r.isConnected)) { this.syncAnchor(); return }
+        const anchor = resolveAnchor(r)
+        if (anchor.header !== this.header || anchor.viewArea !== this.viewArea) this.syncAnchor()
+      },
+      gate: domGate,
+      waitMs: 300,
     })
+    this.fallback = new MutationObserver(fallbackRun)
     this.fallback.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-phase'] })
     // 让位观察器：会话视图区 margin 被外部改写（其他未接入协议的分栏引擎接管）时关闭自身
     this.yieldObserver = new MutationObserver(() => {
@@ -2584,8 +2595,7 @@ export function ConsolePane() {
     e.stopPropagation()
     setSessPop((prev) => prev ? {
       ...prev,
-      items: prev.items.map((i) => i.id === s.id ? { ...i, pinned: !i.pinned } : i)
-        .sort((a, b) => (Number(!!b.pinned) - Number(!!a.pinned)) || (b.updatedAt - a.updatedAt)),
+      items: sortSessionsByActivity(prev.items.map((i) => i.id === s.id ? { ...i, pinned: !i.pinned } : i)),
     } : prev)
     splitEnv?.console?.onPinSession?.(s.id, !s.pinned)
   }
@@ -2813,7 +2823,7 @@ export function ConsolePane() {
                         <svg width="11" height="11" viewBox="0 0 16 16" aria-hidden><path d="M9.7 1.6 14.4 6.3l-1.6 1.6-1-.4-2.8 2.8.3 2.2-1.2 1.2-3-3L1.7 14l-.6-.6 3.3-3.4-3-3 1.2-1.2 2.2.3L7.6 3.3l-.4-1z" fill="currentColor" /></svg>
                       </span>
                     )}
-                    <span className={'dsh-wt_sessDot' + (s.running ? ' dsh-wt_sessDotRun' : '')} aria-hidden />
+                    <span className={'dsh-wt_sessDot' + (s.awaiting ? ' dsh-wt_sessDotNeed' : (s.running ? ' dsh-wt_sessDotRun' : ''))} aria-hidden />
                     {editingId === s.id ? (
                       <input
                         className="dsh-wt_sessRenameInput"
@@ -2833,6 +2843,7 @@ export function ConsolePane() {
                       <span className="dsh-wt_sessName">{s.title || T('console.untitled')}</span>
                     )}
                     {s.archived && <span className="dsh-wt_sessTag">{T('console.archivedTag')}</span>}
+                    {s.awaiting && !s.archived && !s.running && <span className="dsh-wt_sessTag">{T('console.needTag')}</span>}
                     {s.finished && !s.archived && <span className="dsh-wt_sessTag dsh-wt_sessFinishedTag">{T('console.finishedTag')}</span>}
                     {!s.archived && <span className="dsh-wt_sessRel">{s.rel || T('console.sessionRoot')}</span>}
                     {editingId == null && (
@@ -3395,7 +3406,11 @@ function GitPane() {
 function JobsPane() {
   const [, setTick] = useState(0)
   useEffect(() => {
-    const timer = window.setInterval(() => setTick((t) => t + 1), 2000)
+    const timer = window.setInterval(() => {
+      // 2 秒一次强制重渲染：输入框组合中 / 抽屉开合中先让路（下一轮照旧补上）。
+      if (domGate.isPaused()) return
+      setTick((t) => t + 1)
+    }, 2000)
     return () => window.clearInterval(timer)
   }, [])
   const jobs = splitEnv?.getJobs?.() ?? []

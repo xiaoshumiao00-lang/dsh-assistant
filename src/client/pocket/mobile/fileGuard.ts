@@ -15,11 +15,14 @@
 // 就带复制，守卫再插一个等于把地址栏撑成两行。
 
 import { copyTextToClipboard } from '../../clipboard.ts'
+import { domGate, insideComposer } from '../../compositionGate.ts'
 
 /** 手机上点击文件时弹出的提示。 */
 const GUARD_MSG = '手机上无法直接打开电脑上的文件'
 /** 「添加工作区」入口的文案（随语言变化），两种都覆盖。 */
 const WS_LABELS = ['添加工作区', '添加工作区…', 'Add workspace', 'Add workspace…']
+/** 让路窗口结束后再来一次（合并到 400ms 一次，和原来的节流同量级）。 */
+const ADDITIONS_RETRY_MS = 400
 /** 复制按钮文案。 */
 const COPY_LABEL = '复制'
 
@@ -118,6 +121,9 @@ export function startFileGuard(
     if (el.getAttribute('data-mobile-nav-copy') === '1') return
     if (el.getAttribute('data-mobile-nav') === 'copy-file') return
     if (isOwnUi(el)) return // 地址栏/面包屑自己有复制，别再插一个
+    // 一律不往输入框里塞东西：插件在宿主 Lexical contenteditable 里改 DOM，
+    // 手机语音输入法（微信键盘 / 讯飞的实时转写）的组合就被打断，说几个词就自己停。
+    if (insideComposer(el)) return
     const txt = (el.textContent ?? '').trim()
     if (!looksLikeFilePath(txt)) return
     el.setAttribute('data-mobile-nav-copy', '1')
@@ -163,6 +169,14 @@ export function startFileGuard(
   const pending = new Set<Node>()
   let scheduled = false
   const flushAdditions = (): void => {
+    // 用户在输入框里打字 / 语音实时转写期间不做任何 DOM 改写；批次不丢，等窗口结束再跑。
+    if (domGate.isPaused()) {
+      if (pending.size > 0 && !scheduled) {
+        scheduled = true
+        window.setTimeout(flushAdditions, ADDITIONS_RETRY_MS)
+      }
+      return
+    }
     scheduled = false
     const batch = [...pending]
     pending.clear()
@@ -213,6 +227,7 @@ export function startFileGuard(
     const checkOne = (node: Node): void => {
       if (node.nodeType !== 1) return
       const el = node as HTMLElement
+      if (insideComposer(el)) return // 输入框里的节点一律不改（语音 / 拼音输入被打断的老因）
       const txt = (el.getAttribute('aria-label') ?? el.textContent ?? '').trim()
       if (WS_LABELS.includes(txt)) {
         el.style.display = 'none'

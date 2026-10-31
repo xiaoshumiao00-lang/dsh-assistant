@@ -415,6 +415,23 @@ const NARROW_RULES = `
     border-right: none !important;
   }
 
+  /* 抽屉右上角那颗「打开侧边栏」（官方 logoRow 的 toggle）：用户判定它在手机上没用
+     —— 抽屉本身就是完整菜单，"再来一条常驻左栏"只是把屏幕挤坏。这里只收掉抽屉那一列
+     里的这颗按钮：电脑布局的侧栏、会话头右侧的「打开右侧边栏」都不在范围内，官方键盘
+     快捷键（sidebar.left.toggle）照常生效，桌面端用户仍能把侧栏收回收起。
+     判据两条：CSS-modules 的稳定后缀 _toggle（哈希前缀每次构建都变，只匹配后缀），
+     外加 aria-label 兜底（万一宿主换了 class 命名法）。两条都限定在抽屉那一列的
+   logoRow（data-window-drag）里面，绝不碰会话列表行、也不碰输入框。 */
+  [data-mobile-nav="frame"] > :first-child [data-window-drag] button[class*="_toggle"] {
+    display: none !important;
+  }
+  [data-mobile-nav="frame"] > :first-child [data-window-drag] button[aria-label="打开侧边栏"] {
+    display: none !important;
+  }
+  [data-mobile-nav="frame"] > :first-child [data-window-drag] button[aria-label="收起侧边栏"] {
+    display: none !important;
+  }
+
   /* Open state = our own drawer marker (改造 #1/#5). The official
      [data-sidebar-collapsed] is no longer an open-state anchor: mobileApply only
      ever *raises* the official sidebar out of the icon-rail state (first drawer
