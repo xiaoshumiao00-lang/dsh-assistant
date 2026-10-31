@@ -82,6 +82,28 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
   let retryTimer: ReturnType<typeof setTimeout> | null = null
   let tries = 0
   let disposed = false
+  /** 壳层还没挂上时改由观察 DOM 变化补挂 chrome（原来靠 250ms × 48 轮空转全页 querySelector） */
+  let overlayWaiter: MutationObserver | null = null
+  const releaseOverlayWaiter = (): void => {
+    if (overlayWaiter === null) return
+    try { overlayWaiter.disconnect() } catch { /* 忽略 */ }
+    overlayWaiter = null
+  }
+  const armOverlayWaiter = (): void => {
+    if (overlayWaiter !== null) return
+    try {
+      overlayWaiter = new MutationObserver(() => {
+        if (disposed || overlayWaiter === null) return
+        if (overlayLayer() !== null) void attempt()
+      })
+      overlayWaiter.observe(doc.body, { childList: true, subtree: true })
+    } catch {
+      overlayWaiter = null
+    }
+  }
+  /** 兜底轮数（观察器没接上时，如老 WebView / 无 MutationObserver）：递增间隔，覆盖同样约 10 秒窗口 */
+  const CHROME_RETRY_STEPS = [CHROME_RETRY_MS, 1000, 3000, 6000]
+  const CHROME_RETRY_MAX_ATTEMPTS = Math.min(CHROME_RETRY_LIMIT, CHROME_RETRY_STEPS.length)
   /** 首屏后的那次「图标 rail → 完整菜单」升级只做一次。 */
   let preUpgraded = false
   let preUpgradeTimer: ReturnType<typeof setTimeout> | null = null
@@ -292,11 +314,17 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
     syncFrame()
     const layer = overlayLayer()
     if (layer !== null) {
+      // 挂上就不再等壳层：观察器只活到 chrome 就位为止，之后聊天流式更新一路零成本
+      releaseOverlayWaiter()
       buildChrome(layer)
       armPreUpgrade()
-    } else if (tries < CHROME_RETRY_LIMIT) {
+      return
+    }
+    armOverlayWaiter()
+    if (tries < CHROME_RETRY_MAX_ATTEMPTS) {
+      const waitMs = CHROME_RETRY_STEPS[tries] ?? CHROME_RETRY_MS
       tries += 1
-      retryTimer = setTimeout(attempt, CHROME_RETRY_MS)
+      retryTimer = setTimeout(attempt, waitMs)
     }
   }
 
@@ -315,6 +343,7 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
   return () => {
     disposed = true
     if (retryTimer !== null) clearTimeout(retryTimer)
+    releaseOverlayWaiter()
     if (preUpgradeTimer !== null) { clearTimeout(preUpgradeTimer); preUpgradeTimer = null }
     if (willChangeTimer !== null) { clearTimeout(willChangeTimer); willChangeTimer = null }
     try {
