@@ -966,13 +966,19 @@ function OrbPage({ api, t, open }: OrbOverlayProps & { open: boolean }) {
   const onSend = (): Promise<void> => sendWith()
 
   /** 行操作按最新闭包走（行组件 props 恒定 → 整行才能被记忆化跳过）：
-   *  这里每次渲染只是换 7 个函数引用，不像原来每行造 8 个新箭头 + 8 个新对象。 */
-  const rowMapRef = useRef(new Map<string, OrbSessionRow>())
-  rowMapRef.current = new Map(history.map((row) => [row.sessionId, row]))
+   *  这里每次渲染只是换 7 个函数引用，不像原来每行造 8 个新箭头 + 8 个新对象。
+   *  会话 id → 行 这张表只在列表真的换了时重建（原来每一轮渲染——包括每按一下键——
+   *  都把几百行重新塞进一个新 Map）。 */
+  const rowMapSourceRef = useRef<{ source: OrbSessionRow[] | null; map: Map<string, OrbSessionRow> }>({ source: null, map: new Map() })
+  if (rowMapSourceRef.current.source !== history) {
+    rowMapSourceRef.current.map = new Map(history.map((row) => [row.sessionId, row]))
+    rowMapSourceRef.current.source = history
+  }
+  const rowMap = rowMapSourceRef.current.map
   const rowActionsRef = useRef<SessionRowHandlers>({ select: () => {}, view: () => {}, archived: () => {}, refresh: () => {}, swipeOpen: () => {}, swipeClose: () => {}, action: () => {} })
   rowActionsRef.current = {
     select: (sessionId) => {
-      const row = rowMapRef.current.get(sessionId)
+      const row = rowMap.get(sessionId)
       if (row === undefined) return
       setTarget({ kind: 'session', id: sessionId })
       // 选中即把该会话的目录与模式记成「新建会话」模板
