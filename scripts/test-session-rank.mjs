@@ -1,6 +1,6 @@
 /** 会话活跃度排序与「点卡片进入哪条会话」回归：node scripts/test-session-rank.mjs */
 import assert from 'node:assert/strict'
-import { sessionTierOf, sortSessionsByActivity, pickActiveSession } from '../src/client/sessionRank.ts'
+import { sessionTierOf, sortSessionsByActivity, pickActiveSession, progressOrderOf } from '../src/client/sessionRank.ts'
 
 const cases = []
 
@@ -90,6 +90,34 @@ cases.push(['排序不改动调用方传入的数组（返回副本）', () => {
   assert.equal(rows[0].id, 'a')
   assert.equal(sorted[0].id, 'b')
   assert.notEqual(sorted, rows)
+}])
+
+cases.push(['卡片进度顺序：优先级最高那条排第一（含子代理），再按绑定/步骤/其余往下', () => {
+  // 用户要求：不要「只有静止的正在执行」，要按会话优先级显示**优先级最高那条的最新消息**。
+  const order = progressOrderOf({
+    enteredPick: 'A',
+    kidsOf: (sid) => (sid === 'A' ? ['A-kid'] : []),
+    bound: 'B',
+    steps: ['B-step'],
+    candidates: ['A', 'B', 'C'],
+  })
+  assert.deepEqual(order, ['A', 'A-kid', 'B', 'B-step', 'C'], '去重且保持优先级顺序')
+}])
+
+cases.push(['其余关联会话的顺序完全由调用方（活跃度排序）决定，不再有第二个判据', () => {
+  const ranked = sortSessionsByActivity([
+    { id: 'old', updatedAt: 10 },
+    { id: 'busy', updatedAt: 5, running: true },
+    { id: 'need', updatedAt: 1, awaiting: true },
+  ]).map((r) => r.id)
+  const order = progressOrderOf({ enteredPick: 'need', kidsOf: () => [], candidates: ranked })
+  assert.deepEqual(order, ['need', 'busy', 'old'])
+}])
+
+cases.push(['没有进行中的会话时从绑定会话起头；kidsOf 省掉也不炸', () => {
+  assert.deepEqual(progressOrderOf({ enteredPick: null, bound: 'B', steps: [], candidates: ['C'] }), ['B', 'C'])
+  assert.deepEqual(progressOrderOf({ enteredPick: 'A' }), ['A'])
+  assert.deepEqual(progressOrderOf({ enteredPick: '', bound: null }), [])
 }])
 
 let failed = 0
