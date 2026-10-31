@@ -20,7 +20,7 @@ import { assistantHomeDir } from './assistant-entry'
 import { ASSISTANT_PROJECT_ID, ASSISTANT_CARD_NAME, ASSISTANT_CARD_ICON, shouldAddAssistantCard, withAssistantCard } from './assistant-card'
 import { hasPendingInteraction, sessionStatusSourceOf, pendingInteractionSignature } from './sessionStatus'
 import { sessionSnapshotIndexOf, invalidateSessionSnapshotIndex } from './sessionIndex'
-import { pickActiveSession, sortSessionsByActivity, sessionTierOf, type RankableSessionRow } from './sessionRank'
+import { pickActiveSession, sortSessionsByActivity, sessionTierOf, progressOrderOf, type RankableSessionRow } from './sessionRank'
 import { domGate } from './compositionGate'
 
 /** 项目叠加层（L2）可选项：写作语言 */
@@ -3198,16 +3198,6 @@ function WorktableSection(props: any) {
       runningMemo.set(sid, result)
       return result
     }
-    /** 最近更新的会话（预览兜底：非运行态的关联会话里挑最新动过的那条） */
-    const freshestOf = (sids: string[]): string | null => {
-      let best: string | null = null
-      let bestAt = -Infinity
-      for (const s of sids) {
-        const at = Number(byId[s]?.updatedAt ?? 0) || 0
-        if (at > bestAt) { bestAt = at; best = s }
-      }
-      return best
-    }
     // 三态判定（同卡片提醒逻辑，但不过滤 ack——监控室永远显示事实状态）
     // 优先级：黄（待决策）> 红（异常终止）> 绿（有会话在跑）> 青（绑定会话已完成）> 空闲
     const statusOf = (pid: string): ConsoleCardData['status'] => {
@@ -3274,8 +3264,8 @@ function WorktableSection(props: any) {
       return start != null ? Math.max(0, now - start) : null
     }
     const ackMap = loadNotifyAck()
-    /** 按给定会话顺序取「最新一条进度」：本端事件窗口 → 宿主日志行（版本匹配）→ 冷会话成品消息。
-     *  项目卡片与临时卡片共用，避免两套判定漂移。 */
+    /** 按给定会话顺序取「最新一条进度」：本端事件窗口 → 宿主日志行（版本匹配）→ 最近一条消息。
+     *  项目卡片与临时卡片共用，避免两套判定漂移；顺序由 progressOrderOf 按会话优先级给出。 */
     const activityTextOf = (order: string[]): string => {
       for (const s of order) {
         // 1) 本端打开过的会话：本地事件窗口与聊天详情同源（含逐字输出的 live chunk），最新也最准
@@ -3291,7 +3281,7 @@ function WorktableSection(props: any) {
         const entry = activityCache.get(s)
         // 缓存只在这两种情况下可信：行还是这一轮的；或是此刻仍在跑（流式行本来就一直在变）
         if (entry && entry.line && entry.key === activityKeyOf(s) && (!entry.running || isRun)) return entry.line
-        // 3) 冷会话预热的最近一条成品消息（可能是助手的最终答复）
+        // 3) 最近一条消息（冷会话预热；也可能是这一轮之前的答复——按优先级轮到它时该显示它）
         const preview = previewCache.get(s)
         if (preview) return preview
       }
@@ -3312,23 +3302,40 @@ function WorktableSection(props: any) {
       }
       const candidates = [...related, ...kidIds]
       // 正在跑的会话（可能不止一条）：按最近更新时间排，最新动的那条优先显示
-      const running = candidates.filter((s) => isRunning(s))
+      const running = related.filter((s) => isRunning(s))
       const runningLive = running.length > 0
-      const runningPick = runningLive
-        ? (sid && running.includes(sid) ? sid : (freshestOf(running) ?? running[0]))
-        : null
+      // 按活跃度把这条项目的关联会话排好序（待决策 > 正在跑 > 异常 > 空闲，同档取最近更新）：
+      // 卡片中间那块进度就按这个优先级依次找，**第一条拿得到内容的**就是显示的那条。
+      const rankedRelated = sortSessionsByActivity(related.map((s) => ({
+        id: s,
+        updatedAt: Number(byId[s]?.updatedAt ?? 0) || 0,
+        running: isRunning(s),
+        awaiting: awaitingOf(s),
+      }))).map((r) => r.id)
+      // 卡片点开时进入的那一条 = 「待决策 > 正在跑」里最活动的一条，与 preferredSessionOf 的①同一判定
+      //（只按 related 判定、不含 kids：点卡片永远不会进子代理会话）。
+      const enteredPick = pickActiveSession(
+        related.map((s) => ({
+          id: s,
+          updatedAt: Number(byId[s]?.updatedAt ?? 0) || 0,
+          running: isRunning(s),
+          awaiting: awaitingOf(s),
+        })),
+        currentSessionId(),
+      )?.id ?? null
+      const enteredActive = enteredPick !== null && (isRunning(enteredPick) || awaitingOf(enteredPick))
       const status = statusOf(id)
-      // 流式进度文本：按「正在跑的 → 绑定会话 → 步骤会话 → 其余关联会话」逐个找，取第一条拿到内容的。
-      // 关键：跑的是子代理会话时它本身没有可读面（未在前台打开），但父会话的历史里有一条
-      // 「子代理 · …」工具调用 —— 所以必须逐个候选回退，不能只看一条会话。
-      const order: string[] = []
-      const push = (value: string | null | undefined): void => { if (value && !order.includes(value)) order.push(value) }
-      push(runningPick)
-      push(sid)
-      for (const s of stepSids) push(s)
-      for (const s of candidates) push(s)
+      // 进度文本 = 优先级最高那条会话的**最新消息**（拿不到就往下一条优先级会话走，
+      // 一条都拿不到才显示「正在执行…」）。绝不用某条低优先级旧会话的内容冒充高优先级那条。
+      const order = progressOrderOf({
+        enteredPick,
+        kidsOf: (s) => kidsSetOf(s),
+        bound: sid ?? null,
+        steps: stepSids,
+        candidates: [...rankedRelated, ...kidIds],
+      })
       const activityText = activityTextOf(order)
-      const previewText = activityText || ((runningLive || status === 'busy') ? (t('console.liveRunning') || '正在执行…') : '')
+      const previewText = activityText || ((enteredActive || runningLive || status === 'busy' || status === 'need') ? (t('console.liveRunning') || '正在执行…') : '')
       // 发光 = 完成/待决且本轮未被确认；点卡片确认后熄灭
       const glow = !!sid && ((status === 'done' && ackMap[sid] !== 'done') || (status === 'need' && ackMap[sid] !== 'need'))
       return {
@@ -3337,8 +3344,8 @@ function WorktableSection(props: any) {
         runtimeMs: runtimeOfPid(id),
         kids: kidsOfAll(related),
         preview: previewText,
-        // 流式标记：中间那块进度来自正在跑的那条会话，随活动缓存持续刷新
-        live: runningLive,
+        // 流式标记：中间那块进度来自「点开的那条会话」或正在跑的会话，随活动缓存持续刷新
+        live: enteredActive || runningLive,
         bound: !!sid,
         // 内置项目（控制室）恒提供「＋」：它没有项目文件夹，目录由 newSessionFolderOf 逐级回退解析
         canNewSession: self || !!newSessionFolderOf(id),
@@ -3420,11 +3427,13 @@ function WorktableSection(props: any) {
     if (ranked.length > 0) {
       // 卡片点开时进入的那一条 = 待决策 / 正在跑里最活动的一条（与浮层列表第一行同一判定）
       const pick = pickActiveSession(ranked) ?? ranked[0]
-      const order: string[] = []
-      const push = (value: string | null | undefined): void => { if (value && !order.includes(value)) order.push(value) }
-      push(pick?.id)
-      for (const r of ranked) push(r.id)
-      for (const r of ranked) for (const cid of kidsSetOf(r.id)) push(cid)
+      // 优先级最高那条的最新消息先显示；那条没有内容才往下一条优先级会话找
+      //（ranked 本身已按活跃度排好序），一条都没有才落到「正在执行…」。
+      const order = progressOrderOf({
+        enteredPick: pick === undefined ? null : pick.id,
+        kidsOf: (s) => kidsSetOf(s),
+        candidates: ranked.map((r) => r.id),
+      })
       const text = activityTextOf(order)
       const anyNeed = ranked.some((r) => r.awaiting)
       const anyBusy = ranked.some((r) => r.running)

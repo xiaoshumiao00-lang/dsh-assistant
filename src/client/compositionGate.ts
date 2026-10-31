@@ -19,6 +19,8 @@
  * 纯函数 + 注入 clock，node 单测不需要 DOM（scripts/test-composition-gate.mjs）。
  */
 
+import { createComposerLedger, type LedgerSummary } from './composerLedger.ts'
+
 /** 组合结束后的「仍在打字」收尾窗：等引擎迟到的 keydown / 最后一批 mutation。 */
 export const COMPOSITION_GRACE_MS = 140
 /** 一次交互窗口（抽屉开合等）默认暂停时长，覆盖 0.28s 过渡 + 宿主重排。 */
@@ -101,6 +103,16 @@ export interface CompositionSample {
   chars: number
   delta: number
   kind: VoiceSampleKind
+  /** 组合期间输入框子树里的 DOM 变更（最多 8 条，带毫秒偏移）；只读取证用。 */
+  muts?: string[]
+  /** 变更有没有落进编辑器本体（Lexical contenteditable）——最可疑的一类。 */
+  touched?: boolean
+  /** 编辑器本体在组合期间被换掉 / 脱离文档——几乎必然中断输入法会话。 */
+  replaced?: boolean
+  /** 组合期间宿主的 [data-phase] 翻了（hero → 普通）：整页重排的经典时机。 */
+  phaseChanged?: boolean
+  /** 组合开始时的 data-phase（hero / 普通）。 */
+  phase?: string
 }
 
 /**
@@ -128,18 +140,36 @@ export interface VoiceTally {
   interrupted: number
   chars: number
   maxMs: number
+  /** 最近一次可疑中止的现场（压成一行，带几条 DOM 变更）——只在可疑样本上写。 */
+  last: string
 }
 
 export const VOICE_TALLY_BATCH = 20
+
+/** 把一条样本压成一行现场：种类@时长 phase 标记 前几条 DOM 变更。 */
+export function describeVoiceSample(sample: CompositionSample): string {
+  const marks = [sample.phase ? `phase=${sample.phase}` : '', sample.phaseChanged === true ? 'PHASE-FLIP' : '', sample.replaced === true ? 'EDITOR-SWAPPED' : '', sample.touched === true ? 'EDITOR-TOUCHED' : '']
+    .filter((part) => part !== '')
+    .join(' ')
+  const muts = (sample.muts ?? []).slice(0, 4).join(' | ')
+  const text = [ `${sample.kind}@${sample.ms}ms`, marks, muts ].filter((part) => part !== '').join(' ')
+  return clip4Diag(text, 180)
+}
+
+/** 诊断字段短切（保持单字节纪律：超长截断加省略号）。 */
+function clip4Diag(value: string, max: number): string {
+  return value.length > max ? `${value.slice(0, max)}…` : value
+}
 
 export function createVoiceTally(): {
   bump: (sample: CompositionSample) => boolean
   snapshot: () => VoiceTally
   reset: () => void
 } {
-  let tally: VoiceTally = {
-    n: 0, typed: 0, longTyped: 0, silentLong: 0, silentShort: 0, interrupted: 0, chars: 0, maxMs: 0,
-  }
+  const empty = (): VoiceTally => ({
+    n: 0, typed: 0, longTyped: 0, silentLong: 0, silentShort: 0, interrupted: 0, chars: 0, maxMs: 0, last: '',
+  })
+  let tally: VoiceTally = empty()
   const count: Record<VoiceSampleKind, keyof VoiceTally> = {
     typed: 'typed',
     'long-typed': 'longTyped',
@@ -154,16 +184,18 @@ export function createVoiceTally(): {
       if (sample.ms > tally.maxMs) tally.maxMs = sample.ms
       const key = count[sample.kind]
       if (key !== undefined) tally[key] = (tally[key] as number) + 1
+      const suspicious = sample.kind === 'interrupted' || sample.kind === 'silent-long'
+      if (suspicious) tally.last = describeVoiceSample(sample)
       // 可疑中止（上一段没等到 compositionend / 说了很久一个字都没进）立刻发；
       // 正常打字别把网络打成每敲一下一发。
-      if (sample.kind === 'interrupted' || sample.kind === 'silent-long') return true
+      if (suspicious) return true
       return tally.n >= VOICE_TALLY_BATCH
     },
     snapshot(): VoiceTally {
       return { ...tally }
     },
     reset(): void {
-      tally = { n: 0, typed: 0, longTyped: 0, silentLong: 0, silentShort: 0, interrupted: 0, chars: 0, maxMs: 0 }
+      tally = empty()
     },
   }
 }
@@ -219,22 +251,35 @@ export function createVoiceProbe(options: {
   onSample?: (sample: CompositionSample) => void
   clock?: () => number
   reader?: (doc: any) => number
+  /** 变更账本注入（测试用；默认按 doc/clock 现造一个）。传 null 关掉取证。 */
+  ledger?: { start: () => void; stop: () => LedgerSummary } | null
 }): { onStart: () => void; onEnd: () => void; dispose: () => void } {
   const doc = options.doc ?? (globalThis as any).document
   const clock = options.clock ?? (() => Date.now())
   const read = options.reader ?? ((target: any) => composerTextLength(target))
   const explicit = options.onSample
   const sink = explicit ?? forwardVoiceSample
-  /** 有没有人接样本：没人接就不读 DOM（省掉每次组合一遍的整页扫描）。 */
+  /** 有没有人接样本：没人接就不读 DOM、也不记账（零成本）。 */
   const interested = (): boolean => explicit !== undefined || hasVoiceReporter()
+  const ledger = options.ledger === undefined ? createComposerLedger({ doc, clock }) : options.ledger
   let startedAt: number | null = null
   let charsAtStart = 0
 
+  /** 收一次现场：断账本、读输入框长度、归类、上报一条样本。 */
   const take = (interrupted: boolean): void => {
-    if (startedAt === null) return
     const at = startedAt
+    const wanted = interested()
+    let summary: LedgerSummary | null = null
+    if (ledger !== null && ledger !== undefined) {
+      try {
+        summary = ledger.stop()
+      } catch {
+        summary = null
+      }
+    }
+    if (at === null) return
     startedAt = null
-    if (!interested()) return
+    if (!wanted) return
     const ms = clock() - at
     const chars = read(doc)
     const delta = chars - charsAtStart
@@ -242,7 +287,21 @@ export function createVoiceProbe(options: {
       ? 'interrupted'
       : classifyCompositionSample(ms, delta)
     try {
-      sink({ ms: Math.round(ms), chars, delta, kind })
+      sink({
+        ms: Math.round(ms),
+        chars,
+        delta,
+        kind,
+        ...(summary === null
+          ? {}
+          : {
+            muts: summary.muts,
+            touched: summary.touched,
+            replaced: summary.replaced,
+            phaseChanged: summary.phaseChanged,
+            phase: summary.phase,
+          }),
+      })
     } catch {
       /* 打点绝不影响输入 */
     }
@@ -250,10 +309,18 @@ export function createVoiceProbe(options: {
 
   return {
     onStart() {
-      // 上一段没等到 compositionend 就又来一段：那段就是被中止的（微信键盘实时转写的典型现象）
+      // 上一段没等到 compositionend 就又来一段：那段就是被中止的（实时转写被断的典型现象）
       if (startedAt !== null) take(true)
       startedAt = clock()
-      charsAtStart = interested() ? read(doc) : 0
+      const wanted = interested()
+      charsAtStart = wanted ? read(doc) : 0
+      if (wanted) {
+        try {
+          ledger?.start()
+        } catch {
+          /* 记账失败不影响输入 */
+        }
+      }
     },
     onEnd() {
       take(false)
@@ -261,6 +328,11 @@ export function createVoiceProbe(options: {
     dispose() {
       startedAt = null
       charsAtStart = 0
+      try {
+        ledger?.stop()
+      } catch {
+        /* 同上 */
+      }
     },
   }
 }

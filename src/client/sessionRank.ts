@@ -72,3 +72,41 @@ export function pickActiveSession<T extends RankableSessionRow>(rows: T[], curre
   }
   return null
 }
+
+/**
+ * 卡片「实时进度」该按什么顺序找文本：**按会话优先级从高到低，取第一条拿得到内容的**。
+ *
+ * 顺序 = 点卡片会进入的那条（+ 它的子代理）→ 绑定会话 → 模板步骤 → 其余关联会话（调用方按
+ * 活跃度排好序传进来）。这样「卡片上显示的那条消息」永远属于当前优先级最高的会话，
+ * 不会出现「点进去是 A（正在跑），卡片上却挂着 B 的旧消息」。
+ *
+ * 每一条会话内部再按「本端事件窗口 → 宿主日志行 → 最近一条消息」三级取，见调用方 activityTextOf。
+ *
+ * @param options.enteredPick - 点卡片会进入的会话（优先级最高，排第一）。
+ * @param options.kidsOf - 取某条会话的子代理 id（子代理的进度也算这条会话的）。
+ * @param options.bound - 绑定会话。
+ * @param options.steps - 模板步骤会话。
+ * @param options.candidates - 其余关联会话，**调用方必须按活跌度排好序**。
+ * @returns 去重后的会话 id 顺序。
+ */
+export function progressOrderOf(options: {
+  enteredPick: string | null
+  kidsOf?: (sid: string) => Iterable<string>
+  bound?: string | null
+  steps?: string[]
+  candidates?: string[]
+}): string[] {
+  const order: string[] = []
+  const push = (value: string | null | undefined): void => {
+    if (typeof value === 'string' && value !== '' && !order.includes(value)) order.push(value)
+  }
+  const kidsOf = options.kidsOf
+  if (options.enteredPick !== null) {
+    push(options.enteredPick)
+    if (kidsOf !== undefined) for (const kid of kidsOf(options.enteredPick)) push(kid)
+  }
+  push(options.bound)
+  for (const sid of options.steps ?? []) push(sid)
+  for (const sid of options.candidates ?? []) push(sid)
+  return order
+}
