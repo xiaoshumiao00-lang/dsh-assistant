@@ -1,6 +1,6 @@
 // 悬浮球主页面（全屏）：会话历史 + 目标（新会话/会话）+ 输入区。
 // 发送语义与桌面悬浮球一致：新会话 → 电脑上创建会话并执行；已有会话 → 追加指令。
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { useEffect, useMemo, memo, useRef, useState, useSyncExternalStore } from 'react'
 import { controlRoomStore, ballConfigStore } from '../../orb-bridge.ts'
 import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, TouchEvent as ReactTouchEvent } from 'react'
 import { Composer } from './Composer.tsx'
@@ -249,27 +249,55 @@ function OrbBall({ label, avatar, raised = false, onToggle, onLongPress }: {
 /** 会话历史首屏渲染条数：手机上一屏放不下十几行，先渲染这么多，
  * 其余用「显示更多」按需追加——避免几百行会话同时挂载把内存吃光。 */
 const HISTORY_PAGE = 40
-
 /** 左滑操作区宽度（三个按钮各 56px）。 */
 const SWIPE_ACTIONS_WIDTH = 168
 /** 滑动超过这个比例就展开。 */
 const SWIPE_SNAP_RATIO = 0.35
 
+/** 一行的操作都走同一份（父级维护的）处理器：props 恒定才能整表跳过重渲染 */
+type SessionRowHandlers = {
+  select: (sessionId: string) => void
+  view: (sessionId: string) => void
+  archived: (sessionId: string) => void
+  refresh: () => void
+  swipeOpen: (sessionId: string) => void
+  swipeClose: (sessionId: string) => void
+  action: (msg: string) => void
+}
+
+/** 会话列表行重渲染比较器：整行由这份快照驱动，字段没变就不必重渲染（40 行 × 每 250ms 一次投影刷新时是关键成本） */
+function sameRowForRender(a: OrbSessionRow, b: OrbSessionRow): boolean {
+  return a === b || (
+    a.sessionId === b.sessionId
+    && a.title === b.title
+    && a.cwd === b.cwd
+    && a.running === b.running
+    && a.updatedAt === b.updatedAt
+    && a.agentPreset === b.agentPreset
+    && a.pinned === b.pinned
+    && a.archived === b.archived
+    && a.blank === b.blank
+  )
+}
+
 /** 单行会话：左滑露出 置顶/重命名/归档 三个操作。 */
-function SwipeableSessionRow({ row, selected, t, api, swiped, onSwipeOpen, onSwipeClose, onSelect, onView, onAction, onArchived, onRefresh }: {
+function SwipeableSessionRow({ row, selected, swiped, when, t, api, handlers }: {
   row: OrbSessionRow
   selected: boolean
+  /** 「刚刚 / N 分钟前」由父级算好传进来：字段没变的一行才能整行跳过 */
+  when: string
   t: (key: OrbKey) => string
   api: OrbApi
   swiped: boolean
-  onSwipeOpen: () => void
-  onSwipeClose: () => void
-  onSelect: () => void
-  onView: () => void
-  onAction: (msg: string) => void
-  onArchived: () => void
-  onRefresh: () => void
+  handlers: SessionRowHandlers
 }) {
+  const onSwipeOpen = (): void => handlers.swipeOpen(row.sessionId)
+  const onSwipeClose = (): void => handlers.swipeClose(row.sessionId)
+  const onSelect = (): void => handlers.select(row.sessionId)
+  const onView = (): void => handlers.view(row.sessionId)
+  const onArchived = (): void => handlers.archived(row.sessionId)
+  const onRefresh = (): void => handlers.refresh()
+  const onAction = (msg: string): void => handlers.action(msg)
   const [offset, setOffset] = useState(0)
   const [dragging, setDragging] = useState(false)
   const [renaming, setRenaming] = useState(false)
@@ -281,6 +309,26 @@ function SwipeableSessionRow({ row, selected, t, api, swiped, onSwipeOpen, onSwi
   const offsetRef = useRef(0)
   /** 刚滑过：抑制紧随其后的 click，避免「滑开→click→立刻关回」。 */
   const suppressClickRef = useRef(false)
+  /** 拖动期间平移直接写在这行上（一帧一次）：原来每个 touchmove 都 setState 让整行 + 父级列表 reconcile 一遍 */
+  const rowElRef = useRef<HTMLDivElement | null>(null)
+  const paintFrameRef = useRef<number | null>(null)
+  const paintRow = (): void => {
+    const el = rowElRef.current
+    if (el !== null) el.style.transform = `translateX(${offsetRef.current}px)`
+  }
+  const scheduleRowPaint = (): void => {
+    if (paintFrameRef.current !== null) return
+    paintFrameRef.current = window.requestAnimationFrame(() => {
+      paintFrameRef.current = null
+      paintRow()
+    })
+  }
+  useEffect(() => () => {
+    if (paintFrameRef.current !== null) {
+      window.cancelAnimationFrame(paintFrameRef.current)
+      paintFrameRef.current = null
+    }
+  }, [])
 
   // 另一行被打开时收起本行
   useEffect(() => {
@@ -314,13 +362,18 @@ function SwipeableSessionRow({ row, selected, t, api, swiped, onSwipeOpen, onSwi
     // 横向手势由 CSS touch-action: pan-y 交给 JS 处理，纵向滚动仍归浏览器。
     const next = Math.max(-SWIPE_ACTIONS_WIDTH, Math.min(0, startRef.current.offset + dx))
     offsetRef.current = next
-    setDragging(true)
-    setOffset(next)
+    if (!dragging) setDragging(true)
+    scheduleRowPaint()
   }
 
   const onTouchEnd = () => {
     if (renaming || !dragging) return
     setDragging(false)
+    // 松手：把这帧没跑完的平移取消掉，落点由下面的 setOffset 交给 React 写（带 transition 回弹）
+    if (paintFrameRef.current !== null) {
+      window.cancelAnimationFrame(paintFrameRef.current)
+      paintFrameRef.current = null
+    }
     // 这次是滑动（非轻点）：抑制紧随其后的 click，避免滑开/收起后又被 click 反转。
     suppressClickRef.current = true
     window.setTimeout(() => { suppressClickRef.current = false }, 350)
@@ -413,6 +466,7 @@ function SwipeableSessionRow({ row, selected, t, api, swiped, onSwipeOpen, onSwi
 
       {/* 行内容（可左滑） */}
       <div
+        ref={rowElRef}
         role="button"
         tabIndex={0}
         data-pocket-orb="history-row"
@@ -455,7 +509,7 @@ function SwipeableSessionRow({ row, selected, t, api, swiped, onSwipeOpen, onSwi
                 {row.title || t('noTitle')}
               </span>
               <span data-pocket-orb="history-sub">
-                {[row.cwd, fmtWhen(row.updatedAt), row.running ? t('running') : null].filter(Boolean).join(' · ')}
+                {[row.cwd, when, row.running ? t('running') : null].filter(Boolean).join(' · ')}
               </span>
             </span>
             <span data-pocket-orb="preset-badge" data-mode={row.agentPreset === 'computer-use' ? 'computer-use' : 'standard'} title={row.agentPreset || 'standard'}>
@@ -473,6 +527,19 @@ function SwipeableSessionRow({ row, selected, t, api, swiped, onSwipeOpen, onSwi
     </div>
   )
 }
+
+/** 整行记忆化：内容字段 + 「多久之前」文本没变的一行不重渲染。
+ *  原来每 250ms 一次会话投影刷新（还有输入框每按一键）都会把 40 行全量 reconcile 一遍，
+ *  手机上就是打字打到一半整列表闪一次。 */
+const MemoizedSessionRow = memo(SwipeableSessionRow, (prev, next) =>
+  sameRowForRender(prev.row, next.row)
+  && prev.when === next.when
+  && prev.selected === next.selected
+  && prev.swiped === next.swiped
+  && prev.t === next.t
+  && prev.api === next.api
+  && prev.handlers === next.handlers,
+)
 
 function OrbPage({ api, t, open }: OrbOverlayProps & { open: boolean }) {
   // 目标会话持久化（localStorage）：HMR 重载/断连重连导致整页重挂载时恢复用户最后选中的
@@ -898,6 +965,46 @@ function OrbPage({ api, t, open }: OrbOverlayProps & { open: boolean }) {
   /** 输入框发送按钮：用当前草稿。 */
   const onSend = (): Promise<void> => sendWith()
 
+  /** 行操作按最新闭包走（行组件 props 恒定 → 整行才能被记忆化跳过）：
+   *  这里每次渲染只是换 7 个函数引用，不像原来每行造 8 个新箭头 + 8 个新对象。 */
+  const rowMapRef = useRef(new Map<string, OrbSessionRow>())
+  rowMapRef.current = new Map(history.map((row) => [row.sessionId, row]))
+  const rowActionsRef = useRef<SessionRowHandlers>({ select: () => {}, view: () => {}, archived: () => {}, refresh: () => {}, swipeOpen: () => {}, swipeClose: () => {}, action: () => {} })
+  rowActionsRef.current = {
+    select: (sessionId) => {
+      const row = rowMapRef.current.get(sessionId)
+      if (row === undefined) return
+      setTarget({ kind: 'session', id: sessionId })
+      // 选中即把该会话的目录与模式记成「新建会话」模板
+      applySessionTemplate(row)
+      // 模型胶囊跟随这条会话的真实模型；没选过模型就不硬塞草稿模型
+      syncModelFromSession(row)
+      modelDirtyRef.current = false
+    },
+    view: (sessionId) => {
+      noteOpenSession(sessionId)
+      api.openSession(sessionId)
+      orbStore.setOpen(false, 'view-session')
+    },
+    archived: (sessionId) => {
+      // 归档的正好是当前选中会话 → 目标条退回「新会话」，避免指向已隐藏的会话。
+      if (target.kind === 'session' && target.id === sessionId) setTarget({ kind: 'new' })
+    },
+    refresh: () => setHistory(api.listSessions(targetIdRef.current)),
+    swipeOpen: (sessionId) => setSwipedId(sessionId),
+    swipeClose: (sessionId) => setSwipedId((cur) => (cur === sessionId ? null : cur)),
+    action: (msg) => toast(msg),
+  }
+  const stableRowHandlers = useMemo<SessionRowHandlers>(() => ({
+    select: (sessionId) => rowActionsRef.current.select(sessionId),
+    view: (sessionId) => rowActionsRef.current.view(sessionId),
+    archived: (sessionId) => rowActionsRef.current.archived(sessionId),
+    refresh: () => rowActionsRef.current.refresh(),
+    swipeOpen: (sessionId) => rowActionsRef.current.swipeOpen(sessionId),
+    swipeClose: (sessionId) => rowActionsRef.current.swipeClose(sessionId),
+    action: (msg) => rowActionsRef.current.action(msg),
+  }), [])
+
   return (
     <div data-pocket-orb="page" style={open ? undefined : { display: 'none' }}>
       <div data-pocket-orb="header">
@@ -936,40 +1043,18 @@ function OrbPage({ api, t, open }: OrbOverlayProps & { open: boolean }) {
         {/* 会话历史 */}
         <div data-pocket-orb="history-title">{t('history')}</div>
         {history.length === 0 && <div data-pocket-orb="history-empty">{t('historyEmpty')}</div>}
-        {history.slice(0, historyLimit).map((row) => {
-          const selected = target.kind === 'session' && target.id === row.sessionId
-          return (
-            <SwipeableSessionRow
-              key={row.sessionId}
-              row={row}
-              selected={selected}
-              t={t}
-              api={api}
-              swiped={swipedId === row.sessionId}
-              onSwipeOpen={() => setSwipedId(row.sessionId)}
-              onSwipeClose={() => setSwipedId((cur) => (cur === row.sessionId ? null : cur))}
-              onSelect={() => {
-                setTarget({ kind: 'session', id: row.sessionId })
-                // 选中即把该会话的目录与模式记成「新建会话」模板
-                applySessionTemplate(row)
-                // 模型胶囊跟随这条会话的真实模型；没选过模型就不硬塞草稿模型
-                syncModelFromSession(row)
-                modelDirtyRef.current = false
-              }}
-              onView={() => {
-                noteOpenSession(row.sessionId)
-                api.openSession(row.sessionId)
-                orbStore.setOpen(false, 'view-session')
-              }}
-              onAction={(msg) => toast(msg)}
-              onArchived={() => {
-                // 归档的正好是当前选中会话 → 目标条退回「新会话」，避免指向已隐藏的会话。
-                if (target.kind === 'session' && target.id === row.sessionId) setTarget({ kind: 'new' })
-              }}
-              onRefresh={() => setHistory(api.listSessions(targetIdRef.current))}
-            />
-          )
-        })}
+        {history.slice(0, historyLimit).map((row) => (
+          <MemoizedSessionRow
+            key={row.sessionId}
+            row={row}
+            selected={target.kind === 'session' && target.id === row.sessionId}
+            swiped={swipedId === row.sessionId}
+            when={fmtWhen(row.updatedAt)}
+            t={t}
+            api={api}
+            handlers={stableRowHandlers}
+          />
+        ))}
         {/* 分页：其余会话按需追加（一次 40 条），避免几百行同时挂载 */}
         {history.length > historyLimit && (
           <button
