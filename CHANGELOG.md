@@ -36,7 +36,7 @@
 
 【流畅度·这一整批不改任何功能】只改「谁去扫、扫多久、什么时刻写」，看得见的外观与行为一字未动（光晕 / 卡片内容 / 抽屉内容 / 语音 / 会话进入判定都照旧）。新回归测试 `scripts/test-bottom-overlay.mjs`（15 项）、`scripts/test-local-store.mjs`（7 项）、`scripts/test-face-cache.mjs`（6 项），都进了 `npm test` 链。
 
-① 底部面板避让（新模块 `src/client/bottomOverlay.ts`）：原来每 2 秒 `document.querySelectorAll('body *')` 把整页元素过一遍、每个都读一遍布局（两三万节点的会话页一次就是一发）。现在 400 个一片、一片跑完再接下一片；样式变化由观察器只盯 `style` 属性补一轮；轮询自适应（交互密集时 6 秒内不扫、安静时 10 秒一轮）；写 inset 前先比新旧值，不需要就不写。`scanOnce` 会先撤掉排队的那一帧；已有扫描活着时观察器不再排第二个。
+① 底部面板避让（新模块 `src/client/bottomOverlay.ts`）：原来每 2 秒 `document.querySelectorAll('body *')` 把整页元素过一遍、每个都读一遍布局（两三万节点的会话页一次就是一发）。现在 400 个一片、一片跑完再接下一片；样式变化由观察器只盯 `style` 属性补一轮；轮询自适应（交互密集时 6 秒内不扫、安静时 4 秒一轮）；写 inset 前先比新旧值，不需要就不写。`scanOnce` 会先撤掉排队的那一帧；已有扫描活着时观察器不再排第二个。
 
 ② localStorage 读缓存（新模块 `src/client/localStore.ts`）：原来卡片每刷新一次就把整份存档读出来再 `JSON.parse` 一遍，模板配置与助手设置也一样。现在读走 `cachedJsonRead`（原始字符串一字不差才复用缓存那份，`null` 不缓存、每次真读）、写走 `cachedJsonWrite`（改完整体落盘一次；循环引用 / 配额溢出不把调用方带炸）。卡片 ack、模板 override、模板 meta 都接上这条。
 
