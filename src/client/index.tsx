@@ -24,6 +24,7 @@ import { pickActiveSession, sortSessionsByActivity, sessionTierOf, progressOrder
 import { domGate } from './compositionGate'
 import { createBottomOverlayScanner, shouldApplyInset } from './bottomOverlay'
 import { cachedJsonRead, cachedJsonWrite } from './localStore'
+import { createFaceSnapshotCache } from './faceSnapshotCache'
 
 /** 项目叠加层（L2）可选项：写作语言 */
 const PAPER_LANG_OPTIONS = ['中文写作后翻译英文', '直接写英文', '仅中文投稿']
@@ -916,7 +917,7 @@ function schedulePreviewSweep() {
 /** 从会话快照节点里提取最近一条文本（纯读内存镜像，零 Token；代码清洗后无则 ''） */
 function lastTextOf(sid: string): string {
   try {
-    const face = sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.()
+    const face = sessionFaceSnapshotOf(sid)
     const nodes: any[] = face?.nodes ?? []
     for (let i = nodes.length - 1; i >= 0; i--) {
       const n = nodes[i]
@@ -2274,16 +2275,23 @@ function sessionRunningNow(sid: string | undefined, byId: Record<string, any>, k
     if (ce?.running === true) return true
   }
   try {
-    const face = sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.()
+    const face = sessionFaceSnapshotOf(sid)
     if (face && face.completed !== true && faceHasOpenTurn(face)) return true
   } catch {}
   return false
 }
 
-/** 会话面快照（只读，取不到返回 null）；卡片与「会话列表 / 进入判定」共用同一条通道。 */
+/** 会话面快照（只读，取不到返回 null）；卡片与「会话列表 / 进入判定」共用同一条通道。
+ *  带 100ms 的极短 TTL：卡片组装 / 提醒表 / 待决表 / 临时卡片各自都要读同一会话的会话面，
+ *  一次宿主通知就是三四遍 sessions.binding(sid).session.getSnapshot()（宿主侧要投影整棵会话状态），
+ *  再乘上同时挂着的工作台实例（侧栏工作台 + headless 数据宿主 + 分栏浮层）。
+ *  待决 / 在跑 的真正变化都由宿主订阅推出来（pendingInteractionsStore 与 sessions.list 通知），
+ *  这层缓存不会把那一挡压住。 */
+const faceSnapshots = createFaceSnapshotCache({
+  read: (sid: string): any => sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.() ?? null,
+})
 function sessionFaceSnapshotOf(sid: string | undefined): any {
-  if (!sid) return null
-  try { return sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.() ?? null } catch { return null }
+  return sid ? faceSnapshots.get(sid) : null
 }
 
 /** 卡片口径的「此刻在跑」：宿主已 completed 且 running 位没亮的一律不算（避免残留的未结束轮次把会话糊成在跑） */
@@ -3285,7 +3293,7 @@ function WorktableSection(props: any) {
       }
       if (start != null) return start
       try {
-        const face = sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.()
+        const face = sessionFaceSnapshotOf(sid)
         const timings = face?.turnTimings
         if (timings instanceof Map) {
           for (const t of Array.from(timings.values()).reverse()) {
@@ -4873,7 +4881,7 @@ function buildCustomLayoutPrompt(req: string): string {
       }
       if (!needNow) {
         try {
-          const face = sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.()
+          const face = sessionFaceSnapshotOf(sid)
           if (Array.isArray(face?.pending) && face.pending.length > 0) needNow = true
         } catch {}
       }
@@ -4921,7 +4929,7 @@ function buildCustomLayoutPrompt(req: string): string {
         if (sessionAwaitingDecision(cid) || (ce && sessionNotifyState(ce) === 'need')) return true
       }
       try {
-        const face = sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.()
+        const face = sessionFaceSnapshotOf(sid)
         if (Array.isArray(face?.pending) && face.pending.length > 0) return true
       } catch {}
       return false
