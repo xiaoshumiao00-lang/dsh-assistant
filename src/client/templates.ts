@@ -6,6 +6,7 @@
  * - 移植友好：模板是数据不是代码；新增模板不改任何接线文件。
  */
 import { skillFileOf } from './assistant-config.ts'
+import { cachedJsonRead, cachedJsonWrite } from './localStore'
 
 export type TemplateStepDef = {
   /** 步骤 id（语义稳定，勿与序号混淆） */
@@ -713,14 +714,13 @@ type TemplateOverrideStore = Record<string, Record<string, FlowStepOverride>>
 const TPL_OVERRIDES_KEY = 'dsh.worktable.templateOverrides.v1'
 
 function readTemplateOverrides(): TemplateOverrideStore {
-  try {
-    const raw = localStorage.getItem(TPL_OVERRIDES_KEY)
+  // 读缓存：templateById 每次调用都要读它（每项目、每渲染、每验收 tick），
+  // 内容没变就不再 parse —— 省掉的正是卡片渲染与流式期间挤在打字那段的主线程活
+  return cachedJsonRead(TPL_OVERRIDES_KEY, (raw) => {
     if (!raw) return {}
     const p = JSON.parse(raw)
     return p && typeof p === 'object' ? (p as TemplateOverrideStore) : {}
-  } catch {
-    return {}
-  }
+  })
 }
 
 /** 把某步配置（技能/说明）保存到模板级：下次用该模板新建的项目即为最新配置（逐字段合并）。
@@ -748,7 +748,7 @@ export function saveTemplateStepOverride(templateId: string, stepId: string, o: 
       merged.converge = cur.converge
     }
     all[templateId] = { ...(all[templateId] ?? {}), [stepId]: merged }
-    localStorage.setItem(TPL_OVERRIDES_KEY, JSON.stringify(all))
+    cachedJsonWrite(TPL_OVERRIDES_KEY, all)
   } catch {
     /* localStorage 不可用：仅本项目覆盖仍生效 */
   }
@@ -758,14 +758,11 @@ export function saveTemplateStepOverride(templateId: string, stepId: string, o: 
 type TemplateMetaStore = Record<string, { layoutPreset?: string }>
 const TPL_META_KEY = 'dsh.worktable.templateMeta.v1'
 function readTemplateMeta(): TemplateMetaStore {
-  try {
-    const raw = localStorage.getItem(TPL_META_KEY)
+  return cachedJsonRead(TPL_META_KEY, (raw) => {
     if (!raw) return {}
     const p = JSON.parse(raw)
     return p && typeof p === 'object' ? (p as TemplateMetaStore) : {}
-  } catch {
-    return {}
-  }
+  })
 }
 
 /** 可选布局预设（创建弹窗与模板配置共用显示名） */
@@ -785,7 +782,7 @@ export function saveTemplateLayout(templateId: string, layoutPreset: string): vo
   try {
     const all = readTemplateMeta()
     all[templateId] = { ...(all[templateId] ?? {}), layoutPreset }
-    localStorage.setItem(TPL_META_KEY, JSON.stringify(all))
+    cachedJsonWrite(TPL_META_KEY, all)
   } catch {
     /* ignore */
   }
@@ -801,7 +798,7 @@ export function clearTemplateStepOverride(templateId: string, stepId: string): v
     delete next[stepId]
     if (Object.keys(next).length === 0) delete all[templateId]
     else all[templateId] = next
-    localStorage.setItem(TPL_OVERRIDES_KEY, JSON.stringify(all))
+    cachedJsonWrite(TPL_OVERRIDES_KEY, all)
   } catch {
     /* ignore */
   }

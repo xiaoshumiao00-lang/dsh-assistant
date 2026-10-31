@@ -774,6 +774,46 @@ const notifyConsole = () => consoleListeners.forEach((l) => { try { l() } catch 
 const flowListeners = new Set<() => void>()
 const notifyFlow = () => flowListeners.forEach((l) => { try { l() } catch {} })
 
+/**
+ * 「一批宿主通知只做一次」的合并闸门。
+ * 生产里有多个 WorktableSection 实例（侧栏工作台 + headless 数据宿主 + 分栏浮层）同时订阅同一份
+ * 宿主快照：原来每个实例的监听各自都会 notifyConsole/notifyFlow + 扫一遍游离会话生命周期 +
+ * 排一次冷预览清扫 + 催一遍验收环 —— 一次宿主事件 = 实例数的 3–4 倍重复活。
+ * 宿主通知的回调是同步跑的，所以用微任务把同一批并成一次（微任务比动画帧更早，卡片仍在同一帧里刷新）。
+ * 显式的 notifyConsole() 调用点（改动完了要立刻见到）一律保持同步，不动这条。
+ */
+let notifyBusQueued = false
+const queueNotifyBus = (): void => {
+  if (notifyBusQueued) return
+  notifyBusQueued = true
+  queueMicrotask(() => {
+    notifyBusQueued = false
+    notifyConsole()
+    notifyFlow()
+  })
+}
+/**
+ * 同一批通知里的共享扫描按「任务名」合并：多个工作台实例订阅的是同一份宿主快照，
+ * 原来每个实例都各扫一遍（生命周期全表扫 / 冷预览清扫）。同名任务一批只跑一次，
+ * 不同名任务互不影响（谁也不被谁吃掉）。
+ */
+const sharedTaskPending = new Set<string>()
+const sharedTaskQueue: Array<{ key: string; run: () => void }> = []
+let sharedTaskFlushArmed = false
+const queueSharedTask = (key: string, run: () => void): void => {
+  if (sharedTaskPending.has(key)) return
+  sharedTaskPending.add(key)
+  sharedTaskQueue.push({ key, run })
+  if (sharedTaskFlushArmed) return
+  sharedTaskFlushArmed = true
+  queueMicrotask(() => {
+    sharedTaskFlushArmed = false
+    const batch = sharedTaskQueue.splice(0, sharedTaskQueue.length)
+    sharedTaskPending.clear()
+    for (const task of batch) { try { task.run() } catch { /* 共享扫描炸了不能把通知链带崩 */ } }
+  })
+}
+
 /** 宿主工作区列表（分组选择数据源；读 ctx.workspaces 快照） */
 function listWorkspaces(): { id: string; title: string; path: string }[] {
   try {
@@ -922,13 +962,17 @@ function firstLineOf(text: string): string {
 /** 从 argsRaw 里取最有信息量的一行（description / command / path / query…）
  *  流式工具调用只有**半截 JSON**（参数还没生成完），解析失败时按字段名抠出已到达的部分，
  *  否则卡片上会出现 `{"path":"src/cli…` 这种原始碎片。 */
+/** 流式工具调用只有半截 JSON：按这些字段名抠出已到达的部分（正则一次编译，不是每键重新编译） */
+const TOOL_ARG_FALLBACK_KEYS = [ 'description', 'path', 'file_path', 'command', 'pattern', 'query', 'url' ]
+const TOOL_ARG_FALLBACK_RES = TOOL_ARG_FALLBACK_KEYS.map((key) => new RegExp(`"${key}"\\s*:\\s*"([^"\\\\]*(?:\\\\.[^"\\\\]*)*)`, 's'))
+
 function summarizeToolArgs(name: string, argsRaw: string): string {
   const raw = String(argsRaw ?? '').trim()
   if (!raw) return ''
   let args: any = null
   try { args = JSON.parse(raw) } catch {
-    for (const key of ['description', 'path', 'file_path', 'command', 'pattern', 'query', 'url']) {
-      const m = raw.match(new RegExp(`"${key}"\\s*:\\s*"([^"\\\\]*(?:\\\\.[^"\\\\]*)*)`, 's'))
+    for (let i = 0; i < TOOL_ARG_FALLBACK_RES.length; i++) {
+      const m = raw.match(TOOL_ARG_FALLBACK_RES[i])
       if (m?.[1]) {
         let value = m[1]
         try { value = JSON.parse(`"${value}"`) } catch { /* 半截转义按原文 */ }
@@ -3310,23 +3354,17 @@ function WorktableSection(props: any) {
       const runningLive = running.length > 0
       // 按活跃度把这条项目的关联会话排好序（待决策 > 正在跑 > 异常 > 空闲，同档取最近更新）：
       // 卡片中间那块进度就按这个优先级依次找，**第一条拿得到内容的**就是显示的那条。
-      const rankedRelated = sortSessionsByActivity(related.map((s) => ({
+      // 原来这里为「排序」和「挑进入的那条」各建一份对象数组、各排一次；同输入同结果 → 共用一次。
+      const rows = related.map((s) => ({
         id: s,
         updatedAt: Number(byId[s]?.updatedAt ?? 0) || 0,
         running: isRunning(s),
         awaiting: awaitingOf(s),
-      }))).map((r) => r.id)
+      }))
+      const rankedRelated = sortSessionsByActivity(rows).map((r) => r.id)
       // 卡片点开时进入的那一条 = 「待决策 > 正在跑」里最活动的一条，与 preferredSessionOf 的①同一判定
       //（只按 related 判定、不含 kids：点卡片永远不会进子代理会话）。
-      const enteredPick = pickActiveSession(
-        related.map((s) => ({
-          id: s,
-          updatedAt: Number(byId[s]?.updatedAt ?? 0) || 0,
-          running: isRunning(s),
-          awaiting: awaitingOf(s),
-        })),
-        currentSessionId(),
-      )?.id ?? null
+      const enteredPick = pickActiveSession(rows, currentSessionId())?.id ?? null
       const enteredActive = enteredPick !== null && (isRunning(enteredPick) || awaitingOf(enteredPick))
       const status = statusOf(id)
       // 进度文本 = 优先级最高那条会话的**最新消息**（拿不到就往下一条优先级会话走，
@@ -4602,20 +4640,23 @@ function buildCustomLayoutPrompt(req: string): string {
   useEffect(() => {
     const l = () => {
       setNotifyTick((t) => t + 1)
-      notifyConsole()
-      notifyFlow()
-      // 临时卡片「正在运行」的生命周期：即使控制室没开也要记录「跑 → 停」的真实结束时间
-      trackTransientLifecycles()
-      if (splitStore.active && splitStore.spec?.id === CONSOLE_ID) schedulePreviewSweep()
+      // 面板失效与共享扫描合并成「每批一次」：多个工作台实例订阅的是同一份快照，原来各做一遍
+      queueNotifyBus()
+      queueSharedTask('lifecycle', () => {
+        // 临时卡片「正在运行」的生命周期：即使控制室没开也要记录「跑 → 停」的真实结束时间
+        trackTransientLifecycles()
+      })
+      queueSharedTask('preview', () => {
+        if (splitStore.active && splitStore.spec?.id === CONSOLE_ID) schedulePreviewSweep()
+      })
     }
     sessionsSnapshotStore.listeners.add(l)
     // 宿主「待用户决策」登记变化（问题出现/被回答常不伴随会话列表变动，必须单独订阅）
     const bump = () => {
       setNotifyTick((t) => t + 1)
-      notifyConsole()
-      notifyFlow()
+      queueNotifyBus()
       // 待决出现/被回答也会改变「是否算结束」，同步更新生命周期
-      try { trackTransientLifecycles() } catch {}
+      queueSharedTask('lifecycle', () => { trackTransientLifecycles() })
     }
     pendingInteractionsStore.listeners.add(bump)
     refreshPendingInteractions() // 初始拉取一次当前登记（wire 之外再兜底）
@@ -4629,9 +4670,8 @@ function buildCustomLayoutPrompt(req: string): string {
 
   // 项目表变化 → 控制室卡片刷新（打开中的面板即时更新）
   useEffect(() => {
-    notifyConsole()
-    notifyFlow()
-    try { trackTransientLifecycles() } catch {}
+    queueNotifyBus()
+    queueSharedTask('lifecycle', () => { trackTransientLifecycles() })
   }, [projects])
 
   // 入驻项目的名称/图标与注册集合也是卡片数据源；本地 UI 重绘不再兼任失效信号。
@@ -4892,6 +4932,10 @@ function buildCustomLayoutPrompt(req: string): string {
     }
     return res
   }, [projects.bindings, projects.layouts, projects.flows, notifyTick, collectKids])
+
+  /** 卡片 DOM 桥读这两张表的最新值（观察器常驻，不再因它们变化而拆建） */
+  const notifyMapsRef: { current: { bind: Record<string, 'done' | 'need' | 'busy'>; need: Record<string, boolean> } } = { current: { bind: {}, need: {} } }
+  notifyMapsRef.current = { bind: bindNotifyMap, need: needNowMap }
 
   /** 确认一条会话的提醒：清异常标记 + 已看待决/完成就熄光（绑定会话与实际进入的会话共用同一份逻辑） */
   const ackSessionNotify = (sid: string): void => {
@@ -5856,6 +5900,7 @@ function buildCustomLayoutPrompt(req: string): string {
       },
       onStepPassed: (pid) => refreshProjectInfo(pid),
     })
+    // 验收环：每个实例的调度器都订阅这条（tick 内部本来就有 single-flight + 60s 卡死自愈）
     const unsubSnap = sessionsSnapshotStore.listeners.add(() => { void scheduler.tick() })
     scheduler.start()
     verifySchedulerRef.current = scheduler
@@ -6146,6 +6191,10 @@ function buildCustomLayoutPrompt(req: string): string {
     const box = rootRef.current?.querySelector<HTMLElement>('.dsh-wt_projects') ?? null
     if (!box) return
     const sync = () => {
+      // 提醒态从 ref 读最新值（原来这两个 map 在 effect deps 里：每次通知都拆掉观察器重挂 + 全量重扫，
+      // 观察器是这张卡唯一的驱动源，拆建有「漏一帧」的风险，也多花一份全树扫描）
+      const bindNotifyMap = notifyMapsRef.current.bind
+      const needNowMap = notifyMapsRef.current.need
       // 子座位把所有卡片包在一个无类容器里：直接取卡片按钮（DOM 序 = 注册序），排除自渲染的布局卡
       const cards = Array.from(box.querySelectorAll<HTMLElement>('button:not(.dsh-wt_layout)'))
       cards.forEach((el, i) => {
@@ -6224,8 +6273,19 @@ function buildCustomLayoutPrompt(req: string): string {
     // 只观察项目容器；聊天流式更新不再触发整页 childList 回调与卡片扫描。
     const mo = new MutationObserver(sync)
     mo.observe(box, { childList: true, subtree: true })
-    return () => mo.disconnect()
-  }, [headless, wide, aliveRegisteredIds, projects.iconOverrides, projects.views, activeSplitId, projects.bindings, bindNotifyMap, needNowMap])
+    // 状态灯 / 待决策标签变了就跟着控制室那一趟走：同一帧只排一次，观察器不再每轮拆建
+    let bridgeFrame: number | null = null
+    const onInvalidate = () => {
+      if (bridgeFrame != null) return
+      bridgeFrame = window.requestAnimationFrame(() => { bridgeFrame = null; sync() })
+    }
+    consoleListeners.add(onInvalidate)
+    return () => {
+      consoleListeners.delete(onInvalidate)
+      if (bridgeFrame != null) { window.cancelAnimationFrame(bridgeFrame); bridgeFrame = null }
+      mo.disconnect()
+    }
+  }, [headless, wide, aliveRegisteredIds, projects.iconOverrides, projects.views, activeSplitId, projects.bindings])
 
   useEffect(() => {
     if (headless) return
