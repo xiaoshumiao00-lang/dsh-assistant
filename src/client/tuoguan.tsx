@@ -26,6 +26,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { CSSProperties } from 'react'
 import { Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
+import { domGate } from './compositionGate'
 
 /* ---------- 常量 ---------- */
 
@@ -499,6 +500,10 @@ function startSync(): void {
     pollTimer = setInterval(() => {
       // 页面不可见时暂停轮询（省电、省请求）。
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+      // 用户在输入框里打字（含手机语音实时转写）或抽屉正在开合：这一轮先让路。
+      // 轮询回来的 setState 会重渲染输入框工具行里的托管胶囊 —— 而胶囊在 composer
+      // 那一棵树里，宿主重排输入框就等于把正在进行的语音组合打断。
+      if (domGate.isPaused()) return
       if (!hostReachable) {
         if (pollTicks % DEGRADED_POLL_FACTOR !== 0) { pollTicks += 1; return }
       }

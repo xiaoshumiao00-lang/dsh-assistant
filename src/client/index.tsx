@@ -5,7 +5,7 @@ import { isAbs, joinPath, parentPathOf, basenameOf } from './pathutil'
 import { splitStore, SplitWorkspace, setSplitT, setSplitEnv, RUNNING_CARD_ID, type LayoutSpec, type SplitPane, type ConsoleCardData, type ProjectSessionItem, type NewSessionOptions } from './split'
 import { splitOpenIntent } from './splitEntry'
 import { sessionLeavesProject } from './projectExit'
-import { BUILTIN_TEMPLATES, freshFlowRun, templateById, saveTemplateStepOverride, composeStepTask, composeStepSpec, effectiveSkill, effectiveInstruction, effectiveConverge, stepBriefOf, isStepBriefConfirmed, migrateFlowRun, OVERLAY_FILE, REPORT_PREFIX, l1ChecklistPath, parseL1Checklist, isConvergeStep, type FlowRunState, type FlowStepOverride, type FlowStepView, type FlowView, type TemplateDef } from './templates'
+import { BUILTIN_TEMPLATES, freshFlowRun, templateById, saveTemplateStepOverride, composeStepTask, composeStepSpec, effectiveSkill, effectiveInstruction, effectiveConverge, stepBriefOf, isStepBriefConfirmed, migrateFlowRun, OVERLAY_FILE, REPORT_PREFIX, l1ChecklistPath, parseL1Checklist, isConvergeStep, type FlowRunState, type FlowStepOverride, type FlowStepView, type FlowView, type TemplateDef, type TemplateStepDef } from './templates'
 import { VerifyScheduler, composeDiagnosisTask } from './verifyLoop'
 import { defaultProjectFolder, defaultProjectName, isAutoProjectFolder, projectFolderBrowseStart } from './newProjectDefault'
 import { ProjectFolderSheet } from './projectFolderSheet'
@@ -20,6 +20,8 @@ import { assistantHomeDir } from './assistant-entry'
 import { ASSISTANT_PROJECT_ID, ASSISTANT_CARD_NAME, ASSISTANT_CARD_ICON, shouldAddAssistantCard, withAssistantCard } from './assistant-card'
 import { hasPendingInteraction, sessionStatusSourceOf, pendingInteractionSignature } from './sessionStatus'
 import { sessionSnapshotIndexOf, invalidateSessionSnapshotIndex } from './sessionIndex'
+import { pickActiveSession, sortSessionsByActivity, sessionTierOf, type RankableSessionRow } from './sessionRank'
+import { domGate } from './compositionGate'
 
 /** 项目叠加层（L2）可选项：写作语言 */
 const PAPER_LANG_OPTIONS = ['中文写作后翻译英文', '直接写英文', '仅中文投稿']
@@ -1748,6 +1750,21 @@ function markPluginSessionOpen(sessionId: string) {
   }
 }
 
+/** 手机端分栏（dsh-pocket 抽屉布局）判定：只用于「关项目时是否回切打开前的会话」这一条。
+ *  判据优先取 pocket 写在 body 上的生效布局标记（'mobile' = 抽屉布局，含宽屏手机被强制成抽屉）；
+ *  没有标记（pocket 未加载 / 老 bundle）时按官方窄屏线 1024 兜底。桌面 DSH 窗口（≥1024 且无标记）不受影响。 */
+function isPocketPhoneLayout(): boolean {
+  try {
+    const v = globalThis.document?.body?.getAttribute?.('data-dsh-pocket-layout')
+    if (v === 'mobile') return true
+    if (v === 'desktop') return false
+  } catch { /* 读不到标记就往下走视口判断 */ }
+  try {
+    const w = Number(globalThis.window?.innerWidth)
+    return Number.isFinite(w) && w > 0 && w < 1024
+  } catch { return false }
+}
+
 /** 宿主「切换当前会话」入口（跨版本适配，v0.3.28）。
  *  DSH 0.2 起当前会话选择迁到 ui-workspace 服务（ctx.uiWorkspace.openSession，内部写
  *  dsh.sessions.current + 挂主视图），**ctx.sessions.open 已被移除**——旧写法在 0.2 上是
@@ -2215,6 +2232,37 @@ function sessionRunningNow(sid: string | undefined, byId: Record<string, any>, k
   return false
 }
 
+/** 会话面快照（只读，取不到返回 null）；卡片与「会话列表 / 进入判定」共用同一条通道。 */
+function sessionFaceSnapshotOf(sid: string | undefined): any {
+  if (!sid) return null
+  try { return sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.() ?? null } catch { return null }
+}
+
+/** 卡片口径的「此刻在跑」：宿主已 completed 且 running 位没亮的一律不算（避免残留的未结束轮次把会话糊成在跑） */
+function sessionRunningFlag(sid: string | undefined, byId: Record<string, any>, kidsOf: (s: string) => Set<string>): boolean {
+  if (!sid) return false
+  const e = byId[sid]
+  if (e?.completed === true && e?.running !== true) return false
+  return sessionRunningNow(sid, byId, kidsOf)
+}
+
+/** 卡片口径的「等你回答」：pendingInteraction / 会话面 pending / 任一子代理待决。
+ *  与 running 同时为真是常态（原生 UI 以黄点优先），所以判定必须排在 running 之前。 */
+function sessionAwaitingFlag(
+  sid: string | undefined,
+  byId: Record<string, any>,
+  kidsOf: (s: string) => Set<string>,
+  faceOf: (sid: string) => any,
+): boolean {
+  if (!sid) return false
+  if (sessionAwaitingDecision(sid) || sessionNotifyState(byId[sid]) === 'need') return true
+  for (const cid of kidsOf(sid)) {
+    if (sessionAwaitingDecision(cid) || (byId[cid] && sessionNotifyState(byId[cid]) === 'need')) return true
+  }
+  const face = faceOf(sid)
+  return Array.isArray(face?.pending) && face.pending.length > 0
+}
+
 function syncSessionScope(list: any) {
   try {
     const snap = list.getSnapshot()
@@ -2605,6 +2653,10 @@ function WorktableSection(props: any) {
   useEffect(() => {
     const iv = window.setInterval(() => {
       try {
+        // 用户在输入框里打字 / 语音实时转写，或抽屉正在开合：这一整轮先让路。
+        // 1.2s 一轮的日志抓取（follow 读整段历史 + 计算预览文本）在手机上就是
+        // 和 0.28s 的动画、和正在进行的 IME 组合抢主线程的那件事。
+        if (domGate.isPaused()) return
         if (!controlRoomStore.getSnapshot() || document.visibilityState !== 'visible') return
         const pr = projectsRef.current.projects
         const snapById = sessionsSnapshotStore.snapshot?.byId ?? {}
@@ -2701,6 +2753,7 @@ function WorktableSection(props: any) {
   // 轮询另一端的改动（页面可见时）
   useEffect(() => {
     const iv = window.setInterval(() => {
+      if (domGate.isPaused()) return
       if (!syncReadyRef.current || document.visibilityState !== 'visible') return
       if (syncTimerRef.current != null || syncPollBusyRef.current) return
       syncPollBusyRef.current = true
@@ -2726,37 +2779,44 @@ function WorktableSection(props: any) {
     return () => window.clearInterval(iv)
   }, [])
 
-  /** 模板项目「最新阶段」的步骤子目录（判定顺序与 preferredSessionOf 同源，保证
-   *  新建对话落在「打开该项目时切到的那一步」目录里）：
-   *  ① 当前待做步（有效区间内第一个未通过）**已开过专属会话** → 用它的步骤目录；
+  /** 模板流程项目「当前应切入的步骤」（点卡片进入 / 新建会话目录 / 会话列表共用同一判定）：
+   *  ① 当前待做步（有效区间内第一个未通过）**已开过专属会话** → 就是它（进度最新那一步优先）；
    *  ② 否则取最近一次「开始/通过」的步骤（例如第 9 步刚做完、第 10 步还没开始 → 仍是第 9 步）；
    *  ③ 都没有（全新项目尚未开始任何步骤）→ 首个待做步；全部通过 → 最后一步。
-   *  非模板项目、或项目没有根文件夹时返回 ''。 */
-  const latestStepDirOf = (pid: string): string => {
+   *  非模板项目返回 null。 */
+  const templateFlowStepOf = (pid: string): { step: TemplateStep; run: FlowRunState } | null => {
     const pr = projectsRef.current.projects
     const run = pr.flows?.[pid]
-    const root = pr.folders[pid]
-    if (!run || !root) return ''
+    if (!run) return null
     const tmpl = templateById(run.templateId)
-    if (!tmpl || tmpl.steps.length === 0) return ''
+    if (!tmpl || !Array.isArray(tmpl.steps) || tmpl.steps.length === 0) return null
     const startIndex = Math.min(Math.max(run.startIndex ?? 0, 0), Math.max(0, tmpl.steps.length - 1))
-    const doneSet = new Set(run.done)
+    const doneSet = new Set(run.done ?? [])
     const cur = tmpl.steps.find((s, i) => i >= startIndex && !doneSet.has(s.id))
-    if (cur && run.stepSessions?.[cur.id]) return joinPath(root, cur.dir)
     const orderKey = (s: { id: string }): number => {
-      const k1 = run.lastStartedAt?.[s.id]
-      const k2 = run.doneAt?.[s.id]
+      const k1 = (run as any).lastStartedAt?.[s.id]
+      const k2 = (run as any).doneAt?.[s.id]
       if (k1 != null && k2 != null) return Math.max(k1, k2)
       return k1 ?? k2 ?? -Infinity
     }
     const recent = tmpl.steps
       .filter((s, i) => i >= startIndex && orderKey(s) > -Infinity)
       .sort((a, b) => orderKey(b) - orderKey(a))[0]
-    const step = recent ?? cur ?? tmpl.steps[tmpl.steps.length - 1]
-    return step ? joinPath(root, step.dir) : ''
+    const step = (cur && run.stepSessions?.[cur.id]) ? cur : (recent ?? cur ?? tmpl.steps[tmpl.steps.length - 1])
+    return step ? { step, run } : null
   }
 
-  /** 某个项目目录下的全部会话（含模板各步骤子目录），按最近更新倒序（卡片「会话列表」浮层用）。
+  /** 模板项目「最新阶段」的步骤子目录：与 preferredSessionOf 同源判定，保证
+   *  新建对话落在「打开该项目时切到的那一步」目录里；非模板项目或没有根目录时返回 ''。 */
+  const latestStepDirOf = (pid: string): string => {
+    const root = projectsRef.current.projects.folders[pid]
+    const parsed = templateFlowStepOf(pid)
+    if (!root || !parsed) return ''
+    return joinPath(root, parsed.step.dir)
+  }
+
+  /** 某个项目目录下的全部会话（含模板各步骤子目录）。排序与「点卡片进入哪条会话」同一套判定
+   *  （置顶 > 等你回答 > 正在跑 > 异常 > 空闲按最近更新倒序），所以浮层第一行就是点卡片会进的那条。
    *  数据源：宿主会话快照 ctx.sessions.list 的 byId[sid]（cwd / displayTitle / running / updatedAt）——
    *  纯客户端只读镜像，零 Token、无需新路由。目录基准取项目文件夹（模板项目取根，从而覆盖各步骤子目录）；
    *  内置控制室没有项目文件夹，则用它自己对话所在的目录。子代理会话不列出。 */
@@ -2780,14 +2840,14 @@ function WorktableSection(props: any) {
         rel: normalizeFolderPath(r.cwd),
         current: r.id === current,
         running: r.running,
+        awaiting: r.awaiting,
         blank: false,
         updatedAt: r.updatedAt,
         pinned: pinned.has(r.id),
         archived: false,
         finished: r.finished,
       }))
-      out.sort((a, b) => (Number(!!b.pinned) - Number(!!a.pinned)) || (b.updatedAt - a.updatedAt))
-      return out
+      return sortSessionsByActivity(out)
     }
     const base = pr.folders[pid] || cwdOfSession(pr.bindings[pid]) || ''
     if (!base) return []
@@ -2795,6 +2855,15 @@ function WorktableSection(props: any) {
     const byId: Record<string, any> = snap?.byId ?? {}
     const ids: string[] = Array.isArray(snap?.ids) ? snap.ids : Object.keys(byId)
     const current: string = currentSessionId(snap?.current ?? '')
+    const index = sessionSnapshotIndexOf(snap)
+    const noKids: Set<string> = new Set()
+    const kidsOf = (sid: string): Set<string> => index.kidsByParent.get(sid) ?? noKids
+    // 会话面 pending 兜底（旧宿主没有 pendingInteraction 登记时唯一的通道）：同一列表内只探一次
+    const faceCache = new Map<string, any>()
+    const faceOf = (sid: string): any => {
+      if (!faceCache.has(sid)) faceCache.set(sid, sessionFaceSnapshotOf(sid))
+      return faceCache.get(sid) ?? null
+    }
     const norm = (p: unknown) => String(p ?? '').replace(/\\/g, '/').replace(/\/+$/, '')
     const baseN = norm(base)
     if (!baseN) return []
@@ -2810,23 +2879,26 @@ function WorktableSection(props: any) {
       if (!cwd) continue
       const key = cwd.toLowerCase()
       if (key !== baseKey && !key.startsWith(baseKey + '/')) continue
+      const isArchived = archived.has(sid)
+      // 活跃度判定与卡片同一口径：等你回答（黄）> 正在跑（蓝）> 其余。归档会话不可能在跑，跳过探测。
+      const flags = isArchived ? { awaiting: false, running: false } : {
+        awaiting: sessionAwaitingFlag(sid, byId, kidsOf, faceOf),
+        running: sessionRunningFlag(sid, byId, kidsOf),
+      }
       out.push({
         id: sid,
         title: (typeof e.displayTitle === 'string' && e.displayTitle) || (typeof e.title === 'string' && e.title) || '',
         rel: key === baseKey ? '' : cwd.slice(baseN.length + 1),
         current: sid === current,
-        running: e.running === true,
+        running: flags.running,
+        awaiting: flags.awaiting,
         blank: e.blank === true,
         updatedAt: typeof e.updatedAt === 'number' ? e.updatedAt : 0,
         pinned: pinned.has(sid),
-        archived: archived.has(sid),
+        archived: isArchived,
       })
     }
-    out.sort((a, b) => {
-      if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1
-      return (b.updatedAt - a.updatedAt) || a.rel.localeCompare(b.rel)
-    })
-    return out
+    return sortSessionsByActivity(out)
   }
 
   /** 全局（不要求控制室打开）跟踪游离会话的「跑 → 停」：
@@ -2863,11 +2935,8 @@ function WorktableSection(props: any) {
     const kidsOf = (sid: string): Set<string> => kidsByParent.get(sid) ?? noKids
     const now = Date.now()
     for (const sid of roots) {
-      const entry = byId[sid]
       // 与卡片同一口径：宿主明确 completed 且不在 running 时，残留的未结束轮次不算「还在跑」
-      const running = (entry?.completed === true && entry?.running !== true)
-        ? false
-        : sessionRunningNow(sid, byId, kidsOf)
+      const running = sessionRunningFlag(sid, byId, kidsOf)
       // 停在「等用户决策」不算结束：否则等很久后再回答并秒完成，卡片会因旧结束时间过期而看不到结果
       const awaiting = sessionAwaitingDecision(sid)
       const active = running || awaiting
@@ -3072,8 +3141,7 @@ function WorktableSection(props: any) {
     const faceCache = new Map<string, any>()
     const faceOf = (sid: string): any => {
       if (faceCache.has(sid)) return faceCache.get(sid)
-      let face: any = null
-      try { face = sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.() ?? null } catch {}
+      const face = sessionFaceSnapshotOf(sid)
       faceCache.set(sid, face)
       return face
     }
@@ -3109,18 +3177,7 @@ function WorktableSection(props: any) {
       if (!sid) return false
       const cached = awaitingMemo.get(sid)
       if (cached !== undefined) return cached
-      let result = sessionAwaitingDecision(sid) || sessionNotifyState(byId[sid]) === 'need'
-      if (!result) {
-        try {
-          const face = faceOf(sid)
-          result = Array.isArray(face?.pending) && face.pending.length > 0
-        } catch {}
-      }
-      if (!result) {
-        for (const cid of kidsSetOf(sid)) {
-          if (sessionAwaitingDecision(cid) || (byId[cid] && sessionNotifyState(byId[cid]) === 'need')) { result = true; break }
-        }
-      }
+      const result = sessionAwaitingFlag(sid, byId, kidsSetOf, faceOf)
       awaitingMemo.set(sid, result)
       return result
     }
@@ -3356,42 +3413,39 @@ function WorktableSection(props: any) {
         })
       }
     } catch { /* 临时卡片计算失败不影响已创建项目的卡片 */ }
-    transientRows.sort((a, b) => {
-      const rank = (r: TransientRow): number => (r.awaiting ? 0 : r.running ? 1 : r.error ? 2 : 3)
-      return (rank(a) - rank(b)) || (b.updatedAt - a.updatedAt) || a.id.localeCompare(b.id)
-    })
-    transientRowsRef.current = transientRows
-    transientTrackedIdsRef.current = transientRows.map((r) => r.id)
+    const ranked = sortSessionsByActivity(transientRows)
+    transientRowsRef.current = ranked
+    transientTrackedIdsRef.current = ranked.map((r) => r.id)
     let transientCard: ConsoleCardData | null = null
-    if (transientRows.length > 0) {
-      const activeRows = transientRows.filter((r) => r.awaiting || r.running)
-      const pick = (activeRows.length > 0 ? activeRows : transientRows)[0]
+    if (ranked.length > 0) {
+      // 卡片点开时进入的那一条 = 待决策 / 正在跑里最活动的一条（与浮层列表第一行同一判定）
+      const pick = pickActiveSession(ranked) ?? ranked[0]
       const order: string[] = []
       const push = (value: string | null | undefined): void => { if (value && !order.includes(value)) order.push(value) }
       push(pick?.id)
-      for (const r of transientRows) push(r.id)
-      for (const r of transientRows) for (const cid of kidsSetOf(r.id)) push(cid)
+      for (const r of ranked) push(r.id)
+      for (const r of ranked) for (const cid of kidsSetOf(r.id)) push(cid)
       const text = activityTextOf(order)
-      const anyNeed = transientRows.some((r) => r.awaiting)
-      const anyBusy = transientRows.some((r) => r.running)
-      const anyError = transientRows.some((r) => r.error)
-      const anyDone = transientRows.some((r) => r.done)
+      const anyNeed = ranked.some((r) => r.awaiting)
+      const anyBusy = ranked.some((r) => r.running)
+      const anyError = ranked.some((r) => r.error)
+      const anyDone = ranked.some((r) => r.done)
       const status: ConsoleCardData['status'] = anyNeed ? 'need' : anyBusy ? 'busy' : anyError ? 'error' : anyDone ? 'done' : 'idle'
       let start: number | null = null
-      for (const r of transientRows) {
+      for (const r of ranked) {
         if (!r.running) continue
         const s = runningStartOf(r.id)
         if (s != null && (start == null || s < start)) start = s
       }
-      const glow = (status === 'need' && transientRows.some((r) => r.awaiting && ackMap[r.id] !== 'need'))
-        || (status === 'done' && transientRows.some((r) => r.done && ackMap[r.id] !== 'done'))
+      const glow = (status === 'need' && ranked.some((r) => r.awaiting && ackMap[r.id] !== 'need'))
+        || (status === 'done' && ranked.some((r) => r.done && ackMap[r.id] !== 'done'))
       transientCard = {
         id: RUNNING_CARD_ID,
         name: RUNNING_CARD_NAME,
         icon: RUNNING_CARD_ICON,
         status,
         runtimeMs: start != null ? Math.max(0, now - start) : null,
-        kids: kidsOfAll(transientRows.map((r) => r.id)),
+        kids: kidsOfAll(ranked.map((r) => r.id)),
         preview: text || ((anyBusy || anyNeed) ? (t('console.liveRunning') || '正在执行…') : ''),
         live: anyBusy,
         bound: true,
@@ -3589,7 +3643,7 @@ function WorktableSection(props: any) {
             // （openSplit 内部无论 layout 是否存在都会用 preferredSessionOf 判定模板步骤会话）
             actionsRef.current?.openSplit({ id, title: (pr.nameOverrides[id] ?? id), icon: pr.metas?.[id]?.icon ?? '🧱', top: null, main: [], chatWidth: { default: 340, min: 280, max: 600 } } as LayoutSpec, { enter: true })
           } else {
-            // 入驻项目无视图覆盖：切到该项目目录下「最近更新」的会话（没有才用绑定对话）
+            // 入驻项目无视图覆盖：切到该项目「进行中」的会话（没有才退到最近更新 / 绑定对话）
             const target = preferredSessionOf(id)
             if (target) {
               markPluginSessionOpen(target)
@@ -3684,7 +3738,10 @@ function WorktableSection(props: any) {
   useEffect(() => splitStore.subscribe(() => {
     setActiveSplitId(splitStore.active && splitStore.spec ? splitStore.spec.id : null)
     if (!splitStore.active) {
-      if (!suppressRestoreRef.current) {
+      // 手机端（dsh-pocket 抽屉布局）：标题栏 ✕ = 只收起分栏，停在当前会话（退回它的单栏视图），
+      // 不回切「打开项目之前的那条会话」——否则一退出就从论文项目跳到个人助手最新会话。
+      // 桌面布局保持原行为（进项目前在 A、退出分栏回到 A）；「切会话自动关项目」联动仍走 suppressRestoreRef 跳过回切。
+      if (!suppressRestoreRef.current && !isPocketPhoneLayout()) {
         const prev = projectAttachRef.sessionId
         if (prev) openSessionInHost(prev)
       }
@@ -3862,45 +3919,60 @@ function buildCustomLayoutPrompt(req: string): string {
   ].join('\n')
 }
 
-  /** 打开项目应切入的对话：模板流程项目 = 「最新步骤」的专属会话（当前待做步已开会话则用它；
-   *  全部通过时用最近开始/通过的步骤会话）；其余项目 = 该项目目录下「最近更新」的会话（跳过已归档）；
-   *  都没有 = 退回绑定会话；再没有 = null（调用方会新建一条空白会话）。 */
+  /** 点卡片时的候选会话：项目目录（含模板步骤子目录）下的会话 + 显式记账的绑定/步骤会话，
+   *  去重、剔除已归档（点进去一条被归档的旧对话没有意义）。 */
+  const candidateSessionRowsOf = (pid: string): ProjectSessionItem[] => {
+    const pr = projectsRef.current.projects
+    const rows = projectSessionsOf(pid).filter((s) => !s.archived)
+    const seen = new Set(rows.map((r) => r.id))
+    const extra: string[] = []
+    const bound = pr.bindings[pid]
+    if (bound && !seen.has(bound)) extra.push(bound)
+    for (const sid of Object.values<any>(pr.flows?.[pid]?.stepSessions ?? {})) {
+      if (typeof sid === 'string' && sid && !seen.has(sid)) extra.push(sid)
+    }
+    if (extra.length === 0) return rows
+    const snap = sessionBridge?.list?.getSnapshot?.()
+    const byId: Record<string, any> = snap?.byId ?? {}
+    const index = sessionSnapshotIndexOf(snap)
+    const noKids: Set<string> = new Set()
+    const kidsOf = (sid: string): Set<string> => index.kidsByParent.get(sid) ?? noKids
+    for (const sid of extra) {
+      const e = byId[sid]
+      if (!e) continue
+      rows.push({
+        id: sid,
+        title: (typeof e.displayTitle === 'string' && e.displayTitle) || (typeof e.title === 'string' && e.title) || '',
+        rel: '',
+        current: sid === currentSessionId(),
+        running: sessionRunningFlag(sid, byId, kidsOf),
+        awaiting: sessionAwaitingFlag(sid, byId, kidsOf, sessionFaceSnapshotOf),
+        blank: e.blank === true,
+        updatedAt: typeof e.updatedAt === 'number' ? e.updatedAt : 0,
+        pinned: false,
+        archived: false,
+      })
+      seen.add(sid)
+    }
+    return rows
+  }
+
+  /** 打开项目应切入的对话：
+   *  ① 进行中的会话优先（等你回答的黄档 > 正在跑的蓝档；同档内取最近有活动的那条，
+   *    当前会话本身就在这档里则保持不动——点卡片不该把用户正在看的会话踢走）；
+   *  ② 没有进行中的会话：模板流程项目按「最新步骤」判定；
+   *  ③ 再兜底：该项目目录下「最近更新」的会话（与「会话列表」第一行同一套排序）；
+   *  ④ 都没有 = 退回绑定会话；再没有 = null（调用方会新建一条空白会话）。 */
   const preferredSessionOf = (pid: string): string | null => {
     const pr = projectsRef.current.projects
-    const run = pr.flows?.[pid]
-    if (run) {
-      // 模板判定只依赖 flow run，不依赖 layout 记录是否存在（布局卡可能缺失/迁移，但模板会话切换必须可靠）
-      const tmpl = templateById(run.templateId)
-      if (tmpl) {
-        const startIndex = Math.min(Math.max(run.startIndex ?? 0, 0), Math.max(0, tmpl.steps.length - 1))
-        const doneSet = new Set(run.done)
-        // 1) 当前待做步（进度最新一步）已开会话 → 切它
-        const cur = tmpl.steps.find((s, i) => i >= startIndex && !doneSet.has(s.id))
-        if (cur) {
-          const sid = run.stepSessions?.[cur.id]
-          if (sid) return sid
-        }
-        // 2) 全部通过 / 当前步还没开始：取最近一次开始（或通过）的步骤会话
-        const orderKey = (s: any): number => {
-          const k1 = (run as any).lastStartedAt?.[s.id]
-          const k2 = (run as any).doneAt?.[s.id]
-          if (k1 != null && k2 != null) return Math.max(k1, k2)
-          return k1 ?? k2 ?? -Infinity
-        }
-        const recent = tmpl.steps
-          .filter((s, i) => i >= startIndex && orderKey(s) > -Infinity)
-          .sort((a, b) => orderKey(b) - orderKey(a))[0]
-        if (recent) {
-          const sid = run.stepSessions?.[recent.id]
-          if (sid) return sid
-        }
-      }
-    }
-    // 非模板项目：点项目卡片直接进该项目目录下「最近更新」的会话详情（与「会话列表」同源判定；
-    // 已归档的不算，避免点进去是一条被归档的旧对话）。同一目录下没有任何会话时才退回绑定会话。
-    const latest = projectSessionsOf(pid)
-      .filter((s) => !s.archived)
-      .sort((a, b) => b.updatedAt - a.updatedAt)[0]
+    const candidates = candidateSessionRowsOf(pid)
+    const active = pickActiveSession(candidates, currentSessionId())
+    if (active) return active.id
+    // 模板判定只依赖 flow run，不依赖 layout 记录是否存在（布局卡可能缺失/迁移，但模板会话切换必须可靠）
+    const parsed = templateFlowStepOf(pid)
+    const stepSid = parsed ? parsed.run.stepSessions?.[parsed.step.id] : null
+    if (stepSid) return stepSid
+    const latest = sortSessionsByActivity(candidates)[0]
     if (latest) return latest.id
     return pr.bindings[pid] ?? null
   }
@@ -4200,18 +4272,21 @@ function buildCustomLayoutPrompt(req: string): string {
       }
     }
     // 说明：splitStore.open 在同一项目重复点击时是「反选关闭」（返回 true 但 active 变 false）。
-    // 我们要的是「点击项目卡 = 进入项目」，因此只有真正处于打开态才做绑定/模板步骤会话切换；
-    // 对模板流程项目，无论 layout 是否存在，都按 preferredSessionOf 切到最新步骤会话。
+    // 我们要的是「点击项目卡 = 进入项目」，因此只有真正处于打开态才做会话切换；
+    // 切到哪条由 preferredSessionOf 定：进行中的会话（等你回答 > 正在跑）优先，其次模板最新步骤，
+    // 最后才是该项目最近更新的会话。
     if (opened && splitStore.active && splitStore.spec?.id === spec.id) {
       // 记录打开前会话（关项目时回切）与该项目「归属会话」（切到别的会话 = 自动关项目）
       let prev: string | null = null
       try { prev = currentSessionId() || null } catch {}
       projectAttachRef.sessionId = prev
       let target = preferredSessionOf(spec.id)
+      let entered = target
       // 还没有任何专属会话的新项目：自动新建空白会话并绑定（工作目录 = 项目文件夹），
       // 不再回退到「打开项目前的那个会话」（否则进入的会话文件夹与项目不符）
       if (!target && spec.id !== CONSOLE_ID) {
         target = await ensureProjectSession(spec.id)
+        entered = target
       }
       target = target ?? prev
       projectAttachRef.attached = target
@@ -4219,7 +4294,8 @@ function buildCustomLayoutPrompt(req: string): string {
         markPluginSessionOpen(target) // 插件发起的切换：不触发「切会话关项目」联动
         openSessionInHost(target)
       }
-      ackProjectNotify(spec.id)
+      // 熄光只跟着「实际进入的那条会话」走（回退到 prev 的那条不属于本项目，不该被顺带确认）
+      ackProjectNotify(spec.id, entered)
       // 补挂：此前项目未打开时暂存的产物（entries = 多窗口挂载列表），现在自动挂进各目标窗格；
       // 全部落位成功记录指纹（供自愈扫挂去重）
       const pending = pendingMountRef.current[spec.id]
@@ -4239,11 +4315,12 @@ function buildCustomLayoutPrompt(req: string): string {
         try { localStorage.setItem('dsh.worktable.pendingMount.v1', JSON.stringify(pendingMountRef.current)) } catch {}
       }
     } else if (opened) {
-      // 模板流程项目：进入即切到最新步骤会话（即便布局卡缺失；用占位 spec 也保证切会话）
+      // 布局卡缺失的兜底分支：同样按 preferredSessionOf（进行中会话优先）切会话
       const target = preferredSessionOf(spec.id)
       if (target) {
         markPluginSessionOpen(target)
         openSessionInHost(target)
+        ackProjectNotify(spec.id, target)
       }
     }
   }, [projects.views])
@@ -4803,10 +4880,8 @@ function buildCustomLayoutPrompt(req: string): string {
     return res
   }, [projects.bindings, projects.layouts, projects.flows, notifyTick, collectKids])
 
-  /** 点开项目 = 确认提醒：ack 当前会话（含子代理）的待决/完成状态，圆点恢复常态实心 */
-  const ackProjectNotify = (projectId: string) => {
-    const sid = projectsRef.current.projects.bindings[projectId]
-    if (!sid) return
+  /** 确认一条会话的提醒：清异常标记 + 已看待决/完成就熄光（绑定会话与实际进入的会话共用同一份逻辑） */
+  const ackSessionNotify = (sid: string): void => {
     const byId = sessionsSnapshotStore.snapshot?.byId ?? {}
     // 点开项目 = 已看到异常 → 清掉红色标记（下个 tick 卡片恢复常态）
     clearAgentErrors([sid, ...Array.from(collectKids(sid))])
@@ -4815,16 +4890,23 @@ function buildCustomLayoutPrompt(req: string): string {
       if (sessionAwaitingDecision(cid) || sessionNotifyState(byId[cid]) === 'need') { needNow = true; saveNotifyAck(cid, 'need') }
     }
     if (!needNow) {
-      try {
-        const face = sessionBridge?.sessions?.binding?.(sid)?.session?.getSnapshot?.()
-        if (Array.isArray(face?.pending) && face.pending.length > 0) needNow = true
-      } catch {}
+      const face = sessionFaceSnapshotOf(sid)
+      if (Array.isArray(face?.pending) && face.pending.length > 0) needNow = true
     }
     if (needNow) saveNotifyAck(sid, 'need')
     else {
       const st = sessionNotifyState(byId[sid])
       if (st === 'done') saveNotifyAck(sid, 'done')
     }
+  }
+
+  /** 点开项目 = 确认提醒：ack 绑定会话（含子代理）的待决/完成状态；
+   *  卡片现在会进「正在跑 / 等你回答」的那条会话，那条也要一起 ack，否则它的光晕熄不掉。 */
+  const ackProjectNotify = (projectId: string, entered?: string | null) => {
+    const pr = projectsRef.current.projects
+    const bound = pr.bindings[projectId]
+    if (bound) ackSessionNotify(bound)
+    if (entered && entered !== bound) ackSessionNotify(entered)
   }
   ackRef.current = ackProjectNotify
 
@@ -6238,6 +6320,8 @@ function buildCustomLayoutPrompt(req: string): string {
   useEffect(() => {
     if (headless) return
     const timer = window.setInterval(() => {
+      // 每 2s 量一次贴底高度 = 每 2s 一次强制排版；输入框正在组合 / 抽屉正在开合时先让路。
+      if (domGate.isPaused()) return
       if (!floatRef.current) measureBottomOverlay()
     }, 2000)
     return () => window.clearInterval(timer)
@@ -7044,7 +7128,10 @@ export function apply(ctx: any) {
   // 空白会话白屏自愈：每 2s 看一次当前会话，卡在 loading 的空白会话重建一次历史流。
   // （新建会话的聚焦流程自己也兜这个，这里覆盖「用户从侧栏点开一条早已卡住的会话」。）
   ctx.effect(() => {
-    const timer = window.setInterval(() => { void healStuckCurrentSession() }, 2000)
+    const timer = window.setInterval(() => {
+      if (domGate.isPaused()) return // 组合 / 开合窗口内不抢这一轮的 RPC 与重渲染
+      void healStuckCurrentSession()
+    }, 2000)
     return () => { try { window.clearInterval(timer) } catch {} }
   }, 'dsh-assistant: blank session open watchdog')
 
