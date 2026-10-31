@@ -535,9 +535,20 @@ export function mobileApply(ctx): void {
         return
       }
     }
+    const dockSelector = '[data-phase] [data-slot="conversation.composer.dock"]'
+    const markerSelector = '[class$="_root"]'
+    let dock: Element | null = null
+    /** dock 被 React 换掉时重新定位；拿不到 dock 就等于原实现「全页找选择器找不到」的情况（同样什么都不标） */
+    const ensureDock = (): boolean => {
+      if (dock !== null && dock.isConnected) return true
+      dock = document.querySelector(dockSelector)
+      return dock !== null
+    }
     const mark = (): void => {
-      const selector = '[data-phase] [data-slot="conversation.composer.dock"] [class$="_root"]'
-      for (const root of document.querySelectorAll(selector)) {
+      if (!ensureDock() || dock === null) return
+      // 只在这一棵（输入框旁边的 dock）里找统计行：原来是整页扫 [class$="_root"] 再逐条读 textContent，
+      // 一次 ~19ms，长会话页面上每 300ms 就是一发
+      for (const root of dock.querySelectorAll<HTMLElement>(markerSelector)) {
         const text = root.textContent ?? ''
         if (!/(turns|steps|\bLLM\b|轮|步)/.test(text)) continue
         root.setAttribute('data-mobile-nav', 'stats')
@@ -548,7 +559,13 @@ export function mobileApply(ctx): void {
     // createGatedThrottle：用户在输入框里打字（含语音实时转写）或抽屉正在开合时不跑，
     // 到点了也不会丢——它会自己重来，统计行照样折叠。
     const schedule = createGatedThrottle({ run: mark, gate: domGate, waitMs: 300 })
-    const observer = new MutationObserver(schedule)
+    const observer = new MutationObserver((mutations) => {
+      if (!ensureDock() || dock === null) return
+      // 聊天流式更新（消息列表里的节点）与 dock 无关：不在那一棵里就不必重扫
+      const touchesDock = mutations.some((m) => m.target === dock || dock!.contains(m.target))
+      if (!touchesDock) return
+      schedule()
+    })
     observer.observe(document.body, { childList: true, subtree: true })
     mark()
     return () => {
