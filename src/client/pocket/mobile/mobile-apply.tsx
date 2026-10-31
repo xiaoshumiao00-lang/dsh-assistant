@@ -324,12 +324,30 @@ export function mobileApply(ctx): void {
     },
   }), 'dsh-mobile-nav: drawer chrome')
 
-  const chromeCount = (selector: string): number => document.querySelectorAll(selector).length
-  reportMobileStage('slots', {
-    ly: layout,
-    chrome: `${chromeCount('[data-mobile-nav="backdrop"]')}/${chromeCount('[data-mobile-nav="fab"]')}/${chromeCount('[data-mobile-nav="toggle"]')}`,
-    ov: chromeCount('[data-shell-overlay] > *'),
-  })
+  /** 首屏探针：一次扫描数出三种 chrome 与壳层占位（原来是 4 次全页 querySelectorAll，
+   *  在两三万节点的长会话页面上就是四次全树走一遍，正压在首屏那几百毫秒上） */
+  const chromeCounts = (): { backdrop: number; fab: number; toggle: number; overlayChildren: number } => {
+    let backdrop = 0
+    let fab = 0
+    let toggle = 0
+    let overlayChildren = 0
+    for (const el of document.querySelectorAll<HTMLElement>('[data-mobile-nav], [data-shell-overlay] > *')) {
+      const nav = el.getAttribute('data-mobile-nav')
+      if (nav === 'backdrop') backdrop += 1
+      else if (nav === 'fab') fab += 1
+      else if (nav === 'toggle') toggle += 1
+      if (el.parentElement?.hasAttribute('data-shell-overlay')) overlayChildren += 1
+    }
+    return { backdrop, fab, toggle, overlayChildren }
+  }
+  reportMobileStage('slots', (() => {
+    const counted = chromeCounts()
+    return {
+      ly: layout,
+      chrome: `${counted.backdrop}/${counted.fab}/${counted.toggle}`,
+      ov: counted.overlayChildren,
+    }
+  })())
 
   safeEffect(() => {
     const tag = document.createElement('style')
