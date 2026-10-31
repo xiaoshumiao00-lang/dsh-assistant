@@ -22,6 +22,8 @@ import { hasPendingInteraction, sessionStatusSourceOf, pendingInteractionSignatu
 import { sessionSnapshotIndexOf, invalidateSessionSnapshotIndex } from './sessionIndex'
 import { pickActiveSession, sortSessionsByActivity, sessionTierOf, progressOrderOf, type RankableSessionRow } from './sessionRank'
 import { domGate } from './compositionGate'
+import { createBottomOverlayScanner, shouldApplyInset } from './bottomOverlay'
+import { cachedJsonRead, cachedJsonWrite } from './localStore'
 
 /** 项目叠加层（L2）可选项：写作语言 */
 const PAPER_LANG_OPTIONS = ['中文写作后翻译英文', '直接写英文', '仅中文投稿']
@@ -1946,30 +1948,32 @@ function sessionIdsUnderFolder(base: string): string[] {
 }
 
 /** 提醒确认（ack）持久化：会话 id → 已确认的状态（'done' | 'need'） */
-function loadNotifyAck(): Record<string, string> {  try {
-    const raw = localStorage.getItem('dsh.worktable.notifyAck.v1')
+const NOTIFY_ACK_KEY = 'dsh.worktable.notifyAck.v1'
+function loadNotifyAck(): Record<string, string> {
+  // 读缓存：控制室每刷一次卡片都读它，内容没变就不再 parse（省下的正是打字 / 滚动那段主线程）
+  return cachedJsonRead(NOTIFY_ACK_KEY, (raw) => {
     const p = raw ? JSON.parse(raw) : {}
     return p && typeof p === 'object' ? p : {}
-  } catch { return {} }
+  })
 }
 function saveNotifyAck(sid: string, state: string) {
   try {
     const ack = loadNotifyAck()
     ack[sid] = state
-    localStorage.setItem('dsh.worktable.notifyAck.v1', JSON.stringify(ack))
+    cachedJsonWrite(NOTIFY_ACK_KEY, ack)
   } catch {}
 }
 /** 异常终止标记：会话 id 集合（宿主会话面 lastAgentError 出现后记录；
  *  用户点开项目确认、或该会话开始新一轮运行时清除）。控制室卡片据此显示红色「异常终止」。 */
 const AGENT_ERR_KEY = 'dsh.assistant.agentError.v1'
 function loadAgentErrors(): Record<string, string> {
-  try {
-    const p = JSON.parse(localStorage.getItem(AGENT_ERR_KEY) ?? '{}')
+  return cachedJsonRead(AGENT_ERR_KEY, (raw) => {
+    const p = JSON.parse(raw ?? '{}')
     return p && typeof p === 'object' ? p : {}
-  } catch { return {} }
+  })
 }
 function saveAgentErrors(map: Record<string, string>) {
-  try { localStorage.setItem(AGENT_ERR_KEY, JSON.stringify(map)) } catch {}
+  cachedJsonWrite(AGENT_ERR_KEY, map)
 }
 function clearAgentErrors(ids: string[]) {
   if (ids.length === 0) return
@@ -2005,8 +2009,8 @@ function projectOwnedFolders(state: { projects: ProjectsState; aliveRegisteredId
  *  与结束时间比较：收工只压住这一轮；同一会话下一轮结束时结束时间更晚，卡片会重新出现。
  *  收工只是把这一轮结果从临时卡片移除，不删会话、不影响侧栏。 */
 function loadTransientDismissed(): Record<string, number> {
-  try {
-    const p = JSON.parse(localStorage.getItem(TRANSIENT_DISMISS_KEY) ?? '{}')
+  return cachedJsonRead(TRANSIENT_DISMISS_KEY, (raw) => {
+    const p = JSON.parse(raw ?? '{}')
     if (!p || typeof p !== 'object') return {}
     const out: Record<string, number> = {}
     for (const [sid, at] of Object.entries<any>(p)) {
@@ -2014,7 +2018,7 @@ function loadTransientDismissed(): Record<string, number> {
       if (typeof sid === 'string' && sid && Number.isFinite(n) && n > 0) out[sid] = n
     }
     return out
-  } catch { return {} }
+  })
 }
 function saveTransientDismissed(map: Record<string, number>) {
   try {
@@ -2022,7 +2026,7 @@ function saveTransientDismissed(map: Record<string, number>) {
     const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000
     const pruned: Record<string, number> = {}
     for (const [sid, at] of Object.entries(map)) if (at >= cutoff) pruned[sid] = at
-    localStorage.setItem(TRANSIENT_DISMISS_KEY, JSON.stringify(pruned))
+    cachedJsonWrite(TRANSIENT_DISMISS_KEY, pruned)
   } catch {}
 }
 /** 临时卡片上「跑 → 停」的结束时刻（会话 id → ms）。
@@ -2130,7 +2134,7 @@ function clearNotifyAck(sid: string) {
     const all = loadNotifyAck()
     if (all[sid]) {
       delete all[sid]
-      localStorage.setItem('dsh.worktable.notifyAck.v1', JSON.stringify(all))
+      cachedJsonWrite(NOTIFY_ACK_KEY, all)
     }
   } catch {}
 }
@@ -6290,51 +6294,31 @@ function buildCustomLayoutPrompt(req: string): string {
   // ── 底部悬浮面板避让 ──
   // 停靠态下检测「侧边栏列内、贴近底部、且与区块自然位置重叠」的 fixed 面板
   // （如 dsh-usage 的余额 dock），把区块整体抬到面板上方，双方互不遮挡、都可调整位置。
-  const measureBottomOverlay = useCallback(() => {
-    if (isFloat) return
-    const root = rootRef.current
-    if (!root) return
-    const self = root.getBoundingClientRect()
-    if (self.width < 10) return
-    const naturalBottom = self.bottom + bottomInsetRef.current
-    const loX = self.left - 8
-    const hiX = self.right + 8
-    const regionTop = window.innerHeight - 300
-    let needed = 0
-    const nodes = document.querySelectorAll<HTMLElement>('body *')
-    for (const el of nodes) {
-      const r = el.getBoundingClientRect()
-      if (r.width < 40 || r.height < 16) continue
-      if (r.top < regionTop) continue
-      if (r.left > 80) continue
-      if (r.right < loX || r.left > hiX) continue
-      const cs = getComputedStyle(el)
-      if (cs.position !== 'fixed') continue
-      if (cs.visibility === 'hidden' || Number(cs.opacity) === 0) continue
-      if (r.top >= naturalBottom + 4) continue
-      const overlap = Math.min(r.bottom, naturalBottom + 400) - r.top
-      if (overlap > 8) {
-        needed = Math.max(needed, Math.min(naturalBottom - r.top + 8, 340))
-      }
-    }
-    setBottomInset((prev) => (Math.abs(prev - needed) < 2 ? prev : needed))
-  }, [isFloat])
-
-  // 停靠/折叠变化时立即重测；停靠期间每 2s 轮询（悬浮面板自身可移动）
+  // 判定公式原样搬进 bottomOverlay.ts.measureOverlap（几何 → fixed → 可见 → 落点 → 重叠 → 上限），
+  // 区别只在跑法：一次量完整页 → 每帧量 400 个（主线程不再有几十毫秒的长任务）；
+  // 稳定态退到低频兜底、有 style 变更（面板被拖动）立刻补扫、隐藏页不扫。
+  const overlayScannerRef = useRef<ReturnType<typeof createBottomOverlayScanner> | null>(null)
   useEffect(() => {
     if (headless) return
-    if (!isFloat) measureBottomOverlay()
-  }, [headless, isFloat, wide, measureBottomOverlay])
+    const scanner = createBottomOverlayScanner({
+      candidates: () => document.querySelectorAll<HTMLElement>('body *'),
+      root: () => rootRef.current,
+      inset: () => bottomInsetRef.current,
+      applyInset: (needed) => setBottomInset((prev) => (shouldApplyInset(prev, needed) ? needed : prev)),
+      blocked: () => domGate.isPaused(),
+      floating: () => floatRef.current != null,
+    })
+    overlayScannerRef.current = scanner
+    scanner.kick()
+    return () => { overlayScannerRef.current = null; scanner.dispose() }
+  }, [headless])
 
+  // 停靠/折叠变化时立即重测（悬浮态不避让，与原实现一致）
   useEffect(() => {
     if (headless) return
-    const timer = window.setInterval(() => {
-      // 每 2s 量一次贴底高度 = 每 2s 一次强制排版；输入框正在组合 / 抽屉正在开合时先让路。
-      if (domGate.isPaused()) return
-      if (!floatRef.current) measureBottomOverlay()
-    }, 2000)
-    return () => window.clearInterval(timer)
-  }, [headless, measureBottomOverlay])
+    const scanner = overlayScannerRef.current
+    if (scanner && !isFloat) scanner.kick()
+  }, [headless, isFloat, wide])
 
   const dockedStyle = !isFloat && bottomInset > 0 ? { marginBottom: bottomInset } : undefined
 
