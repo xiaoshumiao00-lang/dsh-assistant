@@ -4,9 +4,9 @@
 控制室里的「更新公告」正文由 `npm run build` 从本文件里当前版本那一节抽出来（见 `build.mjs`），
 不再手写常量——改了代码就必须改这一节，公告与实现不会各说各话。
 
-## [Unreleased] - 本机已跑绿，已 commit / 已 push（未 tag / 未 publish）
+## [0.2.12] - 2026-11-01
 
-🛠️ 0.2.11 之后落地的整改（本机验证，已进仓库，尚未发到 GitHub Release 版本号）
+🛠️ 0.2.11 之后落地的整改（本机验证，已 commit / 已 push）
 
 【卸载通道】新增 `scripts/uninstall-assistant.mjs`：默认只摘 profile 的 `dsh-assistant` junction 并把 profile 的 `package.json` 从 `*.bak-assistant-*` 备份恢复（没有备份就剥掉依赖项与打包清单条目，同时留一份 `package.json.before-uninstall-<时间戳>`，并提示旧插件要手动补回）；`--purge` 额外把助手数据挪进 `~/.dsh/uninstall-backup-<时间戳>/`（不是删）——`<profile>/dsh-assistant-ball/`、`~/.dsh/assistant/`、本机 `config.json`、两份状态 json、聚焦日志。浏览器侧（IndexedDB `dsh-worktable` 与 `dsh.assistant.*` / `dsh.worktable.*` 的 localStorage 键）脚本碰不到，只列出键名前缀 + 给一段可粘贴的 DevTools 片段；`dsh.sessions.current` 是宿主的，脚本明确不清。`--dry-run` 什么都不动。回归测试 `scripts/test-uninstall-plan.mjs`（含「真实目录不是 junction 时不许删内容」这一条）。README 补「卸载」章节。
 
@@ -33,6 +33,22 @@
 ④·补 同一轮里再收三处：`modelSettingsNotice` 的补丁队列给上硬上限（800 个节点封顶，只留最新的那批）并且**输入框那一棵树里的节点根本不进队列**（Lexical 每个字都在换文本节点，过去每一批都排进队列）；分栏工作区的「兜底重锚定」body 观察器也挂上闸门（300 毫秒合并 + 组合 / 开合窗口让路）。反过来，`observeExternalSplit`（外来 `.ta_split` 让位观察器）**保持原样不闸门**：那里是「外来分栏出现就立即让位」的契约，不是扫描优化——契约优先，别为省几毫秒偷偷改掉互斥语义（`scripts/test-split-observer.mjs` 盯着这条）。
 
 另外给语音这条路装了探针：`createVoiceProbe` 只在 `compositionstart` / `compositionend` 这两个边界读一次输入框文本长度（全程只读、绝不写 DOM —— 写输入框那一棵树才是要打断语音的那件事），`createVoiceTally` 把它汇总成一条 `voice-compose` 诊断记录（说了几段 / 各类归类 / 一共进去多少字 / 最长一段多少毫秒）。可疑中止（`interrupted` = 上一段还没等到 `compositionend` 就来了新的一段；`silent-long` = 说了 2.5 秒以上一个字都没进）立刻发一条，正常打字每 20 段合并发一条，不把 beacon 打成「每敲一下发一发」。你在手机上说完一段长语音后打开「一键导出诊断包」，就能看见断在哪一类、总共断了几次。
+
+【流畅度·这一整批不改任何功能】只改「谁去扫、扫多久、什么时刻写」，看得见的外观与行为一字未动（光晕 / 卡片内容 / 抽屉内容 / 语音 / 会话进入判定都照旧）。新回归测试 `scripts/test-bottom-overlay.mjs`（15 项）、`scripts/test-local-store.mjs`（7 项）、`scripts/test-face-cache.mjs`（6 项），都进了 `npm test` 链。
+
+① 底部面板避让（新模块 `src/client/bottomOverlay.ts`）：原来每 2 秒 `document.querySelectorAll('body *')` 把整页元素过一遍、每个都读一遍布局（两三万节点的会话页一次就是一发）。现在 400 个一片、一片跑完再接下一片；样式变化由观察器只盯 `style` 属性补一轮；轮询自适应（交互密集时 6 秒内不扫、安静时 10 秒一轮）；写 inset 前先比新旧值，不需要就不写。`scanOnce` 会先撤掉排队的那一帧；已有扫描活着时观察器不再排第二个。
+
+② localStorage 读缓存（新模块 `src/client/localStore.ts`）：原来卡片每刷新一次就把整份存档读出来再 `JSON.parse` 一遍，模板配置与助手设置也一样。现在读走 `cachedJsonRead`（原始字符串一字不差才复用缓存那份，`null` 不缓存、每次真读）、写走 `cachedJsonWrite`（改完整体落盘一次；循环引用 / 配额溢出不把调用方带炸）。卡片 ack、模板 override、模板 meta 都接上这条。
+
+③ 一次宿主通知只做一次：卡片失效与控制流通知改微任务合并（同一批通知排下来的多次失效只发一次；微任务在一帧之前跑完，卡片仍然这一帧就更新）。生命周期扫描与预览扫描按「任务名」去重排队，不再每条通知各扫一遍。卡片 DOM 桥的观察器不再每轮拆掉重挂（挂上就留住 + 一帧合并 + 订阅失效通道）。每卡只排一次序（排好的 id 列表复用给进入判定与其余口径），半截 JSON 的 fallback 正则改成一次编译。
+
+④ 拖分隔线：拖拽过程每一帧只写一次尺寸（原来每个 mousemove 都写 DOM 并落一次存档），存档 180 毫秒合并落盘、松手与关闭时补最后一笔；关闭前先补落盘再走关闭。
+
+⑤ 手机端悬浮球会话列表：整行记忆化（原来每条宿主通知都要把整个列表连同每一行的日期串重算重渲染）。左滑改「每帧只写一次 transform」，松手时把这帧没写完的平移撤掉、落点交给带 transition 的回弹（滑到底 / 滑回照旧）。录音电平不再每 120 毫秒重渲染整个输入框（改成直接写那一行 DOM），并留 250 毫秒兜底计时器（页面在后台 rAF 被停时超时也能自己收）。输入框自动增高合并到一帧。
+
+⑥ 手机端两处「整页扫」下掉：统计行折叠原来每 300 毫秒整页扫 `[class="_root"]` 再逐个读 `textContent`（一次 ~19 毫秒），现在只扫输入框 dock 那一棵，聊天区流式更新的变更与 dock 无关就不重扫。抽屉 chrome 原来 250 毫秒一轮、48 轮全页 `querySelector` 空转等壳层，现在观察 DOM 变化、补到就停观察 + 最多 4 轮递增兜底。标题诊断不再 1 秒 / 5 秒永不自停地读 `document.title`，改观察 `<title>` 本体；首屏 chrome 计数从 4 次全页扫描并成 1 次。
+
+⑦ 会话面快照加一层 100 毫秒极短缓存（新模块 `src/client/faceSnapshotCache.ts`）：卡片组装、提醒表、待决表、临时卡片判定原本一次通知里要把同一条会话的宿主会话面读三四遍，再乘上同时挂着的实例（侧栏工作台 + headless 数据宿主 + 分栏浮层）。取不到不缓存（下一条消息挂上来马上看得见），过期严格重读；待决 / 在跑的真实变化仍由宿主订阅推出。桌面球状态那条 15 秒轮询在页面被盖到后台时停掉，回到前台立刻补一次。
 
 **光看「断了几次」不够，还要看「谁在那一刻动了输入框」。** 实机反馈是「说半句就停、时好时坏、换个会话又正常」——这不是某条规则的确定行为，而是**竞争**。所以补了 `src/client/composerLedger.ts`：组合进行时在 `[data-composer-card]` 子树、以及宿主 `[data-phase]` 那个祖先上各挂一个观察者，**只读**记录现场——每条 DOM 变更的签名（标签 + CSS-module class）+ 毫秒偏移（去重、最多 8 条），并给出三个判定：`EDITOR-TOUCHED`（变更落进了 Lexical 编辑器本体，最可疑）、`EDITOR-SWAPPED`（编辑器本体在组合期间被换掉 / 脱离文档，几乎必然中断输入法）、`PHASE-FLIP`（宿主在组合期间把 `data-phase` 从 hero 翻成普通，整页重排的经典时机）。可疑中止会把这份现场压成一行（`kind@时长 phase=… 标记 + 前几条变更`，≤180 字）写进 `voice-compose` 的 `last` 字段，诊断包里直接读得到——先分清是宿主重投影、插件补丁、还是新建页→会话的布局翻转，再决定改哪儿。
 

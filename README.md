@@ -97,6 +97,7 @@ DeepSeek Harness 一体化助手插件：**悬浮球 → 控制室**，外加**�
 - 独立的「手机访问」设置页签已删除，内容收进「个人助手」。
 - 左侧菜单 = 官方侧栏那一列改成的抽屉：首屏 700 毫秒内先补做「图标 rail → 完整列表」的官方升级（不再挂在第一次点汉堡上），按下汉堡即把那一列提到独立合成层（`will-change` 520 毫秒内必撤，久留会让它成为宿主设置面板 portal 的包含块）；抽屉右上角那颗「打开侧边栏」在手机布局里收掉，官方键盘快捷键照旧。开合耗时实测进诊断流水（`drawer-open` 阶段带 `ms` / `up`）。
 - 输入让路纪律（`src/client/compositionGate.ts` + `scripts/test-composition-gate.mjs`）：用户在输入框里打字（含手机语音输入法实时转写）或抽屉开合的窗口内，插件自己的整页扫描、DOM 补丁、状态轮询一律先让路（批次不丢，到点补跑），插件补丁一律不碰输入框那一棵树。第三方套件 dsh-web-ui 的三个兼容观察者改成有界确认（`featurePresence.mjs`）：本机没有 `[data-aionui-*]` 那两列就不再挂整页观察者。手机布局另有一条只读语音探针（`voice-compose` 诊断记录：说了几段 / 一共进去多少字 / 有几段没等到 `compositionend` 就被中止），配合「一键导出诊断包」看断在哪一类。要定位「谁在那一刻动了输入框」，组合期间还会挂一个只读取证账本（`composerLedger.ts` + `scripts/test-composer-ledger.mjs`：最多 8 条变更签名，加 `EDITOR-TOUCHED` / `EDITOR-SWAPPED` / `PHASE-FLIP` 三个判定），可疑中止会把它压成一行写进同一条记录。
+- 流畅度层（不改功能，只改「谁去扫 / 扫多久 / 什么时刻写」）：底部面板避让 `src/client/bottomOverlay.ts`（400 个一片、分帧跑、样式观察器只盯 `style`、轮询自适应）+ `src/client/localStore.ts`（存档读缓存与合并落盘，卡片刷新不再每次 `JSON.parse`）+ `src/client/faceSnapshotCache.ts`（会话面快照 100 毫秒极短缓存，一次通知不再三四遍宿主投影）+ 宿主通知的卡片失效与扫描走微任务合并、按任务名去重 + 拖分隔线每帧只写一次尺寸、存档 180 毫秒合并落盘 + 手机端悬浮球会话列表整行记忆化与左滑每帧只写一次 transform。回归测试 `test-bottom-overlay.mjs`（15 项）/ `test-local-store.mjs`（7 项）/ `test-face-cache.mjs`（6 项）。
 
 ### 托管（原 dsh-tuoguan）
 
