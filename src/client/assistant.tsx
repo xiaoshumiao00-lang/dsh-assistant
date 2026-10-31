@@ -125,14 +125,32 @@ export function apply(ctx: any): void {
         })
     }
     syncBallState()
-    // 桌面球是异步启动的：刚开页时可能还没起来，补两次 + 低频轮询兜底
+    // 桌面球是异步启动的：刚开页时可能还没起来，补一次 + 低频轮询兜底。
+    // 页面被盖到后台（手机切走 / 其它窗口在前）时不轮：这条 15 秒一轮的 fetch 本来是一直挂着直到页面结束；
+    // 回到前台立刻补一次，球的头像与配置照旧跟手。
+    let ballSyncInterval: number | null = window.setInterval(syncBallState, 15000)
+    const onVisibilitySync = (): void => {
+      try {
+        if (document.visibilityState === 'visible') {
+          syncBallState()
+          if (ballSyncInterval === null) ballSyncInterval = window.setInterval(syncBallState, 15000)
+        } else if (ballSyncInterval !== null) {
+          window.clearInterval(ballSyncInterval)
+          ballSyncInterval = null
+        }
+      } catch { /* 状态读不到就不轮 */ }
+    }
     const timers: number[] = [
       window.setTimeout(syncBallState, 3000),
-      window.setInterval(syncBallState, 15000),
     ]
     try {
+      document.addEventListener('visibilitychange', onVisibilitySync)
       if (typeof ctx.effect === 'function') {
-        ctx.effect(() => () => { for (const t of timers) { try { window.clearTimeout(t); window.clearInterval(t) } catch {} } }, 'dsh-assistant: ball state sync')
+        ctx.effect(() => () => {
+          for (const t of timers) { try { window.clearTimeout(t) } catch {} }
+          try { if (ballSyncInterval !== null) window.clearInterval(ballSyncInterval) } catch {}
+          document.removeEventListener('visibilitychange', onVisibilitySync)
+        }, 'dsh-assistant: ball state sync')
       }
     } catch {}
   } catch {}
