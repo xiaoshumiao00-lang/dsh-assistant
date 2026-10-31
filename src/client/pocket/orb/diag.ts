@@ -594,23 +594,37 @@ export function installDiag(_ctx?: any): void {
     /* 忽略 */
   }
 
-  // 标题变化（详情 ↔ 列表的最直接信号）：前 10 秒每秒查，之后每 5 秒。
+  // 标题变化（详情 ↔ 列表的最直接信号）：原来是「前 10 秒每 1s、之后每 5s 读一次 document.title」
+  // 而且永不自停 —— 手机布局把标题钉成产品名后这条几乎全是空读。
+  // 现在直接观察 <title> 本体：标题真变了才报；观察不上（没有 title 元素 / 老 WebView）才退回慢速采样。
   let lastTitle = String((globalThis as any).document?.title ?? '')
   let titleTimer: number | null = null
+  let titleObserver: MutationObserver | null = null
   const sampleTitle = (): void => {
     const next = String((globalThis as any).document?.title ?? '')
     if (next === lastTitle) return
     lastTitle = next
     post({ ev: 'title', value: next.slice(0, 160) })
   }
-  const start = Date.now()
-  const tick = (): void => {
-    sampleTitle()
-    const elapsed = Date.now() - start
-    const delay = elapsed < 10_000 ? 1000 : 5000
-    titleTimer = (globalThis as any).setTimeout(tick, delay)
+  const titleEl = (globalThis as any).document?.querySelector?.('title') ?? null
+  if (titleEl !== null && typeof (globalThis as any).MutationObserver === 'function') {
+    try {
+      titleObserver = new (globalThis as any).MutationObserver(() => { sampleTitle() }) as MutationObserver
+      titleObserver.observe(titleEl, { childList: true, subtree: true, characterData: true })
+    } catch {
+      titleObserver = null
+    }
   }
-  titleTimer = (globalThis as any).setTimeout(tick, 600)
+  if (titleObserver === null) {
+    const start = Date.now()
+    const tick = (): void => {
+      sampleTitle()
+      const elapsed = Date.now() - start
+      const delay = elapsed < 10_000 ? 1000 : 5000
+      titleTimer = (globalThis as any).setTimeout(tick, delay)
+    }
+    titleTimer = (globalThis as any).setTimeout(tick, 600)
+  }
 
   const onHide = (): void => post({ ev: 'pagehide', visibility: String((globalThis as any).document?.visibilityState ?? '') })
   const onShow = (): void => post({ ev: 'pageshow', visibility: String((globalThis as any).document?.visibilityState ?? '') })
@@ -630,10 +644,11 @@ export function installDiag(_ctx?: any): void {
     /* 忽略 */
   }
 
-  // 页面卸载时停掉计时器（不影响业务）。
+  // 页面卸载时停掉计时器与观察器（不影响业务）。
   try {
     (globalThis as any).addEventListener?.('pagehide', () => {
       if (titleTimer !== null) (globalThis as any).clearTimeout(titleTimer)
+      try { titleObserver?.disconnect() } catch { /* 忽略 */ }
     })
   } catch {
     /* 忽略 */
