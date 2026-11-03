@@ -6,6 +6,11 @@
 import { POCKET_RPC_CHANNEL, POCKET_ENDPOINTS } from '../api.js'
 import { cwdKey, findReusableBlank, presetKey, visibleHistory } from './session-plan.ts'
 import { focusSessionInHost } from '../../sessionFocus.ts'
+import { createTailCache } from '../../sessionTailCache.ts'
+import { perfBump, perfNowMs, perfObserveMs } from '../../perfCounters.ts'
+
+/** 尾快照短缓存（900 ms + 在途去重）：同一轮里卡片 / 提醒表 / 待决表各要一次时只开一条 follow 流。 */
+const sessionTailCache = createTailCache()
 
 /** 创建中的会话（按目录去重）。模块级：悬浮球页面即使被重复挂载出多个实例，
  * 同一目录的并发创建也共用同一个在途请求，不会叠出成串的空白会话。 */
@@ -139,19 +144,58 @@ export function makeOrbApi(ctx: any) {
   }
 
   /** 快照 → 目录行（含空白会话在内，已剔除子代理行与已归档行），置顶在前、按更新时间倒序。
-   * 置顶/归档状态在工作区服务里（workspaces.list 快照），不在 sessions 里。 */
+   * 置顶/归档状态在工作区服务里（workspaces.list 快照），不在 sessions 里。
+   *
+   * 重建缓存（同一刀口径见 sessionIndex.ts）：身份校验是主路径 —— 宿主每推一版列表就重建；
+   * 150 ms 时间窗只是给「原地改同一版快照、又没经过订阅包装」的宿主一个上限，
+   * 最多落后 150 ms，肉眼看不出来。订阅包装里还会显式作废。
+   * 省掉的重复：悬浮球每 250 ms 一刷就要列表 / 单行 / 复用空白各问一边，
+   * 原来每一边都把 1,000+ 会话重新整理一遍再排一遍 —— 多会话在跑时那就是手机端主线程的固定开销。 */
+  const ORB_ROWS_REUSE_MS = 150
+  let rowsCache: {
+    at: number
+    snap: unknown
+    ids: unknown
+    byId: unknown
+    wsSnap: unknown
+    pinnedIds: unknown
+    archivedIds: unknown
+    rows: OrbSessionRow[]
+  } | null = null
+  /** visibleHistory 的结果缓存：同一份行 + 同一个当前选中 id → 复用同一份数组。
+   *  复用同一份数组还有一层好处：setHistory 拿到相同引用时 React 自己就不必重渲染。 */
+  let visibleCache: { rows: OrbSessionRow[]; currentId: string | null; out: OrbSessionRow[] } | null = null
+  const invalidateRowsCache = (): void => {
+    rowsCache = null
+    visibleCache = null
+  }
   const allRows = (): OrbSessionRow[] => {
     const snap = ctx.sessions.list.getSnapshot()
-    let pinnedSet: Set<string> | null = null
-    let archivedSet: Set<string> | null = null
+    let wsSnap: any = null
     try {
       const ws = ctx.get?.('workspaces') ?? ctx.workspaces
-      const wsSnap = ws?.list?.getSnapshot?.()
-      if (wsSnap) {
-        pinnedSet = new Set(wsSnap.pinnedSessionIds ?? [])
-        archivedSet = new Set(wsSnap.archivedSessionIds ?? [])
-      }
-    } catch { /* workspaces 不可用 → 全部视为未置顶/未归档 */ }
+      wsSnap = ws?.list?.getSnapshot?.() ?? null
+    } catch { wsSnap = null }
+    const cached = rowsCache
+    if (cached
+      && cached.snap === snap
+      && cached.ids === snap?.ids
+      && cached.byId === snap?.byId
+      && cached.wsSnap === wsSnap
+      && cached.pinnedIds === wsSnap?.pinnedSessionIds
+      && cached.archivedIds === wsSnap?.archivedSessionIds
+      && Date.now() - cached.at <= ORB_ROWS_REUSE_MS) {
+      perfBump('orbHit')
+      return cached.rows
+    }
+    const rowsStartedAt = perfNowMs()
+    perfBump('orbBuild')
+    let pinnedSet: Set<string> | null = null
+    let archivedSet: Set<string> | null = null
+    if (wsSnap) {
+      pinnedSet = new Set(wsSnap.pinnedSessionIds ?? [])
+      archivedSet = new Set(wsSnap.archivedSessionIds ?? [])
+    }
     const rows: OrbSessionRow[] = []
     for (const id of snap.ids ?? []) {
       const row = (snap.byId?.[id] ?? {}) as SnapshotRow
@@ -180,7 +224,29 @@ export function makeOrbApi(ctx: any) {
       if (a.pinned !== b.pinned) return a.pinned ? -1 : 1
       return b.updatedAt - a.updatedAt
     })
+    rowsCache = {
+      at: Date.now(),
+      snap,
+      ids: snap?.ids,
+      byId: snap?.byId,
+      wsSnap,
+      pinnedIds: wsSnap?.pinnedSessionIds,
+      archivedIds: wsSnap?.archivedSessionIds,
+      rows,
+    }
+    perfObserveMs('orbBuild', perfNowMs() - rowsStartedAt)
     return rows
+  }
+
+  /** 空白会话过滤的结果缓存：同一份行 + 同一个「当前选中」→ 复用同一份数组。
+   *  复用同一份数组还有额外一层好处：OrbOverlay 的 setHistory 拿到相同引用时 React 不必重渲染。
+   *  数组由调用方只读使用（find / 直接给 setHistory），不当入参改写。 */
+  const visibleRowsOf = (rows: OrbSessionRow[], currentSessionId?: string | null): OrbSessionRow[] => {
+    const id = currentSessionId ?? null
+    if (visibleCache && visibleCache.rows === rows && visibleCache.currentId === id) return visibleCache.out
+    const out = visibleHistory(rows, id)
+    visibleCache = { rows, currentId: id, out }
+    return out
   }
 
   /** 语音转写服务（官方 voice-input 插件挂载的 cordis 服务，服务名是 'remote.speech'）。
@@ -267,7 +333,7 @@ export function makeOrbApi(ctx: any) {
      * 唯一例外是悬浮球当前正指着的那条（否则目标条会指到看不见的会话）。
      * 只是不显示：这些会话本身没有被删除或归档，发送时会被复用。 */
     listSessions(currentSessionId?: string | null): OrbSessionRow[] {
-      return visibleHistory(allRows(), currentSessionId)
+      return visibleRowsOf(allRows(), currentSessionId)
     },
 
     /** 单条会话行（不走历史列表的空白过滤）：首屏列表还没刷出来时目标条也要有内容。 */
@@ -283,16 +349,18 @@ export function makeOrbApi(ctx: any) {
       return findReusableBlank(allRows(), cwd, { excludeId, agentPreset })
     },
 
-    /** 订阅会话列表变化；返回退订函数。 */
+    /** 订阅会话列表变化；返回退订函数。
+     *  包装一层：宿主每推一版列表就先作废行缓存（同控制室索引那一刀），
+     *  这样「原地改快照」的老宿主也不会读到旧的行。 */
     subscribeSessions(listener: () => void): () => void {
-      return ctx.sessions.list.subscribe(listener)
+      return ctx.sessions.list.subscribe(() => { invalidateRowsCache(); listener() })
     },
 
     /** 订阅工作区列表变化（置顶/归档状态变化时刷新列表）。 */
     subscribeWorkspaces(listener: () => void): () => void {
       try {
         const ws = ctx.get?.('workspaces') ?? ctx.workspaces
-        return ws?.list?.subscribe?.(listener) ?? (() => {})
+        return ws?.list?.subscribe?.(() => { invalidateRowsCache(); listener() }) ?? (() => {})
       } catch { return () => {} }
     },
 
@@ -448,32 +516,37 @@ export function makeOrbApi(ctx: any) {
      * 拿到开场快照后立刻断开（return 会让异步迭代器释放 follow 句柄），不会长期占连接。
      * 返回 null 表示这个宿主版本没有 follow 接口 / 该会话不可读。
      */
-    async sessionTail(sessionId: string, maxMessages = 8): Promise<{ events: any[]; stream: any; cursor?: number } | null> {
+    async sessionTail(sessionId: string, maxMessages = 8, opts: { stream?: boolean } = {}): Promise<{ events: any[]; stream: any; cursor?: number } | null> {
       const follow = (ctx.remote.session as any)?.follow
       if (typeof follow !== 'function') return null
-      const controller = typeof AbortController === 'function' ? new AbortController() : null
-      const timer = controller ? setTimeout(() => { try { controller.abort() } catch {} }, 4000) : null
-      try {
-        const stream = follow.call(ctx.remote.session, {
-          address: { kind: 'session', sessionId },
-          assistantStream: true,
-          maxMessages,
-        }, controller?.signal)
-        for await (const frame of stream) {
-          if (frame?.type !== 'snapshot') continue
-          const records: any[] = Array.isArray(frame.records) ? frame.records : []
-          return {
-            events: records.map((record) => record?.event ?? record).filter(Boolean),
-            stream: frame.assistantStream ?? null,
-            cursor: frame.cursor,
+      // 空闲会话不需要 assistantStream（少传一份流式快照）；运行中的才带。
+      const wantStream = opts.stream !== false
+      const key = sessionTailCache.key(sessionId, maxMessages, wantStream)
+      return sessionTailCache.run(key, async () => {
+        const controller = typeof AbortController === 'function' ? new AbortController() : null
+        const timer = controller ? setTimeout(() => { try { controller.abort() } catch {} }, 4000) : null
+        try {
+          const stream = follow.call(ctx.remote.session, {
+            address: { kind: 'session', sessionId },
+            ...(wantStream ? { assistantStream: true } : {}),
+            maxMessages,
+          }, controller?.signal)
+          for await (const frame of stream) {
+            if (frame?.type !== 'snapshot') continue
+            const records: any[] = Array.isArray(frame.records) ? frame.records : []
+            return {
+              events: records.map((record) => record?.event ?? record).filter(Boolean),
+              stream: frame.assistantStream ?? null,
+              cursor: frame.cursor,
+            }
           }
+          return null
+        } catch {
+          return null
+        } finally {
+          if (timer != null) clearTimeout(timer)
         }
-        return null
-      } catch {
-        return null
-      } finally {
-        if (timer != null) clearTimeout(timer)
-      }
+      })
     },
 
     /** 模型目录（拍平为展示行；与桌面模型选择同一目录）。

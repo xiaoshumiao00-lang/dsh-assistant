@@ -1011,6 +1011,32 @@ function OrbPage({ api, t, open }: OrbOverlayProps & { open: boolean }) {
     action: (msg) => rowActionsRef.current.action(msg),
   }), [])
 
+  // 输入区回调一律走 ref 转发：身份恒定 → Composer 的 memo 才有效。
+  // 控制室的会话投影每 250 ms 刷一版，OrbPage 因此重渲染；输入框不该跟着重渲染
+  // （受控 textarea 每轮重渲染都会碰一遍 value / composition，手机上就是打字卡）。
+  const liveHandlersRef = useRef({
+    text: (v: string) => { onTextChange(v) },
+    pickSlash: (item: SlashItem) => { onPickSlash(item) },
+    send: () => { void sendWith() },
+    sendText: (voiceText: string) => { void sendWith(voiceText) },
+    pickModel: (model: OrbModel) => { void onPickModel(model) },
+    pickBackgroundModel: (model: OrbModel) => { void onPickBackgroundModel(model) },
+    openPcFiles: () => { setBrowser('file') },
+    toast: (msg: string) => { toast(msg) },
+  })
+  const composerHandlers = useMemo(() => ({
+    onChange: (v: string) => liveHandlersRef.current.text(v),
+    onPickSlash: (item: SlashItem) => liveHandlersRef.current.pickSlash(item),
+    onSend: () => liveHandlersRef.current.send(),
+    onSendText: (voiceText: string) => liveHandlersRef.current.sendText(voiceText),
+    onPickModel: (model: OrbModel) => liveHandlersRef.current.pickModel(model),
+    onPickBackgroundModel: (model: OrbModel) => liveHandlersRef.current.pickBackgroundModel(model),
+    onOpenPcFiles: () => liveHandlersRef.current.openPcFiles(),
+    toast: (msg: string) => liveHandlersRef.current.toast(msg),
+    onAddChips: (added: OrbChip[]) => setChips((cur) => [...cur, ...added]),
+    onRemoveChip: (index: number) => setChips((cur) => cur.filter((_, i) => i !== index)),
+  }), [])
+
   return (
     <div data-pocket-orb="page" style={open ? undefined : { display: 'none' }}>
       <div data-pocket-orb="header">
@@ -1077,23 +1103,23 @@ function OrbPage({ api, t, open }: OrbOverlayProps & { open: boolean }) {
       <div data-pocket-orb="menu-anchor">
         <Composer
           value={text}
-          onChange={onTextChange}
+          onChange={composerHandlers.onChange}
           chips={chips}
-          onAddChips={(added) => setChips((cur) => [...cur, ...added])}
-          onRemoveChip={(index) => setChips((cur) => cur.filter((_, i) => i !== index))}
-          onSend={() => void onSend()}
-          onSendText={(voiceText) => void sendWith(voiceText)}
+          onAddChips={composerHandlers.onAddChips}
+          onRemoveChip={composerHandlers.onRemoveChip}
+          onSend={composerHandlers.onSend}
+          onSendText={composerHandlers.onSendText}
           sending={sending}
           slashItems={slashItems}
-          onPickSlash={onPickSlash}
+          onPickSlash={composerHandlers.onPickSlash}
           models={models}
           modelLabel={modelSel?.name ?? t('model')}
-          onPickModel={(model) => void onPickModel(model)}
+          onPickModel={composerHandlers.onPickModel}
           backgroundModelLabel={bgModelSel?.name ?? t('backgroundModel')}
-          onPickBackgroundModel={(model) => void onPickBackgroundModel(model)}
-          onOpenPcFiles={() => setBrowser('file')}
+          onPickBackgroundModel={composerHandlers.onPickBackgroundModel}
+          onOpenPcFiles={composerHandlers.onOpenPcFiles}
           voice={voice}
-          toast={toast}
+          toast={composerHandlers.toast}
           t={t}
         />
       </div>

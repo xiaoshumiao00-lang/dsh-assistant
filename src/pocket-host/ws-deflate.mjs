@@ -25,6 +25,7 @@ import {
   createInflateRaw,
   constants as zlibConstants,
 } from 'node:zlib';
+import { createDownlinkScheduler } from './downlink-lanes.mjs';
 
 const TAIL = Buffer.from([0x00, 0x00, 0xff, 0xff]);
 const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
@@ -258,6 +259,35 @@ export function attachWsDeflate({ client, upstream, onError = null, onFailure = 
   const deflate = new DeflateQueue(fail);
   const inflate = new InflateQueue(fail);
 
+  // P0-1：下行分道调度（high = 交互/状态小帧，low = 快照/批量大帧），带 drain 背压与合并。
+  // 编码（deflate / 不压缩回退）仍由同一个 DeflateQueue 串行做，保证 zlib 上下文顺序正确。
+  const downlink = createDownlinkScheduler({
+    encode: (text, op) => new Promise((resolve, reject) => {
+      if (text.length < MIN_COMPRESS_BYTES) {
+        stats.downOut += text.length;
+        resolve({ frame: encodeFrame({ fin: true, opcode: op, payload: text }), raw: true });
+        return;
+      }
+      deflate.push(text, {}, (packed) => {
+        if (closed) { reject(new Error('ws-deflate: closed')); return; }
+        let out = packed;
+        let rsv1 = true;
+        if (packed.length >= text.length) { out = text; rsv1 = false; }
+        stats.downOut += out.length;
+        resolve({ frame: encodeFrame({ fin: true, rsv1, opcode: op, payload: out }) });
+      });
+    }),
+    write: (frame) => {
+      try {
+        return client.write(frame);
+      } catch (error) {
+        fail(error);
+        return true;
+      }
+    },
+  });
+  client.on('drain', () => { downlink.resume(); });
+
   // ---- upstream -> browser ----
   // 所有数据帧都走 deflate 队列（即使不压缩）：压缩是异步的，若小消息直接写 socket
   // 就会插到还在排队的压缩消息前面，mux 的 item 顺序被打乱。顺序必须严格保持。
@@ -284,22 +314,8 @@ export function attachWsDeflate({ client, upstream, onError = null, onFailure = 
     stats.downIn += whole.length;
     stats.messages += 1;
     const op = downOpcode;
-    if (whole.length < MIN_COMPRESS_BYTES) {
-      deflate.push(whole, { raw: true }, () => {
-        if (closed) return;
-        stats.downOut += whole.length;
-        try { client.write(encodeFrame({ fin: true, opcode: op, payload: whole })); } catch (e) { fail(e); }
-      });
-      return;
-    }
-    deflate.push(whole, {}, (packed) => {
-      if (closed) return;
-      let out = packed;
-      let rsv1 = true;
-      if (packed.length >= whole.length) { out = whole; rsv1 = false; }
-      stats.downOut += out.length;
-      try { client.write(encodeFrame({ fin: true, rsv1, opcode: op, payload: out })); } catch (e) { fail(e); }
-    });
+    // 全部走下道调度器：顺序由它按「同流保序 + 小帧可越过异流大帧」维护。
+    downlink.push(whole, op);
   }, fail);
 
   // ---- browser -> upstream ----
@@ -352,9 +368,10 @@ export function attachWsDeflate({ client, upstream, onError = null, onFailure = 
       closed = true;
       client.off('data', onClientData);
       upstream.off('data', onUpstreamData);
+      try { downlink.close(); } catch { /* ignore */ }
       deflate.close();
       inflate.close();
     },
-    stats: () => ({ ...stats }),
+    stats: () => ({ ...stats, queue: downlink.snapshot() }),
   };
 }

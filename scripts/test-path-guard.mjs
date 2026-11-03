@@ -1,6 +1,6 @@
 /** 目录 allowlist 与终端环境变量回归（P0-5）：node scripts/test-path-guard.mjs */
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -14,6 +14,17 @@ const configFile = join(tempHome, 'config.json')
 process.env.DSH_ASSISTANT_CONFIG = configFile
 process.env.DSH_ASSISTANT_HOME = nested
 process.env.DSH_HOME = join(tempHome, '.dsh')
+
+/** 配置文件带 mtime 缓存：连续写同一个文件可能落在同一毫秒里，缓存就分不出新旧。
+ *  测试侧每次写完都显式作废缓存，并把 mtime 往前推一格（内容本身也保证每次不同）。 */
+let configStamp = 0
+const writeConfig = (payload) => {
+  configStamp += 1
+  writeFileSync(configFile, JSON.stringify(payload), 'utf8')
+  const next = new Date(1_750_000_000_000 + configStamp * 5000)
+  utimesSync(configFile, next, next)
+  assistant.assistantConfigTestSurface.resetAssistantConfigCacheForTests()
+}
 
 const forbidden = process.platform === 'win32' ? 'C:\\Windows\\System32' : '/etc'
 
@@ -47,7 +58,7 @@ cases.push(['默认允许根包含助手目录、DSH 数据根、主目录、临
 cases.push(['本机配置 allowedRoots 追加的根被采纳（带 ~ 展开）', () => {
   const extra = join(tempHome, 'projects')
   mkdirSync(extra, { recursive: true })
-  writeFileSync(configFile, JSON.stringify({ allowedRoots: [extra, '~/outside-config-root'] }), 'utf8')
+  writeConfig({ allowedRoots: [extra, '~/outside-config-root'] })
   const guard = createPathGuard()
   assert.ok(guard.roots.includes(extra), '配置文件里的根没进允许根')
   assert.equal(guard.check(extra).ok, true)
@@ -83,11 +94,11 @@ cases.push(['Windows 大小写与尾部分隔符不影响判定', () => {
 }])
 
 cases.push(['allowAllLocalPaths: true 是显式逃生开关（默认 false）', () => {
-  writeFileSync(configFile, JSON.stringify({ allowAllLocalPaths: true }), 'utf8')
+  writeConfig({ allowAllLocalPaths: true })
   const open = createPathGuard()
   assert.equal(open.open, true)
   assert.equal(open.check(forbidden).ok, true, '开关打开了就不该挡')
-  writeFileSync(configFile, JSON.stringify({ allowAllLocalPaths: 'yes' }), 'utf8')
+  writeConfig({ allowAllLocalPaths: 'yes' })
   const wrong = createPathGuard()
   assert.equal(wrong.open, false, '非 true 的值不认（不能靠字符串 truthy 蒙混）')
   assert.equal(wrong.check(forbidden).ok, false)
@@ -102,7 +113,7 @@ cases.push(['终端 env 是白名单而不是整包 process.env', () => {
     assert.equal(env.DSH_ASSISTANT_TEST_SECRET, undefined, '未在白名单里的环境变量不该进终端')
     assert.equal(env.WX_APPID_SECRET_LIKE, undefined, '个人密钥类变量不该进终端')
     assert.ok(Object.keys(env).length < 25, `白名单不该扩得过大：${Object.keys(env).length}`)
-    writeFileSync(configFile, JSON.stringify({ termEnvAllow: ['DSH_ASSISTANT_TEST_SECRET'] }), 'utf8')
+    writeConfig({ termEnvAllow: ['DSH_ASSISTANT_TEST_SECRET'] })
     const withExtra = minimalTermEnv()
     assert.equal(withExtra.DSH_ASSISTANT_TEST_SECRET, '不该出现在终端里', '配置文件追加项应生效（大小写不敏感）')
   } finally {

@@ -743,10 +743,11 @@ const NARROW_RULES = `
     padding: 8px 12px 0 !important;
   }
   /* The directory and Files controls are absolutely positioned, so reserve
-     their lanes and let the title use the remaining width without squeezing. */
+     their lanes and let the title use the remaining width without squeezing.
+     左侧让到 44px：汉堡钮已经放大成 44×44（left 4 → 右沿 48），标题要躲开它。 */
   [data-phase] header > :first-child {
     min-height: 36px !important;
-    padding: 0 32px !important;
+    padding: 0 32px 0 44px !important;
   }
   [data-phase] header [class$="_titleCluster"],
   [data-phase] header [class$="_crumbs"] {
@@ -758,12 +759,24 @@ const NARROW_RULES = `
     padding-right: 0 !important;
   }
   /* The directory toggle sits at the far left of the header (the header
-     is position:relative; the data-slot wrappers are display:contents). */
+     is position:relative; the data-slot wrappers are display:contents).
+     44×44：手机端"三条横线点几次都进不去"（2026-11-03）就是 28px 死角的锅 ——
+     图标本身只有 15×10，贴着屏幕左上角，拇指落点偏十来像素就落在按钮外面。
+     按钮放到 left 4 / top 4，图标中心仍然在 (26, 26)，视觉位置几乎不动；
+     外沿留出的 4px 由抽屉 chrome 的命中区（swipe.mjs 的 toggleHitZone）兜住。
+     下沿不能超过 50px：再往下就是会话页的「对话 / 轨迹」标签条。 */
   [data-mobile-nav="toggle"] {
     position: absolute !important;
-    left: 8px !important;
-    top: 12px !important;
+    left: 4px !important;
+    top: 4px !important;
+    width: 44px !important;
+    height: 44px !important;
+    border-radius: 12px !important;
     z-index: 2 !important;
+  }
+  /* 按下去要有反馈：之前点完毫无变化，用户只能靠"抽屉开没开"猜这一下有没有点到。 */
+  [data-mobile-nav="toggle"]:active {
+    background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .08)) !important;
   }
   /* The Files action sits at the FAR RIGHT of the header so it reads as a
      distinct control from the directory toggle on the left (which opens

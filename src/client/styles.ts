@@ -584,7 +584,7 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_console[data-wt-shape=circle] .dsh-wt_consoleCard-glowNeed::before{border-radius:50%}',
   '.dsh-wt_consoleGrid{display:flex;flex-wrap:wrap;justify-content:center;gap:64px;align-content:start;margin-top:clamp(32px,9vh,110px);width:100%;max-width:calc(var(--wt-cols,3)*242px + (var(--wt-cols,3) - 1)*64px);margin-left:auto;margin-right:auto}',
   '.dsh-wt_consoleCols{display:inline-flex;align-items:center;gap:8px;padding:2px 8px;border:1px solid var(--wt-border);border-radius:999px;background:var(--wt-card);color:var(--wt-text3);font-size:11px}',
-  '.dsh-wt_consoleCard{position:relative;box-sizing:border-box;flex:none;width:calc((100% - (var(--wt-cols,3) - 1)*64px)/var(--wt-cols,3));display:flex;flex-direction:column;gap:14px;aspect-ratio:1/1;min-height:248px;padding:21px;background:linear-gradient(135deg,rgba(255,255,255,.22) 0%,rgba(255,255,255,.07) 30%,rgba(255,255,255,.01) 60%,rgba(0,0,0,.07) 100%),rgba(18,23,32,.24);border:1px solid transparent;border-radius:16px;box-shadow:0 10px 28px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.13);cursor:pointer;transition:transform .14s ease,box-shadow .14s ease;overflow:hidden;backdrop-filter:blur(var(--wt-cardBlur,0px)) saturate(1.15)}',
+  '.dsh-wt_consoleCard{position:relative;box-sizing:border-box;flex:none;width:calc((100% - (var(--wt-cols,3) - 1)*64px)/var(--wt-cols,3));display:flex;flex-direction:column;gap:14px;aspect-ratio:1/1;min-height:248px;padding:21px;background:linear-gradient(135deg,rgba(255,255,255,.22) 0%,rgba(255,255,255,.07) 30%,rgba(255,255,255,.01) 60%,rgba(0,0,0,.07) 100%),rgba(18,23,32,.24);border:1px solid transparent;border-radius:16px;box-shadow:0 10px 28px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.13);cursor:pointer;transition:transform .14s ease,box-shadow .14s ease;overflow:hidden}',
   // 玻璃边缘：四角黑白渐变描边（左上/右下=白，右上/左下=黑），1px 环挖空实现
   '.dsh-wt_consoleCard::after{content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;background:conic-gradient(from 45deg,rgba(0,0,0,.4) 0deg,rgba(255,255,255,.55) 90deg,rgba(0,0,0,.4) 180deg,rgba(255,255,255,.55) 270deg,rgba(0,0,0,.4) 360deg);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);mask-composite:exclude;pointer-events:none;opacity:.5}',
   '.dsh-wt_console[data-wt-theme=light] .dsh-wt_consoleCard{background:linear-gradient(135deg,rgba(255,255,255,1) 0%,rgba(255,255,255,.65) 30%,rgba(255,255,255,.12) 60%,rgba(31,41,55,.06) 100%),rgba(255,255,255,.34);box-shadow:0 10px 28px rgba(31,41,55,.18),inset 0 1px 0 rgba(255,255,255,1);backdrop-filter:blur(var(--wt-cardBlur,0px)) saturate(1.15)}',
@@ -593,6 +593,7 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_consoleCard-glowDone::after,.dsh-wt_consoleCard-glowNeed::after{opacity:0}',
   '.dsh-wt_consoleCard:hover{transform:translateY(-2px);box-shadow:0 14px 32px rgba(0,0,0,.32),inset 0 1px 0 rgba(255,255,255,.09)}',
   '.dsh-wt_consoleCardSelf{cursor:default;opacity:.97}',
+  '.dsh-wt_console[data-wt-blur="on"] .dsh-wt_consoleCard{backdrop-filter:blur(var(--wt-cardBlur,0px)) saturate(1.15)}',
   '.dsh-wt_consoleCardHead{display:flex;align-items:center;gap:13px;min-width:0}',
   '.dsh-wt_consoleIcon{flex:none;font-size:31px;line-height:1}',
   '.dsh-wt_consoleName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:20px;font-weight:700;line-height:28px;color:var(--wt-text)}',
@@ -708,7 +709,9 @@ export const css = xtermCss + '\n' + [
   '.dsh-wt_sessOpOn{color:var(--dsw-alias-state-warning,#d29922)}',
   '.dsh-wt_sessArchive:disabled{opacity:.35;cursor:default}',
   '.dsh-wt_sessItemArchived{opacity:.62}',
-  '.dsh-wt_sessMore{align-self:center;margin-top:2px;padding:3px 10px;border:1px solid var(--wt-border);border-radius:999px;background:var(--wt-chip);color:var(--wt-text3);font:inherit;font-size:10px;cursor:pointer}',
+  // 底部开关排（显示已归档 / 显示空白会话 / 归档空白会话）横排，放不下才换行
+  '.dsh-wt_sessMoreRow{display:flex;flex-wrap:wrap;align-items:center;gap:6px}',
+  '.dsh-wt_sessMore{flex:none;margin:0;padding:3px 10px;border:1px solid var(--wt-border);border-radius:999px;background:var(--wt-chip);color:var(--wt-text3);font:inherit;font-size:10px;line-height:15px;white-space:nowrap;cursor:pointer}',
   '.dsh-wt_sessMore:hover{color:var(--wt-text);border-color:var(--wt-borderHover)}',
   '.dsh-wt_sessTag{flex:none;padding:1px 6px;border-radius:999px;background:rgba(210,153,34,.16);color:var(--dsw-alias-state-warning,#d29922);font-size:9px;line-height:15px}',
   // 临时卡片：已结束标记 + 浮层顶部「收工」按钮 + 底部保留策略说明
