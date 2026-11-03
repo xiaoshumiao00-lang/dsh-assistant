@@ -19,7 +19,7 @@ import {
   writeDrawerPref,
 } from './drawer-state.mjs'
 import { isOverlayTap } from './nav-targets.mjs'
-import { mountDrawerSwipe } from './swipe.mjs'
+import { classifyToggleTap, isInToggleZone, mountDrawerSwipe, toggleHitZone } from './swipe.mjs'
 import { domGate, INTERACTION_PAUSE_MS } from '../../compositionGate.ts'
 
 /** Frame marker value that switches the drawer stylesheet on. */
@@ -41,6 +41,10 @@ export const PRE_UPGRADE_MS = 700
 export const DRAWER_TRANSITION_MS = 280
 /** will-change 的兜底清理时长：transitionend 没来也必须清掉（它会成为 fixed 后代的包含块）。 */
 export const DRAWER_WILL_CHANGE_MS = 520
+/** 同一次点击的二次翻转保护窗口（指针路径 + 合成 click 只有一次算数）。 */
+export const TOGGLE_DEBOUNCE_MS = 320
+/** 指针路径已经开合过之后，多久以内的合成 click 一律吞掉。 */
+export const TOGGLE_CLICK_SUPPRESS_MS = 900
 
 const MENU_ICON =
   '<svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true" focusable="false">' +
@@ -58,7 +62,7 @@ export interface DrawerChromeOptions {
   labels: { menu: string; sessionLog: string }
   onDownloadSessionLog?: () => void
   /** 一次开抽屉的打点：ms = 点击到「那一帧真的开始滑」；upgrade = 这次是否补做了宿主升级。 */
-  onMeasure?: (info: { ms: number; upgrade: boolean }) => void
+  onMeasure?: (info: { ms: number; upgrade: boolean; src?: string }) => void
   doc?: Document
   win?: Window
   storage?: Storage | null
@@ -82,6 +86,15 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
   let retryTimer: ReturnType<typeof setTimeout> | null = null
   let tries = 0
   let disposed = false
+  /**
+   * 同一次点击只算一次（2026-11-03）：指针路径（命中区）与随后的合成 click 都可能
+   * 触发，两次翻转让"点一下"等于没点；反过来，某些 WebView 只给一种事件。
+   * 所以两条路径都留着，用时间戳互斥。
+   */
+  let lastToggleAt = -Infinity
+  let pointerHandledAt = -Infinity
+  /** 指针路径的起手点：用来判定"这一下是不是点在汉堡钮命中区里"。 */
+  let tapStart: { x: number; y: number; at: number } | null = null
   /** 壳层还没挂上时改由观察 DOM 变化补挂 chrome（原来靠 250ms × 48 轮空转全页 querySelector） */
   let overlayWaiter: MutationObserver | null = null
   const releaseOverlayWaiter = (): void => {
@@ -158,7 +171,7 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
   }
 
   /** 打点：点击 → 两帧之后（排版绘制完成）= 真的开始滑的时刻。 */
-  const measureOpen = (startedAt: number, upgrade: boolean): void => {
+  const measureOpen = (startedAt: number, upgrade: boolean, src: string): void => {
     const reporter = options.onMeasure
     if (reporter === undefined) return
     const raf = (fn: () => void): void => {
@@ -168,13 +181,14 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
     raf(() => {
       raf(() => {
         try {
-          reporter({ ms: Math.round(nowMs() - startedAt), upgrade })
+          reporter({ ms: Math.round(nowMs() - startedAt), upgrade, src })
         } catch { /* 打点绝不影响抽屉 */ }
       })
     })
   }
 
-  const openDrawer = (): void => {
+  /** 开抽屉。@param src - 入口来源（btn / zone / swipe），只进诊断流水。 */
+  const openDrawer = (src = 'btn'): void => {
     if (open) return
     const startedAt = nowMs()
     /* 只在「首屏预升级还没做 / 做不成」时同步补做：此后每次开抽屉都是纯 CSS 动画。 */
@@ -191,7 +205,7 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
     domGate.pause(INTERACTION_PAUSE_MS)
     armColumnCompositing()
     applyState()
-    measureOpen(startedAt, needsUpgrade)
+    measureOpen(startedAt, needsUpgrade, src)
   }
 
   const closeDrawer = (): void => {
@@ -200,6 +214,20 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
     domGate.pause(INTERACTION_PAUSE_MS)
     applyState()
     armColumnCompositing()
+  }
+
+  /**
+   * 唯一开合入口：同一次点击的重复触发（指针路径 + 合成 click）在这里被时间窗挡掉。
+   * 返回这次是否真的翻转（诊断与测试都靠它）。
+   * @param src - 入口来源（btn / zone / swipe）。
+   */
+  const toggleDrawer = (src = 'btn'): boolean => {
+    const at = nowMs()
+    if (at - lastToggleAt < TOGGLE_DEBOUNCE_MS) return false
+    lastToggleAt = at
+    if (open) closeDrawer()
+    else openDrawer(src)
+    return true
   }
 
   /**
@@ -231,7 +259,11 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
     if (!open) return
     const target = event.target
     if (!(target instanceof Element)) return
-    if (target === toggle || target === backdrop) return
+    if (backdrop !== null && target === backdrop) return
+    /* 汉堡钮自己（含里面的 <svg>/<path> 图标）：只比引用相等会漏判图标 ——
+       点开着的抽屉时，先按"点抽屉外"关掉、再被按钮的 click 重新打开，等于关不掉。
+       所以这里用 contains，把图标子树一并豁免。 */
+    if (toggle !== null && (target === toggle || toggle.contains(target))) return
     /* Portaled popups (account menu / workspace menus / session kebab) are
        children of document.body, i.e. outside the drawer DOM. Without this
        exemption the first tap on a menu item closes the drawer — and the sheet
@@ -253,6 +285,63 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
     closeDrawer()
   }
 
+  /** 汉堡钮按钮本体的矩形（命中区以它为基准；拿不到就退回固定尺寸）。 */
+  const toggleRect = (): { left: number; top: number; width: number; height: number } | null => {
+    if (toggle === null) return null
+    try {
+      const rect = toggle.getBoundingClientRect()
+      return { left: rect.left, top: rect.top, width: rect.width, height: rect.height }
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * 命中区的指针按下：在左上角那一片（比按钮本体外扩一圈）就记下起手点。
+   * 用指针坐标判定，不看"点中了哪个元素" —— 这样即使有别的透明层压在最上面、
+   * 或点击被 WebView 吃掉合成不出 click，抽屉照样能开（2026-11-03 手机端
+   * "三条横线点几次都进不去"的釜底抽薪）。
+   */
+  const onZoneDown = (event: Event): void => {
+    tapStart = null
+    if (disposed || open) return
+    const point = pointerPoint(event)
+    if (point === null) return
+    const zone = toggleHitZone(toggleRect())
+    if (zone === null || !isInToggleZone(point, zone)) return
+    const target = event.target
+    /* 弹窗（设置 / 导出）开着的时候左上角归它，别在下面偷偷开抽屉。 */
+    if (target instanceof Element && target.closest('[aria-modal="true"]') !== null) return
+    /* 悬浮球可以拖到左上角：它自己就是一整块按钮（z-index 3200，压在我们的命中区
+       上面），点在球上归球用，别顺手把抽屉也拽出来。 */
+    if (target instanceof Element && target.closest('[data-pocket-orb]') !== null) return
+    tapStart = { x: point.x, y: point.y, at: nowMs() }
+  }
+
+  /** 命中区的指针抬起：位移与时长都在"点一下"范围内就开合抽屉。 */
+  const onZoneUp = (event: Event): void => {
+    const start = tapStart
+    tapStart = null
+    if (start === null || disposed || open) return
+    const point = pointerPoint(event)
+    if (point === null) return
+    const zone = toggleHitZone(toggleRect())
+    const tapped = classifyToggleTap({
+      startX: start.x,
+      startY: start.y,
+      endX: point.x,
+      endY: point.y,
+      zone,
+      elapsedMs: nowMs() - start.at,
+    })
+    if (!tapped) return
+    /* 这次点击由指针路径负责：随后合成的 click 只吞不翻。 */
+    pointerHandledAt = nowMs()
+    toggleDrawer('zone')
+  }
+
+  const onZoneCancel = (): void => { tapStart = null }
+
   const buildChrome = (layer: HTMLElement): void => {
     if (backdrop === null) {
       backdrop = doc.createElement('div')
@@ -271,8 +360,16 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
       toggle.style.position = 'fixed'
       toggle.style.top = 'calc(env(safe-area-inset-top, 0px) + 8px)'
       toggle.style.left = '8px'
+      /* 兜底尺寸：样式表没注入时也不能是一个 20px 的死角（样式表会覆盖成 44）。 */
+      toggle.style.width = '44px'
+      toggle.style.height = '44px'
       toggle.style.zIndex = '1201'
-      toggle.addEventListener('click', () => (open ? closeDrawer() : openDrawer()))
+      toggle.addEventListener('click', (event: MouseEvent) => {
+        /* 键盘（detail === 0，回车 / 空格）直接开合；指针点击若已经走完命中区
+           那条路径就不再翻转第二次，否则"点一下"等于没点。 */
+        if (event.detail > 0 && nowMs() - pointerHandledAt < TOGGLE_CLICK_SUPPRESS_MS) return
+        toggleDrawer('btn')
+      })
       /* 按下去（pointerdown）就先把那一列提上合成层，别等 click 才 arm：合成层的创建
          要花一帧，提前 arm 才赶得上 0.28s 的开合滑行动画。 */
       toggle.addEventListener('pointerdown', () => { armColumnCompositing() })
@@ -330,13 +427,27 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
 
   const stopSwipe = mountDrawerSwipe({
     isDrawerOpen: () => open,
-    onOpen: openDrawer,
+    onOpen: () => {
+      if (open) return
+      lastToggleAt = nowMs()
+      openDrawer('swipe')
+    },
     onClose: closeDrawer,
     doc,
   })
 
+  /* 命中区监听（见 onZoneDown / onZoneUp）：优先 PointerEvent，没有它的老 WebView
+     退回 touch。一律 capture —— 即使有别的透明层压在最上面，我们也在捕获阶段先拿到坐标。 */
+  const pointerApi = typeof (win as any)?.PointerEvent === 'function'
+  const downEvent = pointerApi ? 'pointerdown' : 'touchstart'
+  const upEvent = pointerApi ? 'pointerup' : 'touchend'
+  const cancelEvent = pointerApi ? 'pointercancel' : 'touchcancel'
+
   doc.addEventListener('keydown', onKeyDown)
   doc.addEventListener('pointerdown', onDocumentPointerDown, true)
+  doc.addEventListener(downEvent, onZoneDown, true)
+  doc.addEventListener(upEvent, onZoneUp, true)
+  doc.addEventListener(cancelEvent, onZoneCancel, true)
   attempt()
   applyState()
 
@@ -346,6 +457,7 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
     releaseOverlayWaiter()
     if (preUpgradeTimer !== null) { clearTimeout(preUpgradeTimer); preUpgradeTimer = null }
     if (willChangeTimer !== null) { clearTimeout(willChangeTimer); willChangeTimer = null }
+    tapStart = null
     try {
       const column = drawerColumn()
       if (column !== null) column.style.willChange = 'auto'
@@ -353,6 +465,9 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
     stopSwipe?.()
     doc.removeEventListener('keydown', onKeyDown)
     doc.removeEventListener('pointerdown', onDocumentPointerDown, true)
+    doc.removeEventListener(downEvent, onZoneDown, true)
+    doc.removeEventListener(upEvent, onZoneUp, true)
+    doc.removeEventListener(cancelEvent, onZoneCancel, true)
     backdrop?.remove()
     toggle?.remove()
     logButton?.remove()
@@ -366,6 +481,19 @@ function safeStorage(): Storage | null {
   } catch {
     return null
   }
+}
+
+/**
+ * 取事件的指针坐标：PointerEvent 直接用 clientX/Y；touch 事件取 changedTouches[0]。
+ * 拿不到（坐标为 NaN 的合成事件、scroll 之类的非指针事件）返回 null。
+ * @param event - 文档级监听收到的原始事件。
+ */
+function pointerPoint(event: Event): { x: number; y: number } | null {
+  const source: any = (event as any)?.changedTouches?.[0] ?? (event as any)?.touches?.[0] ?? event
+  const x = Number(source?.clientX)
+  const y = Number(source?.clientY)
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null
+  return { x, y }
 }
 
 /**

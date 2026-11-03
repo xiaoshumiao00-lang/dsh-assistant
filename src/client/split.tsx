@@ -1,9 +1,12 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
 import { parentPathOf } from './pathutil'
 import { cachedJsonRead, cachedJsonWrite } from './localStore'
 import { filterWorkingCards } from './consoleFilter'
+import { CONSOLE_FIRST_MOUNT, sameConsoleCard } from './consoleCardPolicy'
 import { sortSessionsByActivity } from './sessionRank'
+import { archivableBlankRows, sessionRowsVisible } from './sessionFolder'
 import { domGate, createGatedThrottle } from './compositionGate'
+import { createCardRefreshCoalescer } from './cardRefreshPolicy'
 import { observeExternalSplit } from './splitObserver'
 import { ANNOUNCE_BODY, ANNOUNCE_HEAD } from './changelog'
 import { LOCAL_VERSION, UPGRADE_AI, checkUpdate, getAutoCheck, readCache, setAutoCheck as storeAutoCheck, setSkipVersion, type UpdateInfo, type UpdateStatus } from './updateCheck'
@@ -283,8 +286,11 @@ export type ProjectSessionItem = {
   awaiting?: boolean
   /** 空白会话（还没有消息） */
   blank: boolean
-  /** 最近更新毫秒时间戳（未知为 0） */
+  /** 最近更新毫秒时间戳（未知为 0；宿主口径 = max(创建时间, 最后一次人工提示)） */
   updatedAt: number
+  /** 最后真正活动过的时间（轮次结束 / 后台任务 / 事件窗口；未知省略）。
+   *  排序与「点卡片进入哪条会话」按 max(updatedAt, lastAt)：长任务跑完那一刻 updatedAt 不前进。 */
+  lastAt?: number
   /** 已置顶（宿主工作区 pinnedSessionIds） */
   pinned?: boolean
   /** 已归档（工作区归档 = 从列表移除、磁盘日志保留；可恢复） */
@@ -380,6 +386,9 @@ type SplitEnv = {
     onPinSession?: (sessionId: string, pinned: boolean) => void
     /** 归档 / 恢复（宿主工作区：归档 = 从列表移除，磁盘日志保留） */
     onArchiveSession?: (sessionId: string, archived: boolean) => void
+    /** 一键归档该项目目录下所有空白会话（可恢复；不碰当前会话 / 已归档 / 已置顶）。
+     *  返回真正归档掉的条数。 */
+    onArchiveBlankSessions?: (projectId: string) => Promise<number> | number
     /** 卡片「＋」新建会话：可指定标准 / computer-use 模式与前台、后台模型。
      *  返回 false（或 resolve 成 false）= 未建成：面板留在原处让用户重试；true/undefined = 关面板 */
     onCreateSession?: (id: string, opts: NewSessionOptions) => void | Promise<boolean | void>
@@ -1889,6 +1898,111 @@ function ConsoleRuntime({ value }: { value: number }) {
   return <span className="dsh-wt_consoleRuntime">{text}</span>
 }
 
+/** 控制室单张卡（memo）。
+ *  卡片刷新由宿主投影驱动：多任务运行时每 150 ms 一次 cardsRevision，
+ *  原来整张卡的子树（3 个 SVG + 预览 + 操作按钮）每次重渲染都要重建一遍。
+ *  这里把「读哪个项目」与「做什么」分开：数据比 `sameConsoleCard`，
+ *  动作走 ref 转发的稳定 handlers —— 只有真的变了的卡才重渲染。 */
+const ConsoleCard = memo(function ConsoleCard({ c, canCreate, handlers }: {
+  c: ConsoleCardData
+  canCreate: boolean
+  handlers: {
+    open: (c: ConsoleCardData) => void
+    create: (c: ConsoleCardData, mode: 'standard' | 'computer-use') => void
+    list: (el: HTMLElement, c: ConsoleCardData) => void
+  }
+}) {
+  const statusLabel: Record<string, string> = { idle: T('console.idle'), busy: T('console.busy'), need: T('console.need'), done: T('console.done'), error: T('console.error') }
+  return (
+    <div
+      data-flip={c.id}
+      role={c.self ? undefined : 'button'}
+      tabIndex={c.self ? -1 : 0}
+      className={'dsh-wt_consoleCard' + (c.self ? ' dsh-wt_consoleCardSelf' : '')
+        + (c.temp ? ' dsh-wt_consoleCard-temp' : '')
+        + (c.status === 'busy' ? ' dsh-wt_consoleCard-busy' : '')
+        + (c.status === 'error' ? ' dsh-wt_consoleCard-error' : '')
+        + (c.glow && c.status === 'done' ? ' dsh-wt_consoleCard-glowDone' : '')
+        + (c.glow && c.status === 'need' ? ' dsh-wt_consoleCard-glowNeed' : '')}
+      title={c.temp ? T('console.tempCardTip') + ' · ' + c.name : c.name}
+      onClick={() => { if (c.self) return; handlers.open(c) }}
+    >
+      <div className="dsh-wt_consoleCardHead">
+        {/* 图标只是标识，不再是按钮：换图标统一走「控制室下方工具条 → 项目管理 → 更换图标」 */}
+        <span className="dsh-wt_consoleIcon" aria-hidden>{c.icon}</span>
+        <span className="dsh-wt_consoleName">{c.name}</span>
+        {c.count != null && c.count > 0 && (
+          <span className="dsh-wt_consoleCount" title={T('console.tempCountTip', { n: String(c.count) })}>{c.count}</span>
+        )}
+      </div>
+      <div className="dsh-wt_consoleDivider" aria-hidden />
+      <div className="dsh-wt_consoleStatusRow">
+        <span className={'dsh-wt_consoleStatus dsh-wt_consoleStatus-' + c.status}>{statusLabel[c.status]}</span>
+        {c.runtimeMs != null && <ConsoleRuntime value={c.runtimeMs} />}
+      </div>
+      {(c.status === 'busy' || c.status === 'error' || (c.glow && c.status === 'need')) && <span className="dsh-wt_consoleSweep" aria-hidden />}
+      <div className={'dsh-wt_consolePreview' + (c.preview ? '' : ' dsh-wt_consolePreviewNone') + (c.live ? ' dsh-wt_consolePreviewLive' : '')} title={c.preview}>
+        {c.preview || (c.bound ? T('console.noPreview') : T('console.unboundShort'))}
+        {c.live && c.preview ? <span className="dsh-wt_consoleCaret" aria-hidden>▍</span> : null}
+      </div>
+      {/* 卡片底部操作行：两个醒目的一键新建（对话 / 电脑操作），下面「会话列表」 */}
+      <div className="dsh-wt_consoleCardOps">
+        {c.canNewSession && canCreate && (
+          <>
+            <button
+              type="button"
+              className="dsh-wt_consoleOpBtn dsh-wt_consoleOpBtnNew"
+              title={T('console.newStandardTip')}
+              aria-label={T('console.newStandard')}
+              onClick={(e) => { e.stopPropagation(); handlers.create(c, 'standard') }}
+            >
+              <span className="dsh-wt_consoleOpMain">
+                <svg width="13" height="13" viewBox="0 0 16 16" aria-hidden>
+                  <circle cx="8" cy="8" r="7" fill="currentColor" opacity=".16" />
+                  <path d="M8 4.5v7M4.5 8h7" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" />
+                </svg>
+                <span>{T('console.newShort')}</span>
+              </span>
+              <span className="dsh-wt_consoleOpSub">{T('console.newStandardShort')}</span>
+            </button>
+            <button
+              type="button"
+              className="dsh-wt_consoleOpBtn dsh-wt_consoleOpBtnNew dsh-wt_consoleOpBtnCu"
+              title={T('console.newComputerUseTip')}
+              aria-label={T('console.newComputerUse')}
+              onClick={(e) => { e.stopPropagation(); handlers.create(c, 'computer-use') }}
+            >
+              <span className="dsh-wt_consoleOpMain">
+                <svg width="13" height="13" viewBox="0 0 16 16" aria-hidden>
+                  <circle cx="8" cy="8" r="7" fill="currentColor" opacity=".16" />
+                  <path d="M8 4.5v7M4.5 8h7" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" />
+                </svg>
+                <span>{T('console.newShort')}</span>
+              </span>
+              <span className="dsh-wt_consoleOpSub">{T('console.newComputerUseShort')}</span>
+            </button>
+          </>
+        )}
+        <button
+          type="button"
+          className="dsh-wt_consoleOpBtn dsh-wt_consoleOpBtnFull"
+          title={T('console.sessionsTip')}
+          aria-label={T('console.sessions')}
+          onClick={(e) => { e.stopPropagation(); handlers.list(e.currentTarget as HTMLElement, c) }}
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
+            <path d="M5.6 4.3h7.1M5.6 8h7.1M5.6 11.7h7.1" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            <circle cx="3.1" cy="4.3" r="0.95" fill="currentColor" />
+            <circle cx="3.1" cy="8" r="0.95" fill="currentColor" />
+            <circle cx="3.1" cy="11.7" r="0.95" fill="currentColor" />
+          </svg>
+          <span>{T('console.sessions')}</span>
+        </button>
+      </div>
+    </div>
+  )
+}, (a, b) => a.canCreate === b.canCreate && a.handlers === b.handlers && sameConsoleCard(a.c, b.c))
+
 /** 控制室面板：项目卡片网格（每行 3 张、超出换行）；数据由工作台组装推送（纯读镜像）。
  *  主题：dark/light 直接生效；system = 跟随宿主 html 的 color-scheme（DSH 深色/白色/跟随系统都会反映到它） */
 export function ConsolePane() {
@@ -1911,9 +2025,14 @@ export function ConsolePane() {
   const [glowSpeed, setGlowSpeedState] = useState<number>(() => splitEnv?.console?.getGlowSpeed?.() ?? 50)
   const [annOpen, setAnnOpen] = useState(false)
   /** 卡片「会话列表」浮层：该项目目录下的会话 + 锚点坐标（点某一项即进入该会话，历史保留可继续） */
-  const [sessPop, setSessPop] = useState<{ name: string; x: number; y: number; items: ProjectSessionItem[]; transient?: boolean } | null>(null)
+  const [sessPop, setSessPop] = useState<{ pid: string; name: string; x: number; y: number; items: ProjectSessionItem[]; transient?: boolean } | null>(null)
   /** 会话列表是否显示已归档项 */
   const [sessShowArchived, setSessShowArchived] = useState(false)
+  /** 会话列表是否显示空白会话（一条消息都没有的裸会话）：默认藏掉，就地开关 */
+  const [sessShowBlank, setSessShowBlank] = useState(false)
+  /** 「归档空白会话」的两步确认 + 在途闸门（手机上连点容易，第一次点只亮确认文案） */
+  const [sessArchiveConfirm, setSessArchiveConfirm] = useState(false)
+  const [sessArchiveBusy, setSessArchiveBusy] = useState(false)
   /** 新建会话面板：项目 id/名称 + 模式 + 前台/后台模型 */
   const [newSessFor, setNewSessFor] = useState<{ id: string; name: string } | null>(null)
   const [manageOpen, setManageOpen] = useState(false)
@@ -2507,23 +2626,31 @@ export function ConsolePane() {
   useEffect(() => {
     const env = splitEnv?.console
     if (!env) return
-    // 流式会话可能在一个事件循环里连续推多次；按动画帧合并，只重绘最新状态。
-    // 数据读取仍由 getCards 在渲染时完成，不丢弃状态，也不改变卡片刷新语义。
-    let frame: number | null = null
-    const flush = () => {
-      frame = null
+    // 流式会话可能在一个事件循环里连续推多次：按最小间隔（150 ms）合并，只重绘最新状态。
+    // 数据读取仍由 getCards 在渲染时完成，不丢弃状态，也不改变卡片刷新语义；
+    // 页面不可见时整轮跳过（只记脏），回到前台补一次。
+    let dirty = false
+    const refresh = createCardRefreshCoalescer({
+      schedule: (fn, ms) => window.setTimeout(fn, ms),
+      cancel: (h) => window.clearTimeout(h),
+    })
+    const run = () => {
+      if (document.visibilityState !== 'visible') { dirty = true; return }
+      dirty = false
       setCardsRevision((v) => v + 1)
     }
     const bump = () => {
       setThemeMode(env.getTheme?.() ?? 'system')
-      if (frame != null) return
-      frame = window.requestAnimationFrame(flush)
+      refresh.bump(run)
     }
+    const onVisible = () => { if (document.visibilityState === 'visible' && dirty) bump() }
+    document.addEventListener('visibilitychange', onVisible)
     const un = env.subscribe(bump)
     bump()
     return () => {
       un()
-      if (frame != null) window.cancelAnimationFrame(frame)
+      document.removeEventListener('visibilitychange', onVisible)
+      refresh.dispose()
     }
   }, [])
   // 跟随系统：监听 OS 深浅切换（仅 themeMode==='system' 时影响渲染）
@@ -2605,8 +2732,11 @@ export function ConsolePane() {
     const w = 360
     const x = Math.max(8, Math.min(Math.round(r.left), Math.max(8, window.innerWidth - w - 8)))
     const y = Math.min(Math.round(r.bottom + 6), Math.max(8, window.innerHeight - 140))
-    setSessPop({ name: c.name, x, y, items, transient: c.temp === true })
+    setSessPop({ pid: c.id, name: c.name, x, y, items, transient: c.temp === true })
     setSessShowArchived(false)
+    setSessShowBlank(false)
+    setSessArchiveConfirm(false)
+    setSessArchiveBusy(false)
     setEditingId(null)
   }
   /** 临时卡片「收工」：只移除已结束的会话（运行中的继续留着），会话本身不删除 */
@@ -2666,6 +2796,24 @@ export function ConsolePane() {
     } : prev)
     splitEnv?.console?.onArchiveSession?.(s.id, !s.archived)
   }
+  /** 「归档空白会话」：把这个目录（含模板步骤子目录）下没有一条消息的空白会话交给宿主归档。
+   *  可逆：归档 = 从列表移除、磁盘日志保留，点「显示已归档」就回来。
+   *  两段式确认：第一下只把按钮换成「再点一次」，第二下才真动手——手机上连点容易误触。 */
+  const archiveBlankFromSheet = async (): Promise<void> => {
+    const pid = sessPop?.pid
+    const runner = splitEnv?.console?.onArchiveBlankSessions
+    if (!pid || !runner || sessArchiveBusy) return
+    if (!sessArchiveConfirm) { setSessArchiveConfirm(true); return }
+    setSessArchiveBusy(true)
+    try {
+      await Promise.resolve(runner(pid))
+      const fresh = splitEnv?.console?.getProjectSessions?.(pid) ?? []
+      setSessPop((prev) => (prev && prev.pid === pid ? { ...prev, items: fresh } : prev))
+    } finally {
+      setSessArchiveBusy(false)
+      setSessArchiveConfirm(false)
+    }
+  }
   // 会话列表浮层：Esc 关闭（行内编辑中则由输入框自行处理取消，不关掉浮层）
   useEffect(() => {
     if (!sessPop) return
@@ -2686,8 +2834,58 @@ export function ConsolePane() {
     { mode: 'light', key: 'console.themeLight' },
     { mode: 'system', key: 'console.themeSystem' },
   ]
+  // 首屏只挂前 CONSOLE_FIRST_MOUNT 张，其余在空闲帧一次补齐。
+  // 「自动排版慢半拍」有一半是打开那一下把几十张渐变/模糊卡一次挂满：
+  // 先给可见的首屏，剩下的不抢这一帧（可见集合与排序都不变）。
+  const [mountCount, setMountCount] = useState(CONSOLE_FIRST_MOUNT)
+  useEffect(() => {
+    if (mountCount >= shownCards.length) return
+    let cancelled = false
+    const fill = (): void => { if (!cancelled) setMountCount(shownCards.length) }
+    const ric = (window as any).requestIdleCallback as ((cb: () => void, opts?: { timeout: number }) => number) | undefined
+    const cancelRic = (window as any).cancelIdleCallback as ((h: number) => void) | undefined
+    const handle = ric ? ric(fill, { timeout: 200 }) : window.setTimeout(fill, 16)
+    return () => {
+      cancelled = true
+      if (ric && cancelRic) cancelRic(handle)
+      else window.clearTimeout(handle)
+    }
+  }, [mountCount, shownCards.length])
+
+  // 卡片动作一律走 ref 转发：handlers 身份恒定 → 卡片 memo 才能挡住「没变的卡」。
+  const cardActionRef = useRef({
+    open: (c: ConsoleCardData): void => { void c },
+    create: (c: ConsoleCardData, mode: 'standard' | 'computer-use'): void => { void c; void mode },
+    list: (el: HTMLElement, c: ConsoleCardData): void => { void el; void c },
+  })
+  cardActionRef.current = {
+    open: (c) => {
+      if (!env) return
+      if (c.glow) env.onAck?.(c.id) // 点发光卡片：先确认熄光，再进入
+      env.onOpen(c.id)
+    },
+    create: (c, mode) => {
+      if (splitEnv?.console?.onCreateSession) openNewSessionPanel(c, mode)
+      else env?.onNewSession?.(c.id)
+    },
+    list: (el, c) => openSessionList(el, c),
+  }
+  const cardHandlers = useMemo(() => ({
+    open: (c: ConsoleCardData) => cardActionRef.current.open(c),
+    create: (c: ConsoleCardData, mode: 'standard' | 'computer-use') => cardActionRef.current.create(c, mode),
+    list: (el: HTMLElement, c: ConsoleCardData) => cardActionRef.current.list(el, c),
+  }), [])
+  const canCreateCard = !!splitEnv?.console?.onCreateSession
+  /** 会话列表浮层的可见行（空白会话与已归档默认藏掉，开关在浮层底部） */
+  const sessVisibility = { showArchived: sessShowArchived, showBlank: sessShowBlank }
+  const sessVisibleRows = sessPop === null ? [] : sessionRowsVisible(sessPop.items, sessVisibility)
+  const sessBlankCount = sessPop === null ? 0 : sessPop.items.filter((i) => i.blank).length
+  const sessArchivableCount = sessPop === null ? 0 : archivableBlankRows(sessPop.items).length
+  /** 卡片模糊强度：0 时整卡不建 backdrop-filter（1,000+ 元素各建一个背景根，手机上是纯浪费）。 */
+  const cardBlurPx = bg === 'plain' ? plainBlur : bg === 'glow' ? glowBlur : cardBlur
+
   return (
-    <div className="dsh-wt_console" data-wt-theme={resolvedTheme} data-wt-shape={shape} data-wt-bg={bg} data-wt-grid={bg === 'photo' && !photoGrid ? 'off' : 'on'} style={{ ...(bg === 'plain' ? { ['--wt-bg' as any]: 'hsl(' + plainHsl.h + ', ' + plainHsl.s + '%, ' + plainHsl.l + '%)', ['--wt-gridPlain' as any]: 'rgba(255,255,255,' + (plainGrid / 100) + ')', ['--wt-gridPlainLight' as any]: 'rgba(27,31,36,' + (plainGrid / 100) + ')' } : {}), ...(bg === 'glow' ? { ['--wt-gridGlow' as any]: 'rgba(255,255,255,' + (glowGrid / 100) + ')', ['--wt-gridGlowLight' as any]: 'rgba(27,31,36,' + (glowGrid / 100) + ')', ['--wt-glowScale' as any]: glowSpeed === 0 ? '100000000' : String(50 / glowSpeed) } : {}), ...(bg === 'photo' ? { ['--wt-gridPhoto' as any]: 'rgba(255,255,255,' + (gridOpacity / 100) + ')' } : {}), ['--wt-cardBlur' as any]: (bg === 'plain' ? plainBlur : bg === 'glow' ? glowBlur : cardBlur) + 'px' }}>
+    <div className="dsh-wt_console" data-wt-theme={resolvedTheme} data-wt-blur={cardBlurPx > 0 ? 'on' : 'off'} data-wt-shape={shape} data-wt-bg={bg} data-wt-grid={bg === 'photo' && !photoGrid ? 'off' : 'on'} style={{ ...(bg === 'plain' ? { ['--wt-bg' as any]: 'hsl(' + plainHsl.h + ', ' + plainHsl.s + '%, ' + plainHsl.l + '%)', ['--wt-gridPlain' as any]: 'rgba(255,255,255,' + (plainGrid / 100) + ')', ['--wt-gridPlainLight' as any]: 'rgba(27,31,36,' + (plainGrid / 100) + ')' } : {}), ...(bg === 'glow' ? { ['--wt-gridGlow' as any]: 'rgba(255,255,255,' + (glowGrid / 100) + ')', ['--wt-gridGlowLight' as any]: 'rgba(27,31,36,' + (glowGrid / 100) + ')', ['--wt-glowScale' as any]: glowSpeed === 0 ? '100000000' : String(50 / glowSpeed) } : {}), ...(bg === 'photo' ? { ['--wt-gridPhoto' as any]: 'rgba(255,255,255,' + (gridOpacity / 100) + ')' } : {}), ['--wt-cardBlur' as any]: cardBlurPx + 'px' }}>
       <span className="dsh-wt_consoleBg" aria-hidden style={bg === 'glow' && (glowHsl.h !== 0 || glowHsl.s !== 100 || glowHsl.l !== 100) ? { filter: 'hue-rotate(' + glowHsl.h + 'deg) saturate(' + glowHsl.s + '%) brightness(' + glowHsl.l + '%)' } : undefined}>
         {bg === 'photo' && (bgVideo
           ? <ConsoleVideo src={bgVideo} style={photoHsl.h !== 0 || photoHsl.s !== 100 || photoHsl.l !== 100 ? { filter: 'hue-rotate(' + photoHsl.h + 'deg) saturate(' + photoHsl.s + '%) brightness(' + photoHsl.l + '%)' } : undefined} />
@@ -2723,98 +2921,8 @@ export function ConsolePane() {
           </div>
         ) : (
         <div ref={gridRef} className="dsh-wt_consoleGrid" style={{ ['--wt-cols' as any]: effectiveCols, ...(cols === 0 ? { maxWidth: '100%' } : {}) }}>
-        {shownCards.map((c) => (
-          <div
-            key={c.id}
-            data-flip={c.id}
-            role={c.self ? undefined : 'button'}
-            tabIndex={c.self ? -1 : 0}
-            className={'dsh-wt_consoleCard' + (c.self ? ' dsh-wt_consoleCardSelf' : '')
-              + (c.temp ? ' dsh-wt_consoleCard-temp' : '')
-              + (c.status === 'busy' ? ' dsh-wt_consoleCard-busy' : '')
-              + (c.status === 'error' ? ' dsh-wt_consoleCard-error' : '')
-              + (c.glow && c.status === 'done' ? ' dsh-wt_consoleCard-glowDone' : '')
-              + (c.glow && c.status === 'need' ? ' dsh-wt_consoleCard-glowNeed' : '')}
-            title={c.temp ? T('console.tempCardTip') + ' · ' + c.name : c.name}
-            onClick={() => {
-              if (c.self || !env) return
-              if (c.glow) env.onAck?.(c.id) // 点发光卡片：先确认熄光，再进入
-              env.onOpen(c.id)
-            }}
-          >
-            <div className="dsh-wt_consoleCardHead">
-              {/* 图标只是标识，不再是按钮：换图标统一走「控制室下方工具条 → 项目管理 → 更换图标」 */}
-              <span className="dsh-wt_consoleIcon" aria-hidden>{c.icon}</span>
-              <span className="dsh-wt_consoleName">{c.name}</span>
-              {c.count != null && c.count > 0 && (
-                <span className="dsh-wt_consoleCount" title={T('console.tempCountTip', { n: String(c.count) })}>{c.count}</span>
-              )}
-            </div>
-            <div className="dsh-wt_consoleDivider" aria-hidden />
-            <div className="dsh-wt_consoleStatusRow">
-              <span className={'dsh-wt_consoleStatus dsh-wt_consoleStatus-' + c.status}>{statusLabel[c.status]}</span>
-              {c.runtimeMs != null && <ConsoleRuntime value={c.runtimeMs} />}
-            </div>
-            {(c.status === 'busy' || c.status === 'error' || (c.glow && c.status === 'need')) && <span className="dsh-wt_consoleSweep" aria-hidden />}
-            <div className={'dsh-wt_consolePreview' + (c.preview ? '' : ' dsh-wt_consolePreviewNone') + (c.live ? ' dsh-wt_consolePreviewLive' : '')} title={c.preview}>
-              {c.preview || (c.bound ? T('console.noPreview') : T('console.unboundShort'))}
-              {c.live && c.preview ? <span className="dsh-wt_consoleCaret" aria-hidden>▍</span> : null}
-            </div>
-            {/* 卡片底部操作行：两个醒目的一键新建（对话 / 电脑操作），下面「会话列表」 */}
-            <div className="dsh-wt_consoleCardOps">
-              {c.canNewSession && (
-                <>
-                  <button
-                    type="button"
-                    className="dsh-wt_consoleOpBtn dsh-wt_consoleOpBtnNew"
-                    title={T('console.newStandardTip')}
-                    aria-label={T('console.newStandard')}
-                    onClick={(e) => { e.stopPropagation(); if (splitEnv?.console?.onCreateSession) openNewSessionPanel(c, 'standard'); else env?.onNewSession?.(c.id) }}
-                  >
-                    <span className="dsh-wt_consoleOpMain">
-                      <svg width="13" height="13" viewBox="0 0 16 16" aria-hidden>
-                        <circle cx="8" cy="8" r="7" fill="currentColor" opacity=".16" />
-                        <path d="M8 4.5v7M4.5 8h7" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" />
-                      </svg>
-                      <span>{T('console.newShort')}</span>
-                    </span>
-                    <span className="dsh-wt_consoleOpSub">{T('console.newStandardShort')}</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="dsh-wt_consoleOpBtn dsh-wt_consoleOpBtnNew dsh-wt_consoleOpBtnCu"
-                    title={T('console.newComputerUseTip')}
-                    aria-label={T('console.newComputerUse')}
-                    onClick={(e) => { e.stopPropagation(); if (splitEnv?.console?.onCreateSession) openNewSessionPanel(c, 'computer-use'); else env?.onNewSession?.(c.id) }}
-                  >
-                    <span className="dsh-wt_consoleOpMain">
-                      <svg width="13" height="13" viewBox="0 0 16 16" aria-hidden>
-                        <circle cx="8" cy="8" r="7" fill="currentColor" opacity=".16" />
-                        <path d="M8 4.5v7M4.5 8h7" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" />
-                      </svg>
-                      <span>{T('console.newShort')}</span>
-                    </span>
-                    <span className="dsh-wt_consoleOpSub">{T('console.newComputerUseShort')}</span>
-                  </button>
-                </>
-              )}
-              <button
-                type="button"
-                className="dsh-wt_consoleOpBtn dsh-wt_consoleOpBtnFull"
-                title={T('console.sessionsTip')}
-                aria-label={T('console.sessions')}
-                onClick={(e) => { e.stopPropagation(); openSessionList(e.currentTarget as HTMLElement, c) }}
-              >
-                <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
-                  <path d="M5.6 4.3h7.1M5.6 8h7.1M5.6 11.7h7.1" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-                  <circle cx="3.1" cy="4.3" r="0.95" fill="currentColor" />
-                  <circle cx="3.1" cy="8" r="0.95" fill="currentColor" />
-                  <circle cx="3.1" cy="11.7" r="0.95" fill="currentColor" />
-                </svg>
-                <span>{T('console.sessions')}</span>
-              </button>
-            </div>
-          </div>
+        {shownCards.slice(0, mountCount).map((c) => (
+          <ConsoleCard key={c.id} c={c} canCreate={canCreateCard} handlers={cardHandlers} />
         ))}
         {/* 创建卡片：永远最后一位；点击 = 侧栏工作台「添加项目」同款流程 */}
         <div
@@ -2848,13 +2956,13 @@ export function ConsolePane() {
                   {T('console.dismissFinished')}
                 </button>
               )}
-              <span className="dsh-wt_sessCount">{sessPop.items.filter((i) => sessShowArchived || !i.archived).length}</span>
+              <span className="dsh-wt_sessCount">{sessVisibleRows.length}</span>
             </div>
-            {sessPop.items.filter((i) => sessShowArchived || !i.archived).length === 0 ? (
+            {sessVisibleRows.length === 0 ? (
               <div className="dsh-wt_sessEmpty">{sessPop.transient ? T('console.transientEmpty') : T('console.sessionsEmpty')}</div>
             ) : (
               <div className="dsh-wt_sessList">
-                {sessPop.items.filter((i) => sessShowArchived || !i.archived).map((s) => (
+                {sessVisibleRows.map((s) => (
                   <div
                     key={s.id}
                     role="button"
@@ -2900,6 +3008,7 @@ export function ConsolePane() {
                       <span className="dsh-wt_sessName">{s.title || T('console.untitled')}</span>
                     )}
                     {s.archived && <span className="dsh-wt_sessTag">{T('console.archivedTag')}</span>}
+                    {s.blank && !s.archived && <span className="dsh-wt_sessTag">{T('console.blankTag')}</span>}
                     {s.awaiting && !s.archived && !s.running && <span className="dsh-wt_sessTag">{T('console.needTag')}</span>}
                     {s.finished && !s.archived && <span className="dsh-wt_sessTag dsh-wt_sessFinishedTag">{T('console.finishedTag')}</span>}
                     {!s.archived && <span className="dsh-wt_sessRel">{s.rel || T('console.sessionRoot')}</span>}
@@ -2965,10 +3074,35 @@ export function ConsolePane() {
                 ))}
               </div>
             )}
-            {sessPop.items.some((i) => i.archived) && (
-              <button type="button" className="dsh-wt_sessMore" onClick={() => setSessShowArchived((v) => !v)}>
-                {sessShowArchived ? T('console.hideArchived') : T('console.showArchived')} ({sessPop.items.filter((i) => i.archived).length})
-              </button>
+            {/* 底部开关按钮同一排显示（一行 chip），放不下才换行；没有任何开关时整排不渲染 */}
+            {(sessPop.items.some((i) => i.archived) || sessBlankCount > 0 || (sessArchivableCount > 0 && !sessPop.transient)) && (
+              <div className="dsh-wt_sessMoreRow">
+              {sessPop.items.some((i) => i.archived) && (
+                <button type="button" className="dsh-wt_sessMore" onClick={() => setSessShowArchived((v) => !v)}>
+                  {sessShowArchived ? T('console.hideArchived') : T('console.showArchived')} ({sessPop.items.filter((i) => i.archived).length})
+                </button>
+              )}
+              {sessBlankCount > 0 && (
+                <button type="button" className="dsh-wt_sessMore" onClick={() => setSessShowBlank((v) => !v)}>
+                  {sessShowBlank ? T('console.hideBlank') : T('console.showBlank')} ({sessBlankCount})
+                </button>
+              )}
+              {sessArchivableCount > 0 && !sessPop.transient && (
+                <button
+                  type="button"
+                  className="dsh-wt_sessMore"
+                  disabled={sessArchiveBusy}
+                  title={T('console.archiveBlanksTip')}
+                  onClick={() => { void archiveBlankFromSheet() }}
+                >
+                  {sessArchiveBusy
+                    ? T('console.archiveBlanksRunning')
+                    : sessArchiveConfirm
+                      ? T('console.archiveBlanksConfirm') + ' (' + sessArchivableCount + ')'
+                      : T('console.archiveBlanks') + ' (' + sessArchivableCount + ')'}
+                </button>
+              )}
+              </div>
             )}
             {sessPop.transient && (
               <div className="dsh-wt_sessHint">{T('console.transientHint')}</div>

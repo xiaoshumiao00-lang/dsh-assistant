@@ -13,9 +13,36 @@
  *   - 排除没有 cwd 的会话（宿主没给目录 → 无法归属）。
  */
 
+import { perfBump, perfNowMs, perfObserveMs } from './perfCounters.ts'
+
+/** normalizeFolderPath / folderKeyOf 的只读缓存。
+ *  同一个 cwd 字符串在一次卡片刷新里被反复规范化：1,000+ 会话 × 每 150 ms 一次
+ *  × 三四处调用点，三次正则替换就是手机端多会话并发时的主要重复工作量。
+ *  缓存只存纯文本映射（有上限、超限整表清掉），返回值与直接计算一字不差。 */
+const NORMALIZE_CACHE_MAX = 4096
+const normalizedCache = new Map<string, string>()
+const folderKeyCache = new Map<string, string>()
+
 /** 规范化路径：去首尾空白、反斜杠→斜杠、去尾部斜杠 */
 export function normalizeFolderPath(path: unknown): string {
-  return String(path ?? '').trim().replace(/\\/g, '/').replace(/\/+$/, '')
+  const raw = typeof path === 'string' ? path : String(path ?? '')
+  const hit = normalizedCache.get(raw)
+  if (hit !== undefined) return hit
+  const value = raw.trim().replace(/\\/g, '/').replace(/\/+$/, '')
+  if (normalizedCache.size >= NORMALIZE_CACHE_MAX) normalizedCache.clear()
+  normalizedCache.set(raw, value)
+  return value
+}
+
+/** 目录的比对键（规范化 + 小写）：与 normalizeFolderPath 同一口径，只做小写那一步。 */
+export function folderKeyOf(path: unknown): string {
+  const raw = typeof path === 'string' ? path : String(path ?? '')
+  const hit = folderKeyCache.get(raw)
+  if (hit !== undefined) return hit
+  const key = normalizeFolderPath(raw).toLowerCase()
+  if (folderKeyCache.size >= NORMALIZE_CACHE_MAX) folderKeyCache.clear()
+  folderKeyCache.set(raw, key)
+  return key
 }
 
 /**
@@ -26,18 +53,16 @@ export function normalizeFolderPath(path: unknown): string {
  * @returns 归属该目录的会话 id
  */
 export function sessionsUnderFolder(ids: readonly string[], byId: Record<string, any> | null | undefined, base: string): string[] {
-  const baseN = normalizeFolderPath(base)
-  if (!baseN) return []
-  const baseKey = baseN.toLowerCase()
+  const baseKey = folderKeyOf(base)
+  if (!baseKey) return []
   const out: string[] = []
   const table = byId ?? {}
   for (const sid of ids ?? []) {
     const e = table[sid]
     if (!e) continue
     if (e.parentId || e.origin === 'subagent') continue
-    const cwd = normalizeFolderPath(e.cwd)
-    if (!cwd) continue
-    const key = cwd.toLowerCase()
+    const key = folderKeyOf(e.cwd)
+    if (!key) continue
     if (key !== baseKey && !key.startsWith(baseKey + '/')) continue
     out.push(sid)
   }
@@ -71,27 +96,36 @@ export function unownedSessionIds(
   const table = byId ?? {}
   const ownedSet = new Set(owned)
   const archivedSet = new Set(archived)
-  const folderKeys: string[] = []
+  // 项目目录键集合：原来「每条会话 × 每个目录各做一次前缀比较」＝O(会话数 × 目录数)；
+  // 1,000+ 会话、十几个目录时每刷一次卡片就是几十万次字符串比较。
+  // 改成「沿会话自己的祖先链查集合」＝O(会话数 × 路径深度)，判定结果一字不变。
+  const folderKeys = new Set<string>()
   for (const folder of folders ?? []) {
-    const key = normalizeFolderPath(folder).toLowerCase()
-    if (key) folderKeys.push(key)
+    const key = folderKeyOf(folder)
+    if (key) folderKeys.add(key)
+  }
+  const ownedByAnyFolder = (key: string): boolean => {
+    if (key === '') return false
+    if (folderKeys.has(key)) return true
+    for (let end = key.lastIndexOf('/'); end > 0; end = key.lastIndexOf('/', end - 1)) {
+      if (folderKeys.has(key.slice(0, end))) return true
+    }
+    return false
   }
   const out: string[] = []
+  const startedAt = perfNowMs()
   for (const sid of ids ?? []) {
     const e = table[sid]
     if (!e) continue
     if (e.parentId || e.origin === 'subagent') continue
     if (ownedSet.has(sid) || archivedSet.has(sid)) continue
-    const cwd = normalizeFolderPath(e.cwd)
-    if (!cwd) continue
-    const key = cwd.toLowerCase()
-    let ownedByFolder = false
-    for (const base of folderKeys) {
-      if (key === base || key.startsWith(base + '/')) { ownedByFolder = true; break }
-    }
-    if (ownedByFolder) continue
+    const key = folderKeyOf(e.cwd)
+    if (!key) continue
+    if (ownedByAnyFolder(key)) continue
     out.push(sid)
   }
+  perfBump('unowned')
+  perfObserveMs('unowned', perfNowMs() - startedAt)
   return out
 }
 
@@ -158,4 +192,73 @@ export function transientVisibility(input: TransientVisibilityInput): TransientV
   }
   // 结束（完成 / 异常）后一直保留，直到用户手动收工；不再按时间自动消失
   return { show: input.done || input.error, finished: true, finishedAt }
+}
+
+/**
+ * 会话列表浮层的可见性（纯函数，可单测）。
+ *
+ * 「空白会话」= 一条消息都没有的裸会话。它们是被建出来就没用上的那些：
+ *   - 悬浮球/快捷键的一次唤起会广播给所有在等的页面（宿主 assistant.ts 的 wakeClickWaiters），
+ *     每个客户端各建一条；
+ *   - 助手入口每次进都是「新开会话」，同目录同模式才复用；模式对不上就一直新建。
+ * 于是列表里攒出一串标题只有目录名的「assistant」行（实测 ~/.dsh/assistant 下 102 条里一大半是空白）。
+ * 默认藏起来（不删、不归档，开关一开就看得见）；当前正在看的那条空白会话照常保留，
+ * 否则高亮/目标条会指到一行不存在会话。
+ */
+export type SessionListVisibilityInput = {
+  /** 显示已归档行 */
+  showArchived: boolean
+  /** 显示空白会话行 */
+  showBlank: boolean
+}
+
+export type SessionRowVisibilityRow = {
+  blank: boolean
+  archived?: boolean
+  /** 宿主当前会话（即使空白也保留） */
+  current?: boolean
+}
+
+export function sessionRowVisible(row: SessionRowVisibilityRow, opts: SessionListVisibilityInput): boolean {
+  // 归档行的可见性只由「显示已归档」决定（底部的归档计数就是这条口径）
+  if (row.archived === true) return opts.showArchived
+  if (row.blank && !opts.showBlank && row.current !== true) return false
+  return true
+}
+
+/** 就地过滤：保持入参顺序（入参已由调用方排好序）。 */
+export function sessionRowsVisible<T extends SessionRowVisibilityRow>(rows: readonly T[], opts: SessionListVisibilityInput): T[] {
+  return rows.filter((row) => sessionRowVisible(row, opts))
+}
+
+/**
+ * 宿主没有 `blank` 投影时的兜底判据：标题还没生成（空 / 就是会话 id / 就是目录末段名），
+ * 且不在跑、没置顶、没归档。有内容的会话必有真标题，不会误判。
+ */
+export function looksBlankWithoutFlag(row: {
+  title?: string
+  id?: string
+  cwd?: string
+  running?: boolean
+  pinned?: boolean
+  archived?: boolean
+}): boolean {
+  if (row.running === true || row.pinned === true || row.archived === true) return false
+  const title = String(row.title ?? '').trim()
+  if (!title) return true
+  const id = String(row.id ?? '').trim()
+  if (id && (title === id || title.startsWith(id))) return true
+  const leaf = normalizeFolderPath(row.cwd).split('/').pop() ?? ''
+  return leaf !== '' && title.toLowerCase() === leaf.toLowerCase()
+}
+
+/**
+ * 「一键归档空白会话」的可归档行（与浮层的显示口径共用同一套判据）：
+ * 空白、没归档、没置顶、没在跑、不是当前会话。归档可逆（宿主工作区归档，磁盘日志保留）。
+ */
+export function archivableBlankRows<T extends SessionRowVisibilityRow & {
+  pinned?: boolean
+  running?: boolean
+}>(rows: readonly T[]): T[] {
+  return rows.filter((row) => row.blank && row.archived !== true && row.pinned !== true && row.running !== true && row.current !== true)
 }

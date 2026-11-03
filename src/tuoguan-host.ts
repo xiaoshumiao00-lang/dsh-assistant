@@ -1,9 +1,20 @@
 /**
- * dsh-tuoguan host 端入口：托管状态的**唯一真值源** + HTTP 路由。
+ * dsh-tuoguan host 端入口：托管状态的**唯一真值源** + HTTP 路由 + 输出截断自动续写。
  *
  * 为什么要 host 端：手机浏览器和电脑浏览器各有各的 localStorage，
  * 状态只存在客户端时两端永远不可能同步（这就是之前那个 bug 的根因）。
  * 现在真值落在 profile 目录下的一个 JSON 文件里，两端都通过同源 HTTP 读写它。
+ *
+ * 自动续写（2026-11）：模型单次输出撞到输出 token 上限时，界面显示
+ * 「已达到输出 token 上限 / 回答被截断…发送“继续”可让模型接着输出」，
+ * 对应的会话事件是 `turn/end { reason: { kind: 'max-tokens' } }`。
+ * 托管本来就是无人值守，所以这里在宿主直接替用户补一条「继续」
+ * （判定链、上限与去重见 `src/tuoguan-autocontinue.ts`）。
+ *
+ * 决策自动应答（2026-11，`src/tuoguan-autoanswer.ts`）：提问与审批也改成宿主侧作答。
+ * 以前这条链在客户端 composer 上，只有把那个会话点开、卡片渲染出来才会被 settle，
+ * 会话留在控制室列表里就一直等。现在宿主抢先接 `approval/request` 与
+ * `user-questions/request`，托管开着就直接给默认答案，与页面开不开无关。
  *
  * 路由（做法照抄 dsh-orb / dsh-worktable：注册在宿主 web 端口的前缀路由上，
  * 浏览器用相对路径 fetch，同源 + 既有登录 cookie 即可，无需额外鉴权字段）：
@@ -32,6 +43,8 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { installAutoContinue, tuoguanStateIsOn } from './tuoguan-autocontinue'
+import { installAutoAnswer } from './tuoguan-autoanswer'
 
 export const name = 'dsh-assistant-tuoguan'
 
@@ -179,11 +192,9 @@ class TuoguanStore {
     return this.enqueue(() => readStateSync(this.file))
   }
 
-  /** 某会话的当前有效状态：显式记录优先，否则用默认值。 */
+  /** 某会话的当前有效状态：显式记录优先，否则用默认值（与自动续写共用同一套判定）。 */
   private effective(state: TuoguanState, sessionId: string): boolean {
-    if (state.off[sessionId] === true) return false
-    if (state.on[sessionId] === true) return true
-    return state.defaultOn
+    return tuoguanStateIsOn(state, sessionId)
   }
 
   /**
@@ -373,22 +384,64 @@ function registerTuoguanRoutes(ctx: any, store: TuoguanStore): () => void {
 
 /* ---------- 插件体 ---------- */
 
+/** 一条宿主日志：不改任何状态，写不出去也不该让插件启动失败。 */
+function hostLog(message: string): void {
+  try { console.error(`dsh-assistant: ${message}`) } catch { /* 控制台被接管时静默 */ }
+}
+
 /**
- * 注册托管状态路由。宿主在 desktop / web profile 下都提供 `webServer`；
- * 拿不到时降级为纯客户端插件（旧行为），不抛错、不阻塞其它插件。
+ * 挂上「输出截断自动续写」：托管开着时，`turn/end` 的 reason 是 max-tokens
+ * （聊天里那条「已达到输出 token 上限…发送“继续”」）就替用户补一条「继续」。
+ * 它不依赖 webServer，所以路由挂不上也照样启用；失败只记日志，不影响托管开关本身。
+ */
+function installAutoContinueFor(ctx: any, store: TuoguanStore): () => void {
+  try {
+    return installAutoContinue(ctx, {
+      readState: () => store.read(),
+      log: hostLog,
+    })
+  } catch (error) {
+    hostLog(`托管自动续写启用失败：${String((error as Error)?.message ?? error)}`)
+    return () => void 0
+  }
+}
+
+/**
+ * 挂上「决策自动应答」：托管开着时，宿主直接给审批 / 提问一个默认答案，
+ * 不再依赖「浏览器把那个会话打开」这一步。它同样不依赖 webServer。
+ */
+function installAutoAnswerFor(ctx: any, store: TuoguanStore): () => void {
+  try {
+    return installAutoAnswer(ctx, {
+      readState: () => store.read(),
+      log: hostLog,
+    })
+  } catch (error) {
+    hostLog(`托管决策自动应答启用失败：${String((error as Error)?.message ?? error)}`)
+    return () => void 0
+  }
+}
+
+/**
+ * 注册托管状态路由 + 自动续写 + 决策自动应答。宿主在 desktop / web profile 下都提供
+ * `webServer`；拿不到时降级为纯客户端插件（旧行为），不抛错、不阻塞其它插件。
  */
 export function apply(ctx: any): void {
   const directory = profileDirectory(ctx)
   const store = new TuoguanStore(join(directory, STATE_FILENAME))
-  console.error(`dsh-assistant: 托管状态文件 ${store.file}`)
+  hostLog(`托管状态文件 ${store.file}`)
   const effect = typeof ctx?.effect === 'function' ? ctx.effect : void 0
   if (effect === void 0) {
     registerTuoguanRoutes(ctx, store)
+    installAutoContinueFor(ctx, store)
+    installAutoAnswerFor(ctx, store)
     return
   }
   effect(() => {
     const detach = registerTuoguanRoutes(ctx, store)
-    console.error(`dsh-assistant: 已挂载托管路由 GET/POST ${STATE_ROUTE}`)
-    return () => { detach() }
+    const detachAutoContinue = installAutoContinueFor(ctx, store)
+    const detachAutoAnswer = installAutoAnswerFor(ctx, store)
+    hostLog(`已挂载托管路由 GET/POST ${STATE_ROUTE}`)
+    return () => { detachAutoAnswer(); detachAutoContinue(); detach() }
   })
 }

@@ -319,8 +319,10 @@ export function mobileApply(ctx): void {
       }
     },
     // 开抽屉的实测延迟上报（点击 → 真的开始滑）：诊断包里看得见，别只凭猜判断卡顿来源。
+    // src：这次是按钮（btn）、左上角命中区（zone）还是边缘滑动（swipe）开的 ——
+    // 下次再有"点不进去"，流水里一眼看出点到底有没有到达。
     onMeasure: (info) => {
-      reportMobileStage('drawer-open', { ms: info.ms, up: info.upgrade === true })
+      reportMobileStage('drawer-open', { ms: info.ms, up: info.upgrade === true, src: info.src ?? 'btn' })
     },
   }), 'dsh-mobile-nav: drawer chrome')
 

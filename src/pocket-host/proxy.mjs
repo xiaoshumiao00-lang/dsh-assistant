@@ -1331,6 +1331,8 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
     let wsBytesIn = 0;
     let wsBytesOut = 0;
     let wsCloseReason = '';
+    /** P0-1：下行分道队列的计数（只有走 deflate 通道时才有）。 */
+    let wsQueueStats = null;
     const logWsClose = () => {
       if (!wsOpened || wsLogged) return;
       wsLogged = true;
@@ -1345,6 +1347,7 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
         bytesIn: wsBytesIn,
         bytesOut: wsBytesOut,
         reason: wsCloseReason || 'unknown',
+        ...(typeof wsQueueStats === 'function' ? { queue: wsQueueStats() } : {}),
       });
     };
 
@@ -1392,6 +1395,7 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
           onFailure: noteWsDeflateFailure,
           onError: (err) => log?.(`dsh-pocket: ws-deflate failed: ${err?.message ?? err}`),
         });
+        wsQueueStats = () => wsDef.stats().queue;
         socket.on('close', () => { try { wsDef.close(); } catch {} });
         proxySocket.on('close', () => { try { wsDef.close(); } catch {} });
       } else {

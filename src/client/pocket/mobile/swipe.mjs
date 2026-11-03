@@ -18,6 +18,95 @@ export const SWIPE_EDGE_ZONE = 28
 /** 判定为一次抽屉手势所需的最小横向位移。 */
 export const SWIPE_MIN_DX = 56
 
+/*
+ * 汉堡钮的「命中区」—— 手机上点左上角那三条横线点不进去（2026-11-03 用户反馈）。
+ * 按钮本体只有 28px，图标更小（15×10），还贴着屏幕左上角；手指落点普遍偏低/偏右
+ * 十几像素，落在按钮盒子外面就是"点了没反应"，于是要连点好几次。这里把判定从
+ * 「点中了按钮元素」改成「落点在按钮外扩一圈的矩形里」：指针路径（pointerdown/up）
+ * 直接算坐标，不依赖 click 是否被合成、也不依赖哪个元素在最上面。
+ */
+
+/** 命中区在按钮本体外扩的像素（左/上更宽：拇指最容易落在左上角外侧）。 */
+export const TOGGLE_ZONE_PAD_X = 6
+export const TOGGLE_ZONE_PAD_Y = 6
+/** 下沿只外扩 2px：紧挨着下面就是会话页的「对话 / 轨迹」标签条，别抢它们的点击。 */
+export const TOGGLE_ZONE_PAD_BOTTOM = 2
+
+/** 仍算"点一下"的最大位移（超过就是滑动 / 拖拽，不触发抽屉）。 */
+export const TOGGLE_TAP_MAX_MOVE = 14
+
+/** 仍算"点一下"的最长按压（毫秒）；长按多半是选择/菜单意图。 */
+export const TOGGLE_TAP_MAX_MS = 800
+
+/**
+ * 由按钮的矩形算出命中区（已裁掉屏幕外侧的负数部分）。
+ * @param {{left: number, top: number, width: number, height: number} | null | undefined} rect - getBoundingClientRect()。
+ * @param {{padX?: number, padY?: number, padBottom?: number}} [options]
+ * @returns {{x0: number, x1: number, y0: number, y1: number} | null} 矩形无效时返回 null。
+ */
+export function toggleHitZone(rect, { padX = TOGGLE_ZONE_PAD_X, padY = TOGGLE_ZONE_PAD_Y, padBottom = TOGGLE_ZONE_PAD_BOTTOM } = {}) {
+  const left = Number(rect?.left)
+  const top = Number(rect?.top)
+  const width = Number(rect?.width)
+  const height = Number(rect?.height)
+  if (![left, top, width, height].every((v) => Number.isFinite(v))) return null
+  if (width <= 0 || height <= 0) return null
+  return {
+    x0: Math.max(0, left - padX),
+    x1: left + width + padX,
+    y0: Math.max(0, top - padY),
+    y1: top + height + padBottom,
+  }
+}
+
+/**
+ * 坐标是否落在命中区内。
+ * @param {{x: number, y: number}} point
+ * @param {{x0: number, x1: number, y0: number, y1: number} | null} zone
+ * @returns {boolean}
+ */
+export function isInToggleZone(point, zone) {
+  if (zone == null) return false
+  const x = Number(point?.x)
+  const y = Number(point?.y)
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return false
+  return x >= Math.min(zone.x0, zone.x1) && x <= Math.max(zone.x0, zone.x1)
+    && y >= Math.min(zone.y0, zone.y1) && y <= Math.max(zone.y0, zone.y1)
+}
+
+/**
+ * 一次指针按下→抬起是否算"点了汉堡钮"。
+ * @param {object} tap
+ * @param {number} tap.startX - 按下点。
+ * @param {number} tap.startY
+ * @param {number} tap.endX - 抬起点。
+ * @param {number} tap.endY
+ * @param {{x0: number, x1: number, y0: number, y1: number} | null} tap.zone - 命中区。
+ * @param {number} [tap.elapsedMs] - 按下到抬起的毫秒数。
+ * @param {number} [tap.maxMove] - 允许的位移。
+ * @param {number} [tap.maxMs] - 允许的时长。
+ * @returns {boolean}
+ */
+export function classifyToggleTap({
+  startX,
+  startY,
+  endX,
+  endY,
+  zone,
+  elapsedMs = 0,
+  maxMove = TOGGLE_TAP_MAX_MOVE,
+  maxMs = TOGGLE_TAP_MAX_MS,
+} = {}) {
+  const sx = Number(startX)
+  const sy = Number(startY)
+  const ex = Number(endX)
+  const ey = Number(endY)
+  if (![sx, sy, ex, ey].every((v) => Number.isFinite(v))) return false
+  if (Number(elapsedMs) > maxMs) return false
+  if (Math.hypot(ex - sx, ey - sy) > maxMove) return false
+  return isInToggleZone({ x: sx, y: sy }, zone) && isInToggleZone({ x: ex, y: ey }, zone)
+}
+
 /** 横向位移必须超过纵向位移的这个倍数，否则算纵向滚动。 */
 export const SWIPE_MIN_RATIO = 1.5
 

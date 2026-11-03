@@ -1,6 +1,6 @@
 /** 会话活跃度排序与「点卡片进入哪条会话」回归：node scripts/test-session-rank.mjs */
 import assert from 'node:assert/strict'
-import { sessionTierOf, sortSessionsByActivity, pickActiveSession, progressOrderOf } from '../src/client/sessionRank.ts'
+import { sessionTierOf, sessionLastAt, sortSessionsByActivity, pickActiveSession, pickLatestSession, pickEnterSession, progressOrderOf } from '../src/client/sessionRank.ts'
 
 const cases = []
 
@@ -118,6 +118,164 @@ cases.push(['没有进行中的会话时从绑定会话起头；kidsOf 省掉也
   assert.deepEqual(progressOrderOf({ enteredPick: null, bound: 'B', steps: [], candidates: ['C'] }), ['B', 'C'])
   assert.deepEqual(progressOrderOf({ enteredPick: 'A' }), ['A'])
   assert.deepEqual(progressOrderOf({ enteredPick: '', bound: null }), [])
+}])
+
+cases.push(['最后活动时间 = max(updatedAt, lastAt)：长任务跑完那一刻宿主 updatedAt 不前进', () => {
+  // 宿主的 updatedAt 只有人工提示才前进；一轮跑了很久才结束时它还是很早的值。
+  assert.equal(sessionLastAt({ updatedAt: 100, lastAt: 900 }), 900)
+  assert.equal(sessionLastAt({ updatedAt: 900 }), 900)
+  assert.equal(sessionLastAt({ updatedAt: 900, lastAt: 100 }), 900)
+  assert.equal(sessionLastAt({}), 0)
+}])
+
+cases.push(['任务全部完成：进入「最后跑完」的那条，而不是「提示词更晚、其实更早结束」的旧会话', () => {
+  // 复刻用户报的场景：A 10:00 发提示、跑了很久 22:00 才结束（updatedAt 仍 10:00）；
+  // B 11:00 发过一句、11:05 就结束了（updatedAt 11:00 更晚）。三条都已完成（无在跑/待决）。
+  const rows = [
+    row('justFinished', { updatedAt: 1000, lastAt: 2200 }),
+    row('olderChat', { updatedAt: 1100, lastAt: 1105 }),
+  ]
+  assert.equal(pickEnterSession(rows)?.id, 'justFinished', '应按真实活动时间')
+  assert.deepEqual(sortSessionsByActivity(rows).map((r) => r.id), ['justFinished', 'olderChat'])
+}])
+
+cases.push(['点卡片不抬置顶：很早以前置顶的旧会话不许压住刚跑完的那条', () => {
+  const rows = [
+    row('pinnedOld', { updatedAt: 100, lastAt: 100, pinned: true }),
+    row('justFinished', { updatedAt: 500, lastAt: 900 }),
+  ]
+  assert.equal(pickLatestSession(rows)?.id, 'justFinished', '进入判定按最后活动')
+  assert.equal(pickEnterSession(rows)?.id, 'justFinished')
+  // 「会话列表」浮层仍按置顶排第一（那是列表位置，不是进入判定）
+  assert.equal(sortSessionsByActivity(rows)[0].id, 'pinnedOld')
+}])
+
+cases.push(['进入判定：有进行中的会话时仍按「待决 > 在跑」，空闲新旧不参与比较', () => {
+  const rows = [
+    row('idleFresh', { updatedAt: 5000, lastAt: 5000 }),
+    row('running', { updatedAt: 1000, lastAt: 1200, running: true }),
+  ]
+  assert.equal(pickEnterSession(rows)?.id, 'running')
+  const withNeed = [...rows, row('need', { updatedAt: 10, lastAt: 10, awaiting: true })]
+  assert.equal(pickEnterSession(withNeed)?.id, 'need')
+}])
+
+cases.push(['一条可用会话都没有时 pickEnterSession 返回 null（调用方走模板步骤 / 绑定兜底）', () => {
+  assert.equal(pickEnterSession([]), null)
+  assert.equal(pickLatestSession([]), null)
+  assert.equal(pickEnterSession([row('arched', { updatedAt: 999, archived: true })]), null, '归档的不参与进入判定')
+  // 当前会话不在活跃档时不影响空闲兜底
+  assert.equal(pickEnterSession([row('a', { updatedAt: 10, lastAt: 10 }), row('b', { updatedAt: 20 })], 'a')?.id, 'b')
+}])
+
+/** 参考实现：旧版「比较器里现算」的写法，原样留在这里当对照（顺序必须逐条一致）。 */
+function referenceSort(rows, options = {}) {
+  const pinnedFirst = options.pinnedFirst !== false
+  const list = rows.slice()
+  list.sort((a, b) => {
+    if (pinnedFirst && !!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1
+    const tier = sessionTierOf(a) - sessionTierOf(b)
+    if (tier) return tier
+    const at = sessionLastAt(b) - sessionLastAt(a)
+    if (at) return at
+    const relA = a.rel ?? ''
+    const relB = b.rel ?? ''
+    if (relA !== relB) return relA < relB ? -1 : 1
+    return String(a.id).localeCompare(String(b.id))
+  })
+  return list
+}
+
+/** 参考实现：旧版「includes 判重」的进度顺序。 */
+function referenceProgressOrder(options) {
+  const order = []
+  const push = (value) => {
+    if (typeof value === 'string' && value !== '' && !order.includes(value)) order.push(value)
+  }
+  if (options.enteredPick !== null) {
+    push(options.enteredPick)
+    if (options.kidsOf !== undefined) for (const kid of options.kidsOf(options.enteredPick)) push(kid)
+  }
+  push(options.bound)
+  for (const sid of options.steps ?? []) push(sid)
+  for (const sid of options.candidates ?? []) push(sid)
+  return order
+}
+
+cases.push(['排序与旧实现逐条等价（200 条混合：置顶 / 各档 / lastAt 交错 / 同 rel / 同名 id）', () => {
+  // 固定种子的伪随机：可复现，不是每次跑都不一样
+  let seed = 20261103
+  const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+  const pick = (list) => list[Math.floor(rnd() * list.length) % list.length]
+  const ids = ['a', 'A', 'b10', 'b9', '会话', 'x-1', 'x-10', 'x-2']
+  const rels = [undefined, '', '01', '02', '10', 'A', 'a']
+  const rows = []
+  for (let i = 0; i < 200; i += 1) {
+    rows.push({
+      id: `${pick(ids)}-${i % 7}`,
+      updatedAt: pick([0, 100, 200, 300, 1000]),
+      lastAt: pick([0, 50, 150, 400, 900]),
+      awaiting: rnd() < 0.12,
+      running: rnd() < 0.2,
+      error: rnd() < 0.1,
+      pinned: rnd() < 0.15,
+      archived: rnd() < 0.05,
+      rel: pick(rels),
+    })
+  }
+  const expected = referenceSort(rows).map((r) => r.id + '|' + (r.rel ?? ''))
+  const actual = sortSessionsByActivity(rows).map((r) => r.id + '|' + (r.rel ?? ''))
+  assert.deepEqual(actual, expected, '排序结果必须与旧实现完全一致')
+  const expectedNoPin = referenceSort(rows, { pinnedFirst: false }).map((r) => r.id)
+  const actualNoPin = sortSessionsByActivity(rows, { pinnedFirst: false }).map((r) => r.id)
+  assert.deepEqual(actualNoPin, expectedNoPin, '不抬置顶时也要一致')
+}])
+
+cases.push(['排序键每行只算一次（不再在比较器里重复读 updatedAt / lastAt）', () => {
+  const meta = []
+  const rows = Array.from({ length: 60 }, (_, i) => {
+    const counts = { updatedAt: 0, lastAt: 0 }
+    meta.push(counts)
+    const target = {
+      id: `s${i}`,
+      updatedAt: i * 10,
+      lastAt: i % 3 === 0 ? i * 30 : 0,
+      running: i % 4 === 0,
+      error: i % 7 === 0,
+      pinned: i % 11 === 0,
+      rel: i % 5 === 0 ? '01' : '',
+    }
+    return new Proxy(target, {
+      get(obj, prop) {
+        if (prop === 'updatedAt' || prop === 'lastAt') counts[prop] += 1
+        return obj[prop]
+      },
+    })
+  })
+  sortSessionsByActivity(rows)
+  const worst = Math.max(...meta.map((c) => c.updatedAt + c.lastAt))
+  assert.ok(worst <= 4, `每行最多读 4 次（新实现 = 1 次 updatedAt + 1 次 lastAt），实测 ${worst}`)
+}])
+
+cases.push(['进度顺序去重与旧实现一致（重复 id 散布在子代理 / 绑定 / 步骤 / 候选里）', () => {
+  const casesIn = [
+    { enteredPick: 'a', kidsOf: () => ['a', 'k1', 'k1', ''], bound: 'a', steps: ['s1', 'a', 's1'], candidates: ['c1', 'k1', 'c1', '', 's2'] },
+    { enteredPick: null, kidsOf: () => ['x'], bound: null, steps: [], candidates: ['y', 'z', 'y'] },
+    { enteredPick: '', bound: '', steps: ['', ''], candidates: [] },
+  ]
+  for (const input of casesIn) {
+    assert.deepEqual(progressOrderOf(input), referenceProgressOrder(input))
+  }
+  // 规模版：2,000 候选 + 500 重复（旧的 includes 写法在手机上是 O(n²)，这里只验证结果一致）
+  const big = []
+  for (let i = 0; i < 2000; i += 1) big.push(`s${i}`)
+  for (let i = 0; i < 500; i += 1) big.push(`s${i}`)
+  const args = { enteredPick: 's0', kidsOf: () => ['s1', 's1'], bound: 's2', steps: ['s3', 's0'], candidates: big }
+  const expected = referenceProgressOrder(args)
+  const actual = progressOrderOf(args)
+  assert.deepEqual(actual, expected)
+  assert.equal(actual.length, 2000, '去重后应等于候选并集（2,000 条）')
+  assert.equal(new Set(actual).size, actual.length, '没有重复')
 }])
 
 let failed = 0

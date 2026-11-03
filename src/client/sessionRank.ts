@@ -1,6 +1,10 @@
 /**
  * 会话「活跃度」排序：控制室卡片的「会话列表」浮层与「点卡片进入哪条会话」共用同一套判定。
- * 纯函数（不读宿主状态）——调用方负责把 awaiting / running / error 算准，所以能离线单测。
+ * 纯函数（不读宿主状态）——调用方负责把 awaiting / running / error / lastAt 算准，所以能离线单测。
+ *
+ * 为什么要有 `lastAt`：宿主的 updatedAt 是 `max(createdAt, 最后一次人工提示)`，长任务跑完那一刻
+ * 不会前进。只看 updatedAt 会出现「点卡片进了一条提示词更晚、其实早就结束的旧会话」，
+ * 或者「模板流程全部做完后卡片永远钉在最后一个步骤会话上」。排序因此按 max(updatedAt, lastAt)。
  */
 
 /** 活跃度档：等待决策(0) > 正在跑(1) > 异常终止(2) > 其余（刚结束 / 空闲）(3) > 已归档(4) */
@@ -10,8 +14,10 @@ export type SessionTier = (typeof SESSION_TIERS)[keyof typeof SESSION_TIERS]
 /** 排序 / 挑选共用的一行会话（字段口径与宿主会话条目一致） */
 export type RankableSessionRow = {
   id: string
-  /** 宿主列表的 updatedAt = 最后一次提示词时间（不是结束时间） */
+  /** 宿主列表的 updatedAt = max(创建时间, 最后一次人工提示时间)——**不是**最后活动时间 */
   updatedAt: number
+  /** 最后真正活动过的毫秒时间戳（轮次结束 / 后台任务 / 事件窗口；取不到为 0） */
+  lastAt?: number
   /** 等你回答（pendingInteraction / 会话面 pending / 子代理待决） */
   awaiting?: boolean
   /** 此刻在跑（宿主 running 位 / 未结束的轮次） */
@@ -36,24 +42,44 @@ export function sessionTierOf(row: { awaiting?: boolean; running?: boolean; erro
 }
 
 /**
- * 统一排序：置顶 → 活跃度档 → 最近更新倒序 → 相对目录 → id。
+ * 「最后活动时间」：`updatedAt` 只在**人工提示**时前进（宿主 `list.ts` 里是
+ * `max(createdAt, lastPromptAt)`），所以「跑了很久才结束」的那一次不会让它变大——
+ * 长任务刚跑完的会话会输给「提示词更晚、其实早就结束」的另一条。排序与进入判定都必须用
+ * `max(updatedAt, lastAt)`，否则卡片会被钉在一条更旧的会话上。
+ */
+export function sessionLastAt(row: { updatedAt?: number; lastAt?: number }): number {
+  const updated = Number(row.updatedAt) || 0
+  const active = Number(row.lastAt) || 0
+  return active > updated ? active : updated
+}
+
+/**
+ * 统一排序：置顶 → 活跃度档 → 最后活动倒序 → 相对目录 → id。
  * `pinnedFirst:false` 时不抬置顶（进「正在跑」的会话不该被置顶抢先）。
  */
 export function sortSessionsByActivity<T extends RankableSessionRow>(rows: T[], options: { pinnedFirst?: boolean } = {}): T[] {
   const pinnedFirst = options.pinnedFirst !== false
-  const list = rows.slice()
-  list.sort((a, b) => {
-    if (pinnedFirst && !!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1
-    const tier = sessionTierOf(a) - sessionTierOf(b)
+  // 先算一遍排序键再排（Schwartzian）：原来比较器里每对行都要重算 tier / lastAt
+  // （含 Number() 强制转换与字符串兜底），1,000+ 会话一次排序下来是成倍的重复计算；
+  // 键的算法、比较规则都与原来逐字一致，所以顺序一字不变。
+  const decorated = rows.map((entry) => ({
+    entry,
+    pinned: entry.pinned ? 1 : 0,
+    tier: sessionTierOf(entry),
+    lastAt: sessionLastAt(entry),
+    rel: entry.rel ?? '',
+    id: String(entry.id),
+  }))
+  decorated.sort((a, b) => {
+    if (pinnedFirst && a.pinned !== b.pinned) return b.pinned - a.pinned
+    const tier = a.tier - b.tier
     if (tier) return tier
-    const at = (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0)
+    const at = b.lastAt - a.lastAt
     if (at) return at
-    const relA = a.rel ?? ''
-    const relB = b.rel ?? ''
-    if (relA !== relB) return relA < relB ? -1 : 1
-    return String(a.id).localeCompare(String(b.id))
+    if (a.rel !== b.rel) return a.rel < b.rel ? -1 : 1
+    return a.id.localeCompare(b.id)
   })
-  return list
+  return decorated.map((item) => item.entry)
 }
 
 /**
@@ -71,6 +97,29 @@ export function pickActiveSession<T extends RankableSessionRow>(rows: T[], curre
     return sortSessionsByActivity(pool, { pinnedFirst: false })[0] ?? null
   }
   return null
+}
+
+/**
+ * 点卡片时应进入的「最近活动」会话：按最后活动时间 (`sessionLastAt`) 取最新那条。
+ *
+ * **不抬置顶**：置顶只影响「会话列表」里排在哪儿，不该决定点卡片进哪条——
+ * 否则一条很早以前置顶的旧会话会永远压住刚跑完的那条（正是用户报的那个 bug）。
+ * 已归档的会话不参与（点进一条归档的旧对话没有意义）。
+ */
+export function pickLatestSession<T extends RankableSessionRow>(rows: T[]): T | null {
+  const idle = rows.filter((r) => sessionTierOf(r) !== SESSION_TIERS.archived) as T[]
+  if (idle.length === 0) return null
+  return sortSessionsByActivity(idle, { pinnedFirst: false })[0] ?? null
+}
+
+/**
+ * 「点项目卡片 = 进入哪条会话」的唯一判定：
+ *   ① 进行中的会话优先（等你回答 > 正在跑；当前会话本就在这一档则保持不变）；
+ *   ② 没有进行中的 → 最后真正活动过的那条（不是「提示词最晚」的那条）。
+ * 返回值 `null` = 该项目一条可用会话都没有（调用方去走模板步骤 / 绑定 / 新建的兜底）。
+ */
+export function pickEnterSession<T extends RankableSessionRow>(rows: T[], currentId?: string | null): T | null {
+  return pickActiveSession(rows, currentId) ?? pickLatestSession(rows)
 }
 
 /**
@@ -97,8 +146,13 @@ export function progressOrderOf(options: {
   candidates?: string[]
 }): string[] {
   const order: string[] = []
+  // 去重从 `order.includes(value)`（O(n²)，候选一多就是几十万次比较）改成「数组保序 + Set 判重」，
+  // 输出顺序与去重结果完全一致。
+  const seen = new Set<string>()
   const push = (value: string | null | undefined): void => {
-    if (typeof value === 'string' && value !== '' && !order.includes(value)) order.push(value)
+    if (typeof value !== 'string' || value === '' || seen.has(value)) return
+    seen.add(value)
+    order.push(value)
   }
   const kidsOf = options.kidsOf
   if (options.enteredPick !== null) {

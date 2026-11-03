@@ -1,8 +1,15 @@
 // 悬浮球输入区：大输入框 + / 命令弹层 + 附件菜单（手机图片/手机文件/电脑文件）+ 语音 + 发送。
 // 附件芯片语义与桌面悬浮球一致：
 //   图片 → prompt 的 image 内容块（模型可见）；文件 → 落盘/引用后正文内联 [file: 路径]。
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
+import {
+  composerHeightCap,
+  composerHeightFor,
+  createCompositionTracker,
+  shouldDeferComposerLayout,
+  shouldRemeasure,
+} from './composerPolicy.ts'
 import type { OrbModel } from './orb-api.ts'
 import type { OrbKey } from './locales.ts'
 import { MicCapture, VoiceError, audioFileToBase64 } from './voice.ts'
@@ -112,7 +119,7 @@ export interface ComposerProps {
   disabled?: boolean
 }
 
-export function Composer({
+export function ComposerImpl({
   value,
   onChange,
   chips,
@@ -329,30 +336,67 @@ export function Composer({
   // 按得快的样子：先写死高度再量 scrollHeight 就是 layout 抖动。合并成同一帧只量一次。
   const viewportHRef = useRef(0)
   const autosizeFrameRef = useRef<number | null>(null)
-  const autosize = (): void => {
+  /** 上一次测到的「内容高度 / 当时的封顶」：键盘动画中间那串 resize 不再重复强制布局。 */
+  const measuredRef = useRef<{ contentHeight: number; cap: number }>({ contentHeight: -1, cap: 0 })
+  /** 这一帧要不要强制重测（只有「内容真的变了」才需要写 auto 再读 scrollHeight）。 */
+  const autoForceRef = useRef(false)
+  /** 输入法组合态（拼音候选未上屏）：只改一个布尔，不触发渲染。 */
+  const composingRef = useRef<ReturnType<typeof createCompositionTracker> | null>(null)
+  if (composingRef.current === null) composingRef.current = createCompositionTracker()
+
+  const applyHeight = (height: number): void => {
+    const el = textareaRef.current
+    if (el === null || height <= 0) return
+    const px = `${height}px`
+    // 值没变就不写：写 style 也会走一次样式重算。
+    if (el.style.height !== px) el.style.height = px
+  }
+
+  const autosize = (force: boolean): void => {
     const el = textareaRef.current
     if (el === null) return
-    if (viewportHRef.current <= 0) viewportHRef.current = window.innerHeight
+    // 组合输入 / 页面不可见时不测量：组合中间做同步布局会让候选词上屏慢半拍。
+    if (shouldDeferComposerLayout(composingRef.current?.isComposing() === true, document.hidden)) return
+    const viewport = viewportHRef.current > 0 ? viewportHRef.current : window.innerHeight
+    const cap = composerHeightCap(viewport)
+    const prev = measuredRef.current
+    if (!force && !shouldRemeasure(prev, cap)) {
+      // 上限没变（键盘动画中间）或上限变大：高度由已知内容高度与 cap 决定，不必再强制一次布局。
+      applyHeight(composerHeightFor(prev.contentHeight, cap))
+      return
+    }
+    // 只有这里才做「写 auto → 读 scrollHeight」的强制布局。
     el.style.height = 'auto'
-    el.style.height = `${Math.min(el.scrollHeight, viewportHRef.current * 0.4)}px`
+    const content = el.scrollHeight
+    measuredRef.current = { contentHeight: content, cap }
+    applyHeight(composerHeightFor(content, cap))
   }
-  const autosizeSoon = (): void => {
+  const autosizeSoon = (force = false): void => {
+    if (force) autoForceRef.current = true
     if (autosizeFrameRef.current !== null) return
     autosizeFrameRef.current = window.requestAnimationFrame(() => {
       autosizeFrameRef.current = null
-      autosize()
+      const forced = autoForceRef.current
+      autoForceRef.current = false
+      autosize(forced)
     })
   }
-  useEffect(() => { autosizeSoon() }, [value])
-  // 键盘弹出 / 旋屏：40vh 封顶跟着视口走（原实现是每次按键顺手读 innerHeight，这里改成读一次 + 监听）
+  // 内容变了才强制重测（打字/语音转写/清空）。
+  useEffect(() => { autosizeSoon(true) }, [value])
+  // 键盘弹出 / 旋屏：只更新「封顶」，由 shouldRemeasure 决定要不要真的重排。
+  // 同时听 visualViewport —— iOS/部分 XWEB 版本键盘弹起只动可视视口，不触发 window.resize。
   useEffect(() => {
     const onResize = (): void => {
-      viewportHRef.current = window.innerHeight
-      autosizeSoon()
+      const vv = window.visualViewport
+      viewportHRef.current = vv !== null && vv !== undefined ? Math.round(vv.height) : window.innerHeight
+      autosizeSoon(false)
     }
     window.addEventListener('resize', onResize)
+    const vv = window.visualViewport
+    vv?.addEventListener?.('resize', onResize)
     return () => {
       window.removeEventListener('resize', onResize)
+      vv?.removeEventListener?.('resize', onResize)
       if (autosizeFrameRef.current !== null) {
         window.cancelAnimationFrame(autosizeFrameRef.current)
         autosizeFrameRef.current = null
@@ -464,6 +508,12 @@ export function Composer({
               value={value}
               disabled={disabled}
               onChange={(e) => onChange(e.target.value)}
+              // 输入法组合态只记账、不重排：composition 中间做同步布局会让候选词上屏慢半拍。
+              onCompositionStart={() => { composingRef.current?.start() }}
+              onCompositionEnd={() => {
+                composingRef.current?.end()
+                autosizeSoon(true)
+              }}
             />
           )}
           {/* 常驻按钮：录音中它变成红色方块，再点一下停止并转写。 */}
@@ -609,3 +659,29 @@ export function Composer({
     </div>
   )
 }
+
+/** 整块记忆化：控制室的会话投影每 250 ms 刷一版，`OrbPage` 会因此重渲染；
+ *  输入区不该跟着重渲染（受控 textarea 每轮重渲染都会碰一遍 value/composition）。
+ *  props 由 `OrbPage` 保证稳定（见那里的 useStableCallback），这里再做一层兜底：
+ *  `t` 是同一份词表、`toast` 只认函数身份，两者不参与比较。 */
+export const Composer = memo(ComposerImpl, (prev, next) => (
+  prev.value === next.value
+  && prev.chips === next.chips
+  && prev.sending === next.sending
+  && prev.disabled === next.disabled
+  && prev.slashItems === next.slashItems
+  && prev.models === next.models
+  && prev.modelLabel === next.modelLabel
+  && prev.backgroundModelLabel === next.backgroundModelLabel
+  && prev.voice === next.voice
+  && prev.onChange === next.onChange
+  && prev.onAddChips === next.onAddChips
+  && prev.onRemoveChip === next.onRemoveChip
+  && prev.onSend === next.onSend
+  && prev.onSendText === next.onSendText
+  && prev.onPickSlash === next.onPickSlash
+  && prev.onPickModel === next.onPickModel
+  && prev.onPickBackgroundModel === next.onPickBackgroundModel
+  && prev.onOpenPcFiles === next.onOpenPcFiles
+  && prev.toast === next.toast
+))

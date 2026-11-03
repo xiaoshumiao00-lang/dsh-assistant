@@ -10,6 +10,9 @@
  *      pending question / approval（官方 question composer priority 0、
  *      approval panel priority 1），组件挂载即用默认项应答，
  *      不渲染任何卡片；OFF 时 selector 返回 null，正常 UI 流程不变。
+ *      **这条链只是旧宿主（还没重启）的兜底**：正常情况下来自宿主的
+ *      `src/tuoguan-autoanswer.ts` 已经用 `prepend` 抢先作答，请求根本到不了浏览器，
+ *      所以不需要把会话点开也能自动通过——这一点由宿主保证，不靠这里。
  *   3. **跨端同步（手机 ↔ 电脑）**：真值存在 host（profile 下的 JSON 文件），
  *      客户端通过同源 `GET/POST /.dsh-tuoguan/state` 读写。
  *      点击 = 乐观更新 + POST；页面可见时每 2.5s 轮询，`revision` 变化才 setState，
@@ -17,6 +20,11 @@
  *      `localStorage` 退化为离线兜底缓存（首次 GET 前先渲染缓存，避免闪烁），
  *      一切以 host 为准。host 路由不可用（旧 host 代码未重启等）时自动降级为
  *      仅本机生效，开关不会变成死按钮。
+ *   4. **输出截断自动续写不在这一端**：托管开着时，模型撞到输出 token 上限
+ *      （`turn/end` 的 reason 是 `max-tokens`，也就是界面那条「已达到输出 token 上限…
+ *      发送“继续”」）由宿主自动补一条「继续」。放宿主是因为它要「页面关着也照跑」，
+ *      而且多端同时开着时不会各发一条（见 `src/tuoguan-autocontinue.ts`）。
+ *      这里只负责把这件事写进开关的提示文案里。
  *
  * 鸭子类型：官方 PendingQuestion / PendingApproval class 仅类型导出，
  * 运行时不可用 instanceof，故以 kind 字段判别：
@@ -661,8 +669,8 @@ function TuoguanToggle({ sessionId, locked }: { sessionId?: string; locked?: boo
   const [hover, setHover] = useState(false)
   if (sessionId === undefined) return null
   const base = on
-    ? '托管模式已开启：提问与审批将自动按默认项应答，无需人工干预'
-    : '托管模式未开启：与常规对话无差别'
+    ? '托管模式已开启：提问与审批由宿主直接按默认项应答（不用打开会话、不用点卡片）；输出撞到 token 上限被截断时，自动补发「继续」接着跑，无需人工干预'
+    : '托管模式未开启：与常规对话无差别（提问/审批要你自己点，输出被截断时也不会自动补发「继续」）'
   const label = hostReachable
     ? `${base}\n手机与电脑共用同一状态（宿主保存）`
     : `${base}\n⚠ 当前无法与宿主同步，仅本机生效（重启 DSH 后恢复）`
