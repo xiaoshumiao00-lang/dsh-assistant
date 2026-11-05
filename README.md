@@ -133,18 +133,37 @@ DeepSeek Harness 一体化助手插件：**悬浮球 → 控制室**，外加**�
 
 ### 安装
 
+**最省事：在 DSH 里点两下**（桌面版）
+
+左侧 **「插件」** → **「添加插件 / Add plugin」** → 粘贴下面这一行 → 回车 → 装完**重启 DSH Desktop**：
+
+```
+github:xiaoshumiao00-lang/dsh-assistant
+```
+
+> ⚠️ 别只填 `dsh-assistant`：npm 上同名的是**另一个项目**（别人的 macOS 桌面宠物，作者 vianvio），
+> 跟这里说的个人助手无关。认准 `github:` 这个 Git 地址。
+
+**命令行**（`dsh web` / 服务器 profile；桌面版不能用，`--profile desktop` 由 Electron 独占）：
+
+```bash
+dsh plugin --profile web add github:xiaoshumiao00-lang/dsh-assistant
+```
+
+**改代码再装**（开发用）：
+
 ```powershell
-# 1) 拿代码（或解压 tgz 后进目录）
-git clone <你的 fork 或上游> dsh-assistant
-cd <你放代码的目录>          # 不要照抄作者机器上的路径
+git clone https://github.com/xiaoshumiao00-lang/dsh-assistant.git
+cd dsh-assistant
 npm install                  # 装 esbuild / koffi 等
 npm run build                # 产物：lib/index.js + lib/pocket.js + lib/client.js
+node scripts\install-assistant.mjs desktop   # `dsh web` 用户传 web
 
-# 2) 装进 profile（默认 desktop；`dsh web` 用户传 web）
-node scripts\install-assistant.mjs desktop
-
-# 3) 重启 DSH Desktop（宿主改动必须重启；纯客户端改动刷新页面即可）
+# 重启 DSH Desktop（宿主改动必须重启；纯客户端改动刷新页面即可）
 ```
+
+完整的一页纸说明（装插件 → 手机入口 → 装 APK → 常见问题）：
+[`docs/安装说明-给别人.md`](docs/安装说明-给别人.md)。
 
 回退：把 `<用户目录>\.dsh\profiles\<profile>\package.json.bak-assistant-<时间戳>` 复制回 `package.json`，重启即可。
 
