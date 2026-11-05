@@ -45,6 +45,9 @@ function isTestFile(rel) { return rel.startsWith('scripts/') || /test[-./]/.test
 const scanned = files.filter((rel) => {
   const key = rel.replace(/^\.\//, '')
   if (SELF_EXEMPT.has(key)) return false
+  // docs/ 是审计报告与说明（不进包），里面会**引用**上面这份黑名单原文来举证，
+  // 所以不参与「标识不得复现」这条；packages 的 files 也不含 docs/。
+  if (key.startsWith('docs/')) return false
   if (isTestFile(key)) return false
   return true
 })

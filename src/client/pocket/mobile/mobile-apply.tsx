@@ -4,6 +4,7 @@ import { MobileNavToggle } from './MobileNavToggle.tsx'
 import { MobileNavOverlay } from './MobileNavOverlay.tsx'
 import { MobileDrawerFooter } from './MobileDrawerFooter.tsx'
 import { startFileGuard } from './fileGuard.ts'
+import { installComposerFocusGate } from './composerFocusGate.ts'
 import { createModelSettingsNoticePatcher } from './modelSettingsNotice.ts'
 import { MOBILE_CSS } from './mobile.css.ts'
 import { POCKET_RPC_CHANNEL, POCKET_ENDPOINTS } from '../api.js'
@@ -702,6 +703,23 @@ export function mobileApply(ctx): void {
       document.removeEventListener('visibilitychange', onVisibility)
     }
   }, 'dsh-mobile-nav: replace model-settings load error with mobile hint')
+
+  // 进入会话不再自动弹输入法（2026-11-05）：宿主 InputBar 在挂载/切会话时会把光标
+  // 送回输入框（`[data-composer-input]`），安卓 WebView 一拿到 DOM focus 就顶起系统
+  // 输入法 —— 手机端点进任何会话，第一秒都被键盘糊住。这里只挡「不是用户点进输入区」
+  // 的那类程序化聚焦：点侧栏会话行 / 悬浮球 / 控制台卡片进来的，键盘不弹；点输入框
+  // （含卡片空白、发送钮、命令菜单）照常弹。桌面布局在上面就 return 了，不受影响。
+  safeEffect(() => {
+    if (!narrow.matches) return () => {}
+    const dispose = installComposerFocusGate({
+      // 真机证据走诊断信标（diag.jsonl 的 mobile-stage，stage=composer-focus-blocked）
+      onBlocked: (count: number) => reportMobileStage('composer-focus-blocked', { n: count }),
+    })
+    // 装上了就报一条（stage 名只有新版客户端才有）：手机刷新后对着
+    // diagnostic.jsonl 一看就知道新 bundle 到底上没上，不用瞎猜缓存。
+    reportMobileStage('composer-focus-gate')
+    return dispose
+  }, 'dsh-mobile-nav: no auto soft keyboard on session entry')
 
   // ── 阶段 4：effect 全部登记完毕 ────────────────────────────────────────
   // 注意：ctx.effect 的回调通常在登记时就地执行，所以走到这里说明前面每个 effect

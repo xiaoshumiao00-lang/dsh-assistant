@@ -16,6 +16,7 @@ import { AssistantSettingsHub } from './assistant-settings.tsx'
 import { apply as tuoguanApply } from './tuoguan.tsx'
 import { POCKET_RPC_CHANNEL } from './pocket/api.js'
 import { NS as POCKET_NS } from './pocket/pocket-locales.js'
+import { NS as WORKTABLE_NS } from './locales.ts'
 import { installComposerMenuToggle } from './composerMenu'
 import { installCompositionGate } from './compositionGate'
 import { openAssistant, assistantUrlIntent } from './assistant-entry.ts'
@@ -230,6 +231,8 @@ export function apply(ctx: any): void {
   // 托管（原 dsh-tuoguan）：composer 右侧开关 + 提问/审批自动应答 + 跨端同步
   tuoguanApply(ctx)
 
+  // 防断（turn-guard）只放在设置页「个人助手 → 托管」里，不再往输入框塞按钮。
+
   // 全屏控制室（悬浮球打开；z-index 高于分栏工作区与快捷输入页）
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay',
@@ -239,6 +242,8 @@ export function apply(ctx: any): void {
 
   // 设置页「个人助手」：手机访问（复用 pocket 设置页）+ Computer Use / 模型入口
   const pocketT = (() => { try { return ctx.locale.bind(POCKET_NS) } catch { return undefined } })()
+  // 本机配置面板的文案在 locales.ts（worktable 命名空间，zh/en 齐全）
+  const worktableT = (() => { try { return ctx.locale.bind(WORKTABLE_NS) } catch { return undefined } })()
   const rpcCall = (endpoint: string, payload: any, signal?: any) =>
     ctx.connection.rpc.call(POCKET_RPC_CHANNEL, endpoint, payload, signal)
   ctx.slots.inject('settings.section', () => ctx.slots.register({
@@ -246,7 +251,7 @@ export function apply(ctx: any): void {
     id: 'assistant',
     order: 0.9,
     label: () => '个人助手',
-    inject: () => ({ rpcCall, t: pocketT }),
+    inject: () => ({ rpcCall, t: pocketT, tl: worktableT }),
   }, AssistantSettingsHub), 'dsh-assistant: settings hub')
 
   // 一次性首启引导（P0-6）：只有第一次用这个插件会弹一次（状态 'never'）。

@@ -37,6 +37,12 @@ export interface FocusDeps {
   sleep?: (ms: number) => Promise<void>
   /** 宿主已确认切到新会话时立即通知；历史流修复继续在后台等待，不挡住界面切换。 */
   onOpened?: (result: FocusResult) => void
+  /** true = 宿主确认切过去就返回（不再等空白历史流自愈，通常省 0.7–3 s）；
+   *  自愈继续在后台跑，跑完回调 `onSettled` 补齐 result 的 openState/settled/resyncs。
+   *  新建会话面板靠它立刻收起「创建中…」，把等待从「弹窗里干等」变成「界面已在眼前」。 */
+  returnOnOpened?: boolean
+  /** 后台自愈结束的回调（仅 returnOnOpened 时触发，传同一个 result 对象，字段已补齐）。 */
+  onSettled?: (result: FocusResult) => void
 }
 
 export interface FocusResult {
@@ -59,6 +65,8 @@ export interface FocusResult {
   blank: boolean
   /** 为把卡住的空白会话拉出 loading 而做的 resync 次数 */
   resyncs: number
+  /** 是否提前返回、把空白历史流自愈留在了后台（returnOnOpened） */
+  deferred?: boolean
   /** 失败原因（便于诊断，不面向用户） */
   reason?: string
 }
@@ -80,6 +88,8 @@ export const WAIT_RESYNC_MS = 1200
 export const MAX_RESYNCS = 2
 /** 轮询间隔（够细：总等待时间内能重试十几次） */
 const POLL_MS = 120
+/** 打开校验的轮询间隔：selection 是同步写进 store 的，差一拍就该立刻看见，不该干等 120ms */
+const OPEN_POLL_MS = 40
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((res) => { setTimeout(res, ms) })
 
@@ -211,11 +221,11 @@ export async function focusSessionInHost(bridge: FocusBridge | null, sessionId: 
   // 未在 UI 打开过的会话没有 materialized scope：显式 retain 一次，让 binding/history 可用
   try { bridge?.sessions?.retainAgentScope?.(sessionId) } catch {}
 
-  const waitUntil = async (pred: () => boolean, budgetMs: number): Promise<boolean> => {
+  const waitUntil = async (pred: () => boolean, budgetMs: number, stepMs = POLL_MS): Promise<boolean> => {
     const end = now() + budgetMs
     while (now() < end) {
       if (pred()) return true
-      await sleep(POLL_MS)
+      await sleep(stepMs)
     }
     return pred()
   }
@@ -268,7 +278,7 @@ export async function focusSessionInHost(bridge: FocusBridge | null, sessionId: 
       const v = verifyCurrent(uiWorkspace, sessionId)
       if (v.known) return v.ok
       return listCurrent() === sessionId
-    }, WAIT_OPEN_MS)
+    }, WAIT_OPEN_MS, OPEN_POLL_MS)
     if (settled) { result.opened = true; break }
     // 没切过去：可能是会话刚可见但打开被宿主内部拒了一次，降一小拍再试
     await sleep(160)
@@ -285,6 +295,17 @@ export async function focusSessionInHost(bridge: FocusBridge | null, sessionId: 
   // 4) 宿主已确认切换就先让调用方露出会话；空白历史流的检查与修复随后继续。
   if (result.opened) {
     try { deps.onOpened?.(result) } catch { /* 界面回调不影响聚焦诊断 */ }
+    if (deps.returnOnOpened === true) {
+      // 新建会话面板要的是「能输入」这一刻：宿主接受 openSession 就是这一刻。
+      // 空白会话的 history 流偶发卡 loading 需要 resync（0.7–3 s），那是后台自愈的事，
+      // 不该让用户盯着「创建中…」等——主区此时已经能按摘要画出输入框。
+      result.deferred = true
+      void (async () => {
+        try { await settleBlankHistory(bridge, sessionId, result, waitUntil) } catch { /* 后台自愈失败不影响已露出的界面 */ }
+        try { deps.onSettled?.(result) } catch { /* 诊断回调不影响主流程 */ }
+      })()
+      return result
+    }
     await settleBlankHistory(bridge, sessionId, result, waitUntil)
   }
 

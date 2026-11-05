@@ -1,8 +1,46 @@
 # dsh-assistant 更新日志
 
-单一更新源：GitHub Releases <https://github.com/xiaoshumiao00-lang/dsh-assistant>。
+发布源不再是写死的仓库：真值来自本机配置 `updateSource`（`owner/repo`，默认关闭检查更新）。
 控制室里的「更新公告」正文由 `npm run build` 从本文件里当前版本那一节抽出来（见 `build.mjs`），
 不再手写常量——改了代码就必须改这一节，公告与实现不会各说各话。
+
+## [0.2.16] - 2026-11-05
+
+🧩 换一台机器/换一个人：不用改源码、不用手写 JSON，只在「设置 → 个人助手 → 本机配置」填几项
+
+【背景】上一轮审计（`docs/本机配置可移植性审计-20261105.md`）逐条列出了「换机就会错」的硬编码。本轮落地 P0 八项，目标是别人在干净机器上装完，只在设置里填几项就能正常用。
+
+【P0-1 写入链路】`POST /api/assistant/config` 真的存在了：以前那个 handler 不看 `req.method`，POST 也会 200 下发查询结果（改动被静默丢弃，最坏的失败方式）。现在 GET/POST/PUT/405 四路分明，字段白名单（`newProjectParent` / `skillRoot` / `asrTerms` / `allowedRoots` / `allowAllLocalPaths` / `persona` / `termEnvAllow` / `updateSource` / `updateCheckEnabled`）+ 逐字段类型校验（未知字段 400 `unknown-field`、路径必须绝对、开关必须布尔）+ 原子写（`<file>.<pid>.tmp` → rename，0o600）+ 写后清读缓存。未管理的键原样保留；已存在的坏 JSON 拒绝覆盖。`allowAllLocalPaths: true` 需要 `confirm:"ALLOW-ALL"`（与 memory-clear 同一种确认）。客户端 `saveAssistantConfig()` 保存后**强制回读**，`reloadAssistantConfig()` 不再是死代码。回归：`scripts/test-assistant-config-write.mjs`（11 项），已进 `npm test`。
+
+【P0-2 设置页】新增「🧩 本机配置」tab，三个分组 + 一个更新分组：目录与路径（`newProjectParent` / `skillRoot`，复用 `PathBrowser` 目录选择器，并显示「当前实际生效值」及来源）、语音词表（`asrTerms` 增删行 / flags / 导入导出 JSON）、目录边界（`allowedRoots` 列表 + `allowAllLocalPaths` 开关，打开时红字警告并要求输入 `ALLOW-ALL`）。同时修掉技能根两处回落不一致（客户端曾拼未展开的 `~/.dsh/skills`，现在只认宿主下发的绝对路径）。
+
+【P0-3 更新源】`updateCheck.ts` 不再写死 `xiaoshumiao00-lang/dsh-assistant`：改成读本机配置 `updateSource` + `updateCheckEnabled`，**默认关闭**（没配就完全不发网络请求，返回 `disabled`）。升级命令、Releases 入口都按本机配置拼，没配时给出「去哪配」的提示而不是指向作者的构建。
+
+【P0-4 SSH 隧道六字段】`host / port / user / remotePort / keyPath / localPort` 现在能在「手机访问 → 固定公网地址 → 编辑连接」里改（RPC `sshTunnel.setConfig`），私钥用文件选择器；不再需要手写 `settings.json`。默认值去掉 `user: 'root'`（改为空 = 必须自己填，少一项就不连），注释里的作者 VPS IP / 私钥路径也清掉了。
+
+【P0-5 保存即生效】目录 allowlist 不再是 apply 时的一次性快照：`path-guard.check()` 每次请求重读本机配置，保存 `allowedRoots` / `allowAllLocalPaths` 后立即生效（另提供 `assistantPathGuard.refresh()` 服务）。`persona` 不再"只写一次"：`syncPersonaSection()` 会在 `<!-- dsh-assistant:persona -->` 之间替换，配置清空则整段移除；用户手写的 AGENTS.md 仍然一个字不动。
+
+【P0-6 摘掉宿主补丁脚本】`scripts/apply-desktop-host-auth-cookie-fix.ps1`（写死作者机器 `D:\DSH Desktop\resources\app.asar` 与某次构建的 SHA-256，会对 `app.asar` 做 monkey patch）已移出仓库到 `.author-local/`（已 gitignore），说明见 `docs/作者本地脚本.md`。随包分发不再包含任何"动宿主安装目录"的脚本。
+
+【P0-7 koffi 懒加载】`src/desktop-focus.ts` 顶层 `import koffi` 改成 `createRequire` 懒加载：非 Windows、原生模块没装好、ABI 不匹配时**只让「前台窗口聚焦」这一项不可用**，插件其余功能照常启动（以前会整插件 import 失败）。新增 `GET /api/assistant/capabilities`，设置页「本机配置」显示这一项是否可用及原因。
+
+【P0-8 打包与文档】README 新增「给其他人装（第三方用户看这一节）」：Node ≥ 22、koffi 原生模块（装不上只降级一项）、peerDependencies（全部 optional）、GPL-2.0 说明、安装命令、装完要填的几项设置。`package.json` 的 `files` 确认只含 `lib/*`、`cordis.patch.yml`、`dsh.plugin.json`、`README.md`、`LICENSE`、`NOTICE`、`vendor/`——不含 `docs/`、`scripts/`、`.author-local/`。
+
+【手机端·进会话不弹输入法】宿主的输入框在挂载/切会话时会主动抢焦点（`dsh-client-ui-conversation` 的 InputBar：`useEffect(..., [locked, sessionId, editor]) → focusDraftEditor()`），桌面端这样是对的，但安卓 WebView 里 DOM focus 一落到 contenteditable 就 `showSoftInput` —— 手机端点进任何会话，第一秒都被键盘糊住。新增 `src/client/pocket/mobile/composerFocusGate.ts`：只在手机布局下把「不是用户点进输入区」的那类程序化聚焦挡在门口，判据是「这次聚焦前 1.2 s 内，用户的 pointerdown 是否落在 `[data-conversation-region="composer"]` 里」。点侧栏会话行 / 悬浮球 / 控制台卡片进来的，不弹键盘；点输入框（含卡片空白、发送钮、命令菜单）照常弹；正在打字时编辑器本来就有焦点，拦与不拦没有差别。只挡宿主那一个 `[data-composer-input]`，插件自己的 textarea（`data-pocket-orb`）、文件选择框、搜索框、重命名框一律不动。真机证据走诊断信标（`~/.dsh/dsh-pocket/diagnostic.jsonl` 里的 `mobile-stage`，`stage=composer-focus-blocked`）。回归 `scripts/test-composer-focus-gate.mjs`（用假 DOM 直接验「挡 / 放行 / 卸载还原」）已进 `npm test`。纯客户端改动，手机整页刷新即生效（宿主按 mtime 重组 bundle 表）；万一还是老行为，重启一次 DSH Desktop 再刷新页面即可。
+
+【注意】宿主侧改动（新路由、koffi 加载方式、allowlist 生效方式）**要重启一次 DSH Desktop**；设置页与面板属于客户端，刷新页面即生效。
+
+## [0.2.15] - 2026-11-05
+
+🔁 Computer Use ↔ 标准模式真正互通：后台任务遇到桌面操作会把这一步交回前台
+
+【问题】CU 会话用 `code_agent` 把文件/搜索/写文档这类活交给标准模式的后台会话后，后台会话**没有屏幕、也没有 GUI 工具**。任务一旦走到「打开微信」「在原生对话框里选个文件」「读一个只有窗口里才看得到的值」，它只能拿标准工具硬猜（反复 shell、瞎试路径、写 SendKeys 脚本），而其实前台 CU 会话点两下就完了。
+
+【现在】`code_agent` 新建/继续后台标准会话时，往**这个后台 agent 自己的工具作用域**里装一个 `computer_use` 工具（`src/cu-bridge.mjs` + `src/cu-bridge-core.mjs`，只由 code-agent 调用，`agent.ctx` 作用域随 agent 一起卸载）：后台把「一具体 GUI 步骤 + 要带回什么」交回启动它的 CU 会话，前台做完后用一两句话回结果，后台拿结果继续。工具是**同步等待**的——调用期间后台保持 running，`code_agent` 的完成通知不会在 GUI 步骤做完前误触发；同一 CU 会话的多个请求**串行**排队，不会两条 notice 交错、各自读到对方的结果。等不到前台（会话已关 / 一直没开始 / 超时 / 后台被停）都会给一段明确的失败结果，让后台继续用现有工具或把桌面步骤写成清单，而不是无限重试。单次回传次数有上限（20）防止来回打转。
+
+【提示词】后台角色文本（`BACKGROUND_ROLE`）明确：遇到可见桌面步骤就调 `computer_use`，不要用 shell/SendKeys/UI Automation 硬顶；`code_agent` 的 description 告诉 CU 前台「后台可能把一步 GUI 交回来，收到 notice 就在本会话做完并回具体结果」；CU 预设 persona 同步加了这条处理规则。回传只走文字，截图留在前台，后台模型不需要视觉能力。
+
+【回归】新增 `scripts/test-cu-bridge.mjs`（15 项：请求文本、按事件只取 notice 之后的第一条 assistant（用户插话也不串）、同一前台串行顺序、找不到前台 / 没开始 / 排队被清空 / 超时 / 取消 / 次数上限、registry 归属优先于创建时父会话），已进 `npm test`。宿主侧改动**要重启一次 DSH Desktop** 才生效；CU 预设 persona 只对新会话生效（现有 CU 会话仍能收到回传，只是少了这条处理提示）。
 
 ## [0.2.14] - 2026-11-02
 

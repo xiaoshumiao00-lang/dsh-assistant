@@ -10,6 +10,8 @@
 import { createElement as h, useEffect, useRef, useState } from 'react';
 
 import { POCKET_RPC_CHANNEL, POCKET_ENDPOINTS, redactStatus, compareVersions } from './api.js';
+import { PathBrowser } from './orb/PathBrowser.tsx';
+import { zh as ORB_ZH, en as ORB_EN } from './orb/locales.ts';
 import { mobileApply } from './mobile/mobile-apply.tsx';
 import { installDiag } from './orb/diag.ts';
 import { orbApply } from './orb/orb-apply.tsx';
@@ -423,9 +425,59 @@ export function PocketSettingsTab({ rpcCall, t }) {
       setBusy(false);
     }
   };
-  // 模式按钮选中态高亮：固定域名模式本身，或正在编辑固定域名配置，都视为「选中」
-  const namedActive = namedMode || tunnelCfg !== null;
-  // 后端错误消息统一为「中文 | English」混排；按当前界面语言只显示对应一半
+  // ── 固定公网地址：六项连接配置（P0-4，2026-11-05）──
+  // 以前 host/user/privateKey 只能手写 settings.json；现在在设置页改。
+  // 私钥只显示文件名（宿主不回显完整路径），换私钥要走「选择私钥…」。
+  const orbT = (key) => {
+    const dict = t('ok') === POCKET_ZH.ok ? ORB_ZH : ORB_EN;
+    return dict[key] ?? key;
+  };
+  const openSshEditor = () => {
+    const f = status?.sshTunnel ?? {};
+    setSshEditor({
+      host: f.host ?? '',
+      user: f.user ?? '',
+      sshPort: String(f.sshPort ?? 22),
+      remotePort: String(f.remotePort ?? 7080),
+      localPort: String(f.localPort ?? 0),
+      keyPath: '',
+      keyName: f.keyName ?? '',
+    });
+    setSshPick(false);
+  };
+  const saveSshConfig = async () => {
+    if (!sshEditor) return;
+    setSshBusy(true);
+    try {
+      const payload = {
+        host: String(sshEditor.host ?? '').trim(),
+        user: String(sshEditor.user ?? '').trim(),
+        port: Number(sshEditor.sshPort),
+        remotePort: Number(sshEditor.remotePort),
+        localPort: Number(sshEditor.localPort) || 0,
+      };
+      if (sshEditor.keyPath) payload.keyPath = sshEditor.keyPath;
+      setStatus(await call(POCKET_ENDPOINTS.sshTunnelSetConfig, payload));
+      setSshEditor(null);
+      showToast(t('fixedAddrSavedToast'));
+    } catch (err) {
+      setSshEditor((c) => (c ? { ...c, err: err.message } : c));
+    } finally {
+      setSshBusy(false);
+    }
+  };
+  const sshField = (labelKey, key, opts = {}) => h('div', { style: { marginTop: 6 } },
+    t(labelKey),
+    h('input', {
+      style: { margin: '4px 0 0 6px', padding: '4px 8px', fontSize: 13, border: '1px solid var(--dsw-alias-border-l2,#d1d5db)', borderRadius: 6, outline: 'none', width: opts.width ?? 160, fontFamily: 'ui-monospace,Menlo,monospace' },
+      placeholder: opts.placeholder ?? '',
+      value: sshEditor?.[key] ?? '',
+      onChange: (e) => setSshEditor((c) => (c ? { ...c, [key]: e.target.value, err: null } : c)),
+      onKeyDown: (e) => { if (e.key === 'Enter') saveSshConfig(); if (e.key === 'Escape') setSshEditor(null); },
+    }),
+  );
+
+  const namedActive = namedMode || tunnelCfg !== null;  // 后端错误消息统一为「中文 | English」混排；按当前界面语言只显示对应一半
   const errText = (msg) => {
     const s = String(msg ?? '');
     const i = s.indexOf(' | ');
@@ -434,7 +486,10 @@ export function PocketSettingsTab({ rpcCall, t }) {
   };
   // 轻量 Toast：操作成功/失败后短暂提示（自动消失，不打断操作）
   const [toast, setToast] = useState(null);
-  const toastTimer = useRef(null);
+  // 固定公网地址六项连接配置（P0-4）：host / user / sshPort / remotePort / keyPath / localPort
+  const [sshEditor, setSshEditor] = useState(null);
+  const [sshBusy, setSshBusy] = useState(false);
+  const [sshPick, setSshPick] = useState(false);  const toastTimer = useRef(null);
   const showToast = (text) => {
     setToast(text);
     clearTimeout(toastTimer.current);
@@ -691,7 +746,11 @@ export function PocketSettingsTab({ rpcCall, t }) {
     fixed ? h('div', { style: styles.block },
       h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
         h('span', { style: { fontWeight: 600, fontSize: 13 } }, t('fixedAddrTitle')),
-        fixed.configured ? Switch(fixed.enabled === true, toggleFixedTunnel) : null,
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+          // P0-4：六项连接配置在设置页里改（不用再手写 settings.json）
+          h('button', { style: { ...styles.btn, height: 26, padding: '0 10px', fontSize: 12 }, onClick: openSshEditor, disabled: busy }, t('fixedAddrEdit')),
+          fixed.configured ? Switch(fixed.enabled === true, toggleFixedTunnel) : null,
+        ),
       ),
       !fixed.configured
         ? h('div', { style: { ...styles.muted, marginTop: 6 } }, t('fixedAddrNotConfigured'))
@@ -710,6 +769,36 @@ export function PocketSettingsTab({ rpcCall, t }) {
             : null,
           h('div', { style: { ...styles.muted, marginTop: 6 } }, t('fixedAddrHint')),
         ),
+      // 连接编辑表单（P0-4）：host / user / 端口 / 远端端口 / 私钥 / 本地端口
+      sshEditor ? h('div', { style: { marginTop: 8, paddingTop: 8, borderTop: '1px dashed var(--dsw-alias-border-l2,#d1d5db)', fontSize: 12, color: 'var(--dsw-alias-label-secondary,#6b7280)', lineHeight: 1.6 } },
+        sshField('fixedAddrHost', 'host', { placeholder: 'vps.example.com', width: 220 }),
+        sshField('fixedAddrUser', 'user', { placeholder: 'ssh-user', width: 140 }),
+        sshField('fixedAddrSshPort', 'sshPort', { placeholder: '22', width: 80 }),
+        sshField('fixedAddrRemotePort', 'remotePort', { placeholder: '7080', width: 80 }),
+        sshField('fixedAddrLocalPort', 'localPort', { placeholder: '0', width: 80 }),
+        h('div', { style: { marginTop: 6 } },
+          t('fixedAddrKey'),
+          h('span', { style: { marginLeft: 6, fontFamily: 'ui-monospace,Menlo,monospace', wordBreak: 'break-all' } },
+            sshEditor.keyPath ? sshEditor.keyPath : (sshEditor.keyName || t('fixedAddrKeyKeep'))),
+          h('button', { style: { ...styles.btn, height: 24, padding: '0 8px', fontSize: 11, marginLeft: 8 }, onClick: () => setSshPick(true) }, t('fixedAddrKeyPick')),
+        ),
+        h('div', { style: { ...styles.muted, marginTop: 6 } }, t('fixedAddrFormHint')),
+        sshEditor.err ? h('div', { style: { color: 'var(--dsw-alias-state-error-primary,#dc2626)', marginTop: 4 } }, errText(sshEditor.err)) : null,
+        h('div', { style: { marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' } },
+          h('button', { style: { ...styles.primary, height: 28, padding: '0 12px', fontSize: 12 }, onClick: saveSshConfig, disabled: sshBusy }, sshBusy ? t('saving') : t('save')),
+          h('button', { style: { ...styles.btn, height: 28, padding: '0 12px', fontSize: 12 }, onClick: () => setSshEditor(null) }, t('cancel')),
+        ),
+      ) : null,
+      // 私钥选择器：只选文件（PathBrowser mode=file；列表来自电脑 fs.list）
+      sshPick ? h(PathBrowser, {
+        mode: 'file',
+        api: { listFs: (p) => call(POCKET_ENDPOINTS.fsList, { path: p, includeFiles: true }) },
+        startPath: '',
+        t: orbT,
+        onPick: (entry) => { setSshEditor((c) => (c ? { ...c, keyPath: entry.path, keyName: entry.name } : c)); setSshPick(false) },
+        onPickDir: () => {},
+        onClose: () => setSshPick(false),
+      }) : null,
     ) : null,
 
     error ? h('div', { style: { color: 'var(--dsw-alias-state-error-primary,#dc2626)', fontSize: 12, marginTop: 8 } }, `❌ ${errText(error)}`) : null,

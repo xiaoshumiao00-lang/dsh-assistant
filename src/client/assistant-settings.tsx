@@ -1,5 +1,5 @@
 /**
- * 个人助手设置：手机访问 / 它记下了什么（记忆）/ Computer Use / 托管（默认状态），统一收在一处。
+ * 个人助手设置：手机访问 / 它记下了什么（记忆）/ Computer Use / 托管（默认状态）/ 本机配置，统一收在一处。
  *
  * - 手机访问：直接复用 pocket 的实现（同一个 RPC、同一份配置）。
  * - 它记下了什么：读宿主 GET /api/assistant{,-memory} 的条目与体积，能删某一条 / 清空一侧
@@ -13,17 +13,22 @@
  *   /api/assistant/coordinate-mode（profile 的 millifraction-coordinates.json），
  *   新建 Computer Use 会话时由 assistantCoordinateMode 服务决定点击坐标系。
  * - 托管：新会话默认是否开启托管（写 `/.dsh-tuoguan/state`，跨端同步）。
+ * - 本机配置（v0.2.16，P0-2）：换机/换人才会错的值——默认项目父目录、技能根、语音词表、
+ *   目录边界、更新源——读写宿主 GET/POST /api/assistant/config，真值在
+ *   ~/.dsh/assistant/config.json（面板见 assistant-local-config.tsx）。
  */
 import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import { PocketSettingsTab } from './pocket/index.jsx'
 import { setTuoguanDefault, useTuoguanDefaultOn } from './tuoguan.tsx'
+import { setTurnGuardEnabled, useTurnGuardState } from './turn-guard.ts'
 import { getAssistantApi, readModelPref, writeModelPref, readBgPref, writeBgPref, ballConfigStore } from './orb-bridge.ts'
 import { DEFAULT_ORB_AVATAR } from './pocket/orb/defaultAvatar.ts'
 import { AssistantMemoryPanel } from './assistant-memory-panel.tsx'
+import { LocalConfigPanel } from './assistant-local-config.tsx'
 import { showFirstRunGuide } from './firstRunGuide.ts'
 import { downloadText } from './download.ts'
 
-type HubSection = 'phone' | 'memory' | 'cu' | 'tuoguan'
+type HubSection = 'phone' | 'memory' | 'cu' | 'tuoguan' | 'local'
 
 const segWrap: Record<string, any> = {
   display: 'flex', gap: 6, margin: '2px 0 12px', padding: 3,
@@ -359,10 +364,11 @@ function ComputerUsePanel() {
   )
 }
 
-/* ---------------- 托管：新会话默认状态 ---------------- */
+/* ---------------- 托管：新会话默认状态 + 防空转补步（turn-guard） ---------------- */
 
 function TuoguanPanel() {
   const defaultOn = useTuoguanDefaultOn()
+  const turnGuard = useTurnGuardState()
   return (
     <div>
       <div style={card}>
@@ -379,8 +385,33 @@ function TuoguanPanel() {
           <Toggle checked={defaultOn} label="新会话默认开启托管" onChange={(next) => setTuoguanDefault(next)} />
         </div>
       </div>
+
+      <div style={card}>
+        <div style={row}>
+          <div>
+            <div style={title}>防止空转中断（turn-guard）</div>
+            <p style={desc}>
+              模型把工具调用写成正文（只输出 &lt;tool_call&gt; / &lt;parameter&gt; 之类的片段），或者只思考、
+              既没有正文也没有工具调用时，宿主在收尾处补一条纠正消息，让它接着走下一步，而不是整轮
+              提前结束。同一轮最多补几次由宿主配置决定（默认 3 次），防死循环。
+            </p>
+          </div>
+          <Toggle
+            checked={turnGuard.enabled}
+            label="防止空转中断（turn-guard）"
+            onChange={(next) => setTurnGuardEnabled(next)}
+          />
+        </div>
+        <p style={{ ...desc, marginTop: 8 }}>
+          当前：{turnGuard.enabled ? '已开启，所有会话模式都生效' : '已关闭，空转就按普通流程收尾'}（改动立即生效，不用重启）。
+          {turnGuard.reachable
+            ? '状态存在宿主，手机与电脑共用同一份。'
+            : ' ⚠ 宿主接口还没加载：本次改动只在本机，重启 DSH Desktop 后恢复同步。'}
+        </p>
+      </div>
+
       <p style={{ ...desc, padding: '0 2px' }}>
-        这里只改「默认值」：已经单独切换过托管状态的会话保持原样；改动会同步到手机端与其它窗口。
+        托管那一项只改「默认值」：已经单独切换过托管状态的会话保持原样；改动会同步到手机端与其它窗口。
         提问与审批由宿主侧作答（页面关着、会话没点开都生效），子代理会话跟随它父会话的开关；
         自动补发「继续」同样由宿主执行（多端同时开着也只发一条），连续 8 次封顶，到顶后会停手等你确认。
       </p>
@@ -393,7 +424,7 @@ function TuoguanPanel() {
 const KNOWN_PRESET_IDS = ['chat', '2h', '3h', 'l2', 'grid', 't3', 'l13', 'g4', 'l23', 'full', 'standard', 'computer-use']
 function knownPresetIds(): string[] { return KNOWN_PRESET_IDS }
 
-export function AssistantSettingsHub({ rpcCall, t }: { rpcCall?: any; t?: any }) {
+export function AssistantSettingsHub({ rpcCall, t, tl }: { rpcCall?: any; t?: any; tl?: any }) {
   const [section, setSection] = useState<HubSection>('phone')
   const [diagnosticsLine, setDiagnosticsLine] = useState('')
   const [diagnosticsBusy, setDiagnosticsBusy] = useState(false)
@@ -502,6 +533,7 @@ export function AssistantSettingsHub({ rpcCall, t }: { rpcCall?: any; t?: any })
         {tab('memory', '🧠 它记下了什么')}
         {tab('cu', '🔮 Computer Use')}
         {tab('tuoguan', '🤝 托管')}
+        {tab('local', '🧩 本机配置')}
       </div>
       {section === 'phone' && (
         rpcCall && t
@@ -511,6 +543,7 @@ export function AssistantSettingsHub({ rpcCall, t }: { rpcCall?: any; t?: any })
       {section === 'memory' && <AssistantMemoryPanel />}
       {section === 'cu' && <ComputerUsePanel />}
       {section === 'tuoguan' && <TuoguanPanel />}
+      {section === 'local' && <LocalConfigPanel tl={tl} />}
 
       <p style={{ ...desc, padding: '0 2px', marginTop: 12 }}>
         <button

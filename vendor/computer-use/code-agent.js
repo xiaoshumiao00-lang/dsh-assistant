@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { randomUUID } from "node:crypto";
 import { brandString } from "@deepseek-ai/dsh-brand";
+import { registerComputerUseBridge } from "../../src/cu-bridge.mjs";
 //#region src/code-agent-unattended.ts
 /** Custom answer when a Code agent asks a free-text question. */
 const UNATTENDED_CUSTOM_ANSWER = "Stop. Return the short result you already have. Do not expand the task.";
@@ -124,12 +125,12 @@ const TOOL_NAME = "code_agent";
 const STATUS_TOOL_NAME = "code_agent_status";
 /** Model-visible tool that stops one of this Computer Use caller's Code sessions. */
 const STOP_TOOL_NAME = "code_agent_stop";
-const DESCRIPTION = "Delegate one stretch of file search or file production to a standard-mode Code agent that appears in the desktop sidebar like a user-created session. Do the stretch in this chat when it is visible GUI or when one search or one command will answer or feed the next click. A second search that you expect will hit the point stays here. Do not call this tool for visible GUI work such as opening WeChat or clicking a button in Pages — use the GUI tools instead. Do not call this tool for a short lookup such as today's weather or current headlines — use web_search or web_fetch in this chat. Call this tool when you are still digging through files, searches, or commands, or when the user asked for a file, document, spreadsheet, or site. The last step being a click does not keep the investigation here. Omit session_id to create a new blank standard session: write a Word document, make a gobang game, write an HTML research report, or any task that is not a follow-up to a previous code_agent result. Pass session_id with the id returned by an earlier code_agent result when continuing the same artifact, for example making that Word document's font green, or another stretch of the same investigation. Do not pass a previous id when the new work is unrelated. session_id must be a session this Computer Use agent started. task is the stretch to enqueue. The call returns after the standard session accepts the message; it does not wait for that session to finish. Tell the user the background Code agent is running. Continue with a GUI action in this turn only when it does not need this result; otherwise end the turn. Do not call wait, long_wait, or bash sleep to poll that session. A plugin notice arrives later when that session is idle and this session is idle; then decide again: do remaining GUI, or call code_agent with that session_id for another stretch, and tell the user the short conclusion. Do not recite a long report. Pass cwd when the user named a path or said this folder and <frontmost_folder> is present. Omit cwd to create a new subdirectory under this session's workspace. session_id cannot target this Computer Use session, a subagent child, or a non-standard session.";
+const DESCRIPTION = "Delegate one stretch of file search or file production to a standard-mode Code agent that appears in the desktop sidebar like a user-created session. Do the stretch in this chat when it is visible GUI or when one search or one command will answer or feed the next click. A second search that you expect will hit the point stays here. Do not call this tool for visible GUI work such as opening WeChat or clicking a button in Pages — use the GUI tools instead. A background Code agent can call computer_use to hand one GUI step back to this chat when it needs the screen; when that notice arrives, perform the step here and reply with the concrete result. Do not call this tool for a short lookup such as today's weather or current headlines — use web_search or web_fetch in this chat. Call this tool when you are still digging through files, searches, or commands, or when the user asked for a file, document, spreadsheet, or site. The last step being a click does not keep the investigation here. Omit session_id to create a new blank standard session: write a Word document, make a gobang game, write an HTML research report, or any task that is not a follow-up to a previous code_agent result. Pass session_id with the id returned by an earlier code_agent result when continuing the same artifact, for example making that Word document's font green, or another stretch of the same investigation. Do not pass a previous id when the new work is unrelated. session_id must be a session this Computer Use agent started. task is the stretch to enqueue. The call returns after the standard session accepts the message; it does not wait for that session to finish. Tell the user the background Code agent is running. Continue with a GUI action in this turn only when it does not need this result; otherwise end the turn. Do not call wait, long_wait, or bash sleep to poll that session. A plugin notice arrives later when that session is idle and this session is idle; then decide again: do remaining GUI, or call code_agent with that session_id for another stretch, and tell the user the short conclusion. Do not recite a long report. Pass cwd when the user named a path or said this folder and <frontmost_folder> is present. Omit cwd to create a new subdirectory under this session's workspace. session_id cannot target this Computer Use session, a subagent child, or a non-standard session.";
 /**
 * Role text appended to every queued `code_agent` task.
 * The completion notice keeps the model task only.
 */
-const BACKGROUND_ROLE = "You are the background worker for a Computer Use session. You do not see the screen and you do not talk to the user. If this task asks for a file, document, spreadsheet, or site, produce it, reply with its path, and stop. Otherwise search or run commands only until you can answer, including a second search when the first missed the point. Reply in a few sentences with the paths or results that matter, then stop. Do not write a report or create extra files.";
+const BACKGROUND_ROLE = "You are the background worker for a Computer Use session. You do not see the screen and you do not talk to the user. If a step needs a visible desktop app — opening or switching an app window, clicking a button, typing into another app, choosing a file in a native dialog, reading a dialog or what is currently on screen — call computer_use with that one GUI step and state what to bring back; do that instead of guessing, retrying shell commands, or scripting SendKeys/UI Automation. The foreground Computer Use session sees the screen, performs the step, and returns the result; continue here with it. Do not spawn a subagent for GUI work: computer_use is the only path to the screen. If this task asks for a file, document, spreadsheet, or site, produce it, reply with its path, and stop. Otherwise search or run commands only until you can answer, including a second search when the first missed the point. Reply in a few sentences with the paths or results that matter, then stop. Do not write a report or create extra files.";
 const RUNNING_RESULT = "Tell the user the background Code agent is running. Continue with a GUI action in this turn only when it does not need this result; otherwise end the turn.";
 /**
 * User message queued on the standard session.
@@ -346,6 +347,16 @@ function apply(ctx) {
 				if (args.cwd !== void 0 && header.cwd !== void 0 && args.cwd !== header.cwd) throw new Error(`code_agent cwd "${args.cwd}" does not match session "${sessionId}" cwd "${header.cwd}"`);
 				cwd = header.cwd ?? known.cwd;
 			}
+			// 后台标准会话在第一步之前就装上 computer_use：它没有屏幕，遇到必须点桌面的
+			// 步骤时要把这一步交回启动它的 Computer Use 会话（见 src/cu-bridge.mjs）。
+			const agentsBeforePrompt = ctx.get("agents");
+			const codeBeforePrompt = agentsBeforePrompt?.get(sessionId);
+			if (codeBeforePrompt !== void 0) registerComputerUseBridge({
+				agent: codeBeforePrompt,
+				ctx,
+				parentId: caller.id,
+				logger: ctx.logger
+			});
 			const requestId = brandString(`code-agent-${randomUUID()}`);
 			await ctx.sessionController.prompt({
 				requestId,
@@ -361,6 +372,12 @@ function apply(ctx) {
 			const code = agents?.get(sessionId);
 			if (liveCaller !== void 0) rememberCaller(liveCaller, caller.id, byCaller, rememberedCallers, registry);
 			if (code !== void 0) attachUnattendedCodeAgent(code, unattended);
+			if (code !== void 0) registerComputerUseBridge({
+				agent: code,
+				ctx,
+				parentId: caller.id,
+				logger: ctx.logger
+			});
 			let watch;
 			if (agents !== void 0 && liveCaller !== void 0 && code !== void 0) watch = watchCodeAgentCompletion({
 				caller: liveCaller,

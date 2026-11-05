@@ -12,6 +12,11 @@ scripts/ball.json
 # 本地备份
 .backup-*/
 
+# 作者本机专用脚本（P0-6：写死作者机器的 DSH 安装路径与 app.asar 哈希，
+# 不能随包发给别人；说明见 docs/作者本地脚本.md）
+.author-local/
+scripts/apply-desktop-*.ps1
+
 # 本机个人化配置（正常位置在 ~/.dsh/assistant/config.json，不入库；
 # 这里也挡住有人把配置文件塞进仓库根目录）
 config.json

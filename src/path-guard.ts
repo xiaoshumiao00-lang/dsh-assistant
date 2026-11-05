@@ -1,33 +1,48 @@
 /**
- * 鐩綍杈圭晫锛圥0-5锛夛細宸ヤ綔鍙扮殑鍐呭绐楁暟鎹矾鐢憋紙鍒楃洰褰?/ 璇诲啓鏂囦欢 / git 鐘舵€?/ 闈欐€佹墭绠?/ 鎵撳紑鏂囦欢澶?/ 鎶€鑳芥竻鍗曪級
- * 涔嬪墠瀵逛换浣曞彲鍐欒矾寰勯兘鐓у崟鍏ㄦ敹 鈥斺€?鎵嬫満璁块棶锛堝眬鍩熺綉鎴?SSH 闅ч亾锛夎兘鎶婃彃浠剁殑杩欏嚑鏉¤矾鐢卞綋銆屾湰鏈烘枃浠舵祻瑙堝櫒銆嶇敤锛? * 瓒婄晫璇诲埆鐨勭敤鎴风洰褰曘€佸啓绯荤粺璺緞閮藉彲琛屻€傝繖閲屾妸鍏ュ弬璺緞鏀惰繘涓€浠?allowlist锛岃秺鐣屼竴寰?403銆? *
- * 榛樿鏍癸紙鏈満琛屼负涓嶅彉锛屽彧鏄妸鑼冨洿璁叉竻妤氾級锛? *   - 鍔╂墜鐩綍            ~/.dsh/assistant
- *   - DSH 鏁版嵁鏍圭洰褰?      $DSH_HOME锛堥粯璁?~/.dsh锛? *   - 骞冲彴 Desktop 鐩綍     锛圵indows 涓婂父鏄噸瀹氬悜鍚庣殑妗岄潰锛? *   - 鏂板缓椤圭洰鐨勯粯璁ょ埗鐩綍   鏈満閰嶇疆閲岀殑 newProjectParent锛堟湭閰嶇疆鍗冲洖钀界洰鏍囷級
- *   - 鎶€鑳芥牴鐩綍           鏈満閰嶇疆閲岀殑 skillRoot锛堟湭閰嶇疆鍗?<DSH_HOME>/skills锛? *   - 绯荤粺涓存椂鐩綍 / 鎻掍欢浠撳簱 cwd
- *   - 鐢ㄦ埛涓荤洰褰曟湰韬紙鎻掍欢涓庡涓昏窇鍦ㄥ悓涓€鐢ㄦ埛涓嬶紝娴忚鍣ㄨ兘鐪嬪埌鐨勮嚜宸卞鐩綍涓嶇畻瓒婄晫锛? *   - 鏈満閰嶇疆 allowedRoots 杩藉姞鐨勬牴锛堜緥濡傛煇涓嫭绔嬬洏鐨勯」鐩垎缁勶級
- * 閫冪敓寮€鍏筹細鏈満閰嶇疆 `allowAllLocalPaths: true` 鏃朵笉鍋氳竟鐣屾鏌ワ紙榛樿 false锛夈€? */
+ * 目录边界（P0-5）：工作台的内容窗数据路由（列目录 / 读写文件 / git 状态 / 静态托管 /
+ * 打开文件夹 / 技能清单）之前对任何可写路径都照单全收——手机访问（局域网或 SSH 隧道）
+ * 能把插件的这几条路由当「本机文件浏览器」用，越界读别的用户目录、写系统路径都可行。
+ * 这里把入参路径收进一份 allowlist，越界一律 403。
+ *
+ * 默认根（本机行为不变，只是把范围讲清楚）：
+ *   - 助手目录            ~/.dsh/assistant
+ *   - DSH 数据根目录       $DSH_HOME（默认 ~/.dsh）
+ *   - 平台 Desktop 目录    （Windows 上常是重定向后的桌面）
+ *   - 新建项目的默认父目录  本机配置里的 newProjectParent（未配置即回落目标）
+ *   - 技能根目录           本机配置里的 skillRoot（未配置即 <DSH_HOME>/skills）
+ *   - 系统临时目录 / 插件仓库 cwd
+ *   - 用户主目录本身       （插件与宿主跑在同一用户下，浏览器能看到自己家目录不算越界）
+ *   - 本机配置 allowedRoots 追加的根（例如某个独立盘的项目分组）
+ * 逃生开关：本机配置 `allowAllLocalPaths: true` 时不做边界检查（默认 false）。
+ *
+ * 2026-11-05（P0-5）：allowlist 不再是「apply 时的一次性快照」——`check()` 每次请求都
+ * 重新读一次本机配置（loadAssistantConfig 按 mtime 缓存，代价是一次 stat），所以设置页
+ * 保存 allowedRoots / allowAllLocalPaths 之后**立即生效**，不必重载插件或重启。
+ */
 import { homedir, tmpdir } from 'node:os'
 import { existsSync, realpathSync, statSync } from 'node:fs'
-import { dirname, join, resolve as resolvePath, sep } from 'node:path'
+import { dirname, join, resolve as resolvePath } from 'node:path'
 import { assistantHomeDir } from './assistant-home.ts'
-import { dshHome, loadAssistantConfig, platformDesktopDir, resolveNewProjectParent } from './assistant-config.ts'
+import { dshHome, loadAssistantConfig, platformDesktopDir, resolveNewProjectParent, type AssistantLocalConfig } from './assistant-config.ts'
 
 export interface PathCheckResult {
   ok: boolean
-  /** 瓒婄晫鏃剁殑璇存槑锛堣繘 403 鐨勫搷搴斾笌鏃ュ織锛屼究浜庢帓鏌ユ槸鍝釜鏍规病閰嶏級 */
+  /** 越界时的说明（进 403 的响应与日志，便于排查是哪个根没配） */
   reason: string
-  /** 褰掍竴鍖栧悗鐨勭洰鏍囩粷瀵硅矾寰?*/
+  /** 归一化后的目标绝对路径 */
   target: string
 }
 
 export interface PathGuard {
   roots: string[]
-  /** 鍏ㄥ眬鏀捐锛堟湰鏈洪厤缃?allowAllLocalPaths: true锛?*/
+  /** 全局放行（本机配置 allowAllLocalPaths: true） */
   open: boolean
+  /** 强制重读本机配置（写入配置后调用；read 时机与 check 一致） */
+  refresh(): void
   check(rawPath: string): PathCheckResult
 }
 
-/** `~` / `~\` / `~/` 灞曞紑涓虹敤鎴蜂富鐩綍銆?*/
+/** `~` / `~\` / `~/` 展开为用户主目录。 */
 export function expandHome(raw: string): string {
   const value = String(raw ?? '').trim()
   if (!value) return ''
@@ -37,7 +52,7 @@ export function expandHome(raw: string): string {
   return value
 }
 
-/** 姣旇緝鐢ㄧ殑褰掍竴鍖栵細缁熶竴鍒嗛殧绗︺€佸幓鎺夊熬閮ㄥ垎闅旂銆乄indows 涓婁笉鍖哄垎澶у皬鍐欍€?*/
+/** 比较用的归一化：统一分隔符、去掉尾部分隔符、Windows 上不区分大小写。 */
 function comparable(raw: string): string {
   let value = String(raw).replace(/[\\/]+/g, '/')
   if (value.length > 1 && value.endsWith('/')) value = value.slice(0, -1)
@@ -45,18 +60,18 @@ function comparable(raw: string): string {
   return value
 }
 
-/** 绗﹀彿閾炬帴 / junction 鏄惁钀藉洖鍏佽鏍癸紙鐪熷疄璺緞涔熺畻鍊欓€夛級銆?*/
+/** 符号链接 / junction 是否落回允许根（真实路径也算候选）。 */
 function realCandidates(abs: string): string[] {
   const out: string[] = [abs]
   try {
     const real = realpathSync(abs)
     if (real && real !== abs) out.push(real)
-  } catch { /* 鐩爣涓嶅瓨鍦ㄦ椂 realpath 鎶涢敊锛氱敤鍘熻矾寰勫垽鏂嵆鍙?*/ }
+  } catch { /* 目标不存在时 realpath 抛错：用原路径判断即可 */ }
   return out
 }
 
-/** 鍏佽鏍瑰垪琛紙鍘婚噸銆佸幓鎺変笉瀛樺湪涓旀槑鏄炬槸鍗犱綅鐨勯」锛夈€?*/
-export function defaultAllowedRoots(config = loadAssistantConfig()): string[] {
+/** 允许根列表（去重、去掉不存在且明显是占位的项）。 */
+export function defaultAllowedRoots(config: AssistantLocalConfig = loadAssistantConfig()): string[] {
   const roots: string[] = []
   const push = (raw: string | null | undefined): void => {
     const value = String(raw ?? '').trim()
@@ -84,20 +99,33 @@ export function defaultAllowedRoots(config = loadAssistantConfig()): string[] {
   return out
 }
 
-/** 鐩綍 allowlist 鐨勬墽琛屼綋锛氫竴娆℃瀯寤猴紝澶氭澶嶇敤锛堣矾鐢辨敞鍐屾椂寤轰竴娆★級銆?*/
-export function createPathGuard(config = loadAssistantConfig(true)): PathGuard {
-  const open = config.allowAllLocalPaths === true
-  const roots = defaultAllowedRoots(config)
+/**
+ * 目录 allowlist 的执行体。
+ * @param config 省略时按磁盘/环境解析；调用方传入时视为「固定配置」（测试用，不再自动重读）。
+ */
+export function createPathGuard(config?: AssistantLocalConfig): PathGuard {
+  const pinned = config !== undefined
+  let state: AssistantLocalConfig = config ?? loadAssistantConfig(true)
+
+  const sync = (force: boolean): void => {
+    if (pinned && !force) return
+    try { state = loadAssistantConfig(force) } catch { /* 读失败就沿用上一份 */ }
+  }
+
   return {
-    roots,
-    open,
+    get roots(): string[] { return defaultAllowedRoots(state) },
+    get open(): boolean { return state.allowAllLocalPaths === true },
+    refresh(): void { sync(true) },
     check(rawPath: string): PathCheckResult {
+      // 每次请求同步一次配置：设置页改完 allowedRoots / allowAllLocalPaths 立即生效（P0-5）。
+      sync(false)
       const raw = String(rawPath ?? '').trim()
       if (!raw) return { ok: false, reason: 'empty-path', target: '' }
       const abs = resolvePath(expandHome(raw))
-      if (open) return { ok: true, reason: 'allow-all', target: abs }
+      if (state.allowAllLocalPaths === true) return { ok: true, reason: 'allow-all', target: abs }
+      const roots = defaultAllowedRoots(state)
       const candidates = realCandidates(abs)
-      // 鍏佽鏍规湰韬€佹牴鍐呮枃浠躲€佷互鍙娿€岃鏌愪釜鍏佽鏍瑰寘鍚€嶇殑绗﹀彿閾炬帴鐩爣
+      // 允许根本身、根内文件、以及「被某个允许根包含」的符号链接目标
       for (const candidate of candidates) {
         const value = comparable(candidate)
         for (const root of roots) {
@@ -106,20 +134,23 @@ export function createPathGuard(config = loadAssistantConfig(true)): PathGuard {
           if (value === base || value.startsWith(base + '/')) return { ok: true, reason: '', target: abs }
         }
       }
-      // 瓒婄晫锛氭妸宸摢涓牴鍐欒繘鏃ュ織锛岀敤鎴峰姞涓€鏉?allowedRoots 灏辫兘鏀捐
+      // 越界：把差哪个根写进日志，用户加一条 allowedRoots 就能放行
       return { ok: false, reason: `outside-allowlist: ${abs}`, target: abs }
     },
   }
 }
 
-/** 鏄惁瀛樺湪涓旀槸鍙鐩綍锛堣秺鐣屾鏌ヤ箣鍚庨『鎵嬫妸涓嶅瓨鍦ㄧ殑璺緞褰撴嫆缁濆鐞嗭級銆?*/
+/** 是否存在且是可读目录（越界检查之后顺手把不存在的路径当拒绝处理）。 */
 export function isDirectory(target: string): boolean {
   try {
     return existsSync(target) && statSync(target).isDirectory()
-  } catch { return false }
+  } catch {
+    return false
+  }
 }
 
-/** 缁堢鏈€灏忕幆澧冨彉閲忥紙P0-5锛夛細涓嶅啀鏁村寘 process.env 浜ょ粰 shell銆? *  榛樿鐧藉悕鍗曞彧鏀?shell 涓?Windows 蹇呴渶椤癸紝鍏跺畠涓€寰嬩笉浼狅紱鏈満閰嶇疆 termEnvAllow 杩藉姞鍙橀噺鍚嶃€?*/
+/** 终端最小环境变量（P0-5）：不再整包 process.env 交给 shell。
+ *  默认白名单只放 shell 与 Windows 必需项，其余一律不传；本机配置 termEnvAllow 追加变量名。 */
 const TERM_ENV_ALLOW = [
   'PATH', 'PATHEXT', 'SystemRoot', 'SystemDrive', 'ComSpec', 'windir',
   'TEMP', 'TMP', 'TMPDIR', 'HOME', 'HOMDRIVE', 'HOMEPATH',
@@ -127,7 +158,7 @@ const TERM_ENV_ALLOW = [
   'SHELL', 'NODE_VERSION', 'COLUMNS', 'PYTHONPATH',
 ]
 
-export function minimalTermEnv(config = loadAssistantConfig(), extraNames: string[] = []): Record<string, string> {
+export function minimalTermEnv(config: AssistantLocalConfig = loadAssistantConfig(), extraNames: string[] = []): Record<string, string> {
   const allow = new Set<string>([...TERM_ENV_ALLOW, ...config.termEnvAllow, ...extraNames].map((name) => String(name).trim().toUpperCase()).filter(Boolean))
   const out: Record<string, string> = {}
   for (const name of allow) {

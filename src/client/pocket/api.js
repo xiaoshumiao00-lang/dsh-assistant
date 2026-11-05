@@ -17,6 +17,8 @@ export const POCKET_ENDPOINTS = Object.freeze({
   pocketReset: 'pocket.reset',
   // 固定公网地址（SSH 反向隧道）：开关；地址/主机等配置写 settings.json
   sshTunnelSetEnabled: 'sshTunnel.setEnabled',
+  // 六项连接配置（P0-4）：host / port / user / remotePort / keyPath / localPort（设置页可改）
+  sshTunnelSetConfig: 'sshTunnel.setConfig',
   // 立即重连（自愈失败时的人工触发）：会先收养健康隧道，再清理远端旧占用，最后新建
   sshTunnelReconnect: 'sshTunnel.reconnect',
   // 移动端「复制文件内容」（issue #17）：手机经此 RPC 让主机读取文件正文，

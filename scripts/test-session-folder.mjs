@@ -4,7 +4,7 @@
  *   node scripts/test-session-folder.mjs
  */
 import assert from 'node:assert/strict'
-import { normalizeFolderPath, sessionsUnderFolder, unownedSessionIds, transientVisibility } from '../src/client/sessionFolder.ts'
+import { normalizeFolderPath, projectClaims, sessionsUnderFolder, unownedSessionIds, transientVisibility } from '../src/client/sessionFolder.ts'
 
 const cases = []
 
@@ -98,6 +98,52 @@ cases.push(['游离会话：没有项目文件夹时全部根会话都游离，�
   }
   assert.deepEqual(unownedSessionIds(['a', 'b', 'kid'], byId, [], []), ['a', 'b'])
   assert.deepEqual(unownedSessionIds(['a', 'b'], null, ['D:/a'], []), [])
+}])
+
+// ── 临时卡片盲区：控制室里没有卡片的项目不能「认领」自己的会话 ──
+// 现场（2026-11-05）：微信任务跑在**隐藏的 HPG 项目**目录里，那个目录被当成「项目已收编」，
+// 于是会话既不上项目卡（卡片隐藏）、也不进临时卡片 —— 所有卡片都显示空闲。
+const CLAIM_BASE = {
+  folders: { visible: 'D:/proj', hidden: 'D:/hidden', removed: 'D:/gone', stray: 'D:/stray' },
+  bindings: { visible: 'bv', hidden: 'bh', removed: 'br', house: 'bhouse' },
+  flows: { visible: { stepSessions: { s1: 'stepVisible' } }, hidden: { stepSessions: { s1: 'stepHidden' } } },
+  removed: ['removed'],
+  hidden: ['hidden'],
+  layouts: [{ id: 'visible' }, { id: 'hidden' }, { id: 'removed' }, { id: 'house' }],
+}
+const claim = (patch = {}) => projectClaims({
+  projects: { ...CLAIM_BASE, ...patch },
+  consoleId: 'wt-console',
+  aliveRegisteredIds: ['visible', 'hidden'],
+  cwdOf: (sid) => (sid === 'bhouse' ? 'D:/house-cwd' : ''),
+})
+
+cases.push(['项目认领：可见项目认领目录 / 绑定 / 模板步骤会话', () => {
+  const got = claim()
+  assert.deepEqual(got.folders.sort(), ['D:/house-cwd', 'D:/proj'], '只收有卡片的项目文件夹（含无文件夹项目的绑定目录）')
+  assert.deepEqual(got.sessions.sort(), ['bhouse', 'bv', 'stepVisible'], '只收有卡片的项目的绑定 / 步骤会话')
+}])
+
+cases.push(['项目认领：隐藏项目一律不算认领（否则运行中的会话在控制室彻底消失）', () => {
+  const got = claim()
+  assert.equal(got.sessions.includes('bh'), false, '隐藏项目的绑定会话不算认领')
+  assert.equal(got.sessions.includes('stepHidden'), false, '隐藏项目的模板步骤会话不算认领')
+  assert.equal(got.folders.includes('D:/hidden'), false, '隐藏项目的文件夹不能挡掉临时卡片')
+  assert.deepEqual(got.sessions.sort(), ['bhouse', 'bv', 'stepVisible'], '可见项目照常认领')
+}])
+
+cases.push(['项目认领：隐藏项目的绑定会话照样是「游离」（进临时卡片）', () => {
+  const byId = { bh: { cwd: 'D:/hidden' }, live: { cwd: 'D:/hidden/sub' } }
+  const got = claim()
+  const roots = unownedSessionIds(['bh', 'live'], byId, got.folders, got.sessions)
+  assert.deepEqual(roots, ['bh', 'live'], '隐藏项目的会话必须全部落到临时卡片')
+}])
+
+cases.push(['项目认领：已删除 / 不在注册表的残留同样不认领', () => {
+  const got = claim()
+  assert.equal(got.sessions.includes('br'), false, 'removed 项目的绑定不算认领')
+  assert.equal(got.folders.includes('D:/gone'), false, 'removed 项目的文件夹不算认领')
+  assert.equal(got.folders.includes('D:/stray'), false, '不在 layouts / 注册表的项目不算认领')
 }])
 
 // ── 临时卡片「正在运行」的可见性策略 ──

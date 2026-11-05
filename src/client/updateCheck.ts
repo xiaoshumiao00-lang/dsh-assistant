@@ -1,17 +1,42 @@
 /**
- * 唯一的更新源与升级指令（P0-4 闭环）：
- * 控制室公告页、工作台分栏页、更新检查全部走这里，不再各写各的仓库名。
- * 历史里这里同时存在过三个更新源（两个已退役的旧仓库 + 本仓库），
- * 现在只有 dsh-assistant 这一个；旧的更新源名字不再出现在代码里，避免按名字 grep 时分不清真假。
+ * 唯一的更新源与升级指令（P0-4 闭环；P0-3 改为可配置）。
+ *
+ * 2026-11-05（P0-3）：更新源不再写死作者的 GitHub 仓库。别人的机器装了这个插件，
+ * 不该被作者的仓库牵着升级（点一下就把自己的安装换成作者的构建）。现在的规则：
+ *   - 真值来自本机配置：`updateSource`（owner/repo）+ `updateCheckEnabled`（默认 false）；
+ *   - 两项都没配 → `checkUpdate()` 直接返回 'disabled'，**不发任何网络请求**；
+ *   - 升级命令也按本机配置拼，未配置时给出"先去设置里填"的提示而不是一个错仓库。
+ * 设置位置：设置 → 个人助手 → 本机配置 → 更新检查。
  */
 declare const __WT_VERSION__: string
 export const LOCAL_VERSION = typeof __WT_VERSION__ === 'undefined' ? 'dev' : __WT_VERSION__
 
-/** 插件仓库（GitHub Releases 是版本源） */
-export const UPDATE_REPO = 'xiaoshumiao00-lang/dsh-assistant'
-/** 插件安装名 / 发布 tgz 文件名（与 package.json、dsh.plugin.json 同名） */
+import { updateSettingsSync } from './assistant-config.ts'
+
+/** 插件安装名 / 发布 tgz 文件名（与 package.json、dsh.plugin.json 同名）。 */
 export const PLUGIN_NAME = 'dsh-assistant'
-export const LATEST_TGZ = `https://github.com/${UPDATE_REPO}/releases/latest/download/${PLUGIN_NAME}.tgz`
+
+/** 本机的更新源仓库（`owner/repo`）；没有配置时返回空串 = 不做更新检查。 */
+export function updateRepo(): string {
+  return updateSettingsSync().source
+}
+
+/** 本机是否允许检查更新（默认 false）。 */
+export function updateCheckAllowed(): boolean {
+  return updateSettingsSync().enabled && updateRepo() !== ''
+}
+
+/** 发布包地址（本机配置的仓库）；未配置时返回空串。 */
+export function latestTgzUrl(): string {
+  const repo = updateRepo()
+  return repo ? `https://github.com/${repo}/releases/latest/download/${PLUGIN_NAME}.tgz` : ''
+}
+
+/** Releases 页面地址；未配置时返回空串（调用方据此隐藏入口）。 */
+export function updateRepoUrl(): string {
+  const repo = updateRepo()
+  return repo ? `https://github.com/${repo}/releases/latest` : ''
+}
 
 /** 当前页面的宿主 profile：dsh-assistant 装在 desktop（DSH Desktop），网页构建装在 web。
  *  认不出来就用 desktop —— 这是本插件的主 profile。 */
@@ -28,14 +53,22 @@ export function detectProfile(): 'web' | 'desktop' {
   return 'desktop'
 }
 
-/** 升级指令：插件不自更新，升级由用户或其 Agent 执行 + 重启。 */
+/** 升级指令：插件不自更新，升级由用户或其 Agent 执行 + 重启。
+ *  没配更新源时返回一句去哪配的提示（而不是指向别人的仓库）。 */
 export function upgradeCommand(profile: string = detectProfile()): string {
-  return `dsh plugin --profile ${profile} add "${LATEST_TGZ}"`
+  const url = latestTgzUrl()
+  if (!url) return '（未配置更新源：设置 → 个人助手 → 本机配置 → 更新检查，填你自己的 owner/repo）'
+  return `dsh plugin --profile ${profile} add "${url}"`
 }
-export const UPGRADE_CMD = upgradeCommand()
-export const UPGRADE_AI = `帮我升级 ${PLUGIN_NAME}：执行 ${upgradeCommand()}，完成后提醒我重启 DSH 并刷新页面`
 
-export type UpdateStatus = 'idle' | 'checking' | 'uptodate' | 'failed'
+export function upgradeAiPrompt(profile: string = detectProfile()): string {
+  const cmd = upgradeCommand(profile)
+  if (!latestTgzUrl()) return cmd
+  return `帮我升级 ${PLUGIN_NAME}：执行 ${cmd}，完成后提醒我重启 DSH 并刷新页面`
+}
+
+export type UpdateStatus = 'idle' | 'checking' | 'uptodate' | 'failed' | 'disabled'
+
 export type UpdateInfo = { latest: string; notes: string; url: string }
 
 const K_UPDATE_CHECK = 'dsh.worktable.updateCheck.v1'
@@ -81,8 +114,16 @@ export function writeCache(status: UpdateStatus, info: UpdateInfo | null) {
   try { localStorage.setItem(K_CACHE, JSON.stringify({ status, info })) } catch {}
 }
 
-/** 检查更新：节流一天一次（force 绕过）；8s 超时 × 3 重试；防重入由调用方保证 */
+/**
+ * 检查更新：本机没开更新检查 / 没配更新源 → 'disabled'（不联网）；
+ * 否则节流一天一次（force 绕过）、8s 超时 × 3 重试。
+ */
 export async function checkUpdate(force = false): Promise<{ status: UpdateStatus; info: UpdateInfo | null }> {
+  if (!updateCheckAllowed()) {
+    writeCache('disabled', null)
+    return { status: 'disabled', info: null }
+  }
+  const repo = updateRepo()
   const last = Number(localStorage.getItem(K_LAST_CHECK) ?? '0')
   if (!force && Date.now() - last < 24 * 3600 * 1000) return readCache()
   try { localStorage.setItem(K_LAST_CHECK, String(Date.now())) } catch {}
@@ -91,7 +132,7 @@ export async function checkUpdate(force = false): Promise<{ status: UpdateStatus
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), 8000)
     try {
-      const r = await fetch('https://api.github.com/repos/' + UPDATE_REPO + '/releases/latest', { headers: { Accept: 'application/vnd.github+json' }, cache: 'no-store', signal: ctrl.signal })
+      const r = await fetch('https://api.github.com/repos/' + repo + '/releases/latest', { headers: { Accept: 'application/vnd.github+json' }, cache: 'no-store', signal: ctrl.signal })
       if (r.ok) d = (await r.json()) as { tag_name?: string; body?: string; html_url?: string }
       else if (r.status === 403 || r.status === 404) break
     } catch { /* 网络抖动/超时：下一轮重试 */ }
