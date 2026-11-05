@@ -55,6 +55,7 @@ DeepSeek Harness 一体化助手插件：**悬浮球 → 控制室**，外加**�
 - 设置 →「个人助手」→ Computer Use 新增**「使用千分比坐标（0–1000）」**开关。
 - 打开：模型按截图的 0–1000 比例给点击位置；关闭：按截图原始像素给位置。**GUI 点击经常偏就关掉它**。
 - 坐标方式在会话创建时固定：切换后请新建一个「＋ 新建 / 电脑操作」会话；已打开的会话保持原样。
+- **CU ↔ 后台标准模式互通（v0.2.15）**：CU 会话用 `code_agent` 派出的后台标准会话自带 `computer_use` 工具。后台遇到必须点桌面 / 看屏幕 / 操作原生对话框的步骤时，会把这一步交回启动它的 CU 会话；前台做完后用一两句话回结果，后台接着干。同一前台会话串行处理，单次回传上限 20 次；前台关闭 / 一直没开始 / 超时都会给明确失败，不会让后台无限重试。
 
 ### 项目 / 会话模型
 
@@ -106,7 +107,61 @@ DeepSeek Harness 一体化助手插件：**悬浮球 → 控制室**，外加**�
 - **输出被截断自动续写**：模型撞到输出 token 上限时，聊天里会出现「已达到输出 token 上限／回答被截断…发送“继续”可让模型接着输出」；托管开着时由宿主自动补一条「继续」接着跑，不需要人守着。判定与那条提示同源（`turn/end` 的 `reason.kind === 'max-tokens'`），实现见 `src/tuoguan-autocontinue.ts`：只在会话真的空闲、收件箱没有别的排队工作时补；截断后 90 秒内没等到空闲就放弃；子代理会话不补；连续 8 次封顶（正常收尾或真人发话即清零），到顶停手等你确认。
 - 状态存宿主，手机与电脑同步；默认开启（只记录被显式关闭的会话）。决策应答与自动续写都在宿主执行，所以页面关着 / 手机断线 / 会话只留在控制室列表里时照样生效，多端同时开着也只答一次。
 
-## 安装
+### 防空转补步（turn-guard，2026-11-05 并入）
+
+- 模型把工具调用写成正文（整行以 `<tool_call>` / `<parameter=` / `<function=` 之类的标记开头），或者只思考、既没有正文也没有工具调用时，宿主在 turn 收尾处补一条以 `[turn-guard]` 开头的纠正消息，让循环带着它再走一步，而不是整轮 `completed` 结束。判定见 `src/turn-guard.ts`（`judge()`：有结构化 tool-call 不动、正常正文不动、行内/围栏代码里的引用不算泄漏、同一轮最多补 `maxPerTurn` 次）。
+- **开关在「设置 → 个人助手 → 托管」**（composer 那个「托管」只管提问/审批自动应答与截断续写，两者不是一回事）。开关状态存宿主 `<profile>/dsh-assistant-turn-guard.json`，路由 `GET/POST /.dsh-assistant/turn-guard`，手机与电脑共用同一份；宿主每个 turn 收尾按文件实时判断，点完立即生效、不用重启。
+- 顺带保留原插件的「历史闸」：`agent/pre-step` 上给即将落盘、缺 `id` 的 user/message 就地补 uuid（缺 id 会让整条会话在下次读回时被判 corrupt，2026-11-02 写坏过 5 条）。开关关闭时这道闸也不动手。
+- 原独立插件 `dsh-turn-guard` 已在 profile 的 `cordis.patch.yml` 里停用（那段被注释，备份为 `cordis.patch.yml.bak-turn-guard-merged-20261105`），避免两个实例各补一步。诊断日志：`~/.dsh/dsh-assistant-turn-guard.log`（`load` 行带版本与 presets，`steer` 行记录每次补步）。
+
+## 给其他人装（第三方用户看这一节）
+
+作者本机的路径、词表、更新源都不在仓库里；别人装只需要他自己的几项设置。前提与步骤：
+
+### 前提
+
+| 项 | 要求 | 说明 |
+|---|---|---|
+| Node.js | **≥ 22** | `package.json` 的 `engines` 与构建目标都是 node22；测试脚本直接跑 `.ts`（靠 Node 22 的类型剥离） |
+| 包管理器 | npm / pnpm 任一 | 依赖只有 `qrcode` / `koffi` / `zod` 三个 |
+| 原生模块 `koffi` | 需要能装上（Windows x64 有预编译包） | **装不上也不影响插件启动**：只有「点球后把 DSH 窗口提到前台」这一项不可用，设置页会标出来（v0.2.16 起 koffi 改为懒加载） |
+| 宿主 | DeepSeek Harness（Desktop 或 `dsh web`），带 `webServer` | headless profile 没有 webServer 时会跳过全部路由（只打日志，不崩） |
+| peerDependencies | `@deepseek-ai/cordis`、`@deepseek-ai/dsh-host-webserver`、`@deepseek-ai/dsh-client-locale` | 全部 **optional**，由宿主提供，不用单独装 |
+| 平台 | Windows 完整体验；macOS / Linux 可用但降级 | 窗口外原生球需要 Electron 运行时（没有就用页内球）；`.command`/`.sh` 安装脚本尚未提供，Linux/mac 请用 `npm link` 或手动建软链 |
+| 许可证 | **GPL-2.0** | 整包 GPL-2.0（内含 dsh-pocket 的 GPL 代码）。对外分发必须带源码、同许可；原作者与上游插件版权声明见 `NOTICE` / 各 `LICENSE*` |
+| 分发方式 | 目前**没有 npm 发布** | 用 `npm pack` 产 tgz 或直接 `dsh plugin --profile <p> add <tgz>`；仓库 `.github/workflows/ci.yml` 只跑 build/check/test/lint，不含发布 |
+
+### 安装
+
+```powershell
+# 1) 拿代码（或解压 tgz 后进目录）
+git clone <你的 fork 或上游> dsh-assistant
+cd <你放代码的目录>          # 不要照抄作者机器上的路径
+npm install                  # 装 esbuild / koffi 等
+npm run build                # 产物：lib/index.js + lib/pocket.js + lib/client.js
+
+# 2) 装进 profile（默认 desktop；`dsh web` 用户传 web）
+node scripts\install-assistant.mjs desktop
+
+# 3) 重启 DSH Desktop（宿主改动必须重启；纯客户端改动刷新页面即可）
+```
+
+回退：把 `<用户目录>\.dsh\profiles\<profile>\package.json.bak-assistant-<时间戳>` 复制回 `package.json`，重启即可。
+
+### 装完要填的几项（设置 → 个人助手 → 本机配置）
+
+| 分组 | 填什么 | 不填会怎样 |
+|---|---|---|
+| 目录与路径 | **默认项目父目录**（目录选择器）、**技能根目录**（目录选择器，通常 `~/.dsh/skills`） | 新建项目落到系统桌面；论文模板里的技能文件路径为空/找不到 |
+| 语音词表 | 自己的人名 / 校名 / 店名（听到 → 应改成）；可导入导出 JSON | 语音转写不会纠这些专有名词（其它通用词照常纠） |
+| 目录边界 | 一般**不用填**；要访问桌面/家目录之外的盘（如 `D:\`）时加一条 | 内容窗访问那些盘会 403（提示里会告诉你加哪一条） |
+| 更新检查 | **默认关闭**；想检查更新就填你自己的 `owner/repo` 并打开开关 | 保持关闭：不会去连作者的仓库，也不会被"升级"成作者的构建 |
+
+> 更新源单独说明：`updateCheck.ts` 不再写死作者仓库。`updateSource` 为空 = 完全不联网检查；
+> 填了 `owner/repo` 后，「检查更新」读的是 `https://api.github.com/repos/<owner/repo>/releases/latest`，
+> 升级命令也指向同一个仓库。
+
+## 安装（作者本机）
 
 ```powershell
 cd D:\dsh-assistant
@@ -143,13 +198,18 @@ node scripts\uninstall-assistant.mjs --purge
 
 ## 本机个人化配置（不入库）
 
-仓库里没有任何「只有本机才成立」的常量（个人目录、人名词表、技能根）。这些值放在本地配置文件：
+仓库里没有任何「只有本机才成立」的常量（个人目录、人名词表、技能根、更新源）。这些值放在本地配置文件：
 
 ```
 ~/.dsh/assistant/config.json          ← 首选（助手家目录里）
 <DSH_HOME>/dsh-assistant-config.json  ← 兼容旧位置
 $DSH_ASSISTANT_CONFIG                 ← 显式覆盖（换机 / 测试用）
 ```
+
+**两种改法，效果一样**：
+
+1. **界面改（推荐）**：设置 → 个人助手 → **🧩 本机配置**（四个分组：目录与路径 / 语音词表 / 目录边界 / 更新检查）。保存走 `POST /api/assistant/config`，宿主原子写盘（tmp→rename）后立即生效。
+2. **手改 JSON**：字段见下表；改完页面刷新一次即可（宿主按 mtime 重读，不用重启）。
 
 字段（都可选）：
 
@@ -159,16 +219,28 @@ $DSH_ASSISTANT_CONFIG                 ← 显式覆盖（换机 / 测试用）
   "skillRoot": "C:\\Users\\me\\.dsh\\skills",
   "asrTerms": [{ "pattern": "示例昵称|示例昵称写错", "replace": "示例规范名" }],
   "allowedRoots": ["D:\\我的项目盘"],
+  "allowAllLocalPaths": false,
   "persona": { "title": "本机人设", "lines": ["我是谁，做什么"] },
-  "termEnvAllow": ["PATH", "HOME"]
+  "termEnvAllow": ["PATH", "HOME"],
+  "updateSource": "your-name/dsh-assistant-fork",
+  "updateCheckEnabled": false
 }
 ```
 
-- `newProjectParent`：新建项目未选文件夹时的默认父目录；未配置时按「平台 Desktop → 助手目录下的 `projects/`」回落（UI 里显示为「默认（本机配置）」，点「选择位置…」可临时改）。
-- `skillRoot`：`templates.ts` / `verifyLoop.ts` 里技能文件路径的前缀；未配置时用 `<DSH_HOME>/skills`。
-- `asrTerms`：语音转写的个人化词表（人名 / 校院名 / 店名）。正则源串写进 JSON，`flags` 缺省为 `g`；坏正则只跳过该条。
-- `persona`：写进 `AGENTS.md` 的托管段落（只在这份 AGENTS.md 是本插件生成的通用模板时插入；你自己写的 AGENTS.md 永远不动）。
-- 改完配置文件：页面刷新一次（宿主已下发，客户端缓存刷新）；纯 client 改动不需要重启 DSH。
+| 字段 | 作用 | 未配置时的兜底 |
+|---|---|---|
+| `newProjectParent` | 新建项目未选文件夹时的默认父目录 | 平台 Desktop → 助手目录下的 `projects/` |
+| `skillRoot` | `templates.ts` / `verifyLoop.ts` 里技能文件路径的前缀 | `<DSH_HOME>/skills`（**唯一**回落，客户端不再自己拼 `~`） |
+| `asrTerms` | 语音转写的个人化词表（人名 / 校院名 / 店名）；`flags` 缺省 `g`，坏正则只跳过该条 | 空数组 = 只纠通用词 |
+| `allowedRoots` | 目录边界（allowlist）追加根 | 默认根已含助手目录、DSH 数据根、桌面、项目父目录、技能根、临时目录与用户主目录 |
+| `allowAllLocalPaths` | 逃生开关：true = 关掉目录边界检查（**危险**，界面要输 `ALLOW-ALL` 确认） | `false` |
+| `persona` | 写进 `AGENTS.md` 的托管段落（`<!-- dsh-assistant:persona -->` 之间；用户手写的 AGENTS.md 不动） | 不注入；改动会**替换**已有托管段（v0.2.16 起，不再"只写一次"） |
+| `termEnvAllow` | 终端最小环境变量名追加项 | 只有内置白名单 |
+| `updateSource` | 更新源仓库 `owner/repo`；空 = 不检查更新 | 空（**默认不联网检查**） |
+| `updateCheckEnabled` | 是否允许检查 GitHub 更新 | `false` |
+
+改了 `allowedRoots` / `allowAllLocalPaths` 之后**不用重启**：目录 allowlist 每次请求都会重读本机配置（`path-guard.ts` 的 `check()` 自带同步）。
+
 
 ## 开发
 

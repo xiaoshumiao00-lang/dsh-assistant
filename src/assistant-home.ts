@@ -157,6 +157,26 @@ function personaBlockFromConfig(): string {
   ].filter((line) => line !== '').join('\n')
 }
 
+/**
+ * 把托管人设段合并进 AGENTS.md 正文（P0-5：不再「只写一次」）：
+ *   - 文件里已有 PERSONA_BEGIN/END → 用最新配置**替换**这一整段（配置删了就整段移除）；
+ *   - 没有托管段、但文件是本插件写的通用模板 → 追加一次；
+ *   - 用户手写的 AGENTS.md（不含通用模板句）→ 一个字都不动。
+ */
+function applyPersonaSection(text: string, block: string): string {
+  const start = text.indexOf(PERSONA_BEGIN)
+  const end = text.indexOf(PERSONA_END)
+  if (start >= 0 && end > start) {
+    const before = text.slice(0, start).replace(/\s*$/, '\n\n')
+    const after = text.slice(end + PERSONA_END.length).replace(/^\s*\n/, '')
+    if (block === '') return (before + after).replace(/\n{3,}/g, '\n\n')
+    return before + block + '\n\n' + after.replace(/^\n+/, '')
+  }
+  if (block === '') return text
+  if (text.includes('你是这个助手目录主人的私人助手')) return text.replace(/\s*$/, '\n\n') + block
+  return text
+}
+
 /** 确保目录与 AGENTS.md 存在。已存在的 AGENTS.md 一律不动（用户可能手改过），
  *  只补一次缺少的「家目录规矩」小节，以及（本机配置有人设时）托管的人设段落。 */
 export function ensureAssistantHome(): AssistantHome {
@@ -187,15 +207,31 @@ export function ensureAssistantHome(): AssistantHome {
         current = current.replace(/\s*$/, '\n\n') + ARCHIVE_RULES_MD
         changed = true
       }
-      // 托管人设：只在文件里有本插件写的通用模板时插入（用户手写的 AGENTS.md 不动）。
-      if (persona && !current.includes(PERSONA_BEGIN) && current.includes('你是这个助手目录主人的私人助手')) {
-        current = current.replace(/\s*$/, '\n\n') + persona
+      // 托管人设：替换已有托管段 / 追加一次 / 配置清空时移除（用户手写的 AGENTS.md 不动）。
+      const withPersona = applyPersonaSection(current, persona)
+      if (withPersona !== current) {
+        current = withPersona
         changed = true
       }
       if (changed) writeFileSync(agentsFile, current, 'utf8')
     }
   } catch { /* 只读盘：会话仍可跑，只是没有人设 */ }
   return { dir, journal, notes, agentsFile, outputs, archive }
+}
+
+/**
+ * 把本机配置里的 persona 立刻同步进 AGENTS.md（P0-5：设置页保存后即时生效）。
+ * 返回是否真的改了文件，便于路由/面板如实告诉用户。
+ */
+export function syncPersonaSection(): { changed: boolean; file: string } {
+  const dir = assistantHomeDir()
+  const file = join(dir, 'AGENTS.md')
+  let before = ''
+  try { before = existsSync(file) ? readFileSync(file, 'utf8') : '' } catch { /* 读不到就当空 */ }
+  const home = ensureAssistantHome()
+  let after = ''
+  try { after = readFileSync(home.agentsFile, 'utf8') } catch { /* 只读盘 */ }
+  return { changed: before !== after, file: home.agentsFile }
 }
 
 /** 目录体积（只统计自家四个区，不递归乱扫）。 */

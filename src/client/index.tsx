@@ -15,7 +15,7 @@ import { NS as ORB_NS, zh as ORB_ZH, type OrbKey } from './pocket/orb/locales.ts
 import { POCKET_ENDPOINTS, POCKET_RPC_CHANNEL } from './pocket/api.js'
 import { ICON_CHOICES, resolveProjectIcon, pickUnusedIcon } from './projectIcons'
 import { focusSessionInHost, sessionFaceState, healBlankSessionIfStuck, type FocusResult } from './sessionFocus'
-import { archivableBlankRows, looksBlankWithoutFlag, normalizeFolderPath, transientVisibility, unownedSessionIds } from './sessionFolder'
+import { archivableBlankRows, looksBlankWithoutFlag, normalizeFolderPath, projectClaims, transientVisibility, unownedSessionIds } from './sessionFolder'
 import { assistantHomeDir } from './assistant-entry'
 import { ASSISTANT_PROJECT_ID, ASSISTANT_CARD_NAME, ASSISTANT_CARD_ICON, shouldAddAssistantCard, withAssistantCard } from './assistant-card'
 import { hasPendingInteraction, sessionStatusSourceOf, pendingInteractionSignature } from './sessionStatus'
@@ -76,7 +76,7 @@ type DockMode = 'footer' | 'float'
 
 // ── 更新检查：仓库、版本、升级指令、缓存全部来自 updateCheck（P0-4：唯一的更新源）──
 import {
-  LOCAL_VERSION, UPDATE_REPO, UPGRADE_CMD, UPGRADE_AI, checkUpdate,
+  LOCAL_VERSION, updateRepoUrl, upgradeCommand, upgradeAiPrompt, checkUpdate,
   getAutoCheck, setAutoCheck, setSkipVersion, readCache, type UpdateInfo,
 } from './updateCheck'
 // 更新提示图标（手绘 SVG，避免 emoji 跨平台渲染差异）
@@ -1749,19 +1749,87 @@ async function workspaceIdAtFolder(folder: string): Promise<string | null> {
   return typeof id === 'string' && id ? id : null
 }
 
+/** 目录 → 宿主工作区 id 的会话内缓存。
+ *
+ *  为什么值得缓存：`workspaces.create({path})` 每次都要宿主重新确认目录、写工作区存档，
+ *  再回一份快照；同一个项目卡片反复「＋新建会话」时这份活儿完全重复。缓存只在**建会话失败**时
+ *  作废（工作区被删/目录被挪），下一次自然重新注册，行为与不缓存完全一致。 */
+const workspaceIdByFolder = new Map<string, string>()
+/** 在途注册：预热与「创建」撞在一起时共用同一次注册（宿主侧本来就幂等，这里只是别白跑两趟） */
+const workspacePendingByFolder = new Map<string, Promise<string | null>>()
+
+/** 幂等 mkdir（插件服务端；失败返回 false，由调用方决定是否继续） */
+async function wtMkdir(abs: string): Promise<boolean> {
+  try {
+    const r = await fetch('/api/worktable/mkdir', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: abs }) })
+    return r.ok
+  } catch { return false }
+}
+
+/** 注册（或取回）目录对应的宿主工作区；只注册、不建目录（预热走这条，用户取消面板也不会凭空建目录） */
+function registerWorkspaceOnce(folder: string): Promise<string | null> {
+  const cached = workspaceIdByFolder.get(folder)
+  if (cached) return Promise.resolve(cached)
+  const pending = workspacePendingByFolder.get(folder)
+  if (pending) return pending
+  const task = (async (): Promise<string | null> => {
+    let ws: string | null = null
+    try { ws = await workspaceIdAtFolder(folder) } catch { /* 注册失败：由调用方回退 cwd */ }
+    if (ws) workspaceIdByFolder.set(folder, ws)
+    return ws
+  })()
+  workspacePendingByFolder.set(folder, task)
+  void task.finally(() => { if (workspacePendingByFolder.get(folder) === task) workspacePendingByFolder.delete(folder) }).catch(() => {})
+  return task
+}
+
+/** 取目录的宿主工作区 id；allowMkdir=true 时注册失败会补建目录再试一次（模板步骤目录等新目录）。 */
+async function ensureWorkspaceId(folder: string, allowMkdir: boolean): Promise<string | null> {
+  const first = await registerWorkspaceOnce(folder)
+  if (first || !allowMkdir) return first
+  await wtMkdir(folder)
+  return registerWorkspaceOnce(folder)
+}
+
+/** 预热：打开「新建会话」面板时后台先把目录注册成宿主工作区。
+ *  用户挑模型那 1–3 秒里跑完，点「创建」时这一跳已经在缓存里。失败静默，创建时照常补。 */
+async function warmWorkspaceForFolder(folder: string): Promise<void> {
+  if (!folder || workspaceIdByFolder.has(folder)) return
+  try { await registerWorkspaceOnce(folder) } catch { /* 预热失败不影响创建 */ }
+}
+
 /** 在指定目录注册工作区并建会话：优先 workspace.create({path})（前端工作区可见、不用手动选地址），
  *  失败回退 sessions.create({cwd})。返回会话 id 或 null。可选 title = 会话标题（命名规范见 templates.ts）。
- *  注意：模板项目自动开会话必须走这条路径——仅 {cwd} 建会话时宿主工作区面板为空，会提示「选择一个工作区开始」。 */
+ *  注意：模板项目自动开会话必须走这条路径——仅 {cwd} 建会话时宿主工作区面板为空，会提示「选择一个工作区开始」。
+ *
+ *  路径优化（功能不变，只是少绕路）：
+ *    ① 命中 workspaceIdByFolder / 预热结果 → 直接建会话，省掉一次 workspace.create；
+ *    ② 目录不存在（模板步骤目录等）时才补 mkdir，成功后重试一次注册。
+ *       旧写法是每次新建无条件先 mkdir 一次，等于凭空多一个网络往返。 */
 async function createSessionAtFolder(folder: string, title?: string): Promise<string | null> {
   const b = sessionBridge
   if (!b || typeof b.sessions?.create !== 'function') return null
-  try {
-    let workspaceId: string | null = null
-    try { workspaceId = await workspaceIdAtFolder(folder) } catch { /* 工作区注册失败：回退 cwd 建会话 */ }
-    const createOpts: any = workspaceId ? { workspaceId } : { cwd: folder }
-    const sid = await b.sessions.create(createOpts)
+  const finish = (sid: string | null): string | null => {
     if (sid && title) void setSessionTitle(sid, title)
     return sid
+  }
+  const createWith = async (workspaceId: string | null): Promise<string | null> => {
+    const sid = await b.sessions.create(workspaceId ? { workspaceId } : { cwd: folder })
+    return typeof sid === 'string' && sid ? sid : null
+  }
+  let workspaceId: string | null = null
+  try { workspaceId = folder ? await ensureWorkspaceId(folder, true) : null } catch { workspaceId = null }
+  // 缓存/预热给的工作区可能已经失效（宿主重启、工作区被删）：删缓存、重新注册再来一次
+  if (workspaceId) {
+    try {
+      const sid = await createWith(workspaceId)
+      if (sid) return finish(sid)
+    } catch { /* 落到下面重新注册 */ }
+    workspaceIdByFolder.delete(folder)
+    try { workspaceId = await ensureWorkspaceId(folder, false) } catch { workspaceId = null }
+  }
+  try {
+    return finish(await createWith(workspaceId))
   } catch {
     return null
   }
@@ -1906,14 +1974,29 @@ function openSessionInHost(sessionId: string | null | undefined): boolean {
 /** 新建会话后的「聚焦」：等它进宿主会话列表 → 必要时重拉列表 → 重试打开 → 校验当前会话
  *  → 空白会话的历史流若卡在 loading 就重建它（否则主区停在 settling = 纯白）。
  *
+ *  `returnOnOpened:true`（新建会话面板走这条）= 宿主确认切过去就立刻返回，把空白历史流自愈
+ *  放到后台：用户看到输入框的时间从「建会话 + 自愈」降到「建会话 + 一次 open」。
+ *
  *  结果写 window.__dshAssistantLastFocus（完整诊断）并 POST 到 /api/assistant/focus-diag 落盘，
  *  出问题时不用开 DevTools 也能拿到状态。 */
-async function focusNewSession(sessionId: string, onOpened?: (result: FocusResult) => void): Promise<FocusResult> {
-  const r = await focusSessionInHost(sessionBridge, sessionId, { onOpened })
-  const diag = { ...r, at: Date.now(), dom: focusDomProbe() }
-  try { (window as any).__dshAssistantLastFocus = diag } catch {}
-  if (!r.opened || !r.settled) console.warn('[dsh-assistant] 新会话聚焦未完全就绪：', JSON.stringify(diag))
-  void postFocusDiag(diag)
+async function focusNewSession(
+  sessionId: string,
+  onOpened?: (result: FocusResult) => void,
+  opts: { returnOnOpened?: boolean } = {},
+): Promise<FocusResult> {
+  const publish = (r: FocusResult, kind: string): void => {
+    const diag = { ...r, kind, at: Date.now(), dom: focusDomProbe() }
+    try { (window as any).__dshAssistantLastFocus = diag } catch {}
+    if (!r.opened || !r.settled) console.warn('[dsh-assistant] 新会话聚焦未完全就绪：', JSON.stringify(diag))
+    void postFocusDiag(diag)
+  }
+  const r = await focusSessionInHost(sessionBridge, sessionId, {
+    onOpened,
+    returnOnOpened: opts.returnOnOpened === true,
+    // 后台自愈结束再补一条：这条才有最终 openState/settled/resyncs
+    onSettled: (late) => publish(late, 'focus-settled'),
+  })
+  publish(r, opts.returnOnOpened === true ? 'focus-opened' : 'focus')
   return r
 }
 
@@ -1943,6 +2026,28 @@ async function postFocusDiag(diag: Record<string, unknown>): Promise<void> {
       body: JSON.stringify({ diag, at: new Date().toISOString() }),
     })
   } catch { /* 诊断失败不影响主流程 */ }
+}
+
+/** 单调时钟（比 Date.now 稳：不受系统时间跳变影响，单位毫秒） */
+const nowMs = (): number => (typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now())
+
+/** 新建会话的分步耗时落盘：createMs（建会话）/ openMs（到输入框可用）。
+ *  写进同一份聚焦日志（kind: 'new-session-timing'），以后觉得慢时不用开 DevTools 就知道慢在哪一段。 */
+function reportNewSessionTiming(info: Record<string, unknown>): void {
+  try { console.info('[dsh-assistant] 新建会话耗时', JSON.stringify(info)) } catch {}
+  void postFocusDiag({ kind: 'new-session-timing', ...info, at: Date.now() })
+}
+
+/** 该会话当前用的模型是否已经是 want。是 → 不必再发 selectModel：
+ *  那一次 RPC 会让宿主重启这个会话的 Agent，历史流重挂、输入框跟着再闪一下。 */
+async function sessionAlreadyUsesModel(sessionId: string, want: { provider: string; model: string }): Promise<boolean> {
+  const api = hostApi?.sessions
+  if (!api || typeof api.models !== 'function') return false
+  try {
+    const res = await api.models({ sessionId })
+    const cur = res?.result?.ok ? res.result.value?.current : null
+    return !!cur && cur.provider === want.provider && cur.model === want.model
+  } catch { return false }
 }
 
 /** 空白会话白屏自愈看门狗：不是插件新建、而是用户从侧栏点开一条「历史流卡在 loading」的
@@ -2105,26 +2210,16 @@ function clearAgentErrors(ids: string[]) {
   if (dirty) saveAgentErrors(map)
 }
 
-/** 临时卡片不重复收纳的目录：**有卡片存在**的项目文件夹 + 无文件夹项目的绑定会话目录。
- *  后者与项目卡片 relatedSidsOf 的目录基准同源（项目没有文件夹时，卡片按绑定会话的 cwd 看会话），
- *  避免同一批会话既出现在项目卡片上、又出现在临时卡片上。
- *  已删除（removed）或没有卡片（不在 layouts / 注册表）的残留项目不算：它们已经没有任何卡片能看到这些会话。 */
-function projectOwnedFolders(state: { projects: ProjectsState; aliveRegisteredIds: string[] }): string[] {
-  const pr = state.projects
-  const removed = new Set(pr.removed ?? [])
-  const known = new Set<string>([CONSOLE_ID, ...state.aliveRegisteredIds, ...pr.layouts.map((l) => l.id)])
-  const out = new Set<string>()
-  for (const [pid, folder] of Object.entries(pr.folders)) {
-    if (removed.has(pid) || !known.has(pid)) continue
-    if (typeof folder === 'string' && folder) out.add(folder)
-  }
-  for (const [pid, sid] of Object.entries(pr.bindings)) {
-    if (removed.has(pid) || !known.has(pid)) continue
-    if (pr.folders[pid]) continue
-    const cwd = cwdOfSession(sid)
-    if (cwd) out.add(cwd)
-  }
-  return [...out]
+/** 控制室「有卡片的项目」认领的目录与会话：临时卡片「正在运行」据此不重复收纳。
+ *  判定本体在 sessionFolder.ts（纯函数，可单测）：**隐藏项目不算**——它没有卡片，
+ *  会话若也被算成「项目已收编」，就会既不上项目卡、也不进临时卡片，跑起来谁也看不见。 */
+function projectClaimsOf(state: { projects: ProjectsState; aliveRegisteredIds: string[] }): { folders: string[]; sessions: string[] } {
+  return projectClaims({
+    projects: state.projects,
+    consoleId: CONSOLE_ID,
+    aliveRegisteredIds: state.aliveRegisteredIds,
+    cwdOf: (sid) => cwdOfSession(sid),
+  })
 }
 
 /** 临时卡片「收工」记录：会话 id → 收工时间戳。
@@ -2542,7 +2637,7 @@ function WorktableSection(props: any) {
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
   const [updateCheckOn, setUpdateCheckOn] = useState<boolean>(() => getAutoCheck())
   const [updateCopied, setUpdateCopied] = useState(false)
-  const [updateStatus, setUpdateStatus] = useState<'idle' | 'checking' | 'uptodate' | 'failed'>(() => readCache().status)
+  const [updateStatus, setUpdateStatus] = useState<'idle' | 'checking' | 'uptodate' | 'failed' | 'disabled'>(() => readCache().status)
   const updateCheckingRef = useRef(false)
   const updateAliveRef = useRef(true)
   useEffect(() => () => { updateAliveRef.current = false }, [])
@@ -2567,7 +2662,7 @@ function WorktableSection(props: any) {
     return () => window.clearTimeout(timer)
   }, [headless, updateCheckOn, checkUpdates])
   const copyUpgradeAi = async () => {
-    const ok = await copyText(UPGRADE_AI)
+    const ok = await copyText(upgradeAiPrompt())
     if (ok) { setUpdateCopied(true); setTimeout(() => setUpdateCopied(false), 2200) }
   }
   const skipUpdate = () => {
@@ -3102,24 +3197,16 @@ function WorktableSection(props: any) {
     if (!snap) return
     const byId: Record<string, any> = snap.byId ?? {}
     const ids: string[] = Array.isArray(snap.ids) ? snap.ids : Object.keys(byId)
-    const pr = projectsRef.current.projects
-    const owned = new Set<string>()
-    const removed = new Set(pr.removed ?? [])
-    const known = new Set<string>([CONSOLE_ID, ...projectsRef.current.aliveRegisteredIds, ...pr.layouts.map((l) => l.id)])
-    for (const [pid, sid] of Object.entries(pr.bindings)) {
-      if (removed.has(pid) || !known.has(pid)) continue
-      if (typeof sid === 'string' && sid) owned.add(sid)
-    }
-    for (const [pid, run] of Object.entries(pr.flows ?? {})) {
-      if (removed.has(pid) || !known.has(pid)) continue
-      for (const sid of Object.values(run?.stepSessions ?? {})) if (typeof sid === 'string' && sid) owned.add(sid)
-    }
     let archived = new Set<string>()
     try {
       const wsnap = sessionBridge?.workspaces?.list?.getSnapshot?.()
       if (Array.isArray(wsnap?.archivedSessionIds)) archived = new Set(wsnap.archivedSessionIds.map(String))
     } catch {}
-    const folders = projectOwnedFolders(projectsRef.current)
+    // 与卡片同一套「哪些会话已被可见项目卡认领」：隐藏项目的目录/绑定会话不算，
+    // 否则它们的「跑 → 停」不会被记录，临时卡片也就永远看不到它们。
+    const claims = projectClaimsOf(projectsRef.current)
+    const owned = new Set(claims.sessions)
+    const folders = claims.folders
     const roots = unownedSessionIds(ids, byId, folders, owned, archived)
     const present = new Set(roots)
     // 与卡片同一个「在跑」口径：根会话在跑 / 子代理在跑 / 会话面还有未结束轮次
@@ -3602,23 +3689,17 @@ function WorktableSection(props: any) {
     transientTrackedIdsRef.current = []
     const transientRows: TransientRow[] = []
     try {
-      const owned = new Set<string>()
-      const removed = new Set(pr.projects.removed ?? [])
-      const known = new Set<string>([CONSOLE_ID, ...pr.aliveRegisteredIds, ...pr.projects.layouts.map((l) => l.id)])
-      for (const [pid, sid] of Object.entries(pr.projects.bindings)) {
-        if (removed.has(pid) || !known.has(pid)) continue
-        if (typeof sid === 'string' && sid) owned.add(sid)
-      }
-      for (const [pid, run] of Object.entries(pr.projects.flows ?? {})) {
-        if (removed.has(pid) || !known.has(pid)) continue
-        for (const sid of Object.values(run?.stepSessions ?? {})) if (typeof sid === 'string' && sid) owned.add(sid)
-      }
+      // 已被可见项目卡（绑定 / 模板步骤 / 文件夹）认领的会话不进临时卡片；
+      // **隐藏项目的卡片不在网格里，所以它的目录与会话一律不算认领**，否则这些会话
+      // 既不上项目卡、也不进临时卡片 —— 任务跑起来控制室里一张卡都不会动（用户报的 bug）。
+      const claims = projectClaimsOf(pr)
+      const owned = new Set(claims.sessions)
       let archived = new Set<string>()
       try {
         const wsnap = sessionBridge?.workspaces?.list?.getSnapshot?.()
         if (Array.isArray(wsnap?.archivedSessionIds)) archived = new Set(wsnap.archivedSessionIds.map(String))
       } catch {}
-      const folders = projectOwnedFolders(pr)
+      const folders = claims.folders
       const roots = unownedSessionIds(snapshotIds, byId, folders, owned, archived)
       const dismissed = loadTransientDismissed()
       for (const sid of roots) {
@@ -3913,6 +3994,8 @@ function WorktableSection(props: any) {
         // 图标选择器：控制室「项目管理」面板的「更换图标」按钮传入锚点元素（below：贴按钮下方，不挡操作列）
         onPickIcon: (id, anchor, opts) => { try { openIconPick('project', id, anchor, opts) } catch {} },
         onCreateSession: (id, opts) => createProjectSession(id, opts),
+        // 面板一打开就预热项目目录的工作区注册：用户挑模型的时间足够跑完，点「创建」少一跳
+        onWarmNewSession: (id) => { try { void warmWorkspaceForFolder(newSessionFolderOf(id)) } catch {} },
         onPinSession: (sid, pinned) => pinProjectSession(sid, pinned),
         onArchiveSession: (sid, archived) => archiveProjectSession(sid, archived),
         onArchiveBlankSessions: (pid) => archiveBlankProjectSessions(pid),
@@ -4268,8 +4351,6 @@ function buildCustomLayoutPrompt(req: string): string {
    *  沿用它当前对话的工作目录（同目录续开）。绑定到该项目（卡片的状态与预览随之跟踪新会话）并自动切过去。 */
   const openNewProjectSession = async (pid: string): Promise<boolean> => {
     const folder = newSessionFolderOf(pid)
-    // 目标可能是模板项目里尚未「开始此步」的步骤子目录：先幂等建目录，否则宿主工作区注册会失败
-    if (folder) { try { await apiMkdir(folder) } catch {} }
     // defaults:false —— 预设/模型 RPC 推迟到会话挂载之后（见 applyNewSessionDefaults 注释）
     const sid = await createBoundSession(pid, folder, { defaults: false })
     if (!sid) {
@@ -4283,13 +4364,13 @@ function buildCustomLayoutPrompt(req: string): string {
       // 宿主已接受切换就立刻露出会话；空白历史修复与诊断继续后台完成。
       controlRoomStore.setOpen(false)
       notifyConsole()
-    })
-    if (!focus.opened || !focus.settled) {
-      if (!focus.opened) openSessionInHost(sid)
+    }, { returnOnOpened: true })
+    if (!focus.opened) {
+      openSessionInHost(sid)
       try { await sessionBridge?.sessions?.refresh?.() } catch {}
+      controlRoomStore.setOpen(false)
+      notifyConsole()
     }
-    controlRoomStore.setOpen(false)
-    notifyConsole()
     void applyNewSessionDefaults(sid)
     return true
   }
@@ -4297,15 +4378,21 @@ function buildCustomLayoutPrompt(req: string): string {
   /** 控制室卡片「＋ 新建会话」带模式：标准模式（宿主默认预设）/ computer-use（dsh-orb 电脑操作预设）。
    *  computer-use 支持选前台模型（该会话后续消息用）与后台模型（dsh-orb 后台 Agent，全局）。
    *  入口：控制室「新建」按钮弹出的小面板（split.tsx NewSessionDialog）。
-   *  返回值 = 是否建成：调用方据此决定「关闭弹窗」还是「留在弹窗让用户重试」。 */
+   *  返回值 = 是否建成：调用方据此决定「关闭弹窗」还是「留在弹窗让用户重试」。
+   *
+   *  速度约定（用户体感全在这里）：弹窗在**宿主接受切换的那一刻**就关，不等空白历史流自愈
+   *  （自愈 0.7–3 s 挪到后台）；面板里选的模型若已经是该会话在用的模型，就不发 selectModel
+   *  （那一次 RPC 会让宿主重启会话 Agent，历史流重挂、输入框再闪一次）。 */
   const createProjectSession = async (pid: string, opts: NewSessionOptions): Promise<boolean> => {
+    const startedAt = nowMs()
     const folder = newSessionFolderOf(pid)
-    if (folder) { try { await apiMkdir(folder) } catch {} }
     const api = getAssistantApi()
     let sid: string | null = null
     // 只做「建会话」这一件事：预设/模型 RPC 一律推到会话挂载之后再补（见 applyNewSessionDefaults）。
     // 后台模型是全局设置，先写不影响新会话的历史流。
     if (opts.mode === 'computer-use' && api) {
+      // 电脑操作会走 dsh-orb 自己的建会话：目标目录可能是模板里还没建出来的步骤目录，先补一刀
+      if (folder) { try { await wtMkdir(folder) } catch {} }
       try {
         const res = await api.createSession(folder, 'computer-use', { reuseBlank: false })
         sid = res.sessionId
@@ -4328,8 +4415,10 @@ function buildCustomLayoutPrompt(req: string): string {
         })()
       }
     } else {
+      // createSessionAtFolder 内部才按需 mkdir：目录已存在时不再无条件多打一个 HTTP 往返
       try { sid = folder ? await createSessionAtFolder(folder) : await sessionBridge!.sessions.create({}) } catch { sid = null }
     }
+    const createMs = Math.round(nowMs() - startedAt)
     if (!sid) {
       reportUserError(newSessionFailedText(folder))
       return false
@@ -4340,23 +4429,34 @@ function buildCustomLayoutPrompt(req: string): string {
     }
     // ① 先把新会话设为当前（并让它进宿主列表）；② 再关控制室；③ 通知控制室/卡片刷新。
     markPluginSessionOpen(sid)
+    let openMs = 0
     const focus = await focusNewSession(sid, () => {
       // 宿主已接受切换就立刻露出会话；空白历史修复与诊断继续后台完成。
+      openMs = Math.round(nowMs() - startedAt)
       controlRoomStore.setOpen(false)
       notifyConsole()
-    })
-    if (!focus.opened || !focus.settled) {
-      // 兜底：再切一次 + 重拉列表（侧栏立刻能看到它）；仍然 loading 的话把它的历史流重建一次。
-      if (!focus.opened) openSessionInHost(sid)
+    }, { returnOnOpened: true })
+    if (!focus.opened) {
+      // 兜底：再切一次 + 重拉列表（侧栏立刻能看到它）；仍然 loading 的话后台自愈会把它重建一次。
+      openSessionInHost(sid)
       try { await sessionBridge?.sessions?.refresh?.() } catch {}
+      controlRoomStore.setOpen(false)
+      notifyConsole()
     }
-    controlRoomStore.setOpen(false)
-    notifyConsole()
+    reportNewSessionTiming({
+      pid, mode: opts.mode, folder, createMs,
+      openMs: openMs || Math.round(nowMs() - startedAt),
+      opened: focus.opened, attempts: focus.attempts, deferred: focus.deferred === true,
+    })
     // 会话已经挂到主区：这时再补预设/前台模型（后台不阻塞关闭控制室）
     void (async () => {
       if (opts.front && api) {
         try {
-          await api.selectModel(sid as string, opts.front)
+          // 面板默认就选中「上次用过的模型」，通常等于宿主给新会话继承的模型：
+          // 一致时跳过 selectModel（否则宿主会重启 Agent，界面刚出来又重挂一次历史流）
+          if (!(await sessionAlreadyUsesModel(sid as string, opts.front))) {
+            await api.selectModel(sid as string, opts.front)
+          }
           writeModelPref(opts.mode === 'computer-use' ? 'cu' : 'standard', { provider: opts.front.provider, model: opts.front.model, name: opts.front.name ?? opts.front.model })
           return
         } catch (err) { console.warn('[dsh-assistant] 新会话选模型失败：', err) }
@@ -6950,13 +7050,13 @@ function buildCustomLayoutPrompt(req: string): string {
               <div className="dsh-wt_updateHead"><span className="dsh-wt_updateDot" />{t('update.available')} · v{updateInfo.latest}</div>
               <div className="dsh-wt_updateVers">{t('update.current')} v{LOCAL_VERSION} → v{updateInfo.latest}</div>
               {updateInfo.notes && <div className="dsh-wt_updateNotes">{updateInfo.notes}</div>}
-              <div className="dsh-wt_updateCmd">{UPGRADE_CMD}</div>
+              <div className="dsh-wt_updateCmd">{upgradeCommand()}</div>
               <div className="dsh-wt_updateBtns">
                 <button type="button" className="dsh-wt_updateBtn dsh-wt_updateBtnCopy" onClick={() => void copyUpgradeAi()}>
                   {updateCopied ? '✓ ' + t('update.copied') : <>{ICON_SPARK} {t('update.copyAi')}</>}
                 </button>
                 <button type="button" className="dsh-wt_updateBtn" onClick={skipUpdate}>{t('update.skip')}</button>
-                <button type="button" className="dsh-wt_updateBtn" onClick={() => { try { window.open('https://github.com/' + UPDATE_REPO + '/releases/latest', '_blank') } catch { /* 浏览器弹窗被拦：用户自己开 */ } }}>Releases 页</button>
+                <button type="button" className="dsh-wt_updateBtn" onClick={() => { const url = updateRepoUrl(); if (!url) return; try { window.open(url, '_blank') } catch { /* 浏览器弹窗被拦：用户自己开 */ } }}>Releases 页</button>
               </div>
               <div className="dsh-wt_updateHint">{t('update.upgradeHint')}</div>
             </div>
@@ -7042,6 +7142,7 @@ function buildCustomLayoutPrompt(req: string): string {
               v{LOCAL_VERSION}
               {updateStatus === 'uptodate' && !updateInfo ? ' · ' + t('update.upToDate') : ''}
               {updateStatus === 'failed' && !updateInfo ? ' · ' + t('update.checkFail') : ''}
+              {updateStatus === 'disabled' ? ' · ' + t('update.autoOff') : ''}
             </span>
             <span className="dsh-wt_versionActions">
               <button type="button" className="dsh-wt_updateBtn" disabled={updateStatus === 'checking'} onClick={() => void checkUpdates(true)}>

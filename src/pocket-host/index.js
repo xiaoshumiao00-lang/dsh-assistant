@@ -448,6 +448,22 @@ export function apply(ctx, config = {}, internals = {}) {
       else service.stopFixedTunnel?.();
       return cfg;
     },
+    // 六项连接配置（P0-4）：设置页「固定公网地址 → 编辑连接」写回；改完按新配置生效。
+    setSshTunnelConfig: (patch) => {
+      const input = patch && typeof patch === 'object' ? { ...patch } : {};
+      // keyPath 不传 = 保持已存的私钥（空串是「清空」，由调用方显式传）
+      if (input.keyPath === undefined) delete input.keyPath;
+      // 数字字段统一转数字（RPC 里可能收到字符串）
+      for (const key of ['port', 'remotePort', 'localPort']) {
+        if (input[key] === undefined) continue
+        const n = Number(input[key]);
+        if (Number.isFinite(n)) input[key] = n;
+        else delete input[key];
+      }
+      const cfg = setSshTunnelConfig(input);
+      if (cfg.enabled) void service.restartFixedTunnel?.().catch(() => {});
+      return cfg;
+    },
     // 立即重连：走 restart()——先探活收养外部健康隧道，再清本机残留 + 远端旧占用，最后新建；
     // 同时重置退避与「连续自动清理」计数（用户主动点 = 给一轮新的自愈预算）。
     reconnectSshTunnel: () => service.restartFixedTunnel?.() ?? Promise.resolve(),

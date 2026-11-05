@@ -26,10 +26,13 @@ cases.push(['默认父目录来自本机配置（不是仓库常量）', () => {
   assert.equal(skillFileOf('paper-10step/references/02-十步自纠清单.md'), 'D:\\Users\\me\\.dsh\\skills\\paper-10step\\references\\02-十步自纠清单.md')
 }])
 
-cases.push(['技能根未配置时用通用回落（不写用户名）', () => {
+cases.push(['技能根未配置时不伪造回落（2026-11-05：`~` 与绝对路径两种回落统一由宿主决定）', () => {
   primeAssistantConfig({ newProjectParent: PARENT, skillRoot: '', assistantHome: '' })
-  assert.equal(skillRootSync(), '~/.dsh/skills')
-  assert.ok(!skillFileOf('paper-10step/references/01-个人写作基准.md').includes('Users\\\\'))
+  // 客户端不再自己拼 `~/.dsh/skills`（没展开的 `~` 交给 agent 读不到）：宿主没答过就空串。
+  assert.equal(skillRootSync(), '')
+  // 没有根时返回相对路径本身，而不是一个假绝对路径
+  assert.equal(skillFileOf('paper-10step/references/01-个人写作基准.md'), 'paper-10step/references/01-个人写作基准.md')
+  assert.ok(!skillFileOf('paper-10step/references/01-个人写作基准.md').includes('~'))
 }])
 
 cases.push(['空值 → 本机配置的默认父目录（不造伪路径）', () => {

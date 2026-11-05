@@ -52,9 +52,17 @@ cases.push(['更新源只有一个仓库：旧的两个退役仓库名不再出�
     assert.ok(!text.includes('Aisland-SJL'), `${file} 里还有 Aisland-SJL/dsh-worktable 更新源`)
     assert.ok(!text.includes('Paper-Workspace'), `${file} 里还有 Paper-Workspace 更新源`)
   }
-  assert.equal(updateCheck.match(/xiaoshumiao00-lang\/dsh-assistant/g)?.length, 1, 'updateCheck.ts 里更新源应当只出现一次')
-  assert.ok(updateCheck.includes("export const UPDATE_REPO = 'xiaoshumiao00-lang/dsh-assistant'"), '没有单一 UPDATE_REPO 常量')
-  assert.ok(updateCheck.includes('export const UPGRADE_CMD') && updateCheck.includes('export const UPGRADE_AI'), '升级指令没有集中出口')
+  // P0-3（2026-11-05）：更新源不再写死作者仓库——真值来自本机配置 updateSource，
+  // 默认关闭（别人的机器不该被作者的 release 牵着升级）。
+  for (const file of ['src/client/updateCheck.ts', 'src/client/split.tsx', 'src/client/index.tsx']) {
+    assert.ok(!read(file).includes('xiaoshumiao00-lang'), `${file} 里还写死作者仓库`)
+  }
+  assert.ok(updateCheck.includes('export function updateRepo()'), '没有 updateRepo() 这一处更新源出口')
+  assert.ok(updateCheck.includes('export function latestTgzUrl()'), '没有 latestTgzUrl() 出口')
+  assert.ok(updateCheck.includes('export function updateRepoUrl()'), '没有 updateRepoUrl() 出口')
+  assert.ok(updateCheck.includes('export function upgradeCommand(') && updateCheck.includes('export function upgradeAiPrompt('), '升级指令没有集中出口')
+  // 关闭时不许联网：checkUpdate 必须先看 updateCheckAllowed()
+  assert.ok(/if \(!updateCheckAllowed\(\)\)/.test(updateCheck), 'checkUpdate 没有先检查本机开关')
   assert.ok(!/const UPGRADE_CMD = 'dsh plugin/.test(read('src/client/split.tsx')), 'split.tsx 还在自己写升级命令')
 }])
 

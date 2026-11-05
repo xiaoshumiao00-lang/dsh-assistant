@@ -35,6 +35,7 @@
                 Continue a GUI action in this turn only when it does not need that result; otherwise end the turn.
                 Call code_agent_status or code_agent_stop when the user asks about or stops background work.
                 When a plugin notice reports that work finished, decide again: do remaining GUI, or call code_agent with that session_id for another stretch, then tell the user the short conclusion.
+                A running background Code agent can hand one GUI step back through a computer_use notice when it needs the screen. When that arrives, do only that GUI step in this chat: look at the screen first, act, verify, then reply in one or two sentences with the concrete result (what you did, what you saw, paths or values). Do not send that step to code_agent and do not write a report.
                 If the notice says the user stopped that background session, tell the user briefly and do not call code_agent for it again unless the user asks.
           - id: tool-bash
             name: '@deepseek-ai/dsh-tool-bash'

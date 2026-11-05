@@ -282,16 +282,18 @@ export function setCloudflaredPath(value) {
 // 以前靠「计划任务 + tunnel.cmd 循环」维持（黑窗口 + 半死不重连），现在由插件在
 // DSH 启动后自动拉起并探活重连（lib/ssh-tunnel.mjs），零窗口。
 //
-// settings.json 形态：
+// settings.json 形态（值是示例，不是本机实值；设置页「手机访问 → 固定公网地址」可改）：
 //   "sshTunnel": {
 //     "enabled": true,
-//     "host": "49.234.20.84",
+//     "host": "vps.example.com",
 //     "port": 22,
-//     "user": "root",
+//     "user": "ssh-user",
 //     "remotePort": 7080,
-//     "keyPath": "D:\\dsh-frp\\id_ed25519",
+//     "keyPath": "<你的私钥路径，例如 ~/.ssh/id_ed25519>",
 //     "localPort": 0          // 0 = 跟随插件代理实际端口（推荐）
 //   }
+// 2026-11-05（P0-4）：六项都能在设置页里改（RPC `sshTunnel.setConfig`），
+// 不再需要手写这个文件；user 也不再默认 root（必须自己填）。
 /** 当前固定公网隧道配置（未配置返回默认值，enabled=false）。 */
 export function sshTunnelConfig() {
   return normalizeSshTunnelConfig(readSettings().sshTunnel);

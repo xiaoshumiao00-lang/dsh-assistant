@@ -1,15 +1,53 @@
 /** Windows 桌面主窗口唤醒：桌面球 helper 是独立进程，不能直接操作 DSH 的 BrowserWindow。
  *  DSH Desktop 的插件宿主由桌面主进程启动，因此主窗口属于 process.ppid；
- *  同时核对窗口标题，避免 CLI/网页宿主误聚焦父终端。 */
+ *  同时核对窗口标题，避免 CLI/网页宿主误聚焦父终端。
+ *
+ *  2026-11-05（P0-7）：koffi 改成**懒加载 + 容错**。
+ *  以前是顶层 `import koffi from 'koffi'`：非 Windows、原生模块没装好、或 ABI 不匹配时，
+ *  整个插件在 import 阶段就抛错，连工作台/设置页都起不来。现在只在真的要聚焦窗口时才
+ *  require，失败只让「前台窗口聚焦」这一个能力不可用，其余功能照常。
+ */
+import { createRequire } from 'node:module'
 import { spawn } from 'node:child_process'
 import { basename, dirname } from 'node:path'
-import koffi from 'koffi'
 
 /** 托盘隐藏的窗口不能用 Win32 ShowWindow 直接“显示”：
  *  Electron 会把渲染器留在 hidden 状态，窗口虽然出现，但不收鼠标、也不重绘。
  *  这里改为再启动一次 DSH，让主进程的 second-instance → show()/focus() 走官方恢复路径。 */
 let lastWakeAt = 0
 let wakePending = false
+
+/** koffi 模块缓存：undefined = 还没试过，null = 试过但不可用。 */
+let koffiModule: any | null | undefined
+
+/**
+ * 懒加载 koffi（只加载一次）。失败返回 null，**不抛**。
+ * 用 createRequire 而不是 `await import`：焦点函数是同步的（悬浮球点击路径），
+ * 且 require 失败只影响这一次调用。
+ */
+export function loadKoffi(): any | null {
+  if (koffiModule !== undefined) return koffiModule
+  try {
+    const req = createRequire(import.meta.url)
+    koffiModule = req('koffi')
+  } catch {
+    koffiModule = null
+  }
+  return koffiModule
+}
+
+/** 「前台窗口聚焦」能力是否可用（设置页/诊断用；不可用时只说这一项，不影响插件）。 */
+export function nativeFocusAvailability(): { available: boolean; reason: string } {
+  if (process.platform !== 'win32') return { available: false, reason: 'not-windows' }
+  const koffi = loadKoffi()
+  if (!koffi) return { available: false, reason: 'koffi-unavailable' }
+  try {
+    user32(koffi)
+    return { available: true, reason: '' }
+  } catch {
+    return { available: false, reason: 'user32-load-failed' }
+  }
+}
 
 function desktopAppExecutable(): string {
   if (process.platform !== 'win32') return ''
@@ -65,7 +103,7 @@ type User32Api = {
 
 let cached: User32Api | null = null
 
-function user32(): User32Api {
+function user32(koffi: any): User32Api {
   if (cached) return cached
   const lib = koffi.load('user32.dll')
   cached = {
@@ -90,11 +128,13 @@ function titleOf(api: User32Api, hwnd: any): string {
   return buffer.toString('utf16le', 0, length * 2)
 }
 
-/** 恢复最小化/托盘中的 DSH，并把它切到前台。非 Windows 或找不到主窗口时返回 false。 */
+/** 恢复最小化/托盘中的 DSH，并把它切到前台。非 Windows / koffi 不可用 / 找不到主窗口时返回 false。 */
 export function focusDesktopMainWindow(): boolean {
   if (process.platform !== 'win32' || !process.ppid) return false
   try {
-    const api = user32()
+    const koffi = loadKoffi()
+    if (!koffi) return false
+    const api = user32(koffi)
     let hwnd: any = null
     let fallback: any = null
     while ((hwnd = api.FindWindowExW(null, hwnd, null, null))) {

@@ -401,9 +401,23 @@ export function apply(ctx: Context) {
   }
   const routes = manageWebRoutes(server)
   const webServer = routes.webServer
+  /** 路由以外的卸载动作（例如 allowlist 服务的注销） */
+  const extraDisposers: Array<() => void> = []
 
   // 目录 allowlist（P0-5）：内容窗的数据路由只碰允许根以内的路径。
+  // 2026-11-05：guard 不再是一次性快照——check() 每次请求重读本机配置，
+  // 并通过 assistantPathGuard 服务把 refresh() 暴露给「设置 → 个人助手 → 本机配置」。
   const guard = createPathGuard()
+  try {
+    if (typeof ctx?.provide === 'function' && typeof ctx?.get === 'function' && ctx.get('assistantPathGuard') === undefined) {
+      const off = ctx.provide('assistantPathGuard', {
+        refresh: () => guard.refresh(),
+        get roots() { return guard.roots },
+        get open() { return guard.open },
+      })
+      if (typeof off === 'function') extraDisposers.push(off)
+    }
+  } catch { /* 宿主不支持服务注册：保存后靠下一次重载生效 */ }
   ctx.logger?.info?.(`[${PLUGIN_SELF}] 目录 allowlist: ${guard.open ? '全放行（allowAllLocalPaths）' : guard.roots.join(' | ')}`)
   /** 越界统一拒绝：403 + 日志（说明差哪个根，便于加 allowedRoots） */
   const denyOutside = (res: any, rawPath: string, routeName: string): boolean => {
@@ -414,7 +428,7 @@ export function apply(ctx: Context) {
       ok: false,
       error: 'outside-allowlist',
       path: check.target,
-      hint: '在 ~/.dsh/assistant/config.json 的 allowedRoots 里加上这个目录（或把它本身放进已允许根），再重启 DSH',
+      hint: '在「设置 → 个人助手 → 本机配置 → 目录边界」里加上这个目录（或把它本身放进已允许根），保存后立即生效',
     })
     return true
   }
@@ -694,7 +708,12 @@ export function apply(ctx: Context) {
   })
 
   setupTerminal(webServer, ctx, guard)
-  return routes.dispose
+  return () => {
+    for (const dispose of [...extraDisposers].reverse()) {
+      try { dispose() } catch { /* 已注销 */ }
+    }
+    routes.dispose()
+  }
   } catch (err) {
     // apply 中途失败也不能留下半套路由，否则下一次 HMR 会被自己的残留卡死。
     routes.dispose()

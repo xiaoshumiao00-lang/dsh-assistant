@@ -103,12 +103,14 @@ export function killStaleTunnels(cfg, { onKill, execFn = execFile } = {}) {
   });
 }
 
-/** 默认值：与本机既有部署一致（腾讯云 49.234.20.84:7080 → 127.0.0.1:3081）。 */
+/** 默认值：通用安全值（不预设作者的部署习惯）。
+ *  2026-11-05（P0-4）：`user` 不再默认 root——别人的机器上 root 是错的，而且让人以为能连；
+ *  现在必须自己填登录用户，未填就不算配置好（不会去连）。远端端口只作为可编辑的默认建议。 */
 export const SSH_TUNNEL_DEFAULTS = Object.freeze({
   enabled: false,
   host: '',
   port: 22,
-  user: 'root',
+  user: '',
   remotePort: 7080,
   keyPath: '',
   /** 0 = 跟随插件代理实际端口（推荐）；>0 用于手工指到别的本地端口 */
@@ -127,16 +129,16 @@ export function normalizeSshTunnelConfig(raw) {
     enabled: v.enabled === true,
     host: String(v.host ?? '').trim(),
     port: toPort(v.port, SSH_TUNNEL_DEFAULTS.port),
-    user: String(v.user ?? SSH_TUNNEL_DEFAULTS.user).trim() || SSH_TUNNEL_DEFAULTS.user,
+    user: String(v.user ?? '').trim(),
     remotePort: toPort(v.remotePort, SSH_TUNNEL_DEFAULTS.remotePort),
     keyPath: String(v.keyPath ?? '').trim(),
     localPort: Number.isInteger(Number(v.localPort)) && Number(v.localPort) > 0 ? Number(v.localPort) : 0,
   };
 }
 
-/** 是否具备启动条件（主机 + 私钥）。 */
+/** 是否具备启动条件（主机 + 登录用户 + 私钥）。少一样就不连，也不会把 root 当默认。 */
 export function sshTunnelConfigured(cfg) {
-  return Boolean(cfg && cfg.host && cfg.keyPath);
+  return Boolean(cfg && cfg.host && cfg.user && cfg.keyPath);
 }
 
 /** Windows 上 ssh.exe 不在 PATH 时用系统自带绝对路径。 */
@@ -176,7 +178,7 @@ export function buildSshArgs(cfg, localPort) {
     '-o', 'BatchMode=yes',
   ];
   if (cfg.port && cfg.port !== 22) args.push('-p', String(cfg.port));
-  args.push(`${cfg.user}@${cfg.host}`);
+  args.push(cfg.user ? `${cfg.user}@${cfg.host}` : String(cfg.host));
   return args;
 }
 
@@ -194,7 +196,7 @@ export function buildRemoteCmdArgs(cfg) {
     '-o', 'BatchMode=yes',
   ];
   if (cfg.port && cfg.port !== 22) args.push('-p', String(cfg.port));
-  args.push(`${cfg.user}@${cfg.host}`);
+  args.push(cfg.user ? `${cfg.user}@${cfg.host}` : String(cfg.host));
   return args;
 }
 
@@ -757,7 +759,7 @@ export function createSshTunnel({
     // 直接改 settings.json 把开关关掉 → 下一轮探活生效（设置页开关走 restart，即时生效）
     if (!cfg.enabled) { stop(); return; }
     if (!sshTunnelConfigured(cfg)) {
-      setFailed('not_configured', 'sshTunnel 缺少 host 或 keyPath | missing host/keyPath');
+      setFailed('not_configured', 'sshTunnel 缺少 host / user 或 keyPath | missing host, user or keyPath');
       ensureProbeTimer(); // 设置补全后自动恢复
       return;
     }

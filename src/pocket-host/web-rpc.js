@@ -275,7 +275,7 @@ export function killHint(port) {
  * 优先直接挂到本插件 inject 的 webServer 上（dsh v0.1.5-alpha.1+ 兼容路径），
  * 不可用时回退 ctx.connection.rpc.handle（旧版 dsh 兼容路径）。
  * wire 协议两条路径完全一致：client-request → handler → server-response。 */
-export function installPocketRpc(ctx, { service, log = console, desktop = false, runUpdate = null, restart = null, restartNotice = null, getToken = null, getLanToken = null, refreshLanToken = null, getLanAuthEnabled = null, setLanAuthEnabled = null, getLanEnabled = null, setLanEnabled = null, getLanIpOverride = null, setLanIpOverride = null, getPinCustom = null, setCustomPin = null, getTunnelConfig = null, setTunnelConfig = null, resetPocket = null, setSshTunnelEnabled = null, reconnectSshTunnel = null }) {
+export function installPocketRpc(ctx, { service, log = console, desktop = false, runUpdate = null, restart = null, restartNotice = null, getToken = null, getLanToken = null, refreshLanToken = null, getLanAuthEnabled = null, setLanAuthEnabled = null, getLanEnabled = null, setLanEnabled = null, getLanIpOverride = null, setLanIpOverride = null, getPinCustom = null, setCustomPin = null, getTunnelConfig = null, setTunnelConfig = null, resetPocket = null, setSshTunnelEnabled = null, setSshTunnelConfig = null, reconnectSshTunnel = null }) {
   const pocketRpcHandler = async (endpoint, payload = {}, signal) => {
     if (signal?.aborted) return fail('cancelled', 'The request was cancelled.');
 
@@ -385,6 +385,16 @@ export function installPocketRpc(ctx, { service, log = console, desktop = false,
         if (!setSshTunnelEnabled) return fail('bad-request', '固定公网地址不可用 | fixed tunnel unavailable');
         try {
           setSshTunnelEnabled(payload?.on === true);
+          return await statusPayload();
+        } catch (err) {
+          return fail('bad-request', err?.message ?? String(err));
+        }
+      }
+      if (endpoint === POCKET_ENDPOINTS.sshTunnelSetConfig) {
+        // 六项连接配置（P0-4）：只改传进来的字段，其余保持原值；keyPath 不传 = 保持不变。
+        if (!setSshTunnelConfig) return fail('bad-request', '固定公网地址不可用 | fixed tunnel unavailable');
+        try {
+          setSshTunnelConfig(payload && typeof payload === 'object' ? payload : {});
           return await statusPayload();
         } catch (err) {
           return fail('bad-request', err?.message ?? String(err));

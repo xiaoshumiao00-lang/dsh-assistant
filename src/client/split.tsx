@@ -9,7 +9,7 @@ import { domGate, createGatedThrottle } from './compositionGate'
 import { createCardRefreshCoalescer } from './cardRefreshPolicy'
 import { observeExternalSplit } from './splitObserver'
 import { ANNOUNCE_BODY, ANNOUNCE_HEAD } from './changelog'
-import { LOCAL_VERSION, UPGRADE_AI, checkUpdate, getAutoCheck, readCache, setAutoCheck as storeAutoCheck, setSkipVersion, type UpdateInfo, type UpdateStatus } from './updateCheck'
+import { LOCAL_VERSION, upgradeAiPrompt, checkUpdate, getAutoCheck, readCache, setAutoCheck as storeAutoCheck, setSkipVersion, type UpdateInfo, type UpdateStatus } from './updateCheck'
 import { Terminal } from 'xterm'
 import { FlowPane } from './flow'
 import { TemplateBar } from './templateBar'
@@ -392,6 +392,9 @@ type SplitEnv = {
     /** 卡片「＋」新建会话：可指定标准 / computer-use 模式与前台、后台模型。
      *  返回 false（或 resolve 成 false）= 未建成：面板留在原处让用户重试；true/undefined = 关面板 */
     onCreateSession?: (id: string, opts: NewSessionOptions) => void | Promise<boolean | void>
+    /** 打开「新建会话」面板时预热：后台把该项目的目录注册成宿主工作区。
+     *  用户挑模型的那 1–3 秒里先跑完这一步，点「创建」时少一个网络往返（失败静默，创建时照常补）。 */
+    onWarmNewSession?: (id: string) => void
     /** 项目管理：全部项目（含已隐藏） */
     getManageProjects?: () => { id: string; name: string; icon: string; hidden: boolean }[]
     /** 重命名项目（写 nameOverrides；空名 = 恢复默认名） */
@@ -663,7 +666,7 @@ function boxPayload(x0: number, y0: number, x1: number, y1: number): { primary: 
   return { primary, line, candidates, limited, src }
 }
 
-/** 更新方法：唯一的更新源在 updateCheck.ts（UPGRADE_CMD / UPGRADE_AI 从那里导入）。
+/** 更新方法：更新源与升级指令唯一出口在 updateCheck.ts（upgradeCommand() / upgradeAiPrompt()）。
  *  这里曾自己写死过一条指向退役仓库、profile 也不对的升级命令，已删。 */
 
 async function copyTextSafe(text: string): Promise<boolean> {
@@ -2298,6 +2301,8 @@ export function ConsolePane() {
     setNewSessModelsLoading(cached.length === 0)
     if (mode === 'computer-use') loadNewSessionBackground(requestId)
     loadNewSessionCatalog(requestId)
+    // 预热：挑模型期间先把目录注册成宿主工作区（幂等、失败静默），创建时省一个往返
+    try { splitEnv?.console?.onWarmNewSession?.(c.id) } catch { /* 预热失败不影响创建 */ }
   }
   /** 模型目录仍为空时的手动重试（移动端 Remote 刚就绪时很好用） */
   const reloadNewSessionModels = (): void => {
@@ -2464,7 +2469,7 @@ export function ConsolePane() {
   }
   const [updCopied, setUpdCopied] = useState(false)
   const onCopyUpgrade = async () => {
-    const ok = await copyTextSafe(UPGRADE_AI)
+    const ok = await copyTextSafe(upgradeAiPrompt())
     if (ok) { setUpdCopied(true); window.setTimeout(() => setUpdCopied(false), 2200) }
   }
   const onSkipVersion = () => {

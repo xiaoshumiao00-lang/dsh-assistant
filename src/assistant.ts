@@ -10,10 +10,12 @@
  */
 import * as worktable from './index'
 import * as tuoguan from './tuoguan-host'
+import * as turnGuard from './turn-guard'
 import { registerAssistantState } from './assistant-store'
 import { registerCoordinateMode } from './coordinate-mode'
 import { CONSOLE_SEA01_ROUTE, serveConsoleSea01 } from './consoleAsset'
 import { startDesktopBall, ballProfileDir } from './desktop-ball'
+import { nativeFocusAvailability } from './desktop-focus'
 import { manageWebRoutes } from './web-routes'
 import { registerAssistantHome } from './assistant-home'
 import { registerAssistantConfigRoutes } from './assistant-config'
@@ -44,6 +46,8 @@ export { registerAssistantDiagnostics, assistantDiagnosticsTestSurface, redactTe
 export { registerAssistantArchive, assistantArchiveTestSurface, collectArchive, writeArchiveBundle, importArchiveBundle, ARCHIVE_FORMAT } from './assistant-archive'
 /** 目录 allowlist 与终端环境变量（供 scripts/test-path-guard.mjs 直接验） */
 export { expandHome, defaultAllowedRoots, createPathGuard, minimalTermEnv, isDirectory } from './path-guard'
+/** turn-guard 的判定与状态函数（供 scripts/test-turn-guard.mjs 直接验） */
+export { turnGuardTestSurface } from './turn-guard'
 
 /** 工作台要 webServer/sessions，托管与设置路由要 webServer；手机访问由独立入口注入 connection。 */
 export const inject = ['webServer', 'sessions']
@@ -69,6 +73,15 @@ export function apply(ctx: any, config: any = {}): () => void {
     if (typeof dispose === 'function') disposers.push(dispose)
   } catch (err) {
     try { ctx.logger?.('dsh-assistant')?.error?.('tuoguan half failed: %s', String(err)) } catch {}
+  }
+
+  // ── turn-guard 半部（防空转补步；开关在设置页「个人助手 → 托管」） ──
+  // 原独立插件 dsh-turn-guard 并入本包：判定逻辑、历史闸、跨端开关路由都在 src/turn-guard.ts。
+  try {
+    const dispose = (turnGuard as any).apply?.(ctx)
+    if (typeof dispose === 'function') disposers.push(dispose)
+  } catch (err) {
+    try { ctx.logger?.('dsh-assistant')?.error?.('turn-guard half failed: %s', String(err)) } catch {}
   }
 
   // ── 跨端状态半部（项目 / 控制室视图） ──
@@ -335,6 +348,25 @@ export function apply(ctx: any, config: any = {}): () => void {
         waiter.timer = setTimeout(() => finishClickWaiter(waiter, null), 15000)
         clickWaiters.add(waiter)
         req.on('close', () => finishClickWaiter(waiter, null, false))
+      },
+    })
+    // 能力自检（P0-7）：koffi / 前台窗口聚焦是否可用。不可用时只是这一项不工作，
+    // 插件其余功能照常；设置页「本机配置」把它显示出来。
+    webServer.register({
+      kind: 'exact',
+      path: '/api/assistant/capabilities',
+      handler: (_req: any, res: any) => {
+        let nativeFocus: { available: boolean; reason: string } = { available: false, reason: 'unknown' }
+        try { nativeFocus = nativeFocusAvailability() } catch { /* 探测失败按不可用报 */ }
+        const payload = JSON.stringify({
+          ok: true,
+          platform: process.platform,
+          nativeFocus,
+          desktopBall: nativeBall,
+          electron: Boolean(process.versions.electron),
+        })
+        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+        res.end(payload)
       },
     })
     // 私人助手的家：固定目录 + AGENTS.md 人设 + journal / notes（会话据此创建）

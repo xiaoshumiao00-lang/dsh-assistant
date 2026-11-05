@@ -278,6 +278,50 @@ cases.push(['打开确认先回调 → 历史修复不阻塞界面切换', async
   assert.equal(r.openState, 'open')
 }])
 
+// 13. returnOnOpened：宿主一确认就返回，自愈留后台；自愈结束后回调补齐最终状态
+cases.push(['returnOnOpened → 立刻返回、后台自愈后 onSettled 补状态', async () => {
+  const c = clock()
+  const list = listOf(['new-defer'])
+  list.byId['new-defer'].blank = true
+  const selection = { current: '', getSnapshot() { return { sessionId: this.current } }, set(v) { this.current = v } }
+  let state = 'loading'
+  let resyncs = 0
+  const session = {
+    getSnapshot: () => ({ openState: state, blank: true }),
+    resync: async () => { resyncs++; state = 'open' },
+  }
+  const bridge = {
+    list: { getSnapshot: () => list },
+    sessions: { retainAgentScope() {}, binding: () => ({ session }) },
+    uiWorkspace: { openSession(id) { selection.set(id) }, selection },
+  }
+  let openedCalls = 0
+  let settledCalls = 0
+  let late = null
+  const r = await focusSessionInHost(bridge, 'new-defer', {
+    ...c,
+    returnOnOpened: true,
+    onOpened: () => { openedCalls++ },
+    onSettled: (x) => { settledCalls++; late = x },
+  })
+  // 立即返回：还没开始自愈，settled 仍是乐观值，deferred 标记已置
+  assert.equal(openedCalls, 1)
+  assert.equal(r.opened, true)
+  assert.equal(r.deferred, true)
+  assert.equal(r.resyncs, 0)
+  assert.equal(settledCalls, 0)
+  // 自愈继续在后台：跑完补齐 openState / settled，并回调
+  for (let i = 0; i < 100 && settledCalls === 0; i++) {
+    await Promise.resolve()
+    await c.sleep(10)
+  }
+  assert.equal(resyncs, 1)
+  assert.equal(settledCalls, 1)
+  assert.equal(late.openState, 'open')
+  assert.equal(late.settled, true)
+  assert.equal(r.openState, 'open')
+}])
+
 let failed = 0
 for (const [name, fn] of cases) {
   try {

@@ -129,6 +129,71 @@ export function unownedSessionIds(
   return out
 }
 
+/** 控制室项目卡片认领的输入（项目表 + 谁在控制室里有卡片 + 绑定会话的目录查询）。 */
+export type ProjectClaimInput = {
+  projects: {
+    folders?: Record<string, string>
+    bindings?: Record<string, string>
+    flows?: Record<string, { stepSessions?: Record<string, string> }>
+    /** 已从工作台真删除的项目 id（只剩残留，没有卡片） */
+    removed?: string[]
+    /** 被用户隐藏的项目 id（卡片不在网格里） */
+    hidden?: string[]
+    /** 用户自建布局（项目卡片来源之一） */
+    layouts?: { id: string }[]
+  }
+  /** 内置项目（控制室）的固定 id：它没有文件夹，但永远算有卡片 */
+  consoleId: string
+  /** 侧栏注册表里活着的入驻项目 id */
+  aliveRegisteredIds?: readonly string[]
+  /** 取某个会话的工作目录（无文件夹项目的绑定会话按它的目录认领） */
+  cwdOf: (sid: string) => string
+}
+
+/**
+ * 「控制室里看得见的项目卡片」认领的目录与会话：临时卡片「正在运行」不重复收纳它们。
+ *
+ * 隐藏项目必须排除——它没有卡片。若它的会话仍被算作「项目已收编」，这条会话既不上
+ * 项目卡、也不进临时卡片：跑起来整个控制室一片安静，用户完全看不到（2026-11-05 实测
+ * 到的盲区：微信任务跑在隐藏的 HPG 项目目录里，所有卡片都显示空闲）。
+ * 已删除残留（removed）与不在注册表的旧 id 同理。
+ *
+ * @returns folders = 项目文件夹（含无文件夹项目绑定会话的目录）；sessions = 绑定 / 模板步骤会话
+ */
+export function projectClaims(input: ProjectClaimInput): { folders: string[]; sessions: string[] } {
+  const pr = input.projects ?? {}
+  const removed = new Set(pr.removed ?? [])
+  const hidden = new Set(pr.hidden ?? [])
+  const known = new Set<string>([
+    input.consoleId,
+    ...(input.aliveRegisteredIds ?? []),
+    ...(pr.layouts ?? []).map((layout) => layout.id),
+  ])
+  /** 这个项目在控制室里有没有卡片：删除残留 / 隐藏 / 不在注册表 = 没有 */
+  const hasCard = (pid: string): boolean => !!pid && !removed.has(pid) && !hidden.has(pid) && known.has(pid)
+  const folders = new Set<string>()
+  const sessions = new Set<string>()
+  for (const [pid, folder] of Object.entries(pr.folders ?? {})) {
+    if (!hasCard(pid)) continue
+    if (typeof folder === 'string' && folder) folders.add(folder)
+  }
+  for (const [pid, sid] of Object.entries(pr.bindings ?? {})) {
+    if (!hasCard(pid)) continue
+    if (typeof sid !== 'string' || !sid) continue
+    sessions.add(sid)
+    // 没有项目文件夹的项目（内置控制室 / 纯会话项目）：按绑定会话自己的工作目录认领。
+    // 与项目卡片 relatedSidsOf 的目录基准同源，避免同一批会话既上卡片又进临时卡片。
+    if (pr.folders?.[pid]) continue
+    const cwd = input.cwdOf(sid)
+    if (cwd) folders.add(cwd)
+  }
+  for (const [pid, run] of Object.entries(pr.flows ?? {})) {
+    if (!hasCard(pid)) continue
+    for (const sid of Object.values(run?.stepSessions ?? {})) if (typeof sid === 'string' && sid) sessions.add(sid)
+  }
+  return { folders: [...folders], sessions: [...sessions] }
+}
+
 /** 临时卡片「正在运行」的单条可见性输入。 */
 export type TransientVisibilityInput = {
   /** 正在运行（含子代理在跑） */
