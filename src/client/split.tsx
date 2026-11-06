@@ -2208,13 +2208,15 @@ export function ConsolePane() {
       const padX = (parseFloat(cs.paddingLeft || '0') || 0) + (parseFloat(cs.paddingRight || '0') || 0)
       const width = Math.max(0, (host.clientWidth || 0) - padX)
       if (width <= 0) return
-      // 用实际 gap（窄屏 / 宽屏媒体查询会改）与最小卡宽推导列数。
-      // 最小卡宽按**屏高**分档：矮屏（平板/电视 ≤660px 高）能容忍更小的卡（否则一屏放不下两行），
-      // 桌面窗口给足 210px，卡片才不会瘦成一条、名字全被截断。
+      // 用实际 gap（窄屏 / 宽屏媒体查询会改）与最小卡宽推导列数。最小卡宽分三档：
+      //   手机（<640 宽）168px —— 390 宽正好 2 列，卡片不会被拉成一整条；
+      //   矮屏（≤660 高，平板横放 / 电视）160px —— 一屏要塞得下两行；
+      //   桌面窗口 210px —— 卡片不会瘦成一条、名字被截断。
       let gap = 64
       try { gap = parseFloat(getComputedStyle(el).columnGap || '') || 64 } catch {}
-      const shortViewport = (typeof window !== 'undefined' ? window.innerHeight : 900) <= 660
-      const minW = shortViewport ? 160 : 210
+      const vw = (typeof window !== 'undefined' ? window.innerWidth : 1200) || 1200
+      const vh = (typeof window !== 'undefined' ? window.innerHeight : 900) || 900
+      const minW = vw < 640 ? 168 : (vh <= 660 ? 160 : 210)
       const n = Math.max(1, Math.min(6, Math.floor((width + gap) / (minW + gap))))
       setAutoCols((prev) => (prev === n ? prev : n))
       setCardW(Math.max(120, Math.floor((width - (n - 1) * gap) / n)))
