@@ -12,7 +12,15 @@
  *   3. 只有 reasoning、正文为空（`steerEmptyText`）→ 补一步；
  *   4. 正常正文收尾 → 不动。
  * 补的方式：`agent.send(纠正消息, 'next-step', false)`——inbox.nextStep 非空，循环
- * 不再 break，带着这条纠正指令再走一步。同一会话最多补 `maxPerTurn` 次（防死循环）。
+ * 不再 break，带着这条纠正指令再走一步。
+ *
+ * 配额口径（2026-11-06 修）：`maxPerTurn` = **同一个 turn 内**最多补几次（默认 3）。
+ * `[turn-guard]` 注入按它所属的 turn 计数（归到最后一次 `turn/start` 的 turn 号），
+ * 跨 turn、跨自然日自动重置。旧口径是「按整条会话累计」——被定时任务每天复用的会话
+ * 一旦补满 3 次就永久静音（2026-11-06 定时任务 turn 41 就是这么没被续跑的）。
+ * 每次 `turn-stopping` 决策都写一行 verdict 日志（带 ISO 时间戳）：
+ *   `verdict turn=N steer=true|false branch=判据名 injected=已补/上限 dayInjected=当日已补`
+ * 所以「被上限拦下」「被预设跳过」这类不动作的判定也能在日志里看见。
  *
  * 开关：真值落在 `<profile 目录>/dsh-assistant-turn-guard.json`，客户端通过同源
  * `GET/POST /.dsh-assistant/turn-guard` 读写（与托管状态同一种跨端同步方式）。
@@ -32,8 +40,9 @@ import { manageWebRoutes } from './web-routes.ts'
 
 export const name = 'dsh-assistant-turn-guard'
 
-/** 版本号进日志：宿主热重载后从 load 行就能看出跑的是不是新代码。 */
-export const VERSION = '1.0.0'
+/** 版本号进日志：宿主热重载后从 load 行就能看出跑的是不是新代码。
+ *  1.1.0 = 注入配额改按 turn 计数 + 每次决策写 verdict 日志（2026-11-06）。 */
+export const VERSION = '1.1.0'
 
 /** 纠错消息前缀：既用于统计次数，也便于人工在日志里识别。 */
 export const MARK = '[turn-guard]'
@@ -159,44 +168,132 @@ export function lastAssistantEvent(session: any): any | undefined {
   return undefined
 }
 
-/** 判定结果：`steer` 为真表示这一轮需要补一步；`reason` 区分泄漏与空思考。 */
+/** 判定结果：`steer` 为真表示这一轮需要补一步；`branch` 是本次走到的判据分支名。 */
 export interface TurnGuardVerdict {
   steer: boolean
   reason?: 'leak' | 'empty'
+  /** 判据分支名（进日志，便于核对这一轮被哪条判据拦下） */
+  branch: 'no-assistant' | 'cap' | 'toolcall' | 'text-ok' | 'leak' | 'empty' | 'fallthrough'
   hasToolCall?: boolean
   text?: string
+  /** 当前 turn 已补过几次（配额口径：按 turn 计数，跨 turn / 跨天自动重置） */
   injected?: number
+  /** 当前 turn 的上限（= maxPerTurn） */
+  injectedMax?: number
+  /** 同一自然日累计补过几次（只进日志，不参与判定） */
+  dayInjected?: number
+  /** 本次判定归属的 turn 号 */
+  turn?: number
+}
+
+/** `[turn-guard]` 注入按 turn / 按日的归口结果。 */
+export interface GuardInjectionCounts {
+  byTurn: Map<number, number>
+  byDay: Map<string, number>
+  /** 归不到任何 turn 的注入（没有 turn/start 的旧会话或测试夹具） */
+  unscoped: number
+  total: number
+}
+
+/** 事件时间戳（毫秒）：`snapshotEvents()` 把 time 挂在事件本体，兼容 data.time。 */
+function eventTimeMs(event: any): number {
+  const raw = typeof event?.time === 'number' ? event.time : typeof event?.data?.time === 'number' ? event.data.time : void 0
+  return typeof raw === 'number' && Number.isFinite(raw) ? raw : 0
+}
+
+/** 宿主本地日期（Asia/Shanghai）YYYY-MM-DD，用于「按天」的日志计数。 */
+function dayKeyOf(event: any): string {
+  const ms = eventTimeMs(event)
+  if (ms === 0) return ''
+  const date = new Date(ms)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+/** 这条事件是不是 guard 自己注入的纠正消息？ */
+function isGuardInjectionEvent(event: any): boolean {
+  if (event?.type !== 'user/message') return false
+  const content = event?.data?.content ?? []
+  return content.some((b: any) => b?.type === 'text' && String(b?.text ?? '').startsWith(MARK))
+}
+
+/**
+ * 把历史里的 `[turn-guard]` 注入按 turn 归口。
+ *
+ * guard 是在 `agent/turn-stopping`（turn 收尾、循环 break 之前）注入的，所以这条
+ * user/message 一定落在「本次 turn/start 之后、下一次 turn/start 之前」⇒ 归属那个 turn。
+ * 会话里没有 turn/start（旧会话 / 单测夹具）时退回最近一条 assistant 消息的 turn 号；
+ * 两者都拿不到就计入 `unscoped`——它不会把任何 turn 判满，也就不会再永久静音。
+ */
+export function countGuardInjections(events: readonly any[]): GuardInjectionCounts {
+  const byTurn = new Map<number, number>()
+  const byDay = new Map<string, number>()
+  let unscoped = 0
+  let total = 0
+  let currentTurn: number | undefined
+  let currentDay: string | undefined
+  for (const event of events ?? []) {
+    if (event?.type === 'turn/start') {
+      const turn = event?.data?.turn
+      if (typeof turn === 'number' && Number.isFinite(turn)) currentTurn = turn
+      currentDay = dayKeyOf(event) || currentDay
+      continue
+    }
+    if (event?.type === 'assistant/message') {
+      const turn = event?.data?.turn
+      if (currentTurn === undefined && typeof turn === 'number' && Number.isFinite(turn)) currentTurn = turn
+      const day = dayKeyOf(event)
+      if (day) currentDay = day
+      continue
+    }
+    if (!isGuardInjectionEvent(event)) continue
+    total += 1
+    if (currentTurn === undefined) unscoped += 1
+    else byTurn.set(currentTurn, (byTurn.get(currentTurn) ?? 0) + 1)
+    const day = dayKeyOf(event) || currentDay
+    if (day) byDay.set(day, (byDay.get(day) ?? 0) + 1)
+  }
+  return { byTurn, byDay, unscoped, total }
 }
 
 /**
  * 判断这一轮是否需要补一步纠正。
  * @param session - 会话（读 `snapshotEvents()`）
  * @param config - `{ maxPerTurn, steerEmptyText }`
+ * @param turn - 当前 turn 号（`agent/turn-stopping` 的 payload.turn）。给了且会话里有 turn 边界
+ *               就按 turn 计数；否则退回旧的「整条会话累计」口径（不会把判据改形）。
  */
-export function judge(session: any, config: { maxPerTurn?: number; steerEmptyText?: boolean } = {}): TurnGuardVerdict {
+export function judge(
+  session: any,
+  config: { maxPerTurn?: number; steerEmptyText?: boolean } = {},
+  turn?: number,
+): TurnGuardVerdict {
   const maxPerTurn = Number.isFinite(config.maxPerTurn) ? Math.max(0, Math.floor(config.maxPerTurn as number)) : 3
   const steerEmptyText = config.steerEmptyText !== false
   const events = eventsOf(session)
   const last = lastAssistantEvent(session)
-  if (last === undefined) return { steer: false }
+  if (last === undefined) {
+    return { steer: false, branch: 'no-assistant', injected: 0, injectedMax: maxPerTurn, dayInjected: 0, turn }
+  }
 
   const blocks = last.data?.message?.content ?? []
   const hasToolCall = blocks.some((b: any) => b?.type === 'tool-call')
   const text = blocks.filter((b: any) => b?.type === 'text').map((b: any) => b?.text ?? '').join('\n').trim()
   const hasReasoning = blocks.some((b: any) => b?.type === 'reasoning')
 
-  let injected = 0
-  for (const event of events) {
-    if (event?.type !== 'user/message') continue
-    const content = event?.data?.content ?? []
-    if (content.some((b: any) => b?.type === 'text' && String(b?.text ?? '').startsWith(MARK))) injected += 1
-  }
-  if (injected >= maxPerTurn) return { steer: false, hasToolCall, text, injected }
-  if (hasToolCall) return { steer: false, hasToolCall: true, text, injected }
-  if (text !== '' && !LEAK.test(text)) return { steer: false, hasToolCall, text, injected }
-  if (looksLikeCall(text)) return { steer: true, reason: 'leak', hasToolCall, text, injected }
-  if (steerEmptyText && text === '' && hasReasoning) return { steer: true, reason: 'empty', hasToolCall, text, injected }
-  return { steer: false, hasToolCall, text, injected }
+  const counts = countGuardInjections(events)
+  const perTurn = typeof turn === 'number' && counts.byTurn.size > 0
+  const injected = perTurn ? (counts.byTurn.get(turn as number) ?? 0) : counts.total
+  const injectedMax = maxPerTurn
+  const dayInjected = counts.byDay.get(dayKeyOf(last)) ?? 0
+  const tail = { hasToolCall, text, injected, injectedMax, dayInjected, turn } as const
+
+  if (injected >= maxPerTurn) return { steer: false, branch: 'cap', ...tail }
+  if (hasToolCall) return { steer: false, branch: 'toolcall', hasToolCall: true, ...tail }
+  if (text !== '' && !LEAK.test(text)) return { steer: false, branch: 'text-ok', ...tail }
+  if (looksLikeCall(text)) return { steer: true, reason: 'leak', branch: 'leak', ...tail }
+  if (steerEmptyText && text === '' && hasReasoning) return { steer: true, reason: 'empty', branch: 'empty', ...tail }
+  return { steer: false, branch: 'fallthrough', ...tail }
 }
 
 /** 生成纠正消息正文（附上最后一条工具错误，提醒完整参数）。 */
@@ -475,6 +572,9 @@ async function handleRequest(store: TurnGuardStore, logFile: string, req: Incomi
 /**
  * 挂上 turn-stopping 判定与 pre-step 历史闸；两者都按当前开关实时判断，
  * 所以设置页一点开关，下一轮就按新状态跑（无需重载插件）。
+ *
+ * 每次决策（含「开关关闭 / 预设不在名单 / 配额已满」这些不动作的判定）都写一行
+ * verdict 日志：`verdict turn=N steer=… branch=… injected=已补/上限 dayInjected=… maxPerTurn=…`。
  */
 export function installTurnGuard(ctx: any, options: { readState: () => TurnGuardState; log: (line: string) => void }): () => void {
   const disposers: Array<() => void> = []
@@ -491,16 +591,33 @@ export function installTurnGuard(ctx: any, options: { readState: () => TurnGuard
     const off = ctx.on('agent/turn-stopping', (payload: any) => {
       try {
         const state = options.readState()
-        if (state.enabled !== true) return
+        const turnLabel = typeof payload?.turn === 'number' ? String(payload.turn) : '?'
+        const quota = `maxPerTurn=${state.maxPerTurn}`
+        if (state.enabled !== true) {
+          options.log(`verdict turn=${turnLabel} steer=false branch=disabled injected=0/${state.maxPerTurn} ${quota}`)
+          return
+        }
         const agent = payload?.agent
         const session = agent?.session
-        if (agent === undefined || session === undefined) return
+        if (agent === undefined || session === undefined) {
+          options.log(`verdict turn=${turnLabel} steer=false branch=no-agent ${quota}`)
+          return
+        }
         const anyPreset = state.presets.includes('*')
         if (!anyPreset) {
           const preset = presetOf(ctx, session)
-          if (preset === undefined || !state.presets.includes(preset)) return
+          if (preset === undefined || !state.presets.includes(preset)) {
+            options.log(`verdict turn=${turnLabel} steer=false branch=preset-skip preset=${String(preset ?? '?')} allowed=[${state.presets.join(',')}] ${quota}`)
+            return
+          }
         }
-        const verdict = judge(session, state)
+        const turn = typeof payload?.turn === 'number' ? payload.turn : void 0
+        const verdict = judge(session, state, turn)
+        const injected = verdict.injected ?? 0
+        const injectedMax = verdict.injectedMax ?? state.maxPerTurn
+        options.log(`verdict turn=${turnLabel} steer=${verdict.steer ? 'true' : 'false'} branch=${verdict.branch} `
+          + `injected=${injected}/${injectedMax} dayInjected=${verdict.dayInjected ?? 0} scoped=${turn === undefined ? 'session' : 'turn'} ${quota}`
+          + ` text=${JSON.stringify(String(verdict.text ?? '').slice(0, 40))}`)
         if (!verdict.steer) return
         const message = buildUserMessage(correctiveText(verdict.reason as 'leak' | 'empty', lastToolError(session)), {
           kind: 'user',
@@ -509,7 +626,7 @@ export function installTurnGuard(ctx: any, options: { readState: () => TurnGuard
         // 走唯一的构造入口：id 一定有，形状一定校验过（不合格直接抛，绝不写坏日志）。
         assertIdentifiedMessage(message, 'turn-guard corrective message')
         agent.send(message, 'next-step', false)
-        options.log(`steer turn=${payload?.turn ?? '?'} reason=${verdict.reason} injected=${(verdict.injected ?? 0) + 1} text=${JSON.stringify(String(verdict.text ?? '').slice(0, 40))}`)
+        options.log(`steer turn=${turnLabel} reason=${verdict.reason} branch=${verdict.branch} injected=${injected + 1}/${injectedMax} text=${JSON.stringify(String(verdict.text ?? '').slice(0, 40))}`)
       } catch (error) {
         options.log(`steer failed: ${(error as Error)?.stack ?? String(error)}`)
       }
@@ -573,6 +690,7 @@ export function apply(ctx: any): () => void {
 export const turnGuardTestSurface = {
   looksLikeCall,
   judge,
+  countGuardInjections,
   correctiveText,
   lastToolError,
   buildUserMessage,

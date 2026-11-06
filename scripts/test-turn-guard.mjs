@@ -7,7 +7,9 @@
  *   - 整行以调用标记开头才算把调用写成正文；
  *   - 有结构化 tool-call 时不干预；正常正文收尾不干预；
  *   - 只有 reasoning、正文为空时补一步（steerEmptyText 可关掉）；
- *   - 同一轮补到 maxPerTurn 就停手（不无限补）；
+ *   - 配额按 turn 计数：同一个 turn 补到 maxPerTurn 就停手（不无限补），
+ *     换到下一个 turn / 跨自然日自动重置——定时任务每天复用的会话不会被永久静音；
+ *   - 每次 turn-stopping 决策写一行 verdict 日志（含判据分支名与 injected=已补/上限）；
  *   - 纠正消息带 id 且以 [turn-guard] 开头；历史闸给缺 id 的消息补 uuid、丢掉没有 content 的；
  *   - 状态规整：缺字段用默认值（默认开启）、越界收敛、坏 JSON 不改语义。
  */
@@ -16,6 +18,7 @@ import {
   MARK,
   buildUserMessage,
   correctiveText,
+  countGuardInjections,
   defaultState,
   guardMessagesForHistory,
   installTurnGuard,
@@ -65,15 +68,52 @@ assert.equal(emptyVerdict.steer, true)
 assert.equal(emptyVerdict.reason, 'empty')
 assert.equal(judge(emptyTextSession, { steerEmptyText: false }).steer, false, '关掉空思考补步就不干预')
 
-/* 同一轮补满 maxPerTurn 后停手 */
+/* 配额口径：按 turn 计数；会话里没有 turn 边界时退回旧的「整条会话累计」口径 */
 const already = (count) => Array.from({ length: count }, (_, index) => ({
   type: 'user/message',
+  time: Date.UTC(2026, 10, 2, 6, 2, index),
   data: { id: `u-${index}`, content: [{ type: 'text', text: `${MARK} 补一步` }] },
 }))
 const maxedSession = sessionOf([...already(3), assistantEvent([textBlock('<tool_call>')])])
-assert.equal(judge(maxedSession).steer, false, '补满 3 次就停手')
+assert.equal(judge(maxedSession).steer, false, '没有 turn 边界：退回整条会话计数，补满 3 次就停手')
+assert.equal(judge(maxedSession).branch, 'cap', '被上限拦下走 cap 分支')
 const onceSession = sessionOf([...already(1), assistantEvent([textBlock('<tool_call>')])])
 assert.equal(judge(onceSession).steer, true, '还没补满就继续补')
+assert.equal(onceSession.snapshotEvents().length, 2)
+assert.equal(leakVerdict.branch, 'leak')
+assert.equal(emptyVerdict.branch, 'empty')
+assert.equal(judge(normalSession).branch, 'text-ok')
+assert.equal(judge(toolCallSession).branch, 'toolcall')
+assert.equal(judge(emptySession).branch, 'no-assistant')
+
+/* 定时任务会话：同一 turn 补满就停手，下一个 turn 配额复位（跨天同样） */
+const assistantTurn = (turn, blocks, utcMs = Date.UTC(2026, 10, 2, 6, 30)) => ({
+  type: 'assistant/message', time: utcMs, data: { turn, message: { content: blocks } },
+})
+const startOfTurn = (turn, hour = 6, day = 2) => ({ type: 'turn/start', time: Date.UTC(2026, 10, day, hour, 0), data: { turn } })
+const dailySession = sessionOf([
+  startOfTurn(33), ...already(3), assistantTurn(33, [reasoningBlock('想完')]),
+  startOfTurn(34), assistantTurn(34, [reasoningBlock('想完')]),
+])
+assert.equal(judge(dailySession, { maxPerTurn: 3 }, 33).steer, false, 'turn 33 内已补满 3 次 ⇒ 停手')
+assert.equal(judge(dailySession, { maxPerTurn: 3 }, 33).injected, 3, 'turn 33 的计数是 3')
+assert.equal(judge(dailySession, { maxPerTurn: 3 }, 33).branch, 'cap')
+assert.equal(judge(dailySession, { maxPerTurn: 3 }, 34).steer, true, '换到下一个 turn 仍可注入（旧口径这里是永久静音）')
+assert.equal(judge(dailySession, { maxPerTurn: 3 }, 34).injected, 0, '新 turn 计数从 0 起')
+assert.equal(judge(dailySession, { maxPerTurn: 3 }, 34).branch, 'empty', '补步判据本身没改')
+const counts = countGuardInjections(dailySession.snapshotEvents())
+assert.equal(counts.byTurn.get(33), 3, '按 turn 归口：turn 33 有 3 条注入')
+assert.equal(counts.byTurn.has(34), false, 'turn 34 一条都还没有')
+assert.equal(counts.unscoped, 0, '有 turn 边界时注入都能归口')
+assert.equal(counts.byDay.get('2026-11-02'), 3, '当日计数只进日志：2026-11-02 共补 3 次')
+assert.equal(counts.total, 3)
+const day40 = sessionOf([
+  startOfTurn(40, 22, 2), ...already(3), assistantTurn(40, [reasoningBlock('想完')], Date.UTC(2026, 10, 2, 23, 30)),
+  startOfTurn(41, 6, 3), assistantTurn(41, [reasoningBlock('想完')], Date.UTC(2026, 10, 3, 6, 30)),
+])
+assert.equal(judge(day40, { maxPerTurn: 3 }, 40).steer, false, '同一 turn 内补满就停手')
+assert.equal(judge(day40, { maxPerTurn: 3 }, 41).steer, true, '跨 turn 后配额复位')
+assert.equal(judge(day40, { maxPerTurn: 3 }, 41).dayInjected, 0, '换到 11-03 的当日计数也是 0')
 
 /* ---------- 纠正文案与错误提取 ---------- */
 
@@ -169,6 +209,7 @@ function mountedGuard(initialState) {
 const leaky = mountedGuard()
 leaky.turnStopping(sessionOf([assistantEvent([textBlock('<tool_call>\n</function>\n</tool_call>')])]))
 assert.equal(leaky.sent.length, 1, '泄漏文本会补一步')
+assert.ok(leaky.logs.some((line) => line.includes('verdict turn=1') && line.includes('steer=true') && line.includes('branch=leak') && line.includes('injected=0/3')), `verdict 行缺字段：${leaky.logs.join(' | ')}`)
 assert.equal(leaky.sent[0].kind, 'next-step', '补步走 next-step，循环不 break')
 assert.ok(leaky.sent[0].message.id.length > 0, '补进去的消息带 id（不然会话会被写坏）')
 assert.ok(leaky.sent[0].message.content[0].text.startsWith(MARK))
@@ -189,6 +230,33 @@ assert.equal(presetGuarded.sent.length, 0, '不在 presets 名单里的预设不
 const cuSession = { ...sessionOf([assistantEvent([textBlock('<tool_call>')])]), header: { agentPreset: 'computer-use' } }
 presetGuarded.turnStopping(cuSession)
 assert.equal(presetGuarded.sent.length, 1, '名单内的预设照常补步')
+
+/* 配额按 turn 复位：同一会话补过 3 次，第 4 个 turn 仍能补一步（2026-11-06 的失效场景） */
+const reused = mountedGuard()
+const burnedSession = sessionOf([
+  startOfTurn(33), ...already(3), assistantTurn(33, [reasoningBlock('想完')]),
+  startOfTurn(34, 6, 3), assistantTurn(34, [reasoningBlock('想完')]),
+  startOfTurn(35, 6, 4), assistantTurn(35, [reasoningBlock('想完')]),
+  startOfTurn(41, 6, 6), assistantTurn(41, [reasoningBlock('想完')]),
+])
+reused.turnStopping(burnedSession, 41)
+assert.equal(reused.sent.length, 1, 'turn 41 计数为 0 ⇒ 该补就补（旧口径在这里会被会话级上限直接静音）')
+const turn41Line = reused.logs.find((line) => line.includes('verdict turn=41'))
+assert.ok(turn41Line, '决策写了 verdict 行')
+assert.ok(turn41Line.includes('steer=true') && turn41Line.includes('branch=empty') && turn41Line.includes('injected=0/3'), `verdict 行不对：${turn41Line}`)
+assert.ok(turn41Line.includes('dayInjected=3'), `当日计数没进日志：${turn41Line}`)
+reused.turnStopping(burnedSession, 33)
+assert.ok(reused.logs.some((line) => line.includes('verdict turn=33') && line.includes('steer=false') && line.includes('branch=cap') && line.includes('injected=3/3')), '同一 turn 补满时 verdict 行要说清楚是被上限拦下的')
+
+/* 开关关闭 / 预设不在名单时也要留下 verdict 行（别静默失联） */
+const silent = mountedGuard({ enabled: false })
+silent.turnStopping(sessionOf([assistantEvent([textBlock('<tool_call>')])]), 7)
+assert.ok(silent.logs.some((line) => line.includes('verdict turn=7') && line.includes('branch=disabled')), `开关关闭也要写 verdict 行：${silent.logs.join(' | ')}`)
+silent.setState(stateOf({ presets: ['computer-use'] }))
+const standardHeader = { ...sessionOf([assistantEvent([textBlock('<tool_call>')])]), header: { agentPreset: 'standard' } }
+silent.turnStopping(standardHeader, 8)
+assert.ok(silent.logs.some((line) => line.includes('verdict turn=8') && line.includes('branch=preset-skip')), '预设不在名单也要写 verdict 行')
+assert.equal(silent.sent.length, 0, '这两种情形都不注入')
 
 /* 关掉后历史闸也停手（不偷偷改消息） */
 const historyGuard = mountedGuard({ enabled: true })
