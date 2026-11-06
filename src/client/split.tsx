@@ -2188,27 +2188,39 @@ export function ConsolePane() {
     setColsState(n)
     splitEnv?.console?.setCols?.(n)
   }
-  /** 自适应列数：cols = 0（自动）时按容器宽度算每行能放几张（手机 1-2 张、电脑 3-5 张）。
+  /** 自适应列数：cols = 0（自动）时按**容器**宽度算每行能放几张。
+   *  手机 2 张、平板 3-4 张、电视/宽屏 4-6 张；同时算出卡片实际像素宽度
+   *  （--wt-cardW），不依赖 `calc(100% / var(--wt-cols))` —— 旧 Chromium
+   *  （Android TV / 老平板 WebView）不支持这种除法，卡片会退化成内容宽度、
+   *  整屏只能摆 4 张且第二行被裁掉（用户报的「卡片不能自动排版」）。
    *  手动选 1-5 仍优先；换列动画只在手动切换时播（onCols 记录首帧位置）。 */
   const effectiveCols = cols === 0 ? autoCols : cols
+  const [cardW, setCardW] = useState(0)
   useEffect(() => {
-    if (cols !== 0) return
+    if (cols !== 0) { setCardW(0); return }
     const el = gridRef.current
     if (!el) return
     const calc = () => {
-      const width = el.clientWidth || el.getBoundingClientRect().width || 0
+      // 量父级（滚动容器）而不是自己：卡片网格的 max-width 是由列数推出来的，
+      // 量自己会形成「列数 → 宽度 → 列数」的反馈环，宽屏上会锁死在偏小的值。
+      const host = (el.parentElement as HTMLElement | null) ?? el
+      const cs = getComputedStyle(host)
+      const padX = (parseFloat(cs.paddingLeft || '0') || 0) + (parseFloat(cs.paddingRight || '0') || 0)
+      const width = Math.max(0, (host.clientWidth || 0) - padX)
       if (width <= 0) return
-      // 用实际 gap（窄屏媒体查询会把 64px 压到 20px）与 150px 最小卡宽推导列数
+      // 用实际 gap（窄屏 / 宽屏媒体查询会改）与最小卡宽推导列数
       let gap = 64
       try { gap = parseFloat(getComputedStyle(el).columnGap || '') || 64 } catch {}
-      const n = Math.max(1, Math.min(5, Math.floor((width + gap) / (150 + gap))))
+      const n = Math.max(1, Math.min(6, Math.floor((width + gap) / (168 + gap))))
       setAutoCols((prev) => (prev === n ? prev : n))
+      setCardW(Math.max(120, Math.floor((width - (n - 1) * gap) / n)))
     }
     calc()
     let ro: ResizeObserver | null = null
     try {
       ro = new ResizeObserver(calc)
       ro.observe(el)
+      if (el.parentElement) ro.observe(el.parentElement)
     } catch {}
     window.addEventListener('resize', calc)
     return () => {
@@ -2925,7 +2937,11 @@ export function ConsolePane() {
           </div>
           </div>
         ) : (
-        <div ref={gridRef} className="dsh-wt_consoleGrid" style={{ ['--wt-cols' as any]: effectiveCols, ...(cols === 0 ? { maxWidth: '100%' } : {}) }}>
+        <div ref={gridRef} className="dsh-wt_consoleGrid" style={{
+          ['--wt-cols' as any]: effectiveCols,
+          ...(cardW > 0 ? { ['--wt-cardW' as any]: cardW + 'px' } : {}),
+          ...(cols === 0 ? { maxWidth: '100%' } : {}),
+        }}>
         {shownCards.slice(0, mountCount).map((c) => (
           <ConsoleCard key={c.id} c={c} canCreate={canCreateCard} handlers={cardHandlers} />
         ))}
