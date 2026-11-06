@@ -1,0 +1,364 @@
+/**
+ * 鹈鹕（tihu）三道闸的最小版：写前快照 / 审计 / 危险动作确认。
+ *
+ * 三件事都必须发生在**宿主侧**而不是页面里——页面可以被关掉、可以被伪造，
+ * 只有宿主里的 `tools/pre-execute` 拦得住真正要落盘的那一次调用：
+ *
+ *   1. 写前快照：任何 write / edit / delete 的目标，在动手之前先复制到
+ *      `<工作区>/.tihu/snapshots/<时间戳>/<相对路径>`。删掉/改坏能捞回来。
+ *   2. 审计：每次动手往 `<工作区>/.tihu/audit.jsonl` 追加一行（时间 / 来源=tihu /
+ *      动作 / 目标 / 决策 / diff 摘要）。JSONL 便于 grep，也便于以后接日志分析。
+ *   3. 危险动作确认：删除、覆盖已有文件、执行命令、对外发送 → 先发 confirm.ask，
+ *      设备点「确认」才放行；超时或设备不在线一律**按取消处理**（安全侧默认）。
+ *
+ * 本文件不依赖 cordis / WebSocket，纯函数 + 文件系统，`scripts/test-tihu-guard.mjs`
+ * 可以直接 import 来跑。
+ */
+import { appendFileSync, existsSync, mkdirSync, copyFileSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
+
+/** 工作区内的状态目录（固定 .tihu）。 */
+export const TIHU_DIR = '.tihu'
+/** 快照子目录。 */
+export const SNAPSHOTS_DIR = 'snapshots'
+/** 审计文件名。 */
+export const AUDIT_FILE = 'audit.jsonl'
+
+/* ---------- 动作分类 ---------- */
+
+/** 工具调用被怎么归类：决定要不要快照、要不要确认。 */
+export type TihuActionKind = 'write' | 'edit' | 'delete' | 'shell' | 'send' | 'other'
+
+export interface TihuActionClass {
+  kind: TihuActionKind
+  /** 会不会动文件（需要快照 + 审计）。 */
+  touchesFiles: boolean
+  /** 是不是危险动作（需要设备确认）。 */
+  dangerous: boolean
+  /** 给屏上显示的中文动作名。 */
+  label: string
+}
+
+/** 工具名 → 动作分类。只按名字判定，P1 再按参数细化（比如 rm -rf）。 */
+const TOOL_PATTERNS: Array<{ re: RegExp; kind: TihuActionKind; label: string }> = [
+  { re: /^(write|write_file|create_file|create)$/i, kind: 'write', label: '写文件' },
+  { re: /^(edit|edit_file|multi_edit|apply_patch|str_replace|str_replace_editor|replace)$/i, kind: 'edit', label: '改文件' },
+  { re: /^(delete|delete_file|remove|rm|move|rename|unlink)$/i, kind: 'delete', label: '删除/移动' },
+  { re: /^(shell|bash|sh|pwsh|powershell|cmd|terminal|exec|execute|run|run_command|run_code)$/i, kind: 'shell', label: '执行命令' },
+  { re: /^(send|send_email|email|mail|upload|post|publish|notify)$/i, kind: 'send', label: '对外发送' },
+]
+
+/**
+ * 分类一个工具调用。
+ *
+ * 危险判定（P0 口径，写死在注释里便于以后核对）：
+ *   - delete / shell / send：一律危险；
+ *   - write / edit：目标文件**已存在**才算「覆盖」，才危险（新建文件只快照）；
+ *   - 其它工具：不碰文件、不拦。
+ */
+export function classifyTool(name: string, targetExists?: boolean): TihuActionClass {
+  const raw = String(name ?? '')
+  for (const pattern of TOOL_PATTERNS) {
+    if (!pattern.re.test(raw)) continue
+    const touchesFiles = pattern.kind === 'write' || pattern.kind === 'edit' || pattern.kind === 'delete'
+    const dangerous = pattern.kind === 'delete' || pattern.kind === 'shell' || pattern.kind === 'send'
+      || ((pattern.kind === 'write' || pattern.kind === 'edit') && targetExists === true)
+    return { kind: pattern.kind, touchesFiles, dangerous, label: pattern.label }
+  }
+  return { kind: 'other', touchesFiles: false, dangerous: false, label: '其它' }
+}
+
+/** 从工具参数里挑出文件路径（不同工具用 path / file_path / filePath）。 */
+export function targetPathOf(args: unknown): string | undefined {
+  if (typeof args !== 'object' || args === null) return undefined
+  const record = args as Record<string, unknown>
+  for (const key of ['path', 'file_path', 'filePath', 'file', 'target', 'name']) {
+    const value = record[key]
+    if (typeof value === 'string' && value !== '') return value
+  }
+  return undefined
+}
+
+/** 从 shell 类参数里取命令原文（只用于确认弹窗与审计，不执行）。 */
+export function commandOf(args: unknown): string | undefined {
+  if (typeof args !== 'object' || args === null) return undefined
+  const record = args as Record<string, unknown>
+  for (const key of ['command', 'cmd', 'script', 'code', 'input']) {
+    const value = record[key]
+    if (typeof value === 'string' && value !== '') return String(value).slice(0, 500)
+  }
+  return undefined
+}
+
+/* ---------- 路径与工作区 ---------- */
+
+/**
+ * 把目标路径规整成「工作区内相对路径」。越界（绝对路径跑到工作区外、
+ * `../` 跑出去）返回 null——快照绝不能把工作区外的文件复制进来。
+ */
+export function relativeInsideRoot(root: string, target: string): string | null {
+  if (typeof root !== 'string' || root === '' || typeof target !== 'string' || target === '') return null
+  const absolute = isAbsolute(target) ? target : resolvePath(root, target)
+  const rel = relative(resolvePath(root), resolvePath(absolute))
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return null
+  return rel
+}
+
+/** 工作区里的 `.tihu` 目录（不存在就建）。 */
+export function tihuDirOf(workspace: string): string {
+  const dir = join(workspace, TIHU_DIR)
+  mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+/* ---------- 写前快照 ---------- */
+
+export interface SnapshotResult {
+  /** 是否真的复制了（目标不存在时 false，但仍会建目录）。 */
+  copied: boolean
+  /** 快照根目录（.tihu/snapshots/<ts>）。 */
+  snapshotRoot: string
+  /** 这份文件的快照路径（目标不存在时为 undefined）。 */
+  snapshotPath?: string
+  /** 目标在工作区内的相对路径。 */
+  relativePath?: string
+  /** 目标原本是否存在（用于判断「覆盖」）。 */
+  existed: boolean
+  /** 原文件字节数。 */
+  size?: number
+  /** 失败原因（越界 / 读不到）。 */
+  reason?: string
+}
+
+/**
+ * 写前快照：把 `target` 复制到 `<workspace>/.tihu/snapshots/<ts>/<相对路径>`。
+ *
+ * @param workspace - 会话工作区根目录
+ * @param target - 工具要写的文件（相对或绝对）
+ * @param stamp - 时间戳目录名（默认 `YYYYMMDD-HHmmss-SSS`，测试里可传入固定值）
+ */
+export function takeSnapshot(workspace: string, target: string, stamp?: string): SnapshotResult {
+  const snapshotRoot = join(tihuDirOf(workspace), SNAPSHOTS_DIR, stamp ?? timestampSlug())
+  const rel = relativeInsideRoot(workspace, target)
+  if (rel === null) {
+    return { copied: false, snapshotRoot, existed: false, reason: 'outside-workspace' }
+  }
+  const source = join(workspace, rel)
+  if (!existsSync(source)) {
+    return { copied: false, snapshotRoot, relativePath: rel, existed: false, reason: 'not-found' }
+  }
+  try {
+    const info = statSync(source)
+    if (!info.isFile()) {
+      return { copied: false, snapshotRoot, relativePath: rel, existed: true, reason: 'not-a-file' }
+    }
+    const destination = join(snapshotRoot, rel)
+    mkdirSync(dirname(destination), { recursive: true })
+    copyFileSync(source, destination)
+    return { copied: true, snapshotRoot, snapshotPath: destination, relativePath: rel, existed: true, size: info.size }
+  } catch (error) {
+    return { copied: false, snapshotRoot, relativePath: rel, existed: true, reason: (error as Error)?.message ?? String(error) }
+  }
+}
+
+/** 时间戳目录名：本地时间，`YYYYMMDD-HHmmss-SSS`（可排序、无冒号，Windows 安全）。 */
+export function timestampSlug(date = new Date()): string {
+  const pad = (n: number, width = 2) => String(n).padStart(width, '0')
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}`
+    + `-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+    + `-${pad(date.getMilliseconds(), 3)}`
+}
+
+/* ---------- 审计 ---------- */
+
+export interface AuditEntry {
+  /** ISO 时间。 */
+  ts: string
+  /** 来源恒为 tihu。 */
+  source: 'tihu'
+  /** 会话 id（便于按会话 grep）。 */
+  sessionId?: string
+  /** 动作种类。 */
+  action: TihuActionKind
+  /** 工具名。 */
+  tool: string
+  /** 目标（相对路径或命令原文）。 */
+  target?: string
+  /** 快照目录。 */
+  snapshot?: string
+  /** 决策：allow / confirm-allow / confirm-deny / timeout / offline。 */
+  decision: string
+  /** 结果：executed / failed / skipped。 */
+  result?: string
+  /** diff 摘要（行数）。 */
+  diff?: { added: number; removed: number }
+  /** 备注。 */
+  note?: string
+}
+
+/** 追加一行审计。写失败不抛（审计失败不能反过来阻断用户动作），但会返回 false。 */
+export function appendAudit(workspace: string, entry: AuditEntry): boolean {
+  try {
+    const file = join(tihuDirOf(workspace), AUDIT_FILE)
+    appendFileSync(file, `${JSON.stringify(entry)}\n`, 'utf8')
+    return true
+  } catch { return false }
+}
+
+/** 读回审计（测试用；坏行跳过）。 */
+export function readAudit(workspace: string): AuditEntry[] {
+  const file = join(tihuDirOf(workspace), AUDIT_FILE)
+  if (!existsSync(file)) return []
+  const out: AuditEntry[] = []
+  for (const line of readFileSync(file, 'utf8').split(/\r?\n/)) {
+    if (!line.trim()) continue
+    try { out.push(JSON.parse(line) as AuditEntry) } catch { /* 坏行跳过 */ }
+  }
+  return out
+}
+
+/* ---------- diff 摘要 ---------- */
+
+export interface DiffSummary {
+  /** 新增行数。 */
+  added: number
+  /** 删除行数。 */
+  removed: number
+  /** 一行摘要（给屏上显示）。 */
+  summary: string
+}
+
+/**
+ * 行级 diff 摘要。只求「+N / -M 行」与首处变更，不追求完整 diff——
+ * 屏只有 320×240，完整 diff 由宿主的 diff 视图负责。
+ *
+ * 超过 4000 行退化成长度比较，避免长文件把这一步拖慢。
+ */
+export function diffSummary(before: string, after: string): DiffSummary {
+  // 统一换行，并去掉末尾那一个换行——否则 "a\n".split 会多出一个空行，
+  // 把「改了 1 行」报成 +2/-1，屏上数字就对不上了。
+  const normalize = (value: string) => String(value ?? '').replace(/\r\n/g, '\n').replace(/\n$/, '')
+  const a = normalize(before).split('\n')
+  const b = normalize(after).split('\n')
+  if (a.length > 4000 || b.length > 4000) {
+    const delta = b.length - a.length
+    return { added: delta > 0 ? delta : 0, removed: delta < 0 ? -delta : 0, summary: delta === 0 ? '内容有变化（超长文件，未做逐行 diff）' : `行数 ${delta > 0 ? '+' : ''}${delta}` }
+  }
+  let prefix = 0
+  while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) prefix += 1
+  let suffix = 0
+  while (suffix < a.length - prefix && suffix < b.length - prefix
+    && a[a.length - 1 - suffix] === b[b.length - 1 - suffix]) suffix += 1
+  const removed = a.length - prefix - suffix
+  const added = b.length - prefix - suffix
+  if (removed === 0 && added === 0) return { added: 0, removed: 0, summary: '内容未变化' }
+  const parts: string[] = []
+  if (added > 0) parts.push(`+${added} 行`)
+  if (removed > 0) parts.push(`-${removed} 行`)
+  return { added, removed, summary: parts.join(' ') }
+}
+
+/** 读文件文本（不存在/读不到给 ''，用于快照后 diff）。 */
+export function readTextOrEmpty(path: string): string {
+  try { return existsSync(path) ? readFileSync(path, 'utf8') : '' } catch { return '' }
+}
+
+/* ---------- 危险动作确认 ---------- */
+
+export interface ConfirmRequest {
+  /** 确认 id。 */
+  id: string
+  /** 一行标题。 */
+  title: string
+  /** 详情。 */
+  detail: string
+  /** 超时毫秒（默认 60s）。 */
+  timeoutMs: number
+  /** 风险等级。 */
+  risk?: 'high' | 'medium'
+  /** 归属会话（只推给绑定该会话的设备；缺省推给所有设备）。 */
+  sessionId?: string
+}
+
+export type ConfirmOutcome = 'approved' | 'rejected' | 'timeout' | 'offline' | 'disposed'
+
+export interface ConfirmBroker {
+  /** 发起一次确认，等待设备回应（或超时）。 */
+  ask: (input: { title: string; detail: string; timeoutMs?: number; risk?: 'high' | 'medium'; sessionId?: string }) => Promise<{ outcome: ConfirmOutcome; id: string }>
+  /** 设备回了 confirm.reply。返回是否命中一个在等的请求。 */
+  reply: (confirmId: string, approved: boolean) => boolean
+  /** 当前在等的确认数（调试/测试）。 */
+  pendingCount: () => number
+  /** 设备不在线时由 lane 调用：把在等的请求全部判 offline。 */
+  failAll: (outcome?: ConfirmOutcome) => void
+}
+
+/**
+ * 确认代理：lane 建一个，`ask()` 的返回值就是「准不准」。
+ *
+ * 语义写死在这里：
+ *   - 默认 60 s 超时，超时按 **rejected** 之外的 `timeout` 处理，调用方一律当拒绝；
+ *   - 设备断开时 lane 调 `failAll('offline')`；
+ *   - `ask()` 只保存 resolver，不主动推送——推送由 lane 的 onAsk 回调负责，
+ *     这样本文件不依赖协议/WS，单测能直接测「问→超时→拒」。
+ */
+export function createConfirmBroker(options: { onAsk?: (request: ConfirmRequest) => void } = {}): ConfirmBroker {
+  const pending = new Map<string, { resolve: (outcome: ConfirmOutcome) => void; timer: ReturnType<typeof setTimeout>; request: ConfirmRequest }>()
+  let counter = 0
+
+  const settle = (id: string, outcome: ConfirmOutcome) => {
+    const entry = pending.get(id)
+    if (!entry) return false
+    pending.delete(id)
+    clearTimeout(entry.timer)
+    entry.resolve(outcome)
+    return true
+  }
+
+  return {
+    ask(input) {
+      counter += 1
+      const id = `confirm-${Date.now().toString(36)}-${counter}`
+      const timeoutMs = Number.isFinite(input.timeoutMs) ? Math.max(1000, Math.floor(input.timeoutMs as number)) : 60_000
+      const request: ConfirmRequest = { id, title: String(input.title ?? ''), detail: String(input.detail ?? ''), timeoutMs, risk: input.risk, sessionId: input.sessionId }
+      return new Promise<{ outcome: ConfirmOutcome; id: string }>((resolvePromise) => {
+        const timer = setTimeout(() => {
+          pending.delete(id)
+          resolvePromise({ outcome: 'timeout', id })
+        }, timeoutMs)
+        // 注意：这里**不能** unref——确认 promise 没 settle 之前进程必须活着，
+        // 否则单测里唯一的 await 会因「没有 ref 的句柄」被判 unsettled TLA 直接退出。
+        pending.set(id, { resolve: (outcome) => resolvePromise({ outcome, id }), timer, request })
+        try { options.onAsk?.(request) } catch { /* 推送失败按超时处理 */ }
+      })
+    },
+    reply(confirmId, approved) {
+      return settle(confirmId, approved ? 'approved' : 'rejected')
+    },
+    pendingCount() { return pending.size },
+    failAll(outcome = 'offline') {
+      for (const id of [...pending.keys()]) settle(id, outcome)
+    },
+  }
+}
+
+/* ---------- 测试辅助 ---------- */
+
+/** 直接写一份测试用文件（保证父目录存在）。 */
+export function writeTestFile(path: string, text: string): void {
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, text, 'utf8')
+}
+
+export const tihuGuardTestSurface = {
+  classifyTool,
+  targetPathOf,
+  commandOf,
+  relativeInsideRoot,
+  takeSnapshot,
+  appendAudit,
+  readAudit,
+  diffSummary,
+  timestampSlug,
+  createConfirmBroker,
+}

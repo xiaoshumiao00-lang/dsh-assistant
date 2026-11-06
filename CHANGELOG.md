@@ -14,6 +14,8 @@
 
 【随版入库的取证】`reports/audit-20261106-dsh-assistant-优化与改进清单.md`：只读审计的增量结论（基线七项现状、上轮 7 项复核、36 条薄弱点、14 条建议）。只记录现象与证据，本轮不改其中任何一条。
 
+【P0 鹈鹕（tihu）模拟设备链路】`/tihu`（同一台 pocket 代理、同一套 token/cookie 鉴权）→ 按住说话或选 WAV 文件 → 官方 speech 服务转写 → 作为普通用户消息注入当前会话 → 模型执行 → 屏（320×240）逐条显示进度、回复要点与 diff 摘要，并朗读。新增 `src/tihu/{protocol,guard,lane,page}.ts`：协议 v0（未知 type 忽略、字段只增不删）、三道闸（写前快照到 `.tihu/snapshots/`、`audit.jsonl` 审计、删除/覆盖/命令/外发先发 confirm.ask 且超时按取消）。不新开端口、不改 `package.json` 版本；回归 `scripts/test-tihu-protocol.mjs`（22 项）已进 `npm test`。真板子固件、Opus、本地 VITS 留给 P1。
+
 ## [0.2.17] - 2026-11-06
 
 📺 平板 / 电视（宽屏、矮视口）专项：控制室卡片不再挤成 4 列被裁，抽屉里点得到会话

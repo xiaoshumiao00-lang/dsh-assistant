@@ -1,0 +1,634 @@
+/**
+ * 鹈鹕（tihu）P0 宿主侧 lane：一条**受 pocket 鉴权保护**的 WebSocket 事件通道。
+ *
+ * 为什么挂在 pocket 代理上而不是新开端口：
+ *   - pocket 已经把「局域网/公网 Host 判定 + token/PIN + HttpOnly cookie + 限速」
+ *     这一整套做完了（src/pocket-host/proxy.mjs）。新开端口等于把这套安全逻辑
+ *     再写一遍，多一个可被扫的入口；
+ *   - 手机远程访问本来就是经 pocket 代理进来的：`https://<公网域名>/?token=…`。
+ *     `/tihu` 与 `/tihu/lane` 走**同一个 cookie**，用户不需要第二套密码；
+ *   - 代理侧的放行规则是按「路径前缀」挑处理函数，`/tihu` 与 `/tihu/lane`
+ *     在鉴权通过后由本文件的 handleHttp / handleUpgrade 接走，不落到上游 dsh web。
+ *
+ * 数据流（P0，模拟设备页）：
+ *
+ *   页面 ──audio.frame(base64 WAV)──► handleUpgrade → 本 lane
+ *        ◄─transcript / screen.frame / tts.text / event.* / confirm.ask──
+ *
+ *   本 lane 做的事：
+ *     1. 语音：走官方 speech 服务（`ctx.get('speechController')`，也就是客户端
+ *        `remote.speech` 背后的同一个服务），不新造 ASR、不引入模型依赖；
+ *     2. 注入：`agents.get(sessionId).followup(message)` —— 与用户在会话里发消息
+ *        同一条入口（普通 user/message），不另建并行会话；
+ *     3. 屏：订阅 `session/event`（turn/start、tool/call、assistant/message、
+ *        turn/end）→ screen.frame / event.progress / event.done / tts.text；
+ *     4. 闸：`tools/pre-execute` / `tools/post-execute` → 快照、审计、危险确认
+ *        （见 guard.ts）。只对「tihu 正在执行的会话」生效，不干扰桌面正常使用。
+ */
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { isAbsolute, join } from 'node:path'
+import { WsFrameParser, encodeFrame } from '../pocket-host/ws-deflate.mjs'
+import {
+  TIHU_DOWNSTREAM_TYPES,
+  TIHU_PROTOCOL_VERSION,
+  TIHU_UPSTREAM_TYPES,
+  buildDownstream,
+  createSeq,
+  looksLikeWavBase64,
+  parseUpstream,
+  randomId,
+  summarizeForLog,
+  toBullets,
+  toTtsSegments,
+  type ConfirmAskPayload,
+  type DonePayload,
+  type HelloPayload,
+  type ProgressPayload,
+  type ScreenFramePayload,
+  type TranscriptPayload,
+  type TtsTextPayload,
+} from './protocol.ts'
+import {
+  appendAudit,
+  classifyTool,
+  commandOf,
+  createConfirmBroker,
+  diffSummary,
+  readTextOrEmpty,
+  takeSnapshot,
+  targetPathOf,
+  tihuDirOf,
+  timestampSlug,
+  type ConfirmBroker,
+  type TihuActionClass,
+} from './guard.ts'
+import { tihuPageHtml } from './page.ts'
+
+/** 页面与 WebSocket 的路径（代理侧按这两个前缀放行）。 */
+export const TIHU_PAGE_PATH = '/tihu'
+export const TIHU_LANE_PATH = '/tihu/lane'
+
+/** 单条 WS 文本帧上限（协议层还有更细的限制）。 */
+const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024
+/** 转写超时。 */
+const TRANSCRIBE_TIMEOUT_MS = 45_000
+/** 一次 tihu 会话的「活跃窗口」：注入后这么久内的工具调用才受闸门约束。 */
+const ACTIVE_WINDOW_MS = 15 * 60_000
+
+/** 一个已连接的设备（P0 一个页面一个连接）。 */
+interface TihuDevice {
+  id: string
+  socket: any
+  seq: () => number
+  hello?: HelloPayload
+  sessionId?: string
+  send: (type: string, payload: unknown) => void
+  close: () => void
+}
+
+export interface TihuRuntimeOptions {
+  /** 日志函数（走宿主 logger）。 */
+  log: (line: string) => void
+  /** 当前工作区根目录的解析器（按会话 id）。 */
+  workspaceOf?: (sessionId: string) => string | undefined
+}
+
+/** 提供给代理的两个入口 + 卸载函数。 */
+export interface TihuRuntime {
+  /** 模拟设备页 HTML。 */
+  page: () => string
+  /** WebSocket 升级处理；返回 true 表示这条 upgrade 已被 tihu 接走。 */
+  handleUpgrade: (req: any, socket: any, head: Buffer) => boolean
+  /** 卸掉所有监听。 */
+  dispose: () => void
+  /** 测试/诊断用。 */
+  stats: () => { devices: number; activeSessions: string[]; pendingConfirms: number }
+}
+
+/** 可选服务：cordis 对未 inject 的服务直读会 throw，一律 ctx.get + try。 */
+function optionalService(ctx: any, id: string): any {
+  try {
+    if (ctx && typeof ctx.get === 'function') return ctx.get(id)
+  } catch { /* 服务不存在 */ }
+  return undefined
+}
+
+/** 会话 id：不同版本宿主把它放在 session.id 或 session.header.id。 */
+function sessionIdOf(session: any): string | undefined {
+  const direct = session?.id
+  if (typeof direct === 'string' && direct !== '') return direct
+  const header = session?.header?.id
+  return typeof header === 'string' && header !== '' ? header : undefined
+}
+
+function sessionIdOfAgent(agent: any): string | undefined {
+  return sessionIdOf(agent?.session) ?? (typeof agent?.sessionId === 'string' ? agent.sessionId : undefined)
+}
+
+/** 构造一条普通用户消息（与 turn-guard 的 buildUserMessage 同形状）。 */
+export function buildTihuUserMessage(text: string): any {
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text: String(text ?? '') }],
+    source: { kind: 'user' },
+  }
+}
+
+/** WebSocket 握手应答头。 */
+function websocketAccept(key: string): string {
+  return createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
+}
+
+/** 从 upgrade 请求里取 pathname（坏 URL 一律当作不匹配）。 */
+function pathnameOf(req: any): string {
+  try { return new URL(String(req?.url ?? '/'), 'http://tihu.invalid').pathname } catch { return '' }
+}
+
+/**
+ * 创建 tihu 运行时。不监听端口：页面与 WS 都由 pocket 代理在鉴权之后转进来。
+ */
+export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRuntime {
+  const log = options.log ?? (() => {})
+  const devices = new Set<TihuDevice>()
+  /** 会话 id → 窗口到期时间（只有窗口内的工具调用才受闸门约束）。 */
+  const activeSessions = new Map<string, number>()
+  const confirmBroker: ConfirmBroker = createConfirmBroker({
+    onAsk: (request) => {
+      for (const device of devices) {
+        if (request.sessionId !== undefined && device.sessionId !== request.sessionId) continue
+        const payload: ConfirmAskPayload = {
+          confirmId: request.id,
+          title: request.title,
+          detail: request.detail,
+          options: ['确认', '取消'],
+          timeoutMs: request.timeoutMs,
+          risk: request.risk,
+        }
+        device.send('confirm.ask', payload)
+      }
+      log(`tihu confirm.ask id=${request.id} title=${JSON.stringify(request.title)}`)
+    },
+  } as any)
+
+  /** 发一条下行给「绑定到某会话」的所有设备。 */
+  function broadcast(sessionId: string, type: string, payload: unknown): void {
+    for (const device of devices) {
+      if (device.sessionId !== sessionId) continue
+      device.send(type, payload)
+    }
+  }
+
+  /** 屏帧快捷方法。 */
+  function screen(sessionId: string, frame: Omit<ScreenFramePayload, 'bullets'> & { bullets?: string[] }): void {
+    broadcast(sessionId, 'screen.frame', {
+      stage: frame.stage,
+      title: frame.title,
+      bullets: frame.bullets ?? [],
+      ...(frame.progress === undefined ? {} : { progress: frame.progress }),
+      tone: frame.tone ?? 'idle',
+    } satisfies ScreenFramePayload)
+  }
+
+  /** 语音转写：官方 speech 服务。 */
+  async function transcribe(audioBase64: string): Promise<string> {
+    const speech = optionalService(ctx, 'speechController')
+    if (speech === undefined || typeof speech?.transcribe !== 'function') {
+      throw new Error('本机语音转写不可用：宿主没有加载 speech 服务（voice-input / speech-to-text 插件）')
+    }
+    if (!looksLikeWavBase64(audioBase64)) throw new Error('音频不是 WAV（需要 16k 单声道 16bit）')
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), TRANSCRIBE_TIMEOUT_MS)
+    try {
+      const result = await speech.transcribe({ audioBase64 }, controller.signal)
+      return String(result ?? '').trim()
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /** 把文本注入当前会话（与用户手打一条消息同一条入口）。 */
+  function inject(sessionId: string, text: string): void {
+    const agents = optionalService(ctx, 'agents')
+    const agent = agents?.get?.(sessionId)
+    if (agent === undefined || agent === null || typeof agent.followup !== 'function') {
+      throw new Error(`会话 ${sessionId.slice(0, 8)}… 当前没有活动 agent（先在手机上把这个会话打开）`)
+    }
+    activeSessions.set(sessionId, Date.now() + ACTIVE_WINDOW_MS)
+    agent.followup(buildTihuUserMessage(text))
+    log(`tihu inject session=${sessionId} chars=${text.length}`)
+  }
+
+  /* ---------- 工具闸（快照 / 审计 / 危险确认） ---------- */
+
+  /** 一次已经过闸的工具调用的现场，供 post-execute 收尾。 */
+  const pendingCalls = new Map<string, {
+    sessionId: string
+    workspace: string
+    action: TihuActionClass
+    tool: string
+    target?: string
+    snapshotPath?: string
+    snapshotRoot?: string
+  }>()
+
+  function activeSessionOf(exec: any): string | undefined {
+    const sid = sessionIdOfAgent(exec?.agent)
+    if (sid === undefined) return undefined
+    const until = activeSessions.get(sid)
+    if (until === undefined || until < Date.now()) return undefined
+    return sid
+  }
+
+  function workspaceFor(sessionId: string, agent: any): string {
+    const fromOption = options.workspaceOf?.(sessionId)
+    if (typeof fromOption === 'string' && fromOption !== '') return fromOption
+    const cwd = agent?.session?.header?.cwd
+    return typeof cwd === 'string' && cwd !== '' ? cwd : process.cwd()
+  }
+
+  const disposePre = ctx.on?.('tools/pre-execute', async (exec: any, next: () => Promise<any>) => {
+    try {
+      const sessionId = activeSessionOf(exec)
+      if (sessionId === undefined) return await next()
+      const tool = String(exec?.name ?? '')
+      const workspace = workspaceFor(sessionId, exec?.agent)
+      const rawTarget = targetPathOf(exec?.args)
+      const target = rawTarget !== undefined ? rawTarget : commandOf(exec?.args)
+      const exists = rawTarget !== undefined ? existsSyncSafe(workspace, rawTarget) : undefined
+      const action = classifyTool(tool, exists)
+
+      // 不碰文件的工具（读、搜索…）不拦、不审计，避免把日志刷满。
+      if (!action.touchesFiles && !action.dangerous) return await next()
+
+      let snapshotPath: string | undefined
+      let snapshotRoot: string | undefined
+      if (action.touchesFiles && rawTarget !== undefined) {
+        const snapshot = takeSnapshot(workspace, rawTarget, timestampSlug())
+        snapshotPath = snapshot.snapshotPath
+        snapshotRoot = snapshot.snapshotRoot
+        if (snapshot.copied) {
+          screen(sessionId, {
+            stage: '动手',
+            title: `${action.label}前已备份`,
+            bullets: [snapshot.relativePath ?? '', `快照目录 .tihu/snapshots/${timestampSlug().slice(0, 15)}…`],
+            tone: 'busy',
+          })
+          log(`tihu snapshot ${snapshot.relativePath} -> ${snapshot.snapshotPath}`)
+        }
+      }
+
+      if (action.dangerous) {
+        const detail = action.kind === 'shell'
+          ? String(target ?? '').slice(0, 300)
+          : String(rawTarget ?? target ?? '')
+        const answer = await (confirmBroker as any).ask({
+          title: `${action.label}：需要你确认`,
+          detail,
+          timeoutMs: 60_000,
+          risk: action.kind === 'send' ? 'medium' : 'high',
+          sessionId,
+        })
+        const approved = answer.outcome === 'approved'
+        appendAudit(workspace, {
+          ts: new Date().toISOString(),
+          source: 'tihu',
+          sessionId,
+          action: action.kind,
+          tool,
+          ...(detail === '' ? {} : { target: detail }),
+          ...(snapshotRoot === undefined ? {} : { snapshot: snapshotRoot }),
+          decision: approved ? `confirm-${answer.outcome}` : answer.outcome,
+          note: approved ? '设备确认通过' : '未获确认，已拒绝执行',
+        })
+        if (!approved) {
+          const reason = answer.outcome === 'timeout'
+            ? 'tihu: 危险动作确认超时，按取消处理'
+            : answer.outcome === 'offline'
+              ? 'tihu: 设备不在线，危险动作默认取消'
+              : 'tihu: 用户在设备上取消了这次操作'
+          screen(sessionId, { stage: '已取消', title: action.label, bullets: ['危险动作未执行'], tone: 'alert' })
+          return { kind: 'deny', reason }
+        }
+        screen(sessionId, { stage: '动手', title: `${action.label}：已确认`, bullets: [String(detail).slice(0, 20)], tone: 'busy' })
+      } else {
+        appendAudit(workspace, {
+          ts: new Date().toISOString(),
+          source: 'tihu',
+          sessionId,
+          action: action.kind,
+          tool,
+          ...(rawTarget === undefined ? {} : { target: rawTarget }),
+          ...(snapshotRoot === undefined ? {} : { snapshot: snapshotRoot }),
+          decision: 'allow',
+          note: snapshotPath === undefined ? '新文件或无文件目标' : '已快照',
+        })
+      }
+
+      if (typeof exec?.callId === 'string') {
+        pendingCalls.set(exec.callId, { sessionId, workspace, action, tool, target: rawTarget, snapshotPath, snapshotRoot })
+      }
+      return await next()
+    } catch (error) {
+      // 闸自己出错时**不能**放行危险动作：记录后交给宿主默认策略（next）。
+      log(`tihu pre-execute failed: ${(error as Error)?.stack ?? String(error)}`)
+      return await next()
+    }
+  })
+
+  const disposePost = ctx.on?.('tools/post-execute', async (exec: any, result: any, next: () => Promise<any>) => {
+    try {
+      const callId = typeof exec?.callId === 'string' ? exec.callId : undefined
+      const pending = callId !== undefined ? pendingCalls.get(callId) : undefined
+      if (pending !== undefined) {
+        pendingCalls.delete(callId as string)
+        const failed = result?.kind === 'failure' || result?.ok === false || result?.error !== undefined
+        let diff: { added: number; removed: number } | undefined
+        if (pending.snapshotPath !== undefined && pending.target !== undefined) {
+          const before = readTextOrEmpty(pending.snapshotPath)
+          const after = readTextOrEmpty(joinSafe(pending.workspace, pending.target))
+          const summary = diffSummary(before, after)
+          diff = { added: summary.added, removed: summary.removed }
+          if (!failed) {
+            screen(pending.sessionId, {
+              stage: '动手',
+              title: `${pending.action.label}完成`,
+              bullets: [pending.target, summary.summary],
+              tone: 'ok',
+            })
+          }
+          broadcast(pending.sessionId, 'event.progress', {
+            stage: 'diff',
+            text: `${pending.target} ${summary.summary}`,
+            done: diff.added,
+          } satisfies ProgressPayload)
+        }
+        appendAudit(pending.workspace, {
+          ts: new Date().toISOString(),
+          source: 'tihu',
+          sessionId: pending.sessionId,
+          action: pending.action.kind,
+          tool: pending.tool,
+          ...(pending.target === undefined ? {} : { target: pending.target }),
+          ...(pending.snapshotRoot === undefined ? {} : { snapshot: pending.snapshotRoot }),
+          decision: 'executed',
+          result: failed ? 'failed' : 'executed',
+          ...(diff === undefined ? {} : { diff }),
+        })
+      }
+    } catch (error) {
+      log(`tihu post-execute failed: ${(error as Error)?.stack ?? String(error)}`)
+    }
+    return await next()
+  })
+
+  /* ---------- 会话事件 → 屏 ---------- */
+
+  const disposeSession = ctx.on?.('session/event', (session: any, event: any) => {
+    try {
+      const sessionId = sessionIdOf(session)
+      if (sessionId === undefined) return
+      if (![...devices].some((device) => device.sessionId === sessionId)) return
+      const type = String(event?.type ?? '')
+      const data = event?.data ?? {}
+
+      if (type === 'turn/start') {
+        activeSessions.set(sessionId, Date.now() + ACTIVE_WINDOW_MS)
+        broadcast(sessionId, 'event.progress', { stage: 'turn', text: `开始第 ${data?.turn ?? '?'} 轮` } satisfies ProgressPayload)
+        screen(sessionId, { stage: '思考', title: '正在处理…', bullets: [], tone: 'busy' })
+        return
+      }
+      if (type === 'step/start') {
+        broadcast(sessionId, 'event.progress', {
+          stage: 'step',
+          text: `第 ${data?.step ?? '?'} 步`,
+          done: Number.isFinite(data?.step) ? Number(data.step) : undefined,
+        } satisfies ProgressPayload)
+        return
+      }
+      if (type === 'tool/call') {
+        const tool = String(data?.name ?? data?.call?.name ?? '工具')
+        broadcast(sessionId, 'event.progress', { stage: 'tool', text: `调用 ${tool}` } satisfies ProgressPayload)
+        screen(sessionId, { stage: '动手', title: tool, bullets: ['正在执行…'], tone: 'busy' })
+        return
+      }
+      if (type === 'assistant/message') {
+        const blocks = data?.message?.content ?? []
+        const text = blocks.filter((b: any) => b?.type === 'text').map((b: any) => String(b?.text ?? '')).join('\n').trim()
+        if (text === '') return
+        const bullets = toBullets(text)
+        screen(sessionId, { stage: '回复', title: bullets[0] ?? '已回复', bullets: bullets.slice(1), tone: 'ok' })
+        const segments = toTtsSegments(text)
+        segments.forEach((segment, index) => {
+          broadcast(sessionId, 'tts.text', { text: segment, index, total: segments.length, lang: 'zh-CN' } satisfies TtsTextPayload)
+        })
+        return
+      }
+      if (type === 'turn/end') {
+        const reason = data?.reason?.kind ?? 'stop'
+        broadcast(sessionId, 'event.done', {
+          text: reason === 'stop' ? '本轮完成' : `本轮结束（${reason}）`,
+          ok: reason === 'stop',
+          sessionId,
+        } satisfies DonePayload)
+        screen(sessionId, { stage: '空闲', title: '待命', bullets: ['按住说话继续'], tone: 'idle' })
+        return
+      }
+    } catch (error) {
+      log(`tihu session event failed: ${(error as Error)?.stack ?? String(error)}`)
+    }
+  })
+
+  /* ---------- WebSocket ---------- */
+
+  function handleUpgrade(req: any, socket: any, head: Buffer): boolean {
+    if (pathnameOf(req) !== TIHU_LANE_PATH) return false
+    const key = req?.headers?.['sec-websocket-key']
+    if (typeof key !== 'string' || key === '') {
+      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
+      socket.destroy()
+      return true
+    }
+    socket.write([
+      'HTTP/1.1 101 Switching Protocols',
+      'Upgrade: websocket',
+      'Connection: Upgrade',
+      `Sec-WebSocket-Accept: ${websocketAccept(key)}`,
+      '',
+      '',
+    ].join('\r\n'))
+    try { socket.setNoDelay?.(true) } catch { /* 忽略 */ }
+
+    const seqOf = createSeq()
+    const device: TihuDevice = {
+      id: randomId('dev'),
+      socket,
+      seq: seqOf,
+      send(type: string, payload: unknown) {
+        try {
+          const message = buildDownstream(type as any, payload, seqOf())
+          socket.write(encodeFrame({ fin: true, opcode: 1, payload: Buffer.from(JSON.stringify(message), 'utf8') }))
+        } catch { /* 连接已断，忽略 */ }
+      },
+      close() {
+        try { socket.destroy() } catch { /* 忽略 */ }
+      },
+    }
+    devices.add(device)
+    log(`tihu device connected id=${device.id} ip=${req?.socket?.remoteAddress ?? '?'}`)
+
+    const parser = new WsFrameParser(
+      (frame: any) => {
+        try {
+          if (frame.opcode === 0x8) { // close
+            device.close()
+            return
+          }
+          if (frame.opcode === 0x9) { // ping → pong（控制帧）
+            socket.write(encodeFrame({ fin: true, opcode: 0xA, payload: frame.payload }))
+            return
+          }
+          if (frame.opcode !== 0x1) return // 只处理文本帧
+          if (frame.payload.length > MAX_WS_MESSAGE_BYTES) return
+          const message = parseUpstream(frame.payload)
+          if (message === null) {
+            // 未知 type / 坏消息：忽略，不崩、不回错（协议 v0 的兼容约定）。
+            log(`tihu ignored message: ${summarizeForLog(safeJson(frame.payload))}`)
+            return
+          }
+          void handleUpstream(device, message)
+        } catch (error) {
+          log(`tihu frame failed: ${(error as Error)?.stack ?? String(error)}`)
+        }
+      },
+      (error: unknown) => log(`tihu ws parse failed: ${(error as Error)?.message ?? String(error)}`),
+    )
+    socket.on('data', (chunk: Buffer) => parser.push(chunk))
+    socket.on('error', () => { /* 断开由 close 处理 */ })
+    socket.on('close', () => {
+      devices.delete(device)
+      // 设备全断了：还挂着的危险动作确认一律按「离线」拒绝（安全侧默认）。
+      if (devices.size === 0) (confirmBroker as any).failAll?.('offline')
+      broadcastAll('event.alert', { level: 'info', text: '设备已断开' })
+      log(`tihu device disconnected id=${device.id}`)
+    })
+    if (head !== undefined && head.length > 0) parser.push(head)
+    return true
+  }
+
+  /** 广播给所有设备（设备上下线提示用）。 */
+  function broadcastAll(type: string, payload: unknown): void {
+    for (const device of devices) device.send(type, payload)
+  }
+
+  /** 处理一条合法上行。 */
+  async function handleUpstream(device: TihuDevice, message: any): Promise<void> {
+    const type = String(message.type)
+    if (type === 'ping') {
+      device.send('pong', { nonce: message?.payload?.nonce })
+      return
+    }
+    if (type === 'hello') {
+      const payload = message.payload as HelloPayload
+      if (payload.protocol !== undefined && payload.protocol !== TIHU_PROTOCOL_VERSION) {
+        device.send('event.alert', { level: 'error', text: `协议版本不匹配：设备 ${payload.protocol} / 宿主 ${TIHU_PROTOCOL_VERSION}` })
+        return
+      }
+      device.hello = payload
+      device.sessionId = typeof payload.sessionId === 'string' && payload.sessionId !== '' ? payload.sessionId : undefined
+      const caps = payload.capabilities ?? {}
+      device.send('screen.frame', {
+        stage: '连接',
+        title: payload.deviceName ?? '鹈鹕模拟设备',
+        bullets: [
+          `协议 v${TIHU_PROTOCOL_VERSION}`,
+          device.sessionId === undefined ? '未选择会话：先打开一个会话' : '已绑定当前会话',
+          caps.microphone === false ? '无麦克风：用 WAV 文件驱动' : '麦克风可用',
+        ],
+        tone: 'idle',
+      } satisfies ScreenFramePayload)
+      device.send('event.progress', { stage: '连接', text: `设备 ${device.id} 已就绪` } satisfies ProgressPayload)
+      log(`tihu hello client=${payload.clientId} session=${device.sessionId ?? '?'} caps=${JSON.stringify(caps)}`)
+      return
+    }
+    if (type === 'confirm.reply') {
+      const payload = message.payload
+      const handled = (confirmBroker as any).reply(payload.confirmId, payload.approved === true)
+      device.send('event.progress', {
+        stage: '确认',
+        text: handled ? (payload.approved ? '已确认执行' : '已取消执行') : '这条确认已过期',
+      } satisfies ProgressPayload)
+      return
+    }
+
+    if (type === 'text.input' || type === 'audio.frame') {
+      if (device.sessionId === undefined) {
+        device.send('event.alert', { level: 'warn', text: '还没有选择会话：先在手机上打开一个会话再回来' })
+        return
+      }
+      let text = ''
+      let source: 'voice' | 'keyboard' = 'keyboard'
+      if (type === 'text.input') {
+        text = String(message.payload.text ?? '').trim()
+        source = message.payload.source === 'voice' ? 'voice' : 'keyboard'
+        if (text === '') return
+      } else {
+        source = 'voice'
+        device.send('screen.frame', { stage: '聆听', title: '正在转写…', bullets: ['本机 speech 服务'], tone: 'busy' } satisfies ScreenFramePayload)
+        try {
+          text = await transcribe(String(message.payload.audioBase64 ?? ''))
+        } catch (error) {
+          device.send('event.alert', { level: 'error', text: `转写失败：${(error as Error)?.message ?? String(error)}` })
+          device.send('screen.frame', { stage: '转写失败', title: '请用文字输入', bullets: [], tone: 'alert' } satisfies ScreenFramePayload)
+          return
+        }
+        if (text === '') {
+          device.send('event.alert', { level: 'warn', text: '没有识别到语音内容，请再说一次' })
+          return
+        }
+      }
+      try {
+        inject(device.sessionId, text)
+        // transcript 只发一次（转写成功后由这里统一回给设备，页面据此显示并允许撤回）。
+        device.send('transcript', { text, final: true, source, retryable: true } satisfies TranscriptPayload)
+        device.send('event.progress', { stage: '注入', text: '已送入当前会话' } satisfies ProgressPayload)
+        device.send('screen.frame', { stage: '思考', title: '模型处理中', bullets: [text.slice(0, 20)], tone: 'busy' } satisfies ScreenFramePayload)
+      } catch (error) {
+        device.send('event.alert', { level: 'error', text: `注入失败：${(error as Error)?.message ?? String(error)}` })
+      }
+    }
+  }
+
+  return {
+    page: () => tihuPageHtml({ lanePath: TIHU_LANE_PATH, protocol: TIHU_PROTOCOL_VERSION }),
+    handleUpgrade,
+    dispose: () => {
+      ;(confirmBroker as any).failAll?.('disposed')
+      for (const device of devices) device.close()
+      devices.clear()
+      for (const disposer of [disposePre, disposePost, disposeSession]) {
+        try { if (typeof disposer === 'function') disposer() } catch { /* 忽略 */ }
+      }
+    },
+    stats: () => ({ devices: devices.size, activeSessions: [...activeSessions.keys()], pendingConfirms: (confirmBroker as any).pendingCount?.() ?? 0 }),
+  }
+}
+
+/* ---------- 小工具 ---------- */
+
+function safeJson(buffer: Buffer): unknown {
+  try { return JSON.parse(buffer.toString('utf8')) } catch { return { type: '<unparsable>' } }
+}
+
+/** 工作区内的绝对路径；越界与否由 guard 的快照逻辑再判一次（这里只拼路径）。 */
+function joinSafe(workspace: string, target: string): string {
+  return isAbsolute(target) ? target : join(workspace, target)
+}
+
+function existsSyncSafe(workspace: string, target: string): boolean {
+  try { return existsSync(joinSafe(workspace, target)) } catch { return false }
+}
+
+/** 协议类型集合（测试与文档核对用）。 */
+export const tihuProtocolSurface = { upstream: TIHU_UPSTREAM_TYPES, downstream: TIHU_DOWNSTREAM_TYPES, version: TIHU_PROTOCOL_VERSION, tihuDirOf }

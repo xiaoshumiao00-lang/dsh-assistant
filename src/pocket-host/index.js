@@ -21,6 +21,7 @@ import { createPocketService } from './service.mjs';
 import { acquirePocketRuntime, releasePocketRuntime } from './runtime.mjs';
 import { installPocketRpc } from './web-rpc.js';
 import { restartHost } from './restart.js';
+import { createTihuRuntime } from '../tihu/lane.ts';
 import { advancedNoticeScript, DEFAULT_INJECT, classifyHost } from './proxy.mjs';
 import { lanEnabled, setLanEnabled, lanAuthEnabled, setLanAuthEnabled, lanIpOverride, setLanIpOverride, pinCustom, setPinCustom, tunnelMode, setTunnelMode, tunnelToken, setTunnelToken, tunnelHostname, setTunnelHostname, resetSettings, proxyPort, cloudflaredPath, sshTunnelConfig, setSshTunnelConfig, ensureFirstRunSettings } from './settings.mjs';
 
@@ -342,6 +343,27 @@ export function apply(ctx, config = {}, internals = {}) {
     logger.warn('dsh-pocket: DSH Desktop advanced mode — phone access unsupported, injecting notice | 桌面端 advanced 模式：手机访问暂不支持，已注入提示');
   }
 
+  // 鹈鹕（tihu）P0：宿主侧 lane（模拟设备页 + WebSocket + 三道闸）。
+  // 页面与 /tihu/lane 都由代理在**鉴权之后**接走（见 proxy.mjs），不新开端口；
+  // 语音走官方 speech 服务、注入走 agents.followup——这里只判可用性，失败不阻断手机访问。
+  let tihuRuntime = null;
+  try {
+    tihuRuntime = createTihuRuntime(ctx, {
+      log: (line) => {
+        try { (logger.info ?? logger.log).call(logger, line) } catch { /* 日志失败不影响功能 */ }
+      },
+      workspaceOf: (sessionId) => {
+        try {
+          const cwd = ctx.sessions?.get?.(sessionId)?.header?.cwd;
+          return typeof cwd === 'string' && cwd !== '' ? cwd : undefined;
+        } catch { return undefined; }
+      },
+    });
+    logger.info('dsh-pocket: tihu lane ready at /tihu (P0 simulator) | 鹈鹕模拟设备页已挂载');
+  } catch (error) {
+    logger.warn('dsh-pocket: tihu lane disabled | 鹈鹕 lane 挂载失败: %s', error?.stack ?? error);
+  }
+
   const runtime = internals.service ? null : acquirePocketRuntime(runtimeRevision, () => createPocketService({
     dshPort,
     // 端口（issue #70）：插件模式优先级 settings.proxyPort > cordis patch config.port > 3081。
@@ -349,6 +371,8 @@ export function apply(ctx, config = {}, internals = {}) {
     port: internals.port ?? config.port ?? (proxyPort() || 3081),
     home: pocketHome,
     internals,
+    // 鹈鹕（tihu）：页面与 lane 复用本代理的 token/cookie 鉴权
+    ...(tihuRuntime ? { tihu: tihuRuntime } : {}),
     getLanIpOverride: () => lanIpOverride(),
     getLanEnabled: () => lanEnabled(),
     // 桌面端**不再**注入 dsh-desktop-* 标记（issue #76）：
@@ -412,6 +436,7 @@ export function apply(ctx, config = {}, internals = {}) {
   const service = internals.service ?? runtime.service;
 
   const disposers = [];
+  if (tihuRuntime) disposers.push(() => tihuRuntime?.dispose());
   const disposeRpc = installPocketRpc(ctx, {
     service,
     desktop: isDesktop,
