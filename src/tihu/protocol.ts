@@ -7,7 +7,7 @@
  *     带旧宿主不认识的字段，旧宿主不认识就忽略，不能因此判整条消息非法）。
  *   - **未知 type 必须忽略**：`parseUpstream()` 对不认识的 type、坏 JSON、超长的
  *     文本一律返回 `null`，绝不抛错——设备端以后加消息类型时，老宿主不能崩。
- *   - 上行只有五种：hello / audio.frame / text.input / confirm.reply / ping。
+ *   - 上行只有六种：hello / audio.frame / text.input / confirm.reply / session.end / ping。
  *   - 下行八种：transcript / tts.text / screen.frame / event.progress /
  *     event.alert / event.done / confirm.ask（以及宿主回给设备的 ping 回执）。
  *
@@ -19,7 +19,7 @@
 export const TIHU_PROTOCOL_VERSION = '0' as const
 
 /** 上行消息类型（设备 → 宿主）。 */
-export const TIHU_UPSTREAM_TYPES = ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'ping'] as const
+export const TIHU_UPSTREAM_TYPES = ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'session.end', 'ping'] as const
 /** 下行消息类型（宿主 → 设备）。 */
 export const TIHU_DOWNSTREAM_TYPES = [
   'transcript',
@@ -198,6 +198,13 @@ export interface ConfirmAskPayload {
   risk?: 'high' | 'medium'
 }
 
+export interface SessionEndPayload {
+  /** 要结束的会话；不填则用设备 hello 里绑定的那个。 */
+  sessionId?: string
+  /** 结束原因（页面按钮 / 超时 / 设备主动）。仅日志用。 */
+  reason?: string
+}
+
 /* ---------- 消息联合类型 ---------- */
 
 export type TihuUpstreamMessage =
@@ -205,6 +212,7 @@ export type TihuUpstreamMessage =
   | TihuEnvelope<'audio.frame', AudioFramePayload>
   | TihuEnvelope<'text.input', TextInputPayload>
   | TihuEnvelope<'confirm.reply', ConfirmReplyPayload>
+  | TihuEnvelope<'session.end', SessionEndPayload>
   | TihuEnvelope<'ping', PingPayload>
 
 export type TihuDownstreamMessage =
@@ -293,6 +301,12 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
       case 'confirm.reply': {
         if (typeof payload.confirmId !== 'string' || payload.confirmId === '') return null
         if (typeof payload.approved !== 'boolean') return null
+        return value as TihuUpstreamMessage
+      }
+      case 'session.end': {
+        // 结束本次语音会话：只带可选的 sessionId（不填就用设备绑定的那个）。
+        if (payload.sessionId !== undefined && (typeof payload.sessionId !== 'string' || payload.sessionId.length > 256)) return null
+        if (payload.reason !== undefined && typeof payload.reason !== 'string') return null
         return value as TihuUpstreamMessage
       }
       case 'ping': return value as TihuUpstreamMessage

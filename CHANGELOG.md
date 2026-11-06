@@ -16,6 +16,18 @@
 
 【P0 鹈鹕（tihu）模拟设备链路】`/tihu`（同一台 pocket 代理、同一套 token/cookie 鉴权）→ 按住说话或选 WAV 文件 → 官方 speech 服务转写 → 作为普通用户消息注入当前会话 → 模型执行 → 屏（320×240）逐条显示进度、回复要点与 diff 摘要，并朗读。新增 `src/tihu/{protocol,guard,lane,page}.ts`：协议 v0（未知 type 忽略、字段只增不删）、三道闸（写前快照到 `.tihu/snapshots/`、`audit.jsonl` 审计、删除/覆盖/命令/外发先发 confirm.ask 且超时按取消）。不新开端口、不改 `package.json` 版本；回归 `scripts/test-tihu-protocol.mjs`（22 项）已进 `npm test`。真板子固件、Opus、本地 VITS 留给 P1。
 
+## [0.2.18] - 2026-11-06
+
+🐛 P0 上线后三处真问题：页面 WS 连不上、语音一用完电脑就不能干活、转写注入的是 `[object Object]`
+
+【页面 WS 一直 401（每 2 秒重连）】页面拼 WS 地址时**不带任何凭据**，只指望 HttpOnly cookie；而浏览器里那枚 `dsh_pocket_token` 一旦缺失或过期，`?token=` 打开的页面照样 200（走 query 分支），WS 握手却永远 401，页面就变成每 2 秒一条「WebSocket 出错」。取证：同一台机器用真实 Chrome 打 `ws://49.234.20.84:7080/tihu/lane?token=…` → **101 + screen.frame/event.progress（108 ms）**；同一条链路不带凭据 → 立刻失败（1006）。修法：`laneUrl()` 把 token 带进握手 URL（URL 优先 → sessionStorage 次之 → 最后才是 cookie），token 存进 sessionStorage 供刷新后复用；代理侧 `maybeSeedAuthCookie` 改成「已有 cookie 但与当前 PIN 不匹配时也重种」，不再让一枚过期 cookie 永远修不回来。鉴权强度没变，还是同一个 PIN。
+
+【语音用一次，电脑不能干活】`tools/pre-execute` 旧实现按**工具名**判危险：DSH 的 shell 只有一个工具名 `pwsh`，于是连 `Get-ChildItem` / `git status` 都算危险动作要设备确认，设备不在线就 60 秒超时 → 命令直接失败；再加上活跃窗口 15 分钟、且任何 `turn/start` 都会点亮窗口，用户自己打的命令也被卷进去。现在：①`isReadOnlyCommand()` 按命令原文判只读（ls/dir/Get-ChildItem/grep/Select-String/git status|diff|log|show、只读探测 curl…全部放行；删除/写入/重定向/提权/包安装/`git push`/跑脚本仍拦，拿不到命令原文时 fail closed）；②窗口 120 秒、只在 tihu 注入那一刻点亮，并用「会话最后一条 user 消息是不是刚注入的那条」核对归属——用户后来自己打的字立刻不受约束；③页面新增「结束本次语音会话」按钮（`session.end` 上行）立即清窗口；④设备不在线时危险动作**立即拒绝**，不再干等 60 秒。
+
+【转写结果被 String() 成了 `[object Object]`】`speech.transcribe()` 返回的是 `Transcript{ text, audioSeconds, inferenceSeconds }`，旧代码直接 `String(result)`，于是每次语音注入进会话的都是字面量 `"[object Object]"`（实测日志 `chars=15`）。现在按官方入参 `{ audio, language }` 调用（保留 `audioBase64` 兼容）并归一化成纯文本；`transcript` 帧改成**先回再注入**，即使会话已关也能先看到「我听到的是什么」。
+
+【验证】`scripts/test-tihu-protocol.mjs` 22 → 29 项（只读/危险命令矩阵、Transcript 对象归一化、闸门归属、`session.end` 立即失效）；新增 `scripts/tihu-voice-e2e.mjs` 真语音端到端自测（WAV → audio.frame → transcript → 注入 → 屏帧，打印转写文本与各段耗时）。本机实测：5.615 s 音频、SenseVoice int8 推理 160 ms，audio.frame → transcript 端到端 1.7 s。
+
 ## [0.2.17] - 2026-11-06
 
 📺 平板 / 电视（宽屏、矮视口）专项：控制室卡片不再挤成 4 列被裁，抽屉里点得到会话

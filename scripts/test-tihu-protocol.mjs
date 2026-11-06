@@ -35,6 +35,7 @@ import {
   classifyTool,
   createConfirmBroker,
   diffSummary,
+  isReadOnlyCommand,
   readAudit,
   takeSnapshot,
   targetPathOf,
@@ -91,7 +92,7 @@ console.log('[tihu] 协议 v0')
 
 test('版本号与类型清单固定', () => {
   assert.equal(TIHU_PROTOCOL_VERSION, '0')
-  assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'ping'])
+  assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'session.end', 'ping'])
   assert.equal(TIHU_DOWNSTREAM_TYPES.length, 8)
   assert.equal(TIHU_PAGE_PATH, '/tihu')
   assert.equal(TIHU_LANE_PATH, '/tihu/lane')
@@ -200,6 +201,77 @@ test('目标路径从参数里取（path / file_path）', () => {
   assert.equal(targetPathOf({}), undefined)
   assert.equal(targetPathOf(null), undefined)
 })
+
+/* 2026-11-06 P0 事故回归：语音注入后**只读命令必须放行**，只有真危险动作才要确认。 */
+test('只读命令放行（查看 / 搜索 / git status|diff|log / 只读探测 curl）', () => {
+  const readOnly = [
+    'Get-ChildItem D:\\dsh-assistant',
+    'ls -la',
+    'dir',
+    'Get-Content README.md -TotalCount 20',
+    'cat package.json',
+    'Select-String -Path src\\*.ts -Pattern tihu',
+    'grep -n "foo" bar.txt',
+    'git status',
+    'git diff --stat',
+    'git log --oneline -5',
+    'git show HEAD',
+    'git branch -a',
+    'git config --get user.name',
+    'curl -s http://127.0.0.1:3081/tihu',
+    'ping -n 1 127.0.0.1',
+    'Get-Process',
+    'node --version',
+    'npm ls --depth=0',
+    'cd D:\\dsh-assistant; Get-ChildItem',
+    'Get-ChildItem | Select-Object Name',
+  ]
+  for (const command of readOnly) {
+    assert.equal(isReadOnlyCommand(command), true, `应判只读：${command}`)
+    assert.equal(classifyTool('pwsh', undefined, command).dangerous, false, `不应危险：${command}`)
+  }
+})
+
+test('危险命令仍拦（删除 / 写入 / 提权 / 发请求 / 跑脚本）', () => {
+  const dangerous = [
+    'Remove-Item -Recurse -Force build',
+    'rm -rf build',
+    'del a.txt',
+    'Move-Item a.txt b.txt',
+    'Set-Content -Path a.txt -Value "x"',
+    'Get-ChildItem > out.txt',
+    'Get-Content a.txt | Out-File b.txt',
+    'git push origin main',
+    'git reset --hard',
+    'git checkout -b x',
+    'npm install',
+    'npm run build',
+    'pip install requests',
+    'curl -X POST http://example.com -d "a=1"',
+    'curl -o out.bin http://example.com/x',
+    'node -e "require(\'fs\').rmSync(\'x\')"',
+    'sudo rm -rf /',
+    'ssh root@1.2.3.4',
+  ]
+  for (const command of dangerous) {
+    assert.equal(isReadOnlyCommand(command), false, `应判危险：${command}`)
+    assert.equal(classifyTool('pwsh', undefined, command).dangerous, true, `应拦：${command}`)
+  }
+  // 拿不到命令原文（参数结构变了）时仍然 fail closed
+  assert.equal(classifyTool('shell', undefined, undefined).dangerous, true)
+  assert.equal(classifyTool('pwsh', undefined, '').dangerous, true)
+})
+
+test('session.end 是合法上行，缺少可选字段也能过', () => {
+  const end = buildUpstream('session.end', { reason: 'button' }, 9)
+  const parsed = parseUpstream(JSON.stringify(end))
+  assert.ok(parsed !== null)
+  assert.equal(parsed.type, 'session.end')
+  assert.equal(parsed.payload.reason, 'button')
+  const bad = { ...end, payload: { sessionId: 42 } }
+  assert.equal(parseUpstream(JSON.stringify(bad)), null)
+})
+
 
 const workspace = mkdtempSync(join(tmpdir(), 'tihu-ws-'))
 try {
@@ -400,6 +472,180 @@ test('用户消息形状与 turn-guard 一致（进会话历史不会写坏日�
   assert.deepEqual(message.source, { kind: 'user' })
   assert.deepEqual(message.content, [{ type: 'text', text: '你好' }])
 })
+
+
+{
+  /**
+   * 闸门归属回归：只有「tihu 注入那条消息开始的 turn」才受闸门约束。
+   * - 只读 shell → 直接放行；
+   * - 危险 shell + 设备不在线 → 立刻 deny（不再等 60 秒）；
+   * - 用户自己发起的 turn（最后一条 user 消息不是注入的那条）→ 完全不管。
+   */
+  const mkAgent = (sessionId, userMessageId) => ({
+    sessionId,
+    session: {
+      header: { cwd: process.cwd() },
+      deriveMessages: () => [
+        { id: 'old-user', role: 'user', content: [] },
+        { id: 'assistant-1', role: 'assistant', content: [] },
+        { id: userMessageId, role: 'user', content: [] },
+      ],
+    },
+    followup() {},
+  })
+
+  const preHook = (ctx) => {
+    const entry = ctx.__events.find((e) => e.name === 'tools/pre-execute')
+    return entry.handler
+  }
+
+  await testAsync('闸门：tihu turn 里只读命令放行、危险命令设备离线立刻拒绝', async () => {
+    const injected = []
+    const events = []
+    const agent = mkAgent('session-1', 'ignored')
+    agent.followup = (message) => injected.push(message)
+    const ctx = {
+      on(name, handler) { events.push({ name, handler }); return () => {} },
+      get(id) {
+        if (id === 'agents') return { get: () => agent }
+        return undefined
+      },
+      __events: events,
+    }
+    const runtime = createTihuRuntime(ctx, { log: () => {} })
+    // 直接驱动一次注入：tihu 窗口点亮，注入的消息 id 进窗口
+    const fakeSocket = new FakeSocket()
+    runtime.handleUpgrade({ url: '/tihu/lane', headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' }, socket: {} }, fakeSocket, Buffer.alloc(0))
+    fakeSocket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'c1', protocol: '0', sessionId: 'session-1' }, 1)))
+    const handler = preHook(ctx)
+
+    fakeSocket.emit('data', clientFrame(buildUpstream('text.input', { text: '看一下 git 状态', source: 'voice' }, 2)))
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(injected.length, 1, '应注入一条 tihu 消息')    // 会话里最后一条 user 消息 = tihu 刚注入的那条 → 属于 tihu turn
+    agent.session.deriveMessages = () => [{ id: injected[0].id, role: 'user', content: [] }]
+
+    // 只读命令：放行（next 被调用）
+    let nextCalled = false
+    const readonlyDecision = await handler(
+      { name: 'pwsh', arguments: { command: 'git status' }, agent, callId: 'c-read' },
+      async () => { nextCalled = true; return { kind: 'allow' } },
+    )
+    assert.equal(nextCalled, true)
+    assert.equal(readonlyDecision.kind, 'allow')
+
+    // 危险命令 + 设备掉线 → 立刻 deny，不等 60 秒超时
+    fakeSocket.destroy() // 设备断开（页面关掉 / 手机没网）
+    await new Promise((r) => setTimeout(r, 10))
+    const started = Date.now()
+    const deny = await handler(
+      { name: 'pwsh', arguments: { command: 'Remove-Item -Recurse -Force build' }, agent, callId: 'c-write' },
+      async () => ({ kind: 'allow' }),
+    )
+    assert.equal(deny.kind, 'deny')
+    assert.ok(String(deny.reason).includes('设备不在线'), `reason=${deny.reason}`)
+    assert.ok(Date.now() - started < 1000, '设备离线不应等待 60 秒')
+    runtime.dispose()
+  })
+
+  await testAsync('闸门：用户自己的 turn（最后一条 user 消息不是注入的）完全不受影响', async () => {
+    const events = []
+    const agent = mkAgent('session-1', 'user-typed-later')
+    const ctx = {
+      on(name, handler) { events.push({ name, handler }); return () => {} },
+      get(id) {
+        if (id === 'agents') return { get: () => agent }
+        return undefined
+      },
+    }
+    const runtime = createTihuRuntime(ctx, { log: () => {} })
+    const fakeSocket = new FakeSocket()
+    runtime.handleUpgrade({ url: '/tihu/lane', headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' }, socket: {} }, fakeSocket, Buffer.alloc(0))
+    fakeSocket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'c2', protocol: '0', sessionId: 'session-1' }, 1)))
+    fakeSocket.emit('data', clientFrame(buildUpstream('text.input', { text: '随便说一句', source: 'voice' }, 2)))
+    await new Promise((r) => setTimeout(r, 20))
+    const handler = events.find((e) => e.name === 'tools/pre-execute').handler
+    let nextCalled = false
+    const decision = await handler(
+      { name: 'pwsh', arguments: { command: 'Remove-Item -Recurse -Force build' }, agent, callId: 'c-user' },
+      async () => { nextCalled = true; return { kind: 'allow' } },
+    )
+    assert.equal(nextCalled, true)
+    assert.equal(decision.kind, 'allow')
+    runtime.dispose()
+  })
+
+  await testAsync('闸门：页面「结束本次语音会话」立即清除窗口', async () => {
+    const events = []
+    const injected = []
+    const agent = mkAgent('session-1', 'ignored')
+    agent.followup = (m) => injected.push(m)
+    const ctx = {
+      on(name, handler) { events.push({ name, handler }); return () => {} },
+      get(id) {
+        if (id === 'agents') return { get: () => agent }
+        return undefined
+      },
+    }
+    const runtime = createTihuRuntime(ctx, { log: () => {} })
+    const fakeSocket = new FakeSocket()
+    runtime.handleUpgrade({ url: '/tihu/lane', headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' }, socket: {} }, fakeSocket, Buffer.alloc(0))
+    fakeSocket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'c3', protocol: '0', sessionId: 'session-1' }, 1)))
+    fakeSocket.emit('data', clientFrame(buildUpstream('text.input', { text: '帮我整理一下', source: 'voice' }, 2)))
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(runtime.stats().activeSessions.includes('session-1'), true)
+    fakeSocket.emit('data', clientFrame(buildUpstream('session.end', { reason: 'button' }, 3)))
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(runtime.stats().activeSessions.includes('session-1'), false)
+    // 结束后即便消息仍是注入的那条，也不再受闸门约束
+    agent.session.deriveMessages = () => [{ id: injected[0]?.id ?? 'nope', role: 'user', content: [] }]
+    const handler = events.find((e) => e.name === 'tools/pre-execute').handler
+    let nextCalled = false
+    await handler(
+      { name: 'pwsh', arguments: { command: 'Remove-Item -Recurse -Force build' }, agent, callId: 'c-after-end' },
+      async () => { nextCalled = true; return { kind: 'allow' } },
+    )
+    assert.equal(nextCalled, true)
+    runtime.dispose()
+  })
+
+  /* 2026-11-06 回归：speech.transcribe() 返回的是 Transcript 对象，不是字符串。
+     旧实现 String(result) → 注入 "[object Object]"（实测 chars=15）。 */
+  await testAsync('语音：Transcript 对象 → 纯文本（不再注入 [object Object]）', async () => {
+    const injected = []
+    const events = []
+    const agent = mkAgent('session-1', 'ignored')
+    agent.followup = (m) => injected.push(m)
+    const ctx = {
+      on(name, handler) { events.push({ name, handler }); return () => {} },
+      get(id) {
+        if (id === 'agents') return { get: () => agent }
+        if (id === 'speechController') return {
+          transcribe: async (input) => {
+            assert.ok(input.audio instanceof Uint8Array, '应传 audio 字节，不是 base64')
+            return { text: '对我做了介绍啊，那么我想说的是呢。', audioSeconds: 5.6, inferenceSeconds: 0.16 }
+          },
+        }
+        return undefined
+      },
+    }
+    const runtime = createTihuRuntime(ctx, { log: () => {} })
+    const fakeSocket = new FakeSocket()
+    runtime.handleUpgrade({ url: '/tihu/lane', headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' }, socket: {} }, fakeSocket, Buffer.alloc(0))
+    fakeSocket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'c4', protocol: '0', sessionId: 'session-1' }, 1)))
+    fakeSocket.emit('data', clientFrame(buildUpstream('audio.frame', {
+      format: 'wav', sampleRate: 16000, channels: 1, bits: 16, audioBase64: tinyWavBase64(), durationMs: 16,
+    }, 2)))
+    await new Promise((r) => setTimeout(r, 30))
+    assert.equal(injected.length, 1)
+    assert.equal(injected[0].content[0].text, '对我做了介绍啊，那么我想说的是呢。')
+    const transcriptFrame = fakeSocket.frames()
+      .map((raw) => { try { return JSON.parse(raw) } catch { return null } })
+      .find((frame) => frame?.type === 'transcript')
+    assert.ok(transcriptFrame, '应下发 transcript 帧')
+    assert.equal(transcriptFrame.payload.text, '对我做了介绍啊，那么我想说的是呢。')
+    runtime.dispose()
+  })
+}
 
 /* ---------- 汇总 ---------- */
 

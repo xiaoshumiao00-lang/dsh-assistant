@@ -73,8 +73,18 @@ export const TIHU_LANE_PATH = '/tihu/lane'
 const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024
 /** 转写超时。 */
 const TRANSCRIBE_TIMEOUT_MS = 45_000
-/** 一次 tihu 会话的「活跃窗口」：注入后这么久内的工具调用才受闸门约束。 */
-const ACTIVE_WINDOW_MS = 15 * 60_000
+/**
+ * 一次 tihu 语音会话的「活跃窗口」：**最后一次 tihu 消息之后**这么久内才算活着。
+ *
+ * 2026-11-06 P0 修复：原来是 15 分钟、而且任何 `turn/start` 都会把窗口点亮，
+ * 于是「用一次语音，电脑 15 分钟不能干活」——用户自己在会话里打的命令也会被
+ * 当成危险动作要设备确认，设备不在线就 60 秒超时失败。现在：
+ *   - 只有 tihu 注入**自己这个 turn** 的工具调用才算（见 `tihuTurnOf`）；
+ *   - 窗口 120 秒滑动，页面「结束本次语音会话」立即清零。
+ */
+const ACTIVE_WINDOW_MS = 120_000
+/** 确认超时（设备在线但没人点）。 */
+const CONFIRM_TIMEOUT_MS = 60_000
 
 /** 一个已连接的设备（P0 一个页面一个连接）。 */
 interface TihuDevice {
@@ -85,6 +95,14 @@ interface TihuDevice {
   sessionId?: string
   send: (type: string, payload: unknown) => void
   close: () => void
+}
+
+/** 一个「tihu 语音会话」的活跃窗口。 */
+interface TihuWindow {
+  /** 到期时间（毫秒）。 */
+  until: number
+  /** 这次注入的消息 id：只有「当前 turn 的提示消息就是它」才受闸门约束。 */
+  messageId: string
 }
 
 export interface TihuRuntimeOptions {
@@ -152,8 +170,8 @@ function pathnameOf(req: any): string {
 export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRuntime {
   const log = options.log ?? (() => {})
   const devices = new Set<TihuDevice>()
-  /** 会话 id → 窗口到期时间（只有窗口内的工具调用才受闸门约束）。 */
-  const activeSessions = new Map<string, number>()
+  /** 会话 id → 活跃窗口（只有 tihu 注入的那个 turn 的工具调用才受闸门约束）。 */
+  const activeSessions = new Map<string, TihuWindow>()
   const confirmBroker: ConfirmBroker = createConfirmBroker({
     onAsk: (request) => {
       for (const device of devices) {
@@ -191,7 +209,16 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     } satisfies ScreenFramePayload)
   }
 
-  /** 语音转写：官方 speech 服务。 */
+  /**
+   * 语音转写：官方 speech 服务。
+   *
+   * 2026-11-06 修：`transcribe()` 的返回值是 **Transcript 对象**
+   * （`{ text, audioSeconds, inferenceSeconds }`），不是字符串。旧实现直接
+   * `String(result)`，于是每次语音注入的都是字面量 "[object Object]" —— 实测
+   * （scripts/tihu-voice-e2e.mjs + 日志 `chars=15`）确认过。这里按官方入参形状
+   * 传 `{ audio, language }`（同时保留 `audioBase64` 兼容旧服务），并把返回值
+   * 归一化成纯文本。
+   */
   async function transcribe(audioBase64: string): Promise<string> {
     const speech = optionalService(ctx, 'speechController')
     if (speech === undefined || typeof speech?.transcribe !== 'function') {
@@ -201,8 +228,12 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), TRANSCRIBE_TIMEOUT_MS)
     try {
-      const result = await speech.transcribe({ audioBase64 }, controller.signal)
-      return String(result ?? '').trim()
+      const audio = new Uint8Array(Buffer.from(audioBase64, 'base64'))
+      const result: any = await speech.transcribe({ audio, language: 'auto', audioBase64 }, controller.signal)
+      const text = typeof result === 'string'
+        ? result
+        : String(result?.text ?? result?.transcript ?? result?.result ?? '').trim()
+      return text.trim()
     } finally {
       clearTimeout(timer)
     }
@@ -215,9 +246,59 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     if (agent === undefined || agent === null || typeof agent.followup !== 'function') {
       throw new Error(`会话 ${sessionId.slice(0, 8)}… 当前没有活动 agent（先在手机上把这个会话打开）`)
     }
-    activeSessions.set(sessionId, Date.now() + ACTIVE_WINDOW_MS)
-    agent.followup(buildTihuUserMessage(text))
+    const message = buildTihuUserMessage(text)
+    // 窗口只在「这条消息开始的 turn」里有效：记下消息 id，执行工具时回查会话里
+    // 最后一条 user 消息是不是它——用户后来自己打的字不算 tihu 链路。
+    activeSessions.set(sessionId, { until: Date.now() + ACTIVE_WINDOW_MS, messageId: String(message.id) })
+    agent.followup(message)
     log(`tihu inject session=${sessionId} chars=${text.length}`)
+  }
+
+  /** 页面「结束本次语音会话」：立刻解除闸门（不等 120 秒）。 */
+  function endSession(sessionId: string): boolean {
+    const existed = activeSessions.delete(sessionId)
+    if (existed) log(`tihu session end session=${sessionId}`)
+    return existed
+  }
+
+  /** 会话窗口是否还活着（顺手清掉过期的）。 */
+  function windowOf(sessionId: string): TihuWindow | undefined {
+    const window = activeSessions.get(sessionId)
+    if (window === undefined) return undefined
+    if (window.until < Date.now()) {
+      activeSessions.delete(sessionId)
+      return undefined
+    }
+    return window
+  }
+
+  /** 续期（每次 tihu 上行都算一次「tihu 消息」，窗口滑动）。 */
+  function touchWindow(sessionId: string): void {
+    const window = activeSessions.get(sessionId)
+    if (window === undefined) return
+    window.until = Date.now() + ACTIVE_WINDOW_MS
+  }
+
+  /**
+   * 会话里**最后一条 user 消息**的 id。
+   *
+   * 用来判断「这次工具调用是不是 tihu 触发的」：是 → 受闸门约束；不是（用户后来
+   * 自己打到会话里的）→ 一律放行，绝不能让语音用一次就把用户自己的操作卡住。
+   * `deriveMessages()` 是宿主缓存过的增量投影，长会话也只是一次浅遍历。
+   */
+  function lastUserMessageId(session: any): string | undefined {
+    try {
+      const messages = typeof session?.deriveMessages === 'function' ? session.deriveMessages() : undefined
+      if (!Array.isArray(messages)) return undefined
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const message = messages[i]
+        if (!message || message.role !== 'user') continue
+        return typeof message.id === 'string' ? message.id : undefined
+      }
+      return undefined
+    } catch {
+      return undefined
+    }
   }
 
   /* ---------- 工具闸（快照 / 审计 / 危险确认） ---------- */
@@ -233,12 +314,37 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     snapshotRoot?: string
   }>()
 
-  function activeSessionOf(exec: any): string | undefined {
-    const sid = sessionIdOfAgent(exec?.agent)
-    if (sid === undefined) return undefined
-    const until = activeSessions.get(sid)
-    if (until === undefined || until < Date.now()) return undefined
-    return sid
+  /**
+   * 这次工具调用是否落在「tihu 语音链路」上。
+   *
+   * 判据（缺一不可）：
+   *   1. 该会话有一个未过期的 tihu 窗口（120 秒内收到过 tihu 消息）；
+   *   2. 会话里**最后一条 user 消息**就是 tihu 刚注入的那条 —— 用户自己后来打的字
+   *      会让条件 2 立刻失败，所以用户自己的操作永远不受影响。
+   *
+   * 拿不到消息列表时退回「窗口有效」判定（宁紧勿松，但窗口只有 120 秒）。
+   */
+  function tihuTurnOf(exec: any): string | undefined {
+    const sessionId = sessionIdOfAgent(exec?.agent)
+    if (sessionId === undefined) return undefined
+    const window = windowOf(sessionId)
+    if (window === undefined) return undefined
+    const last = lastUserMessageId(exec?.agent?.session)
+    if (last === undefined) return sessionId
+    return last === window.messageId ? sessionId : undefined
+  }
+
+  /** 本会话当前是否有设备在线（决定危险动作是「等确认」还是「立刻拒绝」）。 */
+  function deviceOnlineFor(sessionId: string): boolean {
+    for (const device of devices) {
+      if (device.sessionId === sessionId) return true
+    }
+    return false
+  }
+
+  /** 工具参数：宿主用 `arguments`，旧快照/单测里用 `args`。 */
+  function argsOf(exec: any): unknown {
+    return exec?.arguments ?? exec?.args
   }
 
   function workspaceFor(sessionId: string, agent: any): string {
@@ -250,16 +356,19 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
 
   const disposePre = ctx.on?.('tools/pre-execute', async (exec: any, next: () => Promise<any>) => {
     try {
-      const sessionId = activeSessionOf(exec)
+      const sessionId = tihuTurnOf(exec)
       if (sessionId === undefined) return await next()
       const tool = String(exec?.name ?? '')
       const workspace = workspaceFor(sessionId, exec?.agent)
-      const rawTarget = targetPathOf(exec?.args)
-      const target = rawTarget !== undefined ? rawTarget : commandOf(exec?.args)
+      const args = argsOf(exec)
+      const rawTarget = targetPathOf(args)
+      const command = commandOf(args)
+      const target = rawTarget !== undefined ? rawTarget : command
       const exists = rawTarget !== undefined ? existsSyncSafe(workspace, rawTarget) : undefined
-      const action = classifyTool(tool, exists)
+      // 关键：shell 类按**命令本身**判只读，不再按工具名一刀切（P0 事故根因）。
+      const action = classifyTool(tool, exists, command)
 
-      // 不碰文件的工具（读、搜索…）不拦、不审计，避免把日志刷满。
+      // 不碰文件的只读工具（读、搜索、只读 shell…）不拦、不审计，避免把日志刷满。
       if (!action.touchesFiles && !action.dangerous) return await next()
 
       let snapshotPath: string | undefined
@@ -281,12 +390,27 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
 
       if (action.dangerous) {
         const detail = action.kind === 'shell'
-          ? String(target ?? '').slice(0, 300)
+          ? String(command ?? '').slice(0, 300)
           : String(rawTarget ?? target ?? '')
+        // 设备不在线：立刻拒绝（旧实现要等 60 秒超时，把一次吐字拖成一条失败命令）。
+        if (!deviceOnlineFor(sessionId)) {
+          appendAudit(workspace, {
+            ts: new Date().toISOString(),
+            source: 'tihu',
+            sessionId,
+            action: action.kind,
+            tool,
+            ...(detail === '' ? {} : { target: detail }),
+            ...(snapshotRoot === undefined ? {} : { snapshot: snapshotRoot }),
+            decision: 'offline',
+            note: '设备不在线，危险动作直接拒绝（不等待）',
+          })
+          return { kind: 'deny', reason: 'tihu: 设备不在线，危险动作默认取消' }
+        }
         const answer = await (confirmBroker as any).ask({
           title: `${action.label}：需要你确认`,
           detail,
-          timeoutMs: 60_000,
+          timeoutMs: CONFIRM_TIMEOUT_MS,
           risk: action.kind === 'send' ? 'medium' : 'high',
           sessionId,
         })
@@ -394,7 +518,10 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       const data = event?.data ?? {}
 
       if (type === 'turn/start') {
-        activeSessions.set(sessionId, Date.now() + ACTIVE_WINDOW_MS)
+        // 注意：**不能**在这里点亮 tihu 窗口。用户自己在会话里打字同样会触发
+        // turn/start，旧实现就是这么把用户自己的每个 turn 都变成「危险动作要确认」的。
+        // 窗口只由 inject() 在 tihu 注入那一刻点亮，并由最后一条 user 消息核对归属。
+        touchWindow(sessionId)
         broadcast(sessionId, 'event.progress', { stage: 'turn', text: `开始第 ${data?.turn ?? '?'} 轮` } satisfies ProgressPayload)
         screen(sessionId, { stage: '思考', title: '正在处理…', bullets: [], tone: 'busy' })
         return
@@ -562,11 +689,34 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       return
     }
 
+    if (type === 'session.end') {
+      // 页面「结束本次语音会话」：立刻解除闸门，不用等 120 秒窗口过期。
+      const payload = message.payload ?? {}
+      const sessionId = device.sessionId ?? (typeof payload.sessionId === 'string' ? payload.sessionId : undefined)
+      if (sessionId === undefined) {
+        device.send('event.progress', { stage: '会话', text: '当前没有绑定会话' } satisfies ProgressPayload)
+        return
+      }
+      const ended = endSession(sessionId)
+      // 还挂着的危险动作确认也一并拒掉（用户已经明确结束本次会话）。
+      ;(confirmBroker as any).failAll?.('rejected')
+      device.send('event.progress', {
+        stage: '会话',
+        text: ended ? `已结束本次语音会话（${payload.reason ?? '页面按钮'}）` : '当前没有进行中的语音会话',
+      } satisfies ProgressPayload)
+      device.send('screen.frame', {
+        stage: '空闲', title: '已结束本次会话', bullets: ['闸门已关闭', '按住说话可再开始'], tone: 'idle',
+      } satisfies ScreenFramePayload)
+      return
+    }
+
     if (type === 'text.input' || type === 'audio.frame') {
       if (device.sessionId === undefined) {
         device.send('event.alert', { level: 'warn', text: '还没有选择会话：先在手机上打开一个会话再回来' })
         return
       }
+      // 收到 tihu 消息就续期（「120 秒无 tihu 消息自动失效」的另一半）。
+      touchWindow(device.sessionId)
       let text = ''
       let source: 'voice' | 'keyboard' = 'keyboard'
       if (type === 'text.input') {
@@ -589,9 +739,10 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         }
       }
       try {
-        inject(device.sessionId, text)
-        // transcript 只发一次（转写成功后由这里统一回给设备，页面据此显示并允许撤回）。
+        // 先回 transcript 再注入：即使这个会话已经被关掉/没有 agent，屏上也先看到
+        // 「我听到的是什么」，而不是只剩一条「注入失败」（E2E 脚本也靠这条核对转写）。
         device.send('transcript', { text, final: true, source, retryable: true } satisfies TranscriptPayload)
+        inject(device.sessionId, text)
         device.send('event.progress', { stage: '注入', text: '已送入当前会话' } satisfies ProgressPayload)
         device.send('screen.frame', { stage: '思考', title: '模型处理中', bullets: [text.slice(0, 20)], tone: 'busy' } satisfies ScreenFramePayload)
       } catch (error) {

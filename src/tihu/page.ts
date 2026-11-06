@@ -100,6 +100,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   </div>
   <textarea id="text" placeholder="文字兜底：直接输入要交给会话的话"></textarea>
   <div class="row" style="margin-top:8px"><button id="send" style="flex:1">发送到当前会话</button></div>
+  <div class="row" style="margin-top:8px"><button id="end" style="flex:1;border-color:#b04545">结束本次语音会话</button></div>
+  <div class="hint">「结束」会立刻解除危险动作闸门（不用等 120 秒空闲），之后你自己在会话里的操作完全不受影响。</div>
 </div>
 
 <div class="card" id="ask">
@@ -183,10 +185,35 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     } catch (e) { addEvent('alert', '朗读失败：' + e.message); }
   }
 
-  /* ---------- WebSocket ---------- */
-  function connect() {
+  /* ---------- WebSocket ----------
+     2026-11-06 P0 修复：**token 必须进握手 URL**。
+     旧实现只靠 HttpOnly cookie：用 "?token=" 打开页面时 HTML 能拿到（走 query 分支），
+     但只要浏览器里没有可用 cookie（或带着一个过期的旧 cookie），WS 握手就一律 401，
+     页面表现为每 2 秒 onerror 重连（"WebSocket 出错"）。实测同一台机器上用真实
+     Chrome 带 token 握手 → 101 + 屏帧；不带任何凭据 → 立刻失败。
+     所以：URL 上的 token 优先，其次 sessionStorage（刷新/换页后仍然记得），
+     最后才退回 cookie。这条不改鉴权强度——还是同一个 PIN，只是换个位置带。 */
+  function tokenFromUrl() {
+    try { return new URLSearchParams(location.search).get('token') || ''; } catch (e) { return ''; }
+  }
+  function rememberedToken() {
+    try { return sessionStorage.getItem('tihu.token') || ''; } catch (e) { return ''; }
+  }
+  function rememberToken(token) {
+    if (!token) return;
+    try { sessionStorage.setItem('tihu.token', token); } catch (e) { /* 隐私模式忽略 */ }
+  }
+  function laneUrl() {
     var scheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
-    var ws = new WebSocket(scheme + location.host + LANE);
+    var token = tokenFromUrl() || rememberedToken();
+    rememberToken(token);
+    var url = scheme + location.host + LANE;
+    if (token) url += '?token=' + encodeURIComponent(token);
+    return url;
+  }
+
+  function connect() {
+    var ws = new WebSocket(laneUrl());
     state.ws = ws;
     ws.onopen = function () {
       $('conn').textContent = '已连接';
@@ -195,7 +222,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       state.sessionId = readCurrentSession();
       send('hello', {
         clientId: state.clientId,
-        clientVersion: 'p0-page-1',
+        clientVersion: 'p0-page-2',
         protocol: PROTOCOL,
         capabilities: { screen: true, tts: true, microphone: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) },
         deviceName: '浏览器模拟设备',
@@ -207,13 +234,16 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       clearInterval(state.retryTimer);
       state.retryTimer = setInterval(function () { send('ping', { nonce: String(Date.now()) }); }, 25000);
     };
-    ws.onclose = function () {
-      $('conn').textContent = '已断开';
+    ws.onclose = function (event) {
+      $('conn').textContent = '已断开' + (event && event.code ? '（' + event.code + '）' : '');
       $('conn').className = 'off';
       clearInterval(state.retryTimer);
       setTimeout(connect, 2000);
     };
-    ws.onerror = function () { addEvent('alert', 'WebSocket 出错（检查是否已登录/网络）'); };
+    ws.onerror = function () {
+      var token = tokenFromUrl() || rememberedToken();
+      addEvent('alert', 'WebSocket 出错（' + (token ? '凭据已带，检查网络/宿主是否在跑' : '没找到 token：请用带 ?token= 的链接打开本页') + '）');
+    };
     ws.onmessage = function (event) {
       var msg;
       try { msg = JSON.parse(event.data); } catch (e) { return; }
@@ -416,6 +446,16 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     addEvent('progress', '已撤回上一条转写，请重新说');
   };
   $('speak').onclick = function () { if (state.lastTranscript) tihuSpeak(state.lastTranscript); };
+
+  /* 「结束本次语音会话」：宿主侧立刻关掉危险动作闸门（session.end），
+     不等 120 秒空闲窗口过期——用户说完就可以放心自己干活。 */
+  $('end').onclick = function () {
+    send('session.end', { reason: 'button', sessionId: state.sessionId || undefined });
+    addEvent('progress', '已结束本次语音会话（闸门关闭）');
+    $('screen').className = 'idle';
+    $('stage').textContent = '空闲';
+    $('title').textContent = '已结束本次会话';
+  };
 
   connect();
 })();
