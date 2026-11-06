@@ -887,7 +887,7 @@ function readDiagBody(req) {
  * @param {() => boolean} [opts.lanAccessEnabled] 局域网访问是否开启（默认开启）。关闭时拦截经局域网 Host 的请求（公网/loopback 不受影响）。
  * @returns {Promise<{server:import('node:http').Server, close:()=>Promise<void>}>}
  */
-export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DEFAULT_UPSTREAM, log = null, injectHtml = DEFAULT_INJECT, auth = null, rateLimit = null, heartbeat = {}, lanAccessEnabled = () => true, launchToken = () => '', handshakeLimit } = {}) {
+export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DEFAULT_UPSTREAM, log = null, injectHtml = DEFAULT_INJECT, auth = null, rateLimit = null, heartbeat = {}, lanAccessEnabled = () => true, launchToken = () => '', handshakeLimit, tihu = null } = {}) {
   const limiter = auth ? createRateLimiter(rateLimit ?? {}) : null;
   // WebSocket permessage-deflate（2026-10-25）：见 lib/ws-deflate.mjs 顶部注释。
   // 默认开启（省 3~4 倍字节），DSH_POCKET_WS_DEFLATE=0 一键回退明文。
@@ -1088,6 +1088,29 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
           maybeSeedAuthCookie(req, res, authResult.rawQueryToken, sessionKey);
         }
       }
+    }
+    // ── 鹈鹕（tihu）模拟设备页 ──────────────────────────────────────────────
+    // 由代理**在鉴权之后**直接吐出（不落到上游 dsh web：上游对 /tihu 是 404）。
+    // 局域网 / 公网 / 回环三种入口走的就是上面那一套 token + cookie 判定：
+    //   - 没有 cookie：先落到登录页，输 PIN 或带 ?token= 登录后种 cookie，再回来；
+    //   - 局域网访问总开关关着时，局域网 Host 会在更早的分支被 403（与首页一致）；
+    //   - 回环（本机 localhost 自测）默认同样要过 PIN（lanAuthEnabled 默认开）。
+    // 页面里的 WebSocket 走 /tihu/lane（同源、同 cookie），见下面的 upgrade 分支。
+    if (tihu && (urlPath === '/tihu' || urlPath === '/tihu/')) {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8', allow: 'GET, HEAD' });
+        res.end('method not allowed');
+        return;
+      }
+      const page = Buffer.from(tihu.page(), 'utf8');
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'content-length': String(page.length),
+        'cache-control': 'no-store',
+        'x-dsh-tihu': 'p0',
+      });
+      res.end(req.method === 'HEAD' ? undefined : page);
+      return;
     }
     const headers = loopbackAuthority({ ...req.headers }, upstream);
     // HTML 必须取未压缩版本：注入与移动首屏精简都只能安全改写纯文本。
@@ -1320,6 +1343,9 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
       }
       if (token && wsAuth.ok && wsGuess) limiter?.clear(wsIp);
     }
+    // 鹈鹕（tihu）lane：与上面完全同一套鉴权（cookie / ?token=），通过后由 tihu
+    // 接走 /tihu/lane；其它路径返回 false，继续按原来的 WS 透传给上游。
+    if (tihu && typeof tihu.handleUpgrade === 'function' && tihu.handleUpgrade(req, socket, head)) return;
     // 诊断：WS 连接的生命周期（手机是否在周期性重连 = 页面跳动的直接证据）。
     const wsId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const wsStarted = Date.now();

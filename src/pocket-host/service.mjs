@@ -192,6 +192,9 @@ export function createPocketService({
   sshTunnel,
   /** 隧道就绪回调（lib/index.js 用它轮换公网密码；参数为 'quick'|'named'） */
   onTunnelReady,
+  /** 鹈鹕（tihu）模拟设备：{ page: () => string, handleUpgrade: (req, socket, head) => boolean }。
+   *  由 lib/index.js 传入；代理在鉴权之后把 /tihu 与 /tihu/lane 交给它。 */
+  tihu = null,
   /** 日志（DSH 宿主 ctx.logger 有 info/warn/error；默认 console 无 info，自动退回 log）。
    *  隧道自动恢复的成败必须走这里：console 输出在 DSH Desktop 里不进日志文件，
    *  出问题时无法排查（2026-09-07 实测教训）。 */
@@ -291,6 +294,8 @@ export function createPocketService({
             lanAccessEnabled: () => getLanEnabled(),
             // dsh web 浏览器会话启动 token（issue #77）：实时取，新版 dsh 才有
             ...(launchToken ? { launchToken } : {}),
+            // 鹈鹕（tihu）：页面与 lane 都在鉴权之后接走，不额外开端口
+            ...(tihu ? { tihu } : {}),
           });
           if (p !== port) {
             logInfo(`dsh-pocket: port ${port} busy, proxy on ${p} | 端口 ${port} 被占用，代理改用 ${p}`);
