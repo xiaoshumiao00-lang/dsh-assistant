@@ -1378,4 +1378,24 @@ export const MOBILE_CSS = [
   scopeRules(NARROW_RULES, SCOPE),
   scopeRules(IOS_ZOOM_RULES, SCOPE),
   `@media (min-width: 1024px) {\n${scopeRules(MOBILE_CONTROLS_HIDE_RULES, DESKTOP_SCOPE)}\n}`,
+  // 矮视口（平板横放 / 电视 / 分屏：实测华为平板 CSS 视口 960×540）下的紧凑抽屉。
+  // 实测该视口里会话列表只剩 156 px（约 1 行完全可点），因为导航与工作区占掉 400 px。
+  // 这里把抽屉里的按钮行统一压到 30 px、缩小图标与行内边距，把高度还给会话列表；
+  // 只在 max-height:660px 生效，手机竖屏（≥700px 高）完全不受影响。
+  `@media (max-height: 660px) and (max-width: 1023px) {
+    [data-mobile-nav="frame"] > :first-child button:not([class*="brand"]) {
+      min-height: 0 !important;
+      height: 30px !important;
+      padding-top: 1px !important;
+      padding-bottom: 1px !important;
+    }
+    [data-mobile-nav="frame"] > :first-child button:not([class*="brand"]) svg {
+      width: 15px !important;
+      height: 15px !important;
+    }
+    [data-mobile-nav="frame"] > :first-child [class*="sessionRow"] {
+      height: 28px !important;
+      min-height: 0 !important;
+    }
+  }`,
 ].join('\n')
