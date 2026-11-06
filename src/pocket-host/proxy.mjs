@@ -492,12 +492,19 @@ function authCheck(req, tokens, sessionKey) {
 
 /** 当请求通过 `?token=<原始 PIN>` 进入且尚无 cookie 时，在响应里种 HttpOnly cookie。
  *  monkey-patch res.writeHead 把 set-cookie 头注入到第一个响应里——同 POST /pocket-login
- *  路径（lib/proxy.mjs 显式 res.writeHead 加 set-cookie）效果一致。 */
+ *  路径（lib/proxy.mjs 显式 res.writeHead 加 set-cookie）效果一致。
+ *
+ *  2026-11-06：**已有 cookie 但和当前 PIN 不匹配时也要重种**。旧实现见到任何
+ *  cookie 就直接 return，于是一个过期/换过 PIN 的旧 cookie 永远修不回来：
+ *  页面 `?token=` 走 query 分支照样 200 打得开，但后续同源 WebSocket 只认 cookie
+ *  → 每 2 秒 401 重连（鹈鹕 P0 就是被这条坑了）。cookie 值本身是
+ *  sha256(PIN:sessionKey)，比对不涉及明文，也不会放宽任何鉴权。 */
 function maybeSeedAuthCookie(req, res, rawToken, sessionKey) {
   if (!rawToken || !sessionKey) return;
-  if (parseCookies(req.headers.cookie)[TOKEN_COOKIE]) return; // 已有 cookie 就不重复种
   const expected = cookieFor(rawToken, sessionKey);
   if (!expected) return;
+  const existing = parseCookies(req.headers.cookie)[TOKEN_COOKIE];
+  if (existing && safeEqual(existing, expected)) return; // 已经是最新的，不重复种
   const origWriteHead = res.writeHead.bind(res);
   res.writeHead = function (statusCode, headers) {
     const h = { ...(headers ?? {}) };

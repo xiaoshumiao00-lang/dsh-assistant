@@ -48,20 +48,142 @@ const TOOL_PATTERNS: Array<{ re: RegExp; kind: TihuActionKind; label: string }> 
   { re: /^(send|send_email|email|mail|upload|post|publish|notify)$/i, kind: 'send', label: '对外发送' },
 ]
 
+/* ---------- 只读命令识别（2026-11-06 P0 修复） ---------- */
+
+/**
+ * **危险 token**：命令里只要出现一个，就直接判危险（保守优先）。
+ *
+ * 为什么用「黑名单 + 白名单动词」两层：
+ *   - 只看命令名字（旧实现）会把 `pwsh Get-ChildItem` 也算危险——DSH 的 shell
+ *     只有一个工具名 `pwsh`，按名字判定等于「所有命令都危险」，用户被语音注入后
+ *     连只读查看都要设备确认，设备不在线就 60 秒超时失败（P0 事故）；
+ *   - 只按首动词白名单又太松（`curl -o x`、`Get-ChildItem | Out-File` 都能写盘），
+ *     所以任何写/删/发送/提权的 token 出现即否决。
+ *
+ * 宁可误判危险，不可漏判：白名单只放「确实不落盘、不对外发送」的动词。
+ */
+const DANGEROUS_TOKENS = new RegExp(
+  [
+    // 写 / 删 / 移动 / 改名（只用不含糊的全名 + 无歧义的别名；
+    // 像 md/ri/ni 这种两字母别名会和 `.md` 文件名、路径撞车，不收）
+    String.raw`\b(rm|rmdir|del|erase|unlink|Remove-Item|Move-Item|mv|move|Rename-Item|ren|rename)\b`,
+    String.raw`\b(New-Item|mkdir|Set-Content|Add-Content|Clear-Content|Out-File|Tee-Object|tee|Copy-Item|xcopy|robocopy)\b`,
+    // 重定向（含 PowerShell 的 *>）
+    String.raw`(^|[^|])\s?>>?\s*[^\s|]`,
+    String.raw`\*\s?>>?`,
+    // 进程 / 系统状态
+    String.raw`\b(Stop-Process|Start-Process|taskkill|kill|shutdown|restart|Format-Volume|Format-Disk|reg\s+(add|delete|import)|schtasks|Set-Service|Stop-Service|Start-Service)\b`,
+    // 提权 / 执行任意代码
+    String.raw`\b(sudo|runas|chmod|chown|Invoke-Expression|iex|Start-Job|npx)\b`,
+    // 包管理（会落盘、会联网）
+    String.raw`\b(pip|conda|apt|apt-get|yum|dnf|brew|winget|choco|Install-Module|Install-Package|Uninstall-)\b`,
+    // 对外发送 / 下载落盘
+    String.raw`\b(git\s+(push|commit|reset|clean|checkout|switch|merge|rebase|stash|apply|rm|mv|tag\s+-d|init|clone))\b`,
+    String.raw`\b(npm\s+(i|install|uninstall|publish|ci|update)|pnpm\s+(add|install|remove|publish|update)|yarn\s+(add|install|publish))\b`,
+    String.raw`\b(curl|wget|Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b[^\n]*?(\s-o\s|\s-O\s|--output|\s-d\s|--data|\s-F\s|--form|-Method\s+(POST|PUT|DELETE|PATCH)|-X\s*(POST|PUT|DELETE|PATCH)|\s-T\s|--upload-file)`,
+    String.raw`\b(scp|sftp|ssh|rsync|ftp|telnet)\b`,
+  ].join('|'),
+  'i',
+)
+
+/** 只读动词白名单（取命令段首 token，去路径与扩展名后比对）。 */
+const READ_ONLY_VERBS = new Set([
+  'ls', 'dir', 'get-childitem', 'gci', 'pwd', 'get-location', 'cd', 'chdir', 'pushd', 'popd',
+  'cat', 'type', 'get-content', 'gc', 'head', 'tail', 'more', 'less', 'bat',
+  'grep', 'rg', 'select-string', 'sls', 'findstr', 'find',
+  'wc', 'sort', 'uniq', 'diff', 'cmp', 'tree', 'stat', 'du', 'df',
+  'echo', 'write-output', 'write-host', 'format-table', 'format-list', 'ft', 'fl',
+  'select-object', 'select', 'where-object', 'where', 'foreach-object', 'measure-object', 'measure',
+  'convertfrom-json', 'convertto-json', 'out-string', 'get-help', 'help', 'man',
+  'test-path', 'get-item', 'get-itemproperty', 'get-filehash', 'resolve-path', 'split-path', 'join-path',
+  'git', 'node', 'npm', 'pnpm', 'python', 'py', 'jq',
+  'where', 'which', 'get-command', 'gcm', 'whoami', 'hostname', 'ver', 'uname',
+  'get-process', 'ps', 'get-service', 'get-date', 'get-childitem', 'ipconfig', 'systeminfo', 'nslookup', 'ping',
+  'curl', 'wget', 'get-netstat', 'netstat', 'net', 'ls-files',
+])
+
+/** `git` 只读子命令（其余一律危险）。 */
+const GIT_READ_ONLY = new Set([
+  'status', 'diff', 'log', 'show', 'branch', 'remote', 'rev-parse', 'ls-files', 'blame',
+  'describe', 'shortlog', 'reflog', 'config', 'tag', 'stash', 'help', 'version', 'whatchanged',
+])
+
+/** 去掉路径前缀与 .exe/.cmd/.ps1 扩展名，得到动词。 */
+function verbOf(token: string): string {
+  const cleaned = String(token ?? '').replace(/^["']|["']$/g, '')
+  const base = cleaned.split(/[\\/]/).pop() ?? ''
+  return base.replace(/\.(exe|cmd|bat|ps1|com)$/i, '').toLowerCase()
+}
+
+/** 单个命令段是否只读。 */
+function isReadOnlySegment(segment: string): boolean {
+  // 去掉环境变量赋值前缀：FOO=bar npm ls
+  let text = segment.trim()
+  while (/^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/.test(text)) text = text.replace(/^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/, '')
+  if (text === '') return true
+  const tokens = text.split(/\s+/)
+  const verb = verbOf(tokens[0])
+  if (!READ_ONLY_VERBS.has(verb)) return false
+  // git / npm / node / python 这几个能改状态的，进一步看子命令或参数
+  if (verb === 'git') {
+    const sub = String(tokens[1] ?? '').toLowerCase()
+    if (sub === '') return true
+    if (!GIT_READ_ONLY.has(sub)) return false
+    // git config 只有读（--get / --list）算只读
+    if (sub === 'config') return tokens.some((t) => /^(--get|--get-all|--list|-l)$/i.test(t))
+    // git tag -d / git branch -D 会改
+    if (sub === 'tag' || sub === 'branch') return !tokens.some((t) => /^-(d|D|m|M|f|u)$/.test(t))
+    return true
+  }
+  if (verb === 'npm' || verb === 'pnpm') {
+    // `npm run build` 会执行项目脚本（任意代码），不算只读；`npm ls / view` 才放行。
+    const sub = String(tokens[1] ?? '').toLowerCase()
+    return ['ls', 'list', 'view', 'v', '--version', '-v', 'why', 'root', 'bin'].includes(sub)
+  }
+  if (verb === 'node' || verb === 'python' || verb === 'py') {
+    // -e / -c / 直接跟脚本 = 执行任意代码
+    if (tokens.some((t) => /^(-e|-c|--eval|--exec)$/i.test(t))) return false
+    return tokens.length === 2 && /^(-v|--version|-V)$/i.test(tokens[1])
+  }
+  if (verb === 'curl' || verb === 'wget') {
+    // 只读探测：不能带 -o/-O/-d/--data/-F/-T/-X POST（上面 token 已拦，这里再兜一层）
+    return !tokens.some((t) => /^(-o|-O|-d|-F|-T|-X|--output|--data|--form|--upload-file|--request)$/i.test(t))
+  }
+  return true
+}
+
+/**
+ * 一条 shell 命令是否**只读**（不落盘、不删、不对外发送、不改状态）。
+ *
+ * 保守策略：任何不确定 → false（判危险，交给人确认）。
+ */
+export function isReadOnlyCommand(command: string): boolean {
+  const text = String(command ?? '').trim()
+  if (text === '') return false
+  if (DANGEROUS_TOKENS.test(text)) return false
+  const segments = text.split(/;|&&|\|\||\||\r?\n/).map((s) => s.trim()).filter((s) => s !== '')
+  if (segments.length === 0) return false
+  return segments.every(isReadOnlySegment)
+}
+
 /**
  * 分类一个工具调用。
  *
- * 危险判定（P0 口径，写死在注释里便于以后核对）：
- *   - delete / shell / send：一律危险；
+ * 危险判定（2026-11-06 P0 修复后的口径，写死在注释里便于以后核对）：
+ *   - delete / send：一律危险；
+ *   - shell：**看命令本身**——只读命令（ls/dir/Get-ChildItem/grep/git status|diff|log/
+ *     只读 curl/探测）放行；写、删、提权、发请求、跑脚本一律危险。
+ *     命令拿不到（参数结构变了）→ 仍然危险（fail closed）。
  *   - write / edit：目标文件**已存在**才算「覆盖」，才危险（新建文件只快照）；
  *   - 其它工具：不碰文件、不拦。
  */
-export function classifyTool(name: string, targetExists?: boolean): TihuActionClass {
+export function classifyTool(name: string, targetExists?: boolean, command?: string): TihuActionClass {
   const raw = String(name ?? '')
   for (const pattern of TOOL_PATTERNS) {
     if (!pattern.re.test(raw)) continue
     const touchesFiles = pattern.kind === 'write' || pattern.kind === 'edit' || pattern.kind === 'delete'
-    const dangerous = pattern.kind === 'delete' || pattern.kind === 'shell' || pattern.kind === 'send'
+    const dangerous = pattern.kind === 'delete' || pattern.kind === 'send'
+      || (pattern.kind === 'shell' && !isReadOnlyCommand(String(command ?? '')))
       || ((pattern.kind === 'write' || pattern.kind === 'edit') && targetExists === true)
     return { kind: pattern.kind, touchesFiles, dangerous, label: pattern.label }
   }
@@ -352,6 +474,7 @@ export function writeTestFile(path: string, text: string): void {
 
 export const tihuGuardTestSurface = {
   classifyTool,
+  isReadOnlyCommand,
   targetPathOf,
   commandOf,
   relativeInsideRoot,
