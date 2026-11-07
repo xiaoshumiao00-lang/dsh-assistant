@@ -28,6 +28,17 @@ export interface ProjectReply {
   at: number
 }
 
+/** 去掉标题里的裸 id/哈希/uuid；剥完为空给「未命名会话」。 */
+export function humanTitle(value: unknown): string {
+  const raw = String(value ?? '')
+    .replace(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gi, ' ')
+    .replace(/\b[0-9a-f]{8,32}\b/gi, ' ')
+    .replace(/[（(]\s*[)）]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return raw === '' ? '未命名会话' : raw
+}
+
 export interface ProjectItem {
   name: string
   status: ProjectStatus
@@ -83,8 +94,8 @@ export function groupProjects(
       const first = sentences[0]?.text ?? toSpeechText(latestReply.text)
       summary = fitLine(first, 240, 12) || '等待新消息'
     } else {
-      const title = (latest?.title ?? '').trim()
-      if (title !== '' && !/^[0-9a-f]{8}$/i.test(title) && !/^[0-9a-f-]{20,}$/i.test(title)) summary = fitLine(toSpeechText(title), 240, 12)
+      const title = humanTitle(latest?.title ?? '')
+      if (title !== '未命名会话') summary = fitLine(toSpeechText(title), 240, 12)
     }
     items.push({ name, status, summary, updatedAt: latest?.updatedAt ?? 0 })
   }

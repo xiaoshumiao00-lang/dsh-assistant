@@ -300,7 +300,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     ttsTurnTexts: [], ttsAudioSeen: {},
     audioCtx: null, pcmSources: [], pcmNextTime: 0, turnPcm: [],
     voice: 'default', voices: [], voiceEngine: null,
-    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, screenMode: 'status', pending: [] };
+    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, screenMode: 'status', pending: [], boundProject: '' };
 
   /* ---------- 会话定位 ----------
      2026-11-07 P0：localStorage **按 origin 隔离**。用户在桌面宿主
@@ -449,8 +449,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         homeBody.appendChild(item);
       }
       screen.className = 'home-mode';
-      if (!state.sessionBound) $('scrollHint').textContent = '未绑定会话 · 点项目进入';
-      else $('scrollHint').textContent = '';
+      $('scrollHint').textContent = state.sessionBound
+        ? ('已绑定：' + (state.boundProject || state.sessionTitle || '未命名会话'))
+        : '未绑定会话 · 点项目进入';
       return;
     }
     if (payload && payload.mode === 'reply' && payload.reply) {
@@ -720,6 +721,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.mode = auto ? 'auto' : 'manual';
     state.sessionId = payload.sessionId;
     state.sessionTitle = payload.title || state.sessionTitle || '';
+    state.boundProject = payload.project || '';
     state.sessionBound = true;
     state.showList = false;
     var cu = payload.computerUse === true;
