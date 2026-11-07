@@ -2222,6 +2222,44 @@ test('进度屏：明细条目格式「标签 · 明细」，跑命令取真正�
   assert.equal(activityEntryOf('edit', { file_path: 'src/tihu/lane.ts' }).detail, 'lane.ts')
 })
 
+/* ---------- 2026-11-07 已定位 bug：鹈鹕「运行命令 · 明细」与 DSH 客户端不一致 ----------
+ *
+ * DSH 工具卡显示的是 pwsh 工具 arguments.description（「Search asar for workspace service」），
+ * 鹈鹕却显示从 command 里截出来的碎片（「$files」）。明细必须优先取 description，
+ * 没有 description 才退回 salientCommand(command)。
+ */
+test('进度屏：命令类明细优先 arguments.description（DSH 工具卡同源），没有才退回 command', () => {
+  const described = activityEntryOf('pwsh', {
+    description: '  Search  asar for  workspace  service ',
+    command: '$files = Get-ChildItem -Recurse | Select-String "workspaceRegistry"; $files',
+  })
+  assert.equal(described.label, '运行命令')
+  assert.equal(described.detail, 'Search asar for workspace service', `明细：${described.detail}`)
+
+  // 只有 command：口径不变（仍是去掉 cd/Set-Location 与管道尾巴的那一段）
+  const commandOnly = activityEntryOf('pwsh', { command: 'Set-Location "D:\\dsh-assistant"; node scripts/test-tihu-protocol.mjs 2>&1 | Select-Object -Last 3' })
+  assert.equal(commandOnly.detail, 'node scripts/test-tihu-protocol.mjs', `明细：${commandOnly.detail}`)
+
+  // description 空白/空串一律忽略，退回 command
+  const blankDescription = activityEntryOf('pwsh', { description: '   ', command: 'git status' })
+  assert.equal(blankDescription.detail, 'git status', `空白 description 要忽略：${blankDescription.detail}`)
+  const emptyDescription = activityEntryOf('bash', { description: '', command: 'ls -la' })
+  assert.equal(emptyDescription.detail, 'ls -la', `空 description 要忽略：${emptyDescription.detail}`)
+
+  // 屏帧走的也是这条口径（第三行最新明细）
+  const state = createProgressState(1000)
+  applySessionEvent(state, { type: 'turn/start', data: { turn: 1 } }, 1000)
+  const frame = applySessionEvent(state, {
+    type: 'tool/call',
+    data: { turn: 1, step: 1, name: 'pwsh', arguments: { description: 'Search asar for workspace service', command: '$files = Get-ChildItem D:\\dsh-assistant' } },
+  }, 2000)
+  assert.ok(frame.screen.bullets[0].startsWith('运行命令 · Search asar'), `屏帧明细：${frame.screen.bullets[0]}`)
+
+  // 其它工具规则不动：读/写/改仍是文件名，pwsh 之外不受 description 影响
+  assert.equal(activityEntryOf('read', { file_path: 'src/tihu/lane.ts', description: 'Read lane source' }).detail, 'lane.ts')
+  assert.equal(activityEntryOf('glob', { pattern: '**/*tihu*', description: 'Find tihu files' }).detail, '**/*tihu*')
+})
+
 test('进度屏：思考条目取模型 thinking 文本的第一句', () => {
   const state = createProgressState(1000)
   applySessionEvent(state, { type: 'turn/start', data: { turn: 4 } }, 1000)
