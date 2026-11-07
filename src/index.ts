@@ -5,6 +5,7 @@ import { readdir, readFile, stat } from 'node:fs/promises'
 import { dirname, resolve as pathResolve, sep } from 'node:path'
 import { createRequire } from 'node:module'
 import { manageWebRoutes } from './web-routes'
+import { registerCuBroadcastStyle } from './cu-broadcast-style'
 import { createPathGuard, minimalTermEnv, type PathGuard } from './path-guard'
 import { homedir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -394,6 +395,16 @@ async function listSkills(ctx: any, cwd: string): Promise<{ skills: SkillEntry[]
 }
 
 export function apply(ctx: Context) {
+  // ── CU 会话「语音播报友好」系统提示（鹈鹕 320×240 小屏 + TTS 朗读） ──
+  // 与内嵌 computer-use 的策略段同一个注册方式（ctx.systemPrompt.section）。
+  // 不依赖 webServer，所以放在下面的早退**之前**：headless profile 也要生效。
+  // 失败只记日志，不影响插件启动。
+  try {
+    registerCuBroadcastStyle(ctx, (line) => ctx.logger?.warn?.(line))
+  } catch (error) {
+    ctx.logger?.warn?.(`[${PLUGIN_SELF}] CU 播报风格提示挂载失败：${(error as Error)?.message ?? String(error)}`)
+  }
+
   const server = (ctx as any).webServer
   if (!server) {
     ctx.logger?.warn(`[${PLUGIN_SELF}] ctx.webServer 不可用（headless profile？），跳过服务端路由`)
