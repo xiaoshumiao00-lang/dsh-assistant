@@ -163,7 +163,8 @@ export class TihuTts {
     const engine = process.env.TIHU_TTS_ENGINE ?? ''
     if (engine === 'q4' && existsSync(this.paths.bin) && existsSync(this.paths.model) && existsSync(this.paths.codec)) return 'q4'
     if (engine === 'cpu' && this.qwenReady()) return 'cpu'
-    if (this.qwenReady() && !this.gpuFailed) return 'qwen-cuda'
+    // 2026-11-07 用户要求：千问 TTS 默认跑 CPU，不占显存；显式 TIHU_TTS_DEVICE=cuda 才走 GPU。
+    if (this.qwenReady() && !this.gpuFailed) return (process.env.TIHU_TTS_DEVICE ?? 'cpu') === 'cuda' ? 'qwen-cuda' : 'cpu'
     return 'none'
   }
 
@@ -266,7 +267,7 @@ export class TihuTts {
         '--port', String(port),
         '--threads', String(this.options.threads ?? 8),
         '--device', backend === 'cpu' ? 'cpu' : 'cuda',
-        '--dtype', process.env.TIHU_TTS_DTYPE ?? 'bf16',
+        '--dtype', process.env.TIHU_TTS_DTYPE ?? (backend === 'cpu' ? 'fp32' : 'bf16'),
       ]
     } else if (process.platform === 'win32' && binaryKind(this.paths.bin) === 'linux') {
       // WSL 里编出来的 Linux ELF：经 wsl.exe 启动，WSL2 的 localhost 转发让 Windows 侧访问 127.0.0.1。
