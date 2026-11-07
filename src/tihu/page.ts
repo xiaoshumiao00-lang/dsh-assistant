@@ -66,7 +66,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen ul { margin:0; padding:0; list-style:none; font-size:16px; line-height:20px; color:#c3ccd5; }
   #screen ul li { white-space:normal; overflow-wrap:anywhere; }
   #screen .reply-body { display:none; flex:1; overflow:hidden; font-size:16px; line-height:20px; color:#d9e2ea; }
-  #screen .reply-line { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #screen .reply-line { white-space:nowrap; overflow:hidden; }
   #screen .reply-line.cur { background:var(--accent); color:#04110f; border-radius:3px; }
   #screen .home-body { display:none; flex:1; overflow:hidden; }
   #screen.home-mode .home-body { display:block; }
@@ -510,7 +510,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         lines.push({ text: reply.lines[li].text, index: reply.lines[li].sentenceIndex });
       }
     } else {
-      var contentWidth = (SCREEN.widthPx || 320) - 2 * (SCREEN.paddingPx || 8);
+      var contentWidth = (SCREEN.widthPx || 320) - 2 * (SCREEN.paddingPx || 8) - 4;
       for (var i = 0; i < reply.sentences.length; i += 1) {
         var sentence = reply.sentences[i];
         var wrapped = wrapPx(sentence.text || '', contentWidth, SCREEN.bodyFontPx || 16);
