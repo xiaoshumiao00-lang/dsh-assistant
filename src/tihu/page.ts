@@ -65,6 +65,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen ul { margin:0; padding:0; list-style:none; font-size:16px; line-height:20px; color:#c3ccd5; }
   #screen ul li { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #screen .reply-body { display:none; flex:1; overflow:hidden; font-size:16px; line-height:20px; color:#d9e2ea; }
+  #screen .reply-line { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #screen .reply-line.cur { background:var(--accent); color:#04110f; border-radius:3px; }
+  #screen.reply-mode .title, #screen.reply-mode ul, #screen.reply-mode .bar { display:none; }
+  #screen.reply-mode .reply-body { display:block; }
   #screen .bar { margin-top:auto; display:flex; align-items:center; gap:6px; font-size:10px; color:var(--dim); }
   #screen .track { flex:1; height:5px; border-radius:3px; background:#182230; overflow:hidden; }
   #screen .fill { height:100%; width:0; background:var(--accent); transition:width .3s; }
@@ -73,6 +78,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   .screen-tools button { padding:6px 10px; font-size:12px; }
   .screen-tools button.on { border-color:var(--accent); background:#132420; }
   .screen-tools .hint { margin-left:auto; }
+  select, #voiceName, #voiceNote { font:inherit; color:var(--fg); background:#0d131b; border:1px solid var(--line); border-radius:9px; padding:8px 10px; width:100%; }
   /* 屏下的会话选择器：没有会话时展开、绑定后收起（按钮可再展开） */
   .sess-now { font-size:13px; line-height:1.35; margin:0 0 8px; word-break:break-word; }
   .sess-now.none { color:var(--warn); }
@@ -129,6 +135,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         <div class="stage" id="stage">连接</div>
         <div class="title" id="title">正在连接宿主…</div>
         <ul id="bullets"></ul>
+        <div id="replyBody" class="reply-body"></div>
         <div class="bar"><span id="progress">—</span><div class="track"><div class="fill" id="fill"></div></div></div>
       </div>
       <div class="grille"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
@@ -155,6 +162,20 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     <button id="sessRefresh" style="flex:1">刷新会话列表</button>
   </div>
   <div class="hint" id="sessHint">列表只显示 Computer Use 模式会话；默认自动绑定最近活跃的一条，手动选一次后以手动为准。</div>
+</div>
+
+<div class="card" id="voiceCard">
+  <h4>音色 · 本地 TTS（Qwen3-TTS 0.6B）</h4>
+  <div class="row">
+    <select id="voiceSelect" style="flex:1"></select>
+    <button id="voiceRefresh">刷新</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <input id="voiceName" placeholder="音色名（英文/数字/下划线）" style="flex:1" />
+    <label class="file" style="flex:1">上传参考音频（3–10 秒）<input id="voiceFile" type="file" accept="audio/*"></label>
+  </div>
+  <input id="voiceNote" placeholder="备注（可选）" style="margin-top:8px" />
+  <div class="hint" id="voiceHint">仅可用于你本人或已获授权的音色；参考音频只在本机处理，不上传云端。</div>
 </div>
 
 <div class="row">
@@ -221,7 +242,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     sessionBound: false, computerUse: null, sessionPreset: '', cuTotal: 0, total: 0,
     mode: 'auto', lastAutoId: '',
     lastTranscript: '', asking: null, recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0,
-    ttsTurnTexts: [] };
+    ttsTurnTexts: [], ttsAudioSeen: {}, ttsFallbacks: {}, localTtsFailed: false,
+    audioCtx: null, pcmSources: [], pcmNextTime: 0, turnPcm: [],
+    voice: 'default', voices: [], voiceEngine: null,
+    reply: null, replyCharPos: 0, replyTimer: 0 };
 
   /* ---------- 会话定位 ----------
      2026-11-07 P0：localStorage **按 origin 隔离**。用户在桌面宿主
@@ -291,6 +315,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
 
   /* ---------- 屏 ---------- */
   function renderScreen(payload) {
+    var screen = $('screen');
+    // reply 模式：正文阅读（跟随朗读滚动 + 当前句高亮）。
+    if (payload && payload.mode === 'reply' && payload.reply) {
+      state.reply = payload.reply;
+      if (typeof payload.reply.charPos === 'number') state.replyCharPos = payload.reply.charPos;
+      $('stage').textContent = clipScreen(payload.stage || '回答中', SCREEN.stageChars);
+      screen.className = (payload.tone || 'ok') + ' reply-mode';
+      renderReply();
+      return;
+    }
+    state.reply = null;
     // 严格按 320×240 规格排版：stage ≤10、标题 ≤28 且单行、正文最多 3 行 ×18 字。
     // 多出来的内容留在事件区，屏幕上不允许出现半行或滚动条。
     $('stage').textContent = clipScreen(payload.stage || '', SCREEN.stageChars);
@@ -302,13 +337,65 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       li.textContent = line;
       list.appendChild(li);
     });
-    var screen = $('screen');
+    $('replyBody').innerHTML = '';
     screen.className = payload.tone || 'idle';
     var progress = payload.progress;
     if (progress && typeof progress.done === 'number') {
       $('progress').textContent = progress.total ? (progress.done + '/' + progress.total) : String(progress.done);
       $('fill').style.width = progress.total ? Math.min(100, Math.round(progress.done / progress.total * 100)) + '%' : '0%';
     }
+  }
+
+  /* reply 模式渲染：句子窗口 → 每行 18 字 → 可视 10 行，当前句反色并居中。 */
+  function renderReply() {
+    var reply = state.reply;
+    var body = $('replyBody');
+    if (!reply || !Array.isArray(reply.sentences)) return;
+    var lines = [];
+    for (var i = 0; i < reply.sentences.length; i += 1) {
+      var sentence = reply.sentences[i];
+      var chars = Array.from(String(sentence.text || ''));
+      for (var offset = 0; offset < chars.length; offset += SCREEN.bodyCharsPerLine) {
+        lines.push({ text: chars.slice(offset, offset + SCREEN.bodyCharsPerLine).join(''), index: sentence.index });
+      }
+    }
+    var current = typeof reply.currentIndex === 'number' ? reply.currentIndex : 0;
+    var visible = SCREEN.replyVisibleLines;
+    var currentLine = 0;
+    for (var j = 0; j < lines.length; j += 1) { if (lines[j].index === current) { currentLine = j; break; } }
+    var start = lines.length <= visible ? 0 : Math.max(0, Math.min(currentLine - Math.floor(visible / 2), lines.length - visible));
+    body.innerHTML = '';
+    for (var k = start; k < Math.min(start + visible, lines.length); k += 1) {
+      var div = document.createElement('div');
+      div.className = 'reply-line' + (lines[k].index === current ? ' cur' : '');
+      div.textContent = lines[k].text;
+      body.appendChild(div);
+    }
+  }
+
+  /** 降级到系统语音时按 4.5 字/秒估算进度，驱动同一套高亮。 */
+  function startSpeechProgress(charStart, charEnd) {
+    clearInterval(state.replyTimer);
+    state.replyCharPos = Number.isFinite(charStart) ? charStart : 0;
+    state.replyTimer = setInterval(function () {
+      state.replyCharPos += 4.5 * 0.3;
+      if (Number.isFinite(charEnd) && state.replyCharPos >= charEnd) {
+        state.replyCharPos = charEnd;
+        clearInterval(state.replyTimer);
+        state.replyTimer = 0;
+      }
+      // 在窗口句子里找当前字符落在哪句
+      if (state.reply && Array.isArray(state.reply.sentences)) {
+        for (var i = 0; i < state.reply.sentences.length; i += 1) {
+          var sentence = state.reply.sentences[i];
+          if (state.replyCharPos >= sentence.start && state.replyCharPos < sentence.end) {
+            state.reply.currentIndex = sentence.index;
+            break;
+          }
+        }
+        renderReply();
+      }
+    }, 300);
   }
   function addEvent(kind, text) {
     var row = document.createElement('div');
@@ -584,6 +671,129 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
   });
 
+  /* ---------- 本地 TTS（PCM）播放 ----------
+     sidecar 以 24kHz/pcm16 流式下发，页面用 WebAudio 无缝排队拼接；
+     本地音频失败/没到时才降级 speechSynthesis。 */
+  function ensureAudio() {
+    if (state.audioCtx) return state.audioCtx;
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    try {
+      state.audioCtx = new Ctx({ sampleRate: 24000 });
+    } catch (e) {
+      try { state.audioCtx = new Ctx(); } catch (e2) { state.audioCtx = null; }
+    }
+    return state.audioCtx;
+  }
+  function stopPcm() {
+    for (var i = 0; i < state.pcmSources.length; i += 1) {
+      try { state.pcmSources[i].stop(); } catch (e) { /* 已结束 */ }
+    }
+    state.pcmSources = [];
+    state.pcmNextTime = 0;
+  }
+  function playPcm(base64, sampleRate) {
+    if (!base64) return;
+    var ctx = ensureAudio();
+    if (!ctx) return;
+    try {
+      var binary = atob(base64);
+      var count = Math.floor(binary.length / 2);
+      var samples = new Float32Array(count);
+      for (var i = 0; i < count; i += 1) {
+        var value = binary.charCodeAt(i * 2) | (binary.charCodeAt(i * 2 + 1) << 8);
+        if (value >= 0x8000) value -= 0x10000;
+        samples[i] = value / 32768;
+      }
+      var buffer = ctx.createBuffer(1, count, sampleRate);
+      buffer.copyToChannel(samples, 0);
+      var source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      var startAt = Math.max(ctx.currentTime + 0.03, state.pcmNextTime || 0);
+      source.start(startAt);
+      state.pcmNextTime = startAt + buffer.duration;
+      state.pcmSources.push(source);
+      source.onended = function () {
+        var index = state.pcmSources.indexOf(source);
+        if (index >= 0) state.pcmSources.splice(index, 1);
+      };
+      // 重读缓存（本轮完整 PCM）
+      state.turnPcm.push(samples);
+    } catch (e) { /* 解码失败：交给系统语音兜底 */ }
+  }
+  function scheduleSpeechFallback(index, text, charStart, charEnd) {
+    clearTimeout(state.ttsFallbacks[index]);
+    state.ttsFallbacks[index] = setTimeout(function () {
+      delete state.ttsFallbacks[index];
+      if (state.ttsAudioSeen[index]) return;
+      tts.enqueue(text);
+      addEvent('progress', '本地音频未到，已用系统语音兜底');
+      startSpeechProgress(charStart, charEnd);
+    }, 4000);
+  }
+  function fallbackAllSpeech() {
+    for (var key in state.ttsFallbacks) {
+      clearTimeout(state.ttsFallbacks[key]);
+      delete state.ttsFallbacks[key];
+    }
+    state.localTtsFailed = true;
+    for (var i = 0; i < state.ttsTurnTexts.length; i += 1) tts.enqueue(state.ttsTurnTexts[i]);
+  }
+  function resetTurnAudio() {
+    tts.stop();
+    stopPcm();
+    clearInterval(state.replyTimer);
+    state.replyTimer = 0;
+    for (var key in state.ttsFallbacks) { clearTimeout(state.ttsFallbacks[key]); delete state.ttsFallbacks[key]; }
+    state.ttsTurnTexts = [];
+    state.ttsAudioSeen = {};
+    state.turnPcm = [];
+    state.localTtsFailed = false;
+  }
+  function replayPcm() {
+    var chunks = state.turnPcm;
+    if (!chunks.length) return false;
+    stopPcm();
+    tts.stop();
+    var ctx = ensureAudio();
+    if (!ctx) return false;
+    var when = ctx.currentTime + 0.05;
+    for (var i = 0; i < chunks.length; i += 1) {
+      var buffer = ctx.createBuffer(1, chunks[i].length, 24000);
+      buffer.copyToChannel(chunks[i], 0);
+      var source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.start(when);
+      when += buffer.duration;
+      state.pcmSources.push(source);
+      (function (src) { src.onended = function () { var at = state.pcmSources.indexOf(src); if (at >= 0) state.pcmSources.splice(at, 1); }; })(source);
+    }
+    state.pcmNextTime = when;
+    return true;
+  }
+
+  /* ---------- 音色选择 ---------- */
+  function renderVoiceSelect() {
+    var select = $('voiceSelect');
+    if (!select) return;
+    select.innerHTML = '';
+    for (var i = 0; i < state.voices.length; i += 1) {
+      var option = document.createElement('option');
+      option.value = state.voices[i].name;
+      option.textContent = state.voices[i].kind === 'default' ? '默认音色' : (state.voices[i].name + (state.voices[i].durationMs ? '（' + Math.round(state.voices[i].durationMs / 1000) + 's）' : ''));
+      if (state.voices[i].name === state.voice) option.selected = true;
+      select.appendChild(option);
+    }
+    var engine = state.voiceEngine;
+    if (engine && engine.available === false) {
+      $('voiceHint').textContent = '本地 TTS 不可用（' + (engine.error || '未安装模型') + '），当前使用系统语音。';
+    } else {
+      $('voiceHint').textContent = '本地 TTS：' + ((engine && engine.model) || '本地引擎') + ' / 音色 ' + state.voice + '。仅可用于你本人或已获授权的音色；参考音频只在本机处理。';
+    }
+  }
+
   /* ---------- WebSocket ----------
      2026-11-06 P0 修复：**token 必须进握手 URL**。
      旧实现只靠 HttpOnly cookie：用 "?token=" 打开页面时 HTML 能拿到（走 query 分支），
@@ -642,6 +852,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       }
       renderSessionBar();
       requestSessions();
+      send('voice.list', {});
       clearInterval(state.retryTimer);
       state.retryTimer = setInterval(function () { send('ping', { nonce: String(Date.now()) }); }, 25000);
     };
@@ -689,11 +900,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function handle(type, payload) {
     switch (type) {
       case 'screen.frame':
-        // 新一轮回复开始：清空上一轮朗读（队列 + 全文缓存）。tts.text 紧跟在这条帧之后。
-        if (payload && payload.stage === '回复') {
-          tts.stop();
-          state.ttsTurnTexts = [];
-        }
+        // 新一轮回复开始：清空上一轮朗读（队列 + 全文缓存 + PCM）。tts.text 紧跟其后。
+        if (payload && payload.stage === '回复') resetTurnAudio();
         renderScreen(payload);
         break;
       case 'transcript':
@@ -701,17 +909,44 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         state.audioPending = false;
         clearTimeout(state.audioTimer);
         // 用户新一轮输入 = 新一轮朗读，停掉上一轮残留。
-        tts.stop();
-        state.ttsTurnTexts = [];
+        resetTurnAudio();
         $('transcript').textContent = state.lastTranscript;
         $('transcript').className = '';
         addEvent('progress', '转写：' + state.lastTranscript);
         break;
       case 'tts.text': {
         var ttsText = String(payload.text || '').trim();
-        if (ttsText) {
-          state.ttsTurnTexts.push(ttsText);
-          tts.enqueue(ttsText);
+        if (!ttsText) break;
+        var ttsIndex = typeof payload.index === 'number' ? payload.index : state.ttsTurnTexts.length;
+        state.ttsTurnTexts.push(ttsText);
+        // 不立刻念：给本地 TTS 4 秒窗口；没等到 tts.audio 才降级系统语音。
+        // 只给第一段设兜底计时：本地 TTS 是逐句串行合成，后面几段天然会晚于 4s；
+        // 若首段一直没有音频（或宿主发来“降级”alert），再整体降级系统语音。
+        if (ttsIndex === 0) scheduleSpeechFallback(ttsIndex, ttsText, payload.charStart, payload.charEnd);
+        break;
+      }
+      case 'tts.audio': {
+        var audioIndex = typeof payload.index === 'number' ? payload.index : 0;
+        state.ttsAudioSeen[audioIndex] = true;
+        clearTimeout(state.ttsFallbacks[audioIndex]);
+        delete state.ttsFallbacks[audioIndex];
+        if (typeof payload.charStart === 'number') state.replyCharPos = payload.charStart;
+        playPcm(String(payload.data || ''), Number(payload.sampleRate) || 24000);
+        break;
+      }
+      case 'voice.list': {
+        state.voices = Array.isArray(payload.voices) ? payload.voices : [];
+        state.voiceEngine = payload.engine || null;
+        if (typeof payload.selected === 'string' && payload.selected !== '') state.voice = payload.selected;
+        renderVoiceSelect();
+        break;
+      }
+      case 'voice.created': {
+        var created = payload && payload.voice ? payload.voice : null;
+        if (created && created.name) {
+          state.voice = created.name;
+          send('voice.select', { name: created.name });
+          addEvent('done', payload.cached ? ('音色 ' + created.name + ' 已存在（缓存）') : ('已创建音色 ' + created.name));
         }
         break;
       }
@@ -725,6 +960,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
           state.audioPending = false;
           clearTimeout(state.audioTimer);
         }
+        // 本地 TTS 失败：立刻把所有待念文本交给系统语音，别让用户等 4 秒兜底。
+        if (String(payload.text || '').indexOf('降级为系统语音') >= 0) fallbackAllSpeech();
         addEvent('alert', (payload.level === 'error' ? '错误：' : '') + (payload.text || ''));
         break;
       case 'event.done': addEvent('done', payload.text || '完成'); break;
@@ -842,14 +1079,13 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     return btoa(out);
   }
-  /* 解码 → 单声道 → 线性插值重采样到 16k → WAV */
-  function decodeAndResample(arrayBuffer) {
+  /* 解码 → 单声道 → 线性插值重采样到目标采样率 → WAV */
+  function decodeToMono(arrayBuffer, target) {
     var Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) return Promise.reject(new Error('浏览器不支持 AudioContext'));
     var context = new Ctx();
     return context.decodeAudioData(arrayBuffer).then(function (audio) {
       var source = audio.numberOfChannels > 1 ? mergeChannels(audio) : audio.getChannelData(0);
-      var target = 16000;
       var ratio = audio.sampleRate / target;
       var length = Math.round(source.length / ratio);
       var samples = new Float32Array(length);
@@ -861,8 +1097,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         samples[i] = source[lo] * (1 - frac) + source[hi] * frac;
       }
       try { context.close(); } catch (e) { /* 忽略 */ }
-      return { wav: encodeWav(samples, target), durationMs: Math.round(length / target * 1000) };
+      return { wav: encodeWav(samples, target), durationMs: Math.round(length / target * 1000), sampleRate: target };
     });
+  }
+  function decodeAndResample(arrayBuffer) {
+    return decodeToMono(arrayBuffer, 16000);
   }
   function mergeChannels(audio) {
     var length = audio.length;
@@ -975,14 +1214,57 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   /* 重读一遍：把本轮所有 tts 段拼回来的全文**从头重播**（不是只读最后一段）。 */
   $('speak').onclick = function () {
     var texts = state.ttsTurnTexts.length ? state.ttsTurnTexts.slice() : (state.lastTranscript ? [state.lastTranscript] : []);
-    if (!texts.length) { addEvent('alert', '还没有可重读的内容'); return; }
+    if (!texts.length && state.turnPcm.length === 0) { addEvent('alert', '还没有可重读的内容'); return; }
+    if (replayPcm()) {
+      addEvent('progress', '重读本轮全文（本地音频）');
+      return;
+    }
     tts.replay(texts);
-    addEvent('progress', '重读本轮全文（' + texts.length + ' 段）');
+    addEvent('progress', '重读本轮全文（系统语音，' + texts.length + ' 段）');
   };
   $('ttsStop').onclick = function () {
     tts.stop();
+    stopPcm();
+    for (var key in state.ttsFallbacks) { clearTimeout(state.ttsFallbacks[key]); delete state.ttsFallbacks[key]; }
     addEvent('progress', '已停止朗读');
   };
+
+  /* ---------- 音色：选择 / 上传参考音频 ---------- */
+  $('voiceSelect').onchange = function () {
+    state.voice = this.value || 'default';
+    send('voice.select', { name: state.voice });
+    renderVoiceSelect();
+  };
+  $('voiceRefresh').onclick = function () { send('voice.list', {}); };
+  $('voiceFile').addEventListener('change', function (event) {
+    var file = event.target.files && event.target.files[0];
+    event.target.value = '';
+    if (!file) return;
+    var typed = String($('voiceName').value || '').trim();
+    var fallback = String(file.name || 'voice').replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24);
+    var name = typed || ('voice-' + fallback + '-' + Date.now().toString(36).slice(-4));
+    if (!/^[A-Za-z0-9_-]{1,32}$/.test(name) || name === 'default') {
+      addEvent('alert', '音色名只能包含英文/数字/下划线/短横线（1–32 字，不能叫 default）');
+      return;
+    }
+    addEvent('progress', '正在处理参考音频（' + file.name + '）…');
+    file.arrayBuffer().then(function (buffer) {
+      return decodeToMono(buffer, 24000);
+    }).then(function (result) {
+      if (result.durationMs < 3000 || result.durationMs > 10000) {
+        addEvent('alert', '参考音频需 3–10 秒（当前 ' + (result.durationMs / 1000).toFixed(1) + ' 秒）');
+        return;
+      }
+      send('voice.create', {
+        name: name,
+        wavBase64: toBase64(result.wav),
+        note: String($('voiceNote').value || '').trim()
+      });
+      addEvent('progress', '已上传参考音频（' + (result.durationMs / 1000).toFixed(1) + ' 秒），等待 embedding…');
+    }).catch(function (error) {
+      addEvent('alert', '参考音频解码失败：' + error.message);
+    });
+  });
 
   /* 「结束本次语音会话」：宿主侧立刻关掉危险动作闸门（session.end），
      不等 120 秒空闲窗口过期——用户说完就可以放心自己干活。 */

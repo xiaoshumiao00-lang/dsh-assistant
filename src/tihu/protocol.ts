@@ -34,12 +34,16 @@ export const TIHU_UPSTREAM_TYPES = [
   'session.end',
   'sessions.query',
   'session.bind',
+  'voice.list',
+  'voice.create',
+  'voice.select',
   'ping',
 ] as const
 /** 下行消息类型（宿主 → 设备）。 */
 export const TIHU_DOWNSTREAM_TYPES = [
   'transcript',
   'tts.text',
+  'tts.audio',
   'screen.frame',
   'event.progress',
   'event.alert',
@@ -48,6 +52,8 @@ export const TIHU_DOWNSTREAM_TYPES = [
   'sessions.list',
   'session.bound',
   'session.invalid',
+  'voice.list',
+  'voice.created',
   'pong',
 ] as const
 
@@ -165,6 +171,87 @@ export interface TtsTextPayload {
   total?: number
   /** 语言（P0 固定 zh-CN；浏览器 speechSynthesis 用）。 */
   lang?: string
+  /** 本段在整段回复里的起始字符下标（Unicode 码点）。 */
+  charStart?: number
+  /** 结束字符下标（不含）。 */
+  charEnd?: number
+}
+
+/**
+ * 本地 TTS 的 PCM 音频块（宿主 → 页面）。
+ *
+ * 流式：`seq` 从 0 单调递增，每块约 120 ms；整句合成完之前就发首块。
+ * `total`/`final` 在流结束时补上（流式时 total 未知，先给 0）。
+ */
+export interface TtsAudioPayload {
+  /** 本段语音内的块序号（0 起）。 */
+  seq: number
+  /** 总块数（流式过程中未知时为 0）。 */
+  total: number
+  /** 采样率（固定 24000）。 */
+  sampleRate: 24000
+  /** 声道（固定单声道）。 */
+  channels: 1
+  /** 采样格式（固定 pcm16 = signed little-endian 16bit）。 */
+  format: 'pcm16'
+  /** PCM 数据（base64）。 */
+  data: string
+  /** 对应的 tts.text 段序号，页面据此取消该段的 speechSynthesis 兜底。 */
+  index?: number
+  /** 本块文本（可选，便于页面显示/重读）。 */
+  text?: string
+  /** 本块文本在整段回复里的字符区间（用于正文滚动/高亮）。 */
+  charStart?: number
+  charEnd?: number
+  /** 是否为最后一块。 */
+  final?: boolean
+}
+
+/** 可选音色（默认音色 + 克隆音色）。 */
+export interface VoiceInfo {
+  /** 页面用的名字（默认音色固定 `default`）。 */
+  name: string
+  /** default | cloned */
+  kind: 'default' | 'cloned'
+  /** 参考音频时长（毫秒，仅克隆音色）。 */
+  durationMs?: number
+  /** 参考音频采样率。 */
+  sampleRate?: number
+  /** 创建时间（毫秒）。 */
+  createdAt?: number
+  /** 备注。 */
+  note?: string
+}
+
+/** 下行：音色列表。 */
+export interface VoiceListPayload {
+  voices: VoiceInfo[]
+  /** 当前选中的音色（页面本地选择，宿主不强制）。 */
+  selected?: string
+  /** 本地 TTS 引擎状态；不可用时页面直接走系统语音。 */
+  engine: { available: boolean; model?: string; error?: string }
+}
+
+/** 上行：新建克隆音色。 */
+export interface VoiceCreatePayload {
+  /** 音色名（页面名，英文/数字/下划线，1–32 字）。 */
+  name: string
+  /** 参考音频 WAV base64（16k 或 24k 单声道 16bit，3–10 秒）。 */
+  wavBase64: string
+  /** 备注。 */
+  note?: string
+}
+
+/** 上行：选择音色（页面下拉框）。 */
+export interface VoiceSelectPayload {
+  name: string
+}
+
+/** 下行：克隆音色已创建。 */
+export interface VoiceCreatedPayload {
+  voice: VoiceInfo
+  /** 是否直接命中缓存（第二次同音色）。 */
+  cached?: boolean
 }
 
 /** 320×240 屏幕帧：阶段标签 / 标题 / 要点行 / 进度数字。 */
@@ -179,6 +266,32 @@ export interface ScreenFramePayload {
   progress?: { done: number; total?: number }
   /** 视觉基调：idle | busy | ok | alert。 */
   tone?: 'idle' | 'busy' | 'ok' | 'alert'
+  /** 屏幕模式：status=阶段面板（默认），reply=正文阅读。 */
+  mode?: 'status' | 'reply'
+  /** reply 模式的正文窗口（长回复只传当前窗口 ±2 句）。 */
+  reply?: ReplyScreenPayload
+}
+
+/** reply 模式的一句（字符下标用于与朗读同步）。 */
+export interface ReplyScreenSentence {
+  index: number
+  start: number
+  end: number
+  text: string
+}
+
+/** reply 模式载荷：只传当前可视窗口的句子。 */
+export interface ReplyScreenPayload {
+  /** 句子窗口（当前句 ±2 句）。 */
+  sentences: ReplyScreenSentence[]
+  /** 当前朗读句索引（0 起，整段回复内的绝对索引）。 */
+  currentIndex: number
+  /** 整段回复的总句数。 */
+  total: number
+  /** 整段回复的总字符数。 */
+  totalChars?: number
+  /** 当前播放到的字符位置（用于高亮/估算进度）。 */
+  charPos?: number
 }
 
 export interface ProgressPayload {
@@ -332,11 +445,15 @@ export type TihuUpstreamMessage =
   | TihuEnvelope<'session.end', SessionEndPayload>
   | TihuEnvelope<'sessions.query', SessionsQueryPayload>
   | TihuEnvelope<'session.bind', SessionBindPayload>
+  | TihuEnvelope<'voice.list', Record<string, never>>
+  | TihuEnvelope<'voice.create', VoiceCreatePayload>
+  | TihuEnvelope<'voice.select', VoiceSelectPayload>
   | TihuEnvelope<'ping', PingPayload>
 
 export type TihuDownstreamMessage =
   | TihuEnvelope<'transcript', TranscriptPayload>
   | TihuEnvelope<'tts.text', TtsTextPayload>
+  | TihuEnvelope<'tts.audio', TtsAudioPayload>
   | TihuEnvelope<'screen.frame', ScreenFramePayload>
   | TihuEnvelope<'event.progress', ProgressPayload>
   | TihuEnvelope<'event.alert', AlertPayload>
@@ -345,6 +462,8 @@ export type TihuDownstreamMessage =
   | TihuEnvelope<'sessions.list', SessionsListPayload>
   | TihuEnvelope<'session.bound', SessionBoundPayload>
   | TihuEnvelope<'session.invalid', SessionInvalidPayload>
+  | TihuEnvelope<'voice.list', VoiceListPayload>
+  | TihuEnvelope<'voice.created', VoiceCreatedPayload>
   | TihuEnvelope<'pong', PingPayload>
 
 /* ---------- 解析与构造 ---------- */
@@ -446,6 +565,19 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
         if (payload.sessionId !== undefined && (typeof payload.sessionId !== 'string' || payload.sessionId.length > 256)) return null
         const manual = typeof payload.sessionId === 'string' && payload.sessionId !== ''
         if (!manual && payload.auto !== true) return null
+        return value as TihuUpstreamMessage
+      }
+      case 'voice.list': return value as TihuUpstreamMessage
+      case 'voice.select': {
+        if (typeof payload.name !== 'string' || payload.name === '' || payload.name.length > 32) return null
+        return value as TihuUpstreamMessage
+      }
+      case 'voice.create': {
+        if (typeof payload.name !== 'string' || payload.name === '' || payload.name.length > 32) return null
+        if (!/^[A-Za-z0-9_-]+$/.test(payload.name)) return null
+        if (typeof payload.wavBase64 !== 'string' || payload.wavBase64 === '') return null
+        if (payload.wavBase64.length > TIHU_MAX_MESSAGE_BYTES) return null
+        if (payload.note !== undefined && typeof payload.note !== 'string') return null
         return value as TihuUpstreamMessage
       }
       case 'ping': return value as TihuUpstreamMessage
