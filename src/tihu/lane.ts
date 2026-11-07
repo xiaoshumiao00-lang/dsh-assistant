@@ -104,6 +104,8 @@ interface TihuDevice {
   voice: string
   /** edge-tts 兜底音色（在线兜底）。 */
   edgeVoice: string
+  /** 仅离线：禁用 edge-tts。 */
+  offlineOnly: boolean
   send: (type: string, payload: unknown) => void
   close: () => void
 }
@@ -683,7 +685,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
    */
   async function speakLocally(device: TihuDevice, sessionId: string, sentences: ReplySentence[], speechSegments: SpeechSegment[], includeAll: boolean): Promise<void> {
     if (speechSegments.length === 0) return
-    await tts.ensureServer()
+    // 默认走 edge 云健，不必为每句唤醒 GPU；只有克隆音色或仅离线才需要本地 Qwen。
+    if ((device.voice && device.voice !== 'default') || device.offlineOnly) await tts.ensureServer()
     const status = tts.status()
     if (!status.available) {
       device.send('event.alert', { level: 'error', text: `所有本地 TTS 均不可用，本条只显示文字：${status.error ?? '未安装模型'}` })
@@ -702,6 +705,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
           voice,
           sessionId,
           edgeVoice: device.edgeVoice,
+          offlineOnly: device.offlineOnly,
           onChunk: (chunk) => {
             device.send('tts.audio', {
               seq: chunk.seq,
@@ -1148,6 +1152,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       autoFollow: false,
       voice: 'default',
       edgeVoice: process.env.TIHU_EDGE_VOICE ?? 'zh-CN-YunjianNeural',
+      offlineOnly: process.env.TIHU_OFFLINE_ONLY === '1',
       send(type: string, payload: unknown) {
         try {
           const message = buildDownstream(type as any, payload, seqOf())
@@ -1336,6 +1341,10 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       const name = String(message.payload?.name ?? '')
       device.voice = name === '' ? 'default' : name
       if (typeof message.payload?.edgeVoice === 'string' && message.payload.edgeVoice !== '') device.edgeVoice = message.payload.edgeVoice
+      if (typeof message.payload?.offlineOnly === 'boolean') device.offlineOnly = message.payload.offlineOnly
+      if (device.voice !== 'default' && tts.available()) {
+        void tts.ensureServer().catch((error) => log(`tihu tts clone prewarm failed: ${(error as Error)?.message ?? String(error)}`))
+      }
       device.send('event.progress', { stage: '音色', text: `音色已切换：${device.voice}` } satisfies ProgressPayload)
       return
     }

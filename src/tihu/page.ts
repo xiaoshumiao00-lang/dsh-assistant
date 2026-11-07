@@ -181,6 +181,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       <option value="zh-CN-YunyangNeural">兜底音色：云扬 Yunyang</option>
     </select>
   </div>
+  <label class="hint" style="display:flex;align-items:center;gap:6px;margin-top:8px">
+    <input id="offlineOnly" type="checkbox" style="width:auto" /> 仅离线（禁用 edge 云健，走 Qwen/SAPI）
+  </label>
   <input id="voiceNote" placeholder="备注（可选）" style="margin-top:8px" />
   <div class="hint" id="voiceHint">仅可用于你本人或已获授权的音色；参考音频只在本机处理，不上传云端。</div>
 </div>
@@ -773,7 +776,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       renderSessionBar();
       requestSessions();
       send('voice.list', {});
-      try { send('voice.select', { name: state.voice || 'default', edgeVoice: $('edgeVoiceSelect').value }); } catch (e) { /* 忽略 */ }
+      try { send('voice.select', { name: state.voice || 'default', edgeVoice: $('edgeVoiceSelect').value, offlineOnly: $('offlineOnly').checked }); } catch (e) { /* 忽略 */ }
       clearInterval(state.retryTimer);
       state.retryTimer = setInterval(function () { send('ping', { nonce: String(Date.now()) }); }, 25000);
     };
@@ -1143,11 +1146,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var saved = '';
     try { saved = localStorage.getItem('tihu.edgeVoice') || ''; } catch (e) { /* 忽略 */ }
     if (saved) $('edgeVoiceSelect').value = saved;
+    try { $('offlineOnly').checked = localStorage.getItem('tihu.offlineOnly') === '1'; } catch (e) { /* 忽略 */ }
   })();
   $('edgeVoiceSelect').onchange = function () {
     try { localStorage.setItem('tihu.edgeVoice', this.value); } catch (e) { /* 忽略 */ }
-    send('voice.select', { name: state.voice, edgeVoice: this.value });
+    send('voice.select', { name: state.voice, edgeVoice: this.value, offlineOnly: $('offlineOnly').checked });
     addEvent('progress', '在线兜底音色：' + this.options[this.selectedIndex].textContent);
+  };
+  $('offlineOnly').onchange = function () {
+    try { localStorage.setItem('tihu.offlineOnly', this.checked ? '1' : '0'); } catch (e) { /* 忽略 */ }
+    send('voice.select', { name: state.voice, edgeVoice: $('edgeVoiceSelect').value, offlineOnly: this.checked });
+    addEvent('progress', this.checked ? '已开启仅离线：禁用 edge 云健' : '已关闭仅离线：优先 edge 云健');
   };
   $('voiceRefresh').onclick = function () { send('voice.list', {}); };
   $('voiceFile').addEventListener('change', function (event) {

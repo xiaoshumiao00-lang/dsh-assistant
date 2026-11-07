@@ -247,6 +247,8 @@ export interface VoiceSelectPayload {
   name: string
   /** edge-tts 兜底音色（zh-CN-...Neural），不填用默认云健。 */
   edgeVoice?: string
+  /** 仅离线：禁用 edge-tts，只走 Qwen / SAPI。 */
+  offlineOnly?: boolean
 }
 
 /** 下行：克隆音色已创建。 */
@@ -573,6 +575,7 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
       case 'voice.select': {
         if (typeof payload.name !== 'string' || payload.name === '' || payload.name.length > 32) return null
         if (payload.edgeVoice !== undefined && (typeof payload.edgeVoice !== 'string' || payload.edgeVoice.length > 64)) return null
+        if (payload.offlineOnly !== undefined && typeof payload.offlineOnly !== 'boolean') return null
         return value as TihuUpstreamMessage
       }
       case 'voice.create': {
