@@ -224,6 +224,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     ...(options.tts?.port === undefined ? {} : { port: options.tts.port }),
     ...(options.tts?.paths === undefined ? {} : { paths: options.tts.paths }),
   })
+  // GPU 引擎需显式 TIHU_TTS_DEVICE=cuda；默认 CPU fp32，避免占用显存影响 strata。
   const confirmBroker: ConfirmBroker = createConfirmBroker({
     onAsk: (request) => {
       for (const device of devices) {
@@ -684,6 +685,9 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       return
     }
     const voice = device.voice || 'default'
+    if (tts.deviceFallback() !== '') {
+      device.send('event.alert', { level: 'warn', text: tts.deviceFallback() })
+    }
     device.send('event.progress', { stage: 'tts', text: `本地 TTS：${status.model ?? 'local'} / 音色 ${voice}` } satisfies ProgressPayload)
     void (async () => {
       for (let index = 0; index < speechSegments.length; index += 1) {

@@ -141,6 +141,10 @@ export class TihuTts {
   private port: number
   private modelLoaded = false
   private lastError = ''
+  /** PyTorch sidecar 实际设备（cuda/cpu），启动后由 /health 回填。 */
+  private activeDevice: 'cuda' | 'cpu' = (process.env.TIHU_TTS_DEVICE ?? 'cpu') === 'cuda' ? 'cuda' : 'cpu'
+  /** 显存不足回落 CPU 的提示（页面事件区用）。 */
+  private fallbackNote = ''
 
   constructor(options: TihuTtsOptions) {
     this.options = options
@@ -186,12 +190,17 @@ export class TihuTts {
   status(): { available: boolean; model?: string; error?: string } {
     const backend = this.backend()
     if (backend === 'codec') return { available: true, model: 'qwen3-tts 0.6b-q4' }
-    if (backend === 'qwen-pt') return { available: true, model: 'qwen3-tts 0.6b-pt' }
+    if (backend === 'qwen-pt') return { available: true, model: this.activeDevice === 'cuda' ? 'qwen3-tts 0.6b-cuda' : 'qwen3-tts 0.6b-pt' }
     if (backend === 'sapi') return { available: true, model: 'windows-sapi（Qwen3-TTS 未就绪）' }
     return {
       available: false,
       error: this.lastError || `本地 TTS 未安装：缺少 ${basename(this.qwenServerScript())} 或模型文件（${this.paths.root}）`,
     }
+  }
+
+  /** 显存不足回落 CPU 的原因（无回落返回空串）。 */
+  deviceFallback(): string {
+    return this.fallbackNote
   }
 
   /** 确保 sidecar 已启动并加载完模型（SAPI 后端无需常驻进程）。 */
@@ -239,6 +248,8 @@ export class TihuTts {
         '--host', '127.0.0.1',
         '--port', String(port),
         '--threads', String(this.options.threads ?? 8),
+        '--device', process.env.TIHU_TTS_DEVICE ?? 'cpu',
+        '--dtype', process.env.TIHU_TTS_DTYPE ?? 'bf16',
       ]
     } else if (process.platform === 'win32' && binaryKind(this.paths.bin) === 'linux') {
       // WSL 里编出来的 Linux ELF：经 wsl.exe 启动，WSL2 的 localhost 转发让 Windows 侧访问 127.0.0.1。
@@ -279,7 +290,17 @@ export class TihuTts {
       if (this.child === null) throw new Error(this.lastError || '本地 TTS 进程启动失败')
       try {
         const response = await fetch(`http://127.0.0.1:${this.port}/health`, { signal: AbortSignal.timeout(1500) })
-        if (response.ok) break
+        if (response.ok) {
+          const info = await response.json().catch(() => null) as { device?: string; free_mb?: number } | null
+          if (info?.device === 'cuda' || info?.device === 'cpu') {
+            const requestedCuda = (process.env.TIHU_TTS_DEVICE ?? 'cuda') !== 'cpu'
+            this.activeDevice = info.device
+            if (requestedCuda && info.device === 'cpu') {
+              this.fallbackNote = `显存不足（可用 ${Math.round(info.free_mb ?? 0)}MB），已回落 CPU 引擎`
+            }
+          }
+          break
+        }
       } catch { /* 继续等 */ }
       await new Promise((resolve) => setTimeout(resolve, 400))
     }

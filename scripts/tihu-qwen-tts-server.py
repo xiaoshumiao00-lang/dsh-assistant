@@ -67,24 +67,49 @@ class Server:
         torch.set_flush_denormal(True)
         torch.set_grad_enabled(False)
         self.torch = torch
-        log(f"loading model {self.args.model} threads={self.args.threads} device=cpu")
+        self.device = "cpu"
+        self.dtype_name = "fp32"
+        if self.args.device == "cuda":
+            free, total = torch.cuda.mem_get_info()
+            log(f"cuda free={free / 1024**3:.1f}GiB total={total / 1024**3:.1f}GiB")
+            if free < 2 * 1024**3:
+                log("cuda free < 2GiB，回落 CPU fp32")
+            else:
+                self.device = "cuda"
+                self.dtype_name = self.args.dtype
+        dtype = {
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+            "fp32": torch.float32,
+        }[self.dtype_name]
+        log(f"loading model {self.args.model} threads={self.args.threads} device={self.device} dtype={self.dtype_name}")
         started = time.time()
         self.model = Qwen3TTSModel.from_pretrained(
             self.args.model,
-            device_map="cpu",
-            dtype=torch.float32,
+            device_map={"": "cuda:0"} if self.device == "cuda" else "cpu",
+            dtype=dtype,
             attn_implementation="sdpa",
             local_files_only=True,
         )
         log(f"model loaded in {time.time() - started:.1f}s")
         self.load_default()
+        # 预热：CUDA 首次 generate 会做 kernel 选择/编译，几十秒；放到启动阶段，
+        # 避免第一句回复卡在首包上。
+        if self.device == "cuda" and self.default_prompt is not None:
+            try:
+                warm = time.time()
+                with self.torch.inference_mode():
+                    self.model.generate_voice_clone(text="你好", language="Chinese", voice_clone_prompt=self.default_prompt)
+                log(f"cuda warmup done in {time.time() - warm:.1f}s")
+            except Exception as error:  # noqa: BLE001
+                log("cuda warmup failed:", repr(error))
 
     def load_default(self):
         pt = self.voices_dir / "default.embed.pt"
         ref = self.args.default_ref
         try:
             if pt.exists():
-                self.default_prompt = self.torch.load(pt, map_location="cpu", weights_only=False)
+                self.default_prompt = self.torch.load(pt, map_location=self.device, weights_only=False)
                 log("default voice cache loaded")
             elif ref and Path(ref).exists():
                 self.default_prompt = self.model.create_voice_clone_prompt(ref_audio=ref, x_vector_only_mode=True)
@@ -179,7 +204,15 @@ def make_handler(state: Server):
 
         def do_GET(self):
             if self.path == "/health":
-                self.json_reply(200, {"status": "ok", "model": "qwen3-tts-0.6b-pt", "device": "cpu", "threads": state.args.threads})
+                gpu = {}
+                if state.device == "cuda":
+                    free, total = state.torch.cuda.mem_get_info()
+                    gpu = {
+                        "free_mb": round(free / 1024 / 1024, 1),
+                        "reserved_mb": round(state.torch.cuda.memory_reserved() / 1024 / 1024, 1),
+                        "max_alloc_mb": round(state.torch.cuda.max_memory_allocated() / 1024 / 1024, 1),
+                    }
+                self.json_reply(200, {"status": "ok", "model": "qwen3-tts-0.6b", "device": state.device, "dtype": state.dtype_name, "threads": state.args.threads, **gpu})
                 return
             if self.path == "/v1/audio/voices":
                 names = ["default"] if state.default_prompt is not None else []
@@ -255,6 +288,8 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8731)
     parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     args = parser.parse_args()
 
     state = Server(args)
