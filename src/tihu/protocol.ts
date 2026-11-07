@@ -271,8 +271,14 @@ export interface ScreenFramePayload {
   progress?: { done: number; total?: number }
   /** 视觉基调：idle | busy | ok | alert。 */
   tone?: 'idle' | 'busy' | 'ok' | 'alert'
-  /** 屏幕模式：status=阶段面板（默认），reply=正文阅读。 */
-  mode?: 'status' | 'reply'
+  /** 屏幕模式：home=控制室主页；status/reply=会话屏。 */
+  mode?: 'home' | 'status' | 'reply'
+  /** 主页屏：项目列表与翻页。 */
+  home?: {
+    projects: { name: string; status: 'running' | 'idle' | 'done'; summary: string }[]
+    page: { index: number; total: number }
+    total: number
+  }
   /** reply 模式的正文窗口（长回复只传当前窗口 ±2 句）。 */
   reply?: ReplyScreenPayload
 }

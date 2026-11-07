@@ -227,6 +227,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     charPos: number
   }
   const screenStates = new Map<string, ScreenScrollState>()
+  /** 每会话的屏幕模式与回主页计时。 */
+  const homeStates = new Map<string, { mode: 'home' | 'session'; page: number; done: boolean; timer?: ReturnType<typeof setTimeout> }>()
   /** 会话 id → 屏幕进度状态（步骤计数 / 用时 / 上一步结果）。 */
   const progressStates = new Map<string, TihuProgressState>()
   /** 正在 reply 阅读模式的会话（turn/end 不再用「完成」状态帧覆盖正文）。 */
@@ -280,6 +282,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       ...(frame.progress === undefined ? {} : { progress: frame.progress }),
       ...(frame.mode === undefined ? {} : { mode: frame.mode }),
       ...(frame.reply === undefined ? {} : { reply: frame.reply }),
+      ...(frame.home === undefined ? {} : { home: frame.home }),
       tone: frame.tone ?? 'idle',
     } satisfies ScreenFramePayload)
   }
@@ -710,10 +713,76 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     screen(sessionId, replyScreen(sessionId, sentences, currentIndex, charPos, includeAll))
   }
 
-  /**
-   * 本地 TTS：按句子合成，PCM 分块流式下发；每句开始前发 reply 屏帧驱动滚动/高亮。
-   * 失败 → event.alert(error)（页面据此立即降级 speechSynthesis），不会让页面干等。
-   */
+  /** 主页屏：用会话快照按 cwd 分组兜底（控制室卡片本体在主客户端，host 拿不到）。 */
+  async function sendHome(sessionId: string): Promise<void> {
+    let rows: TihuSessionRow[] = []
+    try { rows = (await collectSessionRows()).rows } catch { rows = [] }
+    const groups = new Map<string, { name: string; rows: TihuSessionRow[] }>()
+    for (const row of rows) {
+      const cwd = row.cwd ?? ''
+      const name = cwd === '' ? '其他' : (cwd.split(/[\\/]/).filter(Boolean).pop() ?? cwd)
+      const key = cwd === '' ? '__other__' : cwd
+      if (!groups.has(key)) groups.set(key, { name, rows: [] })
+      groups.get(key)!.rows.push(row)
+    }
+    const now = Date.now()
+    const projects = [...groups.values()].map((group) => {
+      const latest = group.rows.slice().sort((a, b) => b.updatedAt - a.updatedAt)[0]
+      const running = group.rows.some((row) => row.live && now - row.updatedAt < 5 * 60_000)
+      const recent = latest !== undefined && now - latest.updatedAt < 24 * 3600_000
+      const status: 'running' | 'idle' | 'done' = running ? 'running' : recent ? 'done' : 'idle'
+      return {
+        name: group.name,
+        status,
+        summary: latest === undefined ? '暂无会话' : (latest.title || shortSessionId(latest.sessionId)),
+        updatedAt: latest?.updatedAt ?? 0,
+      }
+    }).sort((a, b) => {
+      const rank = { running: 0, done: 1, idle: 2 } as Record<string, number>
+      return rank[a.status] - rank[b.status] || b.updatedAt - a.updatedAt
+    })
+    const pageSize = 5
+    const totalPages = Math.max(1, Math.ceil(projects.length / pageSize))
+    const state = homeStates.get(sessionId) ?? { mode: 'session' as const, page: 0, done: false }
+    state.page = Math.max(0, Math.min(state.page, totalPages - 1))
+    state.mode = 'home'
+    homeStates.set(sessionId, state)
+    const pageProjects = projects.slice(state.page * pageSize, (state.page + 1) * pageSize).map((project) => ({
+      name: project.name,
+      status: project.status,
+      summary: project.summary,
+    }))
+    screen(sessionId, {
+      stage: '控制室',
+      title: '',
+      bullets: [],
+      tone: 'ok',
+      mode: 'home',
+      home: { projects: pageProjects, page: { index: state.page, total: totalPages }, total: projects.length },
+    })
+  }
+
+  function cancelHomeTimer(sessionId: string): void {
+    const state = homeStates.get(sessionId)
+    if (state?.timer !== undefined) {
+      clearTimeout(state.timer)
+      state.timer = undefined
+    }
+  }
+
+  function scheduleHome(sessionId: string): void {
+    const state = homeStates.get(sessionId)
+    if (state === undefined || !state.done) return
+    cancelHomeTimer(sessionId)
+    const delay = Number(process.env.TIHU_HOME_AFTER_MS ?? 10_000)
+    state.timer = setTimeout(() => {
+      const current = homeStates.get(sessionId)
+      if (current === undefined || !current.done) return
+      const scroll = screenStates.get(sessionId)
+      if (scroll !== undefined && !scroll.follow) return   // 用户正在浏览历史，禁止切
+      void sendHome(sessionId).catch((error) => log(`tihu home failed: ${(error as Error)?.message ?? String(error)}`))
+    }, Number.isFinite(delay) ? delay : 10_000)
+  }
   async function speakLocally(device: TihuDevice, sessionId: string, sentences: ReplySentence[], speechSegments: SpeechSegment[], includeAll: boolean): Promise<void> {
     if (speechSegments.length === 0) return
     // 默认走 edge 云健，不必为每句唤醒 GPU；只有克隆音色或仅离线才需要本地 Qwen。
@@ -721,6 +790,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     const status = tts.status()
     if (!status.available) {
       device.send('event.alert', { level: 'error', text: `本次无语音：在线兜底不可用且本地引擎未就绪（原因：${status.error ?? '未安装模型'}）` })
+      setTimeout(() => scheduleHome(sessionId), 50)
       return
     }
     const voice = device.voice || 'default'
@@ -769,10 +839,12 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       // 念完停在最后一屏（最后一帧）。
       const last = sentences[sentences.length - 1]
       sendReply(sessionId, sentences, sentences.length - 1, last.end, includeAll)
+      setTimeout(() => scheduleHome(sessionId), 50)
     } catch (error) {
       const message = (error as Error)?.message ?? String(error)
       log(`tihu tts failed session=${sessionId} voice=${voice}: ${message}`)
       device.send('event.alert', { level: 'error', text: `本次无语音：在线兜底不可用且本地引擎未就绪（原因：${message}）` })
+      setTimeout(() => scheduleHome(sessionId), 50)
     }
   }
 
@@ -1102,7 +1174,11 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       if (type === 'turn/start' || type === 'step/start' || type === 'tool/call' || type === 'tool/result') {
         replySessions.delete(sessionId)
       }
-      if (type === 'turn/start') screenStates.delete(sessionId)
+      if (type === 'turn/start') {
+        screenStates.delete(sessionId)
+        cancelHomeTimer(sessionId)
+        homeStates.set(sessionId, { mode: 'session', page: 0, done: false })
+      }
       const update = applySessionEvent(state, event)
       if (type === 'turn/start') {
         // 注意：**不能**在这里点亮 tihu 窗口。用户自己在会话里打字同样会触发
@@ -1143,8 +1219,10 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
             charEnd: segment.end,
           } satisfies TtsTextPayload)
         })
-        // 新回复：强制回到顶部并恢复跟随。
+        // 新回复：强制回到顶部并恢复跟随；取消回主页计时并切会话屏。
         screenStates.delete(sessionId)
+        cancelHomeTimer(sessionId)
+        homeStates.set(sessionId, { mode: 'session', page: 0, done: false })
         sendReply(sessionId, sentences, 0, 0, includeAll)
         // 本地 TTS（Qwen3-TTS sidecar）：每个绑定设备按自己选的音色合成并流式下发；
         // 失败只影响该设备（页面收到 error alert 后立刻降级系统语音）。
@@ -1168,6 +1246,10 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
           sessionId,
         } satisfies DonePayload)
         // 最终帧由 mapper 保留：「完成 · 共 N 步 · 用时 Xs」停在屏上，不清成「待命」。
+        const hs = homeStates.get(sessionId) ?? { mode: 'session' as const, page: 0, done: false }
+        hs.done = okReason
+        homeStates.set(sessionId, hs)
+        // 不在这里启动计时：要等朗读真正结束（speakLocally 完成/失败）再计时。
         return
       }
     } catch (error) {
@@ -1384,8 +1466,22 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     }
 
     if (type === 'screen.gesture') {
-      const payload = message.payload as { action?: string; dy?: number; phase?: string }
+      const payload = message.payload as { action?: string; dy?: number; phase?: string; x?: number; y?: number }
+      if (device.sessionId !== undefined) cancelHomeTimer(device.sessionId)
+      if (payload.action === 'tap' && device.sessionId !== undefined && typeof payload.x === 'number' && typeof payload.y === 'number') {
+        // 右下角 tap = 立刻回主页（第一个 tap 业务）。
+        if (payload.x >= 240 && payload.y >= 180) await sendHome(device.sessionId)
+        return
+      }
       if (payload.action === 'swipe' && device.sessionId !== undefined && typeof payload.dy === 'number') {
+        const home = homeStates.get(device.sessionId)
+        if (home?.mode === 'home') {
+          if (payload.phase === 'move' || payload.phase === 'end') {
+            home.page = Math.max(0, home.page + (payload.dy < 0 ? 1 : payload.dy > 0 ? -1 : 0))
+            await sendHome(device.sessionId)
+          }
+          return
+        }
         const scrollState = screenStates.get(device.sessionId)
         if (scrollState !== undefined) {
           // 手指上滑 dy<0 → 看更早内容 → offset 增大；约 20px 一行。
@@ -1512,6 +1608,10 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     handleUpgrade,
     dispose: () => {
       ;(confirmBroker as any).failAll?.('disposed')
+      for (const [sessionId, state] of homeStates) {
+        if (state.timer !== undefined) clearTimeout(state.timer)
+        homeStates.delete(sessionId)
+      }
       tts.dispose()
       for (const device of devices) device.close()
       devices.clear()
