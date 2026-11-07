@@ -7,8 +7,9 @@
  *     带旧宿主不认识的字段，旧宿主不认识就忽略，不能因此判整条消息非法）。
  *   - **未知 type 必须忽略**：`parseUpstream()` 对不认识的 type、坏 JSON、超长的
  *     文本一律返回 `null`，绝不抛错——设备端以后加消息类型时，老宿主不能崩。
- *   - 上行八种：hello / audio.frame / text.input / confirm.reply / session.end /
- *     sessions.query / session.bind / ping。
+ *   - 上行十种：hello / audio.frame / text.input / confirm.reply / session.end /
+ *     sessions.query / session.bind / ping（另有 tihu 专属的 voice.* / screen.gesture /
+ *     tts.sample）。
  *   - 下行十一种：transcript / tts.text / screen.frame / event.progress /
  *     event.alert / event.done / confirm.ask / sessions.list / session.bound /
  *     session.invalid（以及宿主回给设备的 ping 回执 pong）。
@@ -38,6 +39,7 @@ export const TIHU_UPSTREAM_TYPES = [
   'voice.list',
   'voice.create',
   'voice.select',
+  'tts.sample',
   'ping',
 ] as const
 /** 下行消息类型（宿主 → 设备）。 */
@@ -206,6 +208,11 @@ export interface TtsAudioPayload {
   charEnd?: number
   /** 是否为最后一块。 */
   final?: boolean
+  /**
+   * 试听音频（`tts.sample` 的应答）：页面据此播放但**不写进本轮朗读缓存**，
+   * 也不推进正文高亮——试听不算一轮回复。
+   */
+  sample?: true
 }
 
 /** 可选音色（默认音色 + 克隆音色）。 */
@@ -250,6 +257,12 @@ export interface VoiceSelectPayload {
   edgeVoice?: string
   /** 仅离线：禁用 edge-tts，只走本地 Qwen。 */
   offlineOnly?: boolean
+}
+
+/** 上行：试听（请宿主合成一句示例语音，走与正式朗读同一条 TTS 链路）。 */
+export interface TtsSamplePayload {
+  /** 自定义示例语句；不填就用宿主默认的「试听：我是云健，声音正常吗？」。 */
+  text?: string
 }
 
 /** 下行：克隆音色已创建。 */
@@ -477,6 +490,7 @@ export type TihuUpstreamMessage =
   | TihuEnvelope<'voice.list', Record<string, never>>
   | TihuEnvelope<'voice.create', VoiceCreatePayload>
   | TihuEnvelope<'voice.select', VoiceSelectPayload>
+  | TihuEnvelope<'tts.sample', TtsSamplePayload>
   | TihuEnvelope<'ping', PingPayload>
 
 export type TihuDownstreamMessage =
@@ -597,6 +611,13 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
         return value as TihuUpstreamMessage
       }
       case 'voice.list': return value as TihuUpstreamMessage
+      case 'tts.sample': {
+        // 试听：text 可选；给了就必须是短句（最长 200 字），超长/类型不对整条忽略。
+        if (payload.text !== undefined) {
+          if (typeof payload.text !== 'string' || payload.text.length > 200) return null
+        }
+        return value as TihuUpstreamMessage
+      }
       case 'voice.select': {
         if (typeof payload.name !== 'string' || payload.name === '' || payload.name.length > 32) return null
         if (payload.edgeVoice !== undefined && (typeof payload.edgeVoice !== 'string' || payload.edgeVoice.length > 64)) return null

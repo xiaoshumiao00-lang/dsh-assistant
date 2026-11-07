@@ -116,7 +116,7 @@ test('screen.gesture 校验：swipe/tap 字段合法才收', () => {
 
 test('版本号与类型清单固定', () => {
   assert.equal(TIHU_PROTOCOL_VERSION, '0')
-  assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'session.end', 'sessions.query', 'session.bind', 'screen.gesture', 'voice.list', 'voice.create', 'voice.select', 'ping'])
+  assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'session.end', 'sessions.query', 'session.bind', 'screen.gesture', 'voice.list', 'voice.create', 'voice.select', 'tts.sample', 'ping'])
   assert.equal(TIHU_DOWNSTREAM_TYPES.length, 14)
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('tts.audio'))
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('sessions.list'))
@@ -137,6 +137,11 @@ test('voice.list / voice.create / voice.select 字段校验', () => {
   assert.ok(parseUpstream(JSON.stringify(buildUpstream('voice.select', { name: 'default', edgeVoice: 'zh-CN-YunjianNeural' }, 36))) !== null)
   assert.equal(parseUpstream(JSON.stringify(buildUpstream('voice.select', { name: 'default', edgeVoice: 123 }, 37))), null)
   assert.equal(parseUpstream(JSON.stringify(buildUpstream('voice.select', { name: '' }, 35))), null)
+  // 试听：text 可选；给了就必须是短句（超 200 字/不是字符串一律忽略）
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('tts.sample', {}, 38))) !== null)
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('tts.sample', { text: '试听：我是云健' }, 39))) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('tts.sample', { text: 123 }, 41))), null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('tts.sample', { text: 'x'.repeat(201) }, 42))), null)
 })
 
 test('sessions.query / session.bind：字段合法才收，越界一律忽略', () => {
@@ -1443,6 +1448,46 @@ await testAsync('lane：edge 失败 → Qwen 本地引擎出声', async () => {
   runtime.dispose()
 })
 
+/* ---------- 试听：页面点「试听」→ 宿主合成一句示例语音（不再只响 0.6s 嘟声） ---------- */
+
+await testAsync('lane：试听 tts.sample → 走同一条 TTS 链路下发带 sample 标记的 tts.audio', async () => {
+  const { runtime } = runtimeFor([cuRecord('session-1', { live: true, lastPromptAt: 1000 })], {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'sample', protocol: '0', sessionId: 'session-1' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const before = framesOf(socket).length
+  socket.emit('data', clientFrame(buildUpstream('tts.sample', {}, 2)))
+  await new Promise((resolve) => setTimeout(resolve, 80))
+
+  const frames = framesOf(socket).slice(before)
+  const audio = frames.filter((frame) => frame.type === 'tts.audio')
+  assert.ok(audio.length > 0, '试听必须下发 tts.audio（不能再只响嘟声）')
+  assert.equal(audio[audio.length - 1].payload.sample, true, '试听音频要带 sample 标记（页面据此不写进本轮朗读缓存）')
+  assert.equal(audio[audio.length - 1].payload.final, true, '最后一块 final=true')
+  assert.ok(audio.every((frame) => frame.payload.index === 0), '试听只有一段，index 恒为 0')
+  assert.ok(String(audio[0].payload.text || '').includes('试听'), '试听语句要有可读示例文本')
+  // 试听不是一轮回复：不发 tts.text、不动屏（否则会顶掉正在读的正文）
+  assert.equal(frames.filter((frame) => frame.type === 'tts.text').length, 0, '试听不能当成一轮回复（不发 tts.text）')
+  assert.equal(frames.filter((frame) => frame.type === 'screen.frame').length, 0, '试听不能改屏')
+  runtime.dispose()
+})
+
+await testAsync('lane：试听合成失败 → 红告警且不出音频（页面退到提示音，不静默）', async () => {
+  const { runtime } = runtimeFor([cuRecord('session-1', { live: true, lastPromptAt: 1000 })], {}, { instance: fakeTts({ fail: true }) })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'sample-fail', protocol: '0', sessionId: 'session-1' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const before = framesOf(socket).length
+  socket.emit('data', clientFrame(buildUpstream('tts.sample', { text: '试听一句话。' }, 2)))
+  await new Promise((resolve) => setTimeout(resolve, 80))
+
+  const frames = framesOf(socket).slice(before)
+  const alerts = frames.filter((frame) => frame.type === 'event.alert').map((frame) => frame.payload)
+  assert.ok(alerts.some((alert) => alert.level === 'error' && String(alert.text).includes('试听')), '试听失败必须发红告警')
+  assert.equal(frames.filter((frame) => frame.type === 'tts.audio').length, 0, '合成失败不能下发空音频')
+  runtime.dispose()
+})
+
 await testAsync('lane：edge 与 Qwen 都失败 → alert 且不出声，屏幕保留 reply 正文', async () => {
   const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true, lastPromptAt: 1000 })], {}, { instance: fakeTts({ fail: true }) })
   const socket = openLane(runtime)
@@ -2090,6 +2135,9 @@ await testAsync('页面包含真机外壳/320×240 固定尺寸/三档缩放/外
   assert.ok(html.includes('实际尺寸'))
   assert.ok(html.includes('仅屏幕') && html.includes('shell-off'))
   assert.ok(html.includes('class="mics"') && html.includes('class="grille"') && html.includes('class="dock"'))
+  // 试听按钮不再只响嘟声：没缓存时请宿主合成一句示例（tts.sample），收到 sample 音频再播
+  assert.ok(html.includes("send('tts.sample'"), '试听要发 tts.sample')
+  assert.ok(html.includes('已播放试听语音'), '收到试听音频要有明确回执文案')
   runtime.dispose()
 })
 
