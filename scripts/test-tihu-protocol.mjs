@@ -1168,6 +1168,140 @@ await testAsync('lane：预取流水线——后一句合成在前一句完成�
   runtime.dispose()
 })
 
+/* ---------- 预取后「高亮文字与语音不同步」回归 ---------- */
+
+/** 带时间戳的 socket：lane 每次 send 恰好一次 write（= 一个 WS 帧），据此记录下发时刻。 */
+class TimedSocket extends FakeSocket {
+  constructor() { super(); this.timed = [] }
+  write(chunk) {
+    const bytes = Buffer.from(chunk)
+    this.timed.push({ at: Date.now(), bytes })
+    return super.write(bytes)
+  }
+  /** [{ at, type, payload }]（跳过 HTTP 握手那一笔）。 */
+  timedFrames() {
+    const out = []
+    for (const entry of this.timed) {
+      if (entry.bytes.toString('latin1').startsWith('HTTP/1.1')) continue
+      let offset = 0
+      while (offset + 2 <= entry.bytes.length) {
+        const len0 = entry.bytes[offset + 1] & 0x7f
+        let length = len0
+        let header = 2
+        if (len0 === 126) { length = entry.bytes.readUInt16BE(offset + 2); header = 4 }
+        const payload = entry.bytes.subarray(offset + header, offset + header + length).toString('utf8')
+        offset += header + length
+        try {
+          const msg = JSON.parse(payload)
+          out.push({ at: entry.at, type: msg.type, payload: msg.payload || {} })
+        } catch { /* 半帧：忽略 */ }
+      }
+    }
+    return out
+  }
+}
+function openTimedLane(runtime) {
+  const socket = new TimedSocket()
+  runtime.handleUpgrade({ url: '/tihu/lane', headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' }, socket: {} }, socket, Buffer.alloc(0))
+  return socket
+}
+
+await testAsync('lane：高亮屏帧按累计播放时长推进（预取后文字不得跑在语音前面）', async () => {
+  // 三句实际音频 1.2s / 3.1s / 0.8s，这里按 1/10 缩放成 120 / 310 / 80 ms。
+  const durations = [120, 310, 80]
+  const FIRST_CHUNK_MS = 40
+  const CHUNK_AUDIO_MS = 40
+  const DECODE_MS = 5
+  const BYTES_PER_MS = 48
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const speechTts = {
+    async ensureServer() {},
+    status: () => ({ available: true, model: 'sync-test' }),
+    engineLabel: () => 'sync-test',
+    takeEngineNote: () => '',
+    deviceFallback: () => '',
+    available: () => true,
+    async synthesize(text, options) {
+      // 句序：甲/乙/丙 = 第 0/1/2 段
+      const which = text.includes('甲') ? 0 : text.includes('乙') ? 1 : 2
+      const durMs = durations[which]
+      await sleep(FIRST_CHUNK_MS)
+      let seq = 0
+      for (let sent = 0; sent < durMs; sent += CHUNK_AUDIO_MS) {
+        const ms = Math.min(CHUNK_AUDIO_MS, durMs - sent)
+        options.onChunk({ data: Buffer.alloc(ms * BYTES_PER_MS), seq, total: 0, final: false })
+        seq += 1
+        await sleep(DECODE_MS)
+      }
+      return { sampleRate: 24000, firstChunkMs: FIRST_CHUNK_MS, audioMs: durMs, totalMs: FIRST_CHUNK_MS, chunks: seq }
+    },
+    async createVoice() { throw new Error('n/a') },
+    async listVoices() { return [{ name: 'default', kind: 'default' }] },
+    dispose() {},
+  }
+  const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true, lastPromptAt: 1000 })], {}, { instance: speechTts })
+  const socket = openTimedLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'sync', protocol: '0', sessionId: 'session-1' }, 1)))
+  await sleep(30)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const t0 = Date.now()
+  onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: '甲句内容。乙句内容。丙句内容。' }] } },
+  })
+  await sleep(1200)
+
+  const timed = socket.timedFrames()
+  // 每句首块到达时刻（页面就是在这之后把这段音频排进 AudioContext 时间轴的）
+  const firstAudioAt = new Map()
+  for (const frame of timed) {
+    if (frame.type !== 'tts.audio') continue
+    const index = frame.payload.index
+    if (!firstAudioAt.has(index)) firstAudioAt.set(index, frame.at - t0)
+  }
+  assert.equal(firstAudioAt.size, 3, `应有 3 段音频，实际 ${firstAudioAt.size}`)
+  // 每句「宣布高亮到它」的屏帧到达时刻（currentIndex 首次变成该句）
+  const firstFrameAt = new Map()
+  for (const frame of timed) {
+    if (frame.type !== 'screen.frame' || frame.payload.mode !== 'reply') continue
+    const index = frame.payload.reply.currentIndex
+    if (!firstFrameAt.has(index)) firstFrameAt.set(index, frame.at - t0)
+  }
+  assert.equal(firstFrameAt.size, 3, `应出现 currentIndex 0/1/2 三帧，实际 ${[...firstFrameAt.keys()].join(',')}`)
+
+  // 播放时间轴：start[0] = 首块到达；start[i] = max(首块到达, start[i-1] + 音频时长)
+  const starts = []
+  for (let i = 0; i < durations.length; i += 1) {
+    const arrival = firstAudioAt.get(i)
+    const prevEnd = i === 0 ? 0 : starts[i - 1] + durations[i - 1]
+    starts.push(Math.max(arrival, prevEnd))
+  }
+  const toleranceMs = 35
+  // 关键断言：第 i 句的高亮屏帧不得早于它真正开始播放的时刻（预取让合成很早就完成）。
+  // i=0 的帧是「回复正文刚出现」那一帧（按设计在出声前就下发），不参与这条判断。
+  for (let i = 1; i < durations.length; i += 1) {
+    const at = firstFrameAt.get(i)
+    assert.ok(
+      at >= starts[i] - toleranceMs,
+      `第 ${i} 句高亮帧在 ${at}ms 就到了，但它的音频 ${starts[i]}ms 才开始播（文字跑在语音前面）`,
+    )
+  }
+  // 累计口径：高亮下标必须随累计音频时长推进，而不是随合成完成推进。
+  assert.ok(
+    firstFrameAt.get(2) - firstFrameAt.get(0) >= durations[0] + durations[1] - toleranceMs,
+    `高亮从第 0 句到第 2 句只用了 ${firstFrameAt.get(2) - firstFrameAt.get(0)}ms，累计音频是 ${durations[0] + durations[1]}ms`,
+  )
+  // 收尾帧（念完/回主页前最后一屏）也不能早于最后一段播完。
+  const replyFrames = timed.filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'reply')
+  const finalAt = replyFrames[replyFrames.length - 1].at - t0
+  const audioEnd = starts[durations.length - 1] + durations[durations.length - 1]
+  assert.ok(
+    finalAt >= audioEnd - toleranceMs,
+    `收尾帧在 ${finalAt}ms 就发了，但音频要到 ${audioEnd}ms 才播完`,
+  )
+  runtime.dispose()
+})
+
 /* ---------- 两级链：edge 失败 → Qwen；都失败 → 无语音 ---------- */
 
 function fakeTts({ model = 'qwen3-tts 0.6b-cuda', fail = false } = {}) {

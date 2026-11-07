@@ -844,7 +844,23 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
      * 在途合成任务。单句内部 chunk 顺序不变；音频按句 index 顺序发送。
      */
     const MAX_INFLIGHT_SYNTH = 2
-    type SynthResult = { ok: true } | { ok: false; error: unknown }
+    type SynthResult = { ok: true; audioMs: number } | { ok: false; error: unknown }
+    /**
+     * 播放时间轴（2026-11-07 修「高亮文字与语音不同步」）：
+     * 高亮/滚动/屏帧必须在**音频真正开始播放**的时刻推进，而不是合成完成时刻。
+     * 预取把「合成完成」提前到「音频还没播到」之前（最多一整句），旧实现照合成
+     * 完成推进 → 正文窗口/滚动跑到语音前面，播放中的那一句被卷出可视区、高亮消失。
+     * 这里用首块到达时刻 + 累计 audioMs 复刻页面 playPcm 的排程：
+     *   startAt[i] = max(首块到达, startAt[i-1] + audioMs[i-1])
+     */
+    const playbackEndAt = { value: 0 }
+    const frameAt = (at: number, fn: () => void): Promise<void> =>
+      new Promise<void>((resolve) => {
+        const delay = Math.max(0, at - Date.now())
+        setTimeout(() => {
+          try { fn() } finally { resolve() }
+        }, delay)
+      })
     /**
      * 音频乱序防护：合成本身并发，但 **tts.audio 必须按句 index 顺序下发**
      * （客户端把 PCM 直接排在 AudioContext 时间轴上，跨句乱序会撞音）。
@@ -890,7 +906,11 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
           flushAudio()
         },
       }).then(
-        () => { flushed.add(segmentIndex); flushAudio(); return { ok: true } as SynthResult },
+        (result) => {
+          flushed.add(segmentIndex)
+          flushAudio()
+          return { ok: true, audioMs: Math.max(0, Number(result?.audioMs) || 0) } as SynthResult
+        },
         (error) => { flushed.add(segmentIndex); flushAudio(); return { ok: false, error } as SynthResult },
       )
 
@@ -914,12 +934,15 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       }
 
       // 启动第 index 句的合成；首块到达或合成结束时唤醒泵。
+      /** 每段首块到达的墙钟时刻（页面就是从这一刻开始排它进音频时间轴）。 */
+      const firstChunkAt: number[] = speechSegments.map(() => 0)
       const launch = (index: number): void => {
         const segment = speechSegments[index]
         let firstChunkSeen = false
         const task = synthSegment(segment, index, () => {
           if (firstChunkSeen) return
           firstChunkSeen = true
+          firstChunkAt[index] = Date.now()
           // 首块到达：让泵接着启动后续句子（保持最多 MAX_INFLIGHT_SYNTH 个在途）。
           notify()
         })
@@ -932,8 +955,9 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         inFlight.add(done)
       }
 
-      // 按句顺序消费结果：sendReply/滚动跟随 + takeEngineNote 仍在合成完成后、
-      // 按句 index 顺序执行——只是合成本身被提前启动，消除句间静音缝。
+      // 按句顺序消费结果：合成本身并发，但**推进屏帧的时机**严格按播放时间轴——
+      // 预取让合成远早于播放，若照合成完成推进，文字/高亮会跑到语音前面。
+      const frames: Promise<void>[] = []
       const pump = (async () => {
         for (let index = 0; index < speechSegments.length; index += 1) {
           while (results[index] === undefined && firstError === undefined) {
@@ -952,25 +976,35 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
             break
           }
           const segment = speechSegments[index]
-          const scrollState = screenStates.get(sessionId)
-          if (scrollState !== undefined && scrollState.follow) {
-            const lineIndex = scrollState.lines.findIndex((line) => line.sentenceIndex === segment.sentenceIndex)
-            if (lineIndex >= 0) {
-              const maxOffset = Math.max(0, scrollState.lines.length - SCREEN_SPEC.replyVisibleLines)
-              scrollState.offset = Math.max(0, Math.min(lineIndex - 2, maxOffset))
+          // 音频真正开始播放的时刻：首块到达，或上一段播完（页面按 pcmNextTime 排队）。
+          const startAt = Math.max(firstChunkAt[index] > 0 ? firstChunkAt[index] : Date.now(), playbackEndAt.value)
+          playbackEndAt.value = startAt + result.audioMs
+          // 屏帧/滚动/引擎提示都在播放时刻推进——与音频同一个基准（不再用合成完成）。
+          frames.push(frameAt(startAt, () => {
+            const scrollState = screenStates.get(sessionId)
+            if (scrollState !== undefined && scrollState.follow) {
+              const lineIndex = scrollState.lines.findIndex((line) => line.sentenceIndex === segment.sentenceIndex)
+              if (lineIndex >= 0) {
+                const maxOffset = Math.max(0, scrollState.lines.length - SCREEN_SPEC.replyVisibleLines)
+                scrollState.offset = Math.max(0, Math.min(lineIndex - 2, maxOffset))
+              }
             }
-          }
-          sendReply(sessionId, sentences, segment.sentenceIndex, segment.start, includeAll)
-          const engineNote = tts.takeEngineNote()
-          if (engineNote.startsWith('在线兜底')) {
-            device.send('event.progress', { stage: 'tts', text: engineNote } satisfies ProgressPayload)
-          }
+            sendReply(sessionId, sentences, segment.sentenceIndex, segment.start, includeAll)
+            const engineNote = tts.takeEngineNote()
+            if (engineNote.startsWith('在线兜底')) {
+              device.send('event.progress', { stage: 'tts', text: engineNote } satisfies ProgressPayload)
+            }
+          }))
         }
       })()
 
       // 出错时：等已启动的合成跑完发完（音频顺序不能乱），再把第一处错误抛给现有 catch。
       await Promise.all([pump, ...inFlight])
       if (firstError !== undefined) throw firstError
+      // 等所有屏帧按播放时刻发完，再等最后一段音频播完——否则屏会先跳「念完」/回主页。
+      await Promise.all(frames)
+      const tailMs = playbackEndAt.value - Date.now()
+      if (tailMs > 0) await new Promise<void>((resolve) => { setTimeout(resolve, tailMs) })
       // 念完停在最后一屏（最后一帧）。
       const last = sentences[sentences.length - 1]
       sendReply(sessionId, sentences, sentences.length - 1, last.end, includeAll)
