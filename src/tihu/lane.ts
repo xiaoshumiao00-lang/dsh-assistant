@@ -1426,9 +1426,11 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         device.autoFollow = false
         await bindSession(device, requested)
       } else if (payload.auto === true) {
-        // 默认路径：自动绑定「最近活跃的 Computer Use 会话」。
+        // 默认路径：自动绑定「最近活跃的 Computer Use 会话」，但开机屏仍是主页；
+        // 只有真正收到 assistant 回复时才切会话屏。
         device.autoFollow = true
         await autoBindActive(device, 'hello')
+        if (device.sessionId !== undefined) await sendHome(device.sessionId, device)
       } else {
         device.autoFollow = false
         device.sessionId = undefined
