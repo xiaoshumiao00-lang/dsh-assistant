@@ -1072,6 +1072,102 @@ await testAsync('lane：长回复的 TTS 段全部下发（不再丢 320 字以�
   runtime.dispose()
 })
 
+await testAsync('lane：多句回复 tts.audio 按句 index 顺序到达、末块 final、之后回主页', async () => {
+  process.env.TIHU_HOME_AFTER_MS = '200'
+  process.env.TIHU_HOME_RECHECK_MS = '100'
+  const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true, lastPromptAt: 1000 })], {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pipe-order', protocol: '0', sessionId: 'session-1' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: '第一句内容。第二句内容。第三句内容。第四句内容。' }] } },
+  })
+  // 等朗读 + 回主页计时全部走完（假 TTS 立即返回，home 计时 200ms + 余量）。
+  await new Promise((resolve) => setTimeout(resolve, 800))
+
+  const audioFrames = framesOf(socket).filter((frame) => frame.type === 'tts.audio')
+  assert.ok(audioFrames.length >= 4, `至少 4 个音频块，实际 ${audioFrames.length}`)
+  const byIndex = new Map()
+  for (const frame of audioFrames) {
+    const idx = frame.payload.index
+    if (!byIndex.has(idx)) byIndex.set(idx, [])
+    byIndex.get(idx).push(frame.payload)
+  }
+  // 每个句 index 内部块连续（seq 从 0 开始、final 在最后一块）。
+  for (const [idx, chunks] of byIndex) {
+    assert.deepEqual(chunks.map((c) => c.seq), [...Array(chunks.length).keys()], `句 ${idx} 的 seq 从 0 连续`)
+    assert.equal(chunks[chunks.length - 1].final, true, `句 ${idx} 最后一块 final=true`)
+  }
+  // 全局看：句 index 单调不减（流水线允许相邻句边界交叠，但不允许乱序）。
+  const indices = audioFrames.map((frame) => frame.payload.index)
+  for (let i = 1; i < indices.length; i += 1) {
+    assert.ok(indices[i] >= indices[i - 1], `句 index 单调不减：${indices.join(',')}`)
+  }
+  // 回主页语义：TTS 播完后 scheduleHome 触发，出现 mode=home 帧。
+  const homes = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home')
+  assert.ok(homes.length > 0, '朗读完成后应回主页')
+  delete process.env.TIHU_HOME_AFTER_MS
+  delete process.env.TIHU_HOME_RECHECK_MS
+  runtime.dispose()
+})
+
+await testAsync('lane：预取流水线——后一句合成在前一句完成前启动（并发限 2）', async () => {
+  // 假 TTS：每句分 3 块、块间延迟 15ms；记录同时在途的合成数与「句 N 完成前句 N+1 已启动」证据。
+  let inFlight = 0
+  let maxInFlight = 0
+  let startOrder = []
+  let finishOrder = []
+  const pipelineTts = {
+    async ensureServer() {},
+    status: () => ({ available: true, model: 'pipe-test' }),
+    engineLabel: () => 'pipe-test',
+    takeEngineNote: () => '',
+    deviceFallback: () => '',
+    available: () => true,
+    async synthesize(text, options) {
+      inFlight += 1
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      startOrder.push(text)
+      for (let seq = 0; seq < 3; seq += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 15))
+        options.onChunk({ data: Buffer.alloc(4800), seq, total: 3, final: seq === 2 })
+      }
+      inFlight -= 1
+      finishOrder.push(text)
+    },
+    async createVoice() { throw new Error('n/a') },
+    async listVoices() { return [{ name: 'default', kind: 'default' }] },
+    dispose() {},
+  }
+  const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true, lastPromptAt: 1000 })], {}, { instance: pipelineTts })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pipe', protocol: '0', sessionId: 'session-1' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: '甲句。乙句。丙句。丁句。戊句。' }] } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 1000))
+
+  // 关键断言 1：至少一次出现 2 个合成同时在途（预取确实并发）。
+  assert.ok(maxInFlight >= 2, `预取应出现并发合成，实际 maxInFlight=${maxInFlight}`)
+  // 关键断言 2：所有句都启动并完成，且启动顺序就是完成顺序（音频不乱）。
+  assert.equal(startOrder.length, 5, '5 句全部启动')
+  assert.equal(finishOrder.length, 5, '5 句全部完成')
+  assert.deepEqual(finishOrder, startOrder, '启动顺序即完成顺序（音频按句 index 顺序发）')
+  // 音频帧 index 单调不减
+  const audioFrames = framesOf(socket).filter((frame) => frame.type === 'tts.audio')
+  const indices = audioFrames.map((frame) => frame.payload.index)
+  for (let i = 1; i < indices.length; i += 1) {
+    assert.ok(indices[i] >= indices[i - 1], `句 index 单调不减：${indices.join(',')}`)
+  }
+  assert.equal(audioFrames.length, 15, `5 句 × 3 块 = 15 块，实际 ${audioFrames.length}`)
+  runtime.dispose()
+})
+
 /* ---------- 两级链：edge 失败 → Qwen；都失败 → 无语音 ---------- */
 
 function fakeTts({ model = 'qwen3-tts 0.6b-cuda', fail = false } = {}) {

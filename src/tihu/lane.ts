@@ -836,44 +836,141 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       device.send('event.alert', { level: 'warn', text: tts.deviceFallback() })
     }
     device.send('event.progress', { stage: 'tts', text: tts.engineLabel(voice) } satisfies ProgressPayload)
+    /**
+     * 预取流水线（2026-11-07）：旧实现逐句串行 await tts.synthesize()，第 N 句全部
+     * 合成完才开始第 N+1 句；edge-tts 每句首块 1.25–3.1s，客户端把 PCM 排在
+     * AudioContext 时间轴上，下一段迟到超过前句剩余播放时长就出现「一会有声一会
+     * 没声」的静音缝。改成流水线：第 N 句**首块到达**就启动第 N+1 句，最多 2 个
+     * 在途合成任务。单句内部 chunk 顺序不变；音频按句 index 顺序发送。
+     */
+    const MAX_INFLIGHT_SYNTH = 2
+    type SynthResult = { ok: true } | { ok: false; error: unknown }
+    /**
+     * 音频乱序防护：合成本身并发，但 **tts.audio 必须按句 index 顺序下发**
+     * （客户端把 PCM 直接排在 AudioContext 时间轴上，跨句乱序会撞音）。
+     * 每句一个缓冲区：正在播的句（flushIndex）实时流式下发；提前合成好的句
+     * 先攒着，轮到它时一次放完——预取省掉的是**等待合成**的时间，不是发送顺序。
+     */
+    const audioBuffers: TtsAudioPayload[][] = speechSegments.map(() => [])
+    /** 已合成结束（成功或失败）的句：缓冲区排空后可以把 flushIndex 往前推。 */
+    const flushed = new Set<number>()
+    let flushIndex = 0
+    const flushAudio = (): void => {
+      while (flushIndex < audioBuffers.length) {
+        const queue = audioBuffers[flushIndex]
+        for (const payload of queue.splice(0)) device.send('tts.audio', payload)
+        if (flushed.has(flushIndex)) {
+          flushIndex += 1
+          continue
+        }
+        break
+      }
+    }
+    const synthSegment = (segment: SpeechSegment, segmentIndex: number, onFirstChunk: () => void): Promise<SynthResult> =>
+      tts.synthesize(segment.text, {
+        voice,
+        sessionId,
+        edgeVoice: device.edgeVoice,
+        offlineOnly: device.offlineOnly,
+        onChunk: (chunk) => {
+          onFirstChunk()
+          audioBuffers[segmentIndex].push({
+            seq: chunk.seq,
+            total: chunk.total,
+            sampleRate: 24000,
+            channels: 1,
+            format: 'pcm16',
+            data: chunk.data.toString('base64'),
+            index: segment.index,
+            text: segment.text,
+            charStart: segment.start,
+            charEnd: segment.end,
+            ...(chunk.final ? { final: true } : {}),
+          } satisfies TtsAudioPayload)
+          flushAudio()
+        },
+      }).then(
+        () => { flushed.add(segmentIndex); flushAudio(); return { ok: true } as SynthResult },
+        (error) => { flushed.add(segmentIndex); flushAudio(); return { ok: false, error } as SynthResult },
+      )
+
     try {
-      for (let index = 0; index < speechSegments.length; index += 1) {
+      const results = new Array<SynthResult | undefined>(speechSegments.length).fill(undefined)
+      const inFlight = new Set<Promise<void>>()
+      let firstError: unknown = undefined
+      // 防丢失唤醒：notify 先自增 generation；waiter 挂上前比对——
+      // 若期间已经 notify 过，立即返回，不等。
+      let generation = 0
+      let waiter: (() => void) | undefined = undefined
+      const notify = (): void => {
+        generation += 1
+        const w = waiter
+        waiter = undefined
+        w?.()
+      }
+      const waitForChange = (seen: number): Promise<void> => {
+        if (generation !== seen) return Promise.resolve()
+        return new Promise<void>((resolve) => { waiter = resolve })
+      }
+
+      // 启动第 index 句的合成；首块到达或合成结束时唤醒泵。
+      const launch = (index: number): void => {
         const segment = speechSegments[index]
-        const scrollState = screenStates.get(sessionId)
-        if (scrollState !== undefined && scrollState.follow) {
-          const lineIndex = scrollState.lines.findIndex((line) => line.sentenceIndex === segment.sentenceIndex)
-          if (lineIndex >= 0) {
-            const maxOffset = Math.max(0, scrollState.lines.length - SCREEN_SPEC.replyVisibleLines)
-            scrollState.offset = Math.max(0, Math.min(lineIndex - 2, maxOffset))
+        let firstChunkSeen = false
+        const task = synthSegment(segment, index, () => {
+          if (firstChunkSeen) return
+          firstChunkSeen = true
+          // 首块到达：让泵接着启动后续句子（保持最多 MAX_INFLIGHT_SYNTH 个在途）。
+          notify()
+        })
+        const done = task.then((result) => {
+          results[index] = result
+          if (!result.ok && firstError === undefined) firstError = result.error
+          inFlight.delete(done)
+          notify()
+        })
+        inFlight.add(done)
+      }
+
+      // 按句顺序消费结果：sendReply/滚动跟随 + takeEngineNote 仍在合成完成后、
+      // 按句 index 顺序执行——只是合成本身被提前启动，消除句间静音缝。
+      const pump = (async () => {
+        for (let index = 0; index < speechSegments.length; index += 1) {
+          while (results[index] === undefined && firstError === undefined) {
+            while (inFlight.size < MAX_INFLIGHT_SYNTH && firstError === undefined) {
+              const next = index + inFlight.size
+              if (next >= speechSegments.length) break
+              launch(next)
+            }
+            if (results[index] !== undefined || firstError !== undefined) break
+            await waitForChange(generation)
+          }
+          if (firstError !== undefined) break
+          const result = results[index] as SynthResult
+          if (!result.ok) {
+            if (firstError === undefined) firstError = result.error
+            break
+          }
+          const segment = speechSegments[index]
+          const scrollState = screenStates.get(sessionId)
+          if (scrollState !== undefined && scrollState.follow) {
+            const lineIndex = scrollState.lines.findIndex((line) => line.sentenceIndex === segment.sentenceIndex)
+            if (lineIndex >= 0) {
+              const maxOffset = Math.max(0, scrollState.lines.length - SCREEN_SPEC.replyVisibleLines)
+              scrollState.offset = Math.max(0, Math.min(lineIndex - 2, maxOffset))
+            }
+          }
+          sendReply(sessionId, sentences, segment.sentenceIndex, segment.start, includeAll)
+          const engineNote = tts.takeEngineNote()
+          if (engineNote.startsWith('在线兜底')) {
+            device.send('event.progress', { stage: 'tts', text: engineNote } satisfies ProgressPayload)
           }
         }
-        sendReply(sessionId, sentences, segment.sentenceIndex, segment.start, includeAll)
-        await tts.synthesize(segment.text, {
-          voice,
-          sessionId,
-          edgeVoice: device.edgeVoice,
-          offlineOnly: device.offlineOnly,
-          onChunk: (chunk) => {
-            device.send('tts.audio', {
-              seq: chunk.seq,
-              total: chunk.total,
-              sampleRate: 24000,
-              channels: 1,
-              format: 'pcm16',
-              data: chunk.data.toString('base64'),
-              index: segment.index,
-              text: segment.text,
-              charStart: segment.start,
-              charEnd: segment.end,
-              ...(chunk.final ? { final: true } : {}),
-            } satisfies TtsAudioPayload)
-          },
-        })
-        const engineNote = tts.takeEngineNote()
-        if (engineNote.startsWith('在线兜底')) {
-          device.send('event.progress', { stage: 'tts', text: engineNote } satisfies ProgressPayload)
-        }
-      }
+      })()
+
+      // 出错时：等已启动的合成跑完发完（音频顺序不能乱），再把第一处错误抛给现有 catch。
+      await Promise.all([pump, ...inFlight])
+      if (firstError !== undefined) throw firstError
       // 念完停在最后一屏（最后一帧）。
       const last = sentences[sentences.length - 1]
       sendReply(sessionId, sentences, sentences.length - 1, last.end, includeAll)
