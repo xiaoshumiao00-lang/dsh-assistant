@@ -38,6 +38,15 @@ export class WsFrameParser {
     this.buf = Buffer.alloc(0);
     this.onFrame = onFrame;
     this.onError = onError ?? (() => {});
+    /**
+     * 分片消息重组（RFC 6455 §5.4）：Chrome 会把大消息（实测 ~128KB 以上）拆成
+     * FIN=0 的起始帧 + 若干 continuation 帧。旧实现只认 opcode=1 的单帧，于是
+     * 鹈鹕页面上传 WAV（约 240KB）时第一片被判成坏 JSON 静默丢弃，页面永远等不到
+     * transcript（2026-11-07 实测根因）。
+     */
+    this.fragmentOpcode = 0;
+    this.fragmentRsv1 = false;
+    this.fragmentPayloads = [];
   }
 
   push(chunk) {
@@ -76,6 +85,33 @@ export class WsFrameParser {
       const payload = Buffer.from(b.subarray(off, off + len));
       if (mask) for (let i = 0; i < payload.length; i += 1) payload[i] ^= mask[i & 3];
       this.buf = b.subarray(off + len);
+      // ── 分片重组 ──
+      if (opcode === 0x0) { // continuation
+        if (this.fragmentOpcode === 0) continue; // 没有起始帧：丢弃
+        this.fragmentPayloads.push(payload);
+        const total = this.fragmentPayloads.reduce((sum, item) => sum + item.length, 0);
+        if (total > MAX_MESSAGE_BYTES) {
+          this.fragmentOpcode = 0;
+          this.fragmentPayloads = [];
+          this.onError(new Error(`ws fragmented message too large: ${total}`));
+          continue;
+        }
+        if (!fin) continue;
+        const whole = Buffer.concat(this.fragmentPayloads);
+        const firstOpcode = this.fragmentOpcode;
+        const firstRsv1 = this.fragmentRsv1;
+        this.fragmentOpcode = 0;
+        this.fragmentRsv1 = false;
+        this.fragmentPayloads = [];
+        this.onFrame({ fin: true, rsv1: firstRsv1, opcode: firstOpcode, payload: whole });
+        continue;
+      }
+      if (!fin && (opcode === 0x1 || opcode === 0x2)) {
+        this.fragmentOpcode = opcode;
+        this.fragmentRsv1 = rsv1;
+        this.fragmentPayloads = [payload];
+        continue;
+      }
       this.onFrame({ fin, rsv1, opcode, payload });
     }
   }

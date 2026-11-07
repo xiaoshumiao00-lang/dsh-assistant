@@ -32,6 +32,8 @@
 
 【2026-11-07 追加：只绑 Computer Use 会话 + 默认自动跟随】鹈鹕要靠 GUI 看屏/点按，只有 Computer Use / 电脑操作模式的会话能接活。①**模式判定**：宿主投影 `agentPreset`（`sessionListMetadata` 同层的行，`init = header.agentPreset ?? null`，之后由 `agent-preset/selected` 更新；`dsh-agent-preset-registry` 注释明确「读投影不读 header」），值必须等于 `computer-use`；不靠标题猜。②选择器只列 CU 会话，非 CU 只在 `?session=` 显式指定时保留为灰色「当前（不可用）」行，且在屏上/卡片红色提示「无法看屏/点按」。③**默认自动绑定**：优先级 URL `?session=` → 上次手动记住的（校验仍存在且仍是 CU）→ 最近活跃的 CU 会话；活跃时间用宿主同口径 `updatedAt = max(header.createdAt, 投影 sessionListMetadata.lastPromptAt)`（最后一次用户发言时间）。④自动跟随：页面每次连上强制重列一次，注入前再判定一次（`session/event` 的 `user/message` 会即时刷新缓存活跃时间，避免每句话都全量列 1870 条）；目标变了就 `session.bound {auto:true, followed:true}` + 屏上「已自动跟随到：…」。⑤手动覆盖：选择器点选后不再漂移，出现「恢复自动」按钮；手动记忆失效/变非 CU 时按优先级回落到自动。⑥屏上常驻「当前会话：<名字>（自动/手动）」。`scripts/test-tihu-protocol.mjs` 33 → 39 项。
 
+【2026-11-07 追加：页面上传 WAV 后没有转写回音（只改了一行：WS 分片重组）】真实公网页面（无痕 Chrome）上传 5.6s WAV：页面显示「已上行」，之后 30 秒无 transcript、无 screen.frame、无报错。用 `scripts/tihu-voice-e2e.mjs` 对同一公网入口跑同一段 WAV → **2.4 秒拿到 transcript 并注入成功**，说明 lane 的音频分支没问题，问题在页面发帧/宿主收帧。抓浏览器实际发出的 WS 帧发现：**Chrome 把 239,799 字节的 audio.frame 拆成了 FIN=0 起始帧(130,631B) + continuation 帧**；`WsFrameParser` 只认 opcode=1 单帧、忽略 continuation，于是第一片被当坏 JSON 静默丢弃 → 页面永远等不到回音。修法：`WsFrameParser` 实现 RFC 6455 §5.4 分片重组（起始帧 + continuation + 总大小上限），对整条 pocket 链路生效。另加三道兜底：①大帧解析失败/`audio.frame` 被拒时回 `event.alert(error)`，不再静默；②自动跟随后台化（5 秒上限）且单条上行 60 秒看门狗，任何一步卡住都不再堵死后续消息；③页面 15 秒无 transcript 报「转写超时」，WS 断开明确提示并 2 秒重连。`scripts/test-tihu-protocol.mjs` 39 → 41 项（含分片重组单测 + 分片 audio.frame 端到端）。实测（公网 + 真文件上传）：09:53:55「已上行」→ 09:53:56「已收到音频」→ 转写「对我做了介绍啊，那么我想说的是呢，大家如果对我的研究感兴趣呢。」→ 注入第 5 轮 → 屏帧「思考/模型处理中」，全程约 1–2 秒。
+
 ## [0.2.17] - 2026-11-06
 
 📺 平板 / 电视（宽屏、矮视口）专项：控制室卡片不再挤成 4 列被裁，抽屉里点得到会话
