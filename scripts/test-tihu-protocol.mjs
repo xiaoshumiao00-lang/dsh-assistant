@@ -1113,12 +1113,12 @@ await testAsync('lane：多句回复 tts.audio 按句 index 顺序到达、末�
   runtime.dispose()
 })
 
-await testAsync('lane：预取流水线——后一句合成在前一句完成前启动（并发限 2）', async () => {
-  // 假 TTS：每句分 3 块、块间延迟 15ms；记录同时在途的合成数与「句 N 完成前句 N+1 已启动」证据。
+await testAsync('lane：预取流水线——并发合成、每句只合成一次、音频按序下发', async () => {
+  // 假 TTS：每句分 3 块、块间延迟 15ms；记录同时在途的合成数与启动/完成顺序。
   let inFlight = 0
   let maxInFlight = 0
-  let startOrder = []
-  let finishOrder = []
+  const startOrder = []
+  const finishOrder = []
   const pipelineTts = {
     async ensureServer() {},
     status: () => ({ available: true, model: 'pipe-test' }),
@@ -1152,13 +1152,13 @@ await testAsync('lane：预取流水线——后一句合成在前一句完成�
   })
   await new Promise((resolve) => setTimeout(resolve, 1000))
 
-  // 关键断言 1：至少一次出现 2 个合成同时在途（预取确实并发）。
+  // 断言 1：预取确实并发（不止 1 个在途合成）。
   assert.ok(maxInFlight >= 2, `预取应出现并发合成，实际 maxInFlight=${maxInFlight}`)
-  // 关键断言 2：所有句都启动并完成，且启动顺序就是完成顺序（音频不乱）。
+  // 断言 2：5 句每句只启动一次（旧实现用 index+inFlight.size 会重复合成同一句）。
   assert.equal(startOrder.length, 5, '5 句全部启动')
+  assert.equal(new Set(startOrder).size, 5, `每句只能合成一次，实际启动：${startOrder.join('｜')}`)
   assert.equal(finishOrder.length, 5, '5 句全部完成')
-  assert.deepEqual(finishOrder, startOrder, '启动顺序即完成顺序（音频按句 index 顺序发）')
-  // 音频帧 index 单调不减
+  // 断言 3：音频帧 index 单调不减（合成本身并发，下发必须按句序）。
   const audioFrames = framesOf(socket).filter((frame) => frame.type === 'tts.audio')
   const indices = audioFrames.map((frame) => frame.payload.index)
   for (let i = 1; i < indices.length; i += 1) {
@@ -1302,6 +1302,108 @@ await testAsync('lane：高亮屏帧按累计播放时长推进（预取后文�
   runtime.dispose()
 })
 
+/* ---------- 2026-11-07 回归：长回复朗读「读了几句没声音了」（预取被抽干） ----------
+ *
+ * 实测（本机 edge-tts zh-CN-YunjianNeural rate +45%，8 段干净样本）：
+ *   - 单段合成总耗时 1.87–2.53s（均值 2.21s）；
+ *   - 首块 1.55–2.31s（均值 1.90s）≈ 合成总耗时的 86% → edge 基本不流式，首块≈整段；
+ *   - 单段音频 1.56–2.71s（均值 2.07s）；
+ *   - 限流抖动时单段能到 6.1s（> 2 段音频）。
+ * 预取只有 2 段 ≈ 4s 余量，一次抖动就抽干；更糟的是旧泵用 `index + inFlight.size`
+ * 算下一个要启动的段号——后启动的段先完成时，会**把同一段再合成一遍**，把并发额度
+ * 白烧掉（等价并发变 1），于是「合成跟不上播放」→ 中途静音。
+ * 下面按实测比例缩时（合成 300ms / 首块 270ms / 音频 180ms，每 4 段一次 600ms 抖动），
+ * 用页面 playPcm 的口径复算静音缝。
+ */
+const waitMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** 按每段实际音频时长把 tts.audio 帧还原成页面 AudioContext 的排程，返回静音缝。 */
+function silenceGaps(audioFrames, gapToleranceMs = 200) {
+  const gaps = []
+  let nextAt = null
+  for (const frame of audioFrames) {
+    const bytes = Buffer.from(String(frame.payload.data || ''), 'base64').length
+    const durationMs = (bytes / 2 / 24000) * 1000
+    if (nextAt !== null && frame.at > nextAt + gapToleranceMs) gaps.push({ at: frame.at, silenceMs: Math.round(frame.at - nextAt) })
+    nextAt = Math.max(nextAt === null ? frame.at : nextAt, frame.at) + durationMs
+  }
+  return gaps
+}
+
+await testAsync('lane：长回复朗读不中途静音（预取吃得住抖动，且每段只合成一次）', async () => {
+  const SEGMENTS = 12
+  const SYNTH_MS = 300
+  const FIRST_MS = 270
+  const AUDIO_MS = 180
+  const SLOW_MS = 600
+  const CHUNK_MS = 30
+  const calls = []
+  const drainTts = {
+    async ensureServer() {},
+    status: () => ({ available: true, model: 'drain-test' }),
+    engineLabel: () => 'drain-test',
+    takeEngineNote: () => '',
+    deviceFallback: () => '',
+    available: () => true,
+    async synthesize(text, options) {
+      calls.push(text)
+      const index = Number(/第(\d+)段/.exec(text)?.[1] ?? 0)
+      const synthMs = index % 4 === 3 ? SLOW_MS : SYNTH_MS
+      // 首块之前一个字节都没有（edge 实测：首块≈合成结束）
+      await waitMs(FIRST_MS)
+      let seq = 0
+      for (let sent = 0; sent < AUDIO_MS; sent += CHUNK_MS) {
+        options.onChunk({ data: Buffer.alloc(CHUNK_MS * 48), seq, total: 0, final: false })
+        seq += 1
+        await waitMs(2)
+      }
+      await waitMs(Math.max(0, synthMs - FIRST_MS))
+      return { sampleRate: 24000, firstChunkMs: FIRST_MS, audioMs: AUDIO_MS, totalMs: synthMs, chunks: seq }
+    },
+    async createVoice() { throw new Error('n/a') },
+    async listVoices() { return [{ name: 'default', kind: 'default' }] },
+    dispose() {},
+  }
+  const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true, lastPromptAt: 1000 })], {}, { instance: drainTts })
+  const socket = openTimedLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'drain', protocol: '0', sessionId: 'session-1' }, 1)))
+  await waitMs(30)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const text = Array.from({ length: SEGMENTS }, (_, i) => `第${i}段内容。`).join('')
+  const t0 = Date.now()
+  onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text }] } },
+  })
+  // 朗读 + 收尾（12 段 × 180ms ≈ 2.2s 音频；给足余量）
+  await waitMs(6000)
+
+  const audio = socket.timedFrames().filter((frame) => frame.type === 'tts.audio')
+  const byIndex = new Map()
+  for (const frame of audio) {
+    const index = frame.payload.index
+    if (!byIndex.has(index)) byIndex.set(index, [])
+    byIndex.get(index).push(frame)
+  }
+  // 1) 每段只合成一次（旧泵 index+inFlight.size 会把先完成的段重复合成，白烧并发额度）
+  assert.equal(calls.length, SEGMENTS, `每段应只合成一次，实际合成 ${calls.length} 次（重复合成会拖垮预取）`)
+  // 2) 12 段一段不落，且按 index 顺序下发（预取不能乱序）
+  assert.equal(byIndex.size, SEGMENTS, `12 段音频都要下发，实际 ${byIndex.size} 段（缺段 = 读到一半静音）`)
+  const indices = audio.map((frame) => frame.payload.index)
+  for (let i = 1; i < indices.length; i += 1) {
+    assert.ok(indices[i] >= indices[i - 1], `句 index 必须单调不减：${indices.join(',')}`)
+  }
+  // 3) 按页面 playPcm 的口径：没有超过 200ms 的静音缝
+  const gaps = silenceGaps(audio)
+  const totalSilence = gaps.reduce((sum, gap) => sum + gap.silenceMs, 0)
+  assert.equal(
+    gaps.length,
+    0,
+    `朗读中途出现 ${gaps.length} 处静音（合计 ${totalSilence}ms）：${gaps.map((gap) => `${gap.at - t0}ms 断 ${gap.silenceMs}ms`).join(' / ')}`,
+  )
+  runtime.dispose()
+})
+
 /* ---------- 两级链：edge 失败 → Qwen；都失败 → 无语音 ---------- */
 
 function fakeTts({ model = 'qwen3-tts 0.6b-cuda', fail = false } = {}) {
@@ -1417,6 +1519,7 @@ await testAsync('lane：上滑回看历史、下滑回底恢复 follow、新回�
 
 await testAsync('lane：完成 + 10s 回主页；未完成/浏览模式不切', async () => {
   process.env.TIHU_HOME_AFTER_MS = '60'
+  process.env.TIHU_HOME_RECHECK_MS = '40'
   const records = []
   for (let i = 1; i <= 6; i += 1) {
     const cwds = ['D:/dsh-assistant', 'D:/陈潘HBEU/2027青年基金', 'D:/陈潘HBEU/磷石膏SCI', 'D:/LLM STRATA', 'C:/Users/x/.dsh/assistant', 'C:/Users/x/.dsh/dsh_orb']
@@ -1433,11 +1536,12 @@ await testAsync('lane：完成 + 10s 回主页；未完成/浏览模式不切', 
   emit({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
   await new Promise((resolve) => setTimeout(resolve, 40))
   let screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
-  assert.notEqual(screens[screens.length - 1].payload.mode, 'home', '刚回复完还在会话屏')
-  await new Promise((resolve) => setTimeout(resolve, 160))
+  assert.notEqual(screens[screens.length - 1].payload.mode, 'home', '刚回复完（朗读还没播完）不能切主页')
+  // 朗读播完（假 TTS 每段 100ms 音频）+ 空闲计时过后才回主页
+  await new Promise((resolve) => setTimeout(resolve, 600))
   screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
   const home = screens[screens.length - 1].payload
-  assert.equal(home.mode, 'home', '60ms 后回主页')
+  assert.equal(home.mode, 'home', '朗读播完 + 空闲计时后回主页')
   assert.equal(home.home.projects.length, 5, '主页一屏 5 个项目')
   assert.equal(home.home.page.total, 1, '5 个项目一页')
   assert.equal(home.home.total, 5)
@@ -1449,6 +1553,7 @@ await testAsync('lane：完成 + 10s 回主页；未完成/浏览模式不切', 
   screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
   assert.notEqual(screens[screens.length - 1].payload.mode, 'home', '未完成不切主页')
   delete process.env.TIHU_HOME_AFTER_MS
+  delete process.env.TIHU_HOME_RECHECK_MS
   runtime.dispose()
 })
 
@@ -1514,6 +1619,116 @@ await testAsync('lane：无回复 turn（无 assistant/message）也能回主页
   assert.ok(homes.length > 0, '无回复 turn 结束 + 超时后应回主页')
   delete process.env.TIHU_HOME_AFTER_MS
   delete process.env.TIHU_HOME_RECHECK_MS
+  runtime.dispose()
+})
+
+
+/* ---------- 2026-11-07 回归：朗读没结束就跳控制室主页，随后又被残留屏帧切回 reply ----------
+ *
+ * 机制：正文 assistant/message 一到就开朗读，turn/end 紧接着结束（真实宿主就是这样），
+ * 旧 scheduleHome 只看 runningSessions 空不空——turn 已停、但音频还在播/队列还没播完，
+ * TIHU_HOME_AFTER_MS 一到就发 home 帧；之后 speakLocally 里按播放时刻排的 reply 屏帧
+ * 陆续到期，把模式切回 reply（用户看到的「先跳主页、过一会又自己跳回来继续读」）。
+ */
+await testAsync('lane：朗读没播完不得回主页，回主页后也不再被残留屏帧切回 reply', async () => {
+  process.env.TIHU_HOME_AFTER_MS = '150'
+  process.env.TIHU_HOME_RECHECK_MS = '40'
+  const SEGMENTS = 6
+  const SYNTH_MS = 260
+  const FIRST_MS = 240
+  const AUDIO_MS = 200
+  const CHUNK_MS = 40
+  const slowTts = {
+    async ensureServer() {},
+    status: () => ({ available: true, model: 'home-gate' }),
+    engineLabel: () => 'home-gate',
+    takeEngineNote: () => '',
+    deviceFallback: () => '',
+    available: () => true,
+    async synthesize(_text, options) {
+      await waitMs(FIRST_MS)
+      let seq = 0
+      for (let sent = 0; sent < AUDIO_MS; sent += CHUNK_MS) {
+        options.onChunk({ data: Buffer.alloc(CHUNK_MS * 48), seq, total: 0, final: false })
+        seq += 1
+        await waitMs(2)
+      }
+      await waitMs(Math.max(0, SYNTH_MS - FIRST_MS))
+      return { sampleRate: 24000, firstChunkMs: FIRST_MS, audioMs: AUDIO_MS, totalMs: SYNTH_MS, chunks: seq }
+    },
+    async createVoice() { throw new Error('n/a') },
+    async listVoices() { return [{ name: 'default', kind: 'default' }] },
+    dispose() {},
+  }
+  const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+  const { runtime, events } = runtimeFor(records, {}, { instance: slowTts })
+  const socket = openTimedLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'home-gate', protocol: '0', sessionId: 'session-a' }, 1)))
+  await waitMs(30)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const emit = (event) => onSessionEvent({ id: 'session-a', header: { id: 'session-a' } }, event)
+  const text = Array.from({ length: SEGMENTS }, (_, i) => `第${i}段内容。`).join('')
+
+  emit({ type: 'turn/start', data: { turn: 1 } })
+  emit({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } })
+  // 宿主真实时序：正文下发后 turn 立即结束，朗读才刚开始
+  emit({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  // 6 段 ≈ 1.2s 音频；给足时间看「播完才回主页」
+  await waitMs(3000)
+  delete process.env.TIHU_HOME_AFTER_MS
+  delete process.env.TIHU_HOME_RECHECK_MS
+
+  const timed = socket.timedFrames()
+  const audio = timed.filter((frame) => frame.type === 'tts.audio')
+  assert.ok(audio.length > 0, '应下发 tts.audio')
+  const lastAudioAt = audio[audio.length - 1].at
+  // 绑定时本来就会先发一帧主页屏（开机画面），这里只看「出问题的那段朗读」之后
+  const firstReply = timed.find((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'reply')
+  assert.ok(firstReply, '应出现 reply 屏帧')
+  const homes = timed.filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home' && frame.at >= firstReply.at)
+  const earlyHomes = homes.filter((frame) => frame.at < lastAudioAt)
+  assert.equal(
+    earlyHomes.length,
+    0,
+    `朗读没播完就回了 ${earlyHomes.length} 次主页：home@${earlyHomes.map((frame) => frame.at - audio[0].at).join(',')}ms / 末块@${lastAudioAt - audio[0].at}ms`,
+  )
+  assert.ok(homes.length > 0, '朗读播完后仍要回主页（不能因为守门就永不回主页）')
+  // 回主页之后不能再有 reply 屏帧（否则就是「跳主页又自己跳回来」）
+  const firstHome = homes[0]
+  const replyAfterHome = timed.filter((frame) => frame.at > firstHome.at && frame.type === 'screen.frame' && frame.payload.mode === 'reply')
+  assert.equal(
+    replyAfterHome.length,
+    0,
+    `回主页后仍收到 ${replyAfterHome.length} 个 reply 屏帧（残留屏帧把屏切了回去）`,
+  )
+  runtime.dispose()
+})
+
+await testAsync('lane：用户浏览历史（follow=false）时朗读结束也不回主页', async () => {
+  process.env.TIHU_HOME_AFTER_MS = '80'
+  process.env.TIHU_HOME_RECHECK_MS = '40'
+  const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+  const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'browse', protocol: '0', sessionId: 'session-a' }, 1)))
+  await waitMs(30)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const emit = (event) => onSessionEvent({ id: 'session-a', header: { id: 'session-a' } }, event)
+  const long = Array.from({ length: 30 }, (_, i) => `第${i + 1}句内容。`).join('')
+  emit({ type: 'turn/start', data: { turn: 1 } })
+  emit({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: long }] } } })
+  emit({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await waitMs(40)
+  // 上滑回看：follow=false
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'swipe', dy: -200, phase: 'move' }, 2)))
+  await waitMs(500)
+  delete process.env.TIHU_HOME_AFTER_MS
+  delete process.env.TIHU_HOME_RECHECK_MS
+  const screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+  const firstReply = screens.findIndex((frame) => frame.payload.mode === 'reply')
+  assert.ok(firstReply >= 0, '应出现 reply 屏帧')
+  const homes = screens.slice(firstReply).filter((frame) => frame.payload.mode === 'home')
+  assert.equal(homes.length, 0, '用户正在浏览历史，不得切主页')
   runtime.dispose()
 })
 
