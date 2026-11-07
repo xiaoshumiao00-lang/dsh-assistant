@@ -70,6 +70,7 @@ import { TihuTts, type TihuTtsPaths } from './tts.ts'
 import { replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
 import { toSpeechText } from './speech-text.ts'
 import { CONTENT_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
+import { groupProjects, type ProjectReply } from './project-groups.ts'
 import type { TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
 
 /** 页面与 WebSocket 的路径（代理侧按这两个前缀放行）。 */
@@ -235,6 +236,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const pendingByDisplay = new Map<string, { sessionId: string; title: string; at: number }[]>()
   /** 会话 id → 最近一条回复（点气泡后从头朗读）。 */
   const lastReplies = new Map<string, { sentences: ReplySentence[]; speechSegments: SpeechSegment[]; includeAll: boolean }>()
+  /** 会话 id → 最近一条 assistant 原文（主页摘要用，避免显示裸 id）。 */
+  const lastAssistant = new Map<string, ProjectReply>()
   /** 会话 id → 屏幕进度状态（步骤计数 / 用时 / 上一步结果）。 */
   const progressStates = new Map<string, TihuProgressState>()
   /** 正在 reply 阅读模式的会话（turn/end 不再用「完成」状态帧覆盖正文）。 */
@@ -725,30 +728,10 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   async function sendHome(sessionId: string, device?: TihuDevice): Promise<void> {
     let rows: TihuSessionRow[] = []
     try { rows = (await collectSessionRows()).rows } catch { rows = [] }
-    const groups = new Map<string, { name: string; rows: TihuSessionRow[] }>()
-    for (const row of rows) {
-      const cwd = row.cwd ?? ''
-      const name = cwd === '' ? '其他' : (cwd.split(/[\\/]/).filter(Boolean).pop() ?? cwd)
-      const key = cwd === '' ? '__other__' : cwd
-      if (!groups.has(key)) groups.set(key, { name, rows: [] })
-      groups.get(key)!.rows.push(row)
-    }
-    const now = Date.now()
-    const projects = [...groups.values()].map((group) => {
-      const latest = group.rows.slice().sort((a, b) => b.updatedAt - a.updatedAt)[0]
-      const running = group.rows.some((row) => row.live && now - row.updatedAt < 5 * 60_000)
-      const recent = latest !== undefined && now - latest.updatedAt < 24 * 3600_000
-      const status: 'running' | 'idle' | 'done' = running ? 'running' : recent ? 'done' : 'idle'
-      return {
-        name: group.name,
-        status,
-        summary: latest === undefined ? '暂无会话' : (latest.title || shortSessionId(latest.sessionId)),
-        updatedAt: latest?.updatedAt ?? 0,
-      }
-    }).sort((a, b) => {
-      const rank = { running: 0, done: 1, idle: 2 } as Record<string, number>
-      return rank[a.status] - rank[b.status] || b.updatedAt - a.updatedAt
-    })
+    const projectRows = rows.map((row) => ({ sessionId: row.sessionId, title: row.title, cwd: row.cwd, updatedAt: row.updatedAt, live: row.live }))
+    const replies: Record<string, ProjectReply | undefined> = {}
+    for (const row of projectRows) replies[row.sessionId] = lastAssistant.get(row.sessionId)
+    const projects = groupProjects(projectRows, replies, Date.now())
     const pageSize = 5
     const totalPages = Math.max(1, Math.ceil(projects.length / pageSize))
     const state = homeStates.get(sessionId) ?? { mode: 'session' as const, page: 0, done: false }
@@ -1255,6 +1238,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         // 新回复：强制回到顶部并恢复跟随；取消回主页计时并切会话屏。
         screenStates.delete(sessionId)
         lastReplies.set(sessionId, { sentences, speechSegments, includeAll })
+        lastAssistant.set(sessionId, { text, at: Date.now() })
         cancelHomeTimer(sessionId)
         homeStates.set(sessionId, { mode: 'session', page: 0, done: false })
         sendReply(sessionId, sentences, 0, 0, includeAll)

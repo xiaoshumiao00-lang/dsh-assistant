@@ -54,6 +54,7 @@ import {
 import { ACTUAL_SIZE_SCALE, CONTENT_WIDTH_PX, SCREEN_SPEC, clipScreenTitle, fitLine, fitScreenLines, measureTextPx } from '../src/tihu/screen-spec.ts'
 import { fitViewport, replyViewport, replyWindow, splitReplySentences, splitSpeechSegments, wrapReplyLines } from '../src/tihu/reply.ts'
 import { toSpeechText } from '../src/tihu/speech-text.ts'
+import { groupProjects, projectNameOf } from '../src/tihu/project-groups.ts'
 import { Pcm16Chunker, TTS_CHUNK_BYTES, TTS_SAMPLE_RATE, validateReferenceWav } from '../src/tihu/audio.ts'
 import { normalizeVoiceName } from '../src/tihu/tts.ts'
 import { WsFrameParser, encodeFrame } from '../src/pocket-host/ws-deflate.mjs'
@@ -1188,7 +1189,8 @@ await testAsync('lane：完成 + 10s 回主页；未完成/浏览模式不切', 
   process.env.TIHU_HOME_AFTER_MS = '60'
   const records = []
   for (let i = 1; i <= 6; i += 1) {
-    records.push(cuRecord('session-home-' + i, { live: false, cwd: '/proj' + i, lastPromptAt: 1000 + i, title: '项目 ' + i + ' 的最新进展' }))
+    const cwds = ['D:/dsh-assistant', 'D:/陈潘HBEU/2027青年基金', 'D:/陈潘HBEU/磷石膏SCI', 'D:/LLM STRATA', 'C:/Users/x/.dsh/assistant', 'C:/Users/x/.dsh/dsh_orb']
+    records.push(cuRecord('session-home-' + i, { live: false, cwd: cwds[i - 1], lastPromptAt: 1000 + i, title: '项目 ' + i + ' 的最新进展' }))
   }
   const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
   const socket = openLane(runtime)
@@ -1207,8 +1209,8 @@ await testAsync('lane：完成 + 10s 回主页；未完成/浏览模式不切', 
   const home = screens[screens.length - 1].payload
   assert.equal(home.mode, 'home', '60ms 后回主页')
   assert.equal(home.home.projects.length, 5, '主页一屏 5 个项目')
-  assert.equal(home.home.page.total, 2, '6 个项目两页')
-  assert.equal(home.home.total, 6)
+  assert.equal(home.home.page.total, 1, '5 个项目一页')
+  assert.equal(home.home.total, 5)
   // 未完成不切
   emit({ type: 'turn/start', data: { turn: 2 } })
   emit({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '失败句。' }] } } })
@@ -1275,6 +1277,44 @@ await testAsync('lane：别的会话完成入待读气泡，tap 切屏并从头�
   await new Promise((resolve) => setTimeout(resolve, 40))
   assert.equal(framesOf(socketA).filter((frame) => frame.type === 'session.bound').length, boundBefore, '非法 target 不切屏')
   runtime.dispose()
+})
+
+
+test('主页项目聚合：同 cwd 合并、摘要人话、三态状态', () => {
+  const now = 1_000_000
+  const same = Array.from({ length: 6 }, (_, i) => ({
+    sessionId: 's' + i,
+    cwd: 'D:/dsh-assistant/src/tihu',
+    updatedAt: now - i * 1000,
+    live: false,
+  }))
+  assert.equal(groupProjects(same, {}, now).length, 1, '6 个会话同一 cwd → 1 个项目')
+
+  const different = [
+    { sessionId: 'a', cwd: 'D:/陈潘HBEU/2027青年基金', updatedAt: now, live: false },
+    { sessionId: 'b', cwd: 'D:/陈潘HBEU/磷石膏SCI', updatedAt: now, live: false },
+  ]
+  assert.equal(groupProjects(different, {}, now).length, 2)
+
+  // 摘要取最近 assistant 回复首句，绝不出现裸 session id
+  const replied = groupProjects(different, {
+    a: { text: '**完成** tihu 公网绑定。第二句。', at: now - 60_000 },
+  }, now)
+  const a = replied.find((item) => item.name === '青年基金申请书')
+  assert.ok(a.summary.includes('完成') && !a.summary.includes('session'))
+  assert.ok(!/^[0-9a-f]{8}$/i.test(a.summary))
+
+  // 三态：live 且最近 2 分钟 → running；最近 10 分钟有回复 → done；否则 idle
+  const running = groupProjects([{ sessionId: 'r', cwd: 'D:/dsh-assistant', updatedAt: now - 30_000, live: true }], {}, now)[0]
+  assert.equal(running.status, 'running')
+  const done = groupProjects([{ sessionId: 'd', cwd: 'D:/LLM STRATA', updatedAt: now - 3 * 60_000, live: false }], {
+    d: { text: '做完了。', at: now - 60_000 },
+  }, now)[0]
+  assert.equal(done.status, 'done')
+  const idle = groupProjects([{ sessionId: 'i', cwd: 'D:/陈潘HBEU/磷石膏SCI', updatedAt: now - 3600_000, live: false }], {}, now)[0]
+  assert.equal(idle.status, 'idle')
+  assert.equal(idle.summary, '等待新消息')
+  assert.equal(projectNameOf('D:/dsh-assistant/src/tihu'), 'dsh-assistant')
 })
 
 /* ---------- 屏幕进度映射 ---------- */
