@@ -300,8 +300,11 @@ export function activityEntryOf(name: string, args: unknown): TihuActivityEntry 
     else if (rule.label === '读文件' || rule.label === '写文件' || rule.label === '改文件') detail = baseNameOf(detail) || detail
     return { label: rule.label, detail: sanitizeDetail(detail) }
   }
-  const tail = firstString(params, ['query', 'command', 'path', 'pattern', 'url', 'text', 'message', 'task', 'prompt'])
-  return { label: '工具', detail: sanitizeDetail([tool, tail].filter(Boolean).join(' ')) }
+  // 桌面端工具（截图/点击/按键/派子任务…）用内置中文名，不裸显英文工具名。
+  const known = describeToolAction(lower)
+  const tail = firstString(params, ['query', 'command', 'path', 'pattern', 'url', 'text', 'message', 'task', 'prompt', 'question', 'skill'])
+  if (known !== undefined) return { label: known.title, detail: known.title === '等待确认' ? '' : sanitizeDetail(tail) }
+  return { label: '工具', detail: sanitizeDetail([tail, tool].filter(Boolean).join(' ')) }
 }
 
 /** 明细最多留几条（屏上只显示最后两条）。 */
