@@ -201,10 +201,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   <h4>音色 · 本地 TTS（Qwen3-TTS 0.6B）</h4>
   <div class="row">
     <select id="voiceSelect" style="flex:1"></select>
-    <button id="audioTest" title="播一声提示音，验证音频通路（不出声就点它）">试听</button>
+    <button id="audioTest" title="念一句示例语音，验证声音（不出声就点它）">试听</button>
     <button id="voiceRefresh">刷新</button>
   </div>
-  <div class="hint" id="audioTestHint">试听会先解锁音频：有本轮缓存就重播，没有就响 0.6 秒提示音。</div>
+  <div class="hint" id="audioTestHint">试听会先解锁音频：有本轮缓存就重播，否则让宿主念一句示例（走正式朗读同一条 TTS 链路）。</div>
   <div class="row" style="margin-top:8px">
     <input id="voiceName" placeholder="音色名（英文/数字/下划线）" style="flex:1" />
     <label class="file" style="flex:1">上传参考音频（3–10 秒）<input id="voiceFile" type="file" accept="audio/*"></label>
@@ -308,6 +308,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     lastTranscript: '', asking: null, recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0,
     ttsTurnTexts: [], ttsAudioSeen: {},
     audioCtx: null, pcmSources: [], pcmNextTime: 0, turnPcm: [],
+    samplePending: false, sampleTimer: 0,
     voice: 'default', voices: [], voiceEngine: null,
     reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, screenMode: 'status', pending: [], boundProject: '' };
 
@@ -821,7 +822,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.pcmSources = [];
     state.pcmNextTime = 0;
   }
-  function playPcm(base64, sampleRate) {
+  function playPcm(base64, sampleRate, cache) {
     if (!base64) return null;
     var ctx = ensureAudio();
     if (!ctx) return null;
@@ -858,8 +859,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         if (index >= 0) state.pcmSources.splice(index, 1);
         if (state.audioCtx && state.pcmNextTime <= state.audioCtx.currentTime + 0.05) state.highlightLock = false;
       };
-      // 重读缓存（本轮完整 PCM）
-      state.turnPcm.push(samples);
+      // 重读缓存（本轮完整 PCM）；试听音频不进缓存（否则下次「重读」会念成试听句）。
+      if (cache !== false) state.turnPcm.push(samples);
       return { startAt: startAt, duration: buffer.duration };
     } catch (e) { /* 解码失败：本条只显示文字 */ }
     return null;
@@ -937,7 +938,13 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       return true;
     } catch (e) { return false; }
   }
-  /** 试听按钮：先解锁，有本轮缓存就重播，没有就响提示音。 */
+  /**
+   * 试听按钮：先解锁音频。
+   *   1) 本轮已有缓存音频 → 重播缓存（现状不变）；
+   *   2) 没有缓存 → 发 tts.sample 让宿主念一句示例，走与正式朗读完全同一条链路
+   *      （edge-tts 云健 → 失败按原规则回退）。旧实现这里只会响 0.6 秒嘟声，
+   *      用户以为坏了——嘟声降级为「合成彻底失败」时的兜底提示。
+   */
   function audioTest() {
     var hint = $('audioTestHint');
     var setHint = function (text) { if (hint) hint.textContent = text; };
@@ -947,12 +954,36 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       if (audioRunning(ctx)) hideAudioWarn();
       if (!audioRunning(ctx)) { showAudioWarn(); setHint('无音频（点我先）：浏览器还没解锁，先点一下屏幕'); return; }
       if (state.turnPcm.length > 0 && replayPcm()) { setHint('已播放本轮缓存音频'); return; }
-      if (playBeep()) { setHint('已播放提示音（0.6 秒 440Hz）'); return; }
-      setHint('无音频（点我先）：播放失败，点一下屏幕再试');
+      state.samplePending = true;
+      setHint('正在合成试听语音（edge-tts 云健）…');
+      send('tts.sample', {});
+      clearTimeout(state.sampleTimer);
+      // 兜底：合成彻底失败/宿主没回音时，嘟一声 + 明说失败（不静默）。
+      state.sampleTimer = setTimeout(function () {
+        if (!state.samplePending) return;
+        state.samplePending = false;
+        var beeped = playBeep();
+        setHint(beeped ? '试听失败：已改用提示音（原因看事件区红字）' : '试听失败：合成没有返回（看事件区红字）');
+        addEvent('alert', '错误：试听语音没有返回（宿主 TTS 没响应该请求）');
+      }, 15000);
     };
     var task = resumeAudio();
     if (task && typeof task.then === 'function') task.then(run, run);
     else run();
+  }
+  /** 收到试听音频：播放 + 明确回执；试听 PCM 不进本轮朗读缓存。 */
+  function playSampleAudio(base64, sampleRate) {
+    state.samplePending = false;
+    clearTimeout(state.sampleTimer);
+    var played = playPcm(base64, sampleRate, false);
+    var hint = $('audioTestHint');
+    if (played) {
+      if (hint) hint.textContent = '已播放试听语音';
+      addEvent('progress', '试听：已播放试听语音');
+      return;
+    }
+    if (hint) hint.textContent = '试听失败：播放被浏览器拦了，点一下屏幕再试';
+    addEvent('alert', '试听失败：播放被浏览器拦了（先点一下屏幕解锁音频）');
   }
   /* 一次性解锁：第一次真实手势里 resume，并撤掉「点一下启用声音」横幅。 */
   (function installUnlock() {
@@ -1124,6 +1155,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         break;
       }
       case 'tts.audio': {
+        // 试听音频：只播、不推进高亮、不进本轮朗读缓存（试听不算一轮回复）。
+        if (payload.sample === true) {
+          resumeAudio();
+          playSampleAudio(String(payload.data || ''), Number(payload.sampleRate) || 24000);
+          break;
+        }
         var audioIndex = typeof payload.index === 'number' ? payload.index : 0;
         var isNewSegment = !state.ttsAudioSeen[audioIndex];
         state.ttsAudioSeen[audioIndex] = true;
@@ -1161,6 +1198,14 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
           // 宿主已经明确报错（转写失败/帧被拒），不再让 15 秒超时重复提示。
           state.audioPending = false;
           clearTimeout(state.audioTimer);
+        }
+        // 试听合成彻底失败：宿主已发红告警，这里补一声提示音并改提示文案（不静默）。
+        if (payload.level === 'error' && String(payload.text || '').indexOf('试听') === 0 && state.samplePending) {
+          state.samplePending = false;
+          clearTimeout(state.sampleTimer);
+          var sampleHint = $('audioTestHint');
+          var beeped = playBeep();
+          if (sampleHint) sampleHint.textContent = beeped ? '试听失败：已改用提示音（原因见事件区红字）' : '试听失败：看事件区红字';
         }
         // 本地 TTS 失败：立刻把所有待念文本交给系统语音，别让用户等 4 秒兜底。
         addEvent('alert', (payload.level === 'error' ? '错误：' : '') + (payload.text || ''));
@@ -1421,10 +1466,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     stopPcm();
     addEvent('progress', '已停止朗读');
   };
-  /* 试听：先解锁音频；有本轮缓存重播，没有就响提示音（不出声时点它最直接）。 */
+  /* 试听：先解锁音频；有本轮缓存重播，否则请宿主念一句示例（嘟声只在合成失败时出现）。 */
   $('audioTest').onclick = function () {
     audioTest();
-    addEvent('progress', '试听：检查音频通路');
+    addEvent('progress', '试听：准备示例语音');
   };
 
   /* ---------- 音色：选择 / 上传参考音频 ---------- */

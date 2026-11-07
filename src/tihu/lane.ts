@@ -71,11 +71,17 @@ import { replyWindow, splitReplySentences, splitSpeechSegments, type ReplySenten
 import { stripToolNoise, toSpeechText } from './speech-text.ts'
 import { CONTENT_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
 import { groupProjects, humanTitle, projectNameOf, type ProjectReply } from './project-groups.ts'
-import type { TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
+import type { AlertPayload, TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
 
 /** 页面与 WebSocket 的路径（代理侧按这两个前缀放行）。 */
 export const TIHU_PAGE_PATH = '/tihu'
 export const TIHU_LANE_PATH = '/tihu/lane'
+
+/**
+ * 试听默认示例语句（页面 `tts.sample` 不带 text 时用）。
+ * 选一句自报家门的话：用户点「试听」听到的是真人的声音，而不是一声嘟。
+ */
+const TIHU_SAMPLE_TEXT = '试听：我是云健，声音正常吗？'
 
 /** 单条 WS 文本帧上限（协议层还有更细的限制）。 */
 const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024
@@ -1845,6 +1851,54 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         void tts.ensureServer().catch((error) => log(`tihu tts clone prewarm failed: ${(error as Error)?.message ?? String(error)}`))
       }
       device.send('event.progress', { stage: '音色', text: `音色已切换：${device.voice}` } satisfies ProgressPayload)
+      return
+    }
+    if (type === 'tts.sample') {
+      /**
+       * 试听：走与正式朗读**完全相同**的链路（edge-tts 云健 → 失败按原规则回退本地
+       * Qwen），只是不发 tts.text、不动屏、不占朗读队列与回主页守门——试听不算一轮
+       * 回复。页面收到带 `sample: true` 的 tts.audio 就播，且不写进本轮朗读缓存。
+       * 合成彻底失败：红告警 + 明确告诉页面可以退到提示音（绝不静默）。
+       */
+      const requested = typeof message.payload?.text === 'string' ? message.payload.text.trim() : ''
+      const sampleText = requested === '' ? TIHU_SAMPLE_TEXT : [...requested].slice(0, 60).join('')
+      if (!tts.available()) {
+        device.send('event.alert', {
+          level: 'error',
+          text: `试听无语音：${tts.status().error ?? '本地引擎未就绪'}（已改用提示音）`,
+        } satisfies AlertPayload)
+        return
+      }
+      if ((device.voice && device.voice !== 'default') || device.offlineOnly) {
+        try { await tts.ensureServer() } catch { /* 合成阶段会给出可读错误 */ }
+      }
+      try {
+        const result = await tts.synthesize(sampleText, {
+          voice: device.voice,
+          sessionId: device.sessionId,
+          edgeVoice: device.edgeVoice,
+          offlineOnly: device.offlineOnly,
+          onChunk: (chunk) => {
+            device.send('tts.audio', {
+              seq: chunk.seq,
+              total: chunk.total,
+              sampleRate: 24000,
+              channels: 1,
+              format: 'pcm16',
+              data: chunk.data.toString('base64'),
+              index: 0,
+              text: sampleText,
+              sample: true,
+              ...(chunk.final ? { final: true } : {}),
+            } satisfies TtsAudioPayload)
+          },
+        })
+        log(`tihu tts sample ok chars=${[...sampleText].length} voice=${device.voice} audio=${Math.round(Number(result?.audioMs) || 0)}ms`)
+      } catch (error) {
+        const reason = (error as Error)?.message ?? String(error)
+        log(`tihu tts sample failed: ${reason}`)
+        device.send('event.alert', { level: 'error', text: `试听无语音：${reason}（已改用提示音）` } satisfies AlertPayload)
+      }
       return
     }
     if (type === 'voice.create') {
