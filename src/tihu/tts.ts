@@ -30,6 +30,59 @@ import type { VoiceInfo } from './protocol.ts'
 const DEFAULT_PORT = 8731
 const HEALTH_TIMEOUT_MS = 180_000
 
+/**
+ * edge-tts 首块门限（默认 8000ms，`TIHU_EDGE_FIRST_MS` 可调）。
+ *
+ * 2026-11-07 断音根因（现场实测，见 `C:\Users\Administrator\.dsh\repro\tihu-tts-cut\`）：
+ *   - 4 路并发首块 2263–3317ms，8 路并发开始有段被杀；
+ *   - **12 路并发（=3 个 /tihu 标签页 × 4 段并发）8/12 段被 3500ms 门限杀掉，
+ *     返回 0 字节**（probe-edge.mjs burst 12：`first=-1ms audio=0ms kills=firstTimer@3500ms`）；
+ *   - 被杀之后落本地 Qwen，本机 CPU 首包实测 **54485ms**（probe-qwen.mjs），等于直接丢掉这一句。
+ * 3500ms 只比正常首块（2.2–3.3s）高 200ms，任何抖动都会误杀；这里按实测 p99 的 2.4 倍取 8s，
+ * 并且首块超时**先重试一次 edge**（见 synthesize），仍失败才落本地兜底。
+ */
+const EDGE_FIRST_MS_DEFAULT = 8_000
+const EDGE_FIRST_MS_MIN = 3_000
+const EDGE_FIRST_MS_MAX = 60_000
+
+/** 环境变量整数化 + 夹到区间（非数字一律回落兜底值；0/负数按区间下限算）。 */
+function clampMs(raw: unknown, min: number, max: number, fallback: number): number {
+  const value = Number(raw)
+  if (raw === undefined || raw === '' || !Number.isFinite(value)) return fallback
+  return Math.max(min, Math.min(max, Math.round(value)))
+}
+
+/** edge-tts 首块门限（毫秒）。 */
+export function edgeFirstChunkMs(): number {
+  return clampMs(process.env.TIHU_EDGE_FIRST_MS, EDGE_FIRST_MS_MIN, EDGE_FIRST_MS_MAX, EDGE_FIRST_MS_DEFAULT)
+}
+
+/**
+ * 默认音色在 CPU 上跑 Qwen 时**不再当兜底**。
+ *
+ * 实测（probe-qwen.mjs，单请求无并发）：CPU sidecar 首包 54485ms、整段 5.1s 音频；
+ * 而 `synthesize()` 给默认音色只给 4500ms 就 abort —— 必然失败、白烧 4.5s，
+ * 还让 lane 的按句 flush 卡住后面的段（用户听到的就是「念一句之后没了」）。
+ * 所以默认音色 + CPU：快速失败并说明原因（要启用请显式设 `TIHU_TTS_CPU_FALLBACK=1`）。
+ * 克隆音色（wantsClone）只有本地引擎，永远放行。
+ */
+export function cpuFallbackBlocked(wantsClone: boolean, backend: string): boolean {
+  if (wantsClone) return false
+  if (backend !== 'cpu') return false
+  return process.env.TIHU_TTS_CPU_FALLBACK !== '1'
+}
+
+/**
+ * 本地兜底**单独**的首包中止门限（毫秒，0 = 不单独中止，交给 `firstChunkBudget`）。
+ * CPU 跑 Qwen 时首包实测 8.75s–54.5s（tts-server.log / probe-qwen），4500ms 只会把每一次
+ * 兜底都变成一次空等；CPU 一律不设单独中止，GPU/Q4 保持原来的 4500ms 快速回落。
+ */
+export function localFallbackAbortMs(wantsClone: boolean, backend: string): number {
+  if (wantsClone) return 0
+  if (backend === 'cpu' || backend === 'q4') return 0
+  return 4_500
+}
+
 export interface TihuTtsPaths {
   root: string
   bin: string
@@ -391,18 +444,24 @@ export class TihuTts {
     let chunks = 0
     let bytes = 0
     let firstAt = 0
-    const abort = (reason: string) => {
-      try { py.kill() } catch { /* 忽略 */ }
-      try { ff.kill() } catch { /* 忽略 */ }
-      throw new Error(reason)
-    }
+    /** 外部取消（换绑/被更新的一轮取代）：只杀进程并记账，**不在事件回调里 throw**——
+     *  AbortSignal 的监听器抛错会变成 process 级未捕获异常（实测直接崩测试进程）。 */
+    let abortedBySignal = false
     const signal = options?.signal
-    const onAbort = () => abort('edge-tts aborted')
-    signal?.addEventListener('abort', onAbort, { once: true })
-    const firstTimer = setTimeout(() => {
+    const onAbort = (): void => {
+      abortedBySignal = true
       try { py.kill() } catch { /* 忽略 */ }
       try { ff.kill() } catch { /* 忽略 */ }
-    }, 3500)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    // 首块门限：见 edgeFirstChunkMs() 的实测依据（12 路并发 p99 3.3s，8s 留 2.4 倍余量）。
+    const firstBudgetMs = edgeFirstChunkMs()
+    let firstKilled = false
+    const firstTimer = setTimeout(() => {
+      firstKilled = true
+      try { py.kill() } catch { /* 忽略 */ }
+      try { ff.kill() } catch { /* 忽略 */ }
+    }, firstBudgetMs)
     try {
       await new Promise<void>((resolve, reject) => {
         const done = () => resolve()
@@ -421,7 +480,12 @@ export class TihuTts {
         })
       })
       const tail = chunker.finish()
-      if (firstAt === 0 && tail.length === 0) throw new Error(`edge-tts 没有返回音频：${stderr.split('\n').filter(Boolean).slice(-2).join(' ').slice(0, 200)}`)
+      if (abortedBySignal) throw new Error('edge-tts 已取消（本轮朗读被换绑/更新的一轮取代）')
+      if (firstAt === 0 && tail.length === 0) {
+        // 首块超时单独成一种错：synthesize 只对这种情况重试 edge（别把 403 也白等两轮）。
+        if (firstKilled) throw new Error(`edge-tts 首块超时（${firstBudgetMs}ms 未返回音频）`)
+        throw new Error(`edge-tts 没有返回音频：${stderr.split('\n').filter(Boolean).slice(-2).join(' ').slice(0, 200)}`)
+      }
       for (const block of tail) {
         options.onChunk({ data: block.data, seq: chunks, total: chunks + 1, final: block.final })
         chunks += 1
@@ -466,24 +530,38 @@ export class TihuTts {
     // 默认在线云健（不是克隆音色、且未开仅离线）：首块最快、音质最好。
     if (!wantsClone && !offline && this.edgeReady()) {
       triedEdge = true
-      try {
-        const result = await this.synthesizeEdge(text, { ...options, edgeVoice: options.edgeVoice })
-        this.setEngine('edge')
-        return result
-      } catch (error) {
-        primaryError = (error as Error)?.message ?? String(error)
-        edgeError = primaryError
-        this.log(`edge-tts failed: ${primaryError}`)
+      // 首块超时重试一次 edge：本地兜底在 CPU 上首包 8–54s，换引擎等于丢掉这一句。
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const result = await this.synthesizeEdge(text, { ...options, edgeVoice: options.edgeVoice })
+          this.setEngine('edge')
+          return result
+        } catch (error) {
+          primaryError = (error as Error)?.message ?? String(error)
+          edgeError = primaryError
+          const firstChunkTimeout = primaryError.includes('首块超时')
+          const willRetry = firstChunkTimeout && attempt === 0
+          this.log(`edge-tts failed${willRetry ? '（首块超时，重试一次 edge）' : ''}: ${primaryError}`)
+          if (!willRetry) break
+        }
       }
     }
 
     // 本地 Qwen：克隆音色必走；在线失败/仅离线时也走；失败则无语音。
     const backend = this.backend()
-    if (backend !== 'none') {
+    if (backend !== 'none' && cpuFallbackBlocked(wantsClone, backend)) {
+      // 快速失败 + 说清原因：不让每一段都空等行业已成空等的本地兜底（CPU 首包 54s）。
+      const reason = '本地 Qwen 跑在 CPU（实测首包 8–54s），已不再作为默认音色的兜底；要用请设 TIHU_TTS_CPU_FALLBACK=1'
+      primaryError = reason
+      this.lastError = reason
+      this.log(`tts local fallback skipped: ${reason}`)
+    } else if (backend !== 'none') {
       try {
-        // 在线失败/仅离线走本地时，Qwen 首包 >4.5s 就放弃，避免页面干等。
+        // 在线失败/仅离线走本地时：GPU/Q4 首包 >4.5s 就放弃，避免页面干等；
+        // CPU 见 localFallbackAbortMs()（实测首包 54s，这里不再单独中止）。
         const controller = new AbortController()
-        const timer = wantsClone ? null : setTimeout(() => controller.abort(), 4500)
+        const abortMs = localFallbackAbortMs(wantsClone, backend)
+        const timer = abortMs > 0 ? setTimeout(() => controller.abort(), abortMs) : null
         try {
           const result = await this.synthesizeCodec(text, { ...options, signal: options.signal ?? controller.signal })
           this.setEngine('gpu')
@@ -532,7 +610,7 @@ export class TihuTts {
     const controller = new AbortController()
     const onAbort = () => controller.abort()
     options.signal?.addEventListener('abort', onAbort, { once: true })
-    const firstChunkBudget = this.backend() === 'q4' ? 60_000 : 45_000
+    const firstChunkBudget = this.backend() === 'q4' || this.backend() === 'cpu' ? 60_000 : 45_000
     const firstTimer = setTimeout(() => controller.abort(), firstChunkBudget)
     let firstChunkAt = 0
     let bytes = 0

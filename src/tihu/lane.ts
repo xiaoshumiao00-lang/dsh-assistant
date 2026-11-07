@@ -300,6 +300,15 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   /** 设备 id → 是否在浏览历史（回主页守门按设备算，避免多设备互相卡住）。 */
   const followByDevice = new Map<string, boolean>()
   /**
+   * 「设备 | 会话」→ 朗读轮次号。
+   *
+   * 2026-11-07 断音根因之二：一个 turn 里每条 `assistant/message` 都会从头开一轮朗读，
+   * 而旧实现**不取消上一轮**——两轮的合成同时跑（实测 26 次合成、页面收到两遍 index 0..11），
+   * 页面按到达顺序把两轮 PCM 串起来播，听感就是「念一句然后乱掉/断掉」。
+   * 新的一轮开始前先把自己的前辈掐掉（`device.cancelRound()`），并用轮次号做兜底判定。
+   */
+  const speakRounds = new Map<string, number>()
+  /**
    * 运行中的 turn 跟踪：sessionId → turn/start 时间戳。
    * 2026-11-07 新需求：只要**任何** CU 会话有 turn 在跑，屏幕就必须停在会话详情，
    * 不允许回主页控制室；只有所有会话都停了才允许回主页。
@@ -1102,6 +1111,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
   async function speakLocally(device: TihuDevice, sessionId: string, sentences: ReplySentence[], speechSegments: SpeechSegment[], includeAll: boolean): Promise<void> {
     if (speechSegments.length === 0) return
+    /**
+     * 新的一轮开始前，先把这台设备上还在跑的那一轮掐掉（同一会话连续两条 assistant/message
+     * 是真实会发生的：每个 settled 的 step 都是一条）。不掐的话两轮并读、页面收到两遍 index。
+     */
+    const roundKey = `${device.id}|${sessionId}`
+    const roundToken = (speakRounds.get(roundKey) ?? 0) + 1
+    speakRounds.set(roundKey, roundToken)
+    const isCurrentRound = (): boolean => speakRounds.get(roundKey) === roundToken
+    const previousCancel = device.cancelRound
+    if (previousCancel !== undefined) {
+      log(`tihu tts cancel previous round device=${device.id} session=${sessionId}`)
+      try { previousCancel() } catch { /* 忽略：旧轮自己的清理逻辑不该影响新一轮 */ }
+    }
     // 默认走 edge 云健，不必为每句唤醒 GPU；只有克隆音色或仅离线才需要本地 Qwen。
     if ((device.voice && device.voice !== 'default') || device.offlineOnly) await tts.ensureServer()
     const status = tts.status()
@@ -1158,9 +1180,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     const flushed = new Set<number>()
     /** 整轮放弃后不再下发任何音频（否则后半段 PCM 还会冒出来，而屏已经停在别处）。 */
     let aborted = false
+    /** 首段就失败（本轮彻底没有可念的内容）：停发，但**不是**用户/换绑取消，必须照常报错。 */
+    let roundFailed = false
+    /** 这一轮是否还作数：被掐掉（换绑/断开/被更新的一轮取代）才为真。 */
+    const roundDead = (): boolean => aborted || !isCurrentRound()
     let flushIndex = 0
     const flushAudio = (): void => {
-      if (aborted) {
+      if (roundDead() || roundFailed) {
         for (const queue of audioBuffers) queue.length = 0
         return
       }
@@ -1174,15 +1200,59 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         break
       }
     }
+    /** 本轮的取消信号：被新的一轮/换绑/断开取代时一起 abort 在途合成。 */
+    const roundAbort = new AbortController()
+    /**
+     * 段内停顿看门狗（2026-11-07 断音根因之三）。
+     *
+     * edge 几乎不流式（首块≈整段），所以「已经开始吐块、却 1.2s 没有下一块」= 这条流断了。
+     * 旧实现只会干等，而 tts.audio 必须按句序 flush —— 卡住的那一段把后面已经合成好的段
+     * 全压住，页面就在念完上一句后整轮静音（现场实测：单段卡 12s → 6.9s 静音缝）。
+     * 现在：超时就用手上已有的音频收尾、丢弃这条流的剩余块，并把 flushIndex 往前推，
+     * 同时在事件区说一句「第 k 句音频中断」，绝不悄悄静音。
+     */
+    const stallMs = clampInt(Number(process.env.TIHU_SYNTH_STALL_MS ?? 1_200), 500, 10_000)
+    const stalled = new Set<number>()
+    const stallTimers = new Map<number, ReturnType<typeof setTimeout>>()
+    const pushedBytes: number[] = speechSegments.map(() => 0)
+    /** results 在 try 里才存在，用这个钩子把「卡住即收尾」回填进去。 */
+    const stalledHook = { onStall: (_index: number): void => {} }
+    const clearStall = (index: number): void => {
+      const timer = stallTimers.get(index)
+      if (timer !== undefined) clearTimeout(timer)
+      stallTimers.delete(index)
+    }
+    const armStall = (index: number): void => {
+      clearStall(index)
+      stallTimers.set(index, setTimeout(() => {
+        stallTimers.delete(index)
+        if (roundDead() || flushed.has(index)) return
+        const audioMs = Math.round((pushedBytes[index] / 2 / 24000) * 1000)
+        stalled.add(index)
+        flushed.add(index)
+        log(`tihu tts stall session=${sessionId} index=${index}/${speechSegments.length} audio=${audioMs}ms`)
+        device.send('event.progress', {
+          stage: 'tts',
+          text: `第 ${index + 1}/${speechSegments.length} 句音频中断（已收 ${(audioMs / 1000).toFixed(1)}s），跳过剩余部分`,
+        } satisfies ProgressPayload)
+        stalledHook.onStall(index)
+        flushAudio()
+      }, stallMs))
+    }
     const synthAttempt = (segment: SpeechSegment, segmentIndex: number, onFirstChunk: () => void): Promise<SynthResult> =>
       tts.synthesize(segment.text, {
         voice,
         sessionId,
         edgeVoice: device.edgeVoice,
         offlineOnly: device.offlineOnly,
+        signal: roundAbort.signal,
         onChunk: (chunk) => {
-          if (aborted) return
+          if (roundDead() || roundFailed) return
+          // 这一段已经按「卡住」收尾：后来迟到的块必须丢掉，不能补进已翻过去的句序里。
+          if (stalled.has(segmentIndex)) return
           onFirstChunk()
+          pushedBytes[segmentIndex] += chunk.data.length
+          armStall(segmentIndex)
           audioBuffers[segmentIndex].push({
             seq: chunk.seq,
             total: chunk.total,
@@ -1204,9 +1274,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       )
 
     speakingStart(sessionId)
-    // 换绑/断开时要把这一轮掐掉：否则屏已经切到别的会话，旧会话的 PCM 还在往同一台设备发
-    //（2026-11-07 审计 P1-10）。
-    const cancelRound = (): void => { aborted = true }
+    // 换绑/断开/被更新的一轮取代时要把这一轮掐掉：否则屏已经切到别的会话，旧会话的 PCM
+    // 还在往同一台设备发（2026-11-07 审计 P1-10）；顺手 abort 在途合成，别让 edge 白跑。
+    const cancelRound = (): void => {
+      aborted = true
+      try { roundAbort.abort() } catch { /* 忽略 */ }
+    }
     device.cancelRound = cancelRound
     try {
       const results = new Array<SynthResult | undefined>(speechSegments.length).fill(undefined)
@@ -1231,13 +1304,22 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       const firstChunkAt: number[] = speechSegments.map(() => 0)
       /** 已合成段的实际音频时长（用于估「在途合成还能产出多少音频」）。 */
       const audioMsList: number[] = []
+      /**
+       * 卡住的那一段按「已收到的音频」收尾：让 pump 立刻往下走（屏帧/高亮跟上），
+       * 而不是干等 12s 让整条句序停在那儿。
+       */
+      stalledHook.onStall = (index: number): void => {
+        if (results[index] !== undefined) return
+        results[index] = { ok: true, audioMs: Math.round((pushedBytes[index] / 2 / 24000) * 1000) }
+        notify()
+      }
 
       /** 合成一段；失败重试一次（只在这一段还没吐出过任何音频时才重试，避免重复发声）。 */
       const runSegment = async (index: number): Promise<SynthResult> => {
         const segment = speechSegments[index]
         let last: SynthResult = { ok: false, error: new Error('未开始合成') }
         for (let attempt = 0; attempt < 2; attempt += 1) {
-          if (aborted) break
+          if (roundDead()) break
           last = await synthAttempt(segment, index, () => {
             if (firstChunkAt[index] === 0) firstChunkAt[index] = Date.now()
             notify()
@@ -1246,6 +1328,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           if (audioBuffers[index].length > 0) break
           if (attempt === 0) log(`tihu tts retry session=${sessionId} index=${index}: ${errorText(last.error)}`)
         }
+        clearStall(index)
         // 这一段结束了（成功或最终失败）都要标记，flushIndex 才能继续往前推进。
         flushed.add(index)
         flushAudio()
@@ -1283,20 +1366,38 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       // 按句顺序消费结果：合成本身并发，但**推进屏帧的时机**严格按播放时间轴——
       // 预取让合成远早于播放，若照合成完成推进，文字/高亮会跑到语音前面。
       const frames: Promise<void>[] = []
+      /**
+       * 头段等很久都没音频时（edge 抖动/重试），给用户一句人话进度，别让页面看起来像卡死。
+       * 阈值 `TIHU_SYNTH_HEAD_WARN_MS`，默认 4s（正常首块 2.2–3.3s）。
+       */
+      const headWarnMs = clampInt(Number(process.env.TIHU_SYNTH_HEAD_WARN_MS ?? 4_000), 1_000, 60_000)
       const pump = (async () => {
         for (let index = 0; index < speechSegments.length; index += 1) {
           fill()
+          const waitFrom = Date.now()
+          let warnedWait = false
           while (results[index] === undefined && firstError === undefined) {
+            if (roundDead()) break
             fill()
+            if (!warnedWait && Date.now() - waitFrom >= headWarnMs) {
+              warnedWait = true
+              const seconds = Math.max(1, Math.round((Date.now() - waitFrom) / 1000))
+              device.send('event.progress', {
+                stage: 'tts',
+                text: `第 ${index + 1}/${speechSegments.length} 句合成较慢，正在等音频（已 ${seconds}s）`,
+              } satisfies ProgressPayload)
+            }
             if (results[index] !== undefined || firstError !== undefined) break
             await waitForChange(generation)
           }
+          // 这一轮被掐掉（换绑/断开/被更新的一轮取代）：立刻停手，不报错、不再发帧。
+          if (roundDead()) break
           if (firstError !== undefined) break
           const result = results[index] as SynthResult
           if (!result.ok) {
             if (index === 0) {
               // 第一段就失败了：没有可念的内容，整轮按失败处理（沿用「本次无语音」告警）。
-              aborted = true
+              roundFailed = true
               firstError = result.error
               break
             }
@@ -1334,9 +1435,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
       // 出错时：等已启动的合成跑完发完（音频顺序不能乱），再把第一处错误抛给现有 catch。
       await Promise.all([pump, ...inFlight])
-      if (firstError !== undefined) throw firstError
+      // 被更新的一轮取代：安静收场（新一轮已经在念了，这里再报错就是假告警）。
+      if (!roundDead() && firstError !== undefined) throw firstError
       // 等所有屏帧按播放时刻发完，再等最后一段音频播完——否则屏会先跳「念完」/回主页。
       await Promise.all(frames)
+      if (roundDead()) return
       const tailMs = playbackEndAt.value - Date.now()
       if (tailMs > 0) await new Promise<void>((resolve) => { setTimeout(resolve, tailMs) })
       // 念完停在最后一屏（最后一帧）。
@@ -1346,9 +1449,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     } catch (error) {
       const message = errorText(error)
       log(`tihu tts failed session=${sessionId} voice=${voice}: ${message}`)
-      device.send('event.alert', { level: 'error', text: `本次无语音：在线兜底不可用且本地引擎未就绪（原因：${message}）` })
+      if (!roundDead()) {
+        device.send('event.alert', { level: 'error', text: `本次无语音：在线兜底不可用且本地引擎未就绪（原因：${message}）` })
+      }
       setTimeout(() => scheduleHome(sessionId), 50)
     } finally {
+      for (const index of stallTimers.keys()) clearStall(index)
+      if (speakRounds.get(roundKey) === roundToken) speakRounds.delete(roundKey)
       if (device.cancelRound === cancelRound) device.cancelRound = undefined
       // 已经下发的音频还在播：这段时间算「朗读中」，回主页要等它播完。
       speakingStop(sessionId, playbackEndAt.value + SPEAK_TAIL_MARGIN_MS)
