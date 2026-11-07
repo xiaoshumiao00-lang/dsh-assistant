@@ -34,6 +34,8 @@
 
 【2026-11-07 追加：页面上传 WAV 后没有转写回音（只改了一行：WS 分片重组）】真实公网页面（无痕 Chrome）上传 5.6s WAV：页面显示「已上行」，之后 30 秒无 transcript、无 screen.frame、无报错。用 `scripts/tihu-voice-e2e.mjs` 对同一公网入口跑同一段 WAV → **2.4 秒拿到 transcript 并注入成功**，说明 lane 的音频分支没问题，问题在页面发帧/宿主收帧。抓浏览器实际发出的 WS 帧发现：**Chrome 把 239,799 字节的 audio.frame 拆成了 FIN=0 起始帧(130,631B) + continuation 帧**；`WsFrameParser` 只认 opcode=1 单帧、忽略 continuation，于是第一片被当坏 JSON 静默丢弃 → 页面永远等不到回音。修法：`WsFrameParser` 实现 RFC 6455 §5.4 分片重组（起始帧 + continuation + 总大小上限），对整条 pocket 链路生效。另加三道兜底：①大帧解析失败/`audio.frame` 被拒时回 `event.alert(error)`，不再静默；②自动跟随后台化（5 秒上限）且单条上行 60 秒看门狗，任何一步卡住都不再堵死后续消息；③页面 15 秒无 transcript 报「转写超时」，WS 断开明确提示并 2 秒重连。`scripts/test-tihu-protocol.mjs` 39 → 41 项（含分片重组单测 + 分片 audio.frame 端到端）。实测（公网 + 真文件上传）：09:53:55「已上行」→ 09:53:56「已收到音频」→ 转写「对我做了介绍啊，那么我想说的是呢，大家如果对我的研究感兴趣呢。」→ 注入第 5 轮 → 屏帧「思考/模型处理中」，全程约 1–2 秒。
 
+【2026-11-07 追加：朗读只念几句就没了】两处叠加：①`toTtsSegments()` 上限 4 段 × 80 字，**320 字以后直接丢弃**；②页面每收到一条 `tts.text` 就 `speechSynthesis.cancel()` 再 speak，多段几乎同时到达 → 只剩最后一段。现在：`toTtsSegments(text, perSegment=80)` **不限段数**、按句切完全部文本（无标点长句按 80 字硬切，不丢字），`index/total` 按完整数组下发；页面新增朗读队列 `createTtsQueue`（`src/tihu/tts-queue.ts`，同一份源码注入页面并单测）：顺序播放、段间 200ms、**收到新段不 cancel**；只有「新一轮回复 / 停止朗读 / 重读一遍」才清队列；`onend` 按文本长度 ×1.5+2s 兜底强制推进；队列上限 200 段。「重读一遍」改为重播本轮全文（拼接缓存），新增「停止朗读」按钮（立即 cancel + 清队列 + 事件区记「已停止朗读」）。`scripts/test-tihu-protocol.mjs` 41 → 47 项。
+
 ## [0.2.17] - 2026-11-06
 
 📺 平板 / 电视（宽屏、矮视口）专项：控制室卡片不再挤成 4 列被裁，抽屉里点得到会话

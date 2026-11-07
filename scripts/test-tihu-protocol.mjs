@@ -41,6 +41,7 @@ import {
   targetPathOf,
 } from '../src/tihu/guard.ts'
 import { createTihuRuntime, buildTihuUserMessage, TIHU_LANE_PATH, TIHU_PAGE_PATH } from '../src/tihu/lane.ts'
+import { TTS_QUEUE_SOURCE } from '../src/tihu/tts-queue.ts'
 import { WsFrameParser, encodeFrame } from '../src/pocket-host/ws-deflate.mjs'
 
 let passed = 0
@@ -200,10 +201,132 @@ test('日志摘要不打印音频原文', () => {
 test('屏帧要点行与 TTS 分段有上限', () => {
   const bullets = toBullets('第一句。第二句！第三句？第四句；第五句。第六句。', 4, 20)
   assert.ok(bullets.length <= 4)
-  const long = '这是一个非常长的句子'.repeat(30)
-  const segments = toTtsSegments(long, 4, 80)
-  assert.ok(segments.length <= 4)
-  assert.ok(segments.every((s) => s.length <= 100))
+  const long = '这是一个非常长的句子'.repeat(150) // 1500 字、无标点
+  const segments = toTtsSegments(long, 80)
+  assert.ok(segments.length > 4, '1500 字不能只切 4 段')
+  assert.equal(segments.length, 19, '1500 / 80 → 19 段（18×80 + 60）')
+  assert.ok(segments.every((s) => s.length <= 80))
+  assert.equal(segments.join(''), long, '不能丢字')
+  assert.ok(segments[0].startsWith('这是一个非常长的句子'))
+  assert.ok(segments[segments.length - 1].endsWith('这是一个非常长的句子'))
+})
+
+test('toTtsSegments：1500 字带标点必须切出 >4 段、首尾都在、index/total 可连续', () => {
+  const sentence = '第一段内容比较长但还在八十个字以内，用来验证切分会按句号断开来保证朗读自然；'
+  const text = sentence.repeat(30).slice(0, 1500)
+  const segments = toTtsSegments(text)
+  assert.ok(segments.length > 4, `段数 ${segments.length} 应大于 4`)
+  assert.ok(segments[0].length > 0 && segments[segments.length - 1].length > 0)
+  assert.equal(segments.join(''), text.replace(/\s+/g, ' ').trim(), '首尾/中间都不能丢')
+  // index/total 就是数组下标：从 0 到 total-1 连续
+  const total = segments.length
+  segments.forEach((segment, index) => {
+    assert.equal(segment, segments[index])
+    assert.ok(index >= 0 && index < total)
+    assert.ok(segment.length <= 80, `第 ${index} 段 ${segment.length} 字超过 80`)
+  })
+})
+
+test('toTtsSegments：无标点超长单句仍硬切，不丢字', () => {
+  const text = '无'.repeat(300)
+  const segments = toTtsSegments(text)
+  assert.equal(segments.length, 4, '300 / 80 → 80+80+80+60')
+  assert.deepEqual(segments.map((s) => s.length), [80, 80, 80, 60])
+  assert.equal(segments.join(''), text)
+})
+
+/* ---------- 朗读队列（页面同一份源码） ---------- */
+
+console.log('[tihu] 朗读队列')
+
+function makeTtsQueue() {
+  const timers = new Map()
+  let nextTimer = 0
+  const spoken = []
+  const events = []
+  const state = { pendingDone: null, cancels: 0 }
+  const factory = new Function(TTS_QUEUE_SOURCE + '; return createTtsQueue;')()
+  const queue = factory({
+    speak(text, done) { spoken.push(text); state.pendingDone = done },
+    cancel() { state.cancels += 1; state.pendingDone = null },
+    setTimeout(fn, ms) { nextTimer += 1; timers.set(nextTimer, { fn, ms }); return nextTimer },
+    clearTimeout(id) { timers.delete(id) },
+    onEvent(kind, text) { events.push({ kind, text }) },
+  })
+  return {
+    queue,
+    spoken,
+    events,
+    timers,
+    cancels: () => state.cancels,
+    done() { const fn = state.pendingDone; state.pendingDone = null; if (fn) fn() },
+    runByMs(ms) {
+      for (const [id, timer] of [...timers]) {
+        if (timer.ms === ms) { timers.delete(id); timer.fn() }
+      }
+    },
+    pending() { return timers.size },
+  }
+}
+
+test('朗读队列：顺序播放、段间 200ms、清空/打断/重读', () => {
+  const h = makeTtsQueue()
+  h.queue.enqueue('第一段')
+  h.queue.enqueue('第二段')
+  h.queue.enqueue('第三段')
+  assert.deepEqual(h.spoken, ['第一段'], '只念第一段，其余排队（不是每段 cancel）')
+  h.done()
+  h.runByMs(200)
+  assert.deepEqual(h.spoken, ['第一段', '第二段'], 'onend 后 200ms 念第二段')
+  h.done()
+  h.runByMs(200)
+  assert.deepEqual(h.spoken, ['第一段', '第二段', '第三段'])
+  h.done()
+  h.runByMs(200)
+  assert.equal(h.queue.size(), 0)
+
+  // 停止朗读：立即 cancel + 清队列，迟到的 onend 不能再推进
+  h.queue.enqueue('A')
+  h.queue.enqueue('B')
+  assert.deepEqual(h.spoken.slice(-1), ['A'])
+  const before = h.spoken.length
+  h.queue.stop()
+  assert.equal(h.cancels(), 1)
+  assert.equal(h.queue.size(), 0)
+  h.done()
+  h.runByMs(200)
+  assert.equal(h.spoken.length, before, '停止后迟到的 onend 不应再念 B')
+
+  // 重读一遍：从第一段重新排队
+  h.queue.replay(['A', 'B'])
+  assert.equal(h.spoken.slice(-1)[0], 'A')
+  h.done()
+  h.runByMs(200)
+  assert.equal(h.spoken.slice(-1)[0], 'B')
+})
+
+test('朗读队列：onend 不回调时按文本长度超时推进', () => {
+  const h = makeTtsQueue()
+  h.queue.enqueue('一') // 1 字 → 估时下限 1000ms → 兜底 3500ms
+  assert.deepEqual(h.spoken, ['一'])
+  h.runByMs(3500) // 不调用 done，直接触发超时
+  assert.ok(h.events.some((event) => event.kind === 'timeout'))
+  h.runByMs(200)
+  assert.equal(h.queue.size(), 0)
+  h.queue.enqueue('下一段')
+  assert.equal(h.spoken.slice(-1)[0], '下一段', '超时后继续下一段')
+})
+
+test('朗读队列：上限 200 段、空文本忽略、新一轮清空', () => {
+  const h = makeTtsQueue()
+  h.queue.enqueue('')
+  assert.equal(h.queue.size(), 0)
+  for (let i = 0; i < 250; i += 1) h.queue.enqueue('第' + i + '段')
+  assert.equal(h.queue.size(), 200, '队列上限 200（第一段已在朗读，队列里 200）')
+  assert.ok(h.events.some((event) => event.kind === 'drop'))
+  h.queue.stop()
+  assert.equal(h.queue.size(), 0)
+  assert.ok(h.events.some((event) => event.kind === 'stop'))
 })
 
 /* ---------- 三道闸 ---------- */
@@ -977,7 +1100,28 @@ test('用户消息形状与 turn-guard 一致（进会话历史不会写坏日�
   })
 }
 
-/* ---------- 汇总 ---------- */
+await testAsync('lane：长回复的 TTS 段全部下发（不再丢 320 字以后），index/total 连续', async () => {
+  const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true, lastPromptAt: 1000 })])
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'tts', protocol: '0', sessionId: 'session-1' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
 
+  const text = '这是一段用于验证朗读完整性的长文本，'.repeat(60)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text }] } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  const frames = framesOf(socket).filter((frame) => frame.type === 'tts.text')
+  assert.ok(frames.length > 4, `应切出 >4 段，实际 ${frames.length}`)
+  assert.deepEqual(frames.map((frame) => frame.payload.index), [...Array(frames.length).keys()], 'index 从 0 连续')
+  assert.ok(frames.every((frame) => frame.payload.total === frames.length), 'total 必须一致')
+  assert.equal(frames.map((frame) => frame.payload.text).join(''), text.replace(/\s+/g, ' ').trim(), '不能丢字')
+  runtime.dispose()
+})
+
+/* ---------- 汇总 ---------- */
 console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
 if (failed > 0) process.exit(1)
