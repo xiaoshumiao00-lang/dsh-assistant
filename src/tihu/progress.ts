@@ -82,11 +82,45 @@ export function baseNameOf(path: string): string {
 }
 
 /** 一条工具调用 → 屏上的「动词 + 目标」+ 阶段 + 参数摘要。 */
+/** 动作翻译表：工具名 → { stage, title }（标题绝不裸显英文工具名）。 */
+const TOOL_ACTIONS: Record<string, { stage: TihuStage; title: string }> = {
+  screenshot: { stage: '搜索', title: '截图' },
+  wait: { stage: '等待确认', title: '等待' },
+  long_wait: { stage: '等待确认', title: '长等待' },
+  click: { stage: '跑命令', title: '点击' },
+  hotkey: { stage: '跑命令', title: '按键' },
+  scroll: { stage: '跑命令', title: '滚动' },
+  drag: { stage: '跑命令', title: '拖拽' },
+  input_text: { stage: '写文件', title: '输入文字' },
+  open_in_browser: { stage: '搜索', title: '打开网页' },
+  open_in_finder: { stage: '读文件', title: '打开文件/目录' },
+  open_app: { stage: '跑命令', title: '打开应用' },
+  list_apps: { stage: '搜索', title: '列出应用' },
+  code_agent: { stage: '思考', title: '派发后台任务' },
+  ask_user_question: { stage: '等待确认', title: '等待确认' },
+  skill: { stage: '思考', title: '加载技能' },
+  present: { stage: '回答', title: '展示结果' },
+  working_directory: { stage: '读文件', title: '切换目录' },
+  web_search: { stage: '搜索', title: '搜索' },
+  web_fetch: { stage: '搜索', title: '抓取网页' },
+}
+
+function describeToolAction(lower: string): { stage: TihuStage; title: string } | undefined {
+  if (TOOL_ACTIONS[lower] !== undefined) return TOOL_ACTIONS[lower]
+  if (lower.startsWith('mnemon_')) return { stage: '思考', title: '记忆操作' }
+  return undefined
+}
+
 export function describeTool(name: string, args: unknown): { stage: TihuStage; title: string; detail: string } {
   const tool = String(name ?? '').trim()
   const lower = tool.toLowerCase()
   const params = asRecord(args)
   const file = firstString(params, ['path', 'file_path', 'filePath', 'file', 'filename', 'target', 'target_file'])
+  const action = describeToolAction(lower)
+  if (action !== undefined) {
+    const detail = firstString(params, ['query', 'command', 'path', 'pattern', 'url', 'text', 'message', 'task', 'prompt', 'id'])
+    return { stage: action.stage, title: clipText(action.title, TIHU_TITLE_CHARS), detail: clipText(detail, TIHU_EVENT_CHARS) }
+  }
 
   const matched = (list: readonly string[]): boolean => list.some((item) => lower === item || lower.includes(item))
 
@@ -121,14 +155,22 @@ export function describeTool(name: string, args: unknown): { stage: TihuStage; t
   const detail = firstString(params, ['query', 'command', 'path', 'pattern', 'url', 'text', 'message', 'task', 'prompt', 'id'])
   return {
     stage: '思考',
-    title: clipText(tool || '工具调用', TIHU_TITLE_CHARS),
+    title: clipText(`执行 ${tool || '未知工具'}`, TIHU_TITLE_CHARS),
     detail: clipText(detail, TIHU_EVENT_CHARS),
   }
 }
 
 /** 工具结果 → 「✓/✗ 摘要」+ 输出尾行（都 ≤18 字）。 */
 export function summarizeToolResult(text: string, isError: boolean): { line: string; output: string } {
-  const lines = String(text ?? '').split(/\r?\n/).map((line) => sanitizeScreenLine(line)).filter(Boolean)
+  const lines = String(text ?? '').split(/\r?\n/).map((line) => sanitizeScreenLine(line)).filter((line) => {
+    if (line === '') return false
+    if (/^<[^>\s]+\/?>/.test(line)) return false
+    if (/^\[image omitted/i.test(line)) return false
+    if (/^\(sha256:/i.test(line)) return false
+    if (/^Normalized copy/i.test(line)) return false
+    if (/^(Coordinates remain|Waited \d|Clicked screen|Pressed hotkey|Opened https?|position \[)/i.test(line)) return false
+    return true
+  })
   const first = lines[0] ?? ''
   const last = lines.length > 0 ? lines[lines.length - 1] : ''
   const head = clipText(first, TIHU_LINE_CHARS - 2)
@@ -136,12 +178,12 @@ export function summarizeToolResult(text: string, isError: boolean): { line: str
   if (isError) {
     return {
       line: clipText(`✗ ${head || '执行失败'}`, TIHU_LINE_CHARS),
-      output: tail !== '' && tail !== head ? tail : '',
+      output: tail,
     }
   }
   return {
     line: clipText(`✓ ${head || '完成'}`, TIHU_LINE_CHARS),
-    output: tail !== '' && tail !== head ? tail : '',
+    output: tail,
   }
 }
 

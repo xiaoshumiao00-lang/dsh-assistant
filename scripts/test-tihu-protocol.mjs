@@ -53,7 +53,7 @@ import {
 } from '../src/tihu/progress.ts'
 import { ACTUAL_SIZE_SCALE, CONTENT_WIDTH_PX, SCREEN_SPEC, clipScreenTitle, fitLine, fitScreenLines, measureTextPx } from '../src/tihu/screen-spec.ts'
 import { fitViewport, replyViewport, replyWindow, splitReplySentences, splitSpeechSegments, wrapReplyLines } from '../src/tihu/reply.ts'
-import { toSpeechText } from '../src/tihu/speech-text.ts'
+import { stripToolNoise, toSpeechText } from '../src/tihu/speech-text.ts'
 import { groupProjects, humanTitle, projectNameOf } from '../src/tihu/project-groups.ts'
 import { Pcm16Chunker, TTS_CHUNK_BYTES, TTS_SAMPLE_RATE, validateReferenceWav } from '../src/tihu/audio.ts'
 import { normalizeVoiceName } from '../src/tihu/tts.ts'
@@ -1345,6 +1345,34 @@ await testAsync('lane：自动绑定成功仍回主页，只有回复才切 sess
   runtime.dispose()
 })
 
+
+test('朗读清洗：wait/screenshot/hotkey/XML/坐标/图片哈希一律不进 TTS', () => {
+  const raw = ['截图', '✓ Waited 60s. Coordinates remain 0-1000.', '<coordinate_space>0-1000</coordinate_space>', '<frontmost_app>Chrome</frontmost_app>', 'Pressed hotkey ctrl+alt+w', 'Clicked screen 0 at [500, 200]', '实际回复内容', '[image omitted...]', '(sha256:abcd1234)', 'Normalized copy (read-only...)'].join('\n')
+  const cleaned = toSpeechText(raw)
+  assert.equal(cleaned, '实际回复内容')
+  assert.equal(stripToolNoise('<coordinate_space>0-1000</coordinate_space>结果').trim(), '结果')
+})
+
+test('工具动作翻译表：不再裸显英文工具名', () => {
+  const names = {
+    screenshot: '截图', wait: '等待', long_wait: '长等待', click: '点击', hotkey: '按键',
+    scroll: '滚动', drag: '拖拽', input_text: '输入文字', open_in_browser: '打开网页',
+    open_in_finder: '打开文件/目录', open_app: '打开应用', list_apps: '列出应用',
+    code_agent: '派发后台任务', ask_user_question: '等待确认', skill: '加载技能',
+    mnemon_remember: '记忆操作', present: '展示结果', working_directory: '切换目录',
+    web_search: '搜索', web_fetch: '抓取网页',
+  }
+  for (const [tool, title] of Object.entries(names)) {
+    assert.equal(describeTool(tool, {}).title, title, `${tool} → ${title}`)
+  }
+  assert.equal(describeTool('unknown_thing', {}).title.startsWith('执行 '), true)
+})
+
+test('工具结果尾行：XML/image/sha256 元数据被过滤', () => {
+  const summary = summarizeToolResult('<coordinate_space>0-1000</coordinate_space>\n[image omitted...]\n(sha256:abcd1234)\n实际结果行', false)
+  assert.equal(summary.output, '实际结果行')
+})
+
 /* ---------- 屏幕进度映射 ---------- */
 
 console.log('[tihu] 屏幕进度映射')
@@ -1368,10 +1396,10 @@ test('工具名 → 人话标题（读取/写入/修改/搜索/执行/联网查�
   assert.ok(measureTextPx(shell.title, SCREEN_SPEC.titleFontPx) <= CONTENT_WIDTH_PX, '标题不超过 304px')
   const web = describeTool('web_search', { query: 'ESP32-S3-BOX-3' })
   assert.equal(web.stage, '搜索')
-  assert.equal(web.title, '联网查 ESP32-S3-BOX-3')
+  assert.equal(web.title, '搜索')
   const other = describeTool('computer_use', { task: '打开浏览器' })
   assert.equal(other.stage, '思考')
-  assert.equal(other.title, 'computer_use')
+  assert.equal(other.title, '执行 computer_use')
   // 超长参数截断且不出现半字
   const long = describeTool('pwsh', { command: 'x'.repeat(200) })
   assert.ok(measureTextPx(long.title, SCREEN_SPEC.titleFontPx) <= CONTENT_WIDTH_PX)

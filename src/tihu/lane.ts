@@ -68,7 +68,7 @@ import { tihuPageHtml } from './page.ts'
 import { applySessionEvent, confirmationFrame, createProgressState, type TihuProgressState } from './progress.ts'
 import { TihuTts, type TihuTtsPaths } from './tts.ts'
 import { replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
-import { toSpeechText } from './speech-text.ts'
+import { stripToolNoise, toSpeechText } from './speech-text.ts'
 import { CONTENT_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
 import { groupProjects, humanTitle, projectNameOf, type ProjectReply } from './project-groups.ts'
 import type { TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
@@ -1210,7 +1210,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
 
       if (type === 'assistant/message') {
         const blocks = data?.message?.content ?? []
-        const text = blocks.filter((b: any) => b?.type === 'text').map((b: any) => String(b?.text ?? '')).join('\n').trim()
+        const text = stripToolNoise(blocks.filter((b: any) => b?.type === 'text').map((b: any) => String(b?.text ?? '')).join('\n')).trim()
         if (text === '') return
         // 按句切分（同时带字符区间）：tts.text/tts.audio/reply 屏帧共用这套下标。
         const sentences = splitReplySentences(text)
