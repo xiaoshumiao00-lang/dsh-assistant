@@ -67,7 +67,7 @@ import {
 import { tihuPageHtml } from './page.ts'
 import { applySessionEvent, confirmationFrame, createProgressState, type TihuProgressState } from './progress.ts'
 import { TihuTts, type TihuTtsPaths } from './tts.ts'
-import { replyWindow, splitReplySentences, type ReplySentence } from './reply.ts'
+import { replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
 import type { TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
 
 /** 页面与 WebSocket 的路径（代理侧按这两个前缀放行）。 */
@@ -219,7 +219,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const tts = new TihuTts({
     log,
     workspaceOf: options.workspaceOf,
-    threads: options.tts?.threads ?? 4,
+    threads: options.tts?.threads ?? 8,
     ...(options.tts?.disabled === true ? { disabled: true } : {}),
     ...(options.tts?.port === undefined ? {} : { port: options.tts.port }),
     ...(options.tts?.paths === undefined ? {} : { paths: options.tts.paths }),
@@ -676,8 +676,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
    * 本地 TTS：按句子合成，PCM 分块流式下发；每句开始前发 reply 屏帧驱动滚动/高亮。
    * 失败 → event.alert(error)（页面据此立即降级 speechSynthesis），不会让页面干等。
    */
-  function speakLocally(device: TihuDevice, sessionId: string, sentences: ReplySentence[], includeAll: boolean): void {
-    if (sentences.length === 0) return
+  function speakLocally(device: TihuDevice, sessionId: string, sentences: ReplySentence[], speechSegments: SpeechSegment[], includeAll: boolean): void {
+    if (speechSegments.length === 0) return
     const status = tts.status()
     if (!status.available) {
       device.send('event.alert', { level: 'warn', text: `本地 TTS 不可用，已降级为系统语音：${status.error ?? '未安装模型'}` })
@@ -686,10 +686,10 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     const voice = device.voice || 'default'
     device.send('event.progress', { stage: 'tts', text: `本地 TTS：${status.model ?? 'local'} / 音色 ${voice}` } satisfies ProgressPayload)
     void (async () => {
-      for (let index = 0; index < sentences.length; index += 1) {
-        const sentence = sentences[index]
-        sendReply(sessionId, sentences, index, sentence.start, includeAll)
-        await tts.synthesize(sentence.text, {
+      for (let index = 0; index < speechSegments.length; index += 1) {
+        const segment = speechSegments[index]
+        sendReply(sessionId, sentences, segment.sentenceIndex, segment.start, includeAll)
+        await tts.synthesize(segment.text, {
           voice,
           sessionId,
           onChunk: (chunk) => {
@@ -700,10 +700,10 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
               channels: 1,
               format: 'pcm16',
               data: chunk.data.toString('base64'),
-              index,
-              text: sentence.text,
-              charStart: sentence.start,
-              charEnd: sentence.end,
+              index: segment.index,
+              text: segment.text,
+              charStart: segment.start,
+              charEnd: segment.end,
               ...(chunk.final ? { final: true } : {}),
             } satisfies TtsAudioPayload)
           },
@@ -1063,23 +1063,24 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         // 按句切分（同时带字符区间）：tts.text/tts.audio/reply 屏帧共用这套下标。
         const sentences = splitReplySentences(text)
         if (sentences.length === 0) return
+        const speechSegments = splitSpeechSegments(text)
         const includeAll = [...text].length <= 2000
-        sentences.forEach((sentence, index) => {
+        speechSegments.forEach((segment) => {
           broadcast(sessionId, 'tts.text', {
-            text: sentence.text,
-            index,
-            total: sentences.length,
+            text: segment.text,
+            index: segment.index,
+            total: speechSegments.length,
             lang: 'zh-CN',
-            charStart: sentence.start,
-            charEnd: sentence.end,
+            charStart: segment.start,
+            charEnd: segment.end,
           } satisfies TtsTextPayload)
         })
-        // 进入 reply 模式（首屏）；本地 TTS 就绪时每句会再推进当前句。
+        // 进入 reply 模式（首屏）；本地 TTS 就绪时每段会再推进当前句。
         sendReply(sessionId, sentences, 0, 0, includeAll)
         // 本地 TTS（Qwen3-TTS sidecar）：每个绑定设备按自己选的音色合成并流式下发；
         // 失败只影响该设备（页面收到 error alert 后立刻降级系统语音）。
         for (const device of devices) {
-          if (device.sessionId === sessionId) speakLocally(device, sessionId, sentences, includeAll)
+          if (device.sessionId === sessionId) speakLocally(device, sessionId, sentences, speechSegments, includeAll)
         }
         return
       }

@@ -1,20 +1,24 @@
 /**
- * 本地 TTS sidecar（Qwen3-TTS-12Hz-0.6B GGUF Q4，codec.cpp `tts-server`）。
+ * 本地 TTS sidecar。
+ *
+ * 当前主引擎：Qwen3-TTS-12Hz-0.6B-Base 的 PyTorch CPU 实现（`scripts/tihu-qwen-tts-server.py`，
+ * 官方 `qwen-tts` 包，fp32 + sdpa + 8 线程），仅绑 127.0.0.1，由本模块 spawn。
+ * 旧 GGUF/codec.cpp 路径保留在 backend() 里作为备用；两者都不可用时回退 Windows SAPI。
  *
  * 设计：
- *   - **独立进程**：`tts-server.exe` 由本模块 spawn，只绑 127.0.0.1，DSH 主进程只做 HTTP 客户端；
+ *   - **独立进程**：DSH 主进程只做 HTTP 客户端；
  *   - 模型/二进制放 `~/.dsh/tihu/`，不进仓库；
  *   - 合成走 OpenAI 兼容 `POST /v1/audio/speech`（`response_format: "pcm"`），
- *     服务端按 `--stream-chunk-ms 120` 分块流式返回，这里再把字节流重新切成固定 120ms 块；
- *   - 音色：codec.cpp 的 custom voices（POST /v1/audio/voices，multipart）把 speaker
- *     embedding 存成 `.gguf`，服务重启时自动加载（第二次用同一音色不重算）。
+ *     服务端按 120ms 分块返回，这里再把字节流重新切成固定 120ms 块；
+ *   - 音色：`POST /v1/audio/voices`（multipart）把 speaker embedding 存成
+ *     `.embed.pt`（PyTorch）/ `.gguf`（codec），服务重启时自动加载（第二次用同一音色不重算）。
  *     工作区 `.tihu/voices/<name>.wav|.json` 是用户可见的权威副本，json 里记 serverVoiceId。
  *
  * 失败策略：任何异常都以可读 Error 抛出，由 lane 发 `event.alert` 并让页面降级到
  * 系统语音；绝不静默。
  */
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync } from 'node:fs'
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
@@ -112,12 +116,32 @@ export class TihuTts {
     this.port = options.port ?? DEFAULT_PORT
   }
 
-  /** 当前后端：codec（Qwen3-TTS sidecar）/ sapi（Windows 系统语音占位）/ none。 */
-  backend(): 'codec' | 'sapi' | 'none' {
+  /** 当前后端：qwen-pt（PyTorch CPU sidecar）/ codec（GGUF sidecar）/ sapi（系统语音占位）/ none。 */
+  backend(): 'qwen-pt' | 'codec' | 'sapi' | 'none' {
     if (this.options.disabled) return 'none'
+    if (this.qwenReady()) return 'qwen-pt'
     if (existsSync(this.paths.bin) && existsSync(this.paths.model) && existsSync(this.paths.codec)) return 'codec'
     if (process.platform === 'win32') return 'sapi'
     return 'none'
+  }
+
+  private qwenPython(): string {
+    return process.env.TIHU_QWEN_PYTHON ?? join(this.paths.root, 'venv', 'Scripts', 'python.exe')
+  }
+
+  private qwenServerScript(): string {
+    return process.env.TIHU_QWEN_SERVER ?? join(this.paths.root, 'qwen-tts-server.py')
+  }
+
+  private qwenModelDir(): string {
+    return process.env.TIHU_QWEN_MODEL ?? join(this.paths.root, 'models', 'qwen3-tts-0.6b-pt')
+  }
+
+  private qwenReady(): boolean {
+    return process.platform === 'win32' &&
+      existsSync(this.qwenPython()) &&
+      existsSync(this.qwenServerScript()) &&
+      existsSync(join(this.qwenModelDir(), 'model.safetensors'))
   }
 
   /** 引擎是否可用。 */
@@ -127,17 +151,19 @@ export class TihuTts {
 
   status(): { available: boolean; model?: string; error?: string } {
     const backend = this.backend()
+    if (backend === 'qwen-pt') return { available: true, model: 'qwen3-tts 0.6b-pt' }
     if (backend === 'codec') return { available: true, model: 'qwen3-tts-0.6b-q4_k_m' }
     if (backend === 'sapi') return { available: true, model: 'windows-sapi（Qwen3-TTS 未就绪）' }
     return {
       available: false,
-      error: this.lastError || `本地 TTS 未安装：缺少 ${basename(this.paths.bin)} 或模型文件（${this.paths.root}）`,
+      error: this.lastError || `本地 TTS 未安装：缺少 ${basename(this.qwenServerScript())} 或模型文件（${this.paths.root}）`,
     }
   }
 
   /** 确保 sidecar 已启动并加载完模型（SAPI 后端无需常驻进程）。 */
   async ensureServer(): Promise<void> {
-    if (this.backend() !== 'codec') return
+    const backend = this.backend()
+    if (backend === 'sapi' || backend === 'none') return
     if (this.child !== null && this.modelLoaded) return
     if (this.starting !== null) return this.starting
     this.starting = this.startServer().finally(() => { this.starting = null })
@@ -148,7 +174,9 @@ export class TihuTts {
     await mkdir(this.paths.serverVoices, { recursive: true })
     const port = await this.pickPort()
     this.port = port
-    const args = [
+    const backend = this.backend()
+    let command = this.paths.bin
+    let args = [
       '--model', this.paths.codec,
       '--backbone', this.paths.model,
       '--host', '127.0.0.1',
@@ -159,15 +187,34 @@ export class TihuTts {
       '--segment-bytes', '160',
       '--stream-chunk-ms', String(TTS_CHUNK_MS),
     ]
-    this.log(`starting tts sidecar: ${this.paths.bin} (port ${port})`)
-    const child = spawn(this.paths.bin, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    if (backend === 'qwen-pt') {
+      command = this.qwenPython()
+      args = [
+        '-u', this.qwenServerScript(),
+        '--model', this.qwenModelDir(),
+        '--voices', this.paths.serverVoices,
+        '--default-ref', join(this.paths.root, 'default-ref.wav'),
+        '--host', '127.0.0.1',
+        '--port', String(port),
+        '--threads', String(this.options.threads ?? 8),
+      ]
+    }
+    this.log(`starting tts sidecar (${backend}): ${command} (port ${port})`)
+    const logPath = join(this.paths.root, 'tts-server.log')
+    try { mkdirSync(this.paths.root, { recursive: true }) } catch { /* 忽略 */ }
+    const appendLog = (line: string): void => {
+      try { appendFileSync(logPath, line) } catch { /* 忽略 */ }
+    }
+    const child = spawn(command, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
     this.child = child
     this.stderrTail = ''
+    appendLog(`\n[${new Date().toISOString()}] start ${backend} ${command} ${args.join(' ')}\n`)
     child.stderr?.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8')
       this.stderrTail = (this.stderrTail + text).slice(-4000)
+      appendLog(text)
     })
-    child.stdout?.on('data', () => { /* 访问日志忽略 */ })
+    child.stdout?.on('data', (chunk: Buffer) => { appendLog(chunk.toString('utf8')) })
     child.on('exit', (code, signal) => {
       const wasLoaded = this.modelLoaded
       this.child = null
@@ -222,7 +269,7 @@ export class TihuTts {
     },
   ): Promise<SynthResult> {
     const backend = this.backend()
-    if (backend === 'codec') return this.synthesizeCodec(text, options)
+    if (backend === 'codec' || backend === 'qwen-pt') return this.synthesizeCodec(text, options)
     if (backend === 'sapi') return this.synthesizeSapi(text, options)
     throw new Error(this.status().error ?? '本地 TTS 不可用')
   }
@@ -303,7 +350,8 @@ export class TihuTts {
     const controller = new AbortController()
     const onAbort = () => controller.abort()
     options.signal?.addEventListener('abort', onAbort, { once: true })
-    const firstTimer = setTimeout(() => controller.abort(), FIRST_CHUNK_TIMEOUT_MS)
+    const firstChunkBudget = this.backend() === 'qwen-pt' ? 45_000 : FIRST_CHUNK_TIMEOUT_MS
+    const firstTimer = setTimeout(() => controller.abort(), firstChunkBudget)
     let firstChunkAt = 0
     let bytes = 0
     let chunks = 0
@@ -347,7 +395,7 @@ export class TihuTts {
       return { sampleRate: TTS_SAMPLE_RATE, firstChunkMs: firstChunkAt === 0 ? totalMs : firstChunkAt - started, audioMs, totalMs, chunks }
     } catch (error) {
       const message = (error as Error)?.name === 'AbortError'
-        ? `TTS 合成超时（首块 ${Math.round(FIRST_CHUNK_TIMEOUT_MS / 1000)}s 未返回）`
+        ? `TTS 合成超时（首块 ${Math.round(firstChunkBudget / 1000)}s 未返回）`
         : String((error as Error)?.message ?? error)
       this.lastError = message
       throw new Error(message)
@@ -418,14 +466,15 @@ export class TihuTts {
   ): Promise<{ voice: VoiceInfo; cached: boolean }> {
     const name = normalizeVoiceName(payload.name)
     if (name === null) throw new Error('音色名只能包含英文/数字/下划线/短横线，1–32 字，且不能是 default')
-    if (this.backend() !== 'codec') throw new Error('当前是 Windows SAPI 占位引擎，不支持音色克隆；装好 Qwen3-TTS sidecar 后可用')
+    if (this.backend() !== 'codec' && this.backend() !== 'qwen-pt') throw new Error('当前是 Windows SAPI 占位引擎，不支持音色克隆；装好 Qwen3-TTS sidecar 后可用')
     const dir = this.workspaceDir(sessionId)
     await mkdir(dir, { recursive: true })
     const wav = Buffer.from(payload.wavBase64, 'base64')
     const valid = validateReferenceWav(wav)
     if (!valid.ok) throw new Error('参考音频不合格：' + valid.reason)
     const existing = await this.readVoiceRecord(sessionId, name)
-    if (existing?.serverVoiceId !== undefined && existsSync(join(this.paths.serverVoices, existing.serverVoiceId + '.gguf'))) {
+    const embedExt = this.backend() === 'qwen-pt' ? '.embed.pt' : '.gguf'
+    if (existing?.serverVoiceId !== undefined && existsSync(join(this.paths.serverVoices, existing.serverVoiceId + embedExt))) {
       return {
         voice: { name, kind: 'cloned', durationMs: existing.durationMs, sampleRate: existing.sampleRate, createdAt: existing.createdAt, note: existing.note },
         cached: true,
@@ -466,7 +515,7 @@ export class TihuTts {
     if (record === null || record.serverVoiceId === undefined || record.serverVoiceId === '') {
       throw new Error(`音色 ${name} 没有可用的 embedding，请重新上传参考音频`)
     }
-    if (!existsSync(join(this.paths.serverVoices, record.serverVoiceId + '.gguf'))) {
+    if (!existsSync(join(this.paths.serverVoices, record.serverVoiceId + (this.backend() === 'qwen-pt' ? '.embed.pt' : '.gguf')))) {
       throw new Error(`音色 ${name} 的 embedding 已丢失，请重新上传参考音频`)
     }
     return record.serverVoiceId
