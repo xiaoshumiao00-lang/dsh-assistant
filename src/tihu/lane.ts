@@ -102,6 +102,8 @@ interface TihuDevice {
   autoFollow: boolean
   /** 页面选中的音色（default / 克隆音色名）。 */
   voice: string
+  /** edge-tts 兜底音色（在线兜底）。 */
+  edgeVoice: string
   send: (type: string, payload: unknown) => void
   close: () => void
 }
@@ -119,8 +121,8 @@ export interface TihuRuntimeOptions {
   log: (line: string) => void
   /** 当前工作区根目录的解析器（按会话 id）。 */
   workspaceOf?: (sessionId: string) => string | undefined
-  /** 本地 TTS 覆盖（单测里禁用，避免真的 spawn PowerShell / sidecar）。 */
-  tts?: { disabled?: boolean; threads?: number; port?: number; paths?: Partial<TihuTtsPaths> }
+  /** 本地 TTS 覆盖（单测里禁用/注入假引擎）。 */
+  tts?: { disabled?: boolean; threads?: number; port?: number; paths?: Partial<TihuTtsPaths>; instance?: TihuTts; prewarm?: boolean }
 }
 
 /** 提供给代理的两个入口 + 卸载函数。 */
@@ -216,7 +218,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   /** 正在 reply 阅读模式的会话（turn/end 不再用「完成」状态帧覆盖正文）。 */
   const replySessions = new Set<string>()
   /** 本地 TTS sidecar（独立进程；模型缺失时 available=false，页面走系统语音）。 */
-  const tts = new TihuTts({
+  const tts = options.tts?.instance ?? new TihuTts({
     log,
     workspaceOf: options.workspaceOf,
     threads: options.tts?.threads ?? 8,
@@ -224,8 +226,10 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     ...(options.tts?.port === undefined ? {} : { port: options.tts.port }),
     ...(options.tts?.paths === undefined ? {} : { paths: options.tts.paths }),
   })
-  // GPU 引擎需显式 TIHU_TTS_DEVICE=cuda；默认 CPU fp32，避免占用显存影响 strata。
-  const confirmBroker: ConfirmBroker = createConfirmBroker({
+  // 仅真实插件（pocket-host）启动时预热 GPU；单测传 prewarm=false，避免拉起 sidecar。
+  if (options.tts?.prewarm === true && options.tts?.disabled !== true && tts.backend() === 'qwen-cuda') {
+    void tts.ensureServer().catch((error) => log(`tihu tts prewarm failed: ${(error as Error)?.message ?? String(error)}`))
+  }  const confirmBroker: ConfirmBroker = createConfirmBroker({
     onAsk: (request) => {
       for (const device of devices) {
         if (request.sessionId !== undefined && device.sessionId !== request.sessionId) continue
@@ -677,25 +681,27 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
    * 本地 TTS：按句子合成，PCM 分块流式下发；每句开始前发 reply 屏帧驱动滚动/高亮。
    * 失败 → event.alert(error)（页面据此立即降级 speechSynthesis），不会让页面干等。
    */
-  function speakLocally(device: TihuDevice, sessionId: string, sentences: ReplySentence[], speechSegments: SpeechSegment[], includeAll: boolean): void {
+  async function speakLocally(device: TihuDevice, sessionId: string, sentences: ReplySentence[], speechSegments: SpeechSegment[], includeAll: boolean): Promise<void> {
     if (speechSegments.length === 0) return
+    await tts.ensureServer()
     const status = tts.status()
     if (!status.available) {
-      device.send('event.alert', { level: 'warn', text: `本地 TTS 不可用，已降级为系统语音：${status.error ?? '未安装模型'}` })
+      device.send('event.alert', { level: 'error', text: `所有本地 TTS 均不可用，本条只显示文字：${status.error ?? '未安装模型'}` })
       return
     }
     const voice = device.voice || 'default'
     if (tts.deviceFallback() !== '') {
       device.send('event.alert', { level: 'warn', text: tts.deviceFallback() })
     }
-    device.send('event.progress', { stage: 'tts', text: `本地 TTS：${status.model ?? 'local'} / 音色 ${voice}` } satisfies ProgressPayload)
-    void (async () => {
+    device.send('event.progress', { stage: 'tts', text: tts.engineLabel(voice) } satisfies ProgressPayload)
+    try {
       for (let index = 0; index < speechSegments.length; index += 1) {
         const segment = speechSegments[index]
         sendReply(sessionId, sentences, segment.sentenceIndex, segment.start, includeAll)
         await tts.synthesize(segment.text, {
           voice,
           sessionId,
+          edgeVoice: device.edgeVoice,
           onChunk: (chunk) => {
             device.send('tts.audio', {
               seq: chunk.seq,
@@ -712,15 +718,19 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
             } satisfies TtsAudioPayload)
           },
         })
+        const engineNote = tts.takeEngineNote()
+        if (engineNote.startsWith('在线兜底') || engineNote.startsWith('离线兜底')) {
+          device.send('event.progress', { stage: 'tts', text: engineNote } satisfies ProgressPayload)
+        }
       }
       // 念完停在最后一屏（最后一帧）。
       const last = sentences[sentences.length - 1]
       sendReply(sessionId, sentences, sentences.length - 1, last.end, includeAll)
-    })().catch((error) => {
+    } catch (error) {
       const message = (error as Error)?.message ?? String(error)
       log(`tihu tts failed session=${sessionId} voice=${voice}: ${message}`)
-      device.send('event.alert', { level: 'error', text: `本地 TTS 合成失败，已降级为系统语音：${message}` })
-    })
+      device.send('event.alert', { level: 'error', text: `所有本地 TTS 均不可用，本条只显示文字：${message}` })
+    }
   }
 
   /**
@@ -1084,7 +1094,11 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         // 本地 TTS（Qwen3-TTS sidecar）：每个绑定设备按自己选的音色合成并流式下发；
         // 失败只影响该设备（页面收到 error alert 后立刻降级系统语音）。
         for (const device of devices) {
-          if (device.sessionId === sessionId) speakLocally(device, sessionId, sentences, speechSegments, includeAll)
+          if (device.sessionId === sessionId) {
+            void speakLocally(device, sessionId, sentences, speechSegments, includeAll).catch((error) => {
+              log(`tihu tts task failed: ${(error as Error)?.message ?? String(error)}`)
+            })
+          }
         }
         return
       }
@@ -1133,6 +1147,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       seq: seqOf,
       autoFollow: false,
       voice: 'default',
+      edgeVoice: process.env.TIHU_EDGE_VOICE ?? 'zh-CN-YunjianNeural',
       send(type: string, payload: unknown) {
         try {
           const message = buildDownstream(type as any, payload, seqOf())
@@ -1320,6 +1335,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     if (type === 'voice.select') {
       const name = String(message.payload?.name ?? '')
       device.voice = name === '' ? 'default' : name
+      if (typeof message.payload?.edgeVoice === 'string' && message.payload.edgeVoice !== '') device.edgeVoice = message.payload.edgeVoice
       device.send('event.progress', { stage: '音色', text: `音色已切换：${device.voice}` } satisfies ProgressPayload)
       return
     }

@@ -358,6 +358,7 @@ export function apply(ctx, config = {}, internals = {}) {
           return typeof cwd === 'string' && cwd !== '' ? cwd : undefined;
         } catch { return undefined; }
       },
+      tts: { prewarm: true },
     });
     logger.info('dsh-pocket: tihu lane ready at /tihu (P0 simulator) | 鹈鹕模拟设备页已挂载');
   } catch (error) {
