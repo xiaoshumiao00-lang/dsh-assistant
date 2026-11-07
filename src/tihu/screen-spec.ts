@@ -26,8 +26,8 @@ export const SCREEN_SPEC = {
   bodyLineHeightPx: 20,
   /** 正文每行字符数（约 18 个汉字）。 */
   bodyCharsPerLine: 18,
-  /** 正文最多行数。 */
-  maxBodyLines: 3,
+  /** 正文最多行数（内容区 224px，16px/20px 行高）。 */
+  maxBodyLines: 4,
   /** 标题字号（加粗）。 */
   titleFontPx: 18,
   /** 标题最大字符数。 */
@@ -52,7 +52,73 @@ export const SCREEN_PHYSICAL = {
 /** 实际尺寸模式下 320px 应显示的 CSS px 缩放（≈0.7205）。 */
 export const ACTUAL_SIZE_SCALE = (SCREEN_PHYSICAL.widthMm * SCREEN_PHYSICAL.pxPerMm) / SCREEN_SPEC.widthPx
 
-/** 按 Unicode 码点截断，超长补省略号；不会切出半个字。 */
+/** 内容区宽度（320 − 2×8）。 */
+export const CONTENT_WIDTH_PX = SCREEN_SPEC.widthPx - SCREEN_SPEC.paddingPx * 2
+
+/** 单个码点的近似宽度（em）：CJK/全角 1.0，ASCII 0.47。 */
+export function charWidthEm(char: string): number {
+  const code = char.codePointAt(0) ?? 0
+  const wide =
+    (code >= 0x1100 && code <= 0x115f) ||
+    (code >= 0x2e80 && code <= 0xa4cf) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe10 && code <= 0xfe6f) ||
+    (code >= 0xff00 && code <= 0xff60) ||
+    (code >= 0xffe0 && code <= 0xffe6) ||
+    (code >= 0x1f300 && code <= 0x1faff)
+  return wide ? 1 : 0.47
+}
+
+/** 估算文本像素宽度。 */
+export function measureTextPx(text: string, fontPx: number): number {
+  let width = 0
+  for (const char of String(text ?? '')) width += charWidthEm(char) * fontPx
+  return width
+}
+
+/**
+ * 按像素宽度截断（超宽才省略，省略号贴右边缘）；不会切半个字。
+ */
+export function fitLine(value: unknown, maxWidthPx: number = CONTENT_WIDTH_PX, fontPx: number = SCREEN_SPEC.bodyFontPx): string {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  if (text === '') return ''
+  if (measureTextPx(text, fontPx) <= maxWidthPx) return text
+  const chars = [...text]
+  const ellipsisWidth = measureTextPx('…', fontPx)
+  let width = 0
+  let out = ''
+  for (const char of chars) {
+    const next = width + charWidthEm(char) * fontPx
+    if (next + ellipsisWidth > maxWidthPx) break
+    out += char
+    width = next
+  }
+  return out === '' ? '…' : `${out}…`
+}
+
+/** 按像素宽度折行（保留所有内容，不省略）；返回每行文本。 */
+export function wrapTextPx(value: unknown, maxWidthPx: number = CONTENT_WIDTH_PX, fontPx: number = SCREEN_SPEC.bodyFontPx): string[] {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  if (text === '') return []
+  const lines: string[] = []
+  let current = ''
+  let width = 0
+  for (const char of [...text]) {
+    const charWidth = charWidthEm(char) * fontPx
+    if (current !== '' && width + charWidth > maxWidthPx) {
+      lines.push(current.trimEnd())
+      current = ''
+      width = 0
+    }
+    current += char
+    width += charWidth
+  }
+  if (current !== '') lines.push(current.trimEnd())
+  return lines
+}
+
+/** 按 Unicode 码点截断（事件区等非屏幕文本用）。 */
 export function clipScreenText(value: unknown, maxChars: number): string {
   const text = String(value ?? '').replace(/\s+/g, ' ').trim()
   if (text === '') return ''
@@ -61,30 +127,29 @@ export function clipScreenText(value: unknown, maxChars: number): string {
   return `${chars.slice(0, Math.max(1, maxChars - 1)).join('')}…`
 }
 
-/** 标题：最多 28 字，一行。 */
+/** 标题：一行，按像素宽度省略。 */
 export function clipScreenTitle(value: unknown): string {
-  return clipScreenText(value, SCREEN_SPEC.titleChars)
+  return fitLine(value, CONTENT_WIDTH_PX, SCREEN_SPEC.titleFontPx)
 }
 
-/** stage：最多 10 字。 */
+/** stage：一行，按像素宽度省略。 */
 export function clipScreenStage(value: unknown): string {
-  return clipScreenText(value, SCREEN_SPEC.stageChars)
+  return fitLine(value, CONTENT_WIDTH_PX, SCREEN_SPEC.stageFontPx)
 }
 
 /**
- * 正文：只保留前 `maxLines`（默认 3）条非空行，每行截到 18 字。
- * 多出来的进事件区，不塞进屏幕。
+ * 正文：按像素宽度折行，最多 `maxLines` 行；超出部分丢弃（不是按字数截断）。
  */
 export function fitScreenLines(
   lines: readonly unknown[],
   maxLines: number = SCREEN_SPEC.maxBodyLines,
-  maxChars: number = SCREEN_SPEC.bodyCharsPerLine,
 ): string[] {
   const out: string[] = []
   for (const line of lines) {
-    if (out.length >= maxLines) break
-    const clipped = clipScreenText(line, maxChars)
-    if (clipped !== '') out.push(clipped)
+    for (const wrapped of wrapTextPx(line, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)) {
+      if (out.length >= maxLines) return out
+      out.push(wrapped)
+    }
   }
   return out
 }

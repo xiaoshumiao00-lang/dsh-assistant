@@ -56,6 +56,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   .shell-off #screen { border:1px solid var(--accent); border-radius:0; }
   /* 屏幕本体：固定 320×240（screen-spec），内容按 8px 内边距排版，绝不滚动 */
   #screen { position:relative; width:320px; height:240px; box-sizing:border-box; padding:8px; overflow:hidden;
+    touch-action:none;
     background:#05080b; color:var(--fg); border:1px solid #000; border-radius:3px;
     display:flex; flex-direction:column; gap:4px; }
   #screen .stage { font-size:12px; line-height:14px; letter-spacing:1px; color:var(--accent);
@@ -63,10 +64,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .title { font-size:18px; font-weight:700; line-height:22px;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen ul { margin:0; padding:0; list-style:none; font-size:16px; line-height:20px; color:#c3ccd5; }
-  #screen ul li { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #screen ul li { white-space:normal; overflow-wrap:anywhere; }
   #screen .reply-body { display:none; flex:1; overflow:hidden; font-size:16px; line-height:20px; color:#d9e2ea; }
   #screen .reply-line { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen .reply-line.cur { background:var(--accent); color:#04110f; border-radius:3px; }
+  #screen .scroll-hint { position:absolute; right:8px; bottom:6px; font-size:11px; line-height:14px;
+    color:#9fb0bf; background:rgba(5,8,11,.82); padding:1px 4px; border-radius:3px; pointer-events:none; }
   #screen.reply-mode .title, #screen.reply-mode ul, #screen.reply-mode .bar { display:none; }
   #screen.reply-mode .reply-body { display:block; }
   #screen .bar { margin-top:auto; display:flex; align-items:center; gap:6px; font-size:10px; color:var(--dim); }
@@ -135,6 +138,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         <div class="title" id="title">正在连接宿主…</div>
         <ul id="bullets"></ul>
         <div id="replyBody" class="reply-body"></div>
+        <div id="scrollHint" class="scroll-hint"></div>
         <div class="bar"><span id="progress">—</span><div class="track"><div class="fill" id="fill"></div></div></div>
       </div>
       <div class="grille"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
@@ -237,12 +241,31 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     if (chars.length <= max) return text;
     return chars.slice(0, Math.max(1, max - 1)).join('') + '…';
   }
-  function fitLines(lines, maxLines, maxChars) {
+  function fitLines(lines, maxLines) {
+    return (lines || []).filter(function (line) { return String(line || '').trim() !== ''; }).slice(0, maxLines);
+  }
+  /** 按像素宽度折行（CJK 1em / ASCII 0.47em），与 screen-spec 同一估算。 */
+  function wrapPx(text, width, fontPx) {
     var out = [];
-    for (var i = 0; i < (lines || []).length && out.length < maxLines; i += 1) {
-      var line = clipScreen(lines[i], maxChars);
-      if (line !== '') out.push(line);
+    var current = '';
+    var used = 0;
+    var chars = Array.from(String(text || ''));
+    for (var i = 0; i < chars.length; i += 1) {
+      var code = chars[i].codePointAt(0) || 0;
+      var wide = (code >= 0x1100 && code <= 0x115f) || (code >= 0x2e80 && code <= 0xa4cf) ||
+        (code >= 0xac00 && code <= 0xd7a3) || (code >= 0xf900 && code <= 0xfaff) ||
+        (code >= 0xfe10 && code <= 0xfe6f) || (code >= 0xff00 && code <= 0xff60) ||
+        (code >= 0xffe0 && code <= 0xffe6) || (code >= 0x1f300 && code <= 0x1faff);
+      var charWidth = (wide ? 1 : 0.47) * fontPx;
+      if (current !== '' && used + charWidth > width) {
+        out.push(current);
+        current = '';
+        used = 0;
+      }
+      current += chars[i];
+      used += charWidth;
     }
+    if (current !== '') out.push(current);
     return out;
   }
   var $ = function (id) { return document.getElementById(id); };
@@ -254,7 +277,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     ttsTurnTexts: [], ttsAudioSeen: {},
     audioCtx: null, pcmSources: [], pcmNextTime: 0, turnPcm: [],
     voice: 'default', voices: [], voiceEngine: null,
-    reply: null, replyCharPos: 0, replyTimer: 0 };
+    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false };
 
   /* ---------- 会话定位 ----------
      2026-11-07 P0：localStorage **按 origin 隔离**。用户在桌面宿主
@@ -327,7 +350,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var screen = $('screen');
     // reply 模式：正文阅读（跟随朗读滚动 + 当前句高亮）。
     if (payload && payload.mode === 'reply' && payload.reply) {
+      var lockedIndex = state.highlightLock && state.reply ? state.reply.currentIndex : null;
       state.reply = payload.reply;
+      if (lockedIndex !== null && payload.reply.sentences.some(function (s) { return s.index === lockedIndex; })) {
+        state.reply.currentIndex = lockedIndex;
+      }
       if (typeof payload.reply.charPos === 'number') state.replyCharPos = payload.reply.charPos;
       $('stage').textContent = clipScreen(payload.stage || '回答中', SCREEN.stageChars);
       screen.className = (payload.tone || 'ok') + ' reply-mode';
@@ -361,24 +388,37 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var body = $('replyBody');
     if (!reply || !Array.isArray(reply.sentences)) return;
     var lines = [];
-    for (var i = 0; i < reply.sentences.length; i += 1) {
-      var sentence = reply.sentences[i];
-      var chars = Array.from(String(sentence.text || ''));
-      for (var offset = 0; offset < chars.length; offset += SCREEN.bodyCharsPerLine) {
-        lines.push({ text: chars.slice(offset, offset + SCREEN.bodyCharsPerLine).join(''), index: sentence.index });
+    if (Array.isArray(reply.lines) && reply.lines.length) {
+      for (var li = 0; li < reply.lines.length; li += 1) {
+        lines.push({ text: reply.lines[li].text, index: reply.lines[li].sentenceIndex });
+      }
+    } else {
+      var contentWidth = (SCREEN.widthPx || 320) - 2 * (SCREEN.paddingPx || 8);
+      for (var i = 0; i < reply.sentences.length; i += 1) {
+        var sentence = reply.sentences[i];
+        var wrapped = wrapPx(sentence.text || '', contentWidth, SCREEN.bodyFontPx || 16);
+        for (var w = 0; w < wrapped.length; w += 1) lines.push({ text: wrapped[w], index: sentence.index });
       }
     }
     var current = typeof reply.currentIndex === 'number' ? reply.currentIndex : 0;
     var visible = SCREEN.replyVisibleLines;
     var currentLine = 0;
     for (var j = 0; j < lines.length; j += 1) { if (lines[j].index === current) { currentLine = j; break; } }
-    var start = lines.length <= visible ? 0 : Math.max(0, Math.min(currentLine - Math.floor(visible / 2), lines.length - visible));
+    // 宿主已经按 scrollOffset 切好可视窗口，页面直接渲染，不再自行居中。
+    var start = 0;
     body.innerHTML = '';
     for (var k = start; k < Math.min(start + visible, lines.length); k += 1) {
       var div = document.createElement('div');
-      div.className = 'reply-line' + (lines[k].index === current ? ' cur' : '');
+      div.className = 'reply-line' + (state.audioStarted && lines[k].index === current ? ' cur' : '');
       div.textContent = lines[k].text;
       body.appendChild(div);
+    }
+    var hint = $('scrollHint');
+    if (hint) {
+      var scroll = reply.scroll || { offset: 0, maxOffset: 0 };
+      if (scroll.offset > 0) hint.textContent = '↑ 上方还有 ' + scroll.offset + ' 行';
+      else if (scroll.maxOffset > 0) hint.textContent = '↓ 下方还有 ' + scroll.maxOffset + ' 行';
+      else hint.textContent = '';
     }
   }
 
@@ -637,9 +677,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.pcmNextTime = 0;
   }
   function playPcm(base64, sampleRate) {
-    if (!base64) return;
+    if (!base64) return null;
     var ctx = ensureAudio();
-    if (!ctx) return;
+    if (!ctx) return null;
     try {
       var binary = atob(base64);
       var count = Math.floor(binary.length / 2);
@@ -661,10 +701,33 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       source.onended = function () {
         var index = state.pcmSources.indexOf(source);
         if (index >= 0) state.pcmSources.splice(index, 1);
+        if (state.audioCtx && state.pcmNextTime <= state.audioCtx.currentTime + 0.05) state.highlightLock = false;
       };
       // 重读缓存（本轮完整 PCM）
       state.turnPcm.push(samples);
+      return { startAt: startAt, duration: buffer.duration };
     } catch (e) { /* 解码失败：本条只显示文字 */ }
+    return null;
+  }
+  /** 按真实播放时刻切换当前句：不再用 tts.audio 到达即跳。 */
+  function scheduleHighlight(charStart, startAt) {
+    if (typeof charStart !== 'number' || !state.reply || !Array.isArray(state.reply.sentences)) return;
+    var ctx = state.audioCtx;
+    if (!ctx) return;
+    state.highlightLock = true;
+    var delay = Math.max(0, (startAt - ctx.currentTime) * 1000);
+    setTimeout(function () {
+      state.audioStarted = true;
+      if (!state.reply) return;
+      for (var i = 0; i < state.reply.sentences.length; i += 1) {
+        var sentence = state.reply.sentences[i];
+        if (charStart >= sentence.start && charStart < sentence.end) {
+          state.reply.currentIndex = sentence.index;
+          renderReply();
+          return;
+        }
+      }
+    }, delay);
   }
   function resetTurnAudio() {
     stopPcm();
@@ -673,6 +736,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.ttsTurnTexts = [];
     state.ttsAudioSeen = {};
     state.turnPcm = [];
+    state.highlightLock = false;
+    state.audioStarted = false;
   }
   function replayPcm() {
     var chunks = state.turnPcm;
@@ -849,9 +914,13 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       }
       case 'tts.audio': {
         var audioIndex = typeof payload.index === 'number' ? payload.index : 0;
+        var isNewSegment = !state.ttsAudioSeen[audioIndex];
         state.ttsAudioSeen[audioIndex] = true;
         if (typeof payload.charStart === 'number') state.replyCharPos = payload.charStart;
-        playPcm(String(payload.data || ''), Number(payload.sampleRate) || 24000);
+        var played = playPcm(String(payload.data || ''), Number(payload.sampleRate) || 24000);
+        if (played && isNewSegment && typeof payload.charStart === 'number') {
+          scheduleHighlight(payload.charStart, played.startAt);
+        }
         break;
       }
       case 'voice.list': {
@@ -1163,6 +1232,60 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     addEvent('progress', this.checked ? '已开启仅离线：禁用 edge 云健' : '已关闭仅离线：优先 edge 云健');
   };
   $('voiceRefresh').onclick = function () { send('voice.list', {}); };
+
+  /* ---------- 屏幕手势：滚轮 / 拖拽 / 触摸 → screen.gesture（宿主持有滚动位置） ---------- */
+  (function bindScreenGestures() {
+    var screen = $('screen');
+    var dragging = false;
+    var lastY = 0;
+    function swipe(dy, phase) {
+      if (!state.reply) return;
+      send('screen.gesture', { action: 'swipe', dy: dy, phase: phase });
+    }
+    screen.addEventListener('wheel', function (event) {
+      if (!state.reply) return;
+      event.preventDefault();
+      swipe(event.deltaY, 'move');
+    }, { passive: false });
+    screen.addEventListener('pointerdown', function (event) {
+      if (!state.reply) return;
+      dragging = true;
+      lastY = event.clientY;
+      try { screen.setPointerCapture(event.pointerId); } catch (e) { /* 忽略 */ }
+      event.preventDefault();
+    });
+    screen.addEventListener('pointermove', function (event) {
+      if (!dragging) return;
+      var dy = event.clientY - lastY;
+      lastY = event.clientY;
+      if (dy !== 0) swipe(dy, 'move');
+      event.preventDefault();
+    });
+    function endDrag() {
+      if (!dragging) return;
+      dragging = false;
+      swipe(0, 'end');
+    }
+    screen.addEventListener('pointerup', endDrag);
+    screen.addEventListener('pointercancel', endDrag);
+    screen.addEventListener('touchstart', function (event) {
+      if (!state.reply || !event.touches.length) return;
+      lastY = event.touches[0].clientY;
+      event.preventDefault();
+    }, { passive: false });
+    screen.addEventListener('touchmove', function (event) {
+      if (!state.reply || !event.touches.length) return;
+      var dy = event.touches[0].clientY - lastY;
+      lastY = event.touches[0].clientY;
+      if (dy !== 0) swipe(dy, 'move');
+      event.preventDefault();
+    }, { passive: false });
+    screen.addEventListener('touchend', function (event) {
+      if (!state.reply) return;
+      swipe(0, 'end');
+      event.preventDefault();
+    }, { passive: false });
+  })();
   $('voiceFile').addEventListener('change', function (event) {
     var file = event.target.files && event.target.files[0];
     event.target.value = '';

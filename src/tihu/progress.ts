@@ -16,7 +16,7 @@
  *   turn/end   {turn, reason:{kind}}
  */
 import type { ProgressPayload, ScreenFramePayload } from './protocol.ts'
-import { clipScreenText, SCREEN_SPEC } from './screen-spec.ts'
+import { clipScreenText, CONTENT_WIDTH_PX, fitLine, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
 
 /** 屏幕阶段（固定这几类，别再加新词）。 */
 export type TihuStage = '思考' | '读文件' | '跑命令' | '写文件' | '搜索' | '回答' | '等待确认'
@@ -30,7 +30,10 @@ export const TIHU_EVENT_CHARS = 120
 
 /** 按 Unicode 码点截断，超长加省略号；不会切出半个字。 */
 export function clipText(value: unknown, max: number): string {
-  return clipScreenText(value, max)
+  // 屏幕文本按像素宽度截断（304px），事件区仍按字符数（120）。
+  if (max >= 40) return clipScreenText(value, max)
+  const fontPx = max >= 20 ? SCREEN_SPEC.titleFontPx : SCREEN_SPEC.bodyFontPx
+  return fitLine(value, CONTENT_WIDTH_PX, fontPx)
 }
 
 /** 屏幕上不显示 markdown 围栏/反引号等噪音（只影响屏幕摘要，事件区保留原文）。 */

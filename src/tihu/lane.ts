@@ -68,6 +68,8 @@ import { tihuPageHtml } from './page.ts'
 import { applySessionEvent, confirmationFrame, createProgressState, type TihuProgressState } from './progress.ts'
 import { TihuTts, type TihuTtsPaths } from './tts.ts'
 import { replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
+import { toSpeechText } from './speech-text.ts'
+import { CONTENT_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
 import type { TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
 
 /** 页面与 WebSocket 的路径（代理侧按这两个前缀放行）。 */
@@ -215,6 +217,16 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const devices = new Set<TihuDevice>()
   /** 会话 id → 活跃窗口（只有 tihu 注入的那个 turn 的工具调用才受闸门约束）。 */
   const activeSessions = new Map<string, TihuWindow>()
+  /** 会话 id → reply 历史滚动状态（宿主唯一权威）。 */
+  interface ScreenScrollState {
+    lines: { text: string; sentenceIndex: number }[]
+    offset: number
+    follow: boolean
+    sentences: ReplySentence[]
+    currentIndex: number
+    charPos: number
+  }
+  const screenStates = new Map<string, ScreenScrollState>()
   /** 会话 id → 屏幕进度状态（步骤计数 / 用时 / 上一步结果）。 */
   const progressStates = new Map<string, TihuProgressState>()
   /** 正在 reply 阅读模式的会话（turn/end 不再用「完成」状态帧覆盖正文）。 */
@@ -656,7 +668,23 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   }
 
   /** 构造 reply 模式屏帧：长回复只带当前句 ±2 句窗口，避免每帧全量传长文本。 */
-  function replyScreen(sentences: ReplySentence[], currentIndex: number, charPos: number, includeAll: boolean): ScreenFramePayload {
+  function replyScreen(sessionId: string, sentences: ReplySentence[], currentIndex: number, charPos: number, includeAll: boolean): ScreenFramePayload {
+    let state = screenStates.get(sessionId)
+    if (state === undefined || state.sentences !== sentences) {
+      const lines: { text: string; sentenceIndex: number }[] = []
+      for (const sentence of sentences) {
+        for (const line of wrapTextPx(sentence.text, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)) {
+          lines.push({ text: line, sentenceIndex: sentence.index })
+        }
+      }
+      state = { lines, offset: state?.offset ?? 0, follow: state?.follow ?? true, sentences, currentIndex, charPos }
+      screenStates.set(sessionId, state)
+    }
+    state.currentIndex = currentIndex
+    state.charPos = charPos
+    const visibleLines = SCREEN_SPEC.replyVisibleLines
+    const maxOffset = Math.max(0, state.lines.length - visibleLines)
+    state.offset = Math.max(0, Math.min(state.offset, maxOffset))
     const list = includeAll ? sentences : replyWindow(sentences, currentIndex)
     const totalChars = sentences.length > 0 ? sentences[sentences.length - 1].end : 0
     return {
@@ -671,12 +699,15 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         total: sentences.length,
         totalChars,
         charPos,
+        lines: state.lines.slice(state.offset, state.offset + visibleLines),
+        scroll: { offset: state.offset, maxOffset },
+        follow: state.follow,
       },
     }
   }
 
   function sendReply(sessionId: string, sentences: ReplySentence[], currentIndex: number, charPos: number, includeAll: boolean): void {
-    screen(sessionId, replyScreen(sentences, currentIndex, charPos, includeAll))
+    screen(sessionId, replyScreen(sessionId, sentences, currentIndex, charPos, includeAll))
   }
 
   /**
@@ -700,6 +731,14 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     try {
       for (let index = 0; index < speechSegments.length; index += 1) {
         const segment = speechSegments[index]
+        const scrollState = screenStates.get(sessionId)
+        if (scrollState !== undefined && scrollState.follow) {
+          const lineIndex = scrollState.lines.findIndex((line) => line.sentenceIndex === segment.sentenceIndex)
+          if (lineIndex >= 0) {
+            const maxOffset = Math.max(0, scrollState.lines.length - SCREEN_SPEC.replyVisibleLines)
+            scrollState.offset = Math.max(0, Math.min(lineIndex - 2, maxOffset))
+          }
+        }
         sendReply(sessionId, sentences, segment.sentenceIndex, segment.start, includeAll)
         await tts.synthesize(segment.text, {
           voice,
@@ -1063,6 +1102,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       if (type === 'turn/start' || type === 'step/start' || type === 'tool/call' || type === 'tool/result') {
         replySessions.delete(sessionId)
       }
+      if (type === 'turn/start') screenStates.delete(sessionId)
       const update = applySessionEvent(state, event)
       if (type === 'turn/start') {
         // 注意：**不能**在这里点亮 tihu 窗口。用户自己在会话里打字同样会触发
@@ -1082,7 +1122,17 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         const sentences = splitReplySentences(text)
         if (sentences.length === 0) return
         const speechSegments = splitSpeechSegments(text)
+          .map((segment) => ({ ...segment, text: toSpeechText(segment.text) }))
+          .filter((segment) => segment.text !== '')
         const includeAll = [...text].length <= 2000
+        if (speechSegments.length === 0) {
+          sendReply(sessionId, sentences, 0, 0, includeAll)
+          broadcast(sessionId, 'event.alert', {
+            level: 'error',
+            text: '本次无语音：正文只有符号/空白，已清洗为空（仅显示文字）',
+          })
+          return
+        }
         speechSegments.forEach((segment) => {
           broadcast(sessionId, 'tts.text', {
             text: segment.text,
@@ -1093,7 +1143,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
             charEnd: segment.end,
           } satisfies TtsTextPayload)
         })
-        // 进入 reply 模式（首屏）；本地 TTS 就绪时每段会再推进当前句。
+        // 新回复：强制回到顶部并恢复跟随。
+        screenStates.delete(sessionId)
         sendReply(sessionId, sentences, 0, 0, includeAll)
         // 本地 TTS（Qwen3-TTS sidecar）：每个绑定设备按自己选的音色合成并流式下发；
         // 失败只影响该设备（页面收到 error alert 后立刻降级系统语音）。
@@ -1329,6 +1380,24 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       device.send('screen.frame', {
         stage: '空闲', title: '已结束本次会话', bullets: ['闸门已关闭', '按住说话可再开始'], tone: 'idle',
       } satisfies ScreenFramePayload)
+      return
+    }
+
+    if (type === 'screen.gesture') {
+      const payload = message.payload as { action?: string; dy?: number; phase?: string }
+      if (payload.action === 'swipe' && device.sessionId !== undefined && typeof payload.dy === 'number') {
+        const scrollState = screenStates.get(device.sessionId)
+        if (scrollState !== undefined) {
+          // 手指上滑 dy<0 → 看更早内容 → offset 增大；约 20px 一行。
+          const delta = -payload.dy / SCREEN_SPEC.bodyLineHeightPx
+          if (payload.phase === 'move' || payload.phase === 'end') {
+            const maxOffset = Math.max(0, scrollState.lines.length - SCREEN_SPEC.replyVisibleLines)
+            scrollState.offset = Math.max(0, Math.min(scrollState.offset + delta, maxOffset))
+            scrollState.follow = scrollState.offset < 0.5
+            sendReply(device.sessionId, scrollState.sentences, scrollState.currentIndex, scrollState.charPos, true)
+          }
+        }
+      }
       return
     }
 

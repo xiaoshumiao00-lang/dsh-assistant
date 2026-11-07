@@ -4,7 +4,7 @@
  * 屏幕 320×240：正文 16px、行高 20、每行 18 字、可视 10 行（≈180 字/屏）。
  * 滚动按**句子**跳：当前朗读句保持在可视区中部；LVGL 固件照这份逻辑实现。
  */
-import { SCREEN_SPEC } from './screen-spec.ts'
+import { CONTENT_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
 
 export interface ReplySentence {
   index: number
@@ -120,14 +120,12 @@ export interface ReplyLine {
   sentenceIndex: number
 }
 
-/** 把窗口内的句子按每行 `charsPerLine` 折行（不切断行尾，超出即换行）。 */
-export function wrapReplyLines(sentences: ReplySentence[], charsPerLine = SCREEN_SPEC.bodyCharsPerLine): ReplyLine[] {
+/** 把窗口内的句子按像素宽度折行（不切断行尾，超出即换行）。 */
+export function wrapReplyLines(sentences: ReplySentence[], widthPx = CONTENT_WIDTH_PX, fontPx = SCREEN_SPEC.bodyFontPx): ReplyLine[] {
   const lines: ReplyLine[] = []
   for (const sentence of sentences) {
-    const chars = [...sentence.text]
-    if (chars.length === 0) continue
-    for (let offset = 0; offset < chars.length; offset += charsPerLine) {
-      lines.push({ text: chars.slice(offset, offset + charsPerLine).join(''), sentenceIndex: sentence.index })
+    for (const text of wrapTextPx(sentence.text, widthPx, fontPx)) {
+      lines.push({ text, sentenceIndex: sentence.index })
     }
   }
   return lines
@@ -135,16 +133,16 @@ export function wrapReplyLines(sentences: ReplySentence[], charsPerLine = SCREEN
 
 /**
  * 计算最终显示窗口：当前句尽量居中，首尾不越界，最多 `visibleLines` 行。
- * 返回的行都 ≤ charsPerLine，不会出现半行被切。
+ * 行按像素宽度折行，不会切半个字。
  */
 export function replyViewport(
   sentences: ReplySentence[],
   currentIndex: number,
   visibleLines = SCREEN_SPEC.replyVisibleLines,
-  charsPerLine = SCREEN_SPEC.bodyCharsPerLine,
+  widthPx = CONTENT_WIDTH_PX,
 ): { lines: ReplyLine[]; startLine: number; currentLine: number } {
   const window = replyWindow(sentences, currentIndex)
-  const lines = wrapReplyLines(window, charsPerLine)
+  const lines = wrapReplyLines(window, widthPx)
   return fitViewport(lines, currentIndex, visibleLines)
 }
 

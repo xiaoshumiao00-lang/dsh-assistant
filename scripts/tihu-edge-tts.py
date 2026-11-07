@@ -10,10 +10,10 @@ import os
 import sys
 
 
-async def run(text: str, voice: str, timeout: float, proxy: str | None) -> None:
+async def run(text: str, voice: str, rate: str, timeout: float, proxy: str | None) -> None:
     import edge_tts
 
-    communicate = edge_tts.Communicate(text, voice, proxy=proxy)
+    communicate = edge_tts.Communicate(text, voice, rate=rate, proxy=proxy)
     async for chunk in communicate.stream():
         if chunk.get("type") == "audio" and chunk.get("data"):
             sys.stdout.buffer.write(chunk["data"])
@@ -25,10 +25,11 @@ def main() -> int:
     parser.add_argument("--text", required=True)
     parser.add_argument("--voice", default="zh-CN-YunjianNeural")
     parser.add_argument("--timeout", type=float, default=15.0)
+    parser.add_argument("--rate", default=os.environ.get("TIHU_EDGE_RATE", "+18%"))
     parser.add_argument("--proxy", default=os.environ.get("TIHU_EDGE_PROXY", "http://127.0.0.1:7897"))
     args = parser.parse_args()
     try:
-        asyncio.run(asyncio.wait_for(run(args.text, args.voice, args.timeout, args.proxy), timeout=args.timeout))
+        asyncio.run(asyncio.wait_for(run(args.text, args.voice, args.rate, args.timeout, args.proxy), timeout=args.timeout))
     except Exception as error:  # noqa: BLE001
         print(f"edge-tts failed: {error!r}", file=sys.stderr)
         return 3
