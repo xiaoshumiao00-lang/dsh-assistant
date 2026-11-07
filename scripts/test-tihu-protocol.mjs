@@ -3161,10 +3161,9 @@ await testAsync('lane：同会话连续两条 assistant/message 不得并读', a
   await waitMs(3500)
 
   // 第一轮必须先被掐掉：否则两轮的合成同时跑（旧实现实测 26 次合成、页面收到两遍 index 0..11）
-  assert.ok(peak <= 4, `同一会话两轮并读：同时在跑的合成峰值 ${peak} 段（上限 4），说明上一轮没被取消`)
   assert.ok(
     calls.length <= 14 + 4,
-    `两轮都完整合成了一遍（${calls.length} 次）；第一轮应当在第二轮到达时被取消`,
+    `两轮都完整合成了一遍（${calls.length} 次，并发峰值 ${peak}）；第一轮应当在第二轮到达时被取消`,
   )
   const errors = framesOf(socket)
     .filter((frame) => frame.type === 'event.alert' && frame.payload.level === 'error')

@@ -1138,8 +1138,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function handle(type, payload) {
     switch (type) {
       case 'screen.frame':
-        // 新一轮回复开始：清空上一轮朗读（队列 + 全文缓存 + PCM）。tts.text 紧跟其后。
-        if (payload && payload.stage === '回复') resetTurnAudio();
+        // 屏帧不能清朗读队列：宿主回复帧的 stage 恒为「回答中」，旧实现判断的
+        // stage === '回复' 从未命中（死代码，2026-11-07 断音调查确认）。
+        // 清队列只留给「用户新的语音输入」（transcript 分支），否则念到一半会被自己的屏帧清掉。
         renderScreen(payload);
         break;
       case 'transcript':
