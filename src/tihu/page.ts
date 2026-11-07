@@ -68,6 +68,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .reply-body { display:none; flex:1; overflow:hidden; font-size:16px; line-height:20px; color:#d9e2ea; }
   #screen .reply-line { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen .reply-line.cur { background:var(--accent); color:#04110f; border-radius:3px; }
+  #screen .home-body { display:none; flex:1; overflow:hidden; }
+  #screen.home-mode .home-body { display:block; }
+  #screen.home-mode .title, #screen.home-mode ul, #screen.home-mode .reply-body, #screen.home-mode .bar { display:none; }
+  #screen .home-item { height:36px; box-sizing:border-box; padding:1px 0; overflow:hidden; }
+  #screen .home-row1 { display:flex; align-items:center; gap:6px; font-size:16px; font-weight:700; line-height:20px; white-space:nowrap; }
+  #screen .home-dot { width:8px; height:8px; border-radius:50%; flex:none; background:#6b7785; }
+  #screen .home-row1 .name { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #screen .home-row2 { font-size:12px; line-height:14px; color:#8b97a5; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #screen .home-dot.running { background:#35d07f; }
+  #screen .home-dot.idle { background:#6b7785; }
+  #screen .home-dot.done { background:#4f8ef7; }
   #screen .scroll-hint { position:absolute; right:8px; bottom:6px; font-size:11px; line-height:14px;
     color:#9fb0bf; background:rgba(5,8,11,.82); padding:1px 4px; border-radius:3px; pointer-events:none; }
   #screen.reply-mode .title, #screen.reply-mode ul, #screen.reply-mode .bar { display:none; }
@@ -138,6 +149,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         <div class="title" id="title">正在连接宿主…</div>
         <ul id="bullets"></ul>
         <div id="replyBody" class="reply-body"></div>
+        <div id="homeBody" class="home-body"></div>
         <div id="scrollHint" class="scroll-hint"></div>
         <div class="bar"><span id="progress">—</span><div class="track"><div class="fill" id="fill"></div></div></div>
       </div>
@@ -277,7 +289,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     ttsTurnTexts: [], ttsAudioSeen: {},
     audioCtx: null, pcmSources: [], pcmNextTime: 0, turnPcm: [],
     voice: 'default', voices: [], voiceEngine: null,
-    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false };
+    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, screenMode: 'status' };
 
   /* ---------- 会话定位 ----------
      2026-11-07 P0：localStorage **按 origin 隔离**。用户在桌面宿主
@@ -348,8 +360,40 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   /* ---------- 屏 ---------- */
   function renderScreen(payload) {
     var screen = $('screen');
-    // reply 模式：正文阅读（跟随朗读滚动 + 当前句高亮）。
+    if (payload && payload.mode === 'home' && payload.home) {
+      state.screenMode = 'home';
+      state.reply = null;
+      state.highlightLock = false;
+      $('stage').textContent = '项目 ' + payload.home.total + ' 个 · ' + (payload.home.page.index + 1) + '/' + payload.home.page.total;
+      $('replyBody').innerHTML = '';
+      var homeBody = $('homeBody');
+      homeBody.innerHTML = '';
+      var projects = payload.home.projects || [];
+      for (var pi = 0; pi < projects.length; pi += 1) {
+        var project = projects[pi];
+        var item = document.createElement('div');
+        item.className = 'home-item';
+        var row1 = document.createElement('div');
+        row1.className = 'home-row1';
+        var dot = document.createElement('span');
+        dot.className = 'home-dot ' + (project.status || 'idle');
+        var name = document.createElement('span');
+        name.className = 'name';
+        name.textContent = project.name;
+        row1.appendChild(dot);
+        row1.appendChild(name);
+        var row2 = document.createElement('div');
+        row2.className = 'home-row2';
+        row2.textContent = project.summary || '';
+        item.appendChild(row1);
+        item.appendChild(row2);
+        homeBody.appendChild(item);
+      }
+      screen.className = 'home-mode';
+      return;
+    }
     if (payload && payload.mode === 'reply' && payload.reply) {
+      state.screenMode = 'reply';
       var lockedIndex = state.highlightLock && state.reply ? state.reply.currentIndex : null;
       state.reply = payload.reply;
       if (lockedIndex !== null && payload.reply.sentences.some(function (s) { return s.index === lockedIndex; })) {
@@ -361,6 +405,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       renderReply();
       return;
     }
+    state.screenMode = 'status';
     state.reply = null;
     // 严格按 320×240 规格排版：stage ≤10、标题 ≤28 且单行、正文最多 3 行 ×18 字。
     // 多出来的内容留在事件区，屏幕上不允许出现半行或滚动条。
@@ -1238,19 +1283,25 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var screen = $('screen');
     var dragging = false;
     var lastY = 0;
+    var startX = 0;
+    var startY = 0;
+    var moved = false;
     function swipe(dy, phase) {
-      if (!state.reply) return;
+      if (!state.reply && state.screenMode !== 'home') return;
       send('screen.gesture', { action: 'swipe', dy: dy, phase: phase });
     }
     screen.addEventListener('wheel', function (event) {
-      if (!state.reply) return;
+      if (!state.reply && state.screenMode !== 'home') return;
       event.preventDefault();
       swipe(event.deltaY, 'move');
     }, { passive: false });
     screen.addEventListener('pointerdown', function (event) {
-      if (!state.reply) return;
+      if (!state.reply && state.screenMode !== 'home') return;
       dragging = true;
+      moved = false;
       lastY = event.clientY;
+      startX = event.clientX;
+      startY = event.clientY;
       try { screen.setPointerCapture(event.pointerId); } catch (e) { /* 忽略 */ }
       event.preventDefault();
     });
@@ -1258,12 +1309,18 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       if (!dragging) return;
       var dy = event.clientY - lastY;
       lastY = event.clientY;
+      if (Math.abs(event.clientX - startX) > 5 || Math.abs(event.clientY - startY) > 5) moved = true;
       if (dy !== 0) swipe(dy, 'move');
       event.preventDefault();
     });
-    function endDrag() {
+    function endDrag(event) {
       if (!dragging) return;
       dragging = false;
+      if (!moved && event) {
+        var rect = screen.getBoundingClientRect();
+        send('screen.gesture', { action: 'tap', x: event.clientX - rect.left, y: event.clientY - rect.top });
+        return;
+      }
       swipe(0, 'end');
     }
     screen.addEventListener('pointerup', endDrag);

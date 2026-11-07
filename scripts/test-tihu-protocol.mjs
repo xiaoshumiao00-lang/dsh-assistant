@@ -1181,6 +1181,43 @@ await testAsync('lane：上滑回看历史、下滑回底恢复 follow、新回�
   runtime.dispose()
 })
 
+
+await testAsync('lane：完成 + 10s 回主页；未完成/浏览模式不切', async () => {
+  process.env.TIHU_HOME_AFTER_MS = '60'
+  const records = []
+  for (let i = 1; i <= 6; i += 1) {
+    records.push(cuRecord('session-home-' + i, { live: false, cwd: '/proj' + i, lastPromptAt: 1000 + i, title: '项目 ' + i + ' 的最新进展' }))
+  }
+  const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'home', protocol: '0', sessionId: 'session-home-1' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const emit = (event) => onSessionEvent({ id: 'session-home-1', header: { id: 'session-home-1' } }, event)
+  emit({ type: 'turn/start', data: { turn: 1 } })
+  emit({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '第一句。第二句。' }] } } })
+  emit({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  let screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+  assert.notEqual(screens[screens.length - 1].payload.mode, 'home', '刚回复完还在会话屏')
+  await new Promise((resolve) => setTimeout(resolve, 160))
+  screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+  const home = screens[screens.length - 1].payload
+  assert.equal(home.mode, 'home', '60ms 后回主页')
+  assert.equal(home.home.projects.length, 5, '主页一屏 5 个项目')
+  assert.equal(home.home.page.total, 2, '6 个项目两页')
+  assert.equal(home.home.total, 6)
+  // 未完成不切
+  emit({ type: 'turn/start', data: { turn: 2 } })
+  emit({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '失败句。' }] } } })
+  emit({ type: 'turn/end', data: { turn: 2, reason: { kind: 'error' } } })
+  await new Promise((resolve) => setTimeout(resolve, 160))
+  screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+  assert.notEqual(screens[screens.length - 1].payload.mode, 'home', '未完成不切主页')
+  delete process.env.TIHU_HOME_AFTER_MS
+  runtime.dispose()
+})
+
 /* ---------- 屏幕进度映射 ---------- */
 
 console.log('[tihu] 屏幕进度映射')
