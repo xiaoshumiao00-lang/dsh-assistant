@@ -730,7 +730,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       tts.enqueue(text);
       addEvent('progress', '本地音频未到，已用系统语音兜底');
       startSpeechProgress(charStart, charEnd);
-    }, 15000);
+    }, 60000);
   }
   function fallbackAllSpeech() {
     for (var key in state.ttsFallbacks) {
