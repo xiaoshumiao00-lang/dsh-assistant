@@ -479,6 +479,7 @@ function fakeCtx(overrides = {}) {
       if (id === 'sessionQuery') return overrides.sessionQuery
       if (id === 'sessionProjections') return overrides.sessionProjections
       if (id === 'sessionProjectionCache') return overrides.sessionProjectionCache
+      if (id === 'workspaceRegistry') return overrides.workspaceRegistry
       return undefined
     },
     ...overrides,
@@ -1862,6 +1863,132 @@ await testAsync('lane：别的会话完成入待读气泡，tap 切屏并从头�
   runtime.dispose()
 })
 
+
+/* ---------- 2026-11-07 已定位 bug：鹈鹕首页项目与 DSH 控制室不一致 ----------
+ *
+ * 根因：lane.sendHome 用「会话快照按 cwd 分组」凑项目，而项目卡其实只存在于主客户端。
+ * 于是 D:\dsh-app、C:\Users\Administrator\.dsh\skills 这类「只跑过会话、从没在控制室
+ * 建过项目」的目录成了幽灵项目，控制室里有会话的老项目反倒漏掉。
+ * 真源是宿主 workspace 服务（ctx.get('workspaceRegistry') → list()：id/path/title/
+ * createdAt/updatedAt/sessionIds），首页必须按它列项目、按 updatedAt 倒序排。
+ */
+
+/** 宿主 workspace 实体的形状（每个字段都是 getter，代码不许按 plain object 读）。 */
+function workspaceEntityOf(entry) {
+  return {
+    get id() { return entry.id },
+    get path() { return entry.path },
+    get title() { return entry.title },
+    get createdAt() { return entry.createdAt },
+    get updatedAt() { return entry.updatedAt },
+    get sessionIds() { return [...entry.sessionIds] },
+  }
+}
+
+function workspaceRegistryFixture(entries) {
+  return { list: () => entries.map(workspaceEntityOf) }
+}
+
+/** 右下角 tap（x≥240 且 y≥180）= 立刻回主页：用它重算一次项目清单，不依赖空闲计时器。 */
+async function tapHomeFrame(socket) {
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 300, y: 200 }, 90)))
+  await waitMs(60)
+  const homes = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home')
+  assert.ok(homes.length > 0, '应下发主页屏帧')
+  return homes[homes.length - 1].payload.home
+}
+
+await testAsync('lane：主页项目清单取 workspaceRegistry 真源（标题、updatedAt 倒序、无 cwd 幽灵项目）', async () => {
+  const now = Date.now()
+  const iso = (agoMs) => new Date(now - agoMs).toISOString()
+  const records = [
+    // 控制室里有项目的会话
+    cuRecord('session-a', { preset: 'standard', live: true, cwd: 'D:\\陈潘HBEU\\10：高掺量磷石膏混凝土\\SCI', lastPromptAt: now - 30_000, title: '磷石膏 会话 A' }),
+    cuRecord('session-b', { preset: 'computer-use', cwd: 'D:\\陈潘HBEU\\11：气象桥梁温度场\\paper', lastPromptAt: now - 20 * 60_000, title: '温度场 会话 B' }),
+    cuRecord('session-c', { preset: 'standard', cwd: 'D:\\dsh-assistant', lastPromptAt: now - 30 * 60_000, title: '空闲项目 会话 C' }),
+    // 幽灵：只在某个目录跑过会话，控制室从来没有这个项目
+    cuRecord('session-ghost-app', { preset: 'computer-use', live: true, cwd: 'D:\\dsh-app', lastPromptAt: now - 10_000, title: '只在 dsh-app 跑过会话' }),
+    cuRecord('session-ghost-skills', { preset: 'standard', cwd: 'C:\\Users\\Administrator\\.dsh\\skills', lastPromptAt: now - 10_000, title: '只在 skills 目录跑过会话' }),
+  ]
+  // 首页项目：list() 顺序刻意打乱；「空闲项目」的 updatedAt 最新（不能按 running→done→idle 排）
+  const workspaces = [
+    { id: 'ws-b', path: 'D:\\陈潘HBEU\\11：气象桥梁温度场', title: '桥梁温度场', createdAt: iso(400_000), updatedAt: iso(80_000), sessionIds: ['session-b'] },
+    { id: 'ws-old', path: 'D:\\dsh-assistant\\scripts', title: '最旧项目', createdAt: iso(500_000), updatedAt: iso(300_000), sessionIds: [] },
+    { id: 'ws-a', path: 'D:\\陈潘HBEU\\10：高掺量磷石膏混凝土', title: '磷石膏SCI', createdAt: iso(420_000), updatedAt: iso(40_000), sessionIds: ['session-a'] },
+    { id: 'ws-e', path: 'D:\\dsh-assistant\\src', title: 'GNN-dPINN拓扑优化', createdAt: iso(410_000), updatedAt: iso(120_000), sessionIds: [] },
+    { id: 'ws-c', path: 'D:\\陈潘HBEU\\Desktop\\2027 毕设', title: '空闲项目', createdAt: iso(430_000), updatedAt: iso(3_000), sessionIds: ['session-c'] },
+    { id: 'ws-d', path: 'C:\\Users\\Administrator\\.dsh\\assistant', title: 'assistant', createdAt: iso(440_000), updatedAt: iso(100_000), sessionIds: [] },
+  ]
+  const { runtime, events } = runtimeFor(records, { workspaceRegistry: workspaceRegistryFixture(workspaces) })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'ws-home', protocol: '0', sessionId: 'session-b' }, 1)))
+  await waitMs(40)
+  // session-b 有一条最近的 assistant 回复（该项目该判 done 的依据）
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  onSessionEvent({ id: 'session-b', header: { id: 'session-b' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: '温度场重建：跨中三室箱梁尺寸已定稿。下一步做验证。' }] } },
+  })
+  await waitMs(40)
+
+  const home = await tapHomeFrame(socket)
+  const names = home.projects.map((item) => item.name)
+  assert.deepEqual(
+    names,
+    ['空闲项目', '磷石膏SCI', '桥梁温度场', '个人助手', 'GNN-dPINN拓扑优化'],
+    `项目名与顺序都要来自 workspace.title 与 updatedAt 倒序，实际 ${JSON.stringify(names)}`,
+  )
+  // 没有「只跑过会话、没建过项目」的 cwd 幽灵条目
+  assert.equal(names.includes('dsh-app'), false, 'cwd 为 D:\\dsh-app 的会话不该成为项目')
+  assert.equal(names.includes('skills'), false, 'cwd 为 .dsh\\skills 的会话不该成为项目')
+  // 状态按该项目 sessionIds 对应的会话算（不再用 cwd 前缀匹配猜归属）
+  assert.deepEqual(home.projects.map((item) => item.status), ['idle', 'running', 'done', 'idle', 'idle'], `状态：${JSON.stringify(home.projects.map((item) => item.status))}`)
+  // 摘要仍是「最近回复首句 → 会话名 → 等待新消息」
+  assert.ok(home.projects[2].summary.startsWith('温度场重建'), `摘要取最近回复首句：${home.projects[2].summary}`)
+  assert.equal(home.projects[3].name, '个人助手', 'workspace 标题要保留既有别名（C:\\Users\\Administrator\\.dsh\\assistant）')
+  assert.equal(home.projects[3].summary, '等待新消息', 'workspace 没有会话就只给占位摘要')
+  // 分页与计数字段不变（5 条一页）
+  assert.equal(home.projects.length, 5, '主页一屏 5 个项目')
+  assert.equal(home.total, 6)
+  assert.equal(home.page.total, 2)
+  runtime.dispose()
+})
+
+await testAsync('lane：workspaceRegistry 不可用或 list 抛错时完全回退旧的 cwd 分组', async () => {
+  const now = Date.now()
+  const records = [
+    cuRecord('session-ghost-app', { preset: 'standard', live: true, cwd: 'D:\\dsh-app', lastPromptAt: now - 20_000, title: '只在 dsh-app 跑过会话' }),
+    cuRecord('session-ghost-skills', { preset: 'standard', cwd: 'C:\\Users\\Administrator\\.dsh\\skills', lastPromptAt: now - 20_000, title: '只在 skills 目录跑过会话' }),
+    cuRecord('session-assistant', { preset: 'standard', live: true, cwd: 'C:\\Users\\Administrator\\.dsh\\assistant', lastPromptAt: now - 20_000, title: '宿主工作区会话' }),
+  ]
+  /** 两种兜底来源：拿不到服务（命令行测试环境没有宿主服务）与 list() 抛错。 */
+  const fallbackHome = async (extra) => {
+    const { runtime } = runtimeFor(records, extra)
+    const socket = openLane(runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'ws-fallback', protocol: '0', auto: true }, 1)))
+    await waitMs(60)
+    const homes = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home')
+    const home = homes.length > 0 ? homes[homes.length - 1].payload.home : undefined
+    runtime.dispose()
+    return home
+  }
+  const expected = ['dsh-app', '个人助手', 'skills']
+  for (const [label, extra] of [
+    ['list 抛错', { workspaceRegistry: { list: () => { throw new Error('workspace store broken') } } }],
+    ['服务不存在', {}],
+    ['服务没有 list 函数', { workspaceRegistry: { resolveByPath: () => undefined } }],
+  ]) {
+    const home = await fallbackHome(extra)
+    assert.ok(home !== undefined, `${label}：应下发主页屏帧`)
+    const names = home.projects.map((item) => item.name)
+    assert.equal(names.length, 3, `${label}：回退到 cwd 分组应得 3 个项目，实际 ${JSON.stringify(names)}`)
+    for (const name of expected) assert.ok(names.includes(name), `${label}：应含 cwd 兜底命名的「${name}」，实际 ${JSON.stringify(names)}`)
+    assert.equal(names.includes('桥梁温度场'), false, `${label}：不得用到 workspace 标题`)
+    assert.equal(home.projects[0].status, 'running', `${label}：回退仍按 running→done→idle 排序`)
+    assert.equal(home.projects.filter((item) => item.status === 'running').length, 2, `${label}：两条 live 会话都是 running`)
+    assert.equal(home.total, 3, `${label}：回退的总数按 cwd 分组`)
+  }
+})
 
 test('主页项目聚合：同 cwd 合并、摘要人话、三态状态', () => {
   const now = 1_000_000
