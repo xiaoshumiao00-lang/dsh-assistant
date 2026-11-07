@@ -205,8 +205,10 @@ export interface TihuProgressState {
   lastOutput: string
   /** 阶段汉字（第二行冒号前：思考/执行命令/搜索…）。 */
   stageWord: string
-  /** 第二行的第一句内容。 */
+  /** 第二行的第一句内容（旧字段，只给事件区用）。 */
   firstLine: string
+  /** 屏上明细条目（最近几条，最新的在最后）。 */
+  activity: TihuActivityEntry[]
   /** 会话标题（第一行）。 */
   sessionTitle: string
   /** 第四行：解码速度 / 总 token / 上下文占比。 */
@@ -217,7 +219,7 @@ export interface TihuProgressState {
 }
 
 export function createProgressState(now = Date.now()): TihuProgressState {
-  return { turn: 0, step: 0, turnStartedAt: now, lastResult: undefined, lastOutput: '', stageWord: '思考', firstLine: '', sessionTitle: '', stage: '思考', title: '等待指令', tone: 'idle' }
+  return { turn: 0, step: 0, turnStartedAt: now, lastResult: undefined, lastOutput: '', stageWord: '思考', firstLine: '', activity: [], sessionTitle: '', stage: '思考', title: '等待指令', tone: 'idle' }
 }
 
 export interface ProgressUpdate {
@@ -242,14 +244,6 @@ export function salientCommand(command: string): string {
   return cleaned === '' ? last : cleaned
 }
 
-/** 活动行（第二行冒号后）该写什么：命令取最有用的一段，其它工具去掉动词只看目标。 */
-function activityLine(stage: string, title: string, detail: string): string {
-  if (stage === '跑命令') return salientCommand(detail || title)
-  const text = String(title ?? '').trim()
-  const spaceAt = text.indexOf(' ')
-  return spaceAt > 0 ? text.slice(spaceAt + 1).trim() : text
-}
-
 /** 第一句话：去掉多余空白、压成一行（放不下由 clipText 收省略号）。 */
 function firstSentence(value: unknown): string {
   const text = String(value ?? '').replace(/\s+/g, ' ').trim()
@@ -267,26 +261,112 @@ export function formatTokens(value: number): string {
 }
 
 /**
- * 屏上四行（用户 2026-11-07 定的格式）：
+ * 屏上「明细条目」：`标签 · 明细`（照桌面端活动列表的样子）。
+ */
+export interface TihuActivityEntry {
+  label: string
+  detail: string
+}
+
+/** 工具名 → 屏上标签（照 DSH 桌面端叫法：运行命令 / 查找文件 / 搜索文件内容…）。 */
+const ENTRY_RULES: ReadonlyArray<{ pattern: RegExp; label: string; keys: readonly string[] }> = [
+  { pattern: /^(pwsh|powershell|bash|shell|terminal|exec|run_command|cmd)$/, label: '运行命令', keys: ['command', 'cmd', 'script', 'input'] },
+  { pattern: /^(glob|find|list_files?|ls|list_dir|tree)$/, label: '查找文件', keys: ['pattern', 'glob', 'query', 'path'] },
+  { pattern: /^(grep|search|select-string)$/, label: '搜索文件内容', keys: ['pattern', 'query', 'q', 'keyword'] },
+  { pattern: /^(read|read_file|readfile|view_file|cat|open_file)$/, label: '读文件', keys: ['path', 'file_path', 'file'] },
+  { pattern: /^(write|write_file|writefile|create_file|save_file)$/, label: '写文件', keys: ['path', 'file_path', 'file'] },
+  { pattern: /^(edit|multiedit|apply_patch|str_replace|patch|update_file)$/, label: '改文件', keys: ['path', 'file_path', 'file'] },
+  { pattern: /^(web_search|websearch)$/, label: '网页搜索', keys: ['query', 'q'] },
+  { pattern: /^(web_fetch|webfetch|fetch|browse)$/, label: '网页获取', keys: ['url'] },
+  { pattern: /^(todo|todo_write|update_plan|plan)$/, label: '更新任务', keys: ['text', 'message', 'title', 'todos'] },
+  { pattern: /^(code_agent|task|subagent)$/, label: '派子任务', keys: ['task', 'prompt'] },
+  { pattern: /^(ask_user_question|confirm)$/, label: '等确认', keys: ['question', 'title'] },
+]
+
+/** 参数原文只做空白清理：星号（glob）、斜杠都必须留着。 */
+function sanitizeDetail(value: unknown): string {
+  return String(value ?? '').replace(/`/g, '').replace(/\s+/g, ' ').trim()
+}
+
+/** 一条工具调用 → 屏上明细条目（标签 + 参数原文）。 */
+export function activityEntryOf(name: string, args: unknown): TihuActivityEntry {
+  const tool = String(name ?? '').trim()
+  const lower = tool.toLowerCase()
+  const params = asRecord(args)
+  for (const rule of ENTRY_RULES) {
+    if (!rule.pattern.test(lower)) continue
+    let detail = firstString(params, rule.keys)
+    if (rule.label === '运行命令') detail = salientCommand(detail)
+    else if (rule.label === '读文件' || rule.label === '写文件' || rule.label === '改文件') detail = baseNameOf(detail) || detail
+    return { label: rule.label, detail: sanitizeDetail(detail) }
+  }
+  const tail = firstString(params, ['query', 'command', 'path', 'pattern', 'url', 'text', 'message', 'task', 'prompt'])
+  return { label: '工具', detail: sanitizeDetail([tool, tail].filter(Boolean).join(' ')) }
+}
+
+/** 明细最多留几条（屏上只显示最后两条）。 */
+const ACTIVITY_MAX = 8
+
+function pushActivity(state: TihuProgressState, label: string, detail: string): void {
+  const entry: TihuActivityEntry = { label, detail: sanitizeDetail(detail) }
+  const last = state.activity[state.activity.length - 1]
+  if (last !== undefined && last.label === entry.label && last.detail === entry.detail) return
+  state.activity.push(entry)
+  if (state.activity.length > ACTIVITY_MAX) state.activity.splice(0, state.activity.length - ACTIVITY_MAX)
+}
+
+/** 明细 → 一行 `标签 · 明细`（超宽按像素省略）。 */
+function entryLine(entry: TihuActivityEntry): string {
+  const text = entry.detail === '' ? entry.label : entry.label + ' · ' + entry.detail
+  return fitLine(text, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
+}
+
+/** 第四行统计（解码速度 · 总 token · 上下文）。 */
+function statsLine(stats: TihuProgressState['stats']): string {
+  if (stats === undefined) return ''
+  const parts: string[] = []
+  if (stats.tokPerSec > 0) parts.push(stats.tokPerSec.toFixed(0) + ' tok/s')
+  parts.push(stats.totalTokens > 0 ? formatTokens(stats.totalTokens) + ' tok' : 'tok —')
+  parts.push('上下文 ' + stats.contextPercent.toFixed(0) + '%')
+  return parts.join(' · ')
+}
+
+/** 第四行压缩版（两条明细时用，要一行放得下）。 */
+function statsCompact(stats: TihuProgressState['stats']): string {
+  if (stats === undefined) return '统计中…'
+  return [
+    stats.tokPerSec > 0 ? stats.tokPerSec.toFixed(0) + ' tok/s' : '',
+    stats.totalTokens > 0 ? formatTokens(stats.totalTokens) : '',
+    stats.contextPercent.toFixed(0) + '%',
+  ].filter(Boolean).join(' · ')
+}
+
+/**
+ * 屏上四行（用户 2026-11-07 定格式，2026-11-08 改成明细条目版）：
  *   1 会话标题（title 大字）
- *   2 阶段词：第一句内容（放不下省略）
- *   3 第 x 步 · 已用 xx
- *   4 解码速度 · 总 token · 上下文占比
+ *   2 上一条明细（`标签 · 明细`，照桌面端活动列表：运行命令 / 查找文件 / 思考…）
+ *   3 最新一条明细
+ *   4 步数 + 用时 + 解码速度 + 总 token + 上下文
+ * 只攒到一条明细时退回「明细 / 第 x 步·已用 / 统计」三行，不留空行。
  */
 function statusFrame(state: TihuProgressState, now: number): ScreenFramePayload {
-  const word = STAGE_WORD[state.stageWord] ?? state.stageWord ?? '思考'
-  const head = word + '：'
-  const body = clipText(state.firstLine, Math.max(6, TIHU_LINE_CHARS - [...head].length))
-  const line2 = body === '' ? head.replace(/：$/, '') : head + body
-  const line3 = '第 ' + state.step + ' 步 · 已用 ' + formatElapsed(now - state.turnStartedAt)
-  const stats = state.stats
-  const line4 = stats === undefined
-    ? '统计中…'
-    : (stats.tokPerSec > 0 ? stats.tokPerSec.toFixed(0) + ' tok/s · ' : '') + (stats.totalTokens > 0 ? formatTokens(stats.totalTokens) + ' tok' : 'tok —') + ' · 上下文 ' + stats.contextPercent.toFixed(0) + '%'
+  const elapsed = formatElapsed(now - state.turnStartedAt)
+  const recent = state.activity.slice(-2).map(entryLine)
+  const stepLine = '第 ' + state.step + ' 步 · 已用 ' + elapsed
+  const stats = statsLine(state.stats)
+  let bullets: string[]
+  if (recent.length >= 2) {
+    // 第二、三行：最近两条明细；第四行：步数用时与统计合并。
+    bullets = [recent[recent.length - 2], recent[recent.length - 1], state.step + ' 步 ' + elapsed + ' · ' + statsCompact(state.stats)]
+  } else if (recent.length === 1) {
+    bullets = [recent[0], stepLine, stats === '' ? '统计中…' : stats]
+  } else {
+    bullets = [stepLine, stats === '' ? '统计中…' : stats]
+  }
   return {
     stage: '',
     title: clipText(state.sessionTitle || state.title, TIHU_TITLE_CHARS),
-    bullets: [line2, line3, line4].map((line) => clipText(line, TIHU_LINE_CHARS)).slice(0, SCREEN_SPEC.maxBodyLines),
+    bullets: bullets.map((line) => fitLine(line, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)).slice(0, SCREEN_SPEC.maxBodyLines),
     tone: state.tone,
   }
 }
@@ -299,6 +379,27 @@ function messageText(message: unknown): string {
     .map((block) => String(asRecord(block).text ?? ''))
     .join('\n')
     .trim()
+}
+
+/** 模型思考文本：优先 message.content 里的 thinking 块，其次 stream 的 reasoning-chunks。 */
+function reasoningText(data: Record<string, unknown>): string {
+  const message = asRecord(data.message)
+  const content = Array.isArray(message.content) ? message.content : []
+  const parts: string[] = []
+  for (const block of content) {
+    const item = asRecord(block)
+    if (item.type !== 'thinking' && item.type !== 'reasoning') continue
+    const text = typeof item.thinking === 'string' ? item.thinking : typeof item.text === 'string' ? item.text : typeof item.reasoning === 'string' ? item.reasoning : ''
+    if (text.trim() !== '') parts.push(text)
+  }
+  if (parts.length === 0) {
+    const stream = Array.isArray(data.stream) ? data.stream : []
+    for (const record of stream) {
+      const item = asRecord(record)
+      if (item.type === 'reasoning-chunks' && Array.isArray(item.texts)) parts.push(item.texts.map(String).join(''))
+    }
+  }
+  return parts.join(' ').replace(/\s+/g, ' ').trim()
 }
 
 /** 把一条 session 事件映射成屏帧/事件行；原地更新 state（便于 lane 按会话保存）。 */
@@ -323,6 +424,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.turnStartedAt = now
     state.lastResult = undefined
     state.lastOutput = ''
+    state.activity = []
     state.stage = '思考'
     state.title = '开始新一轮'
     state.stageWord = '思考'
@@ -339,7 +441,6 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.stage = '思考'
     state.title = '思考下一步'
     state.stageWord = '思考'
-    if (state.firstLine === '') state.firstLine = '整理下一步'
     state.tone = 'busy'
     return {
       screen: statusFrame(state, now),
@@ -355,7 +456,8 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.stage = action.stage
     state.title = action.title
     state.stageWord = action.stage
-    state.firstLine = firstSentence(activityLine(action.stage, action.title, action.detail) || action.title)
+    const item = activityEntryOf(name, args)
+    pushActivity(state, item.label, item.detail)
     state.tone = 'busy'
     return {
       screen: statusFrame(state, now),
@@ -373,6 +475,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     const summary = summarizeToolResult(text, isError)
     state.lastResult = { ok: !isError, line: summary.line }
     state.lastOutput = summary.output
+    if (isError) pushActivity(state, '出错', humanizeError(text))
     state.tone = isError ? 'alert' : 'ok'
     return {
       screen: statusFrame(state, now),
@@ -384,6 +487,8 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
   }
 
   if (type === 'assistant/message') {
+    const thought = reasoningText(data)
+    if (thought !== '') pushActivity(state, '思考', firstSentence(thought))
     const text = messageText(data.message)
     if (text === '') return {}
     const lines = text.split(/\r?\n/).map((line) => sanitizeScreenLine(line)).filter(Boolean)
@@ -391,6 +496,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.stage = '回答'
     state.stageWord = '回答'
     state.firstLine = firstSentence(firstLine)
+    pushActivity(state, '回答', firstSentence(firstLine))
     state.title = clipText(`回答 ${firstLine}`, TIHU_TITLE_CHARS)
     state.lastResult = { ok: true, line: '✓ 已生成回复' }
     // 第 3 行保持「最近一条工具输出尾行」，不被回答正文覆盖（回答正文进事件区）。

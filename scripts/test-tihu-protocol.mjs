@@ -2001,7 +2001,7 @@ test('进度状态机：步骤递增、失败 tone=alert、完成帧保留、正
   // 新版四行格式：第一行会话标题、第二行「阶段词：第一句」、第三行步骤用时、第四行统计
   assert.equal(call1.screen.stage, '')
   assert.equal(call1.screen.title, '读取 a.ts')
-  assert.ok(call1.screen.bullets[0].startsWith('读取文件：'), '第二行以阶段词打头：' + call1.screen.bullets[0])
+  assert.equal(call1.screen.bullets[0], '读文件 · a.ts', '第二行是明细条目：' + call1.screen.bullets[0])
   assert.ok(call1.screen.bullets[1].includes('第 1 步'), '第三行带步骤号：' + call1.screen.bullets[1])
   assert.equal(call1.screen.bullets[2], '统计中…')
   push({ type: 'tool/result', data: { turn: 7, step: 1, message: { content: [{ type: 'text', text: 'const a = 1\n第二个文件结尾' }], isError: false } } }, 4000)
@@ -2013,7 +2013,7 @@ test('进度状态机：步骤递增、失败 tone=alert、完成帧保留、正
   push({ type: 'step/start', data: { turn: 7, step: 2 } }, 5000)
   const call2 = push({ type: 'tool/call', data: { turn: 7, step: 2, name: 'pwsh', arguments: { command: 'Remove-Item -Recurse -Force build-with-a-very-long-name-here' } } }, 6000)
   assert.equal(call2.screen.stage, '')
-  assert.ok(call2.screen.bullets[0].startsWith('执行命令：'), '第二行以阶段词打头：' + call2.screen.bullets[0])
+  assert.ok(call2.screen.bullets[1].startsWith('运行命令 · Remove-Item'), '第三行是最新明细：' + call2.screen.bullets[1])
   push({ type: 'tool/result', data: { turn: 7, step: 2, message: { content: [{ type: 'text', text: '拒绝访问：文件被占用（详细信息在日志里）' }], isError: true } } }, 7000)
   assert.equal(state.tone, 'alert')
   assert.ok(state.lastResult.line.startsWith('✗'))
@@ -2022,7 +2022,7 @@ test('进度状态机：步骤递增、失败 tone=alert、完成帧保留、正
   // 回答
   const answer = push({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '第一行回答\n最后一行是输出尾行' }] } } }, 8000)
   assert.equal(answer.screen.stage, '')
-  assert.ok(answer.screen.bullets[0].startsWith('回答：'), '第二行以阶段词打头：' + answer.screen.bullets[0])
+  assert.ok(answer.screen.bullets[1].startsWith('回答 · 第一行回答'), '最新明细在第三行：' + answer.screen.bullets[1])
   assert.ok(answer.screen.bullets.length <= SCREEN_SPEC.maxBodyLines)
   for (const line of answer.screen.bullets) assert.ok(measureTextPx(line, SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX, `行超宽：${line}`)
 
@@ -2061,6 +2061,63 @@ test('屏幕文本按像素截断：标题 ≤304px，正文按宽度折行', ()
   assert.equal(fenced.line, '✓ 结果行')
 })
 
+test('进度屏：步骤开始时不再把上一轮内容顶到「思考」下面（残留 bug 回归）', () => {
+  const state = createProgressState(1000)
+  applySessionEvent(state, { type: 'turn/start', data: { turn: 2 } }, 1000)
+  applySessionEvent(state, { type: 'step/start', data: { turn: 2, step: 1 } }, 1000)
+  const edit = applySessionEvent(state, { type: 'tool/call', data: { turn: 2, step: 1, name: 'edit', arguments: { file_path: 'D:/dsh-assistant/src/tihu/lane.ts' } } }, 2000)
+  assert.equal(edit.screen.bullets[0], '改文件 · lane.ts')
+  const next = applySessionEvent(state, { type: 'step/start', data: { turn: 2, step: 2 } }, 3000)
+  assert.equal(next.screen.bullets[0], '改文件 · lane.ts', '步骤开始不该改写上一条明细：' + next.screen.bullets[0])
+  assert.ok(!next.screen.bullets.some((line) => line.startsWith('思考：')), '不应出现「思考：<上一轮内容>」：' + next.screen.bullets.join(' / '))
+})
+
+test('进度屏：明细条目格式「标签 · 明细」，跑命令取真正干活的一段', () => {
+  const state = createProgressState(1000)
+  applySessionEvent(state, { type: 'turn/start', data: { turn: 3 } }, 1000)
+  const call = applySessionEvent(state, { type: 'tool/call', data: { turn: 3, step: 1, name: 'pwsh', arguments: { command: 'Set-Location "D:\\dsh-assistant"; node scripts/test-tihu-protocol.mjs 2>&1 | Select-Object -Last 3' } } }, 2000)
+  assert.ok(call.screen.bullets[0].startsWith('运行命令 · node scripts/test-tihu-prot'), '明细：' + call.screen.bullets[0])
+  assert.ok(measureTextPx(call.screen.bullets[0], SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX)
+  const glob = applySessionEvent(state, { type: 'tool/call', data: { turn: 3, step: 1, name: 'glob', arguments: { pattern: '**/*tihu*' } } }, 3000)
+  assert.equal(glob.screen.bullets[1], '查找文件 · **/*tihu*', '第二条明细：' + glob.screen.bullets[1])
+  const grep = applySessionEvent(state, { type: 'tool/call', data: { turn: 3, step: 1, name: 'grep', arguments: { pattern: 'TIHU_SYNTH_MAX_INFLIGHT' } } }, 4000, { stats: { tokPerSec: 137, totalTokens: 586600, contextPercent: 26 } })
+  assert.ok(grep.screen.bullets[1].startsWith('搜索文件内容 · TIHU_SYNTH_MAX'), '第三条明细：' + grep.screen.bullets[1])
+  for (const line of grep.screen.bullets) assert.ok(measureTextPx(line, SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX, '行超宽：' + line)
+  assert.equal(grep.screen.bullets.length, 3, '两条明细 + 合并统计行')
+  assert.ok(grep.screen.bullets[2].includes('步') && grep.screen.bullets[2].includes('%'), '第四行合并步数与统计：' + grep.screen.bullets[2])
+  assert.ok(grep.screen.bullets[2].includes('tok/s'), '第四行带解码速度：' + grep.screen.bullets[2])
+  assert.ok(measureTextPx(grep.screen.bullets[2], SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX, '第四行超宽：' + grep.screen.bullets[2])
+})
+
+test('进度屏：思考条目取模型 thinking 文本的第一句', () => {
+  const state = createProgressState(1000)
+  applySessionEvent(state, { type: 'turn/start', data: { turn: 4 } }, 1000)
+  const frame = applySessionEvent(state, {
+    type: 'assistant/message',
+    data: {
+      message: { content: [{ type: 'thinking', thinking: 'Let me start by exploring the repository layout. Then I will patch lane.ts.' }, { type: 'text', text: '先看一下目录结构。' }] },
+    },
+  }, 2000)
+  assert.ok(frame.screen.bullets[0].startsWith('思考 · Let me start by exploring'), '思考明细：' + frame.screen.bullets[0])
+  assert.ok(frame.screen.bullets[1].startsWith('回答 · '), '回答明细：' + frame.screen.bullets[1])
+})
+
+test('进度屏：工具失败记一条「出错」明细', () => {
+  const state = createProgressState(1000)
+  applySessionEvent(state, { type: 'turn/start', data: { turn: 5 } }, 1000)
+  applySessionEvent(state, { type: 'tool/call', data: { turn: 5, step: 1, name: 'pwsh', arguments: { command: 'Get-ChildItem C:/nope' } } }, 2000)
+  const bad = applySessionEvent(state, { type: 'tool/result', data: { turn: 5, step: 1, message: { content: [{ type: 'text', text: 'ENOENT: no such file or directory' }], isError: true } } }, 3000)
+  assert.equal(bad.screen.bullets[1], '出错 · 命令没找到', '出错明细：' + bad.screen.bullets[1])
+})
+
+test('进度屏：新的一轮清空上一轮明细', () => {
+  const state = createProgressState(1000)
+  applySessionEvent(state, { type: 'turn/start', data: { turn: 1 } }, 1000)
+  applySessionEvent(state, { type: 'tool/call', data: { turn: 1, step: 1, name: 'read', arguments: { file_path: 'a.ts' } } }, 2000)
+  const fresh = applySessionEvent(state, { type: 'turn/start', data: { turn: 2 } }, 3000)
+  assert.ok(!fresh.screen.bullets.some((line) => line.includes('读文件')), '新一轮不带上一轮明细：' + fresh.screen.bullets.join(' / '))
+})
+
 await testAsync('lane：执行事件生成有料的屏幕帧（读文件→跑命令→回答→完成）', async () => {
   const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true })])
   const socket = openLane(runtime)
@@ -2077,7 +2134,7 @@ await testAsync('lane：执行事件生成有料的屏幕帧（读文件→跑�
   await new Promise((resolve) => setTimeout(resolve, 20))
 
   const screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame').map((frame) => frame.payload)
-  assert.ok(screens.some((frame) => frame.bullets[0] === '读取文件：README.md'), '第二行应显示读取文件：README.md')
+  assert.ok(screens.some((frame) => frame.bullets[0] === '读文件 · README.md'), '第二行应显示「读文件 · README.md」')
   // 屏上不再显示命令状态/输出尾行，只留四行：标题、阶段行、步骤行、统计行
   const statusFrames = screens.filter((frame) => (frame.mode ?? 'status') === 'status')
   assert.ok(statusFrames.length > 0, '应有状态帧')
@@ -2122,7 +2179,8 @@ test('真机屏幕规格：320×240 常量 + 标题/正文截断', () => {
   assert.ok([...fittedCjk].length >= 18 && [...fittedCjk].length <= 20)
   const asciiCapacity = [...Array(80)].map(() => 'A').join('')
   const fittedAscii = fitLine(asciiCapacity, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
-  assert.ok([...fittedAscii].length > 30, 'ASCII 一行应容纳 30+ 字符')
+  // 大写字母按 0.62em 估（实测真实字体比 0.47em 宽，按 0.47 估会让行在浏览器里折成两行）
+  assert.ok([...fittedAscii].length > 28, 'ASCII 一行应容纳 28+ 字符：' + [...fittedAscii].length)
   assert.ok(measureTextPx(fittedAscii, SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX)
 
   // 5 行正文只保留前 3 行，每行 ≤18 字

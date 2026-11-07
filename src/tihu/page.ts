@@ -64,7 +64,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .title { font-size:18px; font-weight:700; line-height:22px;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen ul { margin:0; padding:0; list-style:none; font-size:16px; line-height:20px; color:#c3ccd5; }
-  #screen ul li { white-space:normal; overflow-wrap:anywhere; }
+  #screen ul li { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen .reply-body { display:none; flex:1; overflow:hidden; font-size:16px; line-height:20px; color:#d9e2ea; }
   #screen .reply-line { white-space:nowrap; overflow:hidden; }
   #screen .reply-line.cur { background:var(--accent); color:#04110f; border-radius:3px; }
