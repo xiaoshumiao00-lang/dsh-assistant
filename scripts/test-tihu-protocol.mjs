@@ -92,10 +92,28 @@ console.log('[tihu] 协议 v0')
 
 test('版本号与类型清单固定', () => {
   assert.equal(TIHU_PROTOCOL_VERSION, '0')
-  assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'session.end', 'ping'])
-  assert.equal(TIHU_DOWNSTREAM_TYPES.length, 8)
+  assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'session.end', 'sessions.query', 'session.bind', 'ping'])
+  assert.equal(TIHU_DOWNSTREAM_TYPES.length, 11)
+  assert.ok(TIHU_DOWNSTREAM_TYPES.includes('sessions.list'))
+  assert.ok(TIHU_DOWNSTREAM_TYPES.includes('session.bound'))
+  assert.ok(TIHU_DOWNSTREAM_TYPES.includes('session.invalid'))
   assert.equal(TIHU_PAGE_PATH, '/tihu')
   assert.equal(TIHU_LANE_PATH, '/tihu/lane')
+})
+
+test('sessions.query / session.bind：字段合法才收，越界一律忽略', () => {
+  const query = buildUpstream('sessions.query', { limit: 20, checkId: 'session-abc' }, 10)
+  assert.ok(parseUpstream(JSON.stringify(query)) !== null)
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('sessions.query', {}, 11))) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('sessions.query', { limit: 0 }, 12))), null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('sessions.query', { limit: 51 }, 13))), null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('sessions.query', { limit: 'x' }, 14))), null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('sessions.query', { checkId: 42 }, 15))), null)
+
+  const bind = buildUpstream('session.bind', { sessionId: 'session-abc' }, 16)
+  assert.ok(parseUpstream(JSON.stringify(bind)) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('session.bind', {}, 17))), null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('session.bind', { sessionId: '' }, 18))), null)
 })
 
 test('hello：合法信封通过，多余字段保留（字段只增不删）', () => {
@@ -377,6 +395,8 @@ function fakeCtx(overrides = {}) {
     get(id) {
       if (id === 'agents') return { get: (sessionId) => sessionId === 'session-1' ? { followup: (message) => injected.push(message) } : undefined }
       if (id === 'speechController') return { transcribe: async () => '读一下 README' }
+      if (id === 'sessions') return overrides.sessions
+      if (id === 'sessionQuery') return overrides.sessionQuery
       return undefined
     },
     ...overrides,
@@ -397,6 +417,12 @@ await testAsync('页面 HTML 包含 lane 地址与屏幕区', async () => {
   assert.ok(html.includes('鹈鹕'))
   assert.ok(html.includes('speechSynthesis'))
   assert.ok(html.includes('audio.frame'))
+  // 2026-11-07 P0：公网 origin 下页面要能自己选会话（会话记忆只存本 origin 的 key）
+  assert.ok(html.includes('dsh.tihu.session'), '页面要使用自己的会话 key')
+  assert.ok(html.includes('sessions.query'), '页面要主动向宿主拉会话列表')
+  assert.ok(html.includes('session.bind'), '页面点选后要能绑定会话')
+  assert.ok(html.includes('还没有选定会话，点下面选一个'), '文案要可操作')
+  assert.ok(html.includes('结束本次语音会话'), '保留结束本次语音会话按钮')
   runtime.dispose()
 })
 
@@ -452,6 +478,91 @@ await testAsync('lane：没有会话时 text.input 只提示，不注入', async
   socket.emit('data', clientFrame(buildUpstream('text.input', { text: '你好' }, 1)))
   await new Promise((resolve) => setTimeout(resolve, 20))
   assert.equal(injected.length, 0)
+  runtime.dispose()
+})
+
+/* ---------- 2026-11-07 P0：页面自建会话选择（公网 origin 下不报「还没有会话」） ---------- */
+
+/** 把 fake socket 的帧解析成 JSON 数组。 */
+function framesOf(socket) {
+  return socket.frames().map((line) => { try { return JSON.parse(line) } catch { return null } }).filter(Boolean)
+}
+
+function sessionQueryFixture(records) {
+  return {
+    listSessions: async () => records,
+    readTitleSnapshots: async (ids) => ids.map((id) => ({ session: { id }, title: { title: '标题:' + id } })),
+  }
+}
+
+await testAsync('lane：sessions.query 返回最近 N 条（live 优先、带标题、核对 checkId）', async () => {
+  const records = [
+    { header: { id: 'session-old', createdAt: 1000, cwd: '/w' }, live: false, persisted: true },
+    { header: { id: 'session-new', createdAt: 3000, cwd: '/w' }, live: false, persisted: true },
+    { header: { id: 'session-live', createdAt: 500, cwd: '/w' }, live: true, persisted: true },
+  ]
+  const { ctx } = fakeCtx({ sessionQuery: sessionQueryFixture(records) })
+  const runtime = createTihuRuntime(ctx, { log: () => {} })
+  const socket = new FakeSocket()
+  runtime.handleUpgrade({ url: '/tihu/lane', headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' }, socket: {} }, socket, Buffer.alloc(0))
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'c1', protocol: '0' }, 1)))
+  socket.emit('data', clientFrame(buildUpstream('sessions.query', { limit: 2, checkId: 'session-new' }, 2)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+
+  const list = framesOf(socket).find((frame) => frame.type === 'sessions.list')
+  assert.ok(list, '应下发 sessions.list')
+  assert.equal(list.payload.total, 3)
+  assert.equal(list.payload.source, 'sessionQuery')
+  assert.equal(list.payload.sessions.length, 2)
+  assert.equal(list.payload.sessions[0].sessionId, 'session-live', '在线会话排最前')
+  assert.equal(list.payload.sessions[1].sessionId, 'session-new')
+  assert.equal(list.payload.sessions[0].title, '标题:session-live')
+  assert.deepEqual(list.payload.check, { sessionId: 'session-new', found: true })
+  runtime.dispose()
+})
+
+await testAsync('lane：hello 带一个不存在的会话 → session.invalid，页面不会被绑死', async () => {
+  const records = [{ header: { id: 'session-new', createdAt: 3000, cwd: '/w' }, live: false, persisted: true }]
+  const { ctx } = fakeCtx({ sessionQuery: sessionQueryFixture(records) })
+  const runtime = createTihuRuntime(ctx, { log: () => {} })
+  const socket = new FakeSocket()
+  runtime.handleUpgrade({ url: '/tihu/lane', headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' }, socket: {} }, socket, Buffer.alloc(0))
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'c2', protocol: '0', sessionId: 'session-404' }, 1)))
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '你好' }, 2)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+
+  const frames = framesOf(socket)
+  const invalid = frames.find((frame) => frame.type === 'session.invalid')
+  assert.ok(invalid, '应下发 session.invalid')
+  assert.equal(invalid.payload.sessionId, 'session-404')
+  assert.ok(invalid.payload.reason.includes('不存在'), invalid.payload.reason)
+  assert.equal(invalid.payload.showPicker, true)
+  // 绑定失败后 text.input 不能再注入（会话没绑上）→ 只提示「还没有选定会话」
+  assert.ok(frames.some((frame) => frame.type === 'event.alert' && String(frame.payload.text).includes('还没有选定会话')))
+  runtime.dispose()
+})
+
+await testAsync('lane：session.bind 成功 → session.bound，随后 text.input 正常注入', async () => {
+  const records = [{ header: { id: 'session-1', createdAt: 3000, cwd: '/w' }, live: true, persisted: true }]
+  const { ctx, injected } = fakeCtx({ sessionQuery: sessionQueryFixture(records) })
+  const runtime = createTihuRuntime(ctx, { log: () => {} })
+  const socket = new FakeSocket()
+  runtime.handleUpgrade({ url: '/tihu/lane', headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' }, socket: {} }, socket, Buffer.alloc(0))
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'c3', protocol: '0' }, 1)))
+  socket.emit('data', clientFrame(buildUpstream('session.bind', { sessionId: 'session-1' }, 2)))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const bound = framesOf(socket).find((frame) => frame.type === 'session.bound')
+  assert.ok(bound, '应下发 session.bound')
+  assert.equal(bound.payload.sessionId, 'session-1')
+  assert.equal(bound.payload.title, '标题:session-1')
+  assert.equal(bound.payload.live, true)
+  // 屏上要显示当前会话名（绑定成功的反馈）
+  assert.ok(framesOf(socket).some((frame) => frame.type === 'screen.frame' && frame.payload.title.includes('标题:session-1')))
+
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '读一下 README', source: 'keyboard' }, 3)))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(injected.length, 1)
+  assert.equal(injected[0].content[0].text, '读一下 README')
   runtime.dispose()
 })
 

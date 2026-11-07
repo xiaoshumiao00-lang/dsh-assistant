@@ -46,6 +46,9 @@ import {
   type HelloPayload,
   type ProgressPayload,
   type ScreenFramePayload,
+  type SessionBoundPayload,
+  type SessionInvalidPayload,
+  type SessionsListPayload,
   type TranscriptPayload,
   type TtsTextPayload,
 } from './protocol.ts'
@@ -144,6 +147,20 @@ function sessionIdOfAgent(agent: any): string | undefined {
   return sessionIdOf(agent?.session) ?? (typeof agent?.sessionId === 'string' ? agent.sessionId : undefined)
 }
 
+/** 屏上/提示里用的短会话 id（`session-98bb83cb-…` → `98bb83cb`）。 */
+function shortSessionId(sessionId: string): string {
+  return sessionId.replace(/^session-/, '').slice(0, 8) || sessionId.slice(0, 8)
+}
+
+/** 选择器一行（宿主内部形状；下发时映射成协议的 SessionChoice）。 */
+interface TihuSessionRow {
+  sessionId: string
+  title: string
+  cwd?: string
+  createdAt?: number
+  live: boolean
+}
+
 /** 构造一条普通用户消息（与 turn-guard 的 buildUserMessage 同形状）。 */
 export function buildTihuUserMessage(text: string): any {
   return {
@@ -207,6 +224,241 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       ...(frame.progress === undefined ? {} : { progress: frame.progress }),
       tone: frame.tone ?? 'idle',
     } satisfies ScreenFramePayload)
+  }
+
+  /* ---------- 会话列表（页面自建选择器；复用宿主的 sessionQuery） ----------
+   *
+   * 2026-11-07 P0：公网 origin 的 localStorage 里没有 `dsh.sessions.current`
+   * （按 origin 隔离），页面因此报「还没有会话」。这里给页面一条**自己选会话**的
+   * 路：复用骨架里已有的会话列表服务 `ctx.sessionQuery`（手机端会话列表同源），
+   * 不新造一套会话索引；拿不到这个服务时退回 `ctx.sessions.list()` 的在线会话。
+   */
+
+  /** 列表缓存：hello 校验与选择器查询共用，60 秒内不重复列（避免每次开页都全量扫）。 */
+  let sessionListCache: { at: number; rows: TihuSessionRow[]; source: 'sessionQuery' | 'live' } | undefined
+  const SESSION_LIST_TTL_MS = 60_000
+  /** 标题缓存：readTitleSnapshots 要读日志，同一会话 60 秒内只读一次。 */
+  const titleCache = new Map<string, { at: number; title: string }>()
+
+  /**
+   * 从**投影缓存**里读会话名：与手机端会话列表同一个数据源（`sessionProjections` /
+   * `sessionProjectionCache` 的 `title` 列），不读会话日志，几百条也是毫秒级。
+   */
+  function cachedTitleOf(source: any): string {
+    const readValue = (block: any): string => {
+      const value = block?.values?.title
+      if (typeof value === 'string') return value
+      if (value !== null && typeof value === 'object' && typeof value.title === 'string') return value.title
+      return ''
+    }
+    try {
+      const projections = optionalService(ctx, 'sessionProjections')
+      if (projections !== undefined && typeof projections?.cachedSnapshot === 'function') {
+        const title = readValue(projections.cachedSnapshot(source))
+        if (title !== '') return title
+      }
+    } catch { /* 投影不可用：下面再试缓存服务 */ }
+    try {
+      const cache = optionalService(ctx, 'sessionProjectionCache')
+      if (cache !== undefined && typeof cache?.cachedSnapshot === 'function') {
+        const title = readValue(cache.cachedSnapshot(source?.header ?? source))
+        if (title !== '') return title
+      }
+    } catch { /* 同上 */ }
+    return ''
+  }
+
+  /** 宿主内存里的会话（至少桌面/手机正开着的那些）。 */
+  function liveSessionRows(): TihuSessionRow[] {
+    const sessions = optionalService(ctx, 'sessions')
+    const list = typeof sessions?.list === 'function' ? sessions.list() : []
+    if (!Array.isArray(list)) return []
+    const rows: TihuSessionRow[] = []
+    for (const session of list) {
+      const sessionId = sessionIdOf(session)
+      if (sessionId === undefined) continue
+      rows.push({
+        sessionId,
+        title: cachedTitleOf(session),
+        ...(typeof session?.header?.cwd === 'string' ? { cwd: session.header.cwd } : {}),
+        ...(Number.isFinite(session?.header?.createdAt) ? { createdAt: Number(session.header.createdAt) } : {}),
+        live: true,
+      })
+    }
+    return rows
+  }
+
+  /** 排序：在线会话优先，其余按创建时间倒序（与宿主列表一致，最后用 id 兜底稳定）。 */
+  function sortSessionRows(rows: TihuSessionRow[]): TihuSessionRow[] {
+    return rows.sort((a, b) => {
+      if (a.live !== b.live) return a.live ? -1 : 1
+      return (b.createdAt ?? 0) - (a.createdAt ?? 0) || a.sessionId.localeCompare(b.sessionId)
+    })
+  }
+
+  /** 拉完整会话列表（带 10 秒缓存）。 */
+  async function collectSessionRows(): Promise<{ rows: TihuSessionRow[]; source: 'sessionQuery' | 'live' }> {
+    const now = Date.now()
+    if (sessionListCache !== undefined && now - sessionListCache.at < SESSION_LIST_TTL_MS) {
+      return { rows: sessionListCache.rows, source: sessionListCache.source }
+    }
+    const live = liveSessionRows()
+    const query = optionalService(ctx, 'sessionQuery')
+    if (query !== undefined && typeof query?.listSessions === 'function') {
+      try {
+        const records = await query.listSessions()
+        const rows: TihuSessionRow[] = []
+        const seen = new Set<string>()
+        for (const record of Array.isArray(records) ? records : []) {
+          const sessionId = String(record?.header?.id ?? '')
+          if (sessionId === '' || seen.has(sessionId)) continue
+          seen.add(sessionId)
+          rows.push({
+            sessionId,
+            title: cachedTitleOf(record?.header),
+            ...(typeof record?.header?.cwd === 'string' ? { cwd: record.header.cwd } : {}),
+            ...(Number.isFinite(record?.header?.createdAt) ? { createdAt: Number(record.header.createdAt) } : {}),
+            live: record?.live === true,
+          })
+        }
+        // 新建但还没进持久化列表的空会话也要能选。
+        for (const row of live) if (!seen.has(row.sessionId)) rows.push(row)
+        sessionListCache = { at: now, rows: sortSessionRows(rows), source: 'sessionQuery' }
+        return { rows: sessionListCache.rows, source: 'sessionQuery' }
+      } catch (error) {
+        log(`tihu sessions query failed: ${(error as Error)?.message ?? String(error)}`)
+      }
+    }
+    sessionListCache = { at: now, rows: sortSessionRows(live), source: 'live' }
+    return { rows: sessionListCache.rows, source: 'live' }
+  }
+
+  /** 给前 N 条补会话名；失败/超时就算了，页面会退回短 id。 */
+  async function attachTitles(rows: TihuSessionRow[]): Promise<TihuSessionRow[]> {
+    if (rows.length === 0) return rows
+    const query = optionalService(ctx, 'sessionQuery')
+    if (query === undefined || typeof query?.readTitleSnapshots !== 'function') return rows
+    const now = Date.now()
+    const missing = rows.filter((row) => {
+      if (row.title !== '') return false   // 投影缓存已经给出标题，不必再读日志
+      const cached = titleCache.get(row.sessionId)
+      return cached === undefined || now - cached.at > 60_000
+    })
+    if (missing.length > 0) {
+      try {
+        const snapshots = await query.readTitleSnapshots(missing.map((row) => row.sessionId))
+        for (const snapshot of Array.isArray(snapshots) ? snapshots : []) {
+          const sessionId = String(snapshot?.session?.id ?? '')
+          const raw = snapshot?.title
+          const title = typeof raw === 'string' ? raw : typeof raw?.title === 'string' ? raw.title : ''
+          if (sessionId !== '' && title !== '') titleCache.set(sessionId, { at: now, title })
+        }
+      } catch (error) {
+        log(`tihu session titles failed: ${(error as Error)?.message ?? String(error)}`)
+      }
+    }
+    return rows.map((row) => {
+      const cached = titleCache.get(row.sessionId)
+      return cached === undefined ? row : { ...row, title: cached.title }
+    })
+  }
+
+  /** 回答一条 sessions.query：最近 N 条 + 全量条数 + checkId 核对结果。 */
+  async function listSessionChoices(limit: number, checkId?: string): Promise<SessionsListPayload> {
+    let collected: { rows: TihuSessionRow[]; source: 'sessionQuery' | 'live' }
+    try {
+      collected = await collectSessionRows()
+    } catch (error) {
+      log(`tihu sessions list failed: ${(error as Error)?.message ?? String(error)}`)
+      collected = { rows: liveSessionRows(), source: 'live' }
+    }
+    const total = collected.rows.length
+    const check = checkId === undefined
+      ? undefined
+      : { sessionId: checkId, found: collected.rows.some((row) => row.sessionId === checkId) }
+    const top = collected.rows.slice(0, limit)
+    // 标题要读会话日志：给个 3 秒上限，慢会话不至于把选择器卡死（拿不到就显示短 id）。
+    const titled = await Promise.race([
+      attachTitles(top),
+      new Promise<TihuSessionRow[]>((resolve) => { setTimeout(() => resolve(top), 3000) }),
+    ])
+    return {
+      sessions: titled.map((row) => ({
+        sessionId: row.sessionId,
+        title: row.title,
+        ...(row.cwd === undefined ? {} : { cwd: row.cwd }),
+        ...(row.createdAt === undefined ? {} : { createdAt: row.createdAt }),
+        live: row.live,
+      })),
+      total,
+      ...(check === undefined ? {} : { check }),
+      source: collected.source,
+    } satisfies SessionsListPayload
+  }
+
+  /** 会话是否存在：live / persisted / missing / unknown（拿不到持久化列表时不敢判死）。 */
+  async function sessionStatus(sessionId: string): Promise<'live' | 'persisted' | 'missing' | 'unknown'> {
+    const sessions = optionalService(ctx, 'sessions')
+    if (sessions !== undefined && typeof sessions?.get === 'function') {
+      try { if (sessions.get(sessionId) !== undefined) return 'live' } catch { /* 忽略 */ }
+    }
+    // 页面选择器给的 id 一定在刚拉过的列表里：**哪怕缓存过期也直接用**，不要为了
+    // 校验一次而重新列 1870 条会话——那会让「点一条会话」等好几秒才有反馈。
+    const cachedRow = sessionListCache?.rows.find((item) => item.sessionId === sessionId)
+    if (cachedRow !== undefined) return cachedRow.live ? 'live' : 'persisted'
+    let collected: { rows: TihuSessionRow[]; source: 'sessionQuery' | 'live' }
+    try { collected = await collectSessionRows() } catch { return 'unknown' }
+    // 只有 sessionQuery 才能代表「全部逻辑会话」；退回 live 列表时不能据此判不存在。
+    if (collected.source !== 'sessionQuery') return 'unknown'
+    const row = collected.rows.find((item) => item.sessionId === sessionId)
+    if (row === undefined) return 'missing'
+    return row.live ? 'live' : 'persisted'
+  }
+
+  /** 绑定会话：非法 id 给可读提示并让页面退回选择器，绝不白屏。 */
+  async function bindSession(device: TihuDevice, sessionId: string): Promise<void> {
+    const status = await sessionStatus(sessionId)
+    if (status === 'missing') {
+      device.sessionId = undefined
+      device.send('session.invalid', {
+        sessionId,
+        reason: `会话 ${shortSessionId(sessionId)} 不存在（可能已归档或删除），请在下面的会话列表里重新选一个`,
+        showPicker: true,
+      } satisfies SessionInvalidPayload)
+      device.send('event.alert', { level: 'warn', text: `会话 ${shortSessionId(sessionId)} 不存在：请从下面的会话列表里选一个` })
+      device.send('screen.frame', {
+        stage: '选择会话',
+        title: '还没有选定会话',
+        bullets: [`会话 ${shortSessionId(sessionId)} 不存在`, '点下面的会话列表选一个'],
+        tone: 'alert',
+      } satisfies ScreenFramePayload)
+      log(`tihu bind rejected session=${sessionId} reason=missing`)
+      return
+    }
+    device.sessionId = sessionId
+    const cached = sessionListCache?.rows.find((row) => row.sessionId === sessionId)
+    let title = cached?.title ?? titleCache.get(sessionId)?.title ?? ''
+    if (title === '') {
+      // 标题要读会话日志：单独给 1.5 秒上限（URL 直接带会话时列表还没拉过）。
+      const base: TihuSessionRow = { sessionId, title: '', live: status === 'live' }
+      const [titled] = await Promise.race([
+        attachTitles([base]),
+        new Promise<TihuSessionRow[]>((resolve) => { setTimeout(() => resolve([base]), 1500) }),
+      ])
+      title = titled?.title ?? ''
+    }
+    const live = status === 'live' || cached?.live === true
+    device.send('session.bound', { sessionId, title, live } satisfies SessionBoundPayload)
+    device.send('screen.frame', {
+      stage: '会话',
+      title: title !== '' ? `已绑定：${title}` : '已绑定会话',
+      bullets: [
+        shortSessionId(sessionId),
+        live ? '桌面正开着这个会话' : '还没在桌面打开（注入前先打开它）',
+      ],
+      tone: 'idle',
+    } satisfies ScreenFramePayload)
+    log(`tihu bind session=${sessionId} status=${status} title=${JSON.stringify(title)}`)
   }
 
   /**
@@ -605,6 +857,15 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     devices.add(device)
     log(`tihu device connected id=${device.id} ip=${req?.socket?.remoteAddress ?? '?'}`)
 
+    // 上行**按到达顺序串行处理**：hello/session.bind 现在包含异步的会话校验（可能要读
+    // 会话列表/标题），若并发执行，紧跟其后的 text.input 可能先到、在 sessionId 还没
+    // 绑定前就被当成「还没选会话」丢掉。串行化后行为与「一条一条读」一致。
+    let queue: Promise<void> = Promise.resolve()
+    const enqueue = (message: any): void => {
+      queue = queue.then(() => handleUpstream(device, message)).catch((error) => {
+        log(`tihu upstream failed: ${(error as Error)?.stack ?? String(error)}`)
+      })
+    }
     const parser = new WsFrameParser(
       (frame: any) => {
         try {
@@ -624,7 +885,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
             log(`tihu ignored message: ${summarizeForLog(safeJson(frame.payload))}`)
             return
           }
-          void handleUpstream(device, message)
+          enqueue(message)
         } catch (error) {
           log(`tihu frame failed: ${(error as Error)?.stack ?? String(error)}`)
         }
@@ -663,20 +924,42 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         return
       }
       device.hello = payload
-      device.sessionId = typeof payload.sessionId === 'string' && payload.sessionId !== '' ? payload.sessionId : undefined
       const caps = payload.capabilities ?? {}
-      device.send('screen.frame', {
-        stage: '连接',
-        title: payload.deviceName ?? '鹈鹕模拟设备',
-        bullets: [
-          `协议 v${TIHU_PROTOCOL_VERSION}`,
-          device.sessionId === undefined ? '未选择会话：先打开一个会话' : '已绑定当前会话',
-          caps.microphone === false ? '无麦克风：用 WAV 文件驱动' : '麦克风可用',
-        ],
-        tone: 'idle',
-      } satisfies ScreenFramePayload)
+      const requested = typeof payload.sessionId === 'string' && payload.sessionId !== '' ? payload.sessionId : undefined
+      if (requested !== undefined) {
+        // 2026-11-07：hello 里带的会话由宿主**校验**（URL 写错/会话已删 → session.invalid，
+        // 页面退回选择器），不再无条件接受一个不存在的 id 然后每次注入都失败。
+        await bindSession(device, requested)
+      } else {
+        device.sessionId = undefined
+        device.send('screen.frame', {
+          stage: '连接',
+          title: payload.deviceName ?? '鹈鹕模拟设备',
+          bullets: [
+            `协议 v${TIHU_PROTOCOL_VERSION}`,
+            '还没有选定会话：在页面下面的列表里选一个',
+            caps.microphone === false ? '无麦克风：用 WAV 文件驱动' : '麦克风可用',
+          ],
+          tone: 'idle',
+        } satisfies ScreenFramePayload)
+      }
       device.send('event.progress', { stage: '连接', text: `设备 ${device.id} 已就绪` } satisfies ProgressPayload)
       log(`tihu hello client=${payload.clientId} session=${device.sessionId ?? '?'} caps=${JSON.stringify(caps)}`)
+      return
+    }
+    if (type === 'sessions.query') {
+      // 页面自建会话选择：拉最近 N 条（默认 10，上限 50），并顺手核对页面手上的 id。
+      const payload = message.payload ?? {}
+      const limit = Number.isSafeInteger(payload.limit) ? Math.min(50, Math.max(1, payload.limit as number)) : 10
+      const checkId = typeof payload.checkId === 'string' && payload.checkId !== '' ? payload.checkId : undefined
+      const list = await listSessionChoices(limit, checkId)
+      device.send('sessions.list', list)
+      log(`tihu sessions.query limit=${limit} total=${list.total} source=${list.source} check=${checkId ?? '-'}${list.check === undefined ? '' : ` found=${String(list.check.found)}`}`)
+      return
+    }
+    if (type === 'session.bind') {
+      // 页面点选择器/换会话：校验后绑定，回 session.bound（或 session.invalid）。
+      await bindSession(device, String(message.payload.sessionId ?? ''))
       return
     }
     if (type === 'confirm.reply') {
@@ -712,7 +995,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
 
     if (type === 'text.input' || type === 'audio.frame') {
       if (device.sessionId === undefined) {
-        device.send('event.alert', { level: 'warn', text: '还没有选择会话：先在手机上打开一个会话再回来' })
+        device.send('event.alert', { level: 'warn', text: '还没有选定会话：点页面下面的会话列表选一个' })
         return
       }
       // 收到 tihu 消息就续期（「120 秒无 tihu 消息自动失效」的另一半）。
