@@ -262,7 +262,7 @@ function statusFrame(state: TihuProgressState, now: number): ScreenFramePayload 
   const stats = state.stats
   const line4 = stats === undefined
     ? '统计中…'
-    : (stats.tokPerSec > 0 ? stats.tokPerSec.toFixed(0) + ' tok/s · ' : '') + formatTokens(stats.totalTokens) + ' tok · 上下文 ' + stats.contextPercent.toFixed(0) + '%'
+    : (stats.tokPerSec > 0 ? stats.tokPerSec.toFixed(0) + ' tok/s · ' : '') + (stats.totalTokens > 0 ? formatTokens(stats.totalTokens) + ' tok' : 'tok —') + ' · 上下文 ' + stats.contextPercent.toFixed(0) + '%'
   return {
     stage: '',
     title: clipText(state.sessionTitle || state.title, TIHU_TITLE_CHARS),
