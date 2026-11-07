@@ -42,6 +42,7 @@ import {
 } from '../src/tihu/guard.ts'
 import { createTihuRuntime, buildTihuUserMessage, TIHU_LANE_PATH, TIHU_PAGE_PATH } from '../src/tihu/lane.ts'
 import {
+  activityEntryOf,
   applySessionEvent,
   clipText,
   confirmationFrame,
@@ -2087,6 +2088,11 @@ test('进度屏：明细条目格式「标签 · 明细」，跑命令取真正�
   assert.ok(grep.screen.bullets[2].includes('步') && grep.screen.bullets[2].includes('%'), '第四行合并步数与统计：' + grep.screen.bullets[2])
   assert.ok(grep.screen.bullets[2].includes('tok/s'), '第四行带解码速度：' + grep.screen.bullets[2])
   assert.ok(measureTextPx(grep.screen.bullets[2], SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX, '第四行超宽：' + grep.screen.bullets[2])
+  // 桌面工具用内置中文名，不裸显英文工具名
+  assert.equal(activityEntryOf('screenshot', {}).label, '截图')
+  assert.equal(activityEntryOf('click', {}).label, '点击')
+  assert.equal(activityEntryOf('unknown_tool_xyz', { path: 'a.ts' }).label, '工具')
+  assert.equal(activityEntryOf('edit', { file_path: 'src/tihu/lane.ts' }).detail, 'lane.ts')
 })
 
 test('进度屏：思考条目取模型 thinking 文本的第一句', () => {
