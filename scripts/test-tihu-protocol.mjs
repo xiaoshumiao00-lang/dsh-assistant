@@ -54,7 +54,7 @@ import {
 import { ACTUAL_SIZE_SCALE, CONTENT_WIDTH_PX, SCREEN_SPEC, clipScreenTitle, fitLine, fitScreenLines, measureTextPx } from '../src/tihu/screen-spec.ts'
 import { fitViewport, replyViewport, replyWindow, splitReplySentences, splitSpeechSegments, wrapReplyLines } from '../src/tihu/reply.ts'
 import { toSpeechText } from '../src/tihu/speech-text.ts'
-import { groupProjects, projectNameOf } from '../src/tihu/project-groups.ts'
+import { groupProjects, humanTitle, projectNameOf } from '../src/tihu/project-groups.ts'
 import { Pcm16Chunker, TTS_CHUNK_BYTES, TTS_SAMPLE_RATE, validateReferenceWav } from '../src/tihu/audio.ts'
 import { normalizeVoiceName } from '../src/tihu/tts.ts'
 import { WsFrameParser, encodeFrame } from '../src/pocket-host/ws-deflate.mjs'
@@ -689,7 +689,7 @@ await testAsync('lane：手动 session.bind 成功 → session.bound（CU 标记
   assert.equal(bound.payload.live, true)
   assert.equal(bound.payload.computerUse, true)
   assert.equal(bound.payload.preset, 'computer-use')
-  assert.ok(framesOf(socket).some((frame) => frame.type === 'screen.frame' && frame.payload.title.includes('标题:session-1')))
+  assert.ok(framesOf(socket).some((frame) => frame.type === 'screen.frame' && frame.payload.title.includes('已绑定')))
   runtime.dispose()
 })
 
@@ -1315,6 +1315,34 @@ test('主页项目聚合：同 cwd 合并、摘要人话、三态状态', () => 
   assert.equal(idle.status, 'idle')
   assert.equal(idle.summary, '等待新消息')
   assert.equal(projectNameOf('D:/dsh-assistant/src/tihu'), 'dsh-assistant')
+})
+
+
+test('humanTitle：剥掉裸 id/uuid，纯 id → 未命名会话', () => {
+  assert.equal(humanTitle('已绑定：tihu 目录文件与自我简介 bbf68ac2').includes('bbf68ac2'), false)
+  assert.equal(humanTitle('9b20811a'), '未命名会话')
+  assert.equal(humanTitle('6f1c2a4e-8b7d-4c3e-9a1f-2d5e6b7c8a9d'), '未命名会话')
+  assert.equal(humanTitle('修复 tihu 绑定'), '修复 tihu 绑定')
+})
+
+await testAsync('lane：自动绑定成功仍回主页，只有回复才切 session', async () => {
+  const records = [cuRecord('session-live', { live: true, cwd: 'D:/dsh-assistant', lastPromptAt: 5000, title: 'tihu 绑定 bbf68ac2' })]
+  const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'h', protocol: '0', auto: true }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  let screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+  assert.equal(screens[screens.length - 1].payload.mode, 'home', '自动绑定后仍是主页')
+  assert.ok(!JSON.stringify(screens).includes('bbf68ac2'), '屏帧不得出现裸 id')
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  onSessionEvent({ id: 'session-live', header: { id: 'session-live' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: '有回复了。' }] } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+  assert.equal(screens[screens.length - 1].payload.mode, 'reply', '有回复才切 session')
+  runtime.dispose()
 })
 
 /* ---------- 屏幕进度映射 ---------- */

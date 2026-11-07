@@ -70,7 +70,7 @@ import { TihuTts, type TihuTtsPaths } from './tts.ts'
 import { replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
 import { toSpeechText } from './speech-text.ts'
 import { CONTENT_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
-import { groupProjects, type ProjectReply } from './project-groups.ts'
+import { groupProjects, humanTitle, projectNameOf, type ProjectReply } from './project-groups.ts'
 import type { TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
 
 /** 页面与 WebSocket 的路径（代理侧按这两个前缀放行）。 */
@@ -592,7 +592,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     }
     device.sessionId = sessionId
     const row = found.row
-    let title = row?.title ?? titleCache.get(sessionId)?.title ?? ''
+    let rawTitle = row?.title ?? titleCache.get(sessionId)?.title ?? ''
+    let title = rawTitle === '' ? '' : humanTitle(rawTitle)
     if (title === '' && found.status !== 'unknown') {
       // 标题要读会话日志：单独给 1.5 秒上限（URL 直接带会话时列表还没拉过）。
       const base: TihuSessionRow = { sessionId, title: '', preset: row?.preset ?? '', updatedAt: row?.updatedAt ?? 0, live: found.status === 'live' }
@@ -600,7 +601,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         attachTitles([base]),
         new Promise<TihuSessionRow[]>((resolve) => { setTimeout(() => resolve([base]), 1500) }),
       ])
-      title = titled?.title ?? ''
+      title = titled?.title ? humanTitle(titled.title) : ''
     }
     const preset = row?.preset ?? ''
     const computerUse = isComputerUsePreset(preset)
@@ -608,6 +609,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     device.send('session.bound', {
       sessionId,
       title,
+      project: projectNameOf(row?.cwd),
       live,
       preset,
       computerUse,
@@ -618,10 +620,10 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       device.send('screen.frame', {
         stage: options.followed === true ? '跟随' : '会话',
         title: options.followed === true
-          ? (title !== '' ? `已自动跟随到：${title}` : '已自动跟随到新的 CU 会话')
-          : (title !== '' ? `已绑定：${title}` : '已绑定会话'),
+          ? `已自动跟随到：${title}`
+          : `已绑定：${projectNameOf(row?.cwd)}`,
         bullets: [
-          shortSessionId(sessionId),
+          `会话：${title}`,
           live ? '桌面正开着这个会话' : '还没在桌面打开（注入前先打开它）',
         ],
         tone: 'idle',
@@ -1409,12 +1411,14 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         // 显式会话（URL）优先：手动绑定，不参与自动跟随。
         device.autoFollow = false
         await bindSession(device, requested)
+        await sendHome(device.sessionId ?? '__unbound__', device)
       } else if (payload.auto === true) {
         // 默认路径：自动绑定「最近活跃的 Computer Use 会话」，但开机屏仍是主页；
         // 只有真正收到 assistant 回复时才切会话屏。
         device.autoFollow = true
         await autoBindActive(device, 'hello')
         if (device.sessionId !== undefined) await sendHome(device.sessionId, device)
+        else await sendHome('__unbound__', device)
       } else {
         device.autoFollow = false
         device.sessionId = undefined

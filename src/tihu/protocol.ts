@@ -439,6 +439,8 @@ export interface SessionBoundPayload {
   sessionId: string
   /** 会话名；拿不到时为空串（页面显示短 id）。 */
   title: string
+  /** 项目名（cwd 目录名）；主页屏底部「已绑定：<项目名>」用，禁止裸会话 id。 */
+  project?: string
   /** 会话当前是否在宿主内存里（没打开的话语音注入前要先在桌面打开）。 */
   live?: boolean
   /** agent preset（`agentPreset` 投影）。 */
