@@ -51,8 +51,9 @@ import {
   sanitizeScreenLine,
   summarizeToolResult,
 } from '../src/tihu/progress.ts'
-import { ACTUAL_SIZE_SCALE, SCREEN_SPEC, clipScreenTitle, fitScreenLines } from '../src/tihu/screen-spec.ts'
+import { ACTUAL_SIZE_SCALE, CONTENT_WIDTH_PX, SCREEN_SPEC, clipScreenTitle, fitLine, fitScreenLines, measureTextPx } from '../src/tihu/screen-spec.ts'
 import { fitViewport, replyViewport, replyWindow, splitReplySentences, splitSpeechSegments, wrapReplyLines } from '../src/tihu/reply.ts'
+import { toSpeechText } from '../src/tihu/speech-text.ts'
 import { Pcm16Chunker, TTS_CHUNK_BYTES, TTS_SAMPLE_RATE, validateReferenceWav } from '../src/tihu/audio.ts'
 import { normalizeVoiceName } from '../src/tihu/tts.ts'
 import { WsFrameParser, encodeFrame } from '../src/pocket-host/ws-deflate.mjs'
@@ -104,9 +105,17 @@ function tinyWavBase64() {
 
 console.log('[tihu] 协议 v0')
 
+test('screen.gesture 校验：swipe/tap 字段合法才收', () => {
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'swipe', dy: -40, phase: 'move' }, 60))) !== null)
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'tap', x: 12, y: 34 }, 61))) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'swipe', dy: '40', phase: 'move' }, 62))), null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'swipe', dy: 1, phase: 'x' }, 63))), null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'tap', x: 1 }, 64))), null)
+})
+
 test('版本号与类型清单固定', () => {
   assert.equal(TIHU_PROTOCOL_VERSION, '0')
-  assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'session.end', 'sessions.query', 'session.bind', 'voice.list', 'voice.create', 'voice.select', 'ping'])
+  assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'session.end', 'sessions.query', 'session.bind', 'screen.gesture', 'voice.list', 'voice.create', 'voice.select', 'ping'])
   assert.equal(TIHU_DOWNSTREAM_TYPES.length, 14)
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('tts.audio'))
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('sessions.list'))
@@ -1121,6 +1130,57 @@ await testAsync('lane：edge 与 Qwen 都失败 → alert 且不出声，屏幕�
   runtime.dispose()
 })
 
+await testAsync('lane：上滑回看历史、下滑回底恢复 follow、新回复归零', async () => {
+  const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true, lastPromptAt: 1000 })], {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'scroll', protocol: '0', sessionId: 'session-1' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const long = Array.from({ length: 30 }, (_, i) => `第${i + 1}句内容。`).join('')
+  onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: long }] } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  let screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+  let reply = screens[screens.length - 1].payload.reply
+  assert.ok(reply.scroll.maxOffset > 0, '长回复要有可滚动历史')
+  // 先回到底部，拿稳定的首行，再上滑
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'swipe', dy: 10000, phase: 'end' }, 9)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+  reply = screens[screens.length - 1].payload.reply
+  const topLine = reply.lines[0].text
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'swipe', dy: -200, phase: 'move' }, 2)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+  reply = screens[screens.length - 1].payload.reply
+  assert.ok(reply.scroll.offset > 0, '上滑后 offset 增大')
+  assert.equal(reply.follow, false, '离开底部后停止跟随')
+  assert.notEqual(reply.lines[0].text, topLine, '首行变成更早内容')
+  const scrolled = reply.scroll.offset
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'swipe', dy: 10000, phase: 'end' }, 3)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+  reply = screens[screens.length - 1].payload.reply
+  assert.equal(reply.scroll.offset, 0, '下滑回底')
+  assert.equal(reply.follow, true, '回底恢复跟随')
+  assert.ok(scrolled > 0)
+  // 新回复重置
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'swipe', dy: -300, phase: 'move' }, 4)))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: '新回复第一句。新回复第二句。' }] } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+  reply = screens[screens.length - 1].payload.reply
+  assert.equal(reply.scroll.offset, 0, '新回复归零')
+  assert.equal(reply.follow, true)
+  runtime.dispose()
+})
+
 /* ---------- 屏幕进度映射 ---------- */
 
 console.log('[tihu] 屏幕进度映射')
@@ -1141,7 +1201,7 @@ test('工具名 → 人话标题（读取/写入/修改/搜索/执行/联网查�
   const shell = describeTool('pwsh', { command: 'Get-ChildItem D:\\dsh-assistant\\src' })
   assert.equal(shell.stage, '跑命令')
   assert.ok(shell.title.startsWith('执行 Get-ChildItem'))
-  assert.ok([...shell.title].length <= 28, '标题不超过 28 字')
+  assert.ok(measureTextPx(shell.title, SCREEN_SPEC.titleFontPx) <= CONTENT_WIDTH_PX, '标题不超过 304px')
   const web = describeTool('web_search', { query: 'ESP32-S3-BOX-3' })
   assert.equal(web.stage, '搜索')
   assert.equal(web.title, '联网查 ESP32-S3-BOX-3')
@@ -1150,7 +1210,7 @@ test('工具名 → 人话标题（读取/写入/修改/搜索/执行/联网查�
   assert.equal(other.title, 'computer_use')
   // 超长参数截断且不出现半字
   const long = describeTool('pwsh', { command: 'x'.repeat(200) })
-  assert.ok([...long.title].length <= 28)
+  assert.ok(measureTextPx(long.title, SCREEN_SPEC.titleFontPx) <= CONTENT_WIDTH_PX)
   assert.ok([...long.detail].length <= 120)
 })
 
@@ -1170,7 +1230,7 @@ test('进度状态机：步骤递增、失败 tone=alert、完成帧保留、正
   push({ type: 'tool/result', data: { turn: 7, step: 1, message: { content: [{ type: 'text', text: 'const a = 1\n第二个文件结尾' }], isError: false } } }, 4000)
   assert.equal(state.tone, 'ok')
   assert.ok(state.lastResult.line.startsWith('✓'))
-  assert.ok([...state.lastResult.line].length <= 18)
+  assert.ok(measureTextPx(state.lastResult.line, SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX)
 
   // 第 2 步：跑命令失败
   push({ type: 'step/start', data: { turn: 7, step: 2 } }, 5000)
@@ -1179,14 +1239,14 @@ test('进度状态机：步骤递增、失败 tone=alert、完成帧保留、正
   push({ type: 'tool/result', data: { turn: 7, step: 2, message: { content: [{ type: 'text', text: '拒绝访问：文件被占用（详细信息在日志里）' }], isError: true } } }, 7000)
   assert.equal(state.tone, 'alert')
   assert.ok(state.lastResult.line.startsWith('✗'))
-  assert.ok([...state.lastResult.line].length <= 18)
+  assert.ok(measureTextPx(state.lastResult.line, SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX)
 
   // 回答
   const answer = push({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '第一行回答\n最后一行是输出尾行' }] } } }, 8000)
   assert.equal(answer.screen.stage, '回答')
   assert.ok(answer.screen.title.startsWith('回答 第一行回答'))
   assert.ok(answer.screen.bullets.length <= 3)
-  for (const line of answer.screen.bullets) assert.ok([...line].length <= 18, `行超长：${line}`)
+  for (const line of answer.screen.bullets) assert.ok(measureTextPx(line, SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX, `行超宽：${line}`)
 
   // 结束帧：保留「完成 · 共 N 步 · 用时 Xs」，正文只留结果行（不重复标题、不带陈旧输出）
   const done = push({ type: 'turn/end', data: { turn: 7, reason: { kind: 'completed' } } }, 13000)
@@ -1205,9 +1265,9 @@ test('进度状态机：步骤递增、失败 tone=alert、完成帧保留、正
   assert.ok(failed.screen.bullets[0].startsWith('✗'))
 })
 
-test('屏幕文本截断：40 字标题省略到 28 字内，5 行正文只留 3 行', () => {
+test('屏幕文本按像素截断：标题 ≤304px，正文按宽度折行', () => {
   const title = clipText('这是一个非常非常长的标题'.repeat(3), 28)
-  assert.ok([...title].length <= 28)
+  assert.ok(measureTextPx(title, SCREEN_SPEC.titleFontPx) <= CONTENT_WIDTH_PX)
   assert.ok(title.endsWith('…'))
   const lines = ['第一行', '第二行', '第三行', '第四行', '第五行']
   const bullets = lines.slice(0, 3).map((line) => clipText(line, 18))
@@ -1261,24 +1321,35 @@ test('真机屏幕规格：320×240 常量 + 标题/正文截断', () => {
   assert.equal(SCREEN_SPEC.paddingPx, 8)
   assert.equal(SCREEN_SPEC.bodyFontPx, 16)
   assert.equal(SCREEN_SPEC.bodyLineHeightPx, 20)
-  assert.equal(SCREEN_SPEC.bodyCharsPerLine, 18)
-  assert.equal(SCREEN_SPEC.maxBodyLines, 3)
-  assert.equal(SCREEN_SPEC.titleChars, 28)
+  assert.equal(SCREEN_SPEC.maxBodyLines, 4)
   assert.equal(SCREEN_SPEC.stageFontPx, 12)
   assert.ok(ACTUAL_SIZE_SCALE > 0.7 && ACTUAL_SIZE_SCALE < 0.75, `实际尺寸缩放 ${ACTUAL_SIZE_SCALE}`)
 
   // 40 字标题 → 28 字内（含省略号）；不出现半个字
   const title = clipScreenTitle('这是一个非常长的标题'.repeat(4))
-  assert.ok([...title].length <= 28)
+  assert.ok(measureTextPx(title, SCREEN_SPEC.titleFontPx) <= CONTENT_WIDTH_PX)
   assert.ok(title.endsWith('…'))
   assert.equal(clipScreenTitle('短标题'), '短标题')
+
+  // 像素宽度：长 ASCII 不截断，20 个汉字截到 ~19 字，ASCII 容量约 2× 汉字
+  const ascii = 'Get-ChildItem D:\\dsh-assistant\\src\\tihu'
+  assert.equal(fitLine(ascii, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx), ascii, 'ASCII 行不应被截')
+  assert.ok(measureTextPx(ascii, SCREEN_SPEC.bodyFontPx) < CONTENT_WIDTH_PX)
+  const cjk20 = '一二三四五六七八九十一二三四五六七八九十'
+  const fittedCjk = fitLine(cjk20, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
+  assert.ok(fittedCjk.endsWith('…'))
+  assert.ok([...fittedCjk].length >= 18 && [...fittedCjk].length <= 20)
+  const asciiCapacity = [...Array(80)].map(() => 'A').join('')
+  const fittedAscii = fitLine(asciiCapacity, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
+  assert.ok([...fittedAscii].length > 30, 'ASCII 一行应容纳 30+ 字符')
+  assert.ok(measureTextPx(fittedAscii, SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX)
 
   // 5 行正文只保留前 3 行，每行 ≤18 字
   const five = ['一', '二', '三', '四', '五'].map((line) => line.repeat(20))
   const fitted = fitScreenLines(five)
-  assert.equal(fitted.length, 3)
-  for (const line of fitted) assert.ok([...line].length <= 18)
-  assert.deepEqual(fitScreenLines(['a', '', 'b', 'c', 'd']), ['a', 'b', 'c'])
+  assert.equal(fitted.length, 4)
+  for (const line of fitted) assert.ok(measureTextPx(line, SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX)
+  assert.deepEqual(fitScreenLines(['a', '', 'b', 'c', 'd']), ['a', 'b', 'c', 'd'])
 })
 
 await testAsync('页面包含真机外壳/320×240 固定尺寸/三档缩放/外壳开关', async () => {
@@ -1442,7 +1513,7 @@ test('回复分句与滚动窗口：800 字下标连续、窗口居中、行不�
   // 可视窗口：10 行、当前句居中、每行 ≤18 字
   const viewport = replyViewport(sentences, middle)
   assert.ok(viewport.lines.length <= 10)
-  for (const line of viewport.lines) assert.ok([...line.text].length <= 18, `行超长：${line.text}`)
+  for (const line of viewport.lines) assert.ok(measureTextPx(line.text, SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX, `行超宽：${line.text}`)
   assert.ok(viewport.currentLine >= 3 && viewport.currentLine <= 6, `当前句应在中部，实际第 ${viewport.currentLine} 行`)
   assert.ok(viewport.lines[viewport.currentLine].sentenceIndex === middle)
 
@@ -1461,6 +1532,19 @@ test('TTS 分段带字符区间：tts.text 的 charStart/charEnd 与句边界一
   const sentences = splitReplySentences(text)
   assert.deepEqual(sentences.map((s) => [s.start, s.end]), [[0, 4], [4, 8], [8, 12]])
   assert.equal(sentences.map((s) => s.text).join(''), text)
+})
+
+test('TTS 文本清洗：markdown/emoji/链接，屏幕原文不动', () => {
+  assert.equal(toSpeechText('**加粗**'), '加粗')
+  assert.equal(toSpeechText('☑️ 已完成'), '已完成')
+  assert.equal(toSpeechText('[文档](http://x)'), '文档')
+  assert.equal(toSpeechText('🔴🟢📌🎯'), '')
+  assert.equal(toSpeechText('# 标题\n- 第一项\n- 第二项'), '标题 第一项 第二项')
+  assert.equal(toSpeechText('看这里 https://example.com/a 谢谢'), '看这里 链接 谢谢')
+  assert.equal(toSpeechText('`code` 和 ~~删除~~'), 'code 和 删除')
+  assert.equal(toSpeechText('✅ **完成**：\n> 引用'), '完成： 引用')
+  // 清洗后不能留下连续空白/换行
+  assert.equal(/\s{2,}/.test(toSpeechText('**a**\n\n☑️ b')), false)
 })
 
 test('语音切段：长句按逗号/32 字切分，首包不必等整句', () => {

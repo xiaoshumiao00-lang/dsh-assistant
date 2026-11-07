@@ -34,6 +34,7 @@ export const TIHU_UPSTREAM_TYPES = [
   'session.end',
   'sessions.query',
   'session.bind',
+  'screen.gesture',
   'voice.list',
   'voice.create',
   'voice.select',
@@ -296,6 +297,12 @@ export interface ReplyScreenPayload {
   totalChars?: number
   /** 当前播放到的字符位置（用于高亮/估算进度）。 */
   charPos?: number
+  /** 已按屏宽折好的行（宿主权威；页面直接渲染，不再自己折行）。 */
+  lines?: { text: string; sentenceIndex: number }[]
+  /** 滚动状态：offset=顶部被卷走的行数，maxOffset=最大可滚动行数。 */
+  scroll?: { offset: number; maxOffset: number }
+  /** 是否跟随朗读自动滚动。 */
+  follow?: boolean
 }
 
 export interface ProgressPayload {
@@ -405,6 +412,11 @@ export interface SessionsListPayload {
 }
 
 /** 上行：绑定一个会话，或切回「自动跟随」。 */
+/** 屏幕手势：上/下滑（滚动历史）与点击（预留）。 */
+export type ScreenGesturePayload =
+  | { action: 'swipe'; dy: number; phase: 'start' | 'move' | 'end' }
+  | { action: 'tap'; x: number; y: number }
+
 export interface SessionBindPayload {
   /** 要手动绑定的会话 id；`auto: true` 时可省略。 */
   sessionId?: string
@@ -449,6 +461,7 @@ export type TihuUpstreamMessage =
   | TihuEnvelope<'session.end', SessionEndPayload>
   | TihuEnvelope<'sessions.query', SessionsQueryPayload>
   | TihuEnvelope<'session.bind', SessionBindPayload>
+  | TihuEnvelope<'screen.gesture', ScreenGesturePayload>
   | TihuEnvelope<'voice.list', Record<string, never>>
   | TihuEnvelope<'voice.create', VoiceCreatePayload>
   | TihuEnvelope<'voice.select', VoiceSelectPayload>
@@ -585,6 +598,19 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
         if (payload.wavBase64.length > TIHU_MAX_MESSAGE_BYTES) return null
         if (payload.note !== undefined && typeof payload.note !== 'string') return null
         return value as TihuUpstreamMessage
+      }
+      case 'screen.gesture': {
+        if (payload.action === 'swipe') {
+          if (typeof payload.dy !== 'number' || !Number.isFinite(payload.dy)) return null
+          if (payload.phase !== 'start' && payload.phase !== 'move' && payload.phase !== 'end') return null
+          return value as TihuUpstreamMessage
+        }
+        if (payload.action === 'tap') {
+          if (typeof payload.x !== 'number' || typeof payload.y !== 'number') return null
+          if (!Number.isFinite(payload.x) || !Number.isFinite(payload.y)) return null
+          return value as TihuUpstreamMessage
+        }
+        return null
       }
       case 'ping': return value as TihuUpstreamMessage
       default: return null
