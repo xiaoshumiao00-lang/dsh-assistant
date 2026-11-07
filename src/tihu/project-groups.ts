@@ -61,8 +61,11 @@ export function projectNameOf(cwd: string | undefined): string {
   if (find('dsh-assistant') >= 0 || find('dsh-pocket') >= 0 || find('dsh-tuoguan') >= 0 || find('dsh desktop') >= 0) return 'dsh-assistant'
   if (find('strata') >= 0 || find('llm') >= 0) return 'STRATA'
   if (find('陈潘hbeu') >= 0) return ''
-  // 控制室只认这 6 个真实项目组；其余 cwd（临时目录/删除区/杂项）不单独成项目。
-  return ''
+  // 2026-11-07 用户要求：电脑端控制室新建的项目/文件夹也要在鹈鹕首页出现，
+  // 未知 cwd 用最后一级目录名兜底（临时目录这类杂项仍然不单独立项）。
+  const last = parts[parts.length - 1] ?? ''
+  if (/^(temp|tmp|outputs|node_modules|临时|删除)$/i.test(last)) return ''
+  return last
 }
 
 /** 聚合项目并按「进行中 → 已完成 → 空闲、同级最近活动倒序」排序。 */
