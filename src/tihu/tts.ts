@@ -399,7 +399,7 @@ export class TihuTts {
     const firstTimer = setTimeout(() => {
       try { py.kill() } catch { /* 忽略 */ }
       try { ff.kill() } catch { /* 忽略 */ }
-    }, 1500)
+    }, 3500)
     try {
       await new Promise<void>((resolve, reject) => {
         const done = () => resolve()
@@ -418,7 +418,7 @@ export class TihuTts {
         })
       })
       const tail = chunker.finish()
-      if (firstAt === 0 && tail.length === 0) throw new Error('edge-tts 没有返回音频')
+      if (firstAt === 0 && tail.length === 0) throw new Error(`edge-tts 没有返回音频：${stderr.split('\n').filter(Boolean).slice(-2).join(' ').slice(0, 200)}`)
       for (const block of tail) {
         options.onChunk({ data: block.data, seq: chunks, total: chunks + 1, final: block.final })
         chunks += 1
