@@ -26,6 +26,14 @@
 /** 协议版本。设备与宿主不一致时由 hello 的 `protocol` 字段拒绝（见 lane）。 */
 export const TIHU_PROTOCOL_VERSION = '0' as const
 
+/** 触摸坐标上限（与 screen-spec 的 320×240 同一事实来源）。 */
+const SCREEN_BOUNDS = { widthPx: 320, heightPx: 240 } as const
+
+/** 越界坐标钳到 [0, max]：页面缩放/横屏错位时可能发出负值或超屏的点，忽略会永远点不中。 */
+function clampCoord(value: number, max: number): number {
+  return Math.max(0, Math.min(max, Math.round(value)))
+}
+
 /** 上行消息类型（设备 → 宿主）。 */
 export const TIHU_UPSTREAM_TYPES = [
   'hello',
@@ -643,7 +651,16 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
           if (!Number.isFinite(payload.x) || !Number.isFinite(payload.y)) return null
           if (payload.hit !== undefined && payload.hit !== 'chip' && payload.hit !== 'screen') return null
           if (payload.targetSessionId !== undefined && (typeof payload.targetSessionId !== 'string' || payload.targetSessionId.length > 256)) return null
-          return value as TihuUpstreamMessage
+          // 钳制而不是丢弃：页面在真机缩放/横屏下会发出负值或超出 320×240 的点，
+          // 直接忽略等于怎么点都没反应（2026-11-07 审计 P2-手势越界）。
+          return {
+            ...value,
+            payload: {
+              ...payload,
+              x: clampCoord(payload.x, SCREEN_BOUNDS.widthPx),
+              y: clampCoord(payload.y, SCREEN_BOUNDS.heightPx),
+            },
+          } as TihuUpstreamMessage
         }
         return null
       }

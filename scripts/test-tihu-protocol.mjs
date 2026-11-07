@@ -2940,6 +2940,266 @@ test('标题 R-P1-12：标题按加粗宽度排版、页面不再按字数二次
   assert.equal(titleLine.includes('clipScreen'), false, '页面不得再按字数二次截断标题（宿主已按像素截过）：' + titleLine)
 })
 
+test('手势 R-P2-1：越界触摸坐标钳到屏幕内（不忽略，也不能把负值传进热点判定）', () => {
+  const clampedLow = parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'tap', x: -40, y: -8 }, 70)))
+  assert.ok(clampedLow, '越界坐标仍要收下（钳制而不是丢弃）')
+  assert.equal(clampedLow.payload.x, 0)
+  assert.equal(clampedLow.payload.y, 0)
+  const clampedHigh = parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'tap', x: 999, y: 480 }, 71)))
+  assert.ok(clampedHigh, '超屏坐标也要收下')
+  assert.equal(clampedHigh.payload.x, 320)
+  assert.equal(clampedHigh.payload.y, 240)
+  const normal = parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'tap', x: 12, y: 34 }, 72)))
+  assert.equal(normal.payload.x, 12)
+  assert.equal(normal.payload.y, 34)
+})
+
+/* ---------- 2026-11-07 断音根因回归（断在合成层的超时门限，不是页面） ----------
+ *
+ * 现场实测（C:\Users\Administrator\.dsh\repro\tihu-tts-cut\probe-edge.mjs）：
+ *   - 4 路并发首块 2263–3317ms；8 路并发开始有段被杀；**12 路并发（=3 个标签页 × 4 并发）
+ *     8/12 段 first=-1 / audio=0**，全部由 tts.ts 的 3500ms first-chunk 定时器杀掉；
+ *   - 被杀之后落本地 Qwen，本机 CPU 首包实测 **54485ms**（probe-qwen.mjs），
+ *     而 synthesize() 给默认音色套的是 4500ms 中止 → 兜底必挂；
+ *   - tts.audio 按句序 flush，卡住的那一段把后面已合成好的段全压住 → 页面念一句后静音。
+ * 这一批用例盯死这四件事：门限、兜底门限、单段卡顿、同会话并读。
+ */
+
+await testAsync('lane：12 并发下 edge 首块门限不误杀', async () => {
+  const ttsModule = await import('../src/tihu/tts.ts')
+  assert.equal(typeof ttsModule.edgeFirstChunkMs, 'function', 'tts 需要导出可测的 edgeFirstChunkMs()')
+  delete process.env.TIHU_EDGE_FIRST_MS
+  const fallback = ttsModule.edgeFirstChunkMs()
+  assert.ok(
+    fallback >= 8000,
+    `12 路并发实测首块到 3304ms 且 8/12 段被门限杀掉，默认门限 ${fallback}ms 仍然太紧（会把整段杀成 0 字节）`,
+  )
+  process.env.TIHU_EDGE_FIRST_MS = '12000'
+  assert.equal(ttsModule.edgeFirstChunkMs(), 12000, 'TIHU_EDGE_FIRST_MS 要能覆盖默认值')
+  process.env.TIHU_EDGE_FIRST_MS = '0'
+  assert.equal(ttsModule.edgeFirstChunkMs(), 3000, '0/负数要钳到下限 3000ms')
+  process.env.TIHU_EDGE_FIRST_MS = 'abc'
+  assert.equal(ttsModule.edgeFirstChunkMs(), fallback, '非数字要退回默认值')
+  process.env.TIHU_EDGE_FIRST_MS = '999999'
+  assert.equal(ttsModule.edgeFirstChunkMs(), 60000, '过大要钳到上限 60000ms')
+  delete process.env.TIHU_EDGE_FIRST_MS
+
+  // 首块超时：先重试一次 edge，不能直接落本地（本地 CPU 首包 54s，等于放弃这一句）
+  const instance = new ttsModule.TihuTts({ log: () => {}, threads: 1 })
+  let edgeCalls = 0
+  let codecCalls = 0
+  instance.edgeReady = () => true
+  instance.synthesizeEdge = async (_text, options) => {
+    edgeCalls += 1
+    if (edgeCalls === 1) throw new Error('edge-tts 首块超时（8000ms 未返回音频）')
+    options.onChunk({ data: Buffer.alloc(4800), seq: 0, total: 1, final: true })
+    return { sampleRate: 24000, firstChunkMs: 120, audioMs: 2400, totalMs: 260, chunks: 1 }
+  }
+  instance.synthesizeCodec = async () => { codecCalls += 1; throw new Error('不该走到本地兜底') }
+  const result = await instance.synthesize('第一句。', { onChunk: () => {} })
+  assert.equal(edgeCalls, 2, `首块超时必须先重试 edge 一次，实际只调了 ${edgeCalls} 次`)
+  assert.equal(codecCalls, 0, '重试成功后不该再落本地兜底')
+  assert.equal(result.audioMs, 2400, '重试成功要正常返回音频时长')
+  instance.dispose()
+
+  // 非超时失败（403/无音频）不做无谓重试，仍按原样落兜底路径
+  const strict = new ttsModule.TihuTts({ log: () => {}, threads: 1 })
+  let strictEdge = 0
+  strict.edgeReady = () => true
+  strict.backend = () => 'none'
+  strict.synthesizeEdge = async () => { strictEdge += 1; throw new Error('edge-tts 失败（exit 1）：403') }
+  await assert.rejects(strict.synthesize('第一句。', { onChunk: () => {} }), /403/)
+  assert.equal(strictEdge, 1, '非首块超时不要重试 edge（避免 403 白等两轮）')
+  strict.dispose()
+})
+
+await testAsync('tts：本地 Qwen CPU 首包 54s 时不得 4.5s 中止', async () => {
+  const ttsModule = await import('../src/tihu/tts.ts')
+  assert.equal(typeof ttsModule.localFallbackAbortMs, 'function', 'tts 需要导出可测的 localFallbackAbortMs()')
+  assert.equal(typeof ttsModule.cpuFallbackBlocked, 'function', 'tts 需要导出可测的 cpuFallbackBlocked()')
+
+  delete process.env.TIHU_TTS_CPU_FALLBACK
+  assert.equal(ttsModule.cpuFallbackBlocked(false, 'cpu'), true, '默认音色 + CPU：不能再等本地兜底（首包 54s，必挂）')
+  assert.equal(ttsModule.cpuFallbackBlocked(true, 'cpu'), false, '克隆音色只有本地引擎，必须放行')
+  assert.equal(ttsModule.cpuFallbackBlocked(false, 'qwen-cuda'), false, 'GPU 兜底照常可用')
+  process.env.TIHU_TTS_CPU_FALLBACK = '1'
+  assert.equal(ttsModule.cpuFallbackBlocked(false, 'cpu'), false, 'TIHU_TTS_CPU_FALLBACK=1 时允许用 CPU 兜底')
+  const allowedMs = ttsModule.localFallbackAbortMs(false, 'cpu')
+  assert.ok(
+    allowedMs === 0 || allowedMs >= 54000,
+    `允许 CPU 兜底时中止门限 ${allowedMs}ms 也必须长于实测首包 54485ms（0 = 不单独中止）`,
+  )
+  process.env.TIHU_TTS_CPU_FALLBACK = '1'
+  delete process.env.TIHU_TTS_CPU_FALLBACK
+  // 默认音色 + CPU + edge 失败：立刻给出明确原因，不进 4.5s/45s 的本地等待，更不能静默返回 0 字节
+  const instance = new ttsModule.TihuTts({ log: () => {}, threads: 1 })
+  let codecCalls = 0
+  instance.edgeReady = () => true
+  instance.backend = () => 'cpu'
+  instance.ensureServer = async () => {}
+  instance.synthesizeEdge = async () => { throw new Error('edge-tts 没有返回音频：') }
+  instance.synthesizeCodec = async () => { codecCalls += 1; throw new Error('不该走到本地兜底') }
+  await assert.rejects(
+    instance.synthesize('第一句。', { onChunk: () => {} }),
+    /CPU/,
+    'CPU 兜底被禁用时要抛出带 CPU 原因的错，不能静默返回空音频',
+  )
+  assert.equal(codecCalls, 0, `CPU 兜底禁用时不许再发一次 54s 的请求，实际发了 ${codecCalls} 次`)
+  instance.dispose()
+})
+
+await testAsync('lane：单段卡 12s 不得出现 >1.5s 静音缝', async () => {
+  const AUDIO_MS = 2000
+  const CHUNK_MS = 200
+  const FIRST_MS = 200
+  const STALL_INDEX = 2
+  const STALL_MS = 12_000
+  let seq = 0
+  const stallTts = {
+    async ensureServer() {},
+    status: () => ({ available: true, model: 'stall-test' }),
+    engineLabel: () => 'stall-test',
+    takeEngineNote: () => '',
+    deviceFallback: () => '',
+    available: () => true,
+    async synthesize(text, options) {
+      const index = Number(/第(\d+)段/.exec(text)?.[1] ?? 0)
+      await waitMs(FIRST_MS)
+      const chunks = Math.round(AUDIO_MS / CHUNK_MS)
+      for (let i = 0; i < chunks; i += 1) {
+        if (index === STALL_INDEX && i === 1) {
+          // edge 实测过的长尾：首块已到、后续块卡住 12s
+          await waitMs(STALL_MS)
+        }
+        options.onChunk({ data: Buffer.alloc(CHUNK_MS * 48), seq, total: 0, final: i === chunks - 1 })
+        seq += 1
+        await waitMs(2)
+      }
+      return { sampleRate: 24000, firstChunkMs: FIRST_MS, audioMs: AUDIO_MS, totalMs: FIRST_MS + AUDIO_MS, chunks }
+    },
+    async createVoice() { throw new Error('n/a') },
+    async listVoices() { return [] },
+    dispose() {},
+  }
+  const records = [cuRecord('session-1', { live: true, lastPromptAt: 1000 })]
+  const { runtime, events } = runtimeFor(records, {}, { instance: stallTts })
+  const socket = openTimedLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'stall', protocol: '0', sessionId: 'session-1' }, 1)))
+  await waitMs(30)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const text = Array.from({ length: 6 }, (_, i) => `第${i}段内容。`).join('')
+  onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text }] } },
+  })
+  await waitMs(4000)
+
+  const audio = socket.timedFrames().filter((frame) => frame.type === 'tts.audio')
+  // 容差 1500ms：卡住那段的已有音频播完后，最多 1.5s 内必须接上下一句
+  const gaps = silenceGaps(audio, 1500)
+  assert.equal(
+    gaps.length,
+    0,
+    `单段卡 ${STALL_MS}ms 就整轮静音：出现 ${gaps.length} 处 >1.5s 静音（${gaps.map((gap) => `停在 ${gap.at}ms 断 ${gap.silenceMs}ms`).join(' / ')}）`,
+  )
+  // 不能悄悄停：卡住时要有一条「第 k 句」的人话提示
+  const progress = socket.timedFrames()
+    .filter((frame) => frame.type === 'event.progress')
+    .map((frame) => String(frame.payload.text ?? ''))
+  assert.ok(
+    progress.some((line) => /第 3\/6/.test(line)),
+    `卡住时要告诉用户卡在第几句，实际进度：${progress.join(' | ')}`,
+  )
+  runtime.dispose()
+})
+
+await testAsync('lane：同会话连续两条 assistant/message 不得并读', async () => {
+  const LATENCY = 600
+  let inFlight = 0
+  let peak = 0
+  const calls = []
+  const slowTts = {
+    async ensureServer() {},
+    status: () => ({ available: true, model: 'slow-test' }),
+    engineLabel: () => 'slow-test',
+    takeEngineNote: () => '',
+    deviceFallback: () => '',
+    available: () => true,
+    async synthesize(text, options) {
+      calls.push(text)
+      inFlight += 1
+      peak = Math.max(peak, inFlight)
+      try {
+        await waitMs(LATENCY)
+        options.onChunk({ data: Buffer.alloc(4800), seq: 0, total: 1, final: true })
+        return { sampleRate: 24000, firstChunkMs: LATENCY, audioMs: 1500, totalMs: LATENCY, chunks: 1 }
+      } finally {
+        inFlight -= 1
+      }
+    },
+    async createVoice() { throw new Error('n/a') },
+    async listVoices() { return [] },
+    dispose() {},
+  }
+  const records = [cuRecord('session-1', { live: true, lastPromptAt: 1000 })]
+  const { runtime, events } = runtimeFor(records, {}, { instance: slowTts })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'dupe', protocol: '0', sessionId: 'session-1' }, 1)))
+  await waitMs(30)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const first = Array.from({ length: 12 }, (_, i) => `第${i}段。`).join('')
+  onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: first }] } },
+  })
+  await waitMs(360)
+  const second = first + '追加两句，说明这是流式更新后的更长正文。'
+  onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: second }] } },
+  })
+  await waitMs(3500)
+
+  // 第一轮必须先被掐掉：否则两轮的合成同时跑（旧实现实测 26 次合成、页面收到两遍 index 0..11）
+  assert.ok(peak <= 4, `同一会话两轮并读：同时在跑的合成峰值 ${peak} 段（上限 4），说明上一轮没被取消`)
+  assert.ok(
+    calls.length <= 14 + 4,
+    `两轮都完整合成了一遍（${calls.length} 次）；第一轮应当在第二轮到达时被取消`,
+  )
+  const errors = framesOf(socket)
+    .filter((frame) => frame.type === 'event.alert' && frame.payload.level === 'error')
+    .map((frame) => String(frame.payload.text ?? ''))
+  assert.equal(errors.length, 0, '取消上一轮是正常行为，不能报「本次无语音」：' + errors.join(' | '))
+  const audio = framesOf(socket).filter((frame) => frame.type === 'tts.audio')
+  assert.ok(audio.length > 0, '第二轮仍要正常出声')
+  runtime.dispose()
+})
+
+test('page：stage=回答中 的新 reply 帧不得清空朗读队列', () => {
+  const { ctx } = fakeCtx()
+  const runtime = createTihuRuntime(ctx, { log: () => {}, tts: { disabled: true } })
+  const html = runtime.page()
+  runtime.dispose()
+  assert.equal(
+    html.includes("payload.stage === '回复'"),
+    false,
+    "lane 的回复帧 stage 恒为「回答中」，页面上这条 stage==='回复' 的 reset 是死代码（永远不会触发），要删掉",
+  )
+  const source = readFileSync(new URL('../src/tihu/page.ts', import.meta.url), 'utf8')
+  const screenCaseStart = source.indexOf("case 'screen.frame'")
+  const transcriptCaseStart = source.indexOf("case 'transcript'")
+  assert.ok(screenCaseStart > 0 && transcriptCaseStart > screenCaseStart, '找不到 screen.frame / transcript 分支')
+  const screenCase = source.slice(screenCaseStart, transcriptCaseStart)
+  assert.equal(
+    screenCase.includes('resetTurnAudio'),
+    false,
+    'screen.frame 分支不得清空朗读队列：' + screenCase.split(String.fromCharCode(10)).join(' / '),
+  )
+  // 清队列这件事只留给「用户新的语音输入」（transcript），这条要留着
+  const transcriptCase = source.slice(transcriptCaseStart, source.indexOf("case 'tts.text'"))
+  assert.ok(transcriptCase.includes('resetTurnAudio'), 'transcript 仍要停掉上一轮残留音频')
+})
+
 /* ---------- 汇总 ---------- */
 console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
 if (failed > 0) process.exit(1)
