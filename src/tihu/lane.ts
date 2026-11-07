@@ -689,7 +689,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     if ((device.voice && device.voice !== 'default') || device.offlineOnly) await tts.ensureServer()
     const status = tts.status()
     if (!status.available) {
-      device.send('event.alert', { level: 'error', text: `所有本地 TTS 均不可用，本条只显示文字：${status.error ?? '未安装模型'}` })
+      device.send('event.alert', { level: 'error', text: `本次无语音：在线兜底不可用且本地引擎未就绪（原因：${status.error ?? '未安装模型'}）` })
       return
     }
     const voice = device.voice || 'default'
@@ -723,7 +723,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
           },
         })
         const engineNote = tts.takeEngineNote()
-        if (engineNote.startsWith('在线兜底') || engineNote.startsWith('离线兜底')) {
+        if (engineNote.startsWith('在线兜底')) {
           device.send('event.progress', { stage: 'tts', text: engineNote } satisfies ProgressPayload)
         }
       }
@@ -733,7 +733,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     } catch (error) {
       const message = (error as Error)?.message ?? String(error)
       log(`tihu tts failed session=${sessionId} voice=${voice}: ${message}`)
-      device.send('event.alert', { level: 'error', text: `所有本地 TTS 均不可用，本条只显示文字：${message}` })
+      device.send('event.alert', { level: 'error', text: `本次无语音：在线兜底不可用且本地引擎未就绪（原因：${message}）` })
     }
   }
 

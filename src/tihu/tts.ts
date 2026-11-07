@@ -3,7 +3,8 @@
  *
  * 当前主引擎：Qwen3-TTS-12Hz-0.6B-Base 的 PyTorch CPU 实现（`scripts/tihu-qwen-tts-server.py`，
  * 官方 `qwen-tts` 包，fp32 + sdpa + 8 线程），仅绑 127.0.0.1，由本模块 spawn。
- * 旧 GGUF/codec.cpp 路径保留在 backend() 里作为备用；两者都不可用时回退 Windows SAPI。
+ * 引擎：edge-tts 云健（默认，在线）/ Qwen3-TTS GPU（离线、克隆）/ Q4（弃用备用）。
+ * 没有机械音兜底；两者都不可用时不发声，由 lane 发 error alert 并保留正文。
  *
  * 设计：
  *   - **独立进程**：DSH 主进程只做 HTTP 客户端；
@@ -20,9 +21,9 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync } from 'node:fs'
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
-import { homedir, tmpdir } from 'node:os'
+import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
-import { Pcm16Chunker, TTS_CHUNK_MS, TTS_SAMPLE_RATE, parseWav, resamplePcm16, validateReferenceWav } from './audio.ts'
+import { Pcm16Chunker, TTS_CHUNK_MS, TTS_SAMPLE_RATE, validateReferenceWav } from './audio.ts'
 import { toTtsSegments } from './protocol.ts'
 import type { VoiceInfo } from './protocol.ts'
 
@@ -144,10 +145,10 @@ export class TihuTts {
   private activeDevice: 'cuda' | 'cpu' = (process.env.TIHU_TTS_DEVICE ?? 'cpu') === 'cuda' ? 'cuda' : 'cpu'
   /** 显存不足回落 CPU 的提示（页面事件区用）。 */
   private fallbackNote = ''
-  /** GPU 启动/合成失败后永久切 SAPI（本次进程内不再重试 GPU）。 */
+  /** GPU 启动/合成失败后本次进程内不再重试（不回退机械音）。 */
   private gpuFailed = false
   /** 实际出声引擎（用于事件标识）。 */
-  private activeEngine: 'gpu' | 'edge' | 'sapi' = 'gpu'
+  private activeEngine: 'gpu' | 'edge' | 'none' = 'edge'
   private lastLabel = ''
 
   constructor(options: TihuTtsOptions) {
@@ -156,15 +157,13 @@ export class TihuTts {
     this.port = options.port ?? DEFAULT_PORT
   }
 
-  /** 当前后端：qwen-cuda（默认 GPU）/ q4（弃用备用）/ cpu（调试）/ sapi（唯一兜底）/ none。 */
-  /** 当前后端：qwen-cuda（默认）/ q4 / cpu（调试）/ sapi（唯一兜底）/ none。 */
-  backend(): 'qwen-cuda' | 'q4' | 'cpu' | 'sapi' | 'none' {
+  /** 当前后端：qwen-cuda（默认 GPU）/ q4（弃用备用）/ cpu（调试）/ none。 */
+  backend(): 'qwen-cuda' | 'q4' | 'cpu' | 'none' {
     if (this.options.disabled) return 'none'
     const engine = process.env.TIHU_TTS_ENGINE ?? ''
     if (engine === 'q4' && existsSync(this.paths.bin) && existsSync(this.paths.model) && existsSync(this.paths.codec)) return 'q4'
     if (engine === 'cpu' && this.qwenReady()) return 'cpu'
     if (this.qwenReady() && !this.gpuFailed) return 'qwen-cuda'
-    if (process.platform === 'win32') return 'sapi'
     return 'none'
   }
 
@@ -187,20 +186,23 @@ export class TihuTts {
       existsSync(join(this.qwenModelDir(), 'model.safetensors'))
   }
 
-  /** 引擎是否可用。 */
+  /** 引擎是否可用（edge 或本地 Qwen 任一可用）。 */
   available(): boolean {
-    return this.backend() !== 'none'
+    return this.edgeReady() || this.backend() !== 'none'
   }
 
   status(): { available: boolean; model?: string; error?: string } {
     const backend = this.backend()
-    if (backend === 'qwen-cuda') return { available: true, model: 'qwen3-tts 0.6b-cuda' }
-    if (backend === 'cpu') return { available: true, model: 'qwen3-tts 0.6b-pt' }
-    if (backend === 'q4') return { available: true, model: 'qwen3-tts 0.6b-q4' }
-    if (backend === 'sapi') return { available: true, model: 'Windows SAPI' }
+    if (this.activeEngine === 'gpu' && backend !== 'none') {
+      if (backend === 'q4') return { available: true, model: 'qwen3-tts 0.6b-q4' }
+      if (backend === 'cpu') return { available: true, model: 'qwen3-tts 0.6b-pt' }
+      return { available: true, model: 'qwen3-tts 0.6b-cuda' }
+    }
+    if (this.edgeReady()) return { available: true, model: 'edge-tts 云健(Yunjian)' }
+    if (backend !== 'none') return { available: true, model: 'qwen3-tts 0.6b-cuda' }
     return {
       available: false,
-      error: this.lastError || `本地 TTS 未安装：缺少 ${basename(this.qwenServerScript())} 或模型文件（${this.paths.root}）`,
+      error: this.lastError || `无语音：edge 不可用且本地 Qwen 未就绪（${this.paths.root}）`,
     }
   }
 
@@ -209,18 +211,18 @@ export class TihuTts {
     return this.fallbackNote
   }
 
-  /** 确保 sidecar 已启动并加载完模型（SAPI 后端无需常驻进程）。 */
+  /** 确保 sidecar 已启动并加载完模型。 */
   async ensureServer(): Promise<void> {
     const backend = this.backend()
-    if (backend === 'sapi' || backend === 'none') return
+    if (backend === 'none') return
     if (this.child !== null && this.modelLoaded) return
     if (this.starting !== null) return this.starting
     this.starting = this.startServer().catch((error) => {
       if (backend === 'qwen-cuda') {
         const message = (error as Error)?.message ?? String(error)
         this.gpuFailed = true
-        this.fallbackNote = `GPU 不可用，已切换 Windows SAPI：${message}`
-        this.log(`tts gpu unavailable, fallback sapi: ${message}`)
+        this.fallbackNote = `GPU 不可用：${message}`
+        this.log(`tts gpu unavailable: ${message}`)
         return
       }
       throw error
@@ -347,7 +349,7 @@ export class TihuTts {
   /** 当前引擎的中文标识（页面事件区）。 */
   engineLabel(voice: string): string {
     if (this.activeEngine === 'edge') return '在线兜底：edge-tts 云健(Yunjian)'
-    if (this.activeEngine === 'sapi') return '离线兜底：Windows SAPI Huihui'
+    if (this.activeEngine === 'none') return '无语音（仅文字）'
     return `本地 TTS：qwen3-tts 0.6b-cuda / 音色 ${voice || 'default'}`
   }
 
@@ -360,7 +362,7 @@ export class TihuTts {
 
   /**
    * edge-tts 在线兜底：Python 流式输出 MP3 → ffmpeg 解码 24k PCM。
-   * 首块 1.5s 不到立即杀掉并由调用方切 SAPI。
+   * 首块 1.5s 不到立即杀掉，由调用方决定落 Qwen 还是无语音。
    */
   private async synthesizeEdge(
     text: string,
@@ -457,6 +459,7 @@ export class TihuTts {
     const wantsClone = typeof options.voice === 'string' && options.voice !== '' && options.voice !== 'default'
     const offline = options.offlineOnly === true || process.env.TIHU_OFFLINE_ONLY === '1'
     let primaryError = ''
+    let edgeError = ''
     let triedEdge = false
 
     // 默认在线云健（不是克隆音色、且未开仅离线）：首块最快、音质最好。
@@ -468,102 +471,41 @@ export class TihuTts {
         return result
       } catch (error) {
         primaryError = (error as Error)?.message ?? String(error)
+        edgeError = primaryError
         this.log(`edge-tts failed: ${primaryError}`)
       }
     }
 
-    // 本地 Qwen：克隆音色必走；在线失败/仅离线时也走；GPU 不可用则直接跳 SAPI。
+    // 本地 Qwen：克隆音色必走；在线失败/仅离线时也走；失败则无语音。
     const backend = this.backend()
-    if (backend !== 'sapi' && backend !== 'none') {
+    if (backend !== 'none') {
       try {
-        const result = await this.synthesizeCodec(text, options)
-        this.setEngine('gpu')
-        return result
+        // 在线失败/仅离线走本地时，Qwen 首包 >4.5s 就放弃，避免页面干等。
+        const controller = new AbortController()
+        const timer = wantsClone ? null : setTimeout(() => controller.abort(), 4500)
+        try {
+          const result = await this.synthesizeCodec(text, { ...options, signal: options.signal ?? controller.signal })
+          this.setEngine('gpu')
+          return result
+        } finally {
+          if (timer !== null) clearTimeout(timer)
+        }
       } catch (error) {
         primaryError = (error as Error)?.message ?? String(error)
         this.gpuFailed = true
-        this.fallbackNote = `GPU 不可用：${primaryError}`
+        this.fallbackNote = `本地 Qwen 失败：${primaryError}`
         this.log(`tts qwen failed: ${primaryError}`)
       }
     }
 
-    if (!triedEdge && !offline && !wantsClone && this.edgeReady()) {
-      try {
-        const result = await this.synthesizeEdge(text, { ...options, edgeVoice: options.edgeVoice })
-        this.setEngine('edge')
-        return result
-      } catch (error) {
-        primaryError = (error as Error)?.message ?? String(error)
-        this.log(`edge-tts failed: ${primaryError}`)
-      }
-    }
-
-    try {
-      const result = await this.synthesizeSapi(text, options)
-      this.setEngine('sapi')
-      if (this.fallbackNote === '') this.fallbackNote = `本地引擎不可用，已用 Windows SAPI：${primaryError}`
-      return result
-    } catch (error) {
-      throw new Error(`所有本地 TTS 均不可用：${(error as Error)?.message ?? String(error)}（${primaryError}）`)
-    }
+    this.activeEngine = 'none'
+    this.lastLabel = '无语音（仅文字）'
+    throw new Error(`本次无语音：在线兜底不可用且本地引擎未就绪（在线：${edgeError || '未启用'}；本地：${primaryError || '未就绪'}）`)
   }
 
-  private setEngine(engine: 'gpu' | 'edge' | 'sapi'): void {
+  private setEngine(engine: 'gpu' | 'edge' | 'none'): void {
     this.activeEngine = engine
     this.lastLabel = this.engineLabel('')
-  }
-
-  /** Windows SAPI 占位后端：生成 24k PCM 后分块（不流式；Qwen sidecar 就绪前保证链路可用）。 */
-  private async synthesizeSapi(
-    text: string,
-    options: {
-      onChunk: (chunk: { data: Buffer; seq: number; total: number; final: boolean }) => void
-      signal?: AbortSignal
-    },
-  ): Promise<SynthResult> {
-    const started = Date.now()
-    const file = join(tmpdir(), `tihu-sapi-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.wav`)
-    const script = [
-      'Add-Type -AssemblyName System.Speech;',
-      '$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;',
-      `$s.SetOutputToWaveFile('${file.replace(/'/g, "''")}');`,
-      '$text = [Console]::In.ReadToEnd();',
-      '$s.Speak($text);',
-      '$s.Dispose();',
-    ].join(' ')
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] })
-      let stderr = ''
-      child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8') })
-      child.on('error', reject)
-      child.on('exit', (code) => {
-        if (code === 0) resolve()
-        else reject(new Error(`系统语音合成失败（exit ${code}）：${stderr.split('\n').filter(Boolean).slice(-2).join(' ').slice(0, 200)}`))
-      })
-      child.stdin?.end(text, 'utf8')
-    })
-    try {
-      const wav = await readFile(file)
-      const info = parseWav(wav)
-      if (info === null) throw new Error('系统语音返回的不是有效 WAV')
-      const pcm = resamplePcm16(wav.subarray(info.dataOffset, info.dataOffset + info.dataBytes), info.sampleRate, TTS_SAMPLE_RATE)
-      const chunker = new Pcm16Chunker()
-      let chunks = 0
-      let firstChunkAt = 0
-      const emit = (data: Buffer, final: boolean) => {
-        if (firstChunkAt === 0) firstChunkAt = Date.now()
-        options.onChunk({ data, seq: chunks, total: 0, final })
-        chunks += 1
-      }
-      for (const block of chunker.push(pcm)) emit(block, false)
-      for (const block of chunker.finish()) emit(block.data, block.final)
-      const totalMs = Date.now() - started
-      const audioMs = Math.round((pcm.length / 2 / TTS_SAMPLE_RATE) * 1000)
-      this.log(`tts(sapi) chars=${[...text].length} first=${firstChunkAt === 0 ? '?' : firstChunkAt - started}ms total=${totalMs}ms audio=${audioMs}ms chunks=${chunks}`)
-      return { sampleRate: TTS_SAMPLE_RATE, firstChunkMs: firstChunkAt === 0 ? totalMs : firstChunkAt - started, audioMs, totalMs, chunks }
-    } finally {
-      import('node:fs/promises').then((fs) => fs.unlink(file).catch(() => {})).catch(() => {})
-    }
   }
 
   private async synthesizeCodec(
@@ -705,7 +647,7 @@ export class TihuTts {
   ): Promise<{ voice: VoiceInfo; cached: boolean }> {
     const name = normalizeVoiceName(payload.name)
     if (name === null) throw new Error('音色名只能包含英文/数字/下划线/短横线，1–32 字，且不能是 default')
-    if (this.backend() === 'sapi' || this.backend() === 'none') throw new Error('当前只有 Windows SAPI 兜底，不支持音色克隆；本地 Qwen 引擎不可用')
+    if (this.backend() === 'none') throw new Error('本地 Qwen 引擎未就绪，无法创建克隆音色')
     const dir = this.workspaceDir(sessionId)
     await mkdir(dir, { recursive: true })
     const wav = Buffer.from(payload.wavBase64, 'base64')

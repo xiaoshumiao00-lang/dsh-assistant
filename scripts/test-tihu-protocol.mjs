@@ -1060,13 +1060,13 @@ await testAsync('lane：长回复的 TTS 段全部下发（不再丢 320 字以�
   runtime.dispose()
 })
 
-/* ---------- 降级链：GPU 不可用 / SAPI 失败 ---------- */
+/* ---------- 两级链：edge 失败 → Qwen；都失败 → 无语音 ---------- */
 
-function fakeTts({ model = 'Windows SAPI', fail = false } = {}) {
+function fakeTts({ model = 'qwen3-tts 0.6b-cuda', fail = false } = {}) {
   return {
     async ensureServer() {},
     status: () => ({ available: true, model }),
-    engineLabel: (voice) => model === 'Windows SAPI' ? '离线兜底：Windows SAPI Huihui' : ('本地 TTS：' + model + ' / 音色 ' + voice),
+    engineLabel: (voice) => '本地 TTS：' + model + ' / 音色 ' + voice,
     takeEngineNote: () => '',
     deviceFallback: () => '',
     available: () => true,
@@ -1080,7 +1080,7 @@ function fakeTts({ model = 'Windows SAPI', fail = false } = {}) {
   }
 }
 
-await testAsync('lane：GPU 不可用 → 直接 SAPI，不出现 CPU 引擎', async () => {
+await testAsync('lane：edge 失败 → Qwen 本地引擎出声', async () => {
   const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true, lastPromptAt: 1000 })], {}, { instance: fakeTts() })
   const socket = openLane(runtime)
   socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'sapi', protocol: '0', sessionId: 'session-1' }, 1)))
@@ -1093,13 +1093,13 @@ await testAsync('lane：GPU 不可用 → 直接 SAPI，不出现 CPU 引擎', a
   await new Promise((resolve) => setTimeout(resolve, 60))
   const frames = framesOf(socket)
   const progress = frames.filter((frame) => frame.type === 'event.progress').map((frame) => frame.payload.text)
-  assert.ok(progress.includes('离线兜底：Windows SAPI Huihui'), `引擎标识应为 SAPI，实际 ${progress.join(' | ')}`)
-  assert.ok(frames.some((frame) => frame.type === 'tts.audio'), 'SAPI 也要下发 tts.audio')
-  assert.ok(!frames.some((frame) => JSON.stringify(frame.payload).includes('qwen')), '不能再出现 GPU/CPU 引擎标识')
+  assert.ok(progress.includes('本地 TTS：qwen3-tts 0.6b-cuda / 音色 default'), `引擎标识应为 Qwen，实际 ${progress.join(' | ')}`)
+  assert.ok(frames.some((frame) => frame.type === 'tts.audio'), 'Qwen 也要下发 tts.audio')
+  assert.ok(!frames.some((frame) => String(frame.payload.text ?? '').includes('SAPI')), '不能再出现 SAPI 引擎标识')
   runtime.dispose()
 })
 
-await testAsync('lane：SAPI 也失败 → error alert，屏幕仍保留 reply 正文', async () => {
+await testAsync('lane：edge 与 Qwen 都失败 → alert 且不出声，屏幕保留 reply 正文', async () => {
   const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true, lastPromptAt: 1000 })], {}, { instance: fakeTts({ fail: true }) })
   const socket = openLane(runtime)
   socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'sapi-fail', protocol: '0', sessionId: 'session-1' }, 1)))
@@ -1112,7 +1112,8 @@ await testAsync('lane：SAPI 也失败 → error alert，屏幕仍保留 reply �
   await new Promise((resolve) => setTimeout(resolve, 60))
   const frames = framesOf(socket)
   const alerts = frames.filter((frame) => frame.type === 'event.alert').map((frame) => frame.payload)
-  assert.ok(alerts.some((alert) => alert.level === 'error' && String(alert.text).includes('所有本地 TTS 均不可用')), '必须发 error alert')
+  assert.ok(alerts.some((alert) => alert.level === 'error' && String(alert.text).includes('本次无语音')), '必须发无语音 alert')
+  assert.ok(!frames.some((frame) => frame.type === 'tts.audio'), '都失败时不能下发 tts.audio')
   const screens = frames.filter((frame) => frame.type === 'screen.frame')
   const last = screens[screens.length - 1].payload
   assert.equal(last.mode, 'reply')

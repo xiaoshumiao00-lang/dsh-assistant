@@ -10,7 +10,7 @@
  *   2. 无麦克风：选本地 WAV 文件（或拖进来）→ 同一条解码/重采样/上行路径。
  *      台式机没有麦克风时用这一条，验收不依赖手机。
  *
- * TTS 只播放宿主下发的 PCM（Qwen GPU / Windows SAPI）；页面不再使用浏览器语音。
+ * TTS 只播放宿主下发的 PCM（edge 云健 / Qwen GPU）；页面不再使用浏览器语音。
  */
 import { ACTUAL_SIZE_SCALE, SCREEN_SPEC } from './screen-spec.ts'
 export function tihuPageHtml(options: { lanePath: string; protocol: string }): string {
@@ -182,7 +182,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     </select>
   </div>
   <label class="hint" style="display:flex;align-items:center;gap:6px;margin-top:8px">
-    <input id="offlineOnly" type="checkbox" style="width:auto" /> 仅离线（禁用 edge 云健，走 Qwen/SAPI）
+    <input id="offlineOnly" type="checkbox" style="width:auto" /> 仅离线（禁用 edge 云健，走本地 Qwen）
   </label>
   <input id="voiceNote" placeholder="备注（可选）" style="margin-top:8px" />
   <div class="hint" id="voiceHint">仅可用于你本人或已获授权的音色；参考音频只在本机处理，不上传云端。</div>
@@ -617,7 +617,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
 
   /* ---------- 本地 TTS（PCM）播放 ----------
      sidecar 以 24kHz/pcm16 流式下发，页面用 WebAudio 无缝排队拼接。
-     页面只播放宿主合成的 PCM（Qwen GPU / Windows SAPI），不再使用浏览器语音。 */
+     页面只播放宿主合成的 PCM（edge 云健 / Qwen GPU），不再使用浏览器语音。 */
   function ensureAudio() {
     if (state.audioCtx) return state.audioCtx;
     var Ctx = window.AudioContext || window.webkitAudioContext;
@@ -710,10 +710,14 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     var engine = state.voiceEngine;
     if (engine && engine.available === false) {
-      $('voiceHint').textContent = '本地 TTS 不可用（' + (engine.error || '未安装模型') + '），本条只显示文字。';
+      $('voiceHint').textContent = '无语音：' + (engine.error || '在线兜底不可用且本地引擎未就绪') + '（本条只显示文字）。';
     } else {
-      var shownVoice = (engine && engine.model === 'Windows SAPI') ? '默认' : state.voice;
-      $('voiceHint').textContent = '本地 TTS：' + ((engine && engine.model) || '本地引擎') + ' / 音色 ' + shownVoice + '。仅可用于你本人或已获授权的音色；参考音频只在本机处理。';
+      var model = (engine && engine.model) || '本地引擎';
+      if (model.indexOf('edge-tts') >= 0) {
+        $('voiceHint').textContent = '在线兜底：edge-tts 云健(Yunjian) / 音色 默认。仅可用于你本人或已获授权的音色。';
+      } else {
+        $('voiceHint').textContent = '本地 TTS：' + model + ' / 音色 ' + state.voice + '。仅可用于你本人或已获授权的音色；参考音频只在本机处理。';
+      }
     }
   }
 
