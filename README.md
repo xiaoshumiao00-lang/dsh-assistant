@@ -309,6 +309,13 @@ npm run lint       # scripts/lint-standards.mjs（不靠 eslint：查个人化�
 - `CHANGELOG.md`：唯一的公告源（`## [<版本>]` 那一节随包发到控制室）
 - `scripts/install-assistant.mjs` / `scripts/uninstall-assistant.mjs` / `scripts/lint-standards.mjs` / `scripts/test-*.mjs`
 
+## 鹈鹕（tihu）本地 TTS 运行时
+
+- 默认在线兜底：`edge-tts` + `zh-CN-YunjianNeural`（云健），默认语速 `TIHU_EDGE_RATE=+45%`，代理 `TIHU_EDGE_PROXY=http://127.0.0.1:7897`。
+- **edge-tts 必须 ≥ 7.3.1**：7.2.x 的 Sec-MS-GEC/DRM 已过期，Bing WSS 会 403。本机 PyPI 直连不通，用清华镜像升级：
+  `python -m pip install -U edge-tts -i https://pypi.tuna.tsinghua.edu.cn/simple`
+- 运行时用 `~/.dsh/tihu/venv`（已装 7.3.1）；edge 失败自动走 Qwen3-TTS GPU，两者都失败则无语音并红字告警（正文仍显示）。
+
 ## 致谢
 
 - [dsh-worktable](https://github.com/xiaoshumiao00-lang/dsh-worktable)（MIT）
