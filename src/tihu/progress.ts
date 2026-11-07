@@ -230,6 +230,26 @@ const STAGE_WORD: Record<string, string> = {
   思考: '思考', 读文件: '读取文件', 写文件: '写文件', 搜索: '搜索', 跑命令: '执行命令', 回答: '回答', 等待确认: '等待确认',
 }
 
+﻿/** 命令里最有用的一段：去掉开头的 cd / Set-Location 和管道前缀，取最后一段真正干活的命令。 */
+export function salientCommand(command: string): string {
+  let text = String(command ?? '').replace(/\s+/g, ' ').trim()
+  const strip = /^(?:Set-Location|cd|sl)\s+(?:"[^"]*"|'[^']*'|\S+)\s*;?\s*/i
+  for (let i = 0; i < 3 && strip.test(text); i += 1) text = text.replace(strip, '')
+  const parts = text.split(/;|&&|\|\|/).map((part) => part.trim()).filter(Boolean)
+  const last = parts.length > 0 ? parts[parts.length - 1] : text
+  // 去掉重定向和管道尾巴（2>&1 | Select-Object -Last 3 这类对用户没意义）。
+  const cleaned = last.replace(/\s*\d?>&\d/g, '').split(/\s\|\s/)[0].trim()
+  return cleaned === '' ? last : cleaned
+}
+
+/** 活动行（第二行冒号后）该写什么：命令取最有用的一段，其它工具去掉动词只看目标。 */
+function activityLine(stage: string, title: string, detail: string): string {
+  if (stage === '跑命令') return salientCommand(detail || title)
+  const text = String(title ?? '').trim()
+  const spaceAt = text.indexOf(' ')
+  return spaceAt > 0 ? text.slice(spaceAt + 1).trim() : text
+}
+
 /** 第一句话：去掉多余空白、压成一行（放不下由 clipText 收省略号）。 */
 function firstSentence(value: unknown): string {
   const text = String(value ?? '').replace(/\s+/g, ' ').trim()
@@ -335,7 +355,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.stage = action.stage
     state.title = action.title
     state.stageWord = action.stage
-    state.firstLine = firstSentence(action.detail || action.title)
+    state.firstLine = firstSentence(activityLine(action.stage, action.title, action.detail) || action.title)
     state.tone = 'busy'
     return {
       screen: statusFrame(state, now),
