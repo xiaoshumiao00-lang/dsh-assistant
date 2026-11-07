@@ -138,27 +138,3 @@ export function parseWav(buffer: Buffer | Uint8Array): WavInfo | null {
   }
   return { ok: true, info }
 }
-
-/**
- * pcm16 单声道线性插值重采样（SAPI 兜底用；Qwen sidecar 直接输出 24k）。
- * 末尾不完整采样会被丢弃。
- */
-export function resamplePcm16(input: Buffer, fromRate: number, toRate: number): Buffer {
-  if (fromRate === toRate) return Buffer.from(input.subarray(0, input.length - (input.length % 2)))
-  const inLength = Math.floor(input.length / 2)
-  if (inLength === 0) return Buffer.alloc(0)
-  const sampleAt = (index: number): number => input.readInt16LE(index * 2)
-  const ratio = fromRate / toRate
-  const outLength = Math.max(1, Math.round(inLength / ratio))
-  const out = Buffer.alloc(outLength * 2)
-  for (let i = 0; i < outLength; i += 1) {
-    const pos = i * ratio
-    const lo = Math.floor(pos)
-    const hi = Math.min(lo + 1, inLength - 1)
-    const frac = pos - lo
-    const value = sampleAt(lo) * (1 - frac) + sampleAt(hi) * frac
-    out.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(value))), i * 2)
-  }
-  return out
-}
-

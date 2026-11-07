@@ -247,7 +247,7 @@ export interface VoiceSelectPayload {
   name: string
   /** edge-tts 兜底音色（zh-CN-...Neural），不填用默认云健。 */
   edgeVoice?: string
-  /** 仅离线：禁用 edge-tts，只走 Qwen / SAPI。 */
+  /** 仅离线：禁用 edge-tts，只走本地 Qwen。 */
   offlineOnly?: boolean
 }
 
