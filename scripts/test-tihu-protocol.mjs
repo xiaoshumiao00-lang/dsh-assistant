@@ -1659,3 +1659,4 @@ test('语音切段：长句按逗号/32 字切分，首包不必等整句', () =
 /* ---------- 汇总 ---------- */
 console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
 if (failed > 0) process.exit(1)
+process.exit(0)

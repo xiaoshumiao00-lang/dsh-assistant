@@ -13,6 +13,10 @@ import sys
 async def run(text: str, voice: str, rate: str, timeout: float, proxy: str | None) -> None:
     import edge_tts
 
+    version = str(getattr(edge_tts, "__version__", "0"))
+    if version.startswith("7.2."):
+        # 7.2.x 的 Sec-MS-GEC-Version 已过期，Bing 一律 403；7.3.1 已修正。
+        raise RuntimeError(f"edge-tts {version} 的 Sec-MS-GEC 已过期（403），需要 7.3.1+")
     communicate = edge_tts.Communicate(text, voice, rate=rate, proxy=proxy)
     async for chunk in communicate.stream():
         if chunk.get("type") == "audio" and chunk.get("data"):

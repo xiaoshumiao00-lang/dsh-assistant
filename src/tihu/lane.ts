@@ -231,6 +231,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   /** 每会话的屏幕模式与回主页计时。 */
   const homeStates = new Map<string, { mode: 'home' | 'session'; page: number; done: boolean; timer?: ReturnType<typeof setTimeout> }>()
   /** 显示会话 id → 待读气泡（别的会话完成时入队）。 */
+  let disposed = false
   const pendingByDisplay = new Map<string, { sessionId: string; title: string; at: number }[]>()
   /** 会话 id → 最近一条回复（点气泡后从头朗读）。 */
   const lastReplies = new Map<string, { sentences: ReplySentence[]; speechSegments: SpeechSegment[]; includeAll: boolean }>()
@@ -804,11 +805,13 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   }
 
   function scheduleHome(sessionId: string): void {
+    if (disposed) return
     const state = homeStates.get(sessionId)
     if (state === undefined || !state.done) return
     cancelHomeTimer(sessionId)
     const delay = Number(process.env.TIHU_HOME_AFTER_MS ?? 10_000)
     state.timer = setTimeout(() => {
+      if (disposed) return
       const current = homeStates.get(sessionId)
       if (current === undefined || !current.done) return
       const scroll = screenStates.get(sessionId)
@@ -1664,6 +1667,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     page: () => tihuPageHtml({ lanePath: TIHU_LANE_PATH, protocol: TIHU_PROTOCOL_VERSION }),
     handleUpgrade,
     dispose: () => {
+      disposed = true
       ;(confirmBroker as any).failAll?.('disposed')
       for (const [sessionId, state] of homeStates) {
         if (state.timer !== undefined) clearTimeout(state.timer)
