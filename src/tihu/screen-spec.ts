@@ -70,7 +70,16 @@ export function charWidthEm(char: string): number {
     (code >= 0xff00 && code <= 0xff60) ||
     (code >= 0xffe0 && code <= 0xffe6) ||
     (code >= 0x1f300 && code <= 0x1faff)
-  return wide ? 1 : 0.47
+  if (wide) return 1
+  // ASCII 按类别估宽：原来一律 0.47em，实测大写/数字/下划线明显更宽，
+  // 会把「刚好 304px」的行挤成两行、把第四行统计顶出屏幕。
+  if (char === ' ') return 0.26
+  if (char >= '0' && char <= '9') return 0.56
+  if (char >= 'A' && char <= 'Z') return 0.62
+  if (char >= 'a' && char <= 'z') return 0.5
+  if ('.,:;!|\'`()[]{}/\\-'.includes(char)) return 0.32
+  if (char === '_' || char === '@' || char === '%' || char === '&' || char === '#') return 0.56
+  return 0.5
 }
 
 /** 估算文本像素宽度。 */
