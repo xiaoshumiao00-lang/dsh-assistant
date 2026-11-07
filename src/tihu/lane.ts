@@ -325,7 +325,26 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   }
 
   /** 屏帧快捷方法。 */
-  function screen(sessionId: string, frame: Omit<ScreenFramePayload, 'bullets'> & { bullets?: string[] }): void {
+  ﻿/** 屏帧需要的会话标题与统计（第一行标题 + 第四行 tok/s、总 token、上下文占比）。 */
+function screenMetaOf(sessionId: string): { title?: string; stats?: { tokPerSec: number; totalTokens: number; contextPercent: number } } {
+  const sessions = optionalService(ctx, 'sessions')
+  let live: any
+  try { live = typeof sessions?.get === 'function' ? sessions.get(sessionId) : undefined } catch { live = undefined }
+  if (live === undefined || live === null) return {}
+  const values = projectionValuesOf(live) as Record<string, any>
+  const totals = values?.tokenUsage?.totals ?? {}
+  const totalTokens = Number(totals.uncachedInputTokens ?? 0) + Number(totals.outputTokens ?? 0)
+    + Number(totals.cacheReadTokens ?? 0) + Number(totals.cacheWriteTokens ?? 0)
+  const decodeMs = Number(values?.sessionStats?.decodeMs ?? 0)
+  const decodeTokens = Number(values?.sessionStats?.decodeTokens ?? 0)
+  const tokPerSec = decodeMs > 0 ? decodeTokens / (decodeMs / 1000) : 0
+  const contextWindow = Number(values?.contextPressure?.contextWindow ?? 0)
+  const used = Number(values?.contextPressure?.pressureTokens ?? values?.contextPressure?.surfaceTokens ?? 0)
+  const contextPercent = contextWindow > 0 ? Math.min(100, (used / contextWindow) * 100) : 0
+  return { title: titleOf(live), stats: { tokPerSec, totalTokens, contextPercent } }
+}
+
+function screen(sessionId: string, frame: Omit<ScreenFramePayload, 'bullets'> & { bullets?: string[] }): void {
     broadcast(sessionId, 'screen.frame', {
       stage: frame.stage,
       title: frame.title,
@@ -1496,7 +1515,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         cancelHomeTimer(sessionId)
         homeStates.set(sessionId, { mode: 'session', page: 0, done: false })
       }
-      const update = applySessionEvent(state, event)
+      const update = applySessionEvent(state, event, Date.now(), screenMetaOf(sessionId))
       if (type === 'turn/start') {
         // 注意：**不能**在这里点亮 tihu 窗口。用户自己在会话里打字同样会触发
         // turn/start，旧实现就是这么把用户自己的每个 turn 都变成「危险动作要确认」的。

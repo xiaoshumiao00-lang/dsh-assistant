@@ -203,13 +203,21 @@ export interface TihuProgressState {
   turnStartedAt: number
   lastResult?: { ok: boolean; line: string }
   lastOutput: string
+  /** 阶段汉字（第二行冒号前：思考/执行命令/搜索…）。 */
+  stageWord: string
+  /** 第二行的第一句内容。 */
+  firstLine: string
+  /** 会话标题（第一行）。 */
+  sessionTitle: string
+  /** 第四行：解码速度 / 总 token / 上下文占比。 */
+  stats?: { tokPerSec: number; totalTokens: number; contextPercent: number }
   stage: TihuStage
   title: string
   tone: 'idle' | 'busy' | 'ok' | 'alert'
 }
 
 export function createProgressState(now = Date.now()): TihuProgressState {
-  return { turn: 0, step: 0, turnStartedAt: now, lastResult: undefined, lastOutput: '', stage: '思考', title: '等待指令', tone: 'idle' }
+  return { turn: 0, step: 0, turnStartedAt: now, lastResult: undefined, lastOutput: '', stageWord: '思考', firstLine: '', sessionTitle: '', stage: '思考', title: '等待指令', tone: 'idle' }
 }
 
 export interface ProgressUpdate {
@@ -217,11 +225,50 @@ export interface ProgressUpdate {
   progress?: ProgressPayload
 }
 
-function bulletsOf(state: TihuProgressState, now: number): string[] {
-  const lines = [`第 ${state.step} 步 · 已用 ${formatElapsed(now - state.turnStartedAt)}`]
-  if (state.lastResult) lines.push(state.lastResult.line)
-  if (state.lastOutput && state.lastOutput !== state.lastResult?.line) lines.push(state.lastOutput)
-  return lines.slice(0, SCREEN_SPEC.maxBodyLines).map((line) => clipText(line, TIHU_LINE_CHARS))
+﻿/** 阶段汉字（第二行冒号前）。 */
+const STAGE_WORD: Record<string, string> = {
+  思考: '思考', 读文件: '读取文件', 写文件: '写文件', 搜索: '搜索', 跑命令: '执行命令', 回答: '回答', 等待确认: '等待确认',
+}
+
+/** 第一句话：去掉多余空白、压成一行（放不下由 clipText 收省略号）。 */
+function firstSentence(value: unknown): string {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  if (text === '') return ''
+  const cut = text.split(/[。！？!?\n]/).map((part) => part.trim()).filter(Boolean)[0] ?? text
+  return cut
+}
+
+/** token 数：99800 → 99.8k、99800000 → 99.8M。 */
+export function formatTokens(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0'
+  if (value >= 1e6) return (value / 1e6).toFixed(1) + 'M'
+  if (value >= 1e3) return (value / 1e3).toFixed(1) + 'k'
+  return String(Math.round(value))
+}
+
+/**
+ * 屏上四行（用户 2026-11-07 定的格式）：
+ *   1 会话标题（title 大字）
+ *   2 阶段词：第一句内容（放不下省略）
+ *   3 第 x 步 · 已用 xx
+ *   4 解码速度 · 总 token · 上下文占比
+ */
+function statusFrame(state: TihuProgressState, now: number): ScreenFramePayload {
+  const word = STAGE_WORD[state.stageWord] ?? state.stageWord ?? '思考'
+  const head = word + '：'
+  const body = clipText(state.firstLine, Math.max(6, TIHU_LINE_CHARS - [...head].length))
+  const line2 = body === '' ? head.replace(/：$/, '') : head + body
+  const line3 = '第 ' + state.step + ' 步 · 已用 ' + formatElapsed(now - state.turnStartedAt)
+  const stats = state.stats
+  const line4 = stats === undefined
+    ? '统计中…'
+    : (stats.tokPerSec > 0 ? stats.tokPerSec.toFixed(0) + ' tok/s · ' : '') + formatTokens(stats.totalTokens) + ' tok · 上下文 ' + stats.contextPercent.toFixed(0) + '%'
+  return {
+    stage: '',
+    title: clipText(state.sessionTitle || state.title, TIHU_TITLE_CHARS),
+    bullets: [line2, line3, line4].map((line) => clipText(line, TIHU_LINE_CHARS)).slice(0, SCREEN_SPEC.maxBodyLines),
+    tone: state.tone,
+  }
 }
 
 function messageText(message: unknown): string {
@@ -235,7 +282,16 @@ function messageText(message: unknown): string {
 }
 
 /** 把一条 session 事件映射成屏帧/事件行；原地更新 state（便于 lane 按会话保存）。 */
-export function applySessionEvent(state: TihuProgressState, event: unknown, now = Date.now()): ProgressUpdate {
+export interface TihuScreenMeta {
+  /** 会话标题（第一行）。 */
+  title?: string
+  /** 第四行统计（解码速度 / 总 token / 上下文占比）。 */
+  stats?: { tokPerSec: number; totalTokens: number; contextPercent: number }
+}
+
+export function applySessionEvent(state: TihuProgressState, event: unknown, now = Date.now(), meta?: TihuScreenMeta): ProgressUpdate {
+  if (meta?.title !== undefined && meta.title !== '') state.sessionTitle = meta.title
+  if (meta?.stats !== undefined) state.stats = meta.stats
   const record = asRecord(event)
   const type = String(record.type ?? '')
   const data = asRecord(record.data)
@@ -249,9 +305,11 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.lastOutput = ''
     state.stage = '思考'
     state.title = '开始新一轮'
+    state.stageWord = '思考'
+    state.firstLine = '开始新一轮'
     state.tone = 'busy'
     return {
-      screen: { stage: '', title: state.title, bullets: bulletsOf(state, now), tone: 'busy' },
+      screen: statusFrame(state, now),
       progress: { stage: 'turn', text: `开始第 ${turn} 轮` },
     }
   }
@@ -260,9 +318,11 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.step = Number.isFinite(data.step) ? Number(data.step) : state.step + 1
     state.stage = '思考'
     state.title = '思考下一步'
+    state.stageWord = '思考'
+    if (state.firstLine === '') state.firstLine = '整理下一步'
     state.tone = 'busy'
     return {
-      screen: { stage: '', title: state.title, bullets: bulletsOf(state, now), tone: 'busy' },
+      screen: statusFrame(state, now),
       progress: { stage: 'step', text: `第 ${state.step} 步` },
     }
   }
@@ -274,9 +334,11 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     if (Number.isFinite(data.step)) state.step = Number(data.step)
     state.stage = action.stage
     state.title = action.title
+    state.stageWord = action.stage
+    state.firstLine = firstSentence(action.detail || action.title)
     state.tone = 'busy'
     return {
-      screen: { stage: action.stage, title: action.title, bullets: bulletsOf(state, now), tone: 'busy' },
+      screen: statusFrame(state, now),
       progress: {
         stage: 'tool',
         text: clipText(`${action.title}｜参数 ${action.detail || '（无）'}`, TIHU_EVENT_CHARS),
@@ -293,7 +355,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.lastOutput = summary.output
     state.tone = isError ? 'alert' : 'ok'
     return {
-      screen: { stage: state.stage, title: state.title, bullets: bulletsOf(state, now), tone: state.tone },
+      screen: statusFrame(state, now),
       progress: {
         stage: 'result',
         text: clipText(`${summary.line}｜${text || (isError ? '工具报错' : '（无输出）')}`, TIHU_EVENT_CHARS),
@@ -307,12 +369,14 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     const lines = text.split(/\r?\n/).map((line) => sanitizeScreenLine(line)).filter(Boolean)
     const firstLine = lines[0] ?? ''
     state.stage = '回答'
+    state.stageWord = '回答'
+    state.firstLine = firstSentence(firstLine)
     state.title = clipText(`回答 ${firstLine}`, TIHU_TITLE_CHARS)
     state.lastResult = { ok: true, line: '✓ 已生成回复' }
     // 第 3 行保持「最近一条工具输出尾行」，不被回答正文覆盖（回答正文进事件区）。
     state.tone = 'ok'
     return {
-      screen: { stage: '回答', title: state.title, bullets: bulletsOf(state, now), tone: 'ok' },
+      screen: statusFrame(state, now),
       progress: { stage: 'answer', text: clipText(text, TIHU_EVENT_CHARS) },
     }
   }

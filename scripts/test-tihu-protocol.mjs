@@ -1998,9 +1998,12 @@ test('进度状态机：步骤递增、失败 tone=alert、完成帧保留、正
   // 第 1 步：读文件成功
   push({ type: 'step/start', data: { turn: 7, step: 1 } }, 2000)
   const call1 = push({ type: 'tool/call', data: { turn: 7, step: 1, name: 'read', arguments: { file_path: 'src/a.ts' } } }, 3000)
-  assert.equal(call1.screen.stage, '读文件')
+  // 新版四行格式：第一行会话标题、第二行「阶段词：第一句」、第三行步骤用时、第四行统计
+  assert.equal(call1.screen.stage, '')
   assert.equal(call1.screen.title, '读取 a.ts')
-  assert.ok(call1.screen.bullets[0].includes('第 1 步'))
+  assert.ok(call1.screen.bullets[0].startsWith('读取文件：'), '第二行以阶段词打头：' + call1.screen.bullets[0])
+  assert.ok(call1.screen.bullets[1].includes('第 1 步'), '第三行带步骤号：' + call1.screen.bullets[1])
+  assert.equal(call1.screen.bullets[2], '统计中…')
   push({ type: 'tool/result', data: { turn: 7, step: 1, message: { content: [{ type: 'text', text: 'const a = 1\n第二个文件结尾' }], isError: false } } }, 4000)
   assert.equal(state.tone, 'ok')
   assert.ok(state.lastResult.line.startsWith('✓'))
@@ -2009,7 +2012,8 @@ test('进度状态机：步骤递增、失败 tone=alert、完成帧保留、正
   // 第 2 步：跑命令失败
   push({ type: 'step/start', data: { turn: 7, step: 2 } }, 5000)
   const call2 = push({ type: 'tool/call', data: { turn: 7, step: 2, name: 'pwsh', arguments: { command: 'Remove-Item -Recurse -Force build-with-a-very-long-name-here' } } }, 6000)
-  assert.equal(call2.screen.stage, '跑命令')
+  assert.equal(call2.screen.stage, '')
+  assert.ok(call2.screen.bullets[0].startsWith('执行命令：'), '第二行以阶段词打头：' + call2.screen.bullets[0])
   push({ type: 'tool/result', data: { turn: 7, step: 2, message: { content: [{ type: 'text', text: '拒绝访问：文件被占用（详细信息在日志里）' }], isError: true } } }, 7000)
   assert.equal(state.tone, 'alert')
   assert.ok(state.lastResult.line.startsWith('✗'))
@@ -2017,9 +2021,9 @@ test('进度状态机：步骤递增、失败 tone=alert、完成帧保留、正
 
   // 回答
   const answer = push({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '第一行回答\n最后一行是输出尾行' }] } } }, 8000)
-  assert.equal(answer.screen.stage, '回答')
-  assert.ok(answer.screen.title.startsWith('回答 第一行回答'))
-  assert.ok(answer.screen.bullets.length <= 3)
+  assert.equal(answer.screen.stage, '')
+  assert.ok(answer.screen.bullets[0].startsWith('回答：'), '第二行以阶段词打头：' + answer.screen.bullets[0])
+  assert.ok(answer.screen.bullets.length <= SCREEN_SPEC.maxBodyLines)
   for (const line of answer.screen.bullets) assert.ok(measureTextPx(line, SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX, `行超宽：${line}`)
 
   // 结束帧：保留「完成 · 共 N 步 · 用时 Xs」，正文只留结果行（不重复标题、不带陈旧输出）
@@ -2073,10 +2077,13 @@ await testAsync('lane：执行事件生成有料的屏幕帧（读文件→跑�
   await new Promise((resolve) => setTimeout(resolve, 20))
 
   const screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame').map((frame) => frame.payload)
-  assert.ok(screens.some((frame) => frame.stage === '读文件' && frame.title === '读取 README.md'))
-  const resultFrame = screens.find((frame) => frame.bullets.some((line) => line.startsWith('✓')))
-  assert.ok(resultFrame, '结果帧应带 ✓ 摘要')
-  assert.ok(resultFrame.bullets.some((line) => line.includes('最后一行输出')))
+  assert.ok(screens.some((frame) => frame.bullets[0] === '读取文件：README.md'), '第二行应显示读取文件：README.md')
+  // 屏上不再显示命令状态/输出尾行，只留四行：标题、阶段行、步骤行、统计行
+  const statusFrames = screens.filter((frame) => (frame.mode ?? 'status') === 'status')
+  assert.ok(statusFrames.length > 0, '应有状态帧')
+  const lastStatus = statusFrames[statusFrames.length - 1]
+  assert.equal(lastStatus.bullets.length, 3, '状态帧正文固定三行')
+  assert.ok(!lastStatus.bullets.some((line) => line.includes('最后一行输出')), '屏上不贴命令输出尾行')
   const progressTexts = framesOf(socket).filter((frame) => frame.type === 'event.progress').map((frame) => frame.payload.text)
   assert.ok(progressTexts.some((text) => text.includes('读取 README.md')))
   assert.ok(progressTexts.some((text) => text.startsWith('✓')))

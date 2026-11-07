@@ -481,7 +481,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.reply = null;
     // 严格按 320×240 规格排版：stage ≤10、标题 ≤28 且单行、正文最多 3 行 ×18 字。
     // 多出来的内容留在事件区，屏幕上不允许出现半行或滚动条。
-    $('stage').textContent = clipScreen(payload.stage || '', SCREEN.stageChars);
+    var stageText = clipScreen(payload.stage || '', SCREEN.stageChars);
+    $('stage').textContent = stageText;
+    // 新四行格式第一行就是会话标题，没有阶段小字时不要留空行。
+    $('stage').style.display = stageText === '' ? 'none' : '';
     $('title').textContent = clipScreen(payload.title || '', SCREEN.titleChars);
     var list = $('bullets');
     list.innerHTML = '';
