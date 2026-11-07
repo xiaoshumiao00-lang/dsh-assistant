@@ -55,6 +55,9 @@ export const ACTUAL_SIZE_SCALE = (SCREEN_PHYSICAL.widthMm * SCREEN_PHYSICAL.pxPe
 /** 内容区宽度（320 − 2×8）。 */
 export const CONTENT_WIDTH_PX = SCREEN_SPEC.widthPx - SCREEN_SPEC.paddingPx * 2
 
+/** 折行安全边距（像素）：真实字体渲染比 CJK=1em 估算略宽，贴着容器宽折行会被浏览器裁成省略号。 */
+export const TEXT_WRAP_SAFETY_PX = 4
+
 /** 单个码点的近似宽度（em）：CJK/全角 1.0，ASCII 0.47。 */
 export function charWidthEm(char: string): number {
   const code = char.codePointAt(0) ?? 0
@@ -101,12 +104,14 @@ export function fitLine(value: unknown, maxWidthPx: number = CONTENT_WIDTH_PX, f
 export function wrapTextPx(value: unknown, maxWidthPx: number = CONTENT_WIDTH_PX, fontPx: number = SCREEN_SPEC.bodyFontPx): string[] {
   const text = String(value ?? '').replace(/\s+/g, ' ').trim()
   if (text === '') return []
-  const lines: string[] = []
+    // 留安全边距：行宽严格小于容器可视宽度，避免行尾最后一个字被裁成省略号。
+  const limit = Math.max(1, maxWidthPx - TEXT_WRAP_SAFETY_PX)
+const lines: string[] = []
   let current = ''
   let width = 0
   for (const char of [...text]) {
     const charWidth = charWidthEm(char) * fontPx
-    if (current !== '' && width + charWidth > maxWidthPx) {
+    if (current !== '' && width + charWidth > limit) {
       lines.push(current.trimEnd())
       current = ''
       width = 0

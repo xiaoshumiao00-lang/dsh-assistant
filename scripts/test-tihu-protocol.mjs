@@ -51,7 +51,7 @@ import {
   sanitizeScreenLine,
   summarizeToolResult,
 } from '../src/tihu/progress.ts'
-import { ACTUAL_SIZE_SCALE, CONTENT_WIDTH_PX, SCREEN_SPEC, clipScreenTitle, fitLine, fitScreenLines, measureTextPx } from '../src/tihu/screen-spec.ts'
+import { ACTUAL_SIZE_SCALE, CONTENT_WIDTH_PX, SCREEN_SPEC, TEXT_WRAP_SAFETY_PX, clipScreenTitle, fitLine, fitScreenLines, measureTextPx, wrapTextPx } from '../src/tihu/screen-spec.ts'
 import { fitViewport, replyViewport, replyWindow, splitReplySentences, splitSpeechSegments, wrapReplyLines } from '../src/tihu/reply.ts'
 import { stripToolNoise, toSpeechText } from '../src/tihu/speech-text.ts'
 import { groupProjects, humanTitle, projectNameOf } from '../src/tihu/project-groups.ts'
@@ -2337,6 +2337,30 @@ test('语音切段：长句按逗号/32 字切分，首包不必等整句', () =
     assert.ok(segment.sentenceIndex >= 0 && segment.sentenceIndex < sentences.length)
     assert.ok(segment.start >= sentences[segment.sentenceIndex].start && segment.end <= sentences[segment.sentenceIndex].end)
   }
+})
+
+test('回复行不出现省略号：折行留安全边距、页面 CSS 不再 ellipsis', () => {
+  const text = '这是一段用于验证回复行不会被裁成省略号的真实中文回复，包含标点、英文 Word 和数字 12345。'.repeat(12)
+  const lines = wrapTextPx(text, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
+  assert.ok(lines.length > 1, '长文本必须折成多行')
+  const limit = CONTENT_WIDTH_PX - TEXT_WRAP_SAFETY_PX
+  for (const line of lines) {
+    assert.equal(line.includes('…'), false, '行内不应出现省略号：' + line)
+    const width = measureTextPx(line, SCREEN_SPEC.bodyFontPx)
+    assert.ok(width <= limit, '行宽 ' + width + ' 超出安全宽 ' + limit + '：' + line)
+  }
+  // 19 个全角字恰好等于 304px 容器宽，必须被拆成两行（否则真机会被浏览器裁成省略号）
+  const full = '一二三四五六七八九十一二三四五六七八九'
+  assert.equal([...full].length, 19)
+  const fullLines = wrapTextPx(full, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
+  assert.equal(fullLines.length, 2, '19 字满宽行应折成两行，实际 ' + fullLines.length)
+  assert.ok(measureTextPx(fullLines[0], SCREEN_SPEC.bodyFontPx) <= limit)
+  assert.equal(fullLines.join(''), full, '折行不能丢字')
+  // 页面 CSS：.reply-line 不得再用 text-overflow:ellipsis
+  const pageSource = readFileSync(new URL('../src/tihu/page.ts', import.meta.url), 'utf8')
+  const rule = pageSource.split(String.fromCharCode(10)).find((line) => line.includes('.reply-line {'))
+  assert.ok(rule !== undefined, '找不到 .reply-line 规则')
+  assert.equal(rule.includes('text-overflow'), false, 'reply-line 不应有 text-overflow：' + rule)
 })
 
 /* ---------- 汇总 ---------- */
