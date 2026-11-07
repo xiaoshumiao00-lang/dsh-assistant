@@ -4,8 +4,23 @@
  * 目标：去掉 markdown 标记、链接语法、emoji/符号，只留可朗读的人类语言；
  * 清洗后为空时调用方不得合成空串（按「无语音（仅文字）」处理）。
  */
+/** 只去掉 harness/工具噪音（XML 元数据、英文执行日志、坐标、图片哈希行），保留 markdown。 */
+export function stripToolNoise(input: string): string {
+  let text = String(input ?? '')
+  // harness/Computer Use 元数据：XML 标签（含成对内容）整条去掉。
+  text = text.replace(/<([a-zA-Z][a-zA-Z0-9_-]*)>[\s\S]*?<\/\1>/g, ' ')
+  text = text.replace(/<[^>\s]+\/?>/g, ' ')
+  // 英文工具执行日志 / 坐标 / 图片与哈希元数据行：整行丢弃。
+  const noisyLine = /^\s*(?:[✓✗]\s*)?(?:Waited\s+\d|Clicked screen|Pressed hotkey|Opened https?|Opened app|Coordinates remain|position\s*\[|\[image omitted|\(sha256:|Normalized copy|image\/png|read-only copy|(?:screenshot|wait|long_wait|click|hotkey|scroll|drag|input_text|open_in_browser|open_in_finder|open_app|list_apps|code_agent|ask_user_question|skill|present|working_directory|web_search|web_fetch|截图|等待|长等待|点击|按键|滚动|拖拽|输入文字|打开网页|打开文件\/目录|打开应用|列出应用|派发后台任务|等待确认|加载技能|记忆操作|展示结果|切换目录|搜索|抓取网页)\s*$)/i
+  text = text.split(/\r?\n/).filter((line) => !noisyLine.test(line)).join('\n')
+  // 行内残留坐标描述。
+  text = text.replace(/Coordinates remain\s+[\d-]+\s*[-–]\s*\d+/gi, ' ')
+  text = text.replace(/position\s*\[[^\]]*\]/gi, ' ')
+  return text
+}
+
 export function toSpeechText(markdown: string): string {
-  let text = String(markdown ?? '')
+  let text = stripToolNoise(markdown)
   // 代码块围栏（保留内容，去掉 ```lang 与 ```）
   text = text.replace(/```[^\n]*\n?/g, ' ')
   // 图片 ![alt](url) → 去掉（图片不可朗读）
