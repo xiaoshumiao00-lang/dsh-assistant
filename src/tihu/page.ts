@@ -10,8 +10,9 @@
  *   2. 无麦克风：选本地 WAV 文件（或拖进来）→ 同一条解码/重采样/上行路径。
  *      台式机没有麦克风时用这一条，验收不依赖手机。
  *
- * TTS 用浏览器 speechSynthesis（zh-CN）——**临时方案**，见 tihuSpeak() 里的 P1 注释。
+ * TTS 用浏览器 speechSynthesis（zh-CN）——**临时方案**，见页面里的朗读队列注释。
  */
+import { TTS_QUEUE_SOURCE } from './tts-queue.ts'
 export function tihuPageHtml(options: { lanePath: string; protocol: string }): string {
   const lane = JSON.stringify(options.lanePath)
   const protocol = JSON.stringify(options.protocol)
@@ -126,7 +127,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   <div id="transcript" class="empty">（还没有内容）</div>
   <div class="row" style="margin-top:8px">
     <button id="retry">撤回重说</button>
-    <button id="speak" title="P1 会用本地 VITS 替换">重读一遍</button>
+    <button id="speak" title="把本轮回复从头再念一遍">重读一遍</button>
+    <button id="ttsStop" title="立刻停止朗读">停止朗读</button>
   </div>
   <textarea id="text" placeholder="文字兜底：直接输入要交给会话的话"></textarea>
   <div class="row" style="margin-top:8px"><button id="send" style="flex:1">发送到当前会话</button></div>
@@ -151,6 +153,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
 <script>
 (function () {
   'use strict';
+  ${TTS_QUEUE_SOURCE}
   var LANE = ${lane};
   var PROTOCOL = ${protocol};
   var $ = function (id) { return document.getElementById(id); };
@@ -158,7 +161,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     sessions: [], listLoaded: false, querying: false, showList: false,
     sessionBound: false, computerUse: null, sessionPreset: '', cuTotal: 0, total: 0,
     mode: 'auto', lastAutoId: '',
-    lastTranscript: '', asking: null, recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0 };
+    lastTranscript: '', asking: null, recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0,
+    ttsTurnTexts: [] };
 
   /* ---------- 会话定位 ----------
      2026-11-07 P0：localStorage **按 origin 隔离**。用户在桌面宿主
@@ -482,20 +486,42 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
      P0 临时方案：浏览器自带 speechSynthesis（zh-CN）。
      P1 要换成**宿主机上的本地 VITS（sherpa-onnx）**：宿主合成 24kHz Opus，
      经 tts.audio 帧下发，板子/页面只负责播放——因为远程链路上手机的
-     speechSynthesis 音色依赖系统、离线不可用，而且真板子没有这个 API。 */
-  function tihuSpeak(text) {
-    if (!text) return;
-    if (!('speechSynthesis' in window)) { addEvent('alert', '本浏览器不支持 speechSynthesis，跳过朗读'); return; }
-    try {
-      var utter = new SpeechSynthesisUtterance(text);
-      utter.lang = 'zh-CN';
-      utter.rate = 1.02;
-      var zh = window.speechSynthesis.getVoices().filter(function (v) { return /zh|Chinese/i.test(v.lang + v.name); });
-      if (zh.length) utter.voice = zh[0];
-      window.speechSynthesis.cancel();
-      window.speechSynthesis.speak(utter);
-    } catch (e) { addEvent('alert', '朗读失败：' + e.message); }
-  }
+     speechSynthesis 音色依赖系统、离线不可用，而且真板子没有这个 API。
+
+     2026-11-07 修「只念几句就没了」：旧实现对每条 tts.text 都 cancel 再 speak，
+     多段几乎同时到达 → 只剩最后一段。现在用队列（createTtsQueue）顺序播放：
+     收到新段只入队、不 cancel；只在「新一轮回复 / 停止朗读 / 重读一遍」时清队列。 */
+  var tts = createTtsQueue({
+    speak: function (text, done) {
+      if (!('speechSynthesis' in window)) {
+        addEvent('alert', '本浏览器不支持 speechSynthesis，跳过朗读');
+        done();
+        return;
+      }
+      try {
+        var utter = new SpeechSynthesisUtterance(text);
+        utter.lang = 'zh-CN';
+        utter.rate = 1.02;
+        var zh = window.speechSynthesis.getVoices().filter(function (v) { return /zh|Chinese/i.test(v.lang + v.name); });
+        if (zh.length) utter.voice = zh[0];
+        utter.onend = function () { done(); };
+        utter.onerror = function () { done(); };
+        window.speechSynthesis.speak(utter);
+      } catch (e) {
+        addEvent('alert', '朗读失败：' + e.message);
+        done();
+      }
+    },
+    cancel: function () {
+      try { window.speechSynthesis.cancel(); } catch (e) { /* 忽略 */ }
+    },
+    setTimeout: function (fn, ms) { return window.setTimeout(fn, ms); },
+    clearTimeout: function (timer) { try { window.clearTimeout(timer); } catch (e) { /* 忽略 */ } },
+    onEvent: function (kind, text) {
+      if (kind === 'timeout') addEvent('progress', '朗读超时，自动跳到下一段');
+      else if (kind === 'drop') addEvent('alert', '朗读队列已满（200 段），后面的内容不再朗读');
+    }
+  });
 
   /* ---------- WebSocket ----------
      2026-11-06 P0 修复：**token 必须进握手 URL**。
@@ -601,16 +627,33 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   /* ---------- 下行处理（未知 type 一律忽略，与宿主同一条约定） ---------- */
   function handle(type, payload) {
     switch (type) {
-      case 'screen.frame': renderScreen(payload); break;
+      case 'screen.frame':
+        // 新一轮回复开始：清空上一轮朗读（队列 + 全文缓存）。tts.text 紧跟在这条帧之后。
+        if (payload && payload.stage === '回复') {
+          tts.stop();
+          state.ttsTurnTexts = [];
+        }
+        renderScreen(payload);
+        break;
       case 'transcript':
         state.lastTranscript = payload.text || '';
         state.audioPending = false;
         clearTimeout(state.audioTimer);
+        // 用户新一轮输入 = 新一轮朗读，停掉上一轮残留。
+        tts.stop();
+        state.ttsTurnTexts = [];
         $('transcript').textContent = state.lastTranscript;
         $('transcript').className = '';
         addEvent('progress', '转写：' + state.lastTranscript);
         break;
-      case 'tts.text': tihuSpeak(payload.text || ''); break;
+      case 'tts.text': {
+        var ttsText = String(payload.text || '').trim();
+        if (ttsText) {
+          state.ttsTurnTexts.push(ttsText);
+          tts.enqueue(ttsText);
+        }
+        break;
+      }
       case 'event.progress':
         addEvent('progress', (payload.stage ? '[' + payload.stage + '] ' : '') + (payload.text || ''));
         if (typeof payload.done === 'number') { $('progress').textContent = payload.total ? payload.done + '/' + payload.total : String(payload.done); }
@@ -840,7 +883,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     $('transcript').className = 'empty';
     addEvent('progress', '已撤回上一条转写，请重新说');
   };
-  $('speak').onclick = function () { if (state.lastTranscript) tihuSpeak(state.lastTranscript); };
+  /* 重读一遍：把本轮所有 tts 段拼回来的全文**从头重播**（不是只读最后一段）。 */
+  $('speak').onclick = function () {
+    var texts = state.ttsTurnTexts.length ? state.ttsTurnTexts.slice() : (state.lastTranscript ? [state.lastTranscript] : []);
+    if (!texts.length) { addEvent('alert', '还没有可重读的内容'); return; }
+    tts.replay(texts);
+    addEvent('progress', '重读本轮全文（' + texts.length + ' 段）');
+  };
+  $('ttsStop').onclick = function () {
+    tts.stop();
+    addEvent('progress', '已停止朗读');
+  };
 
   /* 「结束本次语音会话」：宿主侧立刻关掉危险动作闸门（session.end），
      不等 120 秒空闲窗口过期——用户说完就可以放心自己干活。 */

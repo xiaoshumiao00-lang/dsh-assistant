@@ -533,19 +533,28 @@ export function toBullets(text: string, max = 4, perLine = 20): string[] {
 }
 
 /** 把长回复按句切成若干段给 TTS（每段不超过 perSegment 字符，P0 最多 maxSegments 段）。 */
-export function toTtsSegments(text: string, maxSegments = 4, perSegment = 80): string[] {
+/**
+ * 把长回复按句切成 TTS 段（每段不超过 `perSegment` 字符）。
+ *
+ * 2026-11-07 修：**不再限制段数**。旧实现 `maxSegments = 4` 会把 320 字以后的
+ * 内容直接丢弃（用户实测「只念几句就没了」）。现在默认切完全部文本，`index/total`
+ * 由调用方按完整数组下发；超长无标点单句仍按 `perSegment` 硬切。
+ */
+export function toTtsSegments(text: string, perSegment = 80, maxSegments = Number.POSITIVE_INFINITY): string[] {
   const clean = String(text ?? '').replace(/\s+/g, ' ').trim()
   if (clean === '') return []
   const parts: string[] = []
   let rest = clean
   while (rest !== '' && parts.length < maxSegments) {
     if (rest.length <= perSegment) { parts.push(rest); break }
-    // 在 perSegment 附近找最近的句末标点，找不到就硬切。
-    const window = rest.slice(0, perSegment + 20)
-    const match = window.match(/[^。！？；!?;]*[。！？；!?;]/)
-    const cut = match ? match[0].length : perSegment
-    parts.push(rest.slice(0, cut).trim())
-    rest = rest.slice(cut).trim()
+    // 在 perSegment 内找**最后一个**句末标点；找不到（或太靠前）就硬切。
+    const window = rest.slice(0, perSegment)
+    const match = window.match(/^[\s\S]*[。！？；!?;]/)
+    const boundary = match === null ? 0 : match[0].length
+    const cut = boundary >= Math.ceil(perSegment * 0.5) ? boundary : perSegment
+    const safeCut = Math.max(1, Math.min(cut, rest.length))
+    parts.push(rest.slice(0, safeCut).trim())
+    rest = rest.slice(safeCut).trim()
   }
   return parts.filter(Boolean)
 }
