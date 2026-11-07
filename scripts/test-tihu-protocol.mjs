@@ -53,7 +53,7 @@ import {
   summarizeToolResult,
 } from '../src/tihu/progress.ts'
 import { ACTUAL_SIZE_SCALE, SCREEN_SPEC, clipScreenTitle, fitScreenLines } from '../src/tihu/screen-spec.ts'
-import { fitViewport, replyViewport, replyWindow, splitReplySentences, wrapReplyLines } from '../src/tihu/reply.ts'
+import { fitViewport, replyViewport, replyWindow, splitReplySentences, splitSpeechSegments, wrapReplyLines } from '../src/tihu/reply.ts'
 import { Pcm16Chunker, TTS_CHUNK_BYTES, TTS_SAMPLE_RATE, validateReferenceWav } from '../src/tihu/audio.ts'
 import { normalizeVoiceName } from '../src/tihu/tts.ts'
 import { WsFrameParser, encodeFrame } from '../src/pocket-host/ws-deflate.mjs'
@@ -1488,6 +1488,21 @@ test('TTS 分段带字符区间：tts.text 的 charStart/charEnd 与句边界一
   const sentences = splitReplySentences(text)
   assert.deepEqual(sentences.map((s) => [s.start, s.end]), [[0, 4], [4, 8], [8, 12]])
   assert.equal(sentences.map((s) => s.text).join(''), text)
+})
+
+test('语音切段：长句按逗号/32 字切分，首包不必等整句', () => {
+  const text = '这是一个用于测试语音切段的长句子，' + '它需要在逗号处断开，'.repeat(12) + '最后结束。'
+  const sentences = splitReplySentences(text)
+  const segments = splitSpeechSegments(text)
+  assert.ok(segments.length > sentences.length)
+  assert.equal(segments[0].start, 0)
+  for (let i = 1; i < segments.length; i += 1) assert.ok(segments[i].start >= segments[i - 1].end)
+  for (const segment of segments) {
+    assert.ok([...segment.text].length <= 32, `片段超长：${segment.text}`)
+    assert.equal([...text].slice(segment.start, segment.end).join('').trim(), segment.text)
+    assert.ok(segment.sentenceIndex >= 0 && segment.sentenceIndex < sentences.length)
+    assert.ok(segment.start >= sentences[segment.sentenceIndex].start && segment.end <= sentences[segment.sentenceIndex].end)
+  }
 })
 
 /* ---------- 汇总 ---------- */

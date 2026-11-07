@@ -62,6 +62,58 @@ export function replyWindow(sentences: ReplySentence[], currentIndex: number, ra
   return sentences.slice(start, end)
 }
 
+export interface SpeechSegment {
+  index: number
+  text: string
+  start: number
+  end: number
+  /** 该语音片段属于哪一句正文（用于高亮）。 */
+  sentenceIndex: number
+}
+
+/** 分句标点（语音切段用，逗号也切，保证第一包尽早发出）。 */
+const SPEECH_BREAK = /[，,、：:；;。！？!?\n]/
+
+/**
+ * 把回复切成**语音片段**：先按句，再把长句按逗号/顿号切成 ≤maxChars 的小段。
+ * 这样长句不必等整句合成完才发首包；片段下标仍映射回原句（高亮按句）。
+ */
+export function splitSpeechSegments(text: string, maxChars = 32): SpeechSegment[] {
+  const chars = [...String(text ?? '')]
+  const sentences = splitReplySentences(text)
+  const out: SpeechSegment[] = []
+  let index = 0
+  let cursor = 0
+  let sentenceIndex = 0
+  while (cursor < chars.length && sentenceIndex < sentences.length) {
+    // 跳过句间空白
+    while (cursor < chars.length && /\s/.test(chars[cursor])) cursor += 1
+    if (cursor >= chars.length) break
+    while (sentenceIndex < sentences.length && sentences[sentenceIndex].end <= cursor) sentenceIndex += 1
+    if (sentenceIndex >= sentences.length) break
+    let end = cursor
+    let lastBreak = -1
+    const limit = Math.min(chars.length, sentences[sentenceIndex].end)
+    while (end < limit) {
+      const char = chars[end]
+      if (SPEECH_BREAK.test(char)) { lastBreak = end + 1; break }
+      if (end - cursor + 1 >= maxChars) { lastBreak = end + 1; break }
+      end += 1
+    }
+    if (lastBreak < 0) lastBreak = limit
+    let segmentEnd = Math.min(lastBreak, limit)
+    while (segmentEnd > cursor && /\s/.test(chars[segmentEnd - 1])) segmentEnd -= 1
+    const segmentText = chars.slice(cursor, segmentEnd).join('').trim()
+    if (segmentText !== '') {
+      while (sentenceIndex < sentences.length && sentences[sentenceIndex].end <= cursor) sentenceIndex += 1
+      out.push({ index, text: segmentText, start: cursor, end: segmentEnd, sentenceIndex })
+      index += 1
+    }
+    cursor = Math.max(lastBreak, cursor + 1)
+  }
+  return out
+}
+
 export interface ReplyLine {
   text: string
   /** 该行属于哪一句（用于高亮）。 */
