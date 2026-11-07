@@ -485,7 +485,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     $('stage').textContent = stageText;
     // 新四行格式第一行就是会话标题，没有阶段小字时不要留空行。
     $('stage').style.display = stageText === '' ? 'none' : '';
-    $('title').textContent = clipScreen(payload.title || '', SCREEN.titleChars);
+    $('title').textContent = payload.title || '';
     var list = $('bullets');
     list.innerHTML = '';
     fitLines(payload.bullets || [], SCREEN.maxBodyLines, SCREEN.bodyCharsPerLine).forEach(function (line) {

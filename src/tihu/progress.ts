@@ -16,7 +16,7 @@
  *   turn/end   {turn, reason:{kind}}
  */
 import type { ProgressPayload, ScreenFramePayload } from './protocol.ts'
-import { clipScreenText, CONTENT_WIDTH_PX, fitLine, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
+import { clipScreenText, CONTENT_WIDTH_PX, fitLine, PENDING_RAIL_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
 
 /** 屏幕阶段（固定这几类，别再加新词）。 */
 export type TihuStage = '思考' | '读文件' | '跑命令' | '写文件' | '搜索' | '回答' | '等待确认'
@@ -358,7 +358,7 @@ function statsCompact(stats: TihuProgressState['stats']): string {
  *   4 步数 + 用时 + 解码速度 + 总 token + 上下文
  * 只攒到一条明细时退回「明细 / 第 x 步·已用 / 统计」三行，不留空行。
  */
-function statusFrame(state: TihuProgressState, now: number): ScreenFramePayload {
+function statusFrame(state: TihuProgressState, now: number, widthPx: number = CONTENT_WIDTH_PX): ScreenFramePayload {
   const elapsed = formatElapsed(now - state.turnStartedAt)
   const recent = state.activity.slice(-2).map(entryLine)
   const stepLine = '第 ' + state.step + ' 步 · 已用 ' + elapsed
@@ -374,8 +374,8 @@ function statusFrame(state: TihuProgressState, now: number): ScreenFramePayload 
   }
   return {
     stage: '',
-    title: clipText(state.sessionTitle || state.title, TIHU_TITLE_CHARS),
-    bullets: bullets.map((line) => fitLine(line, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)).slice(0, SCREEN_SPEC.maxBodyLines),
+    title: fitLine(state.sessionTitle || state.title, widthPx, SCREEN_SPEC.titleFontPx),
+    bullets: bullets.map((line) => fitLine(line, widthPx, SCREEN_SPEC.bodyFontPx)).slice(0, SCREEN_SPEC.maxBodyLines),
     tone: state.tone,
   }
 }
@@ -417,11 +417,15 @@ export interface TihuScreenMeta {
   title?: string
   /** 第四行统计（解码速度 / 总 token / 上下文占比）。 */
   stats?: { tokPerSec: number; totalTokens: number; contextPercent: number }
+  /** 有气泡轨占位：正文按 PENDING_RAIL_WIDTH_PX 排版（与页面 CSS 的 240px 对齐）。 */
+  narrow?: boolean
 }
 
 export function applySessionEvent(state: TihuProgressState, event: unknown, now = Date.now(), meta?: TihuScreenMeta): ProgressUpdate {
   if (meta?.title !== undefined && meta.title !== '') state.sessionTitle = meta.title
   if (meta?.stats !== undefined) state.stats = meta.stats
+  // 气泡轨占位时页面把标题/正文压到 240px：这里必须用同一宽度排版，否则会被 CSS 裁掉。
+  const widthPx = meta?.narrow === true ? PENDING_RAIL_WIDTH_PX : CONTENT_WIDTH_PX
   const record = asRecord(event)
   const type = String(record.type ?? '')
   const data = asRecord(record.data)
@@ -440,7 +444,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.firstLine = '开始新一轮'
     state.tone = 'busy'
     return {
-      screen: statusFrame(state, now),
+      screen: statusFrame(state, now, widthPx),
       progress: { stage: 'turn', text: `开始第 ${turn} 轮` },
     }
   }
@@ -452,7 +456,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.stageWord = '思考'
     state.tone = 'busy'
     return {
-      screen: statusFrame(state, now),
+      screen: statusFrame(state, now, widthPx),
       progress: { stage: 'step', text: `第 ${state.step} 步` },
     }
   }
@@ -469,7 +473,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     pushActivity(state, item.label, item.detail)
     state.tone = 'busy'
     return {
-      screen: statusFrame(state, now),
+      screen: statusFrame(state, now, widthPx),
       progress: {
         stage: 'tool',
         text: clipText(`${action.title}｜参数 ${action.detail || '（无）'}`, TIHU_EVENT_CHARS),
@@ -487,7 +491,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     if (isError) pushActivity(state, '出错', humanizeError(text))
     state.tone = isError ? 'alert' : 'ok'
     return {
-      screen: statusFrame(state, now),
+      screen: statusFrame(state, now, widthPx),
       progress: {
         stage: 'result',
         text: clipText(`${summary.line}｜${text || (isError ? '工具报错' : '（无输出）')}`, TIHU_EVENT_CHARS),
@@ -511,7 +515,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     // 第 3 行保持「最近一条工具输出尾行」，不被回答正文覆盖（回答正文进事件区）。
     state.tone = 'ok'
     return {
-      screen: statusFrame(state, now),
+      screen: statusFrame(state, now, widthPx),
       progress: { stage: 'answer', text: clipText(text, TIHU_EVENT_CHARS) },
     }
   }
@@ -520,7 +524,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     const reason = String(asRecord(data.reason).kind ?? 'stop')
     // completed / stop 都算正常完成；error / aborted / cancelled 之类才算失败。
     const okReason = reason === 'completed' || reason === 'stop'
-    const doneTitle = clipText(`完成 · 共 ${state.step} 步 · 用时 ${formatElapsed(now - state.turnStartedAt)}`, TIHU_TITLE_CHARS)
+    const doneTitle = fitLine(`完成 · 共 ${state.step} 步 · 用时 ${formatElapsed(now - state.turnStartedAt)}`, widthPx, SCREEN_SPEC.titleFontPx)
     state.stage = '回答'
     state.title = doneTitle
     state.tone = okReason ? 'ok' : 'alert'
@@ -534,7 +538,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
       screen: {
         stage: '回答',
         title: doneTitle,
-        bullets: [clipText(resultLine, TIHU_LINE_CHARS)],
+        bullets: [fitLine(resultLine, widthPx, SCREEN_SPEC.bodyFontPx)],
         tone: state.tone,
       },
       progress: { stage: 'end', text: okReason ? '本轮完成' : `本轮结束（${reason}）` },

@@ -102,9 +102,26 @@ const CONFIRM_TIMEOUT_MS = 60_000
 /**
  * 回主页守门重试间隔：scheduleHome 的 timer 触发时若还有任何会话的 turn 在跑
  * （runningSessions 非空），不回主页，按这个间隔再查一次。
- * 可用环境变量 TIHU_HOME_RECHECK_MS 覆盖（测试里设小）。
+ * 可用环境变量 TIHU_HOME_RECHECK_MS 覆盖（测试里设小）；非数字/0 一律回落到默认，
+ * 否则 setTimeout(fn, NaN) 会变成 0ms 忙循环（2026-11-07 审计 P1-5）。
  */
-const TIHU_HOME_RECHECK_MS = Number(process.env.TIHU_HOME_RECHECK_MS ?? 2_000)
+export function tihuHomeRecheckMs(): number {
+  const raw = Number(process.env.TIHU_HOME_RECHECK_MS ?? 2_000)
+  if (!Number.isFinite(raw)) return 2_000
+  // 0 / 负数会让 setTimeout 退化成 0ms 忙循环，必须抬到下限。
+  if (raw <= 0) return 250
+  return clampInt(raw, 20, 60_000)
+}
+
+/**
+ * 一轮 turn 的最长寿命：超过它说明 turn/end 永远不会来了（agent 被杀、宿主重启、
+ * 事件在早退分支前抛错），必须自愈，否则 runningSessions 里这条会永久挡住回主页。
+ */
+export function tihuTurnStaleMs(): number {
+  const raw = Number(process.env.TIHU_TURN_STALE_MS ?? 30 * 60_000)
+  if (!Number.isFinite(raw) || raw <= 0) return 30 * 60_000
+  return clampInt(raw, 10, 6 * 60 * 60_000)
+}
 
 /**
  * 朗读收尾余量：lane 的播放时间轴是「首块到达 + 累计音频时长」的投影，页面实际
@@ -135,6 +152,29 @@ interface TihuDevice {
   offlineOnly: boolean
   send: (type: string, payload: unknown) => void
   close: () => void
+  /** 中止该设备当前这一轮朗读（换绑/断开时调用）：置 aborted，后续音频不再下发。 */
+  cancelRound?: () => void
+}
+
+/**
+ * 定时发一帧（朗读时按音频播放时刻推进屏帧）。
+ *
+ * 回调必须 try/catch：异常发生在 setTimeout 里，逃出去就是 uncaughtException，
+ * 会把 pocket / DSH 宿主进程直接打死（2026-11-07 审计 P0-3）。
+ */
+export function scheduleFrameAt(at: number, fn: () => void, onError: (error: unknown) => void = () => {}): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const delay = Math.max(0, at - Date.now())
+    setTimeout(() => {
+      try {
+        fn()
+      } catch (error) {
+        onError(error)
+      } finally {
+        resolve()
+      }
+    }, delay)
+  })
 }
 
 /** 一个「tihu 语音会话」的活跃窗口。 */
@@ -152,6 +192,8 @@ export interface TihuRuntimeOptions {
   workspaceOf?: (sessionId: string) => string | undefined
   /** 本地 TTS 覆盖（单测里禁用/注入假引擎）。 */
   tts?: { disabled?: boolean; threads?: number; port?: number; paths?: Partial<TihuTtsPaths>; instance?: TihuTts; prewarm?: boolean }
+  /** 危险动作确认器覆盖（单测里注入会抛错的 broker，验证 fail-closed）。 */
+  confirmBroker?: ConfirmBroker
 }
 
 /** 提供给代理的两个入口 + 卸载函数。 */
@@ -255,6 +297,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const screenStates = new Map<string, ScreenScrollState>()
   /** 每会话的屏幕模式与回主页计时。 */
   const homeStates = new Map<string, { mode: 'home' | 'session'; page: number; done: boolean; timer?: ReturnType<typeof setTimeout> }>()
+  /** 设备 id → 是否在浏览历史（回主页守门按设备算，避免多设备互相卡住）。 */
+  const followByDevice = new Map<string, boolean>()
   /**
    * 运行中的 turn 跟踪：sessionId → turn/start 时间戳。
    * 2026-11-07 新需求：只要**任何** CU 会话有 turn 在跑，屏幕就必须停在会话详情，
@@ -296,7 +340,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   // 仅真实插件（pocket-host）启动时预热 GPU；单测传 prewarm=false，避免拉起 sidecar。
   if (options.tts?.prewarm === true && options.tts?.disabled !== true && tts.backend() === 'qwen-cuda') {
     void tts.ensureServer().catch((error) => log(`tihu tts prewarm failed: ${(error as Error)?.message ?? String(error)}`))
-  }  const confirmBroker: ConfirmBroker = createConfirmBroker({
+  }
+  const confirmBroker: ConfirmBroker = options.confirmBroker ?? createConfirmBroker({
     onAsk: (request) => {
       for (const device of devices) {
         if (request.sessionId !== undefined && device.sessionId !== request.sessionId) continue
@@ -310,7 +355,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         }
         device.send('confirm.ask', payload)
         // 屏幕也要切到「等待确认」，别让用户只看到上一步的执行画面。
-        device.send('screen.frame', confirmationFrame(request.title, request.detail))
+        sendFrame(device, confirmationFrame(request.title, request.detail))
       }
       log(`tihu confirm.ask id=${request.id} title=${JSON.stringify(request.title)}`)
     },
@@ -393,6 +438,23 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /** 列表缓存：hello 校验与选择器查询共用，60 秒内不重复列（避免每次开页都全量扫）。 */
   let sessionListCache: { at: number; rows: TihuSessionRow[]; source: 'sessionQuery' | 'live' } | undefined
+  /**
+   * 给单台设备发屏帧：必须自己补上待读气泡。
+   *
+   * 页面收到任何 screen.frame 都会重画气泡轨（payload.pending 缺失 = 空数组 = 擦掉），
+   * 所以绕过 screen() 的直发帧会「悄悄吃掉」别的会话完成通知（2026-11-07 审计 P1-7）。
+   */
+  function sendFrame(device: TihuDevice, frame: ScreenFramePayload, sessionId: string | undefined = device.sessionId): void {
+    const pend = sessionId === undefined ? [] : pendingByDisplay.get(sessionId) ?? []
+    device.send('screen.frame', {
+      ...frame,
+      ...(frame.pending === undefined
+        ? { pending: pend.slice(0, 4).map((item) => ({ sessionId: item.sessionId, title: item.title, at: item.at, unread: true as const })) }
+        : {}),
+      ...(frame.pendingCount === undefined ? { pendingCount: pend.length } : {}),
+    })
+  }
+
   const SESSION_LIST_TTL_MS = 60_000
   /** 标题缓存：readTitleSnapshots 要读日志，同一会话 60 秒内只读一次。 */
   const titleCache = new Map<string, { at: number; title: string }>()
@@ -657,6 +719,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     sessionId: string,
     options: { auto?: boolean; followed?: boolean } = {},
   ): Promise<void> {
+    // 换会话先把上一轮的朗读掐掉（屏已经不显示它了，声音不能继续跟过来）。
+    if (device.sessionId !== undefined && device.sessionId !== sessionId) {
+      try { device.cancelRound?.() } catch { /* 忽略 */ }
+    }
     const found = await findSession(sessionId)
     if (found.status === 'missing') {
       device.sessionId = undefined
@@ -666,12 +732,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         showPicker: true,
       } satisfies SessionInvalidPayload)
       device.send('event.alert', { level: 'warn', text: `会话 ${shortSessionId(sessionId)} 不存在：请从下面的会话列表里选一个` })
-      device.send('screen.frame', {
+      sendFrame(device, {
         stage: '选择会话',
         title: '还没有选定会话',
         bullets: [`会话 ${shortSessionId(sessionId)} 不存在`, '点下面的会话列表选一个'],
         tone: 'alert',
-      } satisfies ScreenFramePayload)
+      } satisfies ScreenFramePayload, sessionId)
       log(`tihu bind rejected session=${sessionId} reason=missing`)
       return
     }
@@ -702,7 +768,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       ...(options.followed === true ? { followed: true } : {}),
     } satisfies SessionBoundPayload)
     if (computerUse) {
-      device.send('screen.frame', {
+      sendFrame(device, {
         stage: options.followed === true ? '跟随' : '会话',
         title: options.followed === true
           ? `已自动跟随到：${title}`
@@ -712,19 +778,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           live ? '桌面正开着这个会话' : '还没在桌面打开（注入前先打开它）',
         ],
         tone: 'idle',
-      } satisfies ScreenFramePayload)
+      } satisfies ScreenFramePayload, sessionId)
     } else {
       // 要求 4：允许绑定（?session= 显式指定时不静默改写用户意图），但必须显著提示。
       device.send('event.alert', {
         level: 'error',
         text: `这条会话不是 Computer Use 模式（preset=${preset || '未知'}）：无法看屏/点按，请换一个 Computer Use 会话`,
       })
-      device.send('screen.frame', {
+      sendFrame(device, {
         stage: '非 Computer Use',
         title: '这条不是 Computer Use 模式',
         bullets: ['无法看屏/点按', '请换一个 Computer Use 会话'],
         tone: 'alert',
-      } satisfies ScreenFramePayload)
+      } satisfies ScreenFramePayload, sessionId)
     }
     log(`tihu bind session=${sessionId} status=${found.status} preset=${JSON.stringify(preset)} cu=${String(computerUse)} title=${JSON.stringify(title)}`)
   }
@@ -830,19 +896,24 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     if (!Array.isArray(listed)) return undefined
     const items: TihuWorkspaceRow[] = []
     for (const entry of listed) {
-      const path = typeof entry?.path === 'string' ? entry.path : ''
-      const title = typeof entry?.title === 'string' ? entry.title : ''
-      if (path === '' && title === '') continue
-      const rawUpdatedAt = entry?.updatedAt
-      const parsed = typeof rawUpdatedAt === 'string' ? Date.parse(rawUpdatedAt) : Number(rawUpdatedAt)
-      const sessionIds = Array.isArray(entry?.sessionIds) ? entry.sessionIds.map((id: unknown) => String(id)) : []
-      items.push({
-        id: typeof entry?.id === 'string' ? entry.id : '',
-        path,
-        title,
-        sessionIds,
-        updatedAt: Number.isFinite(parsed) ? parsed : 0,
-      })
+      try {
+        const path = typeof entry?.path === 'string' ? entry.path : ''
+        const title = typeof entry?.title === 'string' ? entry.title : ''
+        if (path === '' && title === '') continue
+        const rawUpdatedAt = entry?.updatedAt
+        const parsed = typeof rawUpdatedAt === 'string' ? Date.parse(rawUpdatedAt) : Number(rawUpdatedAt)
+        const sessionIds = Array.isArray(entry?.sessionIds) ? entry.sessionIds.map((id: unknown) => String(id)) : []
+        items.push({
+          id: typeof entry?.id === 'string' ? entry.id : '',
+          path,
+          title,
+          sessionIds,
+          updatedAt: Number.isFinite(parsed) ? parsed : 0,
+        })
+      } catch (error) {
+        // 宿主实体是 getter：某一条（已 dispose/半删除）抛错不能把整个主页拖死（审计 P1-11）。
+        log(`tihu workspace entry skipped: ${(error as Error)?.message ?? String(error)}`)
+      }
     }
     return items
   }
@@ -857,9 +928,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     const workspaces = workspaceRegistryRows()
     // 注册表可用：项目名/顺序来自 workspace（状态按该项目 sessionIds 对应的会话算，不再按 cwd 猜归属）；
     // 拿不到（命令行测试环境没有宿主服务）：完全保持旧的 cwd 分组行为。
-    const projects = workspaces === undefined
-      ? groupProjects(projectRows, replies, Date.now())
-      : groupWorkspaceProjects(workspaces, projectRows, replies, Date.now())
+    const projects = (() => {
+      if (workspaces === undefined) return groupProjects(projectRows, replies, Date.now())
+      try {
+        return groupWorkspaceProjects(workspaces, projectRows, replies, Date.now())
+      } catch (error) {
+        // 聚合层再兜一层：主页是「兜底屏」，绝不能因为注册表数据异常而发不出帧。
+        log(`tihu home aggregate failed: ${(error as Error)?.stack ?? String(error)}`)
+        return groupProjects(projectRows, replies, Date.now())
+      }
+    })()
     const pageSize = 5
     const totalPages = Math.max(1, Math.ceil(projects.length / pageSize))
     const state = homeStates.get(sessionId) ?? { mode: 'session' as const, page: 0, done: false }
@@ -883,6 +961,26 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
     if (device !== undefined) device.send('screen.frame', frame)
     else screen(sessionId, frame)
+  }
+
+  /**
+   * 记下「最近一条回复」（正文 + 分句 + 语音片段）。
+   *
+   * 与是否绑定设备无关：没绑设备时也要记，否则气泡点开只有空白、主页摘要也缺正文
+   *（2026-11-07 审计 P1-8）。
+   */
+  function rememberReply(sessionId: string, data: any): boolean {
+    const blocks = Array.isArray(data?.message?.content) ? data.message.content : []
+    const text = stripToolNoise(blocks.filter((b: any) => b?.type === 'text').map((b: any) => String(b?.text ?? '')).join('\n')).trim()
+    if (text === '') return false
+    const sentences = splitReplySentences(text)
+    if (sentences.length === 0) return false
+    const speechSegments = splitSpeechSegments(text)
+      .map((segment) => ({ ...segment, text: toSpeechText(segment.text) }))
+      .filter((segment) => segment.text !== '')
+    lastReplies.set(sessionId, { sentences, speechSegments, includeAll: [...text].length <= 2000 })
+    lastAssistant.set(sessionId, { text, at: Date.now() })
+    return true
   }
 
   function enqueuePending(completedSessionId: string): void {
@@ -949,8 +1047,24 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return false
   }
 
+  /**
+   * 自愈：把「turn/start 之后永远没有 turn/end」的会话从运行跟踪里摘掉，并把该会话
+   * 标成已完成，否则回主页守门（全局 runningSessions）会被一条僵尸条目永久挡住。
+   */
+  function pruneStaleTurns(): void {
+    const stale = tihuTurnStaleMs()
+    const now = Date.now()
+    for (const [sessionId, startedAt] of runningSessions) {
+      if (now - startedAt < stale) continue
+      runningSessions.delete(sessionId)
+      const state = homeStates.get(sessionId)
+      if (state !== undefined && state.mode === 'session') state.done = true
+    }
+  }
+
   function scheduleHome(sessionId: string): void {
     if (disposed) return
+    pruneStaleTurns()
     const state = homeStates.get(sessionId)
     if (state === undefined || !state.done) return
     cancelHomeTimer(sessionId)
@@ -959,17 +1073,31 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (disposed) return
       const current = homeStates.get(sessionId)
       if (current === undefined || !current.done) return
-      const scroll = screenStates.get(sessionId)
-      if (scroll !== undefined && !scroll.follow) return   // 用户正在浏览历史，禁止切
+      // 已经在主页：手势重排的那一次不要再补发一张（避免重复 home 帧）。
+      if (current.mode === 'home') return
+      // 浏览状态按设备算：一台在看历史只挡它自己，不能把同会话的另一台也按住
+      //（2026-11-07 审计 P1-9：旧实现用会话级 follow，两台设备互相卡死）。
+      const bound = [...devices].filter((device) => device.sessionId === sessionId)
+      const idle = bound.filter((device) => followByDevice.get(device.id) !== false)
+      if (bound.length > 0 && idle.length === 0) {
+        current.timer = setTimeout(() => scheduleHome(sessionId), tihuHomeRecheckMs())
+        return
+      }
       // 守门：只要还有任何会话的 turn 在跑，就不回主页——屏幕必须显示运行中的会话详情。
       // 按 TIHU_HOME_RECHECK_MS 再查一次；turn/end 会清掉 runningSessions，重试自然收敛。
       // 朗读也同理：音频还在播/待播队列非空就还不算「空闲」，否则长回复读到一半就跳主页，
       // 后面的 reply 屏帧到期又把屏切回来（用户实测的「跳主页又自己跳回来」）。
       if (runningSessions.size > 0 || readingBusy(sessionId)) {
-        current.timer = setTimeout(() => scheduleHome(sessionId), TIHU_HOME_RECHECK_MS)
+        current.timer = setTimeout(() => scheduleHome(sessionId), tihuHomeRecheckMs())
         return
       }
-      void sendHome(sessionId).catch((error) => log(`tihu home failed: ${(error as Error)?.message ?? String(error)}`))
+      if (bound.length === 0) {
+        void sendHome(sessionId).catch((error) => log(`tihu home failed: ${(error as Error)?.message ?? String(error)}`))
+        return
+      }
+      for (const device of idle) {
+        void sendHome(sessionId, device).catch((error) => log(`tihu home failed: ${(error as Error)?.message ?? String(error)}`))
+      }
     }, Number.isFinite(delay) ? delay : 10_000)
   }
   async function speakLocally(device: TihuDevice, sessionId: string, sentences: ReplySentence[], speechSegments: SpeechSegment[], includeAll: boolean): Promise<void> {
@@ -1018,12 +1146,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
      */
     const playbackEndAt = { value: 0 }
     const frameAt = (at: number, fn: () => void): Promise<void> =>
-      new Promise<void>((resolve) => {
-        const delay = Math.max(0, at - Date.now())
-        setTimeout(() => {
-          try { fn() } finally { resolve() }
-        }, delay)
-      })
+      scheduleFrameAt(at, fn, (error) => log(`tihu frame failed: ${(error as Error)?.stack ?? String(error)}`))
     /**
      * 音频乱序防护：合成本身并发，但 **tts.audio 必须按句 index 顺序下发**
      * （客户端把 PCM 直接排在 AudioContext 时间轴上，跨句乱序会撞音）。
@@ -1081,6 +1204,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       )
 
     speakingStart(sessionId)
+    // 换绑/断开时要把这一轮掐掉：否则屏已经切到别的会话，旧会话的 PCM 还在往同一台设备发
+    //（2026-11-07 审计 P1-10）。
+    const cancelRound = (): void => { aborted = true }
+    device.cancelRound = cancelRound
     try {
       const results = new Array<SynthResult | undefined>(speechSegments.length).fill(undefined)
       const inFlight = new Set<Promise<void>>()
@@ -1222,6 +1349,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       device.send('event.alert', { level: 'error', text: `本次无语音：在线兜底不可用且本地引擎未就绪（原因：${message}）` })
       setTimeout(() => scheduleHome(sessionId), 50)
     } finally {
+      if (device.cancelRound === cancelRound) device.cancelRound = undefined
       // 已经下发的音频还在播：这段时间算「朗读中」，回主页要等它播完。
       speakingStop(sessionId, playbackEndAt.value + SPEAK_TAIL_MARGIN_MS)
     }
@@ -1373,9 +1501,15 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   const disposePre = ctx.on?.('tools/pre-execute', async (exec: any, next: () => Promise<any>) => {
+    // 2026-11-07 审计 P0：next() 调用过之后抛错必须原样抛——旧实现在 catch 里再调一次 next()，
+    // 等于把工具跑两遍（命令/写文件都会双执行）。闸内出错且工具还没跑时：危险动作 fail-closed
+    // 拒绝，只读/不碰文件的仍按宿主默认策略放行。
+    let dispatched = false
+    let dangerousAction = false
+    const runNext = async (): Promise<any> => { dispatched = true; return await next() }
     try {
       const sessionId = tihuTurnOf(exec)
-      if (sessionId === undefined) return await next()
+      if (sessionId === undefined) return await runNext()
       const tool = String(exec?.name ?? '')
       const workspace = workspaceFor(sessionId, exec?.agent)
       const args = argsOf(exec)
@@ -1385,9 +1519,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       const exists = rawTarget !== undefined ? existsSyncSafe(workspace, rawTarget) : undefined
       // 关键：shell 类按**命令本身**判只读，不再按工具名一刀切（P0 事故根因）。
       const action = classifyTool(tool, exists, command)
+      dangerousAction = action.dangerous
 
       // 不碰文件的只读工具（读、搜索、只读 shell…）不拦、不审计，避免把日志刷满。
-      if (!action.touchesFiles && !action.dangerous) return await next()
+      if (!action.touchesFiles && !action.dangerous) return await runNext()
 
       let snapshotPath: string | undefined
       let snapshotRoot: string | undefined
@@ -1471,11 +1606,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (typeof exec?.callId === 'string') {
         pendingCalls.set(exec.callId, { sessionId, workspace, action, tool, target: rawTarget, snapshotPath, snapshotRoot })
       }
-      return await next()
+      return await runNext()
     } catch (error) {
-      // 闸自己出错时**不能**放行危险动作：记录后交给宿主默认策略（next）。
       log(`tihu pre-execute failed: ${(error as Error)?.stack ?? String(error)}`)
-      return await next()
+      // 工具已经跑过：原样抛，绝不重跑。
+      if (dispatched) throw error
+      // 还没跑：危险动作 fail-closed（确认器自己坏掉时也绝不静默放行）。
+      if (dangerousAction) return { kind: 'deny', reason: 'tihu: 闸内部出错，危险动作默认不执行' }
+      return await runNext()
     }
   })
 
@@ -1573,6 +1711,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       // 没有设备绑定这个会话时也要处 turn/end 的收尾：别的会话跑完了，
       // 当前屏右侧必须冒出「新回复」气泡（2026-11-07 用户实测：新开的 CU 会话完成，鹈鹕屏没通知）。
       if (![...devices].some((device) => device.sessionId === sessionId)) {
+        // 没有设备绑定这个会话：仍要记下最近一条回复，点气泡/主页摘要都要用（审计 P1-8）。
+        if (type === 'assistant/message') rememberReply(sessionId, event?.data)
         if (type === 'turn/end') enqueuePending(sessionId)
         return
       }
@@ -1590,8 +1730,21 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         screenStates.delete(sessionId)
         cancelHomeTimer(sessionId)
         homeStates.set(sessionId, { mode: 'session', page: 0, done: false })
+        // 兜底看门狗：这一轮如果永远等不到 turn/end（agent 被杀/宿主重启），到 stale
+        // 窗口就自愈并重排回主页（2026-11-07 审计 P1-5）。
+        const watchdog = setTimeout(() => {
+          if (disposed || !runningSessions.has(sessionId)) return
+          pruneStaleTurns()
+          const hs = homeStates.get(sessionId)
+          if (hs !== undefined && hs.done && hs.mode === 'session') scheduleHome(sessionId)
+        }, tihuTurnStaleMs() + 10)
+        watchdog.unref?.()
       }
-      const update = applySessionEvent(state, event, Date.now(), screenMetaOf(sessionId))
+      const update = applySessionEvent(state, event, Date.now(), {
+        ...screenMetaOf(sessionId),
+        // 有气泡轨占位 → 页面把正文压到 240px，屏帧也按 240px 排版（审计 P1-6）。
+        narrow: (pendingByDisplay.get(sessionId)?.length ?? 0) > 0,
+      })
       if (type === 'turn/start') {
         // 注意：**不能**在这里点亮 tihu 窗口。用户自己在会话里打字同样会触发
         // turn/start，旧实现就是这么把用户自己的每个 turn 都变成「危险动作要确认」的。
@@ -1633,6 +1786,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         })
         // 新回复：强制回到顶部并恢复跟随；取消回主页计时并切会话屏。
         screenStates.delete(sessionId)
+        for (const device of devices) if (device.sessionId === sessionId) followByDevice.set(device.id, true)
         lastReplies.set(sessionId, { sentences, speechSegments, includeAll })
         lastAssistant.set(sessionId, { text, at: Date.now() })
         cancelHomeTimer(sessionId)
@@ -1677,8 +1831,24 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /* ---------- WebSocket ---------- */
 
+  /** 握手外壳：异常一律兜住——pocket 代理是裸调用，这里漏一个 throw 就是一进程崩。 */
   function handleUpgrade(req: any, socket: any, head: Buffer): boolean {
     if (pathnameOf(req) !== TIHU_LANE_PATH) return false
+    // 先挂 error 监听：101 应答之前对端就可能 abort，没有监听时 Node 会把
+    // unhandled 'error' 事件抛成 uncaughtException（旧实现到 close 之后才挂）。
+    try {
+      socket.on?.('error', (error: unknown) => log(`tihu socket error: ${(error as Error)?.message ?? String(error)}`))
+    } catch { /* 忽略 */ }
+    try {
+      return handleUpgradeSession(req, socket, head)
+    } catch (error) {
+      log(`tihu upgrade failed: ${(error as Error)?.stack ?? String(error)}`)
+      try { socket.destroy?.() } catch { /* 忽略 */ }
+      return true
+    }
+  }
+
+  function handleUpgradeSession(req: any, socket: any, head: Buffer): boolean {
     const key = req?.headers?.['sec-websocket-key']
     if (typeof key !== 'string' || key === '') {
       socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
@@ -1774,6 +1944,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     socket.on('error', () => { /* 断开由 close 处理 */ })
     socket.on('close', () => {
       devices.delete(device)
+      followByDevice.delete(device.id)
+      // 断开的设备不再有屏：把还挂着的这一轮朗读掐掉，别继续烧合成额度。
+      try { device.cancelRound?.() } catch { /* 忽略 */ }
       // 设备全断了：还挂着的危险动作确认一律按「离线」拒绝（安全侧默认）。
       if (devices.size === 0) (confirmBroker as any).failAll?.('offline')
       broadcastAll('event.alert', { level: 'info', text: '设备已断开' })
@@ -1872,15 +2045,21 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         stage: '会话',
         text: ended ? `已结束本次语音会话（${payload.reason ?? '页面按钮'}）` : '当前没有进行中的语音会话',
       } satisfies ProgressPayload)
-      device.send('screen.frame', {
+      sendFrame(device, {
         stage: '空闲', title: '已结束本次会话', bullets: ['闸门已关闭', '按住说话可再开始'], tone: 'idle',
-      } satisfies ScreenFramePayload)
+      } satisfies ScreenFramePayload, sessionId)
       return
     }
 
     if (type === 'screen.gesture') {
       const payload = message.payload as { action?: string; dy?: number; phase?: string; x?: number; y?: number }
-      if (device.sessionId !== undefined) cancelHomeTimer(device.sessionId)
+      if (device.sessionId !== undefined) {
+        cancelHomeTimer(device.sessionId)
+        // 手势会打断回主页倒计时；处理完必须重新挂一次，否则「完成一轮后随手点一下屏」
+        // 就永远停在会话页（2026-11-07 审计 P1-4）。
+        const home = homeStates.get(device.sessionId)
+        if (home !== undefined && home.done && home.mode === 'session') scheduleHome(device.sessionId)
+      }
       if (payload.action === 'tap' && device.sessionId !== undefined && typeof payload.x === 'number' && typeof payload.y === 'number') {
         // 气泡点击：targetSessionId 必须在当前 pending 队列里（防伪造切屏）。
         if ((payload as any).hit === 'chip' && typeof (payload as any).targetSessionId === 'string') {
@@ -1925,6 +2104,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             const maxOffset = Math.max(0, scrollState.lines.length - SCREEN_SPEC.replyVisibleLines)
             scrollState.offset = Math.max(0, Math.min(scrollState.offset + delta, maxOffset))
             scrollState.follow = scrollState.offset < 0.5
+            followByDevice.set(device.id, scrollState.follow)
             sendReply(device.sessionId, scrollState.sentences, scrollState.currentIndex, scrollState.charPos, true)
           }
         }
@@ -2061,12 +2241,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         if (text === '') return
       } else {
         source = 'voice'
-        device.send('screen.frame', { stage: '聆听', title: '正在转写…', bullets: ['本机 speech 服务'], tone: 'busy' } satisfies ScreenFramePayload)
+        sendFrame(device, { stage: '聆听', title: '正在转写…', bullets: ['本机 speech 服务'], tone: 'busy' } satisfies ScreenFramePayload)
         try {
           text = await transcribe(String(message.payload.audioBase64 ?? ''))
         } catch (error) {
           device.send('event.alert', { level: 'error', text: `转写失败：${(error as Error)?.message ?? String(error)}` })
-          device.send('screen.frame', { stage: '转写失败', title: '请用文字输入', bullets: [], tone: 'alert' } satisfies ScreenFramePayload)
+          sendFrame(device, { stage: '转写失败', title: '请用文字输入', bullets: [], tone: 'alert' } satisfies ScreenFramePayload)
           return
         }
         if (text === '') {
@@ -2080,7 +2260,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         device.send('transcript', { text, final: true, source, retryable: true } satisfies TranscriptPayload)
         inject(device.sessionId, text)
         device.send('event.progress', { stage: '注入', text: '已送入当前会话' } satisfies ProgressPayload)
-        device.send('screen.frame', { stage: '思考', title: '模型处理中', bullets: [text.slice(0, 20)], tone: 'busy' } satisfies ScreenFramePayload)
+        sendFrame(device, { stage: '思考', title: '模型处理中', bullets: [text.slice(0, 20)], tone: 'busy' } satisfies ScreenFramePayload)
       } catch (error) {
         device.send('event.alert', { level: 'error', text: `注入失败：${(error as Error)?.message ?? String(error)}` })
       }
