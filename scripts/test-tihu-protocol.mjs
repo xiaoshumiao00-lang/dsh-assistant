@@ -775,7 +775,7 @@ await testAsync('lane：手动绑定后不再自动漂移（即使别的 CU 会�
   runtime.dispose()
 })
 
-await testAsync('lane：没有 CU 会话时给出可操作提示（自动绑定不硬绑非 CU）', async () => {
+await testAsync('lane：没有 CU 会话时默认显示主页屏（不再整屏引导）', async () => {
   const records = [cuRecord('session-standard', { lastPromptAt: 99999, preset: 'standard' })]
   const { runtime } = runtimeFor(records)
   const socket = openLane(runtime)
@@ -786,7 +786,9 @@ await testAsync('lane：没有 CU 会话时给出可操作提示（自动绑定�
   const frames = framesOf(socket)
   assert.equal(frames.some((frame) => frame.type === 'session.bound'), false, '没有 CU 会话就不该绑定')
   assert.ok(frames.some((frame) => frame.type === 'event.alert' && String(frame.payload.text).includes('没有可自动绑定的 Computer Use 会话')))
-  assert.ok(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.title.includes('没有可自动绑定')))
+  const screen = frames.filter((frame) => frame.type === 'screen.frame').map((frame) => frame.payload).pop()
+  assert.equal(screen.mode, 'home', '无绑定时默认主页屏')
+  assert.ok(!JSON.stringify(screen).includes('还没有选定'), '旧引导文案不得占满屏')
   const list = frames.find((frame) => frame.type === 'sessions.list')
   assert.equal(list.payload.cuTotal, 0)
   assert.equal(list.payload.total, 1)

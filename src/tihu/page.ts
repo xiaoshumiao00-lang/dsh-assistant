@@ -449,6 +449,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         homeBody.appendChild(item);
       }
       screen.className = 'home-mode';
+      if (!state.sessionBound) $('scrollHint').textContent = '未绑定会话 · 点项目进入';
+      else $('scrollHint').textContent = '';
       return;
     }
     if (payload && payload.mode === 'reply' && payload.reply) {
@@ -923,6 +925,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     ws.onopen = function () {
       $('conn').textContent = '已连接';
       $('conn').className = 'on';
+      $('stage').textContent = $('stage').textContent.replace(/^离线 · /, '');
       state.clientId = state.clientId || ('web-' + Math.random().toString(36).slice(2, 10));
       if (!state.sessionId && !state.sessionBound) {
         var picked = pickInitialSession();
@@ -956,6 +959,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     ws.onclose = function (event) {
       $('conn').textContent = '已断开' + (event && event.code ? '（' + event.code + '）' : '');
       $('conn').className = 'off';
+      if (state.screenMode === 'home' && !$('stage').textContent.startsWith('离线 · ')) {
+        $('stage').textContent = '离线 · ' + $('stage').textContent;
+      }
       state.audioPending = false;
       clearTimeout(state.audioTimer);
       addEvent('alert', '连接已断开，2 秒后自动重连（期间发送的内容不会送达）');
