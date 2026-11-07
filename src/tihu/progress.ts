@@ -265,22 +265,26 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
 
   if (type === 'turn/end') {
     const reason = String(asRecord(data.reason).kind ?? 'stop')
-    state.tone = 'ok'
+    // completed / stop 都算正常完成；error / aborted / cancelled 之类才算失败。
+    const okReason = reason === 'completed' || reason === 'stop'
     const doneTitle = clipText(`完成 · 共 ${state.step} 步 · 用时 ${formatElapsed(now - state.turnStartedAt)}`, TIHU_TITLE_CHARS)
     state.stage = '回答'
     state.title = doneTitle
+    state.tone = okReason ? 'ok' : 'alert'
+    // 最终帧只留「结果」一行：不再重复标题（共 N 步/用时），也不再挂上一条命令的
+    // stdout 尾行（2026-11-07 用户实测：完成帧出现了上一轮命令的陈旧输出）。
+    const resultLine = okReason
+      ? (state.lastResult?.ok === false ? state.lastResult.line : (state.lastResult?.line ?? '✓ 本轮完成'))
+      : (state.lastResult?.ok === false ? state.lastResult.line : `✗ 本轮中断（${reason}）`)
     return {
       // 最终帧保留在屏上（不要立刻清成「本轮完成」）
       screen: {
         stage: '回答',
         title: doneTitle,
-        bullets: [`共 ${state.step} 步 · 用时 ${formatElapsed(now - state.turnStartedAt)}`, state.lastResult?.line ?? '', state.lastOutput]
-          .filter(Boolean)
-          .slice(0, 3)
-          .map((line) => clipText(line, TIHU_LINE_CHARS)),
-        tone: 'ok',
+        bullets: [clipText(resultLine, TIHU_LINE_CHARS)],
+        tone: state.tone,
       },
-      progress: { stage: 'end', text: `本轮结束（${reason}）` },
+      progress: { stage: 'end', text: okReason ? '本轮完成' : `本轮结束（${reason}）` },
     }
   }
 

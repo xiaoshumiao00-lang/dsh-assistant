@@ -38,6 +38,8 @@
 
 【2026-11-07 追加：屏幕帧「有料」执行面板 + 真机 320×240 视窗】旧屏幕只有「动手 / code_agent / 正在执行…」。新增纯函数 `src/tihu/progress.ts`：把 `session/event` 映射成 stage（思考/读文件/跑命令/写文件/搜索/回答/等待确认）+「动词+目标」标题（Read→读取 <文件>、Write→写入、Edit→修改、Grep→搜索、pwsh→执行 <命令前 30 字>、WebFetch/web_search→联网查；其它工具显示工具名＋`arguments` 主键）+ 3 行正文（`第 N 步 · 已用 12s` / `✓|✗ 上一步摘要` / 输出尾行），全部按码点截断（标题 28、正文 18），失败 tone=alert；`turn/end` 保留「完成 · 共 N 步 · 用时 Xs」最终帧。事件区每次 tool/call 与 tool/result 各一行（参数/结果截 120 字）。同时把屏幕区改成**真机视窗**：新增 `src/tihu/screen-spec.ts`（宽 320/高 240/边距 8/正文 16px·行高 20·每行 18 字·最多 3 行/标题 18 加粗 28 字/stage 12px；物理 61×45.7mm 近似），页面按它渲染固定 320×240 屏 + BOX-3B 外壳（麦克风孔/扬声器格栅/dock 投影），提供 1×/2×（默认）/实际尺寸三档与「显示外壳/仅屏幕」开关；仅屏幕模式保留 1px 精确边界。`scripts/test-tihu-protocol.mjs` 47 → 53 项。
 
+【2026-11-07 追加：完成帧收尾三处小瑕疵】①`turn/end` 帧的正文第一行曾重复标题「共 N 步 · 用时 Xs」，且第 3 行挂着上一轮命令的 stdout 尾行；现在完成帧只保留「结果」一行（正常 → `✓ 已生成回复`，失败 → `✗ 失败原因`），不再重复标题、不再带陈旧输出。②`event.done` 的 `ok` 只认 `reason.kind === 'stop'`，实测 `completed` 被下发 `ok:false`；现在 `completed` / `stop` 归一为 `ok:true` 且文案「本轮完成」，`error/aborted/cancelled` 才 false。③`turn/end` 的 tone 跟随结果：正常 ok、失败 alert；`sessionId` 保持不变。`scripts/test-tihu-protocol.mjs` 53 → 54 项（新增 done.ok/tone 的 completed/error 对照）。实测短任务完成帧：`完成 · 共 2 步 · 用时 7s` + 唯一正文行 `✓ 已生成回复`。
+
 ## [0.2.17] - 2026-11-06
 
 📺 平板 / 电视（宽屏、矮视口）专项：控制室卡片不再挤成 4 列被裁，抽屉里点得到会话

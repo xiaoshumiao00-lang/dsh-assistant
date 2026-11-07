@@ -1200,12 +1200,21 @@ test('进度状态机：步骤递增、失败 tone=alert、完成帧保留、正
   assert.ok(answer.screen.bullets.length <= 3)
   for (const line of answer.screen.bullets) assert.ok([...line].length <= 18, `行超长：${line}`)
 
-  // 结束帧：保留「完成 · 共 N 步 · 用时 Xs」
-  const done = push({ type: 'turn/end', data: { turn: 7, reason: { kind: 'stop' } } }, 13000)
+  // 结束帧：保留「完成 · 共 N 步 · 用时 Xs」，正文只留结果行（不重复标题、不带陈旧输出）
+  const done = push({ type: 'turn/end', data: { turn: 7, reason: { kind: 'completed' } } }, 13000)
   assert.ok(done.screen.title.startsWith('完成 · 共 2 步'))
   assert.ok(done.screen.title.includes('12s'))
-  assert.ok(done.screen.bullets.length <= 3)
-  assert.equal(done.screen.bullets[0].includes('共 2 步'), true)
+  assert.equal(done.screen.tone, 'ok')
+  assert.equal(done.screen.bullets.length, 1, '完成帧只保留结果一行')
+  assert.equal(done.screen.bullets[0], '✓ 已生成回复')
+  assert.ok(!done.screen.bullets.some((line) => line.includes('共 2 步')), '正文不重复标题')
+  assert.ok(!done.screen.bullets.some((line) => line.includes('第二个文件结尾')), '不带陈旧 stdout 尾行')
+
+  // 异常结束：tone=alert、正文给失败原因
+  const failed = push({ type: 'turn/end', data: { turn: 7, reason: { kind: 'error' } } }, 14000)
+  assert.equal(failed.screen.tone, 'alert')
+  assert.equal(failed.screen.bullets.length, 1)
+  assert.ok(failed.screen.bullets[0].startsWith('✗'))
 })
 
 test('屏幕文本截断：40 字标题省略到 28 字内，5 行正文只留 3 行', () => {
@@ -1289,6 +1298,41 @@ await testAsync('页面包含真机外壳/320×240 固定尺寸/三档缩放/外
   assert.ok(html.includes('实际尺寸'))
   assert.ok(html.includes('仅屏幕') && html.includes('shell-off'))
   assert.ok(html.includes('class="mics"') && html.includes('class="grille"') && html.includes('class="dock"'))
+  runtime.dispose()
+})
+
+await testAsync('lane：turn/end 的 done.ok/tone——completed→true+ok，error→false+alert', async () => {
+  const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true })])
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'end', protocol: '0', sessionId: 'session-1' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const emit = (event) => onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, event)
+
+  emit({ type: 'turn/start', data: { turn: 1 } })
+  emit({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '好了' }] } } })
+  emit({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  let dones = framesOf(socket).filter((frame) => frame.type === 'event.done')
+  let screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+  assert.equal(dones[0].payload.ok, true, 'completed 必须 ok:true')
+  assert.equal(dones[0].payload.text, '本轮完成')
+  assert.equal(dones[0].payload.sessionId, 'session-1')
+  assert.equal(screens[screens.length - 1].payload.tone, 'ok')
+
+  emit({ type: 'turn/start', data: { turn: 2 } })
+  emit({ type: 'tool/call', data: { turn: 2, step: 1, name: 'pwsh', arguments: { command: 'exit 1' } } })
+  emit({ type: 'tool/result', data: { turn: 2, step: 1, message: { content: [{ type: 'text', text: '命令失败：权限不足' }], isError: true } } })
+  emit({ type: 'turn/end', data: { turn: 2, reason: { kind: 'error' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  dones = framesOf(socket).filter((frame) => frame.type === 'event.done')
+  screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+  assert.equal(dones[dones.length - 1].payload.ok, false, 'error 必须 ok:false')
+  assert.equal(dones[dones.length - 1].payload.sessionId, 'session-1')
+  const lastScreen = screens[screens.length - 1].payload
+  assert.equal(lastScreen.tone, 'alert')
+  assert.equal(lastScreen.bullets.length, 1)
+  assert.ok(lastScreen.bullets[0].startsWith('✗'))
   runtime.dispose()
 })
 

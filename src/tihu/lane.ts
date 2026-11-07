@@ -972,9 +972,12 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       }
       if (type === 'turn/end') {
         const reason = String(data?.reason?.kind ?? 'stop')
+        // completed 与 stop 都是正常收尾（实测日志 reason.kind='completed'，旧代码只认 stop
+        // 导致 ok:false）。error/aborted/cancelled 之类才判失败。
+        const okReason = reason === 'stop' || reason === 'completed'
         broadcast(sessionId, 'event.done', {
-          text: reason === 'stop' ? '本轮完成' : `本轮结束（${reason}）`,
-          ok: reason === 'stop',
+          text: okReason ? '本轮完成' : `本轮结束（${reason}）`,
+          ok: okReason,
           sessionId,
         } satisfies DonePayload)
         // 最终帧由 mapper 保留：「完成 · 共 N 步 · 用时 Xs」停在屏上，不清成「待命」。
