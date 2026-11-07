@@ -101,6 +101,11 @@ export interface HelloPayload {
    * （不存在回 session.invalid，页面退回屏下选择器）。
    */
   sessionId?: string
+  /**
+   * 自动跟随模式（2026-11-07）：不带 sessionId 时由宿主自动绑定「最近活跃的
+   * Computer Use 会话」，并在每次注入前重新判定、变化即跟随。
+   */
+  auto?: boolean
 }
 
 /** 一段 WAV 音频：16 kHz / 单声道 / 16 bit，base64（不含 data: 前缀）。 */
@@ -249,35 +254,62 @@ export interface SessionChoice {
   cwd?: string
   /** 创建时间（毫秒）。 */
   createdAt?: number
+  /**
+   * 活跃时间（毫秒）：宿主会话列表用的 `updatedAt = max(header.createdAt, 投影
+   * sessionListMetadata.lastPromptAt)` —— 也就是「最后一次用户发言时间」，
+   * 桌面端会话列表就按它排序。自动绑定取这个字段最大的一条 CU 会话。
+   */
+  updatedAt?: number
   /** 是否正在宿主内存里（桌面正开着）。 */
   live?: boolean
+  /**
+   * 会话的 agent preset（宿主投影 `agentPreset`，缺省回退 `session.header.agentPreset`）。
+   * 这是判断「Computer Use 模式」的唯一可靠依据——**不看标题猜**。
+   */
+  preset?: string
+  /** 是否 Computer Use 模式（preset === 'computer-use'）。语音操作只在这个模式下可用。 */
+  computerUse?: boolean
 }
 
 /** 下行：会话列表 + 对 checkId 的核对结果。 */
 export interface SessionsListPayload {
-  /** 最近 N 条（可绑定的）。 */
+  /** 最近 N 条**可语音操作**（Computer Use 模式）的会话。 */
   sessions: SessionChoice[]
   /** 逻辑会话总数（不只这 N 条）。 */
   total: number
-  /** checkId 是否存在；没传 checkId 时没有这个字段。 */
-  check?: { sessionId: string; found: boolean }
+  /** 其中 Computer Use 模式的会话数（页面据此提示「先去新建一个」）。 */
+  cuTotal: number
+  /** checkId 是否存在、是什么模式；没传 checkId 时没有这个字段。 */
+  check?: { sessionId: string; found: boolean; preset?: string; computerUse?: boolean }
+  /** 当前「最近活跃的 Computer Use 会话」id（自动绑定目标）；没有则为空。 */
+  activeSessionId?: string
   /** 数据源（诊断用）。 */
   source: 'sessionQuery' | 'live' | 'none'
 }
 
-/** 上行：绑定一个会话（页面点选择器 / 换会话时发）。 */
+/** 上行：绑定一个会话，或切回「自动跟随」。 */
 export interface SessionBindPayload {
-  /** 要绑定的会话 id。 */
-  sessionId: string
+  /** 要手动绑定的会话 id；`auto: true` 时可省略。 */
+  sessionId?: string
+  /** true = 切回自动跟随（宿主自动绑定最近活跃的 CU 会话）。 */
+  auto?: boolean
 }
 
-/** 下行：绑定成功（宿主是权威，标题/是否 live 以这里为准）。 */
+/** 下行：绑定成功（宿主是权威，标题/是否 live/模式以这里为准）。 */
 export interface SessionBoundPayload {
   sessionId: string
   /** 会话名；拿不到时为空串（页面显示短 id）。 */
   title: string
   /** 会话当前是否在宿主内存里（没打开的话语音注入前要先在桌面打开）。 */
   live?: boolean
+  /** agent preset（`agentPreset` 投影）。 */
+  preset?: string
+  /** 是否 Computer Use 模式；false 时页面必须显示醒目提示。 */
+  computerUse?: boolean
+  /** 是否自动跟随模式绑定的。 */
+  auto?: boolean
+  /** 这次绑定是否因为「最活跃的 CU 会话变了」而自动跟随（页面提示「已自动跟随到」）。 */
+  followed?: boolean
 }
 
 /** 下行：会话 id 非法（不存在 / 已归档 / 写错），页面据此退回选择器。 */
@@ -373,6 +405,7 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
         if (typeof payload.clientId !== 'string' || payload.clientId === '') return null
         if (payload.clientId.length > 200) return null
         if (payload.sessionId !== undefined && (typeof payload.sessionId !== 'string' || payload.sessionId.length > 256)) return null
+        if (payload.auto !== undefined && typeof payload.auto !== 'boolean') return null
         if (payload.capabilities !== undefined && !isObject(payload.capabilities)) return null
         return value as TihuUpstreamMessage
       }
@@ -408,8 +441,11 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
         return value as TihuUpstreamMessage
       }
       case 'session.bind': {
-        // 绑定会话：id 必填。
-        if (typeof payload.sessionId !== 'string' || payload.sessionId === '' || payload.sessionId.length > 256) return null
+        // 手动绑定要 id；切回自动跟随用 { auto: true }（id 可省）。
+        if (payload.auto !== undefined && typeof payload.auto !== 'boolean') return null
+        if (payload.sessionId !== undefined && (typeof payload.sessionId !== 'string' || payload.sessionId.length > 256)) return null
+        const manual = typeof payload.sessionId === 'string' && payload.sessionId !== ''
+        if (!manual && payload.auto !== true) return null
         return value as TihuUpstreamMessage
       }
       case 'ping': return value as TihuUpstreamMessage

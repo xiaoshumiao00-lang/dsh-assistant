@@ -116,6 +116,14 @@ test('sessions.query / session.bind：字段合法才收，越界一律忽略', 
   assert.equal(parseUpstream(JSON.stringify(buildUpstream('session.bind', { sessionId: '' }, 18))), null)
 })
 
+test('自动绑定：hello.auto 与 session.bind {auto:true}', () => {
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('hello', { clientId: 'c', auto: true }, 20))) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('hello', { clientId: 'c', auto: 'yes' }, 21))), null)
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('session.bind', { auto: true }, 22))) !== null)
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('session.bind', { sessionId: 'session-x', auto: true }, 23))) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('session.bind', { auto: false }, 24))), null)
+})
+
 test('hello：合法信封通过，多余字段保留（字段只增不删）', () => {
   const message = buildUpstream('hello', {
     clientId: 'web-1',
@@ -393,10 +401,12 @@ function fakeCtx(overrides = {}) {
   const ctx = {
     on(name, handler) { events.push({ name, handler }); return () => {} },
     get(id) {
-      if (id === 'agents') return { get: (sessionId) => sessionId === 'session-1' ? { followup: (message) => injected.push(message) } : undefined }
+      if (id === 'agents') return overrides.agents ?? { get: (sessionId) => sessionId === 'session-1' ? { followup: (message) => injected.push(message) } : undefined }
       if (id === 'speechController') return { transcribe: async () => '读一下 README' }
       if (id === 'sessions') return overrides.sessions
       if (id === 'sessionQuery') return overrides.sessionQuery
+      if (id === 'sessionProjections') return overrides.sessionProjections
+      if (id === 'sessionProjectionCache') return overrides.sessionProjectionCache
       return undefined
     },
     ...overrides,
@@ -488,48 +498,100 @@ function framesOf(socket) {
   return socket.frames().map((line) => { try { return JSON.parse(line) } catch { return null } }).filter(Boolean)
 }
 
+/** 一条会话记录：header 带 agentPreset（回退用），projection 是投影缓存（权威）。 */
+function cuRecord(id, options = {}) {
+  const {
+    createdAt = 0,
+    lastPromptAt = 0,
+    preset = 'computer-use',
+    live = false,
+    cwd = '/w',
+    title = '标题:' + id,
+  } = options
+  return {
+    header: { id, createdAt, cwd, agentPreset: preset },
+    live,
+    persisted: !live,
+    projection: { title, agentPreset: preset, sessionListMetadata: { blank: false, lastPromptAt } },
+  }
+}
+
 function sessionQueryFixture(records) {
   return {
-    listSessions: async () => records,
+    listSessions: async () => records.map(({ projection, ...record }) => record),
     readTitleSnapshots: async (ids) => ids.map((id) => ({ session: { id }, title: { title: '标题:' + id } })),
   }
 }
 
-await testAsync('lane：sessions.query 返回最近 N 条（live 优先、带标题、核对 checkId）', async () => {
-  const records = [
-    { header: { id: 'session-old', createdAt: 1000, cwd: '/w' }, live: false, persisted: true },
-    { header: { id: 'session-new', createdAt: 3000, cwd: '/w' }, live: false, persisted: true },
-    { header: { id: 'session-live', createdAt: 500, cwd: '/w' }, live: true, persisted: true },
-  ]
-  const { ctx } = fakeCtx({ sessionQuery: sessionQueryFixture(records) })
-  const runtime = createTihuRuntime(ctx, { log: () => {} })
+function projectionCacheFixture(records) {
+  const byId = new Map(records.map((record) => [record.header.id, record.projection ?? {}]))
+  return {
+    cachedSnapshot: (source) => ({ values: byId.get(source?.header?.id ?? source?.id) ?? {} }),
+  }
+}
+
+function agentsFixture(ids) {
+  const calls = []
+  return {
+    calls,
+    agents: {
+      get: (sessionId) => ids.includes(sessionId)
+        ? { followup: (message) => calls.push({ sessionId, message }) }
+        : undefined,
+    },
+  }
+}
+
+function runtimeFor(records, extras = {}) {
+  const fixture = fakeCtx({
+    sessionQuery: sessionQueryFixture(records),
+    sessionProjectionCache: projectionCacheFixture(records),
+    ...extras,
+  })
+  return { ...fixture, runtime: createTihuRuntime(fixture.ctx, { log: () => {} }) }
+}
+
+function openLane(runtime) {
   const socket = new FakeSocket()
   runtime.handleUpgrade({ url: '/tihu/lane', headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' }, socket: {} }, socket, Buffer.alloc(0))
+  return socket
+}
+
+await testAsync('lane：sessions.query 只列 CU 会话，按活跃时间倒序，带 activeSessionId/check', async () => {
+  const records = [
+    cuRecord('session-standard', { createdAt: 100, lastPromptAt: 99999, preset: 'standard' }),
+    cuRecord('session-old', { createdAt: 1000 }),
+    cuRecord('session-new', { createdAt: 3000, lastPromptAt: 5000 }),
+  ]
+  const { runtime } = runtimeFor(records)
+  const socket = openLane(runtime)
   socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'c1', protocol: '0' }, 1)))
-  socket.emit('data', clientFrame(buildUpstream('sessions.query', { limit: 2, checkId: 'session-new' }, 2)))
-  await new Promise((resolve) => setTimeout(resolve, 30))
+  socket.emit('data', clientFrame(buildUpstream('sessions.query', { limit: 2, checkId: 'session-old' }, 2)))
+  await new Promise((resolve) => setTimeout(resolve, 40))
 
   const list = framesOf(socket).find((frame) => frame.type === 'sessions.list')
   assert.ok(list, '应下发 sessions.list')
   assert.equal(list.payload.total, 3)
+  assert.equal(list.payload.cuTotal, 2)
   assert.equal(list.payload.source, 'sessionQuery')
   assert.equal(list.payload.sessions.length, 2)
-  assert.equal(list.payload.sessions[0].sessionId, 'session-live', '在线会话排最前')
-  assert.equal(list.payload.sessions[1].sessionId, 'session-new')
-  assert.equal(list.payload.sessions[0].title, '标题:session-live')
-  assert.deepEqual(list.payload.check, { sessionId: 'session-new', found: true })
+  // 标准模式即使更新也不进列表；CU 按 updatedAt 倒序
+  assert.equal(list.payload.sessions[0].sessionId, 'session-new')
+  assert.equal(list.payload.sessions[1].sessionId, 'session-old')
+  assert.equal(list.payload.sessions[0].computerUse, true)
+  assert.equal(list.payload.sessions[0].updatedAt, 5000)
+  assert.equal(list.payload.activeSessionId, 'session-new')
+  assert.deepEqual(list.payload.check, { sessionId: 'session-old', found: true, preset: 'computer-use', computerUse: true })
   runtime.dispose()
 })
 
 await testAsync('lane：hello 带一个不存在的会话 → session.invalid，页面不会被绑死', async () => {
-  const records = [{ header: { id: 'session-new', createdAt: 3000, cwd: '/w' }, live: false, persisted: true }]
-  const { ctx } = fakeCtx({ sessionQuery: sessionQueryFixture(records) })
-  const runtime = createTihuRuntime(ctx, { log: () => {} })
-  const socket = new FakeSocket()
-  runtime.handleUpgrade({ url: '/tihu/lane', headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' }, socket: {} }, socket, Buffer.alloc(0))
+  const records = [cuRecord('session-new', { createdAt: 3000, live: true })]
+  const { runtime } = runtimeFor(records)
+  const socket = openLane(runtime)
   socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'c2', protocol: '0', sessionId: 'session-404' }, 1)))
   socket.emit('data', clientFrame(buildUpstream('text.input', { text: '你好' }, 2)))
-  await new Promise((resolve) => setTimeout(resolve, 30))
+  await new Promise((resolve) => setTimeout(resolve, 40))
 
   const frames = framesOf(socket)
   const invalid = frames.find((frame) => frame.type === 'session.invalid')
@@ -542,27 +604,139 @@ await testAsync('lane：hello 带一个不存在的会话 → session.invalid，
   runtime.dispose()
 })
 
-await testAsync('lane：session.bind 成功 → session.bound，随后 text.input 正常注入', async () => {
-  const records = [{ header: { id: 'session-1', createdAt: 3000, cwd: '/w' }, live: true, persisted: true }]
-  const { ctx, injected } = fakeCtx({ sessionQuery: sessionQueryFixture(records) })
-  const runtime = createTihuRuntime(ctx, { log: () => {} })
-  const socket = new FakeSocket()
-  runtime.handleUpgrade({ url: '/tihu/lane', headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' }, socket: {} }, socket, Buffer.alloc(0))
+await testAsync('lane：手动 session.bind 成功 → session.bound（CU 标记）', async () => {
+  const records = [cuRecord('session-1', { createdAt: 3000, live: true })]
+  const { runtime } = runtimeFor(records)
+  const socket = openLane(runtime)
   socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'c3', protocol: '0' }, 1)))
   socket.emit('data', clientFrame(buildUpstream('session.bind', { sessionId: 'session-1' }, 2)))
-  await new Promise((resolve) => setTimeout(resolve, 20))
+  await new Promise((resolve) => setTimeout(resolve, 30))
   const bound = framesOf(socket).find((frame) => frame.type === 'session.bound')
   assert.ok(bound, '应下发 session.bound')
   assert.equal(bound.payload.sessionId, 'session-1')
   assert.equal(bound.payload.title, '标题:session-1')
   assert.equal(bound.payload.live, true)
-  // 屏上要显示当前会话名（绑定成功的反馈）
+  assert.equal(bound.payload.computerUse, true)
+  assert.equal(bound.payload.preset, 'computer-use')
   assert.ok(framesOf(socket).some((frame) => frame.type === 'screen.frame' && frame.payload.title.includes('标题:session-1')))
+  runtime.dispose()
+})
 
-  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '读一下 README', source: 'keyboard' }, 3)))
-  await new Promise((resolve) => setTimeout(resolve, 20))
-  assert.equal(injected.length, 1)
-  assert.equal(injected[0].content[0].text, '读一下 README')
+await testAsync('lane：hello {auto:true} 自动绑定最活跃的 CU 会话（标准模式再新也不选）', async () => {
+  const records = [
+    cuRecord('session-standard', { lastPromptAt: 99999, preset: 'standard' }),
+    cuRecord('session-a', { lastPromptAt: 5000 }),
+    cuRecord('session-b', { lastPromptAt: 9000 }),
+  ]
+  const { runtime } = runtimeFor(records)
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'c4', protocol: '0', auto: true }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 40))
+
+  const bound = framesOf(socket).find((frame) => frame.type === 'session.bound')
+  assert.ok(bound, '应自动下发 session.bound')
+  assert.equal(bound.payload.sessionId, 'session-b')
+  assert.equal(bound.payload.auto, true)
+  assert.equal(bound.payload.computerUse, true)
+  runtime.dispose()
+})
+
+await testAsync('lane：自动跟随——注入前最活跃 CU 变了就跟过去并注入新会话', async () => {
+  const records = [
+    cuRecord('session-a', { lastPromptAt: 5000, live: true }),
+    cuRecord('session-b', { lastPromptAt: 9000, live: true }),
+  ]
+  const { agents, calls } = agentsFixture(['session-a', 'session-b'])
+  const { runtime, events } = runtimeFor(records, { agents })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'c5', protocol: '0', auto: true }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  // 初始自动绑定到最活跃的 b
+  assert.equal(framesOf(socket).find((frame) => frame.type === 'session.bound').payload.sessionId, 'session-b')
+
+  // 模拟用户在桌面端给 a 发了消息（活跃时间刷新）
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  onSessionEvent({ id: 'session-a', header: { id: 'session-a' } }, {
+    type: 'user/message',
+    data: { source: { kind: 'user' } },
+    time: Date.now() + 1000,
+  })
+
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '看下屏幕', source: 'voice' }, 2)))
+  await new Promise((resolve) => setTimeout(resolve, 60))
+
+  const bounds = framesOf(socket).filter((frame) => frame.type === 'session.bound')
+  const follow = bounds[bounds.length - 1]
+  assert.equal(follow.payload.sessionId, 'session-a')
+  assert.equal(follow.payload.followed, true)
+  assert.ok(framesOf(socket).some((frame) => frame.type === 'screen.frame' && frame.payload.title.includes('已自动跟随到')))
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].sessionId, 'session-a')
+  runtime.dispose()
+})
+
+await testAsync('lane：手动绑定后不再自动漂移（即使别的 CU 会话更新）', async () => {
+  const records = [
+    cuRecord('session-a', { lastPromptAt: 5000, live: true }),
+    cuRecord('session-b', { lastPromptAt: 9000, live: true }),
+  ]
+  const { agents, calls } = agentsFixture(['session-a', 'session-b'])
+  const { runtime, events } = runtimeFor(records, { agents })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'c6', protocol: '0', auto: true }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  socket.emit('data', clientFrame(buildUpstream('session.bind', { sessionId: 'session-a' }, 2)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  onSessionEvent({ id: 'session-b', header: { id: 'session-b' } }, {
+    type: 'user/message',
+    data: { source: { kind: 'user' } },
+    time: Date.now() + 5000,
+  })
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '继续', source: 'voice' }, 3)))
+  await new Promise((resolve) => setTimeout(resolve, 60))
+
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].sessionId, 'session-a', '手动绑定后不跟随')
+  const bounds = framesOf(socket).filter((frame) => frame.type === 'session.bound')
+  assert.equal(bounds[bounds.length - 1].payload.sessionId, 'session-a')
+  assert.notEqual(bounds[bounds.length - 1].payload.followed, true)
+  runtime.dispose()
+})
+
+await testAsync('lane：没有 CU 会话时给出可操作提示（自动绑定不硬绑非 CU）', async () => {
+  const records = [cuRecord('session-standard', { lastPromptAt: 99999, preset: 'standard' })]
+  const { runtime } = runtimeFor(records)
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'c7', protocol: '0', auto: true }, 1)))
+  socket.emit('data', clientFrame(buildUpstream('sessions.query', { limit: 20 }, 2)))
+  await new Promise((resolve) => setTimeout(resolve, 50))
+
+  const frames = framesOf(socket)
+  assert.equal(frames.some((frame) => frame.type === 'session.bound'), false, '没有 CU 会话就不该绑定')
+  assert.ok(frames.some((frame) => frame.type === 'event.alert' && String(frame.payload.text).includes('没有可自动绑定的 Computer Use 会话')))
+  assert.ok(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.title.includes('没有可自动绑定')))
+  const list = frames.find((frame) => frame.type === 'sessions.list')
+  assert.equal(list.payload.cuTotal, 0)
+  assert.equal(list.payload.total, 1)
+  assert.equal(list.payload.sessions.length, 0)
+  assert.equal(list.payload.activeSessionId, undefined)
+  runtime.dispose()
+})
+
+await testAsync('页面 HTML 含自动模式/跟随/恢复自动/模式徽标', async () => {
+  const { runtime } = runtimeFor([])
+  const html = runtime.page()
+  assert.ok(html.includes('dsh.tihu.session'))
+  assert.ok(html.includes('sessions.query'))
+  assert.ok(html.includes("send('session.bind', { auto: true })"), '页面要能切回自动')
+  assert.ok(html.includes('已自动跟随到'), '跟随提示')
+  assert.ok(html.includes('（自动）'), '模式徽标')
+  assert.ok(html.includes('（手动）'))
+  assert.ok(html.includes('恢复自动'))
+  assert.ok(html.includes('没有可自动绑定的 CU 会话'))
+  assert.ok(html.includes('结束本次语音会话'))
   runtime.dispose()
 })
 
