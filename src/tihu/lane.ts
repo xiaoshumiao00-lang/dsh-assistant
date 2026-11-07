@@ -332,9 +332,24 @@ function screenMetaOf(sessionId: string): { title?: string; stats?: { tokPerSec:
   try { live = typeof sessions?.get === 'function' ? sessions.get(sessionId) : undefined } catch { live = undefined }
   if (live === undefined || live === null) return {}
   const values = projectionValuesOf(live) as Record<string, any>
-  const totals = values?.tokenUsage?.totals ?? {}
-  const totalTokens = Number(totals.uncachedInputTokens ?? 0) + Number(totals.outputTokens ?? 0)
-    + Number(totals.cacheReadTokens ?? 0) + Number(totals.cacheWriteTokens ?? 0)
+  // 累计 token：不同版本宿主把用量投影在不同小对象里（tokenUsage.totals / usage / sessionStats），
+  // 统一扫一遍「键名以 Tokens 结尾」的数字，取各来源里最大的那个，避免一直是 0。
+  const sumTokens = (node: any): number => {
+    if (node === null || typeof node !== 'object') return 0
+    let sum = 0
+    for (const [key, value] of Object.entries(node)) {
+      if (!/tokens$/i.test(key) || /window|limit/i.test(key)) continue
+      const num = Number(value)
+      if (Number.isFinite(num) && num > 0) sum += num
+    }
+    return sum
+  }
+  const totalTokens = Math.max(
+    sumTokens(values?.tokenUsage),
+    sumTokens(values?.usage),
+    sumTokens(values?.sessionStats),
+    0,
+  )
   const decodeMs = Number(values?.sessionStats?.decodeMs ?? 0)
   const decodeTokens = Number(values?.sessionStats?.decodeTokens ?? 0)
   const tokPerSec = decodeMs > 0 ? decodeTokens / (decodeMs / 1000) : 0
@@ -344,7 +359,16 @@ function screenMetaOf(sessionId: string): { title?: string; stats?: { tokPerSec:
   return { title: titleOf(live), stats: { tokPerSec, totalTokens, contextPercent } }
 }
 
-function screen(sessionId: string, frame: Omit<ScreenFramePayload, 'bullets'> & { bullets?: string[] }): void {
+const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bullets?: string[] }>()
+
+  function screen(sessionId: string, frame: Omit<ScreenFramePayload, 'bullets'> & { bullets?: string[] }): void {
+    lastFrames.set(sessionId, frame)
+    // 待读气泡必须跟着**每一帧**下发：页面收到帧会整体重画气泡轨，
+    // 旧实现只有 reply/主页帧带 pending，思考帧一来就把气泡擦掉了
+    //（2026-11-07 用户实测：别的 CU 会话完成了，鹈鹕屏上看不到通知）。
+    const pend = pendingByDisplay.get(sessionId) ?? []
+    const pending = frame.pending ?? pend.slice(0, 4).map((item) => ({ sessionId: item.sessionId, title: item.title, at: item.at, unread: true as const }))
+    const pendingCount = frame.pendingCount ?? pend.length
     broadcast(sessionId, 'screen.frame', {
       stage: frame.stage,
       title: frame.title,
@@ -353,8 +377,8 @@ function screen(sessionId: string, frame: Omit<ScreenFramePayload, 'bullets'> & 
       ...(frame.mode === undefined ? {} : { mode: frame.mode }),
       ...(frame.reply === undefined ? {} : { reply: frame.reply }),
       ...(frame.home === undefined ? {} : { home: frame.home }),
-      ...(frame.pending === undefined ? {} : { pending: frame.pending }),
-      ...(frame.pendingCount === undefined ? {} : { pendingCount: frame.pendingCount }),
+      pending,
+      pendingCount,
       tone: frame.tone ?? 'idle',
     } satisfies ScreenFramePayload)
   }
@@ -835,7 +859,13 @@ function screen(sessionId: string, frame: Omit<ScreenFramePayload, 'bullets'> & 
       pendingByDisplay.set(display, list)
       // 立即推一帧带气泡的屏帧；不触碰音频/朗读。
       const state = screenStates.get(display)
-      if (state !== undefined) sendReply(display, state.sentences, state.currentIndex, state.charPos, true)
+      if (state !== undefined) {
+        sendReply(display, state.sentences, state.currentIndex, state.charPos, true)
+      } else {
+        // 思考/进度屏（不是 reply 模式）：把最后一帧原样重发一次，让气泡立刻出现。
+        const last = lastFrames.get(display)
+        if (last !== undefined) screen(display, last)
+      }
     }
   }
 
@@ -1499,7 +1529,12 @@ function screen(sessionId: string, frame: Omit<ScreenFramePayload, 'bullets'> & 
       // 运行跟踪与自动跟随都在设备早退**之前**：没绑定该会话的设备收不到事件，
       // 若放在早退之后，别的会话的 turn/start/end 会把跟踪与跟随丢得一干二净。
       if (type === 'turn/start') followRunningTurn(sessionId)
-      if (![...devices].some((device) => device.sessionId === sessionId)) return
+      // 没有设备绑定这个会话时也要处 turn/end 的收尾：别的会话跑完了，
+      // 当前屏右侧必须冒出「新回复」气泡（2026-11-07 用户实测：新开的 CU 会话完成，鹈鹕屏没通知）。
+      if (![...devices].some((device) => device.sessionId === sessionId)) {
+        if (type === 'turn/end') enqueuePending(sessionId)
+        return
+      }
       const data = event?.data ?? {}
 
       // 屏幕帧 / 事件行统一交给纯函数映射（progress.ts）：stage、动词+目标、步骤计数、
