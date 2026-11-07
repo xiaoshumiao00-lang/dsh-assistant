@@ -2599,6 +2599,347 @@ test('回复行不出现省略号：折行留安全边距、页面 CSS 不再 el
   assert.equal(rule.includes('text-overflow'), false, 'reply-line 不应有 text-overflow：' + rule)
 })
 
+/* ---------- 2026-11-07 审计回归（P0 批次）：闸门 / 握手 / 朗读帧 ---------- */
+
+{
+  const mkGateAgent = (sessionId, userMessageId) => ({
+    sessionId,
+    session: {
+      header: { cwd: process.cwd() },
+      deriveMessages: () => [{ id: userMessageId, role: 'user', content: [] }],
+    },
+    followup() {},
+  })
+
+  function gateRuntime(options = {}) {
+    const events = []
+    const injected = []
+    const agent = mkGateAgent('session-1', 'ignored')
+    agent.followup = (message) => injected.push(message)
+    const ctx = {
+      on(name, handler) { events.push({ name, handler }); return () => {} },
+      get(id) { return id === 'agents' ? { get: () => agent } : undefined },
+    }
+    const runtime = createTihuRuntime(ctx, { log: () => {}, ...options })
+    const socket = new FakeSocket()
+    runtime.handleUpgrade({ url: '/tihu/lane', headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' }, socket: {} }, socket, Buffer.alloc(0))
+    return { runtime, socket, events, agent, injected }
+  }
+
+  async function armTihuTurn(fixture) {
+    const { socket, events, agent, injected } = fixture
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'gate', protocol: '0', sessionId: 'session-1' }, 1)))
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '看一下 git 状态', source: 'voice' }, 2)))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    agent.session.deriveMessages = () => [{ id: injected[0].id, role: 'user', content: [] }]
+    return events.find((entry) => entry.name === 'tools/pre-execute').handler
+  }
+
+  await testAsync('闸门 R-P0-1：next() 抛错时原样抛出，工具不得被执行第二次', async () => {
+    const fixture = gateRuntime()
+    const handler = await armTihuTurn(fixture)
+    let nextCalls = 0
+    const failure = new Error('工具自己炸了')
+    await assert.rejects(
+      () => handler(
+        { name: 'pwsh', arguments: { command: 'git status' }, agent: fixture.agent, callId: 'r1' },
+        async () => { nextCalls += 1; throw failure },
+      ),
+      (error) => error === failure,
+    )
+    assert.equal(nextCalls, 1, 'next() 只能调用一次（旧实现 catch 里再调一次 = 工具跑两遍）')
+    fixture.runtime.dispose()
+  })
+
+  await testAsync('闸门 R-P0-1b：确认器 ask 抛错 → 危险动作 fail-closed 拒绝', async () => {
+    const fixture = gateRuntime({
+      confirmBroker: {
+        ask: async () => { throw new Error('broker 崩了') },
+        reply: () => false,
+        failAll() {},
+        pendingCount: () => 0,
+      },
+    })
+    const handler = await armTihuTurn(fixture)
+    const decision = await Promise.race([
+      handler(
+        { name: 'pwsh', arguments: { command: 'Remove-Item -Recurse -Force build' }, agent: fixture.agent, callId: 'r2' },
+        async () => ({ kind: 'allow' }),
+      ),
+      new Promise((resolve) => { setTimeout(() => resolve({ kind: 'test-timeout' }), 800) }),
+    ])
+    assert.equal(decision.kind, 'deny', '确认器自己出错时危险动作必须拒绝，实际 ' + JSON.stringify(decision))
+    fixture.runtime.dispose()
+  })
+}
+
+class ThrowingSocket extends FakeSocket {
+  write() { throw new Error('EPIPE: socket 已销毁') }
+}
+
+await testAsync('握手 R-P0-2：socket 写失败不抛异常（不打死 pocket 进程）', async () => {
+  const { ctx } = fakeCtx()
+  const runtime = createTihuRuntime(ctx, { log: () => {} })
+  const socket = new ThrowingSocket()
+  let threw = null
+  try {
+    const handled = runtime.handleUpgrade({ url: '/tihu/lane', headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' }, socket: {} }, socket, Buffer.alloc(0))
+    assert.equal(handled, true)
+  } catch (error) {
+    threw = error
+  }
+  assert.equal(threw, null, '握手期 socket 异常必须被兜住，实际抛出：' + (threw && threw.message))
+  runtime.dispose()
+})
+
+await testAsync('朗读帧 R-P0-3：帧回调抛错只记日志，不逃出 setTimeout 打死进程', async () => {
+  const lane = await import('../src/tihu/lane.ts')
+  assert.equal(typeof lane.scheduleFrameAt, 'function', 'lane 需要导出可测的帧定时器 scheduleFrameAt')
+  let captured = null
+  await lane.scheduleFrameAt(Date.now(), () => { throw new Error('帧渲染炸了') }, (error) => { captured = error })
+  assert.equal(String(captured && captured.message).includes('帧渲染炸了'), true, '异常必须被 onError 捕获而不是逃出定时器')
+})
+
+/* ---------- 2026-11-07 审计回归（P1 批次）：回主页 / 屏宽 / 气泡 ---------- */
+
+/** 条件轮询：等到某类帧出现（不用固定 sleep 猜时间）。 */
+async function waitForFrame(socket, predicate, timeoutMs = 1500) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const hit = framesOf(socket).filter(predicate)
+    if (hit.length > 0) return hit[hit.length - 1]
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  return undefined
+}
+
+/** 打开一个绑好会话的 lane，返回驱动 session/event 的 emit。 */
+async function laneWithSession(records, sessionId, extras = {}, ttsOptions = { instance: fakeTts() }) {
+  const fixture = runtimeFor(records, extras, ttsOptions)
+  const socket = openLane(fixture.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'r-' + sessionId, protocol: '0', sessionId }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const onSessionEvent = fixture.events.find((entry) => entry.name === 'session/event').handler
+  const emit = (target, event) => onSessionEvent({ id: target, header: { id: target } }, event)
+  return { ...fixture, socket, emit }
+}
+
+await testAsync('回主页 R-P1-4：完成一轮后点一下屏，仍会按空闲条件回主页', async () => {
+  process.env.TIHU_HOME_AFTER_MS = '300'
+  process.env.TIHU_HOME_RECHECK_MS = '40'
+  const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+  const { runtime, socket, emit } = await laneWithSession(records, 'session-a')
+  emit('session-a', { type: 'turn/start', data: { turn: 1 } })
+  emit('session-a', { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  // 等回主页倒计时真正挂上（turn/end 后 50ms 才 scheduleHome），再点一下屏。
+  await new Promise((resolve) => setTimeout(resolve, 120))
+  const isHome = (frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home'
+  const baseline = framesOf(socket).filter(isHome).length // hello 时已有一张主页帧，只认「新来的」
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 10, y: 10 }, 2)))
+  const deadline = Date.now() + 1500
+  while (Date.now() < deadline && framesOf(socket).filter(isHome).length <= baseline) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.ok(framesOf(socket).filter(isHome).length > baseline, '点屏取消倒计时之后仍必须重新挂计时并回主页（条件轮询 1.5s 内）')
+  delete process.env.TIHU_HOME_AFTER_MS
+  delete process.env.TIHU_HOME_RECHECK_MS
+  runtime.dispose()
+})
+
+await testAsync('定时器 R-P1-5a：TIHU_HOME_RECHECK_MS 非数字/0 被钳制，不再 0ms 空转', async () => {
+  const lane = await import('../src/tihu/lane.ts')
+  assert.equal(typeof lane.tihuHomeRecheckMs, 'function', 'lane 需要导出可测的 tihuHomeRecheckMs')
+  process.env.TIHU_HOME_RECHECK_MS = 'abc'
+  assert.equal(lane.tihuHomeRecheckMs(), 2000, '非数字要退回默认 2000ms')
+  process.env.TIHU_HOME_RECHECK_MS = '0'
+  assert.equal(lane.tihuHomeRecheckMs(), 250, '0 要钳到下限 250ms')
+  process.env.TIHU_HOME_RECHECK_MS = '40'
+  assert.equal(lane.tihuHomeRecheckMs(), 40)
+  delete process.env.TIHU_HOME_RECHECK_MS
+  assert.equal(lane.tihuHomeRecheckMs(), 2000)
+})
+
+await testAsync('回主页 R-P1-5b：turn/start 后没有 turn/end（agent 被中断），超过 TIHU_TURN_STALE_MS 也会回主页', async () => {
+  process.env.TIHU_HOME_AFTER_MS = '60'
+  process.env.TIHU_HOME_RECHECK_MS = '40'
+  process.env.TIHU_TURN_STALE_MS = '80'
+  const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+  const { runtime, socket, emit } = await laneWithSession(records, 'session-a')
+  const isHome = (frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home'
+  const baseline = framesOf(socket).filter(isHome).length
+  emit('session-a', { type: 'turn/start', data: { turn: 1 } }) // 故意不发 turn/end
+  const deadline = Date.now() + 1500
+  while (Date.now() < deadline && framesOf(socket).filter(isHome).length <= baseline) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.ok(
+    framesOf(socket).filter(isHome).length > baseline,
+    '被中断的 turn 必须自愈（stale 窗口后回主页），否则屏永久卡在会话页',
+  )
+  delete process.env.TIHU_HOME_AFTER_MS
+  delete process.env.TIHU_HOME_RECHECK_MS
+  delete process.env.TIHU_TURN_STALE_MS
+  runtime.dispose()
+})
+
+await testAsync('屏宽 R-P1-6：有气泡时状态屏按 240px 排版（不再被 CSS 裁掉）', async () => {
+  const records = [
+    cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' }),
+    cuRecord('session-b', { live: true, cwd: '/b', lastPromptAt: 1000, title: '会话 B' }),
+  ]
+  const { runtime, socket, emit } = await laneWithSession(records, 'session-a')
+  emit('session-b', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'B 完成了。' }] } } })
+  emit('session-b', { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  emit('session-a', {
+    type: 'tool/call',
+    data: {
+      turn: 1,
+      step: 1,
+      name: 'pwsh',
+      arguments: { command: 'npm test', description: 'Run the full unit test suite and capture the complete stdout into a temporary log file so we can inspect every failure' },
+    },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+  const last = screens[screens.length - 1].payload
+  assert.ok((last.pending || []).length > 0, '这一帧应带气泡（前提）')
+  for (const line of last.bullets) {
+    const width = measureTextPx(line, SCREEN_SPEC.bodyFontPx)
+    assert.ok(width <= 240, `行宽 ${width} 超过气泡占用后的 240px：${line}`)
+  }
+  runtime.dispose()
+})
+
+await testAsync('气泡 R-P1-7：直发屏幕帧（聆听/转写）也带 pending，气泡不会被擦掉', async () => {
+  const records = [
+    cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' }),
+    cuRecord('session-b', { live: true, cwd: '/b', lastPromptAt: 1000, title: '会话 B' }),
+  ]
+  const { runtime, socket, emit } = await laneWithSession(records, 'session-a')
+  emit('session-b', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'B 完成了。' }] } } })
+  emit('session-b', { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  socket.emit('data', clientFrame(buildUpstream('audio.frame', {
+    audioBase64: tinyWavBase64(), format: 'wav', sampleRate: 16000, channels: 1, bits: 16,
+  }, 2)))
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  const listen = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '聆听').pop()
+  assert.ok(listen, '应有聆听帧')
+  assert.ok((listen.payload.pending || []).length > 0, '聆听帧必须带气泡，否则页面会把气泡轨整条清空')
+  runtime.dispose()
+})
+
+await testAsync('气泡 R-P1-8：没绑定设备的会话完成后，点气泡能显示正文（不能是空白）', async () => {
+  const records = [
+    cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' }),
+    cuRecord('session-b', { live: true, cwd: '/b', lastPromptAt: 1000, title: '会话 B' }),
+  ]
+  const { runtime, socket, emit } = await laneWithSession(records, 'session-a')
+  emit('session-b', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'B 的正文在这里。第二句也在这里。' }] } } })
+  emit('session-b', { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 300, y: 60, hit: 'chip', targetSessionId: 'session-b' }, 3)))
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  const reply = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'reply').pop()
+  assert.ok(reply, '点气泡后必须切到 B 的正文（旧实现早退时没记 lastReplies → 只有空白）')
+  const text = (reply.payload.reply?.sentences ?? []).map((sentence) => sentence.text).join('')
+  assert.ok(text.includes('B 的正文'), '正文内容必须来自 B 的回复，实际 ' + text)
+  runtime.dispose()
+})
+
+await testAsync('多设备 R-P1-9：一台在看历史时，另一台在底部仍会收到主页（不被别人的浏览状态卡住）', async () => {
+  process.env.TIHU_HOME_AFTER_MS = '60'
+  process.env.TIHU_HOME_RECHECK_MS = '40'
+  const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+  const fixture = runtimeFor(records, {}, { instance: fakeTts() })
+  const socket1 = openLane(fixture.runtime)
+  const socket2 = openLane(fixture.runtime)
+  for (const socket of [socket1, socket2]) {
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'multi', protocol: '0', sessionId: 'session-a' }, 1)))
+  }
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  const onSessionEvent = fixture.events.find((entry) => entry.name === 'session/event').handler
+  const emit = (event) => onSessionEvent({ id: 'session-a', header: { id: 'session-a' } }, event)
+  const longText = '这是一段足够长的回复，用来保证正文超过十行，从而可以向上滚动查看历史内容。'.repeat(6)
+  emit({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: longText }] } } })
+  emit({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  // 设备 1 上滑看历史（follow=false）
+  socket1.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'swipe', dy: -80, phase: 'move' }, 2)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const isHome = (frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home'
+  const baseline2 = framesOf(socket2).filter(isHome).length
+  const deadline = Date.now() + 2000
+  while (Date.now() < deadline && framesOf(socket2).filter(isHome).length <= baseline2) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.ok(
+    framesOf(socket2).filter(isHome).length > baseline2,
+    '设备 2 在底部、没有任何浏览动作，必须能回主页（旧实现被设备 1 的 follow=false 全局挡住）',
+  )
+  delete process.env.TIHU_HOME_AFTER_MS
+  delete process.env.TIHU_HOME_RECHECK_MS
+  fixture.runtime.dispose()
+})
+
+await testAsync('换绑 R-P1-10：朗读中切到别的会话，旧会话的音频必须停（不能屏是 B、声还是 A）', async () => {
+  const slowTts = {
+    ...fakeTts(),
+    async synthesize(_text, options) {
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      options.onChunk({ data: Buffer.alloc(4800), seq: 0, total: 1, final: true })
+    },
+  }
+  const records = [
+    cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' }),
+    cuRecord('session-b', { live: true, cwd: '/b', lastPromptAt: 1000, title: '会话 B' }),
+  ]
+  const { runtime, socket, emit } = await laneWithSession(records, 'session-a', {}, { instance: slowTts })
+  const longText = '第一句。第二句。第三句。第四句。第五句。第六句。第七句。第八句。第九句。第十句。'
+  emit('session-a', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: longText }] } } })
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  socket.emit('data', clientFrame(buildUpstream('session.bind', { sessionId: 'session-b' }, 2)))
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  const framesBefore = framesOf(socket).length
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  const after = framesOf(socket).slice(framesBefore)
+  const audioAfter = after.filter((frame) => frame.type === 'tts.audio')
+  assert.equal(audioAfter.length, 0, '切到 B 之后不应再收到 A 的 tts.audio，实际 ' + audioAfter.length + ' 块')
+  runtime.dispose()
+})
+
+await testAsync('主页 R-P1-11：workspaceRegistry 某条实体 getter 抛错，仍要出主页（不能整条链断掉）', async () => {
+  const records = [cuRecord('session-a', { live: true, cwd: '/ok', lastPromptAt: 2000, title: '会话 A' })]
+  const good = { id: 'w1', path: '/ok', title: '正常项目', sessionIds: ['session-a'], updatedAt: '2026-11-07T10:00:00.000Z' }
+  const bad = {
+    id: 'w2',
+    get path() { throw new Error('entity disposed') },
+    title: '坏项目',
+    sessionIds: [],
+    updatedAt: '2026-11-07T10:00:00.000Z',
+  }
+  const { runtime, socket } = await laneWithSession(records, 'session-a', { workspaceRegistry: { list: () => [bad, good] } })
+  const home = await waitForFrame(socket, (frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home', 1200)
+  assert.ok(home, '坏条目不能让主页帧发不出来（旧实现 getter 抛错 → sendHome 整条 reject）')
+  assert.ok(
+    (home.payload.home.projects || []).some((project) => project.name === '正常项目'),
+    '正常项目必须还在，实际 ' + JSON.stringify(home.payload.home.projects),
+  )
+  runtime.dispose()
+})
+
+test('标题 R-P1-12：标题按加粗宽度排版、页面不再按字数二次截断', () => {
+  const title = clipScreenTitle('W'.repeat(60))
+  const boldWidth = measureTextPx(title, SCREEN_SPEC.titleFontPx) * 1.06
+  assert.ok(boldWidth <= CONTENT_WIDTH_PX + 0.5, `加粗渲染宽 ${boldWidth.toFixed(1)} 超过 304px（真机会被裁）：${title}`)
+  assert.ok(title.includes('…'), '超宽标题要有省略号')
+  const pageSource = readFileSync(new URL('../src/tihu/page.ts', import.meta.url), 'utf8')
+  const titleLine = pageSource.split(String.fromCharCode(10)).find((line) => line.includes("$('title').textContent"))
+  assert.ok(titleLine !== undefined, '找不到标题渲染行')
+  assert.equal(titleLine.includes('clipScreen'), false, '页面不得再按字数二次截断标题（宿主已按像素截过）：' + titleLine)
+})
+
 /* ---------- 汇总 ---------- */
 console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
 if (failed > 0) process.exit(1)

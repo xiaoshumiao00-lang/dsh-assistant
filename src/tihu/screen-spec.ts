@@ -58,6 +58,17 @@ export const CONTENT_WIDTH_PX = SCREEN_SPEC.widthPx - SCREEN_SPEC.paddingPx * 2
 /** 折行安全边距（像素）：真实字体渲染比 CJK=1em 估算略宽，贴着容器宽折行会被浏览器裁成省略号。 */
 export const TEXT_WRAP_SAFETY_PX = 4
 
+/**
+ * 待读气泡轨占位后正文可用宽度：页面 `#screen.rail-on .title, ul { width:240px }`，
+ * 宿主排版必须用同一个值，否则状态屏三、四行会被 CSS 二次裁掉（2026-11-07 审计 P1-6）。
+ */
+export const PENDING_RAIL_WIDTH_PX = 240
+
+/**
+ * 标题加粗系数：18px/700 的实测渲染比常规宽约 6%，用常规宽估算会贴着 304px 被裁。
+ */
+export const TITLE_BOLD_FACTOR = 1.06
+
 /** 单个码点的近似宽度（em）：CJK/全角 1.0，ASCII 0.47。 */
 export function charWidthEm(char: string): number {
   const code = char.codePointAt(0) ?? 0
@@ -141,9 +152,9 @@ export function clipScreenText(value: unknown, maxChars: number): string {
   return `${chars.slice(0, Math.max(1, maxChars - 1)).join('')}…`
 }
 
-/** 标题：一行，按像素宽度省略。 */
+/** 标题：一行，按像素宽度省略（标题是 18px 加粗，实际比同字号常规宽约 6%，必须按加粗宽算）。 */
 export function clipScreenTitle(value: unknown): string {
-  return fitLine(value, CONTENT_WIDTH_PX, SCREEN_SPEC.titleFontPx)
+  return fitLine(value, CONTENT_WIDTH_PX, SCREEN_SPEC.titleFontPx * TITLE_BOLD_FACTOR)
 }
 
 /** stage：一行，按像素宽度省略。 */
