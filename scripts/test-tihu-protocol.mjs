@@ -41,7 +41,7 @@ import {
   targetPathOf,
 } from '../src/tihu/guard.ts'
 import { createTihuRuntime, buildTihuUserMessage, TIHU_LANE_PATH, TIHU_PAGE_PATH } from '../src/tihu/lane.ts'
-import { encodeFrame } from '../src/pocket-host/ws-deflate.mjs'
+import { WsFrameParser, encodeFrame } from '../src/pocket-host/ws-deflate.mjs'
 
 let passed = 0
 let failed = 0
@@ -725,6 +725,47 @@ await testAsync('lane：没有 CU 会话时给出可操作提示（自动绑定�
   runtime.dispose()
 })
 
+/* ---------- 2026-11-07 P0：Chrome 大消息分片（FIN=0 + continuation）必须重组 ---------- */
+
+console.log('[tihu] WS 分片重组')
+
+test('分片消息：FIN=0 起始帧 + continuation 帧 → 一次完整回调', () => {
+  const message = JSON.stringify({ v: '0', type: 'audio.frame', id: 'x', seq: 1, ts: 2, payload: { format: 'wav', audioBase64: 'UklGR' + 'A'.repeat(2000) } })
+  const half = Math.floor(message.length / 2)
+  const first = encodeFrame({ fin: false, opcode: 0x1, payload: Buffer.from(message.slice(0, half)), clientMask: true })
+  const second = encodeFrame({ fin: true, opcode: 0x0, payload: Buffer.from(message.slice(half)), clientMask: true })
+  const frames = []
+  const parser = new WsFrameParser((frame) => frames.push(frame), (error) => { throw error })
+  // 逐块喂入，模拟 TCP 分片
+  const all = Buffer.concat([first, second])
+  for (let i = 0; i < all.length; i += 37) parser.push(all.subarray(i, i + 37))
+  assert.equal(frames.length, 1, '两片应重组为一帧')
+  assert.equal(frames[0].opcode, 0x1)
+  assert.equal(frames[0].payload.toString('utf8'), message)
+})
+
+await testAsync('lane：分片到达的 audio.frame 也能触发转写（页面大帧不再静默丢）', async () => {
+  const records = [cuRecord('session-1', { lastPromptAt: 5000, live: true })]
+  const { runtime } = runtimeFor(records)
+  const socket = openLane(runtime)
+  const message = JSON.stringify({
+    v: '0', type: 'audio.frame', id: 'dev-frag', seq: 2, ts: Date.now(),
+    payload: { format: 'wav', sampleRate: 16000, channels: 1, bits: 16, audioBase64: tinyWavBase64(), durationMs: 16 },
+  })
+  const cut = 60
+  const first = encodeFrame({ fin: false, opcode: 0x1, payload: Buffer.from(message.slice(0, cut)), clientMask: true })
+  const second = encodeFrame({ fin: true, opcode: 0x0, payload: Buffer.from(message.slice(cut)), clientMask: true })
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'cf', protocol: '0', sessionId: 'session-1' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  socket.emit('data', Buffer.concat([first, second]))
+  await new Promise((resolve) => setTimeout(resolve, 120))
+
+  const frames = framesOf(socket)
+  assert.ok(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.stage === '聆听'), '应进入转写')
+  assert.ok(frames.some((frame) => frame.type === 'transcript'), '应回 transcript')
+  runtime.dispose()
+})
+
 await testAsync('页面 HTML 含自动模式/跟随/恢复自动/模式徽标', async () => {
   const { runtime } = runtimeFor([])
   const html = runtime.page()
@@ -737,6 +778,10 @@ await testAsync('页面 HTML 含自动模式/跟随/恢复自动/模式徽标', 
   assert.ok(html.includes('恢复自动'))
   assert.ok(html.includes('没有可自动绑定的 CU 会话'))
   assert.ok(html.includes('结束本次语音会话'))
+  // 音频兜底：不能干等
+  assert.ok(html.includes('转写超时'))
+  assert.ok(html.includes('已上行，等待转写'))
+  assert.ok(html.includes('连接已断开，2 秒后自动重连'))
   runtime.dispose()
 })
 

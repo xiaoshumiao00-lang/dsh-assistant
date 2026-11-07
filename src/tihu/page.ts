@@ -158,7 +158,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     sessions: [], listLoaded: false, querying: false, showList: false,
     sessionBound: false, computerUse: null, sessionPreset: '', cuTotal: 0, total: 0,
     mode: 'auto', lastAutoId: '',
-    lastTranscript: '', asking: null, recorder: null, chunks: [], retryTimer: 0 };
+    lastTranscript: '', asking: null, recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0 };
 
   /* ---------- 会话定位 ----------
      2026-11-07 P0：localStorage **按 origin 隔离**。用户在桌面宿主
@@ -561,6 +561,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     ws.onclose = function (event) {
       $('conn').textContent = '已断开' + (event && event.code ? '（' + event.code + '）' : '');
       $('conn').className = 'off';
+      state.audioPending = false;
+      clearTimeout(state.audioTimer);
+      addEvent('alert', '连接已断开，2 秒后自动重连（期间发送的内容不会送达）');
       clearInterval(state.retryTimer);
       setTimeout(connect, 2000);
     };
@@ -601,6 +604,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       case 'screen.frame': renderScreen(payload); break;
       case 'transcript':
         state.lastTranscript = payload.text || '';
+        state.audioPending = false;
+        clearTimeout(state.audioTimer);
         $('transcript').textContent = state.lastTranscript;
         $('transcript').className = '';
         addEvent('progress', '转写：' + state.lastTranscript);
@@ -610,7 +615,14 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         addEvent('progress', (payload.stage ? '[' + payload.stage + '] ' : '') + (payload.text || ''));
         if (typeof payload.done === 'number') { $('progress').textContent = payload.total ? payload.done + '/' + payload.total : String(payload.done); }
         break;
-      case 'event.alert': addEvent('alert', (payload.level === 'error' ? '错误：' : '') + (payload.text || '')); break;
+      case 'event.alert':
+        if (payload.level === 'error') {
+          // 宿主已经明确报错（转写失败/帧被拒），不再让 15 秒超时重复提示。
+          state.audioPending = false;
+          clearTimeout(state.audioTimer);
+        }
+        addEvent('alert', (payload.level === 'error' ? '错误：' : '') + (payload.text || ''));
+        break;
       case 'event.done': addEvent('done', payload.text || '完成'); break;
       case 'confirm.ask': showConfirm(payload); break;
       case 'sessions.list': handleSessionList(payload); break;
@@ -737,11 +749,19 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       return;
     }
     decodeAndResample(arrayBuffer).then(function (result) {
-      addEvent('progress', label + '：' + result.durationMs + ' ms，已上行');
+      addEvent('progress', label + '：' + result.durationMs + ' ms，已上行，等待转写…');
       send('audio.frame', {
         format: 'wav', sampleRate: 16000, channels: 1, bits: 16,
         audioBase64: toBase64(result.wav), durationMs: result.durationMs
       });
+      // 页面侧兜底：15 秒没等到 transcript 就明确报超时，不能干等。
+      state.audioPending = true;
+      clearTimeout(state.audioTimer);
+      state.audioTimer = setTimeout(function () {
+        if (!state.audioPending) return;
+        state.audioPending = false;
+        addEvent('alert', '转写超时：15 秒内没有收到转写结果（音频太长/服务忙/链路断了），请重试或改用文字输入');
+      }, 15000);
     }).catch(function (error) {
       addEvent('alert', '解码失败：' + error.message + '（换成 16k/44.1k 的 WAV/MP3 再试）');
     });

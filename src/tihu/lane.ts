@@ -1037,9 +1037,16 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     // 绑定前就被当成「还没选会话」丢掉。串行化后行为与「一条一条读」一致。
     let queue: Promise<void> = Promise.resolve()
     const enqueue = (message: any): void => {
-      queue = queue.then(() => handleUpstream(device, message)).catch((error) => {
-        log(`tihu upstream failed: ${(error as Error)?.stack ?? String(error)}`)
+      // 单条消息最多占队列 60 秒（转写自身 45 秒超时）：任何一步卡住都不能让后续
+      // 上行永远排不到（2026-11-07 实测：页面音频无回音的兜底）。
+      const guard = new Promise<void>((resolve) => {
+        setTimeout(() => { log('tihu upstream message timed out (60s)'); resolve() }, 60_000).unref?.()
       })
+      queue = queue
+        .then(() => Promise.race([handleUpstream(device, message), guard]))
+        .catch((error) => {
+          log(`tihu upstream failed: ${(error as Error)?.stack ?? String(error)}`)
+        })
     }
     const parser = new WsFrameParser(
       (frame: any) => {
@@ -1057,7 +1064,15 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
           const message = parseUpstream(frame.payload)
           if (message === null) {
             // 未知 type / 坏消息：忽略，不崩、不回错（协议 v0 的兼容约定）。
-            log(`tihu ignored message: ${summarizeForLog(safeJson(frame.payload))}`)
+            // **音频例外**：静默丢掉会让页面干等，必须回一条可读错误（2026-11-07 实测页面上传后无声）。
+            const rejected = safeJson(frame.payload)
+            log(`tihu ignored message: ${summarizeForLog(rejected)}`)
+            if ((rejected as any)?.type === 'audio.frame') {
+              device.send('event.alert', {
+                level: 'error',
+                text: '音频帧被拒绝：需要 16k 单声道 16bit WAV（base64 不超过 6 MB）',
+              })
+            }
             return
           }
           enqueue(message)
@@ -1065,7 +1080,10 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
           log(`tihu frame failed: ${(error as Error)?.stack ?? String(error)}`)
         }
       },
-      (error: unknown) => log(`tihu ws parse failed: ${(error as Error)?.message ?? String(error)}`),
+      (error: unknown) => {
+        log(`tihu ws parse failed: ${(error as Error)?.message ?? String(error)}`)
+        device.send('event.alert', { level: 'error', text: `连接数据解析失败：${(error as Error)?.message ?? String(error)}` })
+      },
     )
     socket.on('data', (chunk: Buffer) => parser.push(chunk))
     socket.on('error', () => { /* 断开由 close 处理 */ })
@@ -1181,10 +1199,22 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     }
 
     if (type === 'text.input' || type === 'audio.frame') {
+      // 页面先看到「已收到」，避免「已上行」之后再无任何回音（2026-11-07 实测问题）。
+      device.send('event.progress', {
+        stage: 'audio',
+        text: type === 'audio.frame' ? '已收到音频，准备转写' : '已收到文字',
+      } satisfies ProgressPayload)
       // 自动跟随（要求：每次注入前重新判定「最活跃的 CU 会话」，变了就跟过去）。
+      // **必须有上限**：跟随失败/超时不能把整条消息队列卡死（页面就会干等转写）。
       if (device.autoFollow) {
         try {
-          await autoBindActive(device, 'inject')
+          await Promise.race([
+            autoBindActive(device, 'inject'),
+            new Promise<void>((resolve) => { setTimeout(() => {
+              log('tihu auto follow timeout (5s), keep current session')
+              resolve()
+            }, 5000) }),
+          ])
         } catch (error) {
           log(`tihu auto follow failed: ${(error as Error)?.message ?? String(error)}`)
         }
