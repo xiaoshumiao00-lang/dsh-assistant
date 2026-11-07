@@ -70,7 +70,7 @@ import { TihuTts, type TihuTtsPaths } from './tts.ts'
 import { replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
 import { stripToolNoise, toSpeechText } from './speech-text.ts'
 import { CONTENT_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
-import { groupProjects, humanTitle, projectNameOf, type ProjectReply } from './project-groups.ts'
+import { groupProjects, groupWorkspaceProjects, humanTitle, projectNameOf, type ProjectReply, type TihuWorkspaceRow } from './project-groups.ts'
 import type { AlertPayload, TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
 
 /** 页面与 WebSocket 的路径（代理侧按这两个前缀放行）。 */
@@ -811,14 +811,55 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     screen(sessionId, replyScreen(sessionId, sentences, currentIndex, charPos, includeAll))
   }
 
-  /** 主页屏：用会话快照按 cwd 分组兜底（控制室卡片本体在主客户端，host 拿不到）。 */
+  /**
+   * 首页项目的真源：DSH 宿主 workspace 服务（@deepseek-ai/dsh-workspace 的
+   * Service 名 "workspaceRegistry"，落盘就是 ~/.dsh/storages/workspace.json 的
+   * tables.workspaces）。实体字段都是 getter：id / path / title / createdAt /
+   * updatedAt（ISO 字符串）/ sessionIds（数组，顺序即显示顺序）。
+   *
+   * 返回 undefined 表示「宿主服务拿不到」或「list() 抛错」，调用方退回旧的 cwd 分组。
+   */
+  function workspaceRegistryRows(): TihuWorkspaceRow[] | undefined {
+    const registry = optionalService(ctx, 'workspaceRegistry')
+    if (registry === undefined || typeof registry.list !== 'function') return undefined
+    let listed: unknown
+    try { listed = registry.list() } catch (error) {
+      log(`tihu workspaceRegistry.list failed: ${(error as Error)?.message ?? String(error)}`)
+      return undefined
+    }
+    if (!Array.isArray(listed)) return undefined
+    const items: TihuWorkspaceRow[] = []
+    for (const entry of listed) {
+      const path = typeof entry?.path === 'string' ? entry.path : ''
+      const title = typeof entry?.title === 'string' ? entry.title : ''
+      if (path === '' && title === '') continue
+      const rawUpdatedAt = entry?.updatedAt
+      const parsed = typeof rawUpdatedAt === 'string' ? Date.parse(rawUpdatedAt) : Number(rawUpdatedAt)
+      const sessionIds = Array.isArray(entry?.sessionIds) ? entry.sessionIds.map((id: unknown) => String(id)) : []
+      items.push({
+        id: typeof entry?.id === 'string' ? entry.id : '',
+        path,
+        title,
+        sessionIds,
+        updatedAt: Number.isFinite(parsed) ? parsed : 0,
+      })
+    }
+    return items
+  }
+
+  /** 主页屏：项目清单优先取宿主 workspace 注册表，取不到才用会话快照按 cwd 分组兜底。 */
   async function sendHome(sessionId: string, device?: TihuDevice): Promise<void> {
     let rows: TihuSessionRow[] = []
     try { rows = (await collectSessionRows()).rows } catch { rows = [] }
     const projectRows = rows.map((row) => ({ sessionId: row.sessionId, title: row.title, cwd: row.cwd, updatedAt: row.updatedAt, live: row.live }))
     const replies: Record<string, ProjectReply | undefined> = {}
     for (const row of projectRows) replies[row.sessionId] = lastAssistant.get(row.sessionId)
-    const projects = groupProjects(projectRows, replies, Date.now())
+    const workspaces = workspaceRegistryRows()
+    // 注册表可用：项目名/顺序来自 workspace（状态按该项目 sessionIds 对应的会话算，不再按 cwd 猜归属）；
+    // 拿不到（命令行测试环境没有宿主服务）：完全保持旧的 cwd 分组行为。
+    const projects = workspaces === undefined
+      ? groupProjects(projectRows, replies, Date.now())
+      : groupWorkspaceProjects(workspaces, projectRows, replies, Date.now())
     const pageSize = 5
     const totalPages = Math.max(1, Math.ceil(projects.length / pageSize))
     const state = homeStates.get(sessionId) ?? { mode: 'session' as const, page: 0, done: false }
