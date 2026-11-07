@@ -108,6 +108,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   .sess-now.bad { color:var(--err); }
   .cu-warn { display:none; background:#3a1414; border:1px solid #b04545; color:#ffd9d9;
     border-radius:8px; padding:8px 10px; font-size:12px; line-height:1.45; margin:0 0 8px; }
+  /* 音频解锁横幅：浏览器自动播放策略会把手动创建的 AudioContext 置为 suspended，
+     此时 PCM 全部「到达但不出声」。点一次页面即可解锁（resume）。 */
+  .audio-warn { display:none; background:#3a2f12; border:1px solid #b08a45; color:#ffe9c2;
+    border-radius:8px; padding:8px 10px; font-size:12px; line-height:1.45; margin:8px 12px 0; cursor:pointer; }
+  .audio-warn.on { display:block; }
   .sess-item.off { opacity:.55; border-style:dashed; cursor:default; }
   .sess-list { display:flex; flex-direction:column; gap:6px; max-height:34vh; overflow:auto; }
   .sess-item { text-align:left; display:flex; flex-direction:column; gap:2px; padding:8px 10px; }
@@ -147,6 +152,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   <b>鹈鹕 · 模拟设备</b><span>协议 v0</span>
   <span id="conn">连接中…</span>
 </header>
+
+<div class="audio-warn" id="audioWarn">🔇 点一下屏幕启用声音（浏览器要求先有一次点击，否则朗读只有数据没有声音）</div>
 
 <div class="device-wrap" id="deviceWrap">
   <div class="device-title">ESP32-S3-BOX-3B · 2.4″ · 320×240 · 触摸屏</div>
@@ -194,8 +201,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   <h4>音色 · 本地 TTS（Qwen3-TTS 0.6B）</h4>
   <div class="row">
     <select id="voiceSelect" style="flex:1"></select>
+    <button id="audioTest" title="播一声提示音，验证音频通路（不出声就点它）">试听</button>
     <button id="voiceRefresh">刷新</button>
   </div>
+  <div class="hint" id="audioTestHint">试听会先解锁音频：有本轮缓存就重播，没有就响 0.6 秒提示音。</div>
   <div class="row" style="margin-top:8px">
     <input id="voiceName" placeholder="音色名（英文/数字/下划线）" style="flex:1" />
     <label class="file" style="flex:1">上传参考音频（3–10 秒）<input id="voiceFile" type="file" accept="audio/*"></label>
@@ -777,6 +786,34 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     return state.audioCtx;
   }
+  /* ---------- 音频解锁 ----------
+     Chrome 自动播放策略：**没有用户手势**创建的 AudioContext 是 suspended。
+     旧实现只 new 不 resume，于是 tts.audio 全部到达、playPcm 也排进时间轴，
+     但永远不出声（刷新页面后必现）。更糟的是 suspended 时 ctx.currentTime 冻结，
+     pcmNextTime 的累加全塌缩到同一时刻，一旦恢复会让所有块同时炸响。
+     所以：①任何播放前先 resume；②suspended 期间丢弃 chunk 并提示点击解锁，
+     不排队；③第一次 pointerdown/keydown/touchstart 自动解锁。 */
+  function resumeAudio() {
+    var ctx = state.audioCtx;
+    if (!ctx) return null;
+    if (ctx.state !== 'suspended') return null;
+    try {
+      var task = ctx.resume();
+      if (task && typeof task.then === 'function') task.catch(function () { /* 解锁失败：等下一次手势 */ });
+      return task;
+    } catch (e) { return null; }
+  }
+  function showAudioWarn() {
+    var warn = $('audioWarn');
+    if (warn && warn.className.indexOf('on') < 0) warn.className = 'audio-warn on';
+  }
+  function hideAudioWarn() {
+    var warn = $('audioWarn');
+    if (warn) warn.className = 'audio-warn';
+  }
+  function audioRunning(ctx) {
+    return ctx !== null && ctx !== undefined && ctx.state === 'running';
+  }
   function stopPcm() {
     for (var i = 0; i < state.pcmSources.length; i += 1) {
       try { state.pcmSources[i].stop(); } catch (e) { /* 已结束 */ }
@@ -788,6 +825,16 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     if (!base64) return null;
     var ctx = ensureAudio();
     if (!ctx) return null;
+    // 未解锁：先 resume，等不到 running 就**丢弃这段**并提示点一下页面——
+    // 绝不排队（suspended 时 currentTime 冻结，排进去的时间轴一旦恢复会全部炸响）。
+    if (!audioRunning(ctx)) {
+      resumeAudio();
+      if (!audioRunning(ctx)) {
+        state.pcmNextTime = 0;
+        showAudioWarn();
+        return null;
+      }
+    }
     try {
       var binary = atob(base64);
       var count = Math.floor(binary.length / 2);
@@ -868,6 +915,58 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.pcmNextTime = when;
     return true;
   }
+  /** 试听提示音：0.6 秒 440Hz 正弦，音量中等（直接证明音频通路可用）。 */
+  function playBeep() {
+    var ctx = state.audioCtx;
+    if (!ctx || !audioRunning(ctx)) return false;
+    try {
+      var osc = ctx.createOscillator();
+      var gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = 440;
+      var now = ctx.currentTime;
+      // 音量中等 + 两端各 20ms 渐入渐出，避免爆音。
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.12, now + 0.02);
+      gain.gain.setValueAtTime(0.12, now + 0.58);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.6);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.62);
+      return true;
+    } catch (e) { return false; }
+  }
+  /** 试听按钮：先解锁，有本轮缓存就重播，没有就响提示音。 */
+  function audioTest() {
+    var hint = $('audioTestHint');
+    var setHint = function (text) { if (hint) hint.textContent = text; };
+    var ctx = ensureAudio();
+    if (!ctx) { setHint('这台设备没有 WebAudio，无法试听'); return; }
+    var run = function () {
+      if (audioRunning(ctx)) hideAudioWarn();
+      if (!audioRunning(ctx)) { showAudioWarn(); setHint('无音频（点我先）：浏览器还没解锁，先点一下屏幕'); return; }
+      if (state.turnPcm.length > 0 && replayPcm()) { setHint('已播放本轮缓存音频'); return; }
+      if (playBeep()) { setHint('已播放提示音（0.6 秒 440Hz）'); return; }
+      setHint('无音频（点我先）：播放失败，点一下屏幕再试');
+    };
+    var task = resumeAudio();
+    if (task && typeof task.then === 'function') task.then(run, run);
+    else run();
+  }
+  /* 一次性解锁：第一次真实手势里 resume，并撤掉「点一下启用声音」横幅。 */
+  (function installUnlock() {
+    var handler = function () {
+      resumeAudio();
+      if (state.audioCtx && audioRunning(state.audioCtx)) hideAudioWarn();
+    };
+    var opts = { once: true, passive: true };
+    document.addEventListener('pointerdown', handler, opts);
+    document.addEventListener('keydown', handler, opts);
+    document.addEventListener('touchstart', handler, opts);
+    var warn = $('audioWarn');
+    if (warn) warn.onclick = function () { resumeAudio(); if (state.audioCtx && audioRunning(state.audioCtx)) hideAudioWarn(); };
+  })();
 
   /* ---------- 音色选择 ---------- */
   function renderVoiceSelect() {
@@ -1029,6 +1128,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         var isNewSegment = !state.ttsAudioSeen[audioIndex];
         state.ttsAudioSeen[audioIndex] = true;
         if (typeof payload.charStart === 'number') state.replyCharPos = payload.charStart;
+        // 每个音频块到达都补一次 resume：浏览器自动播放策略可能在任何时刻把 ctx 挂回 suspended。
+        resumeAudio();
         var played = playPcm(String(payload.data || ''), Number(payload.sampleRate) || 24000);
         if (played && isNewSegment && typeof payload.charStart === 'number') {
           scheduleHighlight(payload.charStart, played.startAt);
@@ -1319,6 +1420,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   $('ttsStop').onclick = function () {
     stopPcm();
     addEvent('progress', '已停止朗读');
+  };
+  /* 试听：先解锁音频；有本轮缓存重播，没有就响提示音（不出声时点它最直接）。 */
+  $('audioTest').onclick = function () {
+    audioTest();
+    addEvent('progress', '试听：检查音频通路');
   };
 
   /* ---------- 音色：选择 / 上传参考音频 ---------- */
