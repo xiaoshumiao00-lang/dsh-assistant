@@ -449,13 +449,32 @@ export class TihuTts {
       voice?: string
       sessionId?: string
       edgeVoice?: string
+      offlineOnly?: boolean
       onChunk: (chunk: { data: Buffer; seq: number; total: number; final: boolean }) => void
       signal?: AbortSignal
     },
   ): Promise<SynthResult> {
-    const backend = this.backend()
+    const wantsClone = typeof options.voice === 'string' && options.voice !== '' && options.voice !== 'default'
+    const offline = options.offlineOnly === true || process.env.TIHU_OFFLINE_ONLY === '1'
     let primaryError = ''
-    if (backend === 'qwen-cuda') {
+    let triedEdge = false
+
+    // 默认在线云健（不是克隆音色、且未开仅离线）：首块最快、音质最好。
+    if (!wantsClone && !offline && this.edgeReady()) {
+      triedEdge = true
+      try {
+        const result = await this.synthesizeEdge(text, { ...options, edgeVoice: options.edgeVoice })
+        this.setEngine('edge')
+        return result
+      } catch (error) {
+        primaryError = (error as Error)?.message ?? String(error)
+        this.log(`edge-tts failed: ${primaryError}`)
+      }
+    }
+
+    // 本地 Qwen：克隆音色必走；在线失败/仅离线时也走；GPU 不可用则直接跳 SAPI。
+    const backend = this.backend()
+    if (backend !== 'sapi' && backend !== 'none') {
       try {
         const result = await this.synthesizeCodec(text, options)
         this.setEngine('gpu')
@@ -463,33 +482,26 @@ export class TihuTts {
       } catch (error) {
         primaryError = (error as Error)?.message ?? String(error)
         this.gpuFailed = true
-        this.fallbackNote = `GPU 不可用，已切换在线兜底：${primaryError}`
-        this.log(`tts gpu failed: ${primaryError}`)
-      }
-    } else if (backend === 'cpu' || backend === 'q4') {
-      try {
-        const result = await this.synthesizeCodec(text, options)
-        this.setEngine('gpu')
-        return result
-      } catch (error) {
-        primaryError = (error as Error)?.message ?? String(error)
-        this.log(`tts debug engine failed: ${primaryError}`)
+        this.fallbackNote = `GPU 不可用：${primaryError}`
+        this.log(`tts qwen failed: ${primaryError}`)
       }
     }
-    if (this.edgeReady()) {
+
+    if (!triedEdge && !offline && !wantsClone && this.edgeReady()) {
       try {
         const result = await this.synthesizeEdge(text, { ...options, edgeVoice: options.edgeVoice })
         this.setEngine('edge')
         return result
       } catch (error) {
         primaryError = (error as Error)?.message ?? String(error)
-        this.log(`edge-tts failed, fallback sapi: ${primaryError}`)
+        this.log(`edge-tts failed: ${primaryError}`)
       }
     }
+
     try {
       const result = await this.synthesizeSapi(text, options)
       this.setEngine('sapi')
-      if (this.fallbackNote === '') this.fallbackNote = `在线兜底不可用，已用 Windows SAPI：${primaryError}`
+      if (this.fallbackNote === '') this.fallbackNote = `本地引擎不可用，已用 Windows SAPI：${primaryError}`
       return result
     } catch (error) {
       throw new Error(`所有本地 TTS 均不可用：${(error as Error)?.message ?? String(error)}（${primaryError}）`)

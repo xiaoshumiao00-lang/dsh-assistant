@@ -485,6 +485,8 @@ await testAsync('页面 HTML 包含 lane 地址与屏幕区', async () => {
   assert.ok(html.includes('edgeVoiceSelect'), '页面要有兜底音色下拉')
   assert.ok(html.includes('tihu.edgeVoice'), '兜底音色要持久化到 localStorage')
   assert.ok(html.includes('zh-CN-YunjianNeural'), '默认兜底音色是云健')
+  assert.ok(html.includes('offlineOnly'), '页面要有仅离线开关')
+  assert.ok(html.includes('tihu.offlineOnly'), '仅离线开关要持久化')
   assert.ok(html.includes('audio.frame'))
   // 2026-11-07 P0：公网 origin 下页面要能自己选会话（会话记忆只存本 origin 的 key）
   assert.ok(html.includes('dsh.tihu.session'), '页面要使用自己的会话 key')
