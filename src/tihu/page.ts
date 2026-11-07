@@ -79,6 +79,16 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .home-dot.running { background:#35d07f; }
   #screen .home-dot.idle { background:#6b7785; }
   #screen .home-dot.done { background:#4f8ef7; }
+  #screen .pending-rail { position:absolute; right:0; top:8px; bottom:8px; width:64px; padding:4px; box-sizing:border-box;
+    display:none; flex-direction:column; gap:4px; z-index:3; }
+  #screen.rail-on .pending-rail { display:flex; }
+  #screen.rail-on .title, #screen.rail-on ul, #screen.rail-on .reply-body, #screen.rail-on .home-body { width:240px; }
+  #screen .pending-chip { width:56px; height:34px; box-sizing:border-box; padding:2px 3px; border-radius:5px;
+    background:rgba(20,28,40,.82); border:1px solid rgba(120,180,255,.55); overflow:hidden; }
+  #screen .pending-name { font-size:11px; line-height:15px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #screen .pending-sub { font-size:10px; line-height:13px; color:#9fb0bf; display:flex; align-items:center; gap:3px; }
+  #screen .pending-dot { width:5px; height:5px; border-radius:50%; background:#35d07f; }
+  #screen .pending-more { font-size:10px; color:#9fb0bf; text-align:center; }
   #screen .scroll-hint { position:absolute; right:8px; bottom:6px; font-size:11px; line-height:14px;
     color:#9fb0bf; background:rgba(5,8,11,.82); padding:1px 4px; border-radius:3px; pointer-events:none; }
   #screen.reply-mode .title, #screen.reply-mode ul, #screen.reply-mode .bar { display:none; }
@@ -150,6 +160,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         <ul id="bullets"></ul>
         <div id="replyBody" class="reply-body"></div>
         <div id="homeBody" class="home-body"></div>
+        <div id="pendingRail" class="pending-rail"></div>
         <div id="scrollHint" class="scroll-hint"></div>
         <div class="bar"><span id="progress">—</span><div class="track"><div class="fill" id="fill"></div></div></div>
       </div>
@@ -289,7 +300,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     ttsTurnTexts: [], ttsAudioSeen: {},
     audioCtx: null, pcmSources: [], pcmNextTime: 0, turnPcm: [],
     voice: 'default', voices: [], voiceEngine: null,
-    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, screenMode: 'status' };
+    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, screenMode: 'status', pending: [] };
 
   /* ---------- 会话定位 ----------
      2026-11-07 P0：localStorage **按 origin 隔离**。用户在桌面宿主
@@ -358,8 +369,56 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   }
 
   /* ---------- 屏 ---------- */
+  function fitTextPx(text, width, fontPx) {
+    var chars = Array.from(String(text || ''));
+    var out = '';
+    var used = 0;
+    for (var i = 0; i < chars.length; i += 1) {
+      var code = chars[i].codePointAt(0) || 0;
+      var wide = (code >= 0x2e80 && code <= 0xa4cf) || (code >= 0xff00 && code <= 0xff60) || (code >= 0x1f300 && code <= 0x1faff);
+      var w = (wide ? 1 : 0.47) * fontPx;
+      if (used + w + fontPx * 0.47 > width) return out === '' ? '…' : out + '…';
+      out += chars[i];
+      used += w;
+    }
+    return out;
+  }
+  function renderPending(payload) {
+    var screen = $('screen');
+    var rail = $('pendingRail');
+    var items = Array.isArray(payload.pending) ? payload.pending : [];
+    state.pending = items;
+    rail.innerHTML = '';
+    if (items.length > 0) screen.classList.add('rail-on');
+    else screen.classList.remove('rail-on');
+    for (var i = 0; i < items.length && i < 4; i += 1) {
+      var chip = document.createElement('div');
+      chip.className = 'pending-chip';
+      chip.dataset.sessionId = items[i].sessionId;
+      var name = document.createElement('div');
+      name.className = 'pending-name';
+      name.textContent = fitTextPx(items[i].title || items[i].sessionId, 48, 11);
+      var sub = document.createElement('div');
+      sub.className = 'pending-sub';
+      var dot = document.createElement('span');
+      dot.className = 'pending-dot';
+      sub.appendChild(dot);
+      sub.appendChild(document.createTextNode('新回复'));
+      chip.appendChild(name);
+      chip.appendChild(sub);
+      rail.appendChild(chip);
+    }
+    if ((payload.pendingCount || items.length) > items.length) {
+      var more = document.createElement('div');
+      more.className = 'pending-more';
+      more.textContent = '+' + ((payload.pendingCount || items.length) - items.length);
+      rail.appendChild(more);
+    }
+  }
+
   function renderScreen(payload) {
     var screen = $('screen');
+    renderPending(payload || {});
     if (payload && payload.mode === 'home' && payload.home) {
       state.screenMode = 'home';
       state.reply = null;
@@ -1318,7 +1377,20 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       dragging = false;
       if (!moved && event) {
         var rect = screen.getBoundingClientRect();
-        send('screen.gesture', { action: 'tap', x: event.clientX - rect.left, y: event.clientY - rect.top });
+        var x = event.clientX - rect.left;
+        var y = event.clientY - rect.top;
+        var hit = null;
+        var chips = document.querySelectorAll('#pendingRail .pending-chip');
+        for (var ci = 0; ci < chips.length; ci += 1) {
+          var chipRect = chips[ci].getBoundingClientRect();
+          if (x >= chipRect.left - rect.left - 8 && x <= chipRect.right - rect.left + 8 &&
+              y >= chipRect.top - rect.top - 8 && y <= chipRect.bottom - rect.top + 8) {
+            hit = chips[ci].dataset.sessionId;
+            break;
+          }
+        }
+        if (hit) send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'chip', targetSessionId: hit });
+        else send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'screen' });
         return;
       }
       swipe(0, 'end');

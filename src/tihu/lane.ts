@@ -225,10 +225,15 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     sentences: ReplySentence[]
     currentIndex: number
     charPos: number
+    widthPx: number
   }
   const screenStates = new Map<string, ScreenScrollState>()
   /** 每会话的屏幕模式与回主页计时。 */
   const homeStates = new Map<string, { mode: 'home' | 'session'; page: number; done: boolean; timer?: ReturnType<typeof setTimeout> }>()
+  /** 显示会话 id → 待读气泡（别的会话完成时入队）。 */
+  const pendingByDisplay = new Map<string, { sessionId: string; title: string; at: number }[]>()
+  /** 会话 id → 最近一条回复（点气泡后从头朗读）。 */
+  const lastReplies = new Map<string, { sentences: ReplySentence[]; speechSegments: SpeechSegment[]; includeAll: boolean }>()
   /** 会话 id → 屏幕进度状态（步骤计数 / 用时 / 上一步结果）。 */
   const progressStates = new Map<string, TihuProgressState>()
   /** 正在 reply 阅读模式的会话（turn/end 不再用「完成」状态帧覆盖正文）。 */
@@ -283,6 +288,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       ...(frame.mode === undefined ? {} : { mode: frame.mode }),
       ...(frame.reply === undefined ? {} : { reply: frame.reply }),
       ...(frame.home === undefined ? {} : { home: frame.home }),
+      ...(frame.pending === undefined ? {} : { pending: frame.pending }),
+      ...(frame.pendingCount === undefined ? {} : { pendingCount: frame.pendingCount }),
       tone: frame.tone ?? 'idle',
     } satisfies ScreenFramePayload)
   }
@@ -672,15 +679,18 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
 
   /** 构造 reply 模式屏帧：长回复只带当前句 ±2 句窗口，避免每帧全量传长文本。 */
   function replyScreen(sessionId: string, sentences: ReplySentence[], currentIndex: number, charPos: number, includeAll: boolean): ScreenFramePayload {
+    const pending = pendingByDisplay.get(sessionId) ?? []
+    const widthPx = pending.length > 0 ? 240 : CONTENT_WIDTH_PX
     let state = screenStates.get(sessionId)
-    if (state === undefined || state.sentences !== sentences) {
+    if (state === undefined || state.sentences !== sentences || state.widthPx !== widthPx) {
       const lines: { text: string; sentenceIndex: number }[] = []
       for (const sentence of sentences) {
-        for (const line of wrapTextPx(sentence.text, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)) {
+        for (const line of wrapTextPx(sentence.text, widthPx, SCREEN_SPEC.bodyFontPx)) {
           lines.push({ text: line, sentenceIndex: sentence.index })
         }
       }
-      state = { lines, offset: state?.offset ?? 0, follow: state?.follow ?? true, sentences, currentIndex, charPos }
+      const offset = state?.offset ?? 0
+      state = { lines, offset, follow: state?.follow ?? true, sentences, currentIndex, charPos, widthPx }
       screenStates.set(sessionId, state)
     }
     state.currentIndex = currentIndex
@@ -706,6 +716,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         scroll: { offset: state.offset, maxOffset },
         follow: state.follow,
       },
+      pending: pending.slice(0, 4).map((item) => ({ sessionId: item.sessionId, title: item.title, at: item.at, unread: true as const })),
+      pendingCount: pending.length,
     }
   }
 
@@ -759,7 +771,28 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       tone: 'ok',
       mode: 'home',
       home: { projects: pageProjects, page: { index: state.page, total: totalPages }, total: projects.length },
+      pending: (pendingByDisplay.get(sessionId) ?? []).slice(0, 4).map((item) => ({ sessionId: item.sessionId, title: item.title, at: item.at, unread: true as const })),
+      pendingCount: (pendingByDisplay.get(sessionId) ?? []).length,
     })
+  }
+
+  function enqueuePending(completedSessionId: string): void {
+    const title = sessionListCache?.rows.find((row) => row.sessionId === completedSessionId)?.title || shortSessionId(completedSessionId)
+    const displays = new Set<string>()
+    for (const device of devices) {
+      if (device.sessionId !== undefined && device.sessionId !== completedSessionId) displays.add(device.sessionId)
+    }
+    for (const display of displays) {
+      const list = pendingByDisplay.get(display) ?? []
+      const existing = list.find((item) => item.sessionId === completedSessionId)
+      if (existing !== undefined) existing.at = Date.now()
+      else list.push({ sessionId: completedSessionId, title, at: Date.now() })
+      list.sort((a, b) => a.at - b.at)
+      pendingByDisplay.set(display, list)
+      // 立即推一帧带气泡的屏帧；不触碰音频/朗读。
+      const state = screenStates.get(display)
+      if (state !== undefined) sendReply(display, state.sentences, state.currentIndex, state.charPos, true)
+    }
   }
 
   function cancelHomeTimer(sessionId: string): void {
@@ -1221,6 +1254,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         })
         // 新回复：强制回到顶部并恢复跟随；取消回主页计时并切会话屏。
         screenStates.delete(sessionId)
+        lastReplies.set(sessionId, { sentences, speechSegments, includeAll })
         cancelHomeTimer(sessionId)
         homeStates.set(sessionId, { mode: 'session', page: 0, done: false })
         sendReply(sessionId, sentences, 0, 0, includeAll)
@@ -1249,6 +1283,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         const hs = homeStates.get(sessionId) ?? { mode: 'session' as const, page: 0, done: false }
         hs.done = okReason
         homeStates.set(sessionId, hs)
+        if (okReason) enqueuePending(sessionId)
         // 不在这里启动计时：要等朗读真正结束（speakLocally 完成/失败）再计时。
         return
       }
@@ -1469,6 +1504,28 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       const payload = message.payload as { action?: string; dy?: number; phase?: string; x?: number; y?: number }
       if (device.sessionId !== undefined) cancelHomeTimer(device.sessionId)
       if (payload.action === 'tap' && device.sessionId !== undefined && typeof payload.x === 'number' && typeof payload.y === 'number') {
+        // 气泡点击：targetSessionId 必须在当前 pending 队列里（防伪造切屏）。
+        if ((payload as any).hit === 'chip' && typeof (payload as any).targetSessionId === 'string') {
+          const target = (payload as any).targetSessionId as string
+          const display = device.sessionId
+          const list = pendingByDisplay.get(display) ?? []
+          const index = list.findIndex((item) => item.sessionId === target)
+          if (index >= 0) {
+            list.splice(index, 1)
+            pendingByDisplay.set(display, list)
+            const reply = lastReplies.get(target)
+            await bindSession(device, target)
+            screenStates.delete(target)
+            homeStates.set(target, { mode: 'session', page: 0, done: true })
+            if (reply !== undefined) {
+              sendReply(target, reply.sentences, 0, 0, reply.includeAll)
+              void speakLocally(device, target, reply.sentences, reply.speechSegments, reply.includeAll).catch((error) => {
+                log(`tihu chip speak failed: ${(error as Error)?.message ?? String(error)}`)
+              })
+            }
+          }
+          return
+        }
         // 右下角 tap = 立刻回主页（第一个 tap 业务）。
         if (payload.x >= 240 && payload.y >= 180) await sendHome(device.sessionId)
         return

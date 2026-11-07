@@ -279,6 +279,10 @@ export interface ScreenFramePayload {
     page: { index: number; total: number }
     total: number
   }
+  /** 待读会话气泡（最多 4 条，按完成时间排序）。 */
+  pending?: { sessionId: string; title: string; at: number; unread: true }[]
+  /** 未被 display 的待读总数（>4 时用于 +N）。 */
+  pendingCount?: number
   /** reply 模式的正文窗口（长回复只传当前窗口 ±2 句）。 */
   reply?: ReplyScreenPayload
 }
@@ -421,7 +425,7 @@ export interface SessionsListPayload {
 /** 屏幕手势：上/下滑（滚动历史）与点击（预留）。 */
 export type ScreenGesturePayload =
   | { action: 'swipe'; dy: number; phase: 'start' | 'move' | 'end' }
-  | { action: 'tap'; x: number; y: number }
+  | { action: 'tap'; x: number; y: number; hit?: 'chip' | 'screen'; targetSessionId?: string }
 
 export interface SessionBindPayload {
   /** 要手动绑定的会话 id；`auto: true` 时可省略。 */
@@ -614,6 +618,8 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
         if (payload.action === 'tap') {
           if (typeof payload.x !== 'number' || typeof payload.y !== 'number') return null
           if (!Number.isFinite(payload.x) || !Number.isFinite(payload.y)) return null
+          if (payload.hit !== undefined && payload.hit !== 'chip' && payload.hit !== 'screen') return null
+          if (payload.targetSessionId !== undefined && (typeof payload.targetSessionId !== 'string' || payload.targetSessionId.length > 256)) return null
           return value as TihuUpstreamMessage
         }
         return null
