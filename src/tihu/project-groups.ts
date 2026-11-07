@@ -54,7 +54,8 @@ export function projectNameOf(cwd: string | undefined): string {
   const lower = parts.map((part) => part.toLowerCase())
   const find = (needle: string): number => lower.findIndex((part) => part.includes(needle))
 
-  if (find('dsh_orb') >= 0 || find('profiles') >= 0 || (find('.dsh') >= 0 && find('assistant') >= 0)) return '控制室'
+  // 2026-11-07 用户要求：宿主工作区（默认会话都落在这里）叫「个人助手」，不再叫「控制室」。
+  if (find('dsh_orb') >= 0 || find('profiles') >= 0 || (find('.dsh') >= 0 && find('assistant') >= 0)) return '个人助手'
   if (find('青年') >= 0 || find('基金') >= 0 || find('2027') >= 0) return '青年基金申请书'
   if (find('磷石膏') >= 0) return '磷石膏SCI'
   if (find('dsh-assistant') >= 0 || find('dsh-pocket') >= 0 || find('dsh-tuoguan') >= 0 || find('dsh desktop') >= 0) return 'dsh-assistant'
