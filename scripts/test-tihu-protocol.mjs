@@ -42,6 +42,17 @@ import {
 } from '../src/tihu/guard.ts'
 import { createTihuRuntime, buildTihuUserMessage, TIHU_LANE_PATH, TIHU_PAGE_PATH } from '../src/tihu/lane.ts'
 import { TTS_QUEUE_SOURCE } from '../src/tihu/tts-queue.ts'
+import {
+  applySessionEvent,
+  clipText,
+  confirmationFrame,
+  createProgressState,
+  describeTool,
+  formatElapsed,
+  sanitizeScreenLine,
+  summarizeToolResult,
+} from '../src/tihu/progress.ts'
+import { ACTUAL_SIZE_SCALE, SCREEN_SPEC, clipScreenTitle, fitScreenLines } from '../src/tihu/screen-spec.ts'
 import { WsFrameParser, encodeFrame } from '../src/pocket-host/ws-deflate.mjs'
 
 let passed = 0
@@ -1119,6 +1130,165 @@ await testAsync('lane：长回复的 TTS 段全部下发（不再丢 320 字以�
   assert.deepEqual(frames.map((frame) => frame.payload.index), [...Array(frames.length).keys()], 'index 从 0 连续')
   assert.ok(frames.every((frame) => frame.payload.total === frames.length), 'total 必须一致')
   assert.equal(frames.map((frame) => frame.payload.text).join(''), text.replace(/\s+/g, ' ').trim(), '不能丢字')
+  runtime.dispose()
+})
+
+/* ---------- 屏幕进度映射 ---------- */
+
+console.log('[tihu] 屏幕进度映射')
+
+test('工具名 → 人话标题（读取/写入/修改/搜索/执行/联网查）', () => {
+  const read = describeTool('read', { file_path: 'D:\\proj\\src\\README.md' })
+  assert.equal(read.stage, '读文件')
+  assert.equal(read.title, '读取 README.md')
+  const write = describeTool('write_file', { path: '/tmp/a.txt' })
+  assert.equal(write.stage, '写文件')
+  assert.equal(write.title, '写入 a.txt')
+  const edit = describeTool('apply_patch', { file_path: 'a/b/c.ts' })
+  assert.equal(edit.stage, '写文件')
+  assert.equal(edit.title, '修改 c.ts')
+  const grep = describeTool('Grep', { pattern: 'tihu' })
+  assert.equal(grep.stage, '搜索')
+  assert.equal(grep.title, '搜索 tihu')
+  const shell = describeTool('pwsh', { command: 'Get-ChildItem D:\\dsh-assistant\\src' })
+  assert.equal(shell.stage, '跑命令')
+  assert.ok(shell.title.startsWith('执行 Get-ChildItem'))
+  assert.ok([...shell.title].length <= 28, '标题不超过 28 字')
+  const web = describeTool('web_search', { query: 'ESP32-S3-BOX-3' })
+  assert.equal(web.stage, '搜索')
+  assert.equal(web.title, '联网查 ESP32-S3-BOX-3')
+  const other = describeTool('computer_use', { task: '打开浏览器' })
+  assert.equal(other.stage, '思考')
+  assert.equal(other.title, 'computer_use')
+  // 超长参数截断且不出现半字
+  const long = describeTool('pwsh', { command: 'x'.repeat(200) })
+  assert.ok([...long.title].length <= 28)
+  assert.ok([...long.detail].length <= 120)
+})
+
+test('进度状态机：步骤递增、失败 tone=alert、完成帧保留、正文最多 3 行', () => {
+  const state = createProgressState(1000)
+  const events = []
+  const push = (event, now) => { const update = applySessionEvent(state, event, now); events.push(update); return update }
+
+  assert.equal(push({ type: 'turn/start', data: { turn: 7 } }, 1000).screen.title, '开始新一轮')
+  assert.equal(state.step, 0)
+  // 第 1 步：读文件成功
+  push({ type: 'step/start', data: { turn: 7, step: 1 } }, 2000)
+  const call1 = push({ type: 'tool/call', data: { turn: 7, step: 1, name: 'read', arguments: { file_path: 'src/a.ts' } } }, 3000)
+  assert.equal(call1.screen.stage, '读文件')
+  assert.equal(call1.screen.title, '读取 a.ts')
+  assert.ok(call1.screen.bullets[0].includes('第 1 步'))
+  push({ type: 'tool/result', data: { turn: 7, step: 1, message: { content: [{ type: 'text', text: 'const a = 1\n第二个文件结尾' }], isError: false } } }, 4000)
+  assert.equal(state.tone, 'ok')
+  assert.ok(state.lastResult.line.startsWith('✓'))
+  assert.ok([...state.lastResult.line].length <= 18)
+
+  // 第 2 步：跑命令失败
+  push({ type: 'step/start', data: { turn: 7, step: 2 } }, 5000)
+  const call2 = push({ type: 'tool/call', data: { turn: 7, step: 2, name: 'pwsh', arguments: { command: 'Remove-Item -Recurse -Force build-with-a-very-long-name-here' } } }, 6000)
+  assert.equal(call2.screen.stage, '跑命令')
+  push({ type: 'tool/result', data: { turn: 7, step: 2, message: { content: [{ type: 'text', text: '拒绝访问：文件被占用（详细信息在日志里）' }], isError: true } } }, 7000)
+  assert.equal(state.tone, 'alert')
+  assert.ok(state.lastResult.line.startsWith('✗'))
+  assert.ok([...state.lastResult.line].length <= 18)
+
+  // 回答
+  const answer = push({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '第一行回答\n最后一行是输出尾行' }] } } }, 8000)
+  assert.equal(answer.screen.stage, '回答')
+  assert.ok(answer.screen.title.startsWith('回答 第一行回答'))
+  assert.ok(answer.screen.bullets.length <= 3)
+  for (const line of answer.screen.bullets) assert.ok([...line].length <= 18, `行超长：${line}`)
+
+  // 结束帧：保留「完成 · 共 N 步 · 用时 Xs」
+  const done = push({ type: 'turn/end', data: { turn: 7, reason: { kind: 'stop' } } }, 13000)
+  assert.ok(done.screen.title.startsWith('完成 · 共 2 步'))
+  assert.ok(done.screen.title.includes('12s'))
+  assert.ok(done.screen.bullets.length <= 3)
+  assert.equal(done.screen.bullets[0].includes('共 2 步'), true)
+})
+
+test('屏幕文本截断：40 字标题省略到 28 字内，5 行正文只留 3 行', () => {
+  const title = clipText('这是一个非常非常长的标题'.repeat(3), 28)
+  assert.ok([...title].length <= 28)
+  assert.ok(title.endsWith('…'))
+  const lines = ['第一行', '第二行', '第三行', '第四行', '第五行']
+  const bullets = lines.slice(0, 3).map((line) => clipText(line, 18))
+  assert.deepEqual(bullets, ['第一行', '第二行', '第三行'])
+  assert.equal(formatElapsed(12500), '13s')
+  assert.equal(formatElapsed(65000), '1m05s')
+  assert.equal(confirmationFrame('删除文件', 'tmp/a.txt').stage, '等待确认')
+  assert.equal(summarizeToolResult('ok\nlast line', false).output, 'last line')
+  // 屏幕摘要去掉 markdown 噪音
+  assert.equal(sanitizeScreenLine('```json'), '')
+  assert.equal(sanitizeScreenLine('**粗体** 与 `代码`'), '粗体 与 代码')
+  const fenced = summarizeToolResult('```\n结果行\n```', false)
+  assert.equal(fenced.line, '✓ 结果行')
+})
+
+await testAsync('lane：执行事件生成有料的屏幕帧（读文件→跑命令→回答→完成）', async () => {
+  const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true })])
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'prog', protocol: '0', sessionId: 'session-1' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const emit = (event) => onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, event)
+  emit({ type: 'turn/start', data: { turn: 3 } })
+  emit({ type: 'step/start', data: { turn: 3, step: 1 } })
+  emit({ type: 'tool/call', data: { turn: 3, step: 1, name: 'read', arguments: { file_path: 'README.md' } } })
+  emit({ type: 'tool/result', data: { turn: 3, step: 1, message: { content: [{ type: 'text', text: '第一行结果\n最后一行输出' }], isError: false } } })
+  emit({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '好的，我看完了。\n结论在最后。' }] } } })
+  emit({ type: 'turn/end', data: { turn: 3, reason: { kind: 'stop' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  const screens = framesOf(socket).filter((frame) => frame.type === 'screen.frame').map((frame) => frame.payload)
+  assert.ok(screens.some((frame) => frame.stage === '读文件' && frame.title === '读取 README.md'))
+  const resultFrame = screens.find((frame) => frame.bullets.some((line) => line.startsWith('✓')))
+  assert.ok(resultFrame, '结果帧应带 ✓ 摘要')
+  assert.ok(resultFrame.bullets.some((line) => line.includes('最后一行输出')))
+  const progressTexts = framesOf(socket).filter((frame) => frame.type === 'event.progress').map((frame) => frame.payload.text)
+  assert.ok(progressTexts.some((text) => text.includes('读取 README.md')))
+  assert.ok(progressTexts.some((text) => text.startsWith('✓')))
+  const last = screens[screens.length - 1]
+  assert.ok(last.title.startsWith('完成 · 共 1 步'), `最终帧 ${last.title}`)
+  runtime.dispose()
+})
+
+test('真机屏幕规格：320×240 常量 + 标题/正文截断', () => {
+  assert.equal(SCREEN_SPEC.widthPx, 320)
+  assert.equal(SCREEN_SPEC.heightPx, 240)
+  assert.equal(SCREEN_SPEC.paddingPx, 8)
+  assert.equal(SCREEN_SPEC.bodyFontPx, 16)
+  assert.equal(SCREEN_SPEC.bodyLineHeightPx, 20)
+  assert.equal(SCREEN_SPEC.bodyCharsPerLine, 18)
+  assert.equal(SCREEN_SPEC.maxBodyLines, 3)
+  assert.equal(SCREEN_SPEC.titleChars, 28)
+  assert.equal(SCREEN_SPEC.stageFontPx, 12)
+  assert.ok(ACTUAL_SIZE_SCALE > 0.7 && ACTUAL_SIZE_SCALE < 0.75, `实际尺寸缩放 ${ACTUAL_SIZE_SCALE}`)
+
+  // 40 字标题 → 28 字内（含省略号）；不出现半个字
+  const title = clipScreenTitle('这是一个非常长的标题'.repeat(4))
+  assert.ok([...title].length <= 28)
+  assert.ok(title.endsWith('…'))
+  assert.equal(clipScreenTitle('短标题'), '短标题')
+
+  // 5 行正文只保留前 3 行，每行 ≤18 字
+  const five = ['一', '二', '三', '四', '五'].map((line) => line.repeat(20))
+  const fitted = fitScreenLines(five)
+  assert.equal(fitted.length, 3)
+  for (const line of fitted) assert.ok([...line].length <= 18)
+  assert.deepEqual(fitScreenLines(['a', '', 'b', 'c', 'd']), ['a', 'b', 'c'])
+})
+
+await testAsync('页面包含真机外壳/320×240 固定尺寸/三档缩放/外壳开关', async () => {
+  const { runtime } = runtimeFor([])
+  const html = runtime.page()
+  assert.ok(html.includes('ESP32-S3-BOX-3B · 2.4″ · 320×240 · 触摸屏'))
+  assert.ok(html.includes('width:320px') && html.includes('height:240px'), '屏幕固定 320×240')
+  assert.ok(html.includes('data-scale="1"') && html.includes('data-scale="2"') && html.includes('data-scale="actual"'))
+  assert.ok(html.includes('实际尺寸'))
+  assert.ok(html.includes('仅屏幕') && html.includes('shell-off'))
+  assert.ok(html.includes('class="mics"') && html.includes('class="grille"') && html.includes('class="dock"'))
   runtime.dispose()
 })
 

@@ -13,6 +13,7 @@
  * TTS 用浏览器 speechSynthesis（zh-CN）——**临时方案**，见页面里的朗读队列注释。
  */
 import { TTS_QUEUE_SOURCE } from './tts-queue.ts'
+import { ACTUAL_SIZE_SCALE, SCREEN_SPEC } from './screen-spec.ts'
 export function tihuPageHtml(options: { lanePath: string; protocol: string }): string {
   const lane = JSON.stringify(options.lanePath)
   const protocol = JSON.stringify(options.protocol)
@@ -27,28 +28,51 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   :root { --bg:#0b0f14; --panel:#121821; --line:#1f2a37; --fg:#e6edf3; --dim:#8b98a5; --accent:#3fb6a8; --warn:#e2b03f; --err:#e05f5f; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system, "Segoe UI", "Noto Sans SC", system-ui, sans-serif; }
-  body { padding:12px; display:flex; flex-direction:column; gap:10px; max-width:560px; margin:0 auto; }
+  body { padding:12px; display:flex; flex-direction:column; gap:10px; max-width:760px; margin:0 auto; }
   header { display:flex; align-items:baseline; gap:8px; }
   header b { font-size:15px; letter-spacing:.5px; }
   header span { color:var(--dim); font-size:12px; }
   #conn { margin-left:auto; font-size:12px; color:var(--dim); }
   #conn.on { color:var(--accent); }
   #conn.off { color:var(--err); }
-  /* 320×240 屏幕区：按容器宽度等比放大，比例永远是 4:3 */
-  #screen { position:relative; width:100%; aspect-ratio:4/3; max-height:46vh; background:#05080b; border:1px solid var(--line);
-    border-radius:10px; padding:10px 12px; display:flex; flex-direction:column; gap:6px; overflow:hidden; }
-  #screen .stage { font-size:11px; letter-spacing:2px; color:var(--accent); text-transform:uppercase; }
-  #screen .title { font-size:17px; font-weight:600; line-height:1.25; }
-  #screen ul { margin:0; padding-left:16px; color:#c3ccd5; font-size:13px; }
-  #screen ul li { margin:2px 0; }
-  #screen .bar { margin-top:0; display:flex; align-items:center; gap:8px; font-size:12px; color:var(--dim); }
-  #screen .track { flex:1; height:6px; border-radius:3px; background:#182230; overflow:hidden; }
+  /* ── 真机屏幕：ESP32-S3-BOX-3B · 2.4″ · 320×240，1:1 CSS px，外壳只是装饰 ── */
+  .device-wrap { display:flex; flex-direction:column; gap:8px; }
+  .device-title { font-size:12px; color:var(--dim); letter-spacing:.5px; }
+  .device-caption { font-size:12px; color:var(--accent); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .device-caption.none { color:var(--dim); }
+  .device-caption.bad { color:var(--err); }
+  .device { width:max-content; zoom:var(--screen-scale, 1); }
+  .bezel { background:linear-gradient(180deg,#2a3440,#151c24); border-radius:18px; padding:16px 16px 14px;
+    box-shadow:0 10px 24px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.06); }
+  .mics { display:flex; justify-content:center; gap:16px; margin:0 0 10px; }
+  .mics span { width:6px; height:6px; border-radius:50%; background:#0a0e13;
+    box-shadow:inset 0 1px 2px rgba(0,0,0,.9), 0 0 0 1px #39434f; }
+  .grille { display:flex; justify-content:center; gap:3px; margin-top:10px; }
+  .grille span { width:3px; height:9px; border-radius:2px; background:#0a0e13; box-shadow:inset 0 1px 1px rgba(255,255,255,.05); }
+  .dock { width:62%; height:10px; margin:10px auto 0; border-radius:50%;
+    background:radial-gradient(ellipse at center, rgba(0,0,0,.55), transparent 70%); filter:blur(1px); }
+  /* 仅屏幕：去掉外壳装饰，只留 320×240 精确边界 */
+  .shell-off .bezel { background:none; padding:0; border-radius:0; box-shadow:none; }
+  .shell-off .mics, .shell-off .grille, .shell-off .dock { display:none; }
+  .shell-off #screen { border:1px solid var(--accent); border-radius:0; }
+  /* 屏幕本体：固定 320×240（screen-spec），内容按 8px 内边距排版，绝不滚动 */
+  #screen { position:relative; width:320px; height:240px; box-sizing:border-box; padding:8px; overflow:hidden;
+    background:#05080b; color:var(--fg); border:1px solid #000; border-radius:3px;
+    display:flex; flex-direction:column; gap:4px; }
+  #screen .stage { font-size:12px; line-height:14px; letter-spacing:1px; color:var(--accent);
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #screen .title { font-size:18px; font-weight:700; line-height:22px;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #screen ul { margin:0; padding:0; list-style:none; font-size:16px; line-height:20px; color:#c3ccd5; }
+  #screen ul li { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #screen .bar { margin-top:auto; display:flex; align-items:center; gap:6px; font-size:10px; color:var(--dim); }
+  #screen .track { flex:1; height:5px; border-radius:3px; background:#182230; overflow:hidden; }
   #screen .fill { height:100%; width:0; background:var(--accent); transition:width .3s; }
   #screen.busy .stage { color:var(--warn); } #screen.alert .stage { color:var(--err); } #screen.ok .stage { color:var(--accent); }
-  /* 屏上常驻一行「当前会话名」：不参与 screen.frame 渲染，绑定后一直可见 */
-  #screen .sess { margin-top:auto; font-size:11px; color:var(--accent); border-top:1px solid var(--line);
-    padding-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  #screen .sess.none { color:var(--dim); }
+  .screen-tools { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .screen-tools button { padding:6px 10px; font-size:12px; }
+  .screen-tools button.on { border-color:var(--accent); background:#132420; }
+  .screen-tools .hint { margin-left:auto; }
   /* 屏下的会话选择器：没有会话时展开、绑定后收起（按钮可再展开） */
   .sess-now { font-size:13px; line-height:1.35; margin:0 0 8px; word-break:break-word; }
   .sess-now.none { color:var(--warn); }
@@ -95,12 +119,29 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   <span id="conn">连接中…</span>
 </header>
 
-<div id="screen">
-  <div class="stage" id="stage">连接</div>
-  <div class="title" id="title">正在连接宿主…</div>
-  <ul id="bullets"></ul>
-  <div class="sess none" id="sessLine">会话：未选定</div>
-  <div class="bar"><span id="progress">—</span><div class="track"><div class="fill" id="fill"></div></div></div>
+<div class="device-wrap" id="deviceWrap">
+  <div class="device-title">ESP32-S3-BOX-3B · 2.4″ · 320×240 · 触摸屏</div>
+  <div class="device-caption none" id="sessLine">当前会话：未选定</div>
+  <div class="device" id="device">
+    <div class="bezel">
+      <div class="mics"><span></span><span></span></div>
+      <div id="screen">
+        <div class="stage" id="stage">连接</div>
+        <div class="title" id="title">正在连接宿主…</div>
+        <ul id="bullets"></ul>
+        <div class="bar"><span id="progress">—</span><div class="track"><div class="fill" id="fill"></div></div></div>
+      </div>
+      <div class="grille"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+    </div>
+    <div class="dock"></div>
+  </div>
+  <div class="screen-tools">
+    <button data-scale="1">1×</button>
+    <button data-scale="2" class="on">2×</button>
+    <button data-scale="actual">实际尺寸</button>
+    <button id="shellToggle">仅屏幕</button>
+    <span class="hint" id="scaleHint">640 × 480 显示</span>
+  </div>
 </div>
 
 <div class="card" id="sessCard">
@@ -156,6 +197,24 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   ${TTS_QUEUE_SOURCE}
   var LANE = ${lane};
   var PROTOCOL = ${protocol};
+  /* 真机屏幕规格：与 src/tihu/screen-spec.ts 同一份常量（页面只消费，不另写数值）。 */
+  var SCREEN = ${JSON.stringify(SCREEN_SPEC)};
+  var ACTUAL_SCALE = ${JSON.stringify(ACTUAL_SIZE_SCALE)};
+  function clipScreen(value, max) {
+    var text = String(value == null ? '' : value).replace(/\\s+/g, ' ').trim();
+    if (text === '') return '';
+    var chars = Array.from(text);
+    if (chars.length <= max) return text;
+    return chars.slice(0, Math.max(1, max - 1)).join('') + '…';
+  }
+  function fitLines(lines, maxLines, maxChars) {
+    var out = [];
+    for (var i = 0; i < (lines || []).length && out.length < maxLines; i += 1) {
+      var line = clipScreen(lines[i], maxChars);
+      if (line !== '') out.push(line);
+    }
+    return out;
+  }
   var $ = function (id) { return document.getElementById(id); };
   var state = { ws: null, seq: 0, clientId: '', sessionId: '', sessionTitle: '', sessionSource: '',
     sessions: [], listLoaded: false, querying: false, showList: false,
@@ -232,11 +291,13 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
 
   /* ---------- 屏 ---------- */
   function renderScreen(payload) {
-    $('stage').textContent = payload.stage || '';
-    $('title').textContent = payload.title || '';
+    // 严格按 320×240 规格排版：stage ≤10、标题 ≤28 且单行、正文最多 3 行 ×18 字。
+    // 多出来的内容留在事件区，屏幕上不允许出现半行或滚动条。
+    $('stage').textContent = clipScreen(payload.stage || '', SCREEN.stageChars);
+    $('title').textContent = clipScreen(payload.title || '', SCREEN.titleChars);
     var list = $('bullets');
     list.innerHTML = '';
-    (payload.bullets || []).forEach(function (line) {
+    fitLines(payload.bullets || [], SCREEN.maxBodyLines, SCREEN.bodyCharsPerLine).forEach(function (line) {
       var li = document.createElement('li');
       li.textContent = line;
       list.appendChild(li);
@@ -291,19 +352,19 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       $('sessNow').textContent = '当前会话：' + label + modeText;
       $('sessNow').className = 'sess-now' + (state.computerUse === false ? ' bad' : '');
       $('sessLine').textContent = '当前会话：' + label + modeText;
-      $('sessLine').className = 'sess' + (state.computerUse === false ? ' none' : '');
+      $('sessLine').className = 'device-caption' + (state.computerUse === false ? ' bad' : '');
     } else if (state.sessionId) {
       $('sessNow').textContent = '正在确认会话 ' + shortId(state.sessionId) + '…';
       $('sessNow').className = 'sess-now';
       $('sessLine').textContent = '当前会话：确认中' + modeText;
-      $('sessLine').className = 'sess none';
+      $('sessLine').className = 'device-caption none';
     } else {
       $('sessNow').textContent = state.mode === 'auto'
         ? '正在自动绑定最近活跃的 Computer Use 会话…'
         : '还没有选定会话，点下面选一个';
       $('sessNow').className = 'sess-now none';
       $('sessLine').textContent = '当前会话：未选定' + modeText;
-      $('sessLine').className = 'sess none';
+      $('sessLine').className = 'device-caption none';
     }
     $('sessSwitch').style.display = state.sessionBound ? '' : 'none';
     $('sessSwitch').textContent = state.showList ? '收起会话列表' : '换个会话';
@@ -720,6 +781,34 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     send('session.bind', { auto: true });
   };
   $('sessRefresh').onclick = function () { requestSessions(); };
+
+  /* ---------- 真机屏幕：缩放三档 + 外壳开关（只影响显示，不改 320×240 内容） ---------- */
+  var SCALE_MODES = {
+    '1': { scale: 1, label: '320 × 240 显示（1×）' },
+    '2': { scale: 2, label: '640 × 480 显示（2×）' },
+    'actual': { scale: ACTUAL_SCALE, label: '实际尺寸（≈61 × 45.7 mm，近似）' }
+  };
+  var scaleButtons = document.querySelectorAll('.screen-tools button[data-scale]');
+  function applyScale(mode) {
+    var spec = SCALE_MODES[mode] || SCALE_MODES['2'];
+    $('device').style.setProperty('--screen-scale', String(spec.scale));
+    $('scaleHint').textContent = spec.label;
+    for (var i = 0; i < scaleButtons.length; i += 1) {
+      scaleButtons[i].className = scaleButtons[i].getAttribute('data-scale') === mode ? 'on' : '';
+    }
+  }
+  for (var s = 0; s < scaleButtons.length; s += 1) {
+    (function (button) {
+      button.onclick = function () { applyScale(button.getAttribute('data-scale')); };
+    })(scaleButtons[s]);
+  }
+  applyScale('2');
+  var shellOn = true;
+  $('shellToggle').onclick = function () {
+    shellOn = !shellOn;
+    $('deviceWrap').className = 'device-wrap' + (shellOn ? '' : ' shell-off');
+    $('shellToggle').textContent = shellOn ? '仅屏幕' : '显示外壳';
+  };
 
   /* ---------- 音频：任意音频 → 16 kHz 单声道 16 bit WAV ---------- */
   function encodeWav(samples, sampleRate) {

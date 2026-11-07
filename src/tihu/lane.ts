@@ -39,7 +39,6 @@ import {
   parseUpstream,
   randomId,
   summarizeForLog,
-  toBullets,
   toTtsSegments,
   type ConfirmAskPayload,
   type DonePayload,
@@ -67,6 +66,7 @@ import {
   type TihuActionClass,
 } from './guard.ts'
 import { tihuPageHtml } from './page.ts'
+import { applySessionEvent, confirmationFrame, createProgressState, type TihuProgressState } from './progress.ts'
 
 /** 页面与 WebSocket 的路径（代理侧按这两个前缀放行）。 */
 export const TIHU_PAGE_PATH = '/tihu'
@@ -205,6 +205,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const devices = new Set<TihuDevice>()
   /** 会话 id → 活跃窗口（只有 tihu 注入的那个 turn 的工具调用才受闸门约束）。 */
   const activeSessions = new Map<string, TihuWindow>()
+  /** 会话 id → 屏幕进度状态（步骤计数 / 用时 / 上一步结果）。 */
+  const progressStates = new Map<string, TihuProgressState>()
   const confirmBroker: ConfirmBroker = createConfirmBroker({
     onAsk: (request) => {
       for (const device of devices) {
@@ -218,6 +220,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
           risk: request.risk,
         }
         device.send('confirm.ask', payload)
+        // 屏幕也要切到「等待确认」，别让用户只看到上一步的执行画面。
+        device.send('screen.frame', confirmationFrame(request.title, request.detail))
       }
       log(`tihu confirm.ask id=${request.id} title=${JSON.stringify(request.title)}`)
     },
@@ -943,35 +947,23 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       const type = String(event?.type ?? '')
       const data = event?.data ?? {}
 
+      // 屏幕帧 / 事件行统一交给纯函数映射（progress.ts）：stage、动词+目标、步骤计数、
+      // 上一步结果、输出尾行都在那里统一截断，lane 只负责转发。
+      const state = progressStates.get(sessionId) ?? createProgressState()
+      progressStates.set(sessionId, state)
+      const update = applySessionEvent(state, event)
       if (type === 'turn/start') {
         // 注意：**不能**在这里点亮 tihu 窗口。用户自己在会话里打字同样会触发
         // turn/start，旧实现就是这么把用户自己的每个 turn 都变成「危险动作要确认」的。
-        // 窗口只由 inject() 在 tihu 注入那一刻点亮，并由最后一条 user 消息核对归属。
         touchWindow(sessionId)
-        broadcast(sessionId, 'event.progress', { stage: 'turn', text: `开始第 ${data?.turn ?? '?'} 轮` } satisfies ProgressPayload)
-        screen(sessionId, { stage: '思考', title: '正在处理…', bullets: [], tone: 'busy' })
-        return
       }
-      if (type === 'step/start') {
-        broadcast(sessionId, 'event.progress', {
-          stage: 'step',
-          text: `第 ${data?.step ?? '?'} 步`,
-          done: Number.isFinite(data?.step) ? Number(data.step) : undefined,
-        } satisfies ProgressPayload)
-        return
-      }
-      if (type === 'tool/call') {
-        const tool = String(data?.name ?? data?.call?.name ?? '工具')
-        broadcast(sessionId, 'event.progress', { stage: 'tool', text: `调用 ${tool}` } satisfies ProgressPayload)
-        screen(sessionId, { stage: '动手', title: tool, bullets: ['正在执行…'], tone: 'busy' })
-        return
-      }
+      if (update.screen !== undefined) screen(sessionId, update.screen)
+      if (update.progress !== undefined) broadcast(sessionId, 'event.progress', update.progress)
+
       if (type === 'assistant/message') {
         const blocks = data?.message?.content ?? []
         const text = blocks.filter((b: any) => b?.type === 'text').map((b: any) => String(b?.text ?? '')).join('\n').trim()
         if (text === '') return
-        const bullets = toBullets(text)
-        screen(sessionId, { stage: '回复', title: bullets[0] ?? '已回复', bullets: bullets.slice(1), tone: 'ok' })
         const segments = toTtsSegments(text)
         segments.forEach((segment, index) => {
           broadcast(sessionId, 'tts.text', { text: segment, index, total: segments.length, lang: 'zh-CN' } satisfies TtsTextPayload)
@@ -979,13 +971,13 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         return
       }
       if (type === 'turn/end') {
-        const reason = data?.reason?.kind ?? 'stop'
+        const reason = String(data?.reason?.kind ?? 'stop')
         broadcast(sessionId, 'event.done', {
           text: reason === 'stop' ? '本轮完成' : `本轮结束（${reason}）`,
           ok: reason === 'stop',
           sessionId,
         } satisfies DonePayload)
-        screen(sessionId, { stage: '空闲', title: '待命', bullets: ['按住说话继续'], tone: 'idle' })
+        // 最终帧由 mapper 保留：「完成 · 共 N 步 · 用时 Xs」停在屏上，不清成「待命」。
         return
       }
     } catch (error) {
