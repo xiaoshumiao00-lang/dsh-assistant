@@ -296,7 +296,13 @@ export function activityEntryOf(name: string, args: unknown): TihuActivityEntry 
   for (const rule of ENTRY_RULES) {
     if (!rule.pattern.test(lower)) continue
     let detail = firstString(params, rule.keys)
-    if (rule.label === '运行命令') detail = salientCommand(detail)
+    // 与 DSH 工具卡同源：命令类工具（pwsh 那组规则）自带的 arguments.description 就是
+    // 「这条命令干什么」这句话，明细优先显示它（去首尾空白、折叠空白由 sanitizeDetail 统一做）；
+    // 没有 description、或只是空白，才退回从 command 里挑出真正干活的那一段（旧口径）。
+    if (rule.label === '运行命令') {
+      const description = firstString(params, ['description'])
+      detail = description === '' ? salientCommand(detail) : description
+    }
     else if (rule.label === '读文件' || rule.label === '写文件' || rule.label === '改文件') detail = baseNameOf(detail) || detail
     return { label: rule.label, detail: sanitizeDetail(detail) }
   }
