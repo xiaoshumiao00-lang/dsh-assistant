@@ -245,6 +245,8 @@ export interface VoiceCreatePayload {
 /** 上行：选择音色（页面下拉框）。 */
 export interface VoiceSelectPayload {
   name: string
+  /** edge-tts 兜底音色（zh-CN-...Neural），不填用默认云健。 */
+  edgeVoice?: string
 }
 
 /** 下行：克隆音色已创建。 */
@@ -570,6 +572,7 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
       case 'voice.list': return value as TihuUpstreamMessage
       case 'voice.select': {
         if (typeof payload.name !== 'string' || payload.name === '' || payload.name.length > 32) return null
+        if (payload.edgeVoice !== undefined && (typeof payload.edgeVoice !== 'string' || payload.edgeVoice.length > 64)) return null
         return value as TihuUpstreamMessage
       }
       case 'voice.create': {

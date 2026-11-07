@@ -70,13 +70,19 @@ class Server:
         self.device = "cpu"
         self.dtype_name = "fp32"
         if self.args.device == "cuda":
+            if os.environ.get("TIHU_TTS_FORCE_NO_CUDA") == "1":
+                log("TIHU_TTS_FORCE_NO_CUDA=1，模拟 GPU 不可用，退出")
+                raise SystemExit(3)
+            if not torch.cuda.is_available():
+                log("cuda 不可用，退出（链路会切 Windows SAPI）")
+                raise SystemExit(3)
             free, total = torch.cuda.mem_get_info()
             log(f"cuda free={free / 1024**3:.1f}GiB total={total / 1024**3:.1f}GiB")
             if free < 2 * 1024**3:
-                log("cuda free < 2GiB，回落 CPU fp32")
-            else:
-                self.device = "cuda"
-                self.dtype_name = self.args.dtype
+                log(f"cuda 可用显存 {free / 1024**2:.0f}MB < 2GB，退出（链路会切 Windows SAPI）")
+                raise SystemExit(3)
+            self.device = "cuda"
+            self.dtype_name = self.args.dtype
         dtype = {
             "bf16": torch.bfloat16,
             "fp16": torch.float16,

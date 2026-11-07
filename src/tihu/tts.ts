@@ -28,7 +28,6 @@ import type { VoiceInfo } from './protocol.ts'
 
 const DEFAULT_PORT = 8731
 const HEALTH_TIMEOUT_MS = 180_000
-const FIRST_CHUNK_TIMEOUT_MS = 8_000
 
 export interface TihuTtsPaths {
   root: string
@@ -145,6 +144,11 @@ export class TihuTts {
   private activeDevice: 'cuda' | 'cpu' = (process.env.TIHU_TTS_DEVICE ?? 'cpu') === 'cuda' ? 'cuda' : 'cpu'
   /** 显存不足回落 CPU 的提示（页面事件区用）。 */
   private fallbackNote = ''
+  /** GPU 启动/合成失败后永久切 SAPI（本次进程内不再重试 GPU）。 */
+  private gpuFailed = false
+  /** 实际出声引擎（用于事件标识）。 */
+  private activeEngine: 'gpu' | 'edge' | 'sapi' = 'gpu'
+  private lastLabel = ''
 
   constructor(options: TihuTtsOptions) {
     this.options = options
@@ -152,13 +156,14 @@ export class TihuTts {
     this.port = options.port ?? DEFAULT_PORT
   }
 
-  /** 当前后端：qwen-pt（PyTorch CPU sidecar）/ codec（GGUF sidecar）/ sapi（系统语音占位）/ none。 */
-  backend(): 'qwen-pt' | 'codec' | 'sapi' | 'none' {
+  /** 当前后端：qwen-cuda（默认 GPU）/ q4（弃用备用）/ cpu（调试）/ sapi（唯一兜底）/ none。 */
+  /** 当前后端：qwen-cuda（默认）/ q4 / cpu（调试）/ sapi（唯一兜底）/ none。 */
+  backend(): 'qwen-cuda' | 'q4' | 'cpu' | 'sapi' | 'none' {
     if (this.options.disabled) return 'none'
-    // Q4 实测比 PyTorch fp32 更慢（见 CHANGELOG），默认仍用 fp32；设 TIHU_TTS_ENGINE=q4 可强制走 GGUF。
-    if (process.env.TIHU_TTS_ENGINE === 'q4' && existsSync(this.paths.bin) && existsSync(this.paths.model) && existsSync(this.paths.codec)) return 'codec'
-    if (this.qwenReady()) return 'qwen-pt'
-    if (existsSync(this.paths.bin) && existsSync(this.paths.model) && existsSync(this.paths.codec)) return 'codec'
+    const engine = process.env.TIHU_TTS_ENGINE ?? ''
+    if (engine === 'q4' && existsSync(this.paths.bin) && existsSync(this.paths.model) && existsSync(this.paths.codec)) return 'q4'
+    if (engine === 'cpu' && this.qwenReady()) return 'cpu'
+    if (this.qwenReady() && !this.gpuFailed) return 'qwen-cuda'
     if (process.platform === 'win32') return 'sapi'
     return 'none'
   }
@@ -189,9 +194,10 @@ export class TihuTts {
 
   status(): { available: boolean; model?: string; error?: string } {
     const backend = this.backend()
-    if (backend === 'codec') return { available: true, model: 'qwen3-tts 0.6b-q4' }
-    if (backend === 'qwen-pt') return { available: true, model: this.activeDevice === 'cuda' ? 'qwen3-tts 0.6b-cuda' : 'qwen3-tts 0.6b-pt' }
-    if (backend === 'sapi') return { available: true, model: 'windows-sapi（Qwen3-TTS 未就绪）' }
+    if (backend === 'qwen-cuda') return { available: true, model: 'qwen3-tts 0.6b-cuda' }
+    if (backend === 'cpu') return { available: true, model: 'qwen3-tts 0.6b-pt' }
+    if (backend === 'q4') return { available: true, model: 'qwen3-tts 0.6b-q4' }
+    if (backend === 'sapi') return { available: true, model: 'Windows SAPI' }
     return {
       available: false,
       error: this.lastError || `本地 TTS 未安装：缺少 ${basename(this.qwenServerScript())} 或模型文件（${this.paths.root}）`,
@@ -209,7 +215,16 @@ export class TihuTts {
     if (backend === 'sapi' || backend === 'none') return
     if (this.child !== null && this.modelLoaded) return
     if (this.starting !== null) return this.starting
-    this.starting = this.startServer().finally(() => { this.starting = null })
+    this.starting = this.startServer().catch((error) => {
+      if (backend === 'qwen-cuda') {
+        const message = (error as Error)?.message ?? String(error)
+        this.gpuFailed = true
+        this.fallbackNote = `GPU 不可用，已切换 Windows SAPI：${message}`
+        this.log(`tts gpu unavailable, fallback sapi: ${message}`)
+        return
+      }
+      throw error
+    }).finally(() => { this.starting = null })
     return this.starting
   }
 
@@ -238,7 +253,7 @@ export class TihuTts {
     if (existsSync(join(this.paths.serverVoices, 'default.gguf'))) {
       args.push('--speaker-file', join(this.paths.serverVoices, 'default.gguf'))
     }
-    if (backend === 'qwen-pt') {
+    if (backend === 'qwen-cuda' || backend === 'cpu') {
       command = this.qwenPython()
       args = [
         '-u', this.qwenServerScript(),
@@ -248,7 +263,7 @@ export class TihuTts {
         '--host', '127.0.0.1',
         '--port', String(port),
         '--threads', String(this.options.threads ?? 8),
-        '--device', process.env.TIHU_TTS_DEVICE ?? 'cpu',
+        '--device', backend === 'cpu' ? 'cpu' : 'cuda',
         '--dtype', process.env.TIHU_TTS_DTYPE ?? 'bf16',
       ]
     } else if (process.platform === 'win32' && binaryKind(this.paths.bin) === 'linux') {
@@ -324,6 +339,106 @@ export class TihuTts {
     return this.options.port ?? DEFAULT_PORT
   }
 
+  /** edge-tts 兜底是否可用（脚本 + Python；ffmpeg 由系统 PATH 提供）。 */
+  edgeReady(): boolean {
+    return existsSync(this.qwenPython()) && existsSync(join(this.paths.root, 'tihu-edge-tts.py'))
+  }
+
+  /** 当前引擎的中文标识（页面事件区）。 */
+  engineLabel(voice: string): string {
+    if (this.activeEngine === 'edge') return '在线兜底：edge-tts 云健(Yunjian)'
+    if (this.activeEngine === 'sapi') return '离线兜底：Windows SAPI Huihui'
+    return `本地 TTS：qwen3-tts 0.6b-cuda / 音色 ${voice || 'default'}`
+  }
+
+  /** 引擎切换后取一次提示（空串表示没变化）。 */
+  takeEngineNote(): string {
+    const label = this.lastLabel
+    this.lastLabel = ''
+    return label
+  }
+
+  /**
+   * edge-tts 在线兜底：Python 流式输出 MP3 → ffmpeg 解码 24k PCM。
+   * 首块 1.5s 不到立即杀掉并由调用方切 SAPI。
+   */
+  private async synthesizeEdge(
+    text: string,
+    options: {
+      onChunk: (chunk: { data: Buffer; seq: number; total: number; final: boolean }) => void
+      signal?: AbortSignal
+      edgeVoice?: string
+    },
+  ): Promise<SynthResult> {
+    const started = Date.now()
+    const voice = options.edgeVoice || process.env.TIHU_EDGE_VOICE || 'zh-CN-YunjianNeural'
+    const py = spawn(this.qwenPython(), ['-u', join(this.paths.root, 'tihu-edge-tts.py'), '--text', text, '--voice', voice], {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const ff = spawn(process.env.TIHU_FFMPEG ?? 'ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
+      '-f', 's16le', '-ac', '1', '-ar', '24000', 'pipe:1',
+    ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+    let stderr = ''
+    py.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8') })
+    ff.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8') })
+    py.stdout?.pipe(ff.stdin)
+    const chunker = new Pcm16Chunker()
+    let chunks = 0
+    let bytes = 0
+    let firstAt = 0
+    const abort = (reason: string) => {
+      try { py.kill() } catch { /* 忽略 */ }
+      try { ff.kill() } catch { /* 忽略 */ }
+      throw new Error(reason)
+    }
+    const signal = options?.signal
+    const onAbort = () => abort('edge-tts aborted')
+    signal?.addEventListener('abort', onAbort, { once: true })
+    const firstTimer = setTimeout(() => {
+      try { py.kill() } catch { /* 忽略 */ }
+      try { ff.kill() } catch { /* 忽略 */ }
+    }, 1500)
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const done = () => resolve()
+        ff.stdout?.on('data', (chunk: Buffer) => {
+          if (firstAt === 0) { firstAt = Date.now(); clearTimeout(firstTimer) }
+          bytes += chunk.length
+          for (const block of chunker.push(chunk)) {
+            options.onChunk({ data: block, seq: chunks, total: 0, final: false })
+            chunks += 1
+          }
+        })
+        ff.on('error', (error) => reject(error))
+        ff.on('close', done)
+        py.on('close', (code) => {
+          if (code !== 0 && firstAt === 0) reject(new Error(`edge-tts 失败（exit ${code}）：${stderr.split('\n').filter(Boolean).slice(-2).join(' ').slice(0, 200)}`))
+        })
+      })
+      const tail = chunker.finish()
+      if (firstAt === 0 && tail.length === 0) throw new Error('edge-tts 没有返回音频')
+      for (const block of tail) {
+        options.onChunk({ data: block.data, seq: chunks, total: chunks + 1, final: block.final })
+        chunks += 1
+      }
+      const totalMs = Date.now() - started
+      const audioMs = Math.round((bytes / 2 / TTS_SAMPLE_RATE) * 1000)
+      if (audioMs < 50) throw new Error('edge-tts 返回音频过短')
+      this.log(`edge-tts ok chars=${[...text].length} voice=${voice} first=${firstAt === 0 ? '?' : firstAt - started}ms total=${totalMs}ms audio=${audioMs}ms`)
+      return { sampleRate: TTS_SAMPLE_RATE, firstChunkMs: firstAt === 0 ? totalMs : firstAt - started, audioMs, totalMs, chunks }
+    } catch (error) {
+      clearTimeout(firstTimer)
+      try { py.kill() } catch { /* 忽略 */ }
+      try { ff.kill() } catch { /* 忽略 */ }
+      throw error
+    } finally {
+      clearTimeout(firstTimer)
+      signal?.removeEventListener('abort', onAbort)
+    }
+  }
+
   /**
    * 合成一段文本并流式输出 PCM 块。
    * @returns 首块耗时 / 总时长 / 块数（用于报告与日志）。
@@ -333,14 +448,57 @@ export class TihuTts {
     options: {
       voice?: string
       sessionId?: string
+      edgeVoice?: string
       onChunk: (chunk: { data: Buffer; seq: number; total: number; final: boolean }) => void
       signal?: AbortSignal
     },
   ): Promise<SynthResult> {
     const backend = this.backend()
-    if (backend === 'codec' || backend === 'qwen-pt') return this.synthesizeCodec(text, options)
-    if (backend === 'sapi') return this.synthesizeSapi(text, options)
-    throw new Error(this.status().error ?? '本地 TTS 不可用')
+    let primaryError = ''
+    if (backend === 'qwen-cuda') {
+      try {
+        const result = await this.synthesizeCodec(text, options)
+        this.setEngine('gpu')
+        return result
+      } catch (error) {
+        primaryError = (error as Error)?.message ?? String(error)
+        this.gpuFailed = true
+        this.fallbackNote = `GPU 不可用，已切换在线兜底：${primaryError}`
+        this.log(`tts gpu failed: ${primaryError}`)
+      }
+    } else if (backend === 'cpu' || backend === 'q4') {
+      try {
+        const result = await this.synthesizeCodec(text, options)
+        this.setEngine('gpu')
+        return result
+      } catch (error) {
+        primaryError = (error as Error)?.message ?? String(error)
+        this.log(`tts debug engine failed: ${primaryError}`)
+      }
+    }
+    if (this.edgeReady()) {
+      try {
+        const result = await this.synthesizeEdge(text, { ...options, edgeVoice: options.edgeVoice })
+        this.setEngine('edge')
+        return result
+      } catch (error) {
+        primaryError = (error as Error)?.message ?? String(error)
+        this.log(`edge-tts failed, fallback sapi: ${primaryError}`)
+      }
+    }
+    try {
+      const result = await this.synthesizeSapi(text, options)
+      this.setEngine('sapi')
+      if (this.fallbackNote === '') this.fallbackNote = `在线兜底不可用，已用 Windows SAPI：${primaryError}`
+      return result
+    } catch (error) {
+      throw new Error(`所有本地 TTS 均不可用：${(error as Error)?.message ?? String(error)}（${primaryError}）`)
+    }
+  }
+
+  private setEngine(engine: 'gpu' | 'edge' | 'sapi'): void {
+    this.activeEngine = engine
+    this.lastLabel = this.engineLabel('')
   }
 
   /** Windows SAPI 占位后端：生成 24k PCM 后分块（不流式；Qwen sidecar 就绪前保证链路可用）。 */
@@ -419,7 +577,7 @@ export class TihuTts {
     const controller = new AbortController()
     const onAbort = () => controller.abort()
     options.signal?.addEventListener('abort', onAbort, { once: true })
-    const firstChunkBudget = this.backend() === 'qwen-pt' ? 45_000 : FIRST_CHUNK_TIMEOUT_MS
+    const firstChunkBudget = this.backend() === 'q4' ? 60_000 : 45_000
     const firstTimer = setTimeout(() => controller.abort(), firstChunkBudget)
     let firstChunkAt = 0
     let bytes = 0
@@ -535,14 +693,14 @@ export class TihuTts {
   ): Promise<{ voice: VoiceInfo; cached: boolean }> {
     const name = normalizeVoiceName(payload.name)
     if (name === null) throw new Error('音色名只能包含英文/数字/下划线/短横线，1–32 字，且不能是 default')
-    if (this.backend() !== 'codec' && this.backend() !== 'qwen-pt') throw new Error('当前是 Windows SAPI 占位引擎，不支持音色克隆；装好 Qwen3-TTS sidecar 后可用')
+    if (this.backend() === 'sapi' || this.backend() === 'none') throw new Error('当前只有 Windows SAPI 兜底，不支持音色克隆；本地 Qwen 引擎不可用')
     const dir = this.workspaceDir(sessionId)
     await mkdir(dir, { recursive: true })
     const wav = Buffer.from(payload.wavBase64, 'base64')
     const valid = validateReferenceWav(wav)
     if (!valid.ok) throw new Error('参考音频不合格：' + valid.reason)
     const existing = await this.readVoiceRecord(sessionId, name)
-    const embedExt = this.backend() === 'qwen-pt' ? '.embed.pt' : '.gguf'
+    const embedExt = this.backend() === 'q4' ? '.gguf' : '.embed.pt'
     if (existing?.serverVoiceId !== undefined && existsSync(join(this.paths.serverVoices, existing.serverVoiceId + embedExt))) {
       return {
         voice: { name, kind: 'cloned', durationMs: existing.durationMs, sampleRate: existing.sampleRate, createdAt: existing.createdAt, note: existing.note },
@@ -584,7 +742,7 @@ export class TihuTts {
     if (record === null || record.serverVoiceId === undefined || record.serverVoiceId === '') {
       throw new Error(`音色 ${name} 没有可用的 embedding，请重新上传参考音频`)
     }
-    if (!existsSync(join(this.paths.serverVoices, record.serverVoiceId + (this.backend() === 'qwen-pt' ? '.embed.pt' : '.gguf')))) {
+    if (!existsSync(join(this.paths.serverVoices, record.serverVoiceId + (this.backend() === 'q4' ? '.gguf' : '.embed.pt')))) {
       throw new Error(`音色 ${name} 的 embedding 已丢失，请重新上传参考音频`)
     }
     return record.serverVoiceId

@@ -10,9 +10,8 @@
  *   2. 无麦克风：选本地 WAV 文件（或拖进来）→ 同一条解码/重采样/上行路径。
  *      台式机没有麦克风时用这一条，验收不依赖手机。
  *
- * TTS 用浏览器 speechSynthesis（zh-CN）——**临时方案**，见页面里的朗读队列注释。
+ * TTS 只播放宿主下发的 PCM（Qwen GPU / Windows SAPI）；页面不再使用浏览器语音。
  */
-import { TTS_QUEUE_SOURCE } from './tts-queue.ts'
 import { ACTUAL_SIZE_SCALE, SCREEN_SPEC } from './screen-spec.ts'
 export function tihuPageHtml(options: { lanePath: string; protocol: string }): string {
   const lane = JSON.stringify(options.lanePath)
@@ -174,6 +173,14 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     <input id="voiceName" placeholder="音色名（英文/数字/下划线）" style="flex:1" />
     <label class="file" style="flex:1">上传参考音频（3–10 秒）<input id="voiceFile" type="file" accept="audio/*"></label>
   </div>
+  <div class="row" style="margin-top:8px">
+    <select id="edgeVoiceSelect" style="flex:1">
+      <option value="zh-CN-YunjianNeural">兜底音色：云健 Yunjian</option>
+      <option value="zh-CN-YunxiNeural">兜底音色：云希 Yunxi</option>
+      <option value="zh-CN-XiaoxiaoNeural">兜底音色：晓晓 Xiaoxiao</option>
+      <option value="zh-CN-YunyangNeural">兜底音色：云扬 Yunyang</option>
+    </select>
+  </div>
   <input id="voiceNote" placeholder="备注（可选）" style="margin-top:8px" />
   <div class="hint" id="voiceHint">仅可用于你本人或已获授权的音色；参考音频只在本机处理，不上传云端。</div>
 </div>
@@ -215,7 +222,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
 <script>
 (function () {
   'use strict';
-  ${TTS_QUEUE_SOURCE}
   var LANE = ${lane};
   var PROTOCOL = ${protocol};
   /* 真机屏幕规格：与 src/tihu/screen-spec.ts 同一份常量（页面只消费，不另写数值）。 */
@@ -242,7 +248,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     sessionBound: false, computerUse: null, sessionPreset: '', cuTotal: 0, total: 0,
     mode: 'auto', lastAutoId: '',
     lastTranscript: '', asking: null, recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0,
-    ttsTurnTexts: [], ttsAudioSeen: {}, ttsFallbacks: {}, localTtsFailed: false,
+    ttsTurnTexts: [], ttsAudioSeen: {},
     audioCtx: null, pcmSources: [], pcmNextTime: 0, turnPcm: [],
     voice: 'default', voices: [], voiceEngine: null,
     reply: null, replyCharPos: 0, replyTimer: 0 };
@@ -373,30 +379,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
   }
 
-  /** 降级到系统语音时按 4.5 字/秒估算进度，驱动同一套高亮。 */
-  function startSpeechProgress(charStart, charEnd) {
-    clearInterval(state.replyTimer);
-    state.replyCharPos = Number.isFinite(charStart) ? charStart : 0;
-    state.replyTimer = setInterval(function () {
-      state.replyCharPos += 4.5 * 0.3;
-      if (Number.isFinite(charEnd) && state.replyCharPos >= charEnd) {
-        state.replyCharPos = charEnd;
-        clearInterval(state.replyTimer);
-        state.replyTimer = 0;
-      }
-      // 在窗口句子里找当前字符落在哪句
-      if (state.reply && Array.isArray(state.reply.sentences)) {
-        for (var i = 0; i < state.reply.sentences.length; i += 1) {
-          var sentence = state.reply.sentences[i];
-          if (state.replyCharPos >= sentence.start && state.replyCharPos < sentence.end) {
-            state.reply.currentIndex = sentence.index;
-            break;
-          }
-        }
-        renderReply();
-      }
-    }, 300);
-  }
   function addEvent(kind, text) {
     var row = document.createElement('div');
     row.className = kind;
@@ -630,50 +612,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     fallbackToAuto(payload.reason || ('会话 ' + shortId(payload.sessionId) + ' 不存在。'));
   }
 
-  /* ---------- TTS ----------
-     P0 临时方案：浏览器自带 speechSynthesis（zh-CN）。
-     P1 要换成**宿主机上的本地 VITS（sherpa-onnx）**：宿主合成 24kHz Opus，
-     经 tts.audio 帧下发，板子/页面只负责播放——因为远程链路上手机的
-     speechSynthesis 音色依赖系统、离线不可用，而且真板子没有这个 API。
-
-     2026-11-07 修「只念几句就没了」：旧实现对每条 tts.text 都 cancel 再 speak，
-     多段几乎同时到达 → 只剩最后一段。现在用队列（createTtsQueue）顺序播放：
-     收到新段只入队、不 cancel；只在「新一轮回复 / 停止朗读 / 重读一遍」时清队列。 */
-  var tts = createTtsQueue({
-    speak: function (text, done) {
-      if (!('speechSynthesis' in window)) {
-        addEvent('alert', '本浏览器不支持 speechSynthesis，跳过朗读');
-        done();
-        return;
-      }
-      try {
-        var utter = new SpeechSynthesisUtterance(text);
-        utter.lang = 'zh-CN';
-        utter.rate = 1.02;
-        var zh = window.speechSynthesis.getVoices().filter(function (v) { return /zh|Chinese/i.test(v.lang + v.name); });
-        if (zh.length) utter.voice = zh[0];
-        utter.onend = function () { done(); };
-        utter.onerror = function () { done(); };
-        window.speechSynthesis.speak(utter);
-      } catch (e) {
-        addEvent('alert', '朗读失败：' + e.message);
-        done();
-      }
-    },
-    cancel: function () {
-      try { window.speechSynthesis.cancel(); } catch (e) { /* 忽略 */ }
-    },
-    setTimeout: function (fn, ms) { return window.setTimeout(fn, ms); },
-    clearTimeout: function (timer) { try { window.clearTimeout(timer); } catch (e) { /* 忽略 */ } },
-    onEvent: function (kind, text) {
-      if (kind === 'timeout') addEvent('progress', '朗读超时，自动跳到下一段');
-      else if (kind === 'drop') addEvent('alert', '朗读队列已满（200 段），后面的内容不再朗读');
-    }
-  });
-
   /* ---------- 本地 TTS（PCM）播放 ----------
-     sidecar 以 24kHz/pcm16 流式下发，页面用 WebAudio 无缝排队拼接；
-     本地音频失败/没到时才降级 speechSynthesis。 */
+     sidecar 以 24kHz/pcm16 流式下发，页面用 WebAudio 无缝排队拼接。
+     页面只播放宿主合成的 PCM（Qwen GPU / Windows SAPI），不再使用浏览器语音。 */
   function ensureAudio() {
     if (state.audioCtx) return state.audioCtx;
     var Ctx = window.AudioContext || window.webkitAudioContext;
@@ -720,42 +661,20 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       };
       // 重读缓存（本轮完整 PCM）
       state.turnPcm.push(samples);
-    } catch (e) { /* 解码失败：交给系统语音兜底 */ }
-  }
-  function scheduleSpeechFallback(index, text, charStart, charEnd) {
-    clearTimeout(state.ttsFallbacks[index]);
-    state.ttsFallbacks[index] = setTimeout(function () {
-      delete state.ttsFallbacks[index];
-      if (state.ttsAudioSeen[index]) return;
-      tts.enqueue(text);
-      addEvent('progress', '本地音频未到，已用系统语音兜底');
-      startSpeechProgress(charStart, charEnd);
-    }, 60000);
-  }
-  function fallbackAllSpeech() {
-    for (var key in state.ttsFallbacks) {
-      clearTimeout(state.ttsFallbacks[key]);
-      delete state.ttsFallbacks[key];
-    }
-    state.localTtsFailed = true;
-    for (var i = 0; i < state.ttsTurnTexts.length; i += 1) tts.enqueue(state.ttsTurnTexts[i]);
+    } catch (e) { /* 解码失败：本条只显示文字 */ }
   }
   function resetTurnAudio() {
-    tts.stop();
     stopPcm();
     clearInterval(state.replyTimer);
     state.replyTimer = 0;
-    for (var key in state.ttsFallbacks) { clearTimeout(state.ttsFallbacks[key]); delete state.ttsFallbacks[key]; }
     state.ttsTurnTexts = [];
     state.ttsAudioSeen = {};
     state.turnPcm = [];
-    state.localTtsFailed = false;
   }
   function replayPcm() {
     var chunks = state.turnPcm;
     if (!chunks.length) return false;
     stopPcm();
-    tts.stop();
     var ctx = ensureAudio();
     if (!ctx) return false;
     var when = ctx.currentTime + 0.05;
@@ -788,9 +707,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     var engine = state.voiceEngine;
     if (engine && engine.available === false) {
-      $('voiceHint').textContent = '本地 TTS 不可用（' + (engine.error || '未安装模型') + '），当前使用系统语音。';
+      $('voiceHint').textContent = '本地 TTS 不可用（' + (engine.error || '未安装模型') + '），本条只显示文字。';
     } else {
-      $('voiceHint').textContent = '本地 TTS：' + ((engine && engine.model) || '本地引擎') + ' / 音色 ' + state.voice + '。仅可用于你本人或已获授权的音色；参考音频只在本机处理。';
+      var shownVoice = (engine && engine.model === 'Windows SAPI') ? '默认' : state.voice;
+      $('voiceHint').textContent = '本地 TTS：' + ((engine && engine.model) || '本地引擎') + ' / 音色 ' + shownVoice + '。仅可用于你本人或已获授权的音色；参考音频只在本机处理。';
     }
   }
 
@@ -853,6 +773,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       renderSessionBar();
       requestSessions();
       send('voice.list', {});
+      try { send('voice.select', { name: state.voice || 'default', edgeVoice: $('edgeVoiceSelect').value }); } catch (e) { /* 忽略 */ }
       clearInterval(state.retryTimer);
       state.retryTimer = setInterval(function () { send('ping', { nonce: String(Date.now()) }); }, 25000);
     };
@@ -916,20 +837,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         break;
       case 'tts.text': {
         var ttsText = String(payload.text || '').trim();
-        if (!ttsText) break;
-        var ttsIndex = typeof payload.index === 'number' ? payload.index : state.ttsTurnTexts.length;
-        state.ttsTurnTexts.push(ttsText);
-        // 不立刻念：给本地 TTS 4 秒窗口；没等到 tts.audio 才降级系统语音。
-        // 只给第一段设兜底计时：本地 TTS 是逐句串行合成，后面几段天然会晚于 4s；
-        // 若首段一直没有音频（或宿主发来“降级”alert），再整体降级系统语音。
-        if (ttsIndex === 0) scheduleSpeechFallback(ttsIndex, ttsText, payload.charStart, payload.charEnd);
+        if (ttsText) state.ttsTurnTexts.push(ttsText);
         break;
       }
       case 'tts.audio': {
         var audioIndex = typeof payload.index === 'number' ? payload.index : 0;
         state.ttsAudioSeen[audioIndex] = true;
-        clearTimeout(state.ttsFallbacks[audioIndex]);
-        delete state.ttsFallbacks[audioIndex];
         if (typeof payload.charStart === 'number') state.replyCharPos = payload.charStart;
         playPcm(String(payload.data || ''), Number(payload.sampleRate) || 24000);
         break;
@@ -961,7 +874,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
           clearTimeout(state.audioTimer);
         }
         // 本地 TTS 失败：立刻把所有待念文本交给系统语音，别让用户等 4 秒兜底。
-        if (String(payload.text || '').indexOf('降级为系统语音') >= 0) fallbackAllSpeech();
         addEvent('alert', (payload.level === 'error' ? '错误：' : '') + (payload.text || ''));
         break;
       case 'event.done': addEvent('done', payload.text || '完成'); break;
@@ -1213,27 +1125,29 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   };
   /* 重读一遍：把本轮所有 tts 段拼回来的全文**从头重播**（不是只读最后一段）。 */
   $('speak').onclick = function () {
-    var texts = state.ttsTurnTexts.length ? state.ttsTurnTexts.slice() : (state.lastTranscript ? [state.lastTranscript] : []);
-    if (!texts.length && state.turnPcm.length === 0) { addEvent('alert', '还没有可重读的内容'); return; }
-    if (replayPcm()) {
-      addEvent('progress', '重读本轮全文（本地音频）');
-      return;
-    }
-    tts.replay(texts);
-    addEvent('progress', '重读本轮全文（系统语音，' + texts.length + ' 段）');
+    if (state.turnPcm.length === 0) { addEvent('alert', '还没有可重读的本地音频'); return; }
+    if (replayPcm()) addEvent('progress', '重读本轮全文（本地音频）');
   };
   $('ttsStop').onclick = function () {
-    tts.stop();
     stopPcm();
-    for (var key in state.ttsFallbacks) { clearTimeout(state.ttsFallbacks[key]); delete state.ttsFallbacks[key]; }
     addEvent('progress', '已停止朗读');
   };
 
   /* ---------- 音色：选择 / 上传参考音频 ---------- */
   $('voiceSelect').onchange = function () {
     state.voice = this.value || 'default';
-    send('voice.select', { name: state.voice });
+    send('voice.select', { name: state.voice, edgeVoice: $('edgeVoiceSelect').value });
     renderVoiceSelect();
+  };
+  (function initEdgeVoice() {
+    var saved = '';
+    try { saved = localStorage.getItem('tihu.edgeVoice') || ''; } catch (e) { /* 忽略 */ }
+    if (saved) $('edgeVoiceSelect').value = saved;
+  })();
+  $('edgeVoiceSelect').onchange = function () {
+    try { localStorage.setItem('tihu.edgeVoice', this.value); } catch (e) { /* 忽略 */ }
+    send('voice.select', { name: state.voice, edgeVoice: this.value });
+    addEvent('progress', '在线兜底音色：' + this.options[this.selectedIndex].textContent);
   };
   $('voiceRefresh').onclick = function () { send('voice.list', {}); };
   $('voiceFile').addEventListener('change', function (event) {

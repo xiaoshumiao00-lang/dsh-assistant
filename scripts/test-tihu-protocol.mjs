@@ -41,7 +41,6 @@ import {
   targetPathOf,
 } from '../src/tihu/guard.ts'
 import { createTihuRuntime, buildTihuUserMessage, TIHU_LANE_PATH, TIHU_PAGE_PATH } from '../src/tihu/lane.ts'
-import { TTS_QUEUE_SOURCE } from '../src/tihu/tts-queue.ts'
 import {
   applySessionEvent,
   clipText,
@@ -125,6 +124,8 @@ test('voice.list / voice.create / voice.select 字段校验', () => {
   assert.equal(parseUpstream(JSON.stringify(buildUpstream('voice.create', { name: 'bad name!', wavBase64: 'UklGR' }, 32))), null)
   assert.equal(parseUpstream(JSON.stringify(buildUpstream('voice.create', { name: 'ok', wavBase64: '' }, 33))), null)
   assert.ok(parseUpstream(JSON.stringify(buildUpstream('voice.select', { name: 'default' }, 34))) !== null)
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('voice.select', { name: 'default', edgeVoice: 'zh-CN-YunjianNeural' }, 36))) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('voice.select', { name: 'default', edgeVoice: 123 }, 37))), null)
   assert.equal(parseUpstream(JSON.stringify(buildUpstream('voice.select', { name: '' }, 35))), null)
 })
 
@@ -259,100 +260,6 @@ test('toTtsSegments：无标点超长单句仍硬切，不丢字', () => {
   assert.equal(segments.length, 4, '300 / 80 → 80+80+80+60')
   assert.deepEqual(segments.map((s) => s.length), [80, 80, 80, 60])
   assert.equal(segments.join(''), text)
-})
-
-/* ---------- 朗读队列（页面同一份源码） ---------- */
-
-console.log('[tihu] 朗读队列')
-
-function makeTtsQueue() {
-  const timers = new Map()
-  let nextTimer = 0
-  const spoken = []
-  const events = []
-  const state = { pendingDone: null, cancels: 0 }
-  const factory = new Function(TTS_QUEUE_SOURCE + '; return createTtsQueue;')()
-  const queue = factory({
-    speak(text, done) { spoken.push(text); state.pendingDone = done },
-    cancel() { state.cancels += 1; state.pendingDone = null },
-    setTimeout(fn, ms) { nextTimer += 1; timers.set(nextTimer, { fn, ms }); return nextTimer },
-    clearTimeout(id) { timers.delete(id) },
-    onEvent(kind, text) { events.push({ kind, text }) },
-  })
-  return {
-    queue,
-    spoken,
-    events,
-    timers,
-    cancels: () => state.cancels,
-    done() { const fn = state.pendingDone; state.pendingDone = null; if (fn) fn() },
-    runByMs(ms) {
-      for (const [id, timer] of [...timers]) {
-        if (timer.ms === ms) { timers.delete(id); timer.fn() }
-      }
-    },
-    pending() { return timers.size },
-  }
-}
-
-test('朗读队列：顺序播放、段间 200ms、清空/打断/重读', () => {
-  const h = makeTtsQueue()
-  h.queue.enqueue('第一段')
-  h.queue.enqueue('第二段')
-  h.queue.enqueue('第三段')
-  assert.deepEqual(h.spoken, ['第一段'], '只念第一段，其余排队（不是每段 cancel）')
-  h.done()
-  h.runByMs(200)
-  assert.deepEqual(h.spoken, ['第一段', '第二段'], 'onend 后 200ms 念第二段')
-  h.done()
-  h.runByMs(200)
-  assert.deepEqual(h.spoken, ['第一段', '第二段', '第三段'])
-  h.done()
-  h.runByMs(200)
-  assert.equal(h.queue.size(), 0)
-
-  // 停止朗读：立即 cancel + 清队列，迟到的 onend 不能再推进
-  h.queue.enqueue('A')
-  h.queue.enqueue('B')
-  assert.deepEqual(h.spoken.slice(-1), ['A'])
-  const before = h.spoken.length
-  h.queue.stop()
-  assert.equal(h.cancels(), 1)
-  assert.equal(h.queue.size(), 0)
-  h.done()
-  h.runByMs(200)
-  assert.equal(h.spoken.length, before, '停止后迟到的 onend 不应再念 B')
-
-  // 重读一遍：从第一段重新排队
-  h.queue.replay(['A', 'B'])
-  assert.equal(h.spoken.slice(-1)[0], 'A')
-  h.done()
-  h.runByMs(200)
-  assert.equal(h.spoken.slice(-1)[0], 'B')
-})
-
-test('朗读队列：onend 不回调时按文本长度超时推进', () => {
-  const h = makeTtsQueue()
-  h.queue.enqueue('一') // 1 字 → 估时下限 1000ms → 兜底 3500ms
-  assert.deepEqual(h.spoken, ['一'])
-  h.runByMs(3500) // 不调用 done，直接触发超时
-  assert.ok(h.events.some((event) => event.kind === 'timeout'))
-  h.runByMs(200)
-  assert.equal(h.queue.size(), 0)
-  h.queue.enqueue('下一段')
-  assert.equal(h.spoken.slice(-1)[0], '下一段', '超时后继续下一段')
-})
-
-test('朗读队列：上限 200 段、空文本忽略、新一轮清空', () => {
-  const h = makeTtsQueue()
-  h.queue.enqueue('')
-  assert.equal(h.queue.size(), 0)
-  for (let i = 0; i < 250; i += 1) h.queue.enqueue('第' + i + '段')
-  assert.equal(h.queue.size(), 200, '队列上限 200（第一段已在朗读，队列里 200）')
-  assert.ok(h.events.some((event) => event.kind === 'drop'))
-  h.queue.stop()
-  assert.equal(h.queue.size(), 0)
-  assert.ok(h.events.some((event) => event.kind === 'stop'))
 })
 
 /* ---------- 三道闸 ---------- */
@@ -574,7 +481,10 @@ await testAsync('页面 HTML 包含 lane 地址与屏幕区', async () => {
   const html = runtime.page()
   assert.ok(html.includes('/tihu/lane'))
   assert.ok(html.includes('鹈鹕'))
-  assert.ok(html.includes('speechSynthesis'))
+  assert.ok(!html.includes('speechSynthesis'), '页面必须彻底移除 speechSynthesis')
+  assert.ok(html.includes('edgeVoiceSelect'), '页面要有兜底音色下拉')
+  assert.ok(html.includes('tihu.edgeVoice'), '兜底音色要持久化到 localStorage')
+  assert.ok(html.includes('zh-CN-YunjianNeural'), '默认兜底音色是云健')
   assert.ok(html.includes('audio.frame'))
   // 2026-11-07 P0：公网 origin 下页面要能自己选会话（会话记忆只存本 origin 的 key）
   assert.ok(html.includes('dsh.tihu.session'), '页面要使用自己的会话 key')
@@ -691,13 +601,13 @@ function agentsFixture(ids) {
   }
 }
 
-function runtimeFor(records, extras = {}) {
+function runtimeFor(records, extras = {}, ttsOptions = {}) {
   const fixture = fakeCtx({
     sessionQuery: sessionQueryFixture(records),
     sessionProjectionCache: projectionCacheFixture(records),
     ...extras,
   })
-  return { ...fixture, runtime: createTihuRuntime(fixture.ctx, { log: () => {}, tts: { disabled: true } }) }
+  return { ...fixture, runtime: createTihuRuntime(fixture.ctx, { log: () => {}, tts: { disabled: true, ...ttsOptions } }) }
 }
 
 function openLane(runtime) {
@@ -1145,6 +1055,66 @@ await testAsync('lane：长回复的 TTS 段全部下发（不再丢 320 字以�
   assert.deepEqual(frames.map((frame) => frame.payload.index), [...Array(frames.length).keys()], 'index 从 0 连续')
   assert.ok(frames.every((frame) => frame.payload.total === frames.length), 'total 必须一致')
   assert.equal(frames.map((frame) => frame.payload.text).join(''), text.replace(/\s+/g, ' ').trim(), '不能丢字')
+  runtime.dispose()
+})
+
+/* ---------- 降级链：GPU 不可用 / SAPI 失败 ---------- */
+
+function fakeTts({ model = 'Windows SAPI', fail = false } = {}) {
+  return {
+    async ensureServer() {},
+    status: () => ({ available: true, model }),
+    engineLabel: (voice) => model === 'Windows SAPI' ? '离线兜底：Windows SAPI Huihui' : ('本地 TTS：' + model + ' / 音色 ' + voice),
+    takeEngineNote: () => '',
+    deviceFallback: () => '',
+    available: () => true,
+    async synthesize(_text, options) {
+      if (fail) throw new Error('SAPI 无法发声')
+      options.onChunk({ data: Buffer.alloc(4800), seq: 0, total: 1, final: true })
+    },
+    async createVoice() { throw new Error('n/a') },
+    async listVoices() { return [{ name: 'default', kind: 'default' }] },
+    dispose() {},
+  }
+}
+
+await testAsync('lane：GPU 不可用 → 直接 SAPI，不出现 CPU 引擎', async () => {
+  const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true, lastPromptAt: 1000 })], {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'sapi', protocol: '0', sessionId: 'session-1' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: '第一句。第二句。' }] } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  const frames = framesOf(socket)
+  const progress = frames.filter((frame) => frame.type === 'event.progress').map((frame) => frame.payload.text)
+  assert.ok(progress.includes('离线兜底：Windows SAPI Huihui'), `引擎标识应为 SAPI，实际 ${progress.join(' | ')}`)
+  assert.ok(frames.some((frame) => frame.type === 'tts.audio'), 'SAPI 也要下发 tts.audio')
+  assert.ok(!frames.some((frame) => JSON.stringify(frame.payload).includes('qwen')), '不能再出现 GPU/CPU 引擎标识')
+  runtime.dispose()
+})
+
+await testAsync('lane：SAPI 也失败 → error alert，屏幕仍保留 reply 正文', async () => {
+  const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true, lastPromptAt: 1000 })], {}, { instance: fakeTts({ fail: true }) })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'sapi-fail', protocol: '0', sessionId: 'session-1' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: '第一句。第二句。' }] } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  const frames = framesOf(socket)
+  const alerts = frames.filter((frame) => frame.type === 'event.alert').map((frame) => frame.payload)
+  assert.ok(alerts.some((alert) => alert.level === 'error' && String(alert.text).includes('所有本地 TTS 均不可用')), '必须发 error alert')
+  const screens = frames.filter((frame) => frame.type === 'screen.frame')
+  const last = screens[screens.length - 1].payload
+  assert.equal(last.mode, 'reply')
+  assert.ok(Array.isArray(last.reply.sentences) && last.reply.sentences.length > 0, '屏幕正文不能清掉')
   runtime.dispose()
 })
 
