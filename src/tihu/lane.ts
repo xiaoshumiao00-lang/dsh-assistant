@@ -655,13 +655,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     if (active === undefined) {
       device.sessionId = undefined
       if (reason === 'hello') {
-        device.send('event.alert', { level: 'warn', text: '没有可自动绑定的 Computer Use 会话：先在桌面端新建一个 CU 会话' })
-        device.send('screen.frame', {
-          stage: '等待会话',
-          title: '没有可自动绑定的 CU 会话',
-          bullets: ['先在桌面端新建 Computer Use 会话', '再回来点「刷新会话列表」'],
-          tone: 'alert',
-        } satisfies ScreenFramePayload)
+        device.send('event.alert', { level: 'warn', text: '没有可自动绑定的 Computer Use 会话，已显示控制室主页' })
+        await sendHome('__unbound__', device)
       }
       log(`tihu auto bind: no computer-use session (${reason})`)
       return
@@ -727,7 +722,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   }
 
   /** 主页屏：用会话快照按 cwd 分组兜底（控制室卡片本体在主客户端，host 拿不到）。 */
-  async function sendHome(sessionId: string): Promise<void> {
+  async function sendHome(sessionId: string, device?: TihuDevice): Promise<void> {
     let rows: TihuSessionRow[] = []
     try { rows = (await collectSessionRows()).rows } catch { rows = [] }
     const groups = new Map<string, { name: string; rows: TihuSessionRow[] }>()
@@ -765,7 +760,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       status: project.status,
       summary: project.summary,
     }))
-    screen(sessionId, {
+    const frame: ScreenFramePayload = {
       stage: '控制室',
       title: '',
       bullets: [],
@@ -774,7 +769,9 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       home: { projects: pageProjects, page: { index: state.page, total: totalPages }, total: projects.length },
       pending: (pendingByDisplay.get(sessionId) ?? []).slice(0, 4).map((item) => ({ sessionId: item.sessionId, title: item.title, at: item.at, unread: true as const })),
       pendingCount: (pendingByDisplay.get(sessionId) ?? []).length,
-    })
+    }
+    if (device !== undefined) device.send('screen.frame', frame)
+    else screen(sessionId, frame)
   }
 
   function enqueuePending(completedSessionId: string): void {
@@ -1435,16 +1432,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       } else {
         device.autoFollow = false
         device.sessionId = undefined
-        device.send('screen.frame', {
-          stage: '连接',
-          title: payload.deviceName ?? '鹈鹕模拟设备',
-          bullets: [
-            `协议 v${TIHU_PROTOCOL_VERSION}`,
-            '还没有选定 Computer Use 会话：在页面下面的列表里选一个',
-            caps.microphone === false ? '无麦克风：用 WAV 文件驱动' : '麦克风可用',
-          ],
-          tone: 'idle',
-        } satisfies ScreenFramePayload)
+        await sendHome('__unbound__', device)
       }
       device.send('event.progress', { stage: '连接', text: `设备 ${device.id} 已就绪` } satisfies ProgressPayload)
       log(`tihu hello client=${payload.clientId} session=${device.sessionId ?? '?'} caps=${JSON.stringify(caps)}`)
@@ -1625,6 +1613,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
             ? '没有可自动绑定的 Computer Use 会话：先在桌面端新建一个'
             : '还没有选定会话：点页面下面的会话列表选一个',
         })
+        await sendHome('__unbound__', device)
         return
       }
       // 收到 tihu 消息就续期（「120 秒无 tihu 消息自动失效」的另一半）。
