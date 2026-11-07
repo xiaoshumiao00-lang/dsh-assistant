@@ -1223,6 +1223,98 @@ await testAsync('lane：完成 + 10s 回主页；未完成/浏览模式不切', 
 })
 
 
+await testAsync('lane：A turn 进行中（turn/start 后无 turn/end），TTS 播完且超时 → 不收 home 帧；turn/end 后回主页', async () => {
+  process.env.TIHU_HOME_AFTER_MS = '300'
+  process.env.TIHU_HOME_RECHECK_MS = '100'
+  const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+  const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'guard', protocol: '0', sessionId: 'session-a' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const emit = (event) => onSessionEvent({ id: 'session-a', header: { id: 'session-a' } }, event)
+
+  // 第一轮完整走完：TTS 播完 + done=true，屏幕在会话屏
+  emit({ type: 'turn/start', data: { turn: 1 } })
+  emit({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'A 的第一句。A 的第二句。' }] } } })
+  emit({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  // 第二轮开始但不结束：turn/start 后无 turn/end（A 的 turn 进行中）
+  const framesBefore = framesOf(socket).filter((frame) => frame.type === 'screen.frame').length
+  emit({ type: 'turn/start', data: { turn: 2 } })
+  await new Promise((resolve) => setTimeout(resolve, 500))
+
+  const homeDuring = framesOf(socket)
+    .filter((frame) => frame.type === 'screen.frame')
+    .slice(framesBefore)
+    .filter((frame) => frame.payload.mode === 'home')
+  assert.equal(homeDuring.length, 0, 'turn 进行中不得发 home 帧（超过 TIHU_HOME_AFTER_MS 也不行）')
+
+  // turn 结束 → 等 TIHU_HOME_AFTER_MS 后应收到 home 帧
+  emit({ type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+  await new Promise((resolve) => setTimeout(resolve, 800))
+  const homeAfter = framesOf(socket)
+    .filter((frame) => frame.type === 'screen.frame')
+    .filter((frame) => frame.payload.mode === 'home')
+  assert.ok(homeAfter.length > 0, 'turn 结束后应回主页')
+  delete process.env.TIHU_HOME_AFTER_MS
+  delete process.env.TIHU_HOME_RECHECK_MS
+  runtime.dispose()
+})
+
+
+await testAsync('lane：无回复 turn（无 assistant/message）也能回主页', async () => {
+  process.env.TIHU_HOME_AFTER_MS = '200'
+  process.env.TIHU_HOME_RECHECK_MS = '100'
+  const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+  const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'noreply', protocol: '0', sessionId: 'session-a' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const emit = (event) => onSessionEvent({ id: 'session-a', header: { id: 'session-a' } }, event)
+
+  emit({ type: 'turn/start', data: { turn: 1 } })
+  emit({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+  const homes = framesOf(socket)
+    .filter((frame) => frame.type === 'screen.frame')
+    .filter((frame) => frame.payload.mode === 'home')
+  assert.ok(homes.length > 0, '无回复 turn 结束 + 超时后应回主页')
+  delete process.env.TIHU_HOME_AFTER_MS
+  delete process.env.TIHU_HOME_RECHECK_MS
+  runtime.dispose()
+})
+
+
+await testAsync('lane：B 发 turn/start → 绑定到空闲会话 A 的设备收到 session.bound followed=true 且绑定到 B', async () => {
+  const records = [
+    cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' }),
+    cuRecord('session-b', { live: true, cwd: '/b', lastPromptAt: 1000, title: '会话 B' }),
+  ]
+  const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'follow', protocol: '0', sessionId: 'session-a' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const emit = (id, event) => onSessionEvent({ id, header: { id } }, event)
+
+  // A 空闲（无 turn 在跑）；B 开始 turn
+  emit('session-b', { type: 'turn/start', data: { turn: 1 } })
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  const bounds = framesOf(socket).filter((frame) => frame.type === 'session.bound')
+  const followed = bounds.filter((frame) => frame.payload.followed === true)
+  assert.ok(followed.length > 0, '应收到 followed=true 的 session.bound')
+  assert.equal(followed[followed.length - 1].payload.sessionId, 'session-b', '应绑定到 B')
+  // 跟随提示
+  const progresses = framesOf(socket)
+    .filter((frame) => frame.type === 'event.progress' && frame.payload.stage === '跟随')
+  assert.ok(progresses.length > 0, '应发「跟随」event.progress')
+  runtime.dispose()
+})
+
+
 await testAsync('lane：别的会话完成入待读气泡，tap 切屏并从头朗读，不打断当前会话', async () => {
   const records = [
     cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' }),

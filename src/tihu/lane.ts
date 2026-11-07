@@ -93,6 +93,12 @@ const TRANSCRIBE_TIMEOUT_MS = 45_000
 const ACTIVE_WINDOW_MS = 120_000
 /** 确认超时（设备在线但没人点）。 */
 const CONFIRM_TIMEOUT_MS = 60_000
+/**
+ * 回主页守门重试间隔：scheduleHome 的 timer 触发时若还有任何会话的 turn 在跑
+ * （runningSessions 非空），不回主页，按这个间隔再查一次。
+ * 可用环境变量 TIHU_HOME_RECHECK_MS 覆盖（测试里设小）。
+ */
+const TIHU_HOME_RECHECK_MS = Number(process.env.TIHU_HOME_RECHECK_MS ?? 2_000)
 
 /** 一个已连接的设备（P0 一个页面一个连接）。 */
 interface TihuDevice {
@@ -231,6 +237,14 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const screenStates = new Map<string, ScreenScrollState>()
   /** 每会话的屏幕模式与回主页计时。 */
   const homeStates = new Map<string, { mode: 'home' | 'session'; page: number; done: boolean; timer?: ReturnType<typeof setTimeout> }>()
+  /**
+   * 运行中的 turn 跟踪：sessionId → turn/start 时间戳。
+   * 2026-11-07 新需求：只要**任何** CU 会话有 turn 在跑，屏幕就必须停在会话详情，
+   * 不允许回主页控制室；只有所有会话都停了才允许回主页。
+   * 注意：这条跟踪必须在 session/event 处理器的「设备早退」**之前**更新——
+   * 没绑定该会话的设备收不到事件，早退会把跟踪丢掉。
+   */
+  const runningSessions = new Map<string, number>()
   /** 显示会话 id → 待读气泡（别的会话完成时入队）。 */
   let disposed = false
   const pendingByDisplay = new Map<string, { sessionId: string; title: string; at: number }[]>()
@@ -798,6 +812,12 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       if (current === undefined || !current.done) return
       const scroll = screenStates.get(sessionId)
       if (scroll !== undefined && !scroll.follow) return   // 用户正在浏览历史，禁止切
+      // 守门：只要还有任何会话的 turn 在跑，就不回主页——屏幕必须显示运行中的会话详情。
+      // 按 TIHU_HOME_RECHECK_MS 再查一次；turn/end 会清掉 runningSessions，重试自然收敛。
+      if (runningSessions.size > 0) {
+        current.timer = setTimeout(() => scheduleHome(sessionId), TIHU_HOME_RECHECK_MS)
+        return
+      }
       void sendHome(sessionId).catch((error) => log(`tihu home failed: ${(error as Error)?.message ?? String(error)}`))
     }, Number.isFinite(delay) ? delay : 10_000)
   }
@@ -1166,6 +1186,29 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
 
   /* ---------- 会话事件 → 屏 ---------- */
 
+  /**
+   * turn/start 自动跟随：任何 CU 会话的 turn 一开始，「空闲且没有自己 turn 在跑」
+   * 的设备自动跟随到这个会话——屏幕必须显示正在运行的会话详情。
+   * 已绑定到该会话的设备不动；用户正在浏览历史（follow===false 且就是当前
+   * 会话）的设备也不动，不打扰。
+   * 放在设备早退**之外**：事件对应的会话可能没有任何设备绑定，但别的设备仍要跟过去。
+   */
+  function followRunningTurn(sessionId: string): void {
+    for (const device of devices) {
+      if (device.sessionId === undefined) continue
+      if (device.sessionId === sessionId) continue
+      if (runningSessions.has(device.sessionId)) continue
+      const scroll = screenStates.get(device.sessionId)
+      if (scroll !== undefined && !scroll.follow) continue
+      void bindSession(device, sessionId, { auto: true, followed: true }).then(() => {
+        device.send('event.progress', {
+          stage: '跟随',
+          text: `已自动跟随到：${shortSessionId(sessionId)}`,
+        } satisfies ProgressPayload)
+      }).catch((error) => log(`tihu turn/start follow failed: ${(error as Error)?.message ?? String(error)}`))
+    }
+  }
+
   const disposeSession = ctx.on?.('session/event', (session: any, event: any) => {
     try {
       const sessionId = sessionIdOf(session)
@@ -1180,8 +1223,13 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
           if (sessionListCache !== undefined) sessionListCache.rows = sortSessionRows(sessionListCache.rows)
         }
       }
-      if (![...devices].some((device) => device.sessionId === sessionId)) return
       const type = String(event?.type ?? '')
+      if (type === 'turn/start') runningSessions.set(sessionId, Date.now())
+      else if (type === 'turn/end') runningSessions.delete(sessionId)
+      // 运行跟踪与自动跟随都在设备早退**之前**：没绑定该会话的设备收不到事件，
+      // 若放在早退之后，别的会话的 turn/start/end 会把跟踪与跟随丢得一干二净。
+      if (type === 'turn/start') followRunningTurn(sessionId)
+      if (![...devices].some((device) => device.sessionId === sessionId)) return
       const data = event?.data ?? {}
 
       // 屏幕帧 / 事件行统一交给纯函数映射（progress.ts）：stage、动词+目标、步骤计数、
@@ -1271,6 +1319,9 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         homeStates.set(sessionId, hs)
         if (okReason) enqueuePending(sessionId)
         // 不在这里启动计时：要等朗读真正结束（speakLocally 完成/失败）再计时。
+        // 无回复 turn（assistant/message 为空）也能回主页：这里兜底一次 scheduleHome，
+        // 已有早退和 done 检查兜底，重复调用无害。
+        setTimeout(() => scheduleHome(sessionId), 50)
         return
       }
     } catch (error) {
