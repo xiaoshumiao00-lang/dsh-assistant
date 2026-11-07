@@ -100,6 +100,18 @@ const CONFIRM_TIMEOUT_MS = 60_000
  */
 const TIHU_HOME_RECHECK_MS = Number(process.env.TIHU_HOME_RECHECK_MS ?? 2_000)
 
+/**
+ * 朗读收尾余量：lane 的播放时间轴是「首块到达 + 累计音频时长」的投影，页面实际
+ * 起播还差一个 ~30ms 的排程缓冲；留这点余量，回主页才不会被最后半句抢跑。
+ */
+const SPEAK_TAIL_MARGIN_MS = 120
+
+/** 环境变量整数化 + 夹到安全区间（NaN / 0 / 负数一律回落兜底值）。 */
+function clampInt(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min
+  return Math.max(min, Math.min(max, Math.round(value)))
+}
+
 /** 一个已连接的设备（P0 一个页面一个连接）。 */
 interface TihuDevice {
   id: string
@@ -245,6 +257,16 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
    * 没绑定该会话的设备收不到事件，早退会把跟踪丢掉。
    */
   const runningSessions = new Map<string, number>()
+  /**
+   * 朗读（音频）状态：sessionId → { speaking, until }。
+   *   - speaking：正在跑的 speakLocally 数（合成+下发还没结束就算「在播」）；
+   *   - until：投影的播放结束时刻（按每段音频时长累加，与页面 AudioContext 同一口径）。
+   * 2026-11-07 实测缺陷：长回复读到一半，turn 已经结束（runningSessions 空），
+   * 但音频还在播/队列还没播完，旧的 scheduleHome 只看 runningSessions 就切了主页；
+   * 之后 speakLocally 里按播放时刻排的 reply 屏帧到期，又把屏切回回复页——
+   * 用户看到的就是「读到一半跳控制室主页，过一会自己跳回来继续读」。
+   */
+  const readingStates = new Map<string, { speaking: number; until: number }>()
   /** 显示会话 id → 待读气泡（别的会话完成时入队）。 */
   let disposed = false
   const pendingByDisplay = new Map<string, { sessionId: string; title: string; at: number }[]>()
@@ -800,6 +822,37 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     }
   }
 
+  /** 朗读开始（多设备同会话会并发调用，按计数累加）。 */
+  function speakingStart(sessionId: string): void {
+    const state = readingStates.get(sessionId) ?? { speaking: 0, until: 0 }
+    state.speaking += 1
+    readingStates.set(sessionId, state)
+    cancelHomeTimer(sessionId)
+  }
+  /** 播放时间轴推进：把投影的播完时刻往前推（只增不减）。 */
+  function speakingProgress(sessionId: string, until: number): void {
+    const state = readingStates.get(sessionId)
+    if (state === undefined) return
+    state.until = Math.max(state.until, until)
+  }
+  /** 朗读结束：留到最后一块音频真正播完（含少量余量）才算不忙。 */
+  function speakingStop(sessionId: string, until: number): void {
+    const state = readingStates.get(sessionId)
+    if (state === undefined) return
+    state.speaking = Math.max(0, state.speaking - 1)
+    state.until = Math.max(state.until, until)
+    if (state.speaking === 0 && state.until <= Date.now()) readingStates.delete(sessionId)
+  }
+  /** 还有音频在播/队列没播完 → 不能回主页。 */
+  function readingBusy(sessionId: string): boolean {
+    const state = readingStates.get(sessionId)
+    if (state === undefined) return false
+    if (state.speaking > 0) return true
+    if (state.until > Date.now()) return true
+    readingStates.delete(sessionId)
+    return false
+  }
+
   function scheduleHome(sessionId: string): void {
     if (disposed) return
     const state = homeStates.get(sessionId)
@@ -814,7 +867,9 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       if (scroll !== undefined && !scroll.follow) return   // 用户正在浏览历史，禁止切
       // 守门：只要还有任何会话的 turn 在跑，就不回主页——屏幕必须显示运行中的会话详情。
       // 按 TIHU_HOME_RECHECK_MS 再查一次；turn/end 会清掉 runningSessions，重试自然收敛。
-      if (runningSessions.size > 0) {
+      // 朗读也同理：音频还在播/待播队列非空就还不算「空闲」，否则长回复读到一半就跳主页，
+      // 后面的 reply 屏帧到期又把屏切回来（用户实测的「跳主页又自己跳回来」）。
+      if (runningSessions.size > 0 || readingBusy(sessionId)) {
         current.timer = setTimeout(() => scheduleHome(sessionId), TIHU_HOME_RECHECK_MS)
         return
       }
@@ -837,13 +892,25 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     }
     device.send('event.progress', { stage: 'tts', text: tts.engineLabel(voice) } satisfies ProgressPayload)
     /**
-     * 预取流水线（2026-11-07）：旧实现逐句串行 await tts.synthesize()，第 N 句全部
-     * 合成完才开始第 N+1 句；edge-tts 每句首块 1.25–3.1s，客户端把 PCM 排在
-     * AudioContext 时间轴上，下一段迟到超过前句剩余播放时长就出现「一会有声一会
-     * 没声」的静音缝。改成流水线：第 N 句**首块到达**就启动第 N+1 句，最多 2 个
-     * 在途合成任务。单句内部 chunk 顺序不变；音频按句 index 顺序发送。
+     * 预取流水线（2026-11-07 二修：治「读了几句没声音了」）。
+     *
+     * 实测（本机 edge-tts zh-CN-YunjianNeural rate +45%，8 段干净样本）：
+     *   单段合成 1.87–2.53s（均值 2.21s）；首块 1.55–2.31s ≈ 合成总耗时的 86%
+     *   （edge 几乎不流式：首块一到基本就是整段）；单段音频 1.56–2.71s（均值 2.07s）；
+     *   限流抖动时单段能到 6.1s（≈ 2 段音频）。
+     * 旧实现三个问题叠在一起：
+     *   ① 预取只有 2 段（≈4s 余量），一次抖动就抽干 → 静音；
+     *   ② 启动段号用 `index + inFlight.size` 推算：后启动的段先完成时会**把同一段
+     *      再合成一遍**（实测 12 段被合成 30 次），并发额度全烧在重复合成上；
+     *   ③ 任意一段失败就整轮终止（首块 3.5s 门限一到就杀进程），后半段永远不念。
+     * 现在：启动游标单调递增（每段只合成一次）；按「已有着落的音频余量」补位，
+     * 默认最多 4 段并发、目标提前量 12s（TIHU_SYNTH_MAX_INFLIGHT / TIHU_SYNTH_AHEAD_MS 可调）；
+     * 单段失败重试一次，仍失败就跳过这一句并**红告警**，后面的照常念。
+     * 合成本身并发，但 tts.audio 永远按句 index 顺序下发，首块到达即起播（首屏不等人）。
      */
-    const MAX_INFLIGHT_SYNTH = 2
+    const maxInflight = clampInt(Number(process.env.TIHU_SYNTH_MAX_INFLIGHT ?? 4), 2, 8)
+    const aheadTargetMs = clampInt(Number(process.env.TIHU_SYNTH_AHEAD_MS ?? 12_000), 3_000, 30_000)
+    const errorText = (value: unknown): string => (value as Error)?.message ?? String(value)
     type SynthResult = { ok: true; audioMs: number } | { ok: false; error: unknown }
     /**
      * 播放时间轴（2026-11-07 修「高亮文字与语音不同步」）：
@@ -870,8 +937,14 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     const audioBuffers: TtsAudioPayload[][] = speechSegments.map(() => [])
     /** 已合成结束（成功或失败）的句：缓冲区排空后可以把 flushIndex 往前推。 */
     const flushed = new Set<number>()
+    /** 整轮放弃后不再下发任何音频（否则后半段 PCM 还会冒出来，而屏已经停在别处）。 */
+    let aborted = false
     let flushIndex = 0
     const flushAudio = (): void => {
+      if (aborted) {
+        for (const queue of audioBuffers) queue.length = 0
+        return
+      }
       while (flushIndex < audioBuffers.length) {
         const queue = audioBuffers[flushIndex]
         for (const payload of queue.splice(0)) device.send('tts.audio', payload)
@@ -882,13 +955,14 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         break
       }
     }
-    const synthSegment = (segment: SpeechSegment, segmentIndex: number, onFirstChunk: () => void): Promise<SynthResult> =>
+    const synthAttempt = (segment: SpeechSegment, segmentIndex: number, onFirstChunk: () => void): Promise<SynthResult> =>
       tts.synthesize(segment.text, {
         voice,
         sessionId,
         edgeVoice: device.edgeVoice,
         offlineOnly: device.offlineOnly,
         onChunk: (chunk) => {
+          if (aborted) return
           onFirstChunk()
           audioBuffers[segmentIndex].push({
             seq: chunk.seq,
@@ -906,14 +980,11 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
           flushAudio()
         },
       }).then(
-        (result) => {
-          flushed.add(segmentIndex)
-          flushAudio()
-          return { ok: true, audioMs: Math.max(0, Number(result?.audioMs) || 0) } as SynthResult
-        },
-        (error) => { flushed.add(segmentIndex); flushAudio(); return { ok: false, error } as SynthResult },
+        (result) => ({ ok: true, audioMs: Math.max(0, Number(result?.audioMs) || 0) } as SynthResult),
+        (error) => ({ ok: false, error } as SynthResult),
       )
 
+    speakingStart(sessionId)
     try {
       const results = new Array<SynthResult | undefined>(speechSegments.length).fill(undefined)
       const inFlight = new Set<Promise<void>>()
@@ -933,26 +1004,57 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         return new Promise<void>((resolve) => { waiter = resolve })
       }
 
-      // 启动第 index 句的合成；首块到达或合成结束时唤醒泵。
       /** 每段首块到达的墙钟时刻（页面就是从这一刻开始排它进音频时间轴）。 */
       const firstChunkAt: number[] = speechSegments.map(() => 0)
-      const launch = (index: number): void => {
+      /** 已合成段的实际音频时长（用于估「在途合成还能产出多少音频」）。 */
+      const audioMsList: number[] = []
+
+      /** 合成一段；失败重试一次（只在这一段还没吐出过任何音频时才重试，避免重复发声）。 */
+      const runSegment = async (index: number): Promise<SynthResult> => {
         const segment = speechSegments[index]
-        let firstChunkSeen = false
-        const task = synthSegment(segment, index, () => {
-          if (firstChunkSeen) return
-          firstChunkSeen = true
-          firstChunkAt[index] = Date.now()
-          // 首块到达：让泵接着启动后续句子（保持最多 MAX_INFLIGHT_SYNTH 个在途）。
-          notify()
-        })
-        const done = task.then((result) => {
+        let last: SynthResult = { ok: false, error: new Error('未开始合成') }
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          if (aborted) break
+          last = await synthAttempt(segment, index, () => {
+            if (firstChunkAt[index] === 0) firstChunkAt[index] = Date.now()
+            notify()
+          })
+          if (last.ok) break
+          if (audioBuffers[index].length > 0) break
+          if (attempt === 0) log(`tihu tts retry session=${sessionId} index=${index}: ${errorText(last.error)}`)
+        }
+        // 这一段结束了（成功或最终失败）都要标记，flushIndex 才能继续往前推进。
+        flushed.add(index)
+        flushAudio()
+        return last
+      }
+
+      const launch = (index: number): void => {
+        const done = runSegment(index).then((result) => {
           results[index] = result
-          if (!result.ok && firstError === undefined) firstError = result.error
+          if (result.ok) audioMsList.push(result.audioMs)
           inFlight.delete(done)
           notify()
         })
         inFlight.add(done)
+      }
+
+      /**
+       * 补位策略：按「已有着落的音频」补，而不是固定并发数。
+       * aheadMs = 已排程未播完 + 在途合成预计产出的时长；不到目标提前量就继续启动。
+       * 启动游标 nextToLaunch 单调递增——这是修「重复合成」的关键（旧代码用
+       * index + inFlight.size，段完成乱序时会重合成同一段）。
+       */
+      let nextToLaunch = 0
+      const avgAudioMs = (): number =>
+        audioMsList.length === 0 ? 2_500 : audioMsList.reduce((sum, ms) => sum + ms, 0) / audioMsList.length
+      const aheadMs = (): number => Math.max(0, playbackEndAt.value - Date.now()) + inFlight.size * avgAudioMs()
+      const fill = (): void => {
+        while (nextToLaunch < speechSegments.length && inFlight.size < maxInflight) {
+          if (inFlight.size > 0 && aheadMs() >= aheadTargetMs) break
+          launch(nextToLaunch)
+          nextToLaunch += 1
+        }
       }
 
       // 按句顺序消费结果：合成本身并发，但**推进屏帧的时机**严格按播放时间轴——
@@ -960,25 +1062,34 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       const frames: Promise<void>[] = []
       const pump = (async () => {
         for (let index = 0; index < speechSegments.length; index += 1) {
+          fill()
           while (results[index] === undefined && firstError === undefined) {
-            while (inFlight.size < MAX_INFLIGHT_SYNTH && firstError === undefined) {
-              const next = index + inFlight.size
-              if (next >= speechSegments.length) break
-              launch(next)
-            }
+            fill()
             if (results[index] !== undefined || firstError !== undefined) break
             await waitForChange(generation)
           }
           if (firstError !== undefined) break
           const result = results[index] as SynthResult
           if (!result.ok) {
-            if (firstError === undefined) firstError = result.error
-            break
+            if (index === 0) {
+              // 第一段就失败了：没有可念的内容，整轮按失败处理（沿用「本次无语音」告警）。
+              aborted = true
+              firstError = result.error
+              break
+            }
+            // 中途某段重试后仍失败：跳过这一句继续往下念，并红告警（绝不静默停下）。
+            log(`tihu tts skip session=${sessionId} index=${index}/${speechSegments.length}: ${errorText(result.error)}`)
+            device.send('event.alert', {
+              level: 'error',
+              text: `第 ${index + 1}/${speechSegments.length} 段朗读失败，已跳过继续（原因：${errorText(result.error).slice(0, 60)}）`,
+            })
+            continue
           }
           const segment = speechSegments[index]
           // 音频真正开始播放的时刻：首块到达，或上一段播完（页面按 pcmNextTime 排队）。
           const startAt = Math.max(firstChunkAt[index] > 0 ? firstChunkAt[index] : Date.now(), playbackEndAt.value)
           playbackEndAt.value = startAt + result.audioMs
+          speakingProgress(sessionId, playbackEndAt.value)
           // 屏帧/滚动/引擎提示都在播放时刻推进——与音频同一个基准（不再用合成完成）。
           frames.push(frameAt(startAt, () => {
             const scrollState = screenStates.get(sessionId)
@@ -1010,10 +1121,13 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       sendReply(sessionId, sentences, sentences.length - 1, last.end, includeAll)
       setTimeout(() => scheduleHome(sessionId), 50)
     } catch (error) {
-      const message = (error as Error)?.message ?? String(error)
+      const message = errorText(error)
       log(`tihu tts failed session=${sessionId} voice=${voice}: ${message}`)
       device.send('event.alert', { level: 'error', text: `本次无语音：在线兜底不可用且本地引擎未就绪（原因：${message}）` })
       setTimeout(() => scheduleHome(sessionId), 50)
+    } finally {
+      // 已经下发的音频还在播：这段时间算「朗读中」，回主页要等它播完。
+      speakingStop(sessionId, playbackEndAt.value + SPEAK_TAIL_MARGIN_MS)
     }
   }
 
