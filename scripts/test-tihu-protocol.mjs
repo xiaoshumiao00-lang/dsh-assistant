@@ -1218,6 +1218,63 @@ await testAsync('lane：完成 + 10s 回主页；未完成/浏览模式不切', 
   runtime.dispose()
 })
 
+
+await testAsync('lane：别的会话完成入待读气泡，tap 切屏并从头朗读，不打断当前会话', async () => {
+  const records = [
+    cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' }),
+    cuRecord('session-b', { live: true, cwd: '/b', lastPromptAt: 1000, title: '会话 B' }),
+  ]
+  const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+  const socketA = openLane(runtime)
+  const socketB = openLane(runtime)
+  socketA.emit('data', clientFrame(buildUpstream('hello', { clientId: 'dev-a', protocol: '0', sessionId: 'session-a' }, 1)))
+  socketB.emit('data', clientFrame(buildUpstream('hello', { clientId: 'dev-b', protocol: '0', sessionId: 'session-b' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const emit = (id, event) => onSessionEvent({ id, header: { id } }, event)
+
+  // A 正在回复
+  emit('session-a', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'A 的第一句。A 的第二句。' }] } } })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  const audioBefore = framesOf(socketA).filter((frame) => frame.type === 'tts.audio').length
+
+  // B 完成 → A 右侧 pending，A 不被切
+  emit('session-b', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'B 的第一句。B 的第二句。' }] } } })
+  emit('session-b', { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  let screens = framesOf(socketA).filter((frame) => frame.type === 'screen.frame')
+  let last = screens[screens.length - 1].payload
+  assert.equal(last.mode, 'reply')
+  assert.equal(last.pending.length, 1)
+  assert.equal(last.pending[0].sessionId, 'session-b')
+  assert.equal(framesOf(socketA).filter((frame) => frame.type === 'tts.audio').length, audioBefore, '入队不打断当前朗读')
+
+  // 重复完成去重
+  emit('session-b', { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  screens = framesOf(socketA).filter((frame) => frame.type === 'screen.frame')
+  assert.equal(screens[screens.length - 1].payload.pending.length, 1, '同会话去重')
+
+  // tap 气泡 → 切到 B 并从头朗读，队列移除
+  const tapFrame = buildUpstream('screen.gesture', { action: 'tap', x: 280, y: 30, hit: 'chip', targetSessionId: 'session-b' }, 2)
+  socketA.emit('data', clientFrame(tapFrame))
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  screens = framesOf(socketA).filter((frame) => frame.type === 'screen.frame')
+  last = screens[screens.length - 1].payload
+  assert.equal(last.mode, 'reply')
+  assert.equal(last.pending.length, 0, '切屏后队列移除')
+  assert.ok(last.reply.sentences.some((sentence) => sentence.text.includes('B 的第一句')), '显示 B 的回复')
+  const bound = framesOf(socketA).filter((frame) => frame.type === 'session.bound')
+  assert.equal(bound[bound.length - 1].payload.sessionId, 'session-b')
+
+  // 非法 targetSessionId 不得切屏
+  const boundBefore = framesOf(socketA).filter((frame) => frame.type === 'session.bound').length
+  socketA.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 280, y: 30, hit: 'chip', targetSessionId: 'session-x' }, 3)))
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  assert.equal(framesOf(socketA).filter((frame) => frame.type === 'session.bound').length, boundBefore, '非法 target 不切屏')
+  runtime.dispose()
+})
+
 /* ---------- 屏幕进度映射 ---------- */
 
 console.log('[tihu] 屏幕进度映射')
