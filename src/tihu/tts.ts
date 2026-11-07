@@ -17,11 +17,11 @@
  * 失败策略：任何异常都以可读 Error 抛出，由 lane 发 `event.alert` 并让页面降级到
  * 系统语音；绝不静默。
  */
-import { spawn, type ChildProcess } from 'node:child_process'
-import { appendFileSync, existsSync, mkdirSync } from 'node:fs'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync } from 'node:fs'
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { Pcm16Chunker, TTS_CHUNK_MS, TTS_SAMPLE_RATE, parseWav, resamplePcm16, validateReferenceWav } from './audio.ts'
 import { toTtsSegments } from './protocol.ts'
 import type { VoiceInfo } from './protocol.ts'
@@ -100,6 +100,38 @@ export function normalizeVoiceName(name: string): string | null {
   return value
 }
 
+export function binaryKind(path: string): 'windows' | 'linux' | 'unknown' {
+  try {
+    const fd = openSync(path, 'r')
+    const head = Buffer.alloc(4)
+    readSync(fd, head, 0, 4, 0)
+    closeSync(fd)
+    if (head.toString('ascii', 0, 2) === 'MZ') return 'windows'
+    if (head[0] === 0x7f && head[1] === 0x45 && head[2] === 0x4c && head[3] === 0x46) return 'linux'
+  } catch { /* 读不到按平台猜 */ }
+  return process.platform === 'win32' ? 'windows' : 'linux'
+}
+
+/** Windows 路径 → WSL 路径（C:\a\b → /mnt/c/a/b）。 */
+export function toWslPath(path: string): string {
+  const match = /^([A-Za-z]):[\\/](.*)$/.exec(path)
+  if (match === null) return path.replace(/\\/g, '/')
+  return `/mnt/${match[1].toLowerCase()}/${match[2].replace(/\\/g, '/')}`
+}
+
+function wslDistro(): string {
+  return process.env.TIHU_TTS_WSL_DISTRO ?? 'Ubuntu'
+}
+
+/** 确保 WSL 发行版已启动（Stopped 时自动拉起）。 */
+function ensureWslRunning(): void {
+  const result = spawnSync('wsl.exe', ['-d', wslDistro(), '--', 'true'], { timeout: 30_000, windowsHide: true })
+  if (result.status !== 0) {
+    const detail = `${result.stderr?.toString('utf8') ?? ''}${result.stdout?.toString('utf8') ?? ''}`.trim()
+    throw new Error(`WSL(${wslDistro()}) 启动失败：${detail || result.error?.message || '未知错误'}`)
+  }
+}
+
 export class TihuTts {
   private options: TihuTtsOptions
   private paths: TihuTtsPaths
@@ -119,6 +151,8 @@ export class TihuTts {
   /** 当前后端：qwen-pt（PyTorch CPU sidecar）/ codec（GGUF sidecar）/ sapi（系统语音占位）/ none。 */
   backend(): 'qwen-pt' | 'codec' | 'sapi' | 'none' {
     if (this.options.disabled) return 'none'
+    // Q4 实测比 PyTorch fp32 更慢（见 CHANGELOG），默认仍用 fp32；设 TIHU_TTS_ENGINE=q4 可强制走 GGUF。
+    if (process.env.TIHU_TTS_ENGINE === 'q4' && existsSync(this.paths.bin) && existsSync(this.paths.model) && existsSync(this.paths.codec)) return 'codec'
     if (this.qwenReady()) return 'qwen-pt'
     if (existsSync(this.paths.bin) && existsSync(this.paths.model) && existsSync(this.paths.codec)) return 'codec'
     if (process.platform === 'win32') return 'sapi'
@@ -151,8 +185,8 @@ export class TihuTts {
 
   status(): { available: boolean; model?: string; error?: string } {
     const backend = this.backend()
+    if (backend === 'codec') return { available: true, model: 'qwen3-tts 0.6b-q4' }
     if (backend === 'qwen-pt') return { available: true, model: 'qwen3-tts 0.6b-pt' }
-    if (backend === 'codec') return { available: true, model: 'qwen3-tts-0.6b-q4_k_m' }
     if (backend === 'sapi') return { available: true, model: 'windows-sapi（Qwen3-TTS 未就绪）' }
     return {
       available: false,
@@ -186,7 +220,15 @@ export class TihuTts {
       '--n-threads', String(this.options.threads ?? 4),
       '--segment-bytes', '160',
       '--stream-chunk-ms', String(TTS_CHUNK_MS),
+      '--max-frames', '400',
+      '--temp', '0.9', '--top-k', '50', '--top-p', '1.0',
+      '--repeat-penalty', '1.05', '--repeat-last-n', '4096',
+      '--samplers', 'penalties;temperature;top_k;top_p',
     ]
+    // Q4 的 Base 模型没有内置音色：用预生成的 speaker 文件作为默认音色（否则必须上传参考音频）。
+    if (existsSync(join(this.paths.serverVoices, 'default.gguf'))) {
+      args.push('--speaker-file', join(this.paths.serverVoices, 'default.gguf'))
+    }
     if (backend === 'qwen-pt') {
       command = this.qwenPython()
       args = [
@@ -198,6 +240,12 @@ export class TihuTts {
         '--port', String(port),
         '--threads', String(this.options.threads ?? 8),
       ]
+    } else if (process.platform === 'win32' && binaryKind(this.paths.bin) === 'linux') {
+      // WSL 里编出来的 Linux ELF：经 wsl.exe 启动，WSL2 的 localhost 转发让 Windows 侧访问 127.0.0.1。
+      ensureWslRunning()
+      command = 'wsl.exe'
+      const libDir = toWslPath(dirname(this.paths.bin))
+      args = ['-d', wslDistro(), '--', 'env', `LD_LIBRARY_PATH=${libDir}`, toWslPath(this.paths.bin), ...args.map((arg) => (/^[A-Za-z]:[\\/]/.test(arg) ? toWslPath(arg) : arg))]
     }
     this.log(`starting tts sidecar (${backend}): ${command} (port ${port})`)
     const logPath = join(this.paths.root, 'tts-server.log')
