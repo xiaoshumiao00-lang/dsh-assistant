@@ -53,6 +53,9 @@ import {
   summarizeToolResult,
 } from '../src/tihu/progress.ts'
 import { ACTUAL_SIZE_SCALE, SCREEN_SPEC, clipScreenTitle, fitScreenLines } from '../src/tihu/screen-spec.ts'
+import { fitViewport, replyViewport, replyWindow, splitReplySentences, wrapReplyLines } from '../src/tihu/reply.ts'
+import { Pcm16Chunker, TTS_CHUNK_BYTES, TTS_SAMPLE_RATE, validateReferenceWav } from '../src/tihu/audio.ts'
+import { normalizeVoiceName } from '../src/tihu/tts.ts'
 import { WsFrameParser, encodeFrame } from '../src/pocket-host/ws-deflate.mjs'
 
 let passed = 0
@@ -104,13 +107,25 @@ console.log('[tihu] 协议 v0')
 
 test('版本号与类型清单固定', () => {
   assert.equal(TIHU_PROTOCOL_VERSION, '0')
-  assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'session.end', 'sessions.query', 'session.bind', 'ping'])
-  assert.equal(TIHU_DOWNSTREAM_TYPES.length, 11)
+  assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'session.end', 'sessions.query', 'session.bind', 'voice.list', 'voice.create', 'voice.select', 'ping'])
+  assert.equal(TIHU_DOWNSTREAM_TYPES.length, 14)
+  assert.ok(TIHU_DOWNSTREAM_TYPES.includes('tts.audio'))
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('sessions.list'))
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('session.bound'))
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('session.invalid'))
+  assert.ok(TIHU_DOWNSTREAM_TYPES.includes('voice.list'))
+  assert.ok(TIHU_DOWNSTREAM_TYPES.includes('voice.created'))
   assert.equal(TIHU_PAGE_PATH, '/tihu')
   assert.equal(TIHU_LANE_PATH, '/tihu/lane')
+})
+
+test('voice.list / voice.create / voice.select 字段校验', () => {
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('voice.list', {}, 30))) !== null)
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('voice.create', { name: 'my_voice', wavBase64: 'UklGR' }, 31))) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('voice.create', { name: 'bad name!', wavBase64: 'UklGR' }, 32))), null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('voice.create', { name: 'ok', wavBase64: '' }, 33))), null)
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('voice.select', { name: 'default' }, 34))) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('voice.select', { name: '' }, 35))), null)
 })
 
 test('sessions.query / session.bind：字段合法才收，越界一律忽略', () => {
@@ -682,7 +697,7 @@ function runtimeFor(records, extras = {}) {
     sessionProjectionCache: projectionCacheFixture(records),
     ...extras,
   })
-  return { ...fixture, runtime: createTihuRuntime(fixture.ctx, { log: () => {} }) }
+  return { ...fixture, runtime: createTihuRuntime(fixture.ctx, { log: () => {}, tts: { disabled: true } }) }
 }
 
 function openLane(runtime) {
@@ -1259,7 +1274,11 @@ await testAsync('lane：执行事件生成有料的屏幕帧（读文件→跑�
   assert.ok(progressTexts.some((text) => text.includes('读取 README.md')))
   assert.ok(progressTexts.some((text) => text.startsWith('✓')))
   const last = screens[screens.length - 1]
-  assert.ok(last.title.startsWith('完成 · 共 1 步'), `最终帧 ${last.title}`)
+  // 有 assistant 消息后进入 reply 模式；turn/end 不再用「完成」状态帧覆盖正文。
+  assert.equal(last.mode, 'reply')
+  assert.equal(last.stage, '回答中')
+  assert.ok(Array.isArray(last.reply.sentences) && last.reply.sentences.length > 0)
+  assert.equal(last.reply.currentIndex, 0)
   runtime.dispose()
 })
 
@@ -1334,6 +1353,141 @@ await testAsync('lane：turn/end 的 done.ok/tone——completed→true+ok，err
   assert.equal(lastScreen.bullets.length, 1)
   assert.ok(lastScreen.bullets[0].startsWith('✗'))
   runtime.dispose()
+})
+
+/* ---------- 本地 TTS：PCM 分块 / 参考音频 ---------- */
+
+console.log('[tihu] 本地 TTS 音频')
+
+/** 造一个标准 PCM WAV。 */
+function makeWav({ sampleRate = 24000, channels = 1, bits = 16, ms = 5000 } = {}) {
+  const samples = Math.round((sampleRate * ms) / 1000)
+  const dataBytes = samples * channels * (bits / 8)
+  const buffer = Buffer.alloc(44 + dataBytes)
+  buffer.write('RIFF', 0)
+  buffer.writeUInt32LE(36 + dataBytes, 4)
+  buffer.write('WAVE', 8)
+  buffer.write('fmt ', 12)
+  buffer.writeUInt32LE(16, 16)
+  buffer.writeUInt16LE(1, 20)
+  buffer.writeUInt16LE(channels, 22)
+  buffer.writeUInt32LE(sampleRate, 24)
+  buffer.writeUInt32LE(sampleRate * channels * (bits / 8), 28)
+  buffer.writeUInt16LE(channels * (bits / 8), 32)
+  buffer.writeUInt16LE(bits, 34)
+  buffer.write('data', 36)
+  buffer.writeUInt32LE(dataBytes, 40)
+  for (let i = 0; i < samples; i += 1) buffer.writeInt16LE((i % 200) - 100, 44 + i * 2)
+  return buffer
+}
+
+test('PCM 分块：120ms 固定块、偶数字节、不丢帧、只有最后一块 final', () => {
+  const chunker = new Pcm16Chunker()
+  const input = Buffer.alloc(TTS_CHUNK_BYTES * 3 + 1000, 0x5a)
+  const emitted = []
+  for (const piece of [input.subarray(0, 1000), input.subarray(1000, 9000), input.subarray(9000)]) {
+    for (const chunk of chunker.push(piece)) emitted.push({ data: chunk, final: false })
+  }
+  for (const chunk of chunker.finish()) emitted.push(chunk)
+  assert.ok(emitted.every((chunk) => chunk.data.length % 2 === 0), '块必须按 16bit 偶数边界')
+  for (let i = 0; i < emitted.length - 1; i += 1) {
+    assert.equal(emitted[i].data.length, TTS_CHUNK_BYTES, `第 ${i} 块应满 120ms`)
+    assert.equal(emitted[i].final, false)
+  }
+  assert.equal(emitted[emitted.length - 1].final, true)
+  assert.equal(emitted.filter((chunk) => chunk.final).length, 1)
+  assert.deepEqual(Buffer.concat(emitted.map((chunk) => chunk.data)), input, '拼回来不能丢字节/错位')
+  assert.equal(emitted.reduce((sum, chunk) => sum + chunk.data.length, 0), input.length)
+})
+
+test('PCM 分块：任意 TCP 分片边界都等价', () => {
+  const input = Buffer.alloc(TTS_CHUNK_BYTES * 2 + 334, 1)
+  const collect = (sizes) => {
+    const chunker = new Pcm16Chunker()
+    const out = []
+    let offset = 0
+    for (const size of sizes) {
+      out.push(...chunker.push(input.subarray(offset, offset + size)))
+      offset += size
+    }
+    out.push(...chunker.push(input.subarray(offset)))
+    const tail = chunker.finish().map((chunk) => chunk.data)
+    return Buffer.concat([...out, ...tail])
+  }
+  assert.deepEqual(collect([1, 2, 3, 5000, 7000, 9000]), input)
+  assert.deepEqual(collect([input.length]), input)
+  assert.deepEqual(collect(Array(input.length).fill(1)), input)
+})
+
+test('参考音频校验：3–10 秒、单声道 16bit、16k/24k', () => {
+  assert.equal(normalizeVoiceName('my_voice-1'), 'my_voice-1')
+  assert.equal(normalizeVoiceName('default'), null)
+  assert.equal(normalizeVoiceName('bad name'), null)
+  assert.equal(normalizeVoiceName('中文'), null)
+
+  const ok24 = validateReferenceWav(makeWav({ sampleRate: 24000, ms: 5000 }))
+  assert.equal(ok24.ok, true)
+  const ok16 = validateReferenceWav(makeWav({ sampleRate: 16000, ms: 8000 }))
+  assert.equal(ok16.ok, true)
+  const tooShort = validateReferenceWav(makeWav({ ms: 2000 }))
+  assert.equal(tooShort.ok, false)
+  assert.ok(tooShort.reason.includes('3–10'))
+  const stereo = validateReferenceWav(makeWav({ channels: 2 }))
+  assert.equal(stereo.ok, false)
+  const wrongRate = validateReferenceWav(makeWav({ sampleRate: 44100 }))
+  assert.equal(wrongRate.ok, false)
+  const notWav = validateReferenceWav(Buffer.from('not a wav at all'))
+  assert.equal(notWav.ok, false)
+})
+
+test('TTS 采样率与块长常量符合协议', () => {
+  assert.equal(TTS_SAMPLE_RATE, 24000)
+  assert.equal(TTS_CHUNK_BYTES, 24000 * 2 * 0.12)
+})
+
+test('回复分句与滚动窗口：800 字下标连续、窗口居中、行不越界', () => {
+  const text = ('这是一段用于测试滚动窗口的中文回复内容，需要足够长才能触发分句与滚动。').repeat(20).slice(0, 800)
+  const sentences = splitReplySentences(text)
+  assert.ok(sentences.length > 10, `800 字至少切出 10 句，实际 ${sentences.length}`)
+  // 下标首尾相接、无缝、从 0 开始
+  assert.equal(sentences[0].start, 0)
+  for (let i = 1; i < sentences.length; i += 1) {
+    assert.equal(sentences[i].start, sentences[i - 1].end, `第 ${i} 句起点应等于上一句终点`)
+  }
+  assert.equal(sentences[sentences.length - 1].end <= 800, true)
+  assert.equal(sentences.map((sentence) => sentence.text).join(''), text.replace(/\s+/g, ' ').trim())
+
+  // 中间句窗口 ±2，当前句在中间
+  const middle = 10
+  const window = replyWindow(sentences, middle, 2)
+  assert.equal(window[0].index, middle - 2)
+  assert.equal(window[window.length - 1].index, middle + 2)
+  // 边界不越界
+  assert.equal(replyWindow(sentences, 0, 2)[0].index, 0)
+  assert.equal(replyWindow(sentences, sentences.length - 1, 2).slice(-1)[0].index, sentences.length - 1)
+
+  // 可视窗口：10 行、当前句居中、每行 ≤18 字
+  const viewport = replyViewport(sentences, middle)
+  assert.ok(viewport.lines.length <= 10)
+  for (const line of viewport.lines) assert.ok([...line.text].length <= 18, `行超长：${line.text}`)
+  assert.ok(viewport.currentLine >= 3 && viewport.currentLine <= 6, `当前句应在中部，实际第 ${viewport.currentLine} 行`)
+  assert.ok(viewport.lines[viewport.currentLine].sentenceIndex === middle)
+
+  // 行拼起来不丢字（窗口内）
+  const wrapped = wrapReplyLines(replyWindow(sentences, middle), 18)
+  assert.equal(wrapped.map((line) => line.text).join(''), replyWindow(sentences, middle).map((s) => s.text.replace(/\s+/g, ' ').trim()).join(''))
+
+  // 空文本
+  assert.deepEqual(splitReplySentences(''), [])
+  assert.deepEqual(fitViewport([], 0).lines, [])
+  assert.equal(SCREEN_SPEC.replyVisibleLines, 10)
+})
+
+test('TTS 分段带字符区间：tts.text 的 charStart/charEnd 与句边界一致', () => {
+  const text = '第一句。第二句！第三句？'
+  const sentences = splitReplySentences(text)
+  assert.deepEqual(sentences.map((s) => [s.start, s.end]), [[0, 4], [4, 8], [8, 12]])
+  assert.equal(sentences.map((s) => s.text).join(''), text)
 })
 
 /* ---------- 汇总 ---------- */

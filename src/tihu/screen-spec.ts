@@ -36,6 +36,8 @@ export const SCREEN_SPEC = {
   stageFontPx: 12,
   /** stage 最大字符数。 */
   stageChars: 10,
+  /** reply 模式：可视正文行数（16px/20px 行高）。 */
+  replyVisibleLines: 10,
 } as const
 
 /** 物理规格（近似值，仅用于「实际尺寸」显示）。 */

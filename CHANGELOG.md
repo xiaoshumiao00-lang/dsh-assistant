@@ -40,6 +40,8 @@
 
 【2026-11-07 追加：完成帧收尾三处小瑕疵】①`turn/end` 帧的正文第一行曾重复标题「共 N 步 · 用时 Xs」，且第 3 行挂着上一轮命令的 stdout 尾行；现在完成帧只保留「结果」一行（正常 → `✓ 已生成回复`，失败 → `✗ 失败原因`），不再重复标题、不再带陈旧输出。②`event.done` 的 `ok` 只认 `reason.kind === 'stop'`，实测 `completed` 被下发 `ok:false`；现在 `completed` / `stop` 归一为 `ok:true` 且文案「本轮完成」，`error/aborted/cancelled` 才 false。③`turn/end` 的 tone 跟随结果：正常 ok、失败 alert；`sessionId` 保持不变。`scripts/test-tihu-protocol.mjs` 53 → 54 项（新增 done.ok/tone 的 completed/error 对照）。实测短任务完成帧：`完成 · 共 2 步 · 用时 7s` + 唯一正文行 `✓ 已生成回复`。
 
+【2026-11-07 追加：本地 TTS（P1 第一块）+ 回复正文跟随朗读】目标是 Qwen3-TTS-12Hz-0.6B GGUF Q4 纯 CPU sidecar 替换 speechSynthesis。已落地：①`src/tihu/tts.ts` 独立进程 sidecar（`tts-server` 只绑 127.0.0.1、4 线程、120ms 流式块、8s 首块超时），模型/二进制放 `~/.dsh/tihu/`，缺失时状态可读；②协议新增 `tts.audio`（24k pcm16、`seq/total/index/charStart/charEnd/final`）与 `voice.list|create|select`，保留 `tts.text`；③页面 WebAudio 24k 无缝排队播放（120ms 块），与「停止朗读/重读一遍/新一轮清空」共用一套逻辑；无音频时 4s 兜底 speechSynthesis，宿主失败会发 `event.alert` 并立即降级；④音色目录 `<workspace>/.tihu/voices/<name>.wav|.json`，参考音频 3–10 秒/16k/24k 校验、embedding 由 sidecar 持久化（第二次命中缓存），上传界面带授权合规提示；⑤`src/tihu/audio.ts` 纯函数 PCM 分块/重采样/WAV 校验，单测覆盖块边界、任意 TCP 分片、参考音频。**现实阻塞**：codec.cpp 在 MSVC 下编译失败（`lm_internal.h` 语法、`M_PI` 未定义等 GCC 专属写法），llama.cpp/codec.cpp 已下载但无法产出 `tts-server.exe`；因此运行时自动回退 **Windows SAPI（Huihui zh-CN）** 作为本地占位引擎，页面真机链路已验证（PCM 182 块/21.7s，`speechSynthesis` 0 次）。Qwen 模型只下载了 backbone（396MB），codec（1.29GB）未拉完。⑥屏幕新增 `reply` 模式：`src/tihu/reply.ts` 分句/字符区间/窗口（每行 18 字、可视 10 行、当前句居中反色），`screen-spec.ts` 增加 `replyVisibleLines: 10`；`tts.text/audio` 带 `charStart/charEnd`，本地音频逐句推进高亮，降级时按 4.5 字/秒估算；思考/工具切回 status，turn 结束保持正文最后一屏。实测长回复：reply 模式 10 行、高亮随朗读推进、最终停在最后一句。`scripts/test-tihu-protocol.mjs` 54 → 61 项。
+
 ## [0.2.17] - 2026-11-06
 
 📺 平板 / 电视（宽屏、矮视口）专项：控制室卡片不再挤成 4 列被裁，抽屉里点得到会话
