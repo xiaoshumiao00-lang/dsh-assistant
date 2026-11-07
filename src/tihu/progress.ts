@@ -160,6 +160,17 @@ export function describeTool(name: string, args: unknown): { stage: TihuStage; t
   }
 }
 
+/** 原始报错 → 一句人话（屏上一行放得下）。 */
+export function humanizeError(text: string): string {
+  const raw = String(text ?? '')
+  if (/ENOENT|not recognized|not found|找不到|no such file/i.test(raw)) return '命令没找到'
+  if (/EACCES|EPERM|denied|拒绝访问|permission/i.test(raw)) return '没有权限'
+  if (/ETIMEDOUT|timed out|timeout|超时/i.test(raw)) return '超时了'
+  if (/ECONNREFUSED|ECONNRESET|connect|socket|fetch failed/i.test(raw)) return '连不上'
+  if (/spawn/i.test(raw)) return '程序没跑起来'
+  return '执行出错'
+}
+
 /** 工具结果 → 「✓/✗ 摘要」+ 输出尾行（都 ≤18 字）。 */
 export function summarizeToolResult(text: string, isError: boolean): { line: string; output: string } {
   const lines = String(text ?? '').split(/\r?\n/).map((line) => sanitizeScreenLine(line)).filter((line) => {
@@ -176,10 +187,8 @@ export function summarizeToolResult(text: string, isError: boolean): { line: str
   const head = clipText(first, TIHU_LINE_CHARS - 2)
   const tail = clipText(last, TIHU_LINE_CHARS)
   if (isError) {
-    return {
-      line: clipText(`✗ ${head || '执行失败'}`, TIHU_LINE_CHARS),
-      output: tail,
-    }
+    // 屏上只给一句人话原因，不贴 spawn/ENOENT/路径这类原始报错（用户看不懂）。
+    return { line: clipText(`✗ ${humanizeError(text)}`, TIHU_LINE_CHARS), output: '' }
   }
   return {
     line: clipText(`✓ ${head || '完成'}`, TIHU_LINE_CHARS),
@@ -211,7 +220,7 @@ export interface ProgressUpdate {
 function bulletsOf(state: TihuProgressState, now: number): string[] {
   const lines = [`第 ${state.step} 步 · 已用 ${formatElapsed(now - state.turnStartedAt)}`]
   if (state.lastResult) lines.push(state.lastResult.line)
-  if (state.lastOutput) lines.push(state.lastOutput)
+  if (state.lastOutput && state.lastOutput !== state.lastResult?.line) lines.push(state.lastOutput)
   return lines.slice(0, SCREEN_SPEC.maxBodyLines).map((line) => clipText(line, TIHU_LINE_CHARS))
 }
 
@@ -242,7 +251,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.title = '开始新一轮'
     state.tone = 'busy'
     return {
-      screen: { stage: '思考', title: state.title, bullets: bulletsOf(state, now), tone: 'busy' },
+      screen: { stage: '', title: state.title, bullets: bulletsOf(state, now), tone: 'busy' },
       progress: { stage: 'turn', text: `开始第 ${turn} 轮` },
     }
   }
@@ -253,7 +262,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.title = '思考下一步'
     state.tone = 'busy'
     return {
-      screen: { stage: '思考', title: state.title, bullets: bulletsOf(state, now), tone: 'busy' },
+      screen: { stage: '', title: state.title, bullets: bulletsOf(state, now), tone: 'busy' },
       progress: { stage: 'step', text: `第 ${state.step} 步` },
     }
   }
