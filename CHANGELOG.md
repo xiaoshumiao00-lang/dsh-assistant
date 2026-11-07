@@ -30,6 +30,8 @@
 
 【2026-11-07 追加：公网 origin 下「还没有会话」】`localStorage` 按 origin 隔离：用户在桌面宿主 `127.0.0.1:57440` 选过会话，打开公网 `http://49.234.20.84:7080/tihu` 时 `dsh.sessions.current` 根本不存在，旧页面据此直接报「还没有会话」。现在：①连上 lane 后没有会话就向宿主发 `sessions.query`，宿主复用 `ctx.sessionQuery`（手机会话列表同源）返回最近 N 条（在线优先、带标题），页面在屏下渲染选择器，点一条即 `session.bind`；②绑定结果只存**本 origin 自己的** `dsh.tihu.session`，下次自动记住；③`?session=<id>` 优先级最高、绑定后写回，宿主校验不存在时回 `session.invalid` 并给可读提示（不白屏、不绑死）；④兜底顺序 URL → `dsh.tihu.session` → 宽松读一次 `dsh.sessions.current` → 都没有就展示选择器、**不报错**；⑤文案改为「还没有选定会话，点下面选一个」，屏上常驻当前会话名，保留「结束本次语音会话」。协议新增上行 `sessions.query`/`session.bind`、下行 `sessions.list`/`session.bound`/`session.invalid`（字段只增不删）；上行改为按到达顺序串行处理，避免异步绑定校验期间紧跟的 `text.input` 被误丢。`scripts/test-tihu-protocol.mjs` 29 → 33 项。
 
+【2026-11-07 追加：只绑 Computer Use 会话 + 默认自动跟随】鹈鹕要靠 GUI 看屏/点按，只有 Computer Use / 电脑操作模式的会话能接活。①**模式判定**：宿主投影 `agentPreset`（`sessionListMetadata` 同层的行，`init = header.agentPreset ?? null`，之后由 `agent-preset/selected` 更新；`dsh-agent-preset-registry` 注释明确「读投影不读 header」），值必须等于 `computer-use`；不靠标题猜。②选择器只列 CU 会话，非 CU 只在 `?session=` 显式指定时保留为灰色「当前（不可用）」行，且在屏上/卡片红色提示「无法看屏/点按」。③**默认自动绑定**：优先级 URL `?session=` → 上次手动记住的（校验仍存在且仍是 CU）→ 最近活跃的 CU 会话；活跃时间用宿主同口径 `updatedAt = max(header.createdAt, 投影 sessionListMetadata.lastPromptAt)`（最后一次用户发言时间）。④自动跟随：页面每次连上强制重列一次，注入前再判定一次（`session/event` 的 `user/message` 会即时刷新缓存活跃时间，避免每句话都全量列 1870 条）；目标变了就 `session.bound {auto:true, followed:true}` + 屏上「已自动跟随到：…」。⑤手动覆盖：选择器点选后不再漂移，出现「恢复自动」按钮；手动记忆失效/变非 CU 时按优先级回落到自动。⑥屏上常驻「当前会话：<名字>（自动/手动）」。`scripts/test-tihu-protocol.mjs` 33 → 39 项。
+
 ## [0.2.17] - 2026-11-06
 
 📺 平板 / 电视（宽屏、矮视口）专项：控制室卡片不再挤成 4 列被裁，抽屉里点得到会话

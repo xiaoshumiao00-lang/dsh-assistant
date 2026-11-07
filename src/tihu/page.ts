@@ -51,6 +51,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   /* 屏下的会话选择器：没有会话时展开、绑定后收起（按钮可再展开） */
   .sess-now { font-size:13px; line-height:1.35; margin:0 0 8px; word-break:break-word; }
   .sess-now.none { color:var(--warn); }
+  .sess-now.bad { color:var(--err); }
+  .cu-warn { display:none; background:#3a1414; border:1px solid #b04545; color:#ffd9d9;
+    border-radius:8px; padding:8px 10px; font-size:12px; line-height:1.45; margin:0 0 8px; }
+  .sess-item.off { opacity:.55; border-style:dashed; cursor:default; }
   .sess-list { display:flex; flex-direction:column; gap:6px; max-height:34vh; overflow:auto; }
   .sess-item { text-align:left; display:flex; flex-direction:column; gap:2px; padding:8px 10px; }
   .sess-item .t { font-size:13px; line-height:1.3; }
@@ -99,14 +103,16 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
 </div>
 
 <div class="card" id="sessCard">
-  <h4>当前会话</h4>
+  <h4>当前会话（Computer Use 模式）</h4>
+  <div class="cu-warn" id="cuWarn"></div>
   <div class="sess-now none" id="sessNow">还没有选定会话，点下面选一个</div>
   <div class="sess-list" id="sessList"></div>
   <div class="row" style="margin-top:8px">
-    <button id="sessSwitch" style="display:none">换一个会话</button>
+    <button id="sessSwitch" style="display:none">换个会话</button>
+    <button id="sessAuto" style="display:none">恢复自动</button>
     <button id="sessRefresh" style="flex:1">刷新会话列表</button>
   </div>
-  <div class="hint" id="sessHint">列表来自宿主的最近会话；在这个网址上选一次，下次会自动记住。</div>
+  <div class="hint" id="sessHint">列表只显示 Computer Use 模式会话；默认自动绑定最近活跃的一条，手动选一次后以手动为准。</div>
 </div>
 
 <div class="row">
@@ -149,7 +155,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   var PROTOCOL = ${protocol};
   var $ = function (id) { return document.getElementById(id); };
   var state = { ws: null, seq: 0, clientId: '', sessionId: '', sessionTitle: '', sessionSource: '',
-    sessions: [], listLoaded: false, querying: false, showList: false, lastTranscript: '', asking: null, recorder: null, chunks: [], retryTimer: 0 };
+    sessions: [], listLoaded: false, querying: false, showList: false,
+    sessionBound: false, computerUse: null, sessionPreset: '', cuTotal: 0, total: 0,
+    mode: 'auto', lastAutoId: '',
+    lastTranscript: '', asking: null, recorder: null, chunks: [], retryTimer: 0 };
 
   /* ---------- 会话定位 ----------
      2026-11-07 P0：localStorage **按 origin 隔离**。用户在桌面宿主
@@ -193,13 +202,24 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     try { return looseSessionId(localStorage.getItem(LEGACY_SESSION_KEY)); } catch (e) { return ''; }
   }
   function pickInitialSession() {
+    // 自动绑定优先级：URL（显式）> 上次记住的（校验后）> 最近活跃的 CU（宿主自动）> 选择器。
     var fromUrl = urlSessionId();
-    if (fromUrl) return { id: fromUrl, source: 'url' };
+    if (fromUrl) return { id: fromUrl, source: 'url', mode: 'manual' };
     var stored = storedSessionId();
-    if (stored) return { id: stored, source: 'local' };
+    if (stored) return { id: stored, source: 'local', mode: 'manual' };
     var legacy = legacySessionId();
-    if (legacy) return { id: legacy, source: 'legacy' };
-    return { id: '', source: '' };
+    if (legacy) return { id: legacy, source: 'legacy', mode: 'manual' };
+    return { id: '', source: '', mode: 'auto' };
+  }
+  /** 上次自动绑定到的会话 id（localStorage，用来识别「已自动跟随到」）。 */
+  function lastAutoSessionId() {
+    try { return localStorage.getItem('dsh.tihu.auto') || ''; } catch (e) { return ''; }
+  }
+  function rememberAutoSessionId(sessionId) {
+    try {
+      if (sessionId) localStorage.setItem('dsh.tihu.auto', sessionId);
+      else localStorage.removeItem('dsh.tihu.auto');
+    } catch (e) { /* 隐私模式忽略 */ }
   }
   function shortId(sessionId) {
     if (!sessionId) return '';
@@ -232,7 +252,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     $('events').appendChild(row);
   }
 
-  /* ---------- 会话选择器（屏下） ---------- */
+  /* ---------- 会话选择器（屏下，只列 Computer Use 模式） ----------
+   * 鹈鹕要靠 GUI 看屏幕、点按钮：只有 Computer Use / 电脑操作模式的会话能接这活。
+   * 模式判定**只认宿主返回的 agentPreset**（投影 agentPreset，回退 header），
+   * 不靠标题猜。宿主只下发 CU 会话；非 CU 会话在页面上只能是「当前（不可用）」灰色行。
+   */
   function sessionLabel() {
     if (state.sessionTitle) return state.sessionTitle;
     return state.sessionId ? shortId(state.sessionId) : '';
@@ -244,25 +268,69 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     renderSessionList();
     send('sessions.query', { limit: 20, checkId: state.sessionId || undefined });
   }
+  function setComputerUseNotice(ok, preset) {
+    state.computerUse = ok;
+    state.sessionPreset = preset || '';
+    var warn = $('cuWarn');
+    if (ok === false) {
+      warn.textContent = '⚠ 这条会话不是 Computer Use 模式'
+        + (state.sessionPreset ? '（' + state.sessionPreset + '）' : '')
+        + '：无法看屏/点按。请从下面换一个 Computer Use 会话。';
+    } else {
+      warn.textContent = '';
+    }
+  }
   function renderSessionBar() {
-    var bound = !!state.sessionId;
     var label = sessionLabel();
-    $('sessNow').textContent = bound ? ('当前会话：' + label) : '还没有选定会话，点下面选一个';
-    $('sessNow').className = bound ? 'sess-now' : 'sess-now none';
-    $('sessLine').textContent = bound ? ('会话：' + label) : '会话：未选定';
-    $('sessLine').className = bound ? 'sess' : 'sess none';
-    $('sessSwitch').style.display = bound ? '' : 'none';
-    $('sessSwitch').textContent = state.showList ? '收起会话列表' : '换一个会话';
-    $('sessList').style.display = (bound && !state.showList) ? 'none' : 'flex';
+    var modeText = state.mode === 'auto' ? '（自动）' : '（手动）';
+    if (state.sessionBound) {
+      $('sessNow').textContent = '当前会话：' + label + modeText;
+      $('sessNow').className = 'sess-now' + (state.computerUse === false ? ' bad' : '');
+      $('sessLine').textContent = '当前会话：' + label + modeText;
+      $('sessLine').className = 'sess' + (state.computerUse === false ? ' none' : '');
+    } else if (state.sessionId) {
+      $('sessNow').textContent = '正在确认会话 ' + shortId(state.sessionId) + '…';
+      $('sessNow').className = 'sess-now';
+      $('sessLine').textContent = '当前会话：确认中' + modeText;
+      $('sessLine').className = 'sess none';
+    } else {
+      $('sessNow').textContent = state.mode === 'auto'
+        ? '正在自动绑定最近活跃的 Computer Use 会话…'
+        : '还没有选定会话，点下面选一个';
+      $('sessNow').className = 'sess-now none';
+      $('sessLine').textContent = '当前会话：未选定' + modeText;
+      $('sessLine').className = 'sess none';
+    }
+    $('sessSwitch').style.display = state.sessionBound ? '' : 'none';
+    $('sessSwitch').textContent = state.showList ? '收起会话列表' : '换个会话';
+    $('sessAuto').style.display = (state.sessionBound && state.mode === 'manual') ? '' : 'none';
+    $('sessList').style.display = (state.sessionBound && !state.showList && state.computerUse !== false) ? 'none' : 'flex';
+    $('cuWarn').style.display = state.computerUse === false ? 'block' : 'none';
   }
   function renderSessionList() {
     var box = $('sessList');
     box.innerHTML = '';
+    // 当前绑定的非 CU 会话：置灰保留（用户可能从 ?session= 显式指定），不可点。
+    if (state.sessionBound && state.computerUse === false && state.sessionId) {
+      var current = document.createElement('div');
+      current.className = 'sess-item off';
+      var currentTitle = document.createElement('span');
+      currentTitle.className = 't';
+      currentTitle.textContent = (state.sessionTitle || ('会话 ' + shortId(state.sessionId))) + '（当前）';
+      var currentMeta = document.createElement('span');
+      currentMeta.className = 'm';
+      currentMeta.textContent = '非 Computer Use，语音操作不可用';
+      current.appendChild(currentTitle);
+      current.appendChild(currentMeta);
+      box.appendChild(current);
+    }
     if (!state.sessions.length) {
       var note = document.createElement('div');
       note.className = 'hint';
       note.textContent = state.listLoaded
-        ? '宿主里还没有可用会话：先在 DSH 里新建并打开一个会话，再点「刷新会话列表」。'
+        ? (state.cuTotal === 0
+            ? '还没有 Computer Use 模式会话：先在桌面端新建一个 Computer Use 模式会话，再回来点「刷新会话列表」。'
+            : '最近会话里没有 Computer Use 模式（共 ' + state.total + ' 条）：请刷新，或新建一个 CU 会话。')
         : '正在读取会话列表…';
       box.appendChild(note);
       return;
@@ -275,7 +343,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       title.textContent = row.title || ('会话 ' + shortId(row.sessionId));
       var meta = document.createElement('span');
       meta.className = 'm';
-      meta.textContent = (row.live ? '桌面打开中' : '未打开') + ' · ' + shortId(row.sessionId);
+      meta.textContent = 'Computer Use · ' + (row.live ? '桌面打开中' : '未打开') + ' · ' + shortId(row.sessionId);
       item.appendChild(title);
       item.appendChild(meta);
       item.onclick = function () { chooseSession(row.sessionId, row.title || ''); };
@@ -289,59 +357,125 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.showList = false;
     renderSessionBar();
     renderSessionList();
-    addEvent('progress', '正在绑定会话 ' + shortId(sessionId) + '…');
+    addEvent('progress', '正在绑定 Computer Use 会话 ' + shortId(sessionId) + '…');
     send('session.bind', { sessionId: sessionId });
+  }
+  function checkedTitle(sessionId) {
+    for (var i = 0; i < state.sessions.length; i += 1) {
+      if (state.sessions[i].sessionId === sessionId && state.sessions[i].title) return state.sessions[i].title;
+    }
+    return '';
+  }
+  /** 手动会话失效 / 不是 CU：按优先级回落到「自动绑定最近活跃 CU」。 */
+  function fallbackToAuto(reason) {
+    state.sessionId = '';
+    state.sessionTitle = '';
+    state.sessionBound = false;
+    state.sessionSource = '';
+    state.computerUse = null;
+    state.sessionPreset = '';
+    state.mode = 'auto';
+    rememberSessionId('');
+    setComputerUseNotice(null, '');
+    state.showList = true;
+    $('sessHint').textContent = reason + '已改为自动绑定最近活跃的 Computer Use 会话。';
+    addEvent('alert', reason + '已改为自动绑定');
+    renderSessionBar();
+    renderSessionList();
+    if (state.ws && state.ws.readyState === 1) send('session.bind', { auto: true });
   }
   function handleSessionList(payload) {
     state.sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
     state.listLoaded = true;
     state.querying = false;
-    // URL/本机记住的 id 不存在：宿主核对结果优先，给可读提示并展开选择器（不白屏）。
-    if (payload.check && payload.check.sessionId === state.sessionId && payload.check.found === false) {
-      handleSessionInvalid({
-        sessionId: state.sessionId,
-        reason: '会话 ' + shortId(state.sessionId) + ' 不在宿主会话列表里（可能已归档或删除），请在下面重新选一个'
-      });
-      return;
-    }
-    if (state.sessionId) {
-      for (var i = 0; i < state.sessions.length; i += 1) {
-        if (state.sessions[i].sessionId === state.sessionId && state.sessions[i].title) {
-          state.sessionTitle = state.sessions[i].title;
-          break;
-        }
+    state.cuTotal = typeof payload.cuTotal === 'number' ? payload.cuTotal : state.sessions.length;
+    state.total = typeof payload.total === 'number' ? payload.total : state.cuTotal;
+
+    var check = payload.check;
+    if (state.sessionId && check && check.sessionId === state.sessionId) {
+      // 不存在：可读提示 + 回落到自动（不白屏）。
+      if (check.found === false) {
+        handleSessionInvalid({
+          sessionId: state.sessionId,
+          reason: '会话 ' + shortId(state.sessionId) + ' 不在宿主会话列表里（可能已归档或删除）。'
+        });
+        return;
       }
+      var cu = check.computerUse === true;
+      if (state.sessionSource === 'url') {
+        // ?session= 显式指定 —— 允许绑定非 CU，但必须显著提示（宿主同时下发红色屏帧）。
+        setComputerUseNotice(cu, check.preset);
+      } else if (!cu) {
+        // 上次记住的会话已经不是 CU / 不是 CU：按优先级回落到自动。
+        fallbackToAuto('上次记住的会话不是 Computer Use 模式。');
+        return;
+      } else if (!state.sessionBound) {
+        // 仍是 CU：页面先确认，再让宿主绑定（手动）。
+        chooseSession(state.sessionId, checkedTitle(state.sessionId) || state.sessionTitle);
+        return;
+      } else {
+        setComputerUseNotice(true, check.preset);
+      }
+    }
+
+    if (state.sessionId && state.sessionBound) {
+      var title = checkedTitle(state.sessionId);
+      if (title) state.sessionTitle = title;
     }
     renderSessionBar();
     renderSessionList();
+    if (!state.sessionBound && state.listLoaded) {
+      $('sessHint').textContent = state.cuTotal === 0
+        ? '没有可自动绑定的 CU 会话：先在桌面端新建一个 Computer Use 模式会话，再点「刷新会话列表」。'
+        : '列表只显示 Computer Use 模式会话；自动模式会跟随最近活跃的一条，手动选一次就以手动为准。';
+    }
   }
   function handleSessionBound(payload) {
     if (!payload || !payload.sessionId) return;
+    var auto = payload.auto === true;
+    var previousAuto = auto ? state.lastAutoId : '';
+    state.mode = auto ? 'auto' : 'manual';
     state.sessionId = payload.sessionId;
     state.sessionTitle = payload.title || state.sessionTitle || '';
+    state.sessionBound = true;
     state.showList = false;
-    rememberSessionId(payload.sessionId);   // 只存本 origin 自己的 key
+    var cu = payload.computerUse === true;
+    setComputerUseNotice(cu, payload.preset);
+    // 手动记忆只记手动选中的 CU 会话；自动模式不写 dsh.tihu.session，避免把自动锁死。
+    rememberSessionId(!auto && cu ? payload.sessionId : '');
+    if (auto) {
+      state.lastAutoId = payload.sessionId;
+      rememberAutoSessionId(payload.sessionId);
+    }
     renderSessionBar();
     renderSessionList();
-    $('sessHint').textContent = payload.live
-      ? '已绑定，桌面正开着这个会话。'
-      : '已绑定。这个会话当前没在桌面打开，语音注入前先在桌面打开它。';
-    addEvent('done', '已绑定会话：' + sessionLabel());
+    var followed = auto && (payload.followed === true || (previousAuto !== '' && previousAuto !== payload.sessionId));
+    if (followed) {
+      $('sessHint').textContent = '已自动跟随到：' + sessionLabel()
+        + '（' + (payload.live ? '桌面正开着' : '未打开') + '）。';
+      addEvent('done', '已自动跟随到：' + sessionLabel());
+      return;
+    }
+    $('sessHint').textContent = cu
+      ? (auto
+          ? '已自动绑定最近活跃的 Computer Use 会话；桌面端切到别的 CU 会话时会自动跟随。'
+          : (payload.live
+              ? '已手动绑定 Computer Use 会话，桌面正开着它。'
+              : '已手动绑定 CU 会话；它当前没在桌面打开，语音注入前先在桌面打开。'))
+      : '已绑定，但这条不是 Computer Use 模式：无法看屏/点按，请换一个 CU 会话。';
+    addEvent(cu ? 'done' : 'alert',
+      (cu ? (auto ? '已自动绑定：' : '已绑定会话：') : '已绑定非 CU 会话：') + sessionLabel());
   }
   function handleSessionInvalid(payload) {
     if (!payload) return;
     if (state.sessionId === payload.sessionId) {
       state.sessionId = '';
       state.sessionTitle = '';
+      state.sessionBound = false;
       if (storedSessionId() === payload.sessionId) rememberSessionId('');
     }
-    state.showList = true;
-    $('sessHint').textContent = payload.reason || ('会话 ' + shortId(payload.sessionId) + ' 不存在，请在下面重新选一个');
-    addEvent('alert', payload.reason || ('会话 ' + shortId(payload.sessionId) + ' 不存在，请在下面重新选一个'));
-    renderSessionBar();
-    // 已有查询在途时不要重复发：否则刚到的列表会被「正在读取…」重新盖掉。
-    if (!state.sessions.length && !state.querying) requestSessions();
-    else renderSessionList();
+    addEvent('alert', payload.reason || ('会话 ' + shortId(payload.sessionId) + ' 不存在，已改为自动绑定'));
+    fallbackToAuto(payload.reason || ('会话 ' + shortId(payload.sessionId) + ' 不存在。'));
   }
 
   /* ---------- TTS ----------
@@ -397,22 +531,24 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       $('conn').textContent = '已连接';
       $('conn').className = 'on';
       state.clientId = state.clientId || ('web-' + Math.random().toString(36).slice(2, 10));
-      if (!state.sessionId) {
+      if (!state.sessionId && !state.sessionBound) {
         var picked = pickInitialSession();
+        state.mode = picked.mode;
         if (picked.id) {
           state.sessionId = picked.id;
           state.sessionSource = picked.source;
         }
       }
-      send('hello', {
-        clientId: state.clientId,
-        clientVersion: 'p0-page-3',
-        protocol: PROTOCOL,
-        capabilities: { screen: true, tts: true, microphone: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) },
-        deviceName: '浏览器模拟设备',
-        sessionId: state.sessionId || undefined
-      });
-      if (!state.sessionId) {
+      state.lastAutoId = state.lastAutoId || lastAutoSessionId();
+      // 自动模式：不带 id 让宿主挑「最近活跃的 CU 会话」；手动模式：URL 直接绑，
+      // 本机记住的会话先让宿主校验「仍存在且仍是 CU」再绑。
+      var helloSession = '';
+      if (state.mode === 'manual') {
+        if (state.sessionBound) helloSession = state.sessionId;
+        else if (state.sessionSource === 'url') helloSession = state.sessionId;
+      }
+      sendHello(helloSession, state.mode === 'auto');
+      if (!helloSession && state.mode !== 'auto' && !state.sessionId) {
         // 不报错：提示可操作，并展开屏下的选择器。
         state.showList = true;
         addEvent('progress', '还没有选定会话，点下面选一个');
@@ -445,6 +581,18 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.ws.send(JSON.stringify({
       v: PROTOCOL, type: type, id: 'dev-' + Date.now().toString(36) + '-' + state.seq, seq: state.seq, ts: Date.now(), payload: payload
     }));
+  }
+  /** 发 hello；sessionId 为空串表示「不指定会话」（自动模式下由宿主挑最活跃 CU）。 */
+  function sendHello(sessionId, auto) {
+    send('hello', {
+      clientId: state.clientId,
+      clientVersion: 'p0-page-5',
+      protocol: PROTOCOL,
+      capabilities: { screen: true, tts: true, microphone: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) },
+      deviceName: '浏览器模拟设备',
+      sessionId: sessionId || undefined,
+      auto: auto === true ? true : undefined
+    });
   }
 
   /* ---------- 下行处理（未知 type 一律忽略，与宿主同一条约定） ---------- */
@@ -498,6 +646,23 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.showList = !state.showList;
     renderSessionBar();
     renderSessionList();
+  };
+  /* 恢复自动：清掉手动记忆，交回宿主「最近活跃 CU 会话」自动跟随。 */
+  $('sessAuto').onclick = function () {
+    state.sessionId = '';
+    state.sessionTitle = '';
+    state.sessionBound = false;
+    state.sessionSource = '';
+    state.computerUse = null;
+    state.sessionPreset = '';
+    state.mode = 'auto';
+    state.showList = false;
+    rememberSessionId('');
+    setComputerUseNotice(null, '');
+    renderSessionBar();
+    renderSessionList();
+    addEvent('progress', '已切回自动：正在绑定最近活跃的 Computer Use 会话…');
+    send('session.bind', { auto: true });
   };
   $('sessRefresh').onclick = function () { requestSessions(); };
 
