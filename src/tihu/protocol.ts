@@ -7,9 +7,16 @@
  *     带旧宿主不认识的字段，旧宿主不认识就忽略，不能因此判整条消息非法）。
  *   - **未知 type 必须忽略**：`parseUpstream()` 对不认识的 type、坏 JSON、超长的
  *     文本一律返回 `null`，绝不抛错——设备端以后加消息类型时，老宿主不能崩。
- *   - 上行只有六种：hello / audio.frame / text.input / confirm.reply / session.end / ping。
- *   - 下行八种：transcript / tts.text / screen.frame / event.progress /
- *     event.alert / event.done / confirm.ask（以及宿主回给设备的 ping 回执）。
+ *   - 上行八种：hello / audio.frame / text.input / confirm.reply / session.end /
+ *     sessions.query / session.bind / ping。
+ *   - 下行十一种：transcript / tts.text / screen.frame / event.progress /
+ *     event.alert / event.done / confirm.ask / sessions.list / session.bound /
+ *     session.invalid（以及宿主回给设备的 ping 回执 pong）。
+ *
+ * 2026-11-07 P0 会话绑定：页面不再只靠 `localStorage['dsh.sessions.current']`
+ * （localStorage 按 origin 隔离，公网 origin 下读不到桌面宿主选的会话），改成
+ * 连上 lane 后向宿主拉会话列表、自己选一个；`sessions.query` / `session.bind`
+ * 与对应的三条下行就是这条路。协议仍遵守「字段只增不删、未知 type 忽略」。
  *
  * 为什么单独一层：P1 要换成真板子（ESP32-S3-BOX-3）固件，协议必须能脱离
  * WebSocket 实现被单测覆盖——`scripts/test-tihu-protocol.mjs` 直接 import 本文件。
@@ -19,7 +26,16 @@
 export const TIHU_PROTOCOL_VERSION = '0' as const
 
 /** 上行消息类型（设备 → 宿主）。 */
-export const TIHU_UPSTREAM_TYPES = ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'session.end', 'ping'] as const
+export const TIHU_UPSTREAM_TYPES = [
+  'hello',
+  'audio.frame',
+  'text.input',
+  'confirm.reply',
+  'session.end',
+  'sessions.query',
+  'session.bind',
+  'ping',
+] as const
 /** 下行消息类型（宿主 → 设备）。 */
 export const TIHU_DOWNSTREAM_TYPES = [
   'transcript',
@@ -29,6 +45,9 @@ export const TIHU_DOWNSTREAM_TYPES = [
   'event.alert',
   'event.done',
   'confirm.ask',
+  'sessions.list',
+  'session.bound',
+  'session.invalid',
   'pong',
 ] as const
 
@@ -77,8 +96,9 @@ export interface HelloPayload {
   /** 设备名（屏上显示用）。 */
   deviceName?: string
   /**
-   * 目标会话 id。模拟页从同源 localStorage 的 `dsh.sessions.current` 读，
-   * 也就是「手机上当前打开的那个会话」——不另建并行会话体系。
+   * 目标会话 id。模拟页按 URL ?session= → 本 origin 的 `dsh.tihu.session` →
+   * 宽松读一次 `dsh.sessions.current` 的顺序取；宿主会校验它是否存在
+   * （不存在回 session.invalid，页面退回屏下选择器）。
    */
   sessionId?: string
 }
@@ -205,6 +225,71 @@ export interface SessionEndPayload {
   reason?: string
 }
 
+/**
+ * 会话列表查询（页面自己建会话选择用）。
+ *
+ * 为什么由设备主动要：公网 origin（http://<公网IP>:<端口>/tihu）与桌面宿主
+ * （http://127.0.0.1:…）不是同一个 origin，localStorage 互相隔离，页面读不到
+ * 桌面选过的会话。所以「当前会话」必须由宿主告诉页面，而不是页面自己猜。
+ */
+export interface SessionsQueryPayload {
+  /** 最多返回多少条；缺省 10，宿主上限 50。 */
+  limit?: number
+  /** 页面当前准备绑定的会话 id；宿主在完整列表里核对它是否还存在。 */
+  checkId?: string
+}
+
+/** 屏下选择器的一行。 */
+export interface SessionChoice {
+  /** 会话 id（`session-…`）。 */
+  sessionId: string
+  /** 会话名（宿主折叠不到标题时为空串，页面退回短 id）。 */
+  title: string
+  /** 工作目录（P0 只用于悬停提示）。 */
+  cwd?: string
+  /** 创建时间（毫秒）。 */
+  createdAt?: number
+  /** 是否正在宿主内存里（桌面正开着）。 */
+  live?: boolean
+}
+
+/** 下行：会话列表 + 对 checkId 的核对结果。 */
+export interface SessionsListPayload {
+  /** 最近 N 条（可绑定的）。 */
+  sessions: SessionChoice[]
+  /** 逻辑会话总数（不只这 N 条）。 */
+  total: number
+  /** checkId 是否存在；没传 checkId 时没有这个字段。 */
+  check?: { sessionId: string; found: boolean }
+  /** 数据源（诊断用）。 */
+  source: 'sessionQuery' | 'live' | 'none'
+}
+
+/** 上行：绑定一个会话（页面点选择器 / 换会话时发）。 */
+export interface SessionBindPayload {
+  /** 要绑定的会话 id。 */
+  sessionId: string
+}
+
+/** 下行：绑定成功（宿主是权威，标题/是否 live 以这里为准）。 */
+export interface SessionBoundPayload {
+  sessionId: string
+  /** 会话名；拿不到时为空串（页面显示短 id）。 */
+  title: string
+  /** 会话当前是否在宿主内存里（没打开的话语音注入前要先在桌面打开）。 */
+  live?: boolean
+}
+
+/** 下行：会话 id 非法（不存在 / 已归档 / 写错），页面据此退回选择器。 */
+export interface SessionInvalidPayload {
+  /** 非法/找不到的会话 id。 */
+  sessionId: string
+  /** 给用户看的一行原因（可操作：从下面选一个）。 */
+  reason: string
+  /** 是否建议立刻显示选择器（P0 恒为 true）。 */
+  showPicker?: boolean
+}
+
 /* ---------- 消息联合类型 ---------- */
 
 export type TihuUpstreamMessage =
@@ -213,6 +298,8 @@ export type TihuUpstreamMessage =
   | TihuEnvelope<'text.input', TextInputPayload>
   | TihuEnvelope<'confirm.reply', ConfirmReplyPayload>
   | TihuEnvelope<'session.end', SessionEndPayload>
+  | TihuEnvelope<'sessions.query', SessionsQueryPayload>
+  | TihuEnvelope<'session.bind', SessionBindPayload>
   | TihuEnvelope<'ping', PingPayload>
 
 export type TihuDownstreamMessage =
@@ -223,6 +310,9 @@ export type TihuDownstreamMessage =
   | TihuEnvelope<'event.alert', AlertPayload>
   | TihuEnvelope<'event.done', DonePayload>
   | TihuEnvelope<'confirm.ask', ConfirmAskPayload>
+  | TihuEnvelope<'sessions.list', SessionsListPayload>
+  | TihuEnvelope<'session.bound', SessionBoundPayload>
+  | TihuEnvelope<'session.invalid', SessionInvalidPayload>
   | TihuEnvelope<'pong', PingPayload>
 
 /* ---------- 解析与构造 ---------- */
@@ -307,6 +397,19 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
         // 结束本次语音会话：只带可选的 sessionId（不填就用设备绑定的那个）。
         if (payload.sessionId !== undefined && (typeof payload.sessionId !== 'string' || payload.sessionId.length > 256)) return null
         if (payload.reason !== undefined && typeof payload.reason !== 'string') return null
+        return value as TihuUpstreamMessage
+      }
+      case 'sessions.query': {
+        // 页面拉会话列表：limit/checkId 都可选，但给了就必须合法（超限直接忽略这条）。
+        if (payload.limit !== undefined) {
+          if (typeof payload.limit !== 'number' || !Number.isSafeInteger(payload.limit) || payload.limit < 1 || payload.limit > 50) return null
+        }
+        if (payload.checkId !== undefined && (typeof payload.checkId !== 'string' || payload.checkId.length > 256)) return null
+        return value as TihuUpstreamMessage
+      }
+      case 'session.bind': {
+        // 绑定会话：id 必填。
+        if (typeof payload.sessionId !== 'string' || payload.sessionId === '' || payload.sessionId.length > 256) return null
         return value as TihuUpstreamMessage
       }
       case 'ping': return value as TihuUpstreamMessage

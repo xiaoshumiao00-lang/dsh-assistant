@@ -28,6 +28,8 @@
 
 【验证】`scripts/test-tihu-protocol.mjs` 22 → 29 项（只读/危险命令矩阵、Transcript 对象归一化、闸门归属、`session.end` 立即失效）；新增 `scripts/tihu-voice-e2e.mjs` 真语音端到端自测（WAV → audio.frame → transcript → 注入 → 屏帧，打印转写文本与各段耗时）。本机实测：5.615 s 音频、SenseVoice int8 推理 160 ms，audio.frame → transcript 端到端 1.7 s。
 
+【2026-11-07 追加：公网 origin 下「还没有会话」】`localStorage` 按 origin 隔离：用户在桌面宿主 `127.0.0.1:57440` 选过会话，打开公网 `http://49.234.20.84:7080/tihu` 时 `dsh.sessions.current` 根本不存在，旧页面据此直接报「还没有会话」。现在：①连上 lane 后没有会话就向宿主发 `sessions.query`，宿主复用 `ctx.sessionQuery`（手机会话列表同源）返回最近 N 条（在线优先、带标题），页面在屏下渲染选择器，点一条即 `session.bind`；②绑定结果只存**本 origin 自己的** `dsh.tihu.session`，下次自动记住；③`?session=<id>` 优先级最高、绑定后写回，宿主校验不存在时回 `session.invalid` 并给可读提示（不白屏、不绑死）；④兜底顺序 URL → `dsh.tihu.session` → 宽松读一次 `dsh.sessions.current` → 都没有就展示选择器、**不报错**；⑤文案改为「还没有选定会话，点下面选一个」，屏上常驻当前会话名，保留「结束本次语音会话」。协议新增上行 `sessions.query`/`session.bind`、下行 `sessions.list`/`session.bound`/`session.invalid`（字段只增不删）；上行改为按到达顺序串行处理，避免异步绑定校验期间紧跟的 `text.input` 被误丢。`scripts/test-tihu-protocol.mjs` 29 → 33 项。
+
 ## [0.2.17] - 2026-11-06
 
 📺 平板 / 电视（宽屏、矮视口）专项：控制室卡片不再挤成 4 列被裁，抽屉里点得到会话
