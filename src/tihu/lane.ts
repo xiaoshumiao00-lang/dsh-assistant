@@ -1426,6 +1426,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   function enqueuePending(completedSessionId: string): void {
+    // 只给 Computer Use 模式的会话冒「新回复」泡（2026-11-08 用户要求）：标准/语音会话的
+    // 新回复不上右侧未读轨。预设未知时按非 CU 处理。
+    if (!isComputerUsePreset(sessionPresets.get(completedSessionId) ?? '')) return
     const title = sessionListCache?.rows.find((row) => row.sessionId === completedSessionId)?.title || shortSessionId(completedSessionId)
     const displays = new Set<string>()
     for (const device of devices) {
