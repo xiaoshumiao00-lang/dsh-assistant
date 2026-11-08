@@ -646,13 +646,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       div.textContent = lines[k].text;
       body.appendChild(div);
     }
-    var hint = $('scrollHint');
-    if (hint) {
-      var scroll = reply.scroll || { offset: 0, maxOffset: 0 };
-      if (scroll.offset > 0) hint.textContent = '↑ 上方还有 ' + scroll.offset + ' 行';
-      else if (scroll.maxOffset > 0) hint.textContent = '↓ 下方还有 ' + scroll.maxOffset + ' 行';
-      else hint.textContent = '';
-    }
+    // 角落不再显示还剩几行的提示，它挡住了主页按钮（可视窗口由宿主 scrollOffset 决定）
   }
 
   function addEvent(kind, text) {
