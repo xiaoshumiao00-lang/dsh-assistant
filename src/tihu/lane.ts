@@ -2112,6 +2112,41 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return window
   }
 
+  /**
+   * 任务进行中收到新语音命令：不终止老任务，自动新开并行会话跑这条命令（2026-11-08 用户定案）。
+   * 新会话沿用绑定会话的模式，标题由宿主按首条消息自动取前几个字；建完即把设备绑过去，
+   * 老会话原样跑完，完成后靠右侧气泡通知。sessions.using 的 prompt 路径会自动拉起 agent；
+   * 落库后回读最后一条 user 消息 id 挂上工具闸窗口——语音触发的危险动作仍要设备语音确认。
+   */
+  async function spawnParallelTask(device: TihuDevice, text: string): Promise<string> {
+    const fromId = device.sessionId
+    if (fromId === undefined) throw new Error('设备未绑定会话')
+    const preset = sessionPresets.get(fromId) ?? ''
+    const remote = optionalService(ctx, 'remote') as { session?: { create?: (base: unknown) => Promise<any> } } | undefined
+    let newId: string
+    if (preset !== '' && typeof remote?.session?.create === 'function') {
+      const result: any = await remote.session.create({ agentPreset: preset })
+      if (result?.ok !== true || typeof result?.value?.sessionId !== 'string') {
+        throw new Error(`新建并行会话失败：${String(JSON.stringify(result?.error ?? null)).slice(0, 80)}`)
+      }
+      newId = result.value.sessionId
+    } else {
+      const sessions = optionalService(ctx, 'sessions') as { create?: (base: unknown) => Promise<string> } | undefined
+      if (typeof sessions?.create !== 'function') throw new Error('宿主 sessions 服务不可用')
+      newId = await sessions.create({})
+    }
+    const blocks = [{ type: 'text', text }, { type: 'text', text: voiceTailOf(newId) }]
+    const sessionsSvc = optionalService(ctx, 'sessions') as { using?: (id: string, opts: unknown, fn: (ref: any) => Promise<void>) => Promise<void> } | undefined
+    if (typeof sessionsSvc?.using !== 'function') throw new Error('宿主 sessions.using 不可用')
+    await sessionsSvc.using(newId, { source: 'tihu-voice' }, async (reference: any) => {
+      await reference?.binding?.session?.prompt(blocks, 'steer')
+      const messageId = lastUserMessageId(reference?.binding?.session)
+      if (messageId !== undefined) activeSessions.set(newId, { until: Date.now() + ACTIVE_WINDOW_MS, messageId })
+    })
+    await bindSession(device, newId)
+    log(`tihu spawn session=${newId} from=${fromId} preset=${preset || 'standard'}`)
+    return newId
+  }
   /** 续期（每次 tihu 上行都算一次「tihu 消息」，窗口滑动）。 */
   function touchWindow(sessionId: string): void {
     const window = activeSessions.get(sessionId)
@@ -3118,7 +3153,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         // 先回 transcript 再注入：即使这个会话已经被关掉/没有 agent，屏上也先看到
         // 「我听到的是什么」，而不是只剩一条「注入失败」（E2E 脚本也靠这条核对转写）。
         device.send('transcript', { text, final: true, source, retryable: true } satisfies TranscriptPayload)
-        inject(device.sessionId, text, voiceTailOf(device.sessionId))
+        if (runningSessions.has(device.sessionId)) {
+          // 任务进行中：不终止老任务，自动新开并行会话（用户 2026-11-08 定案）。
+          const freshId = await spawnParallelTask(device, text)
+          device.send('event.progress', { stage: '新任务', text: '已在新会话开工，原任务继续跑（完成后气泡提醒）' } satisfies ProgressPayload)
+          log(`tihu parallel route from=${device.sessionId} to=${freshId}`)
+        } else {
+          inject(device.sessionId, text, voiceTailOf(device.sessionId))
+        }
         device.send('event.progress', { stage: '注入', text: '已送入当前会话' } satisfies ProgressPayload)
         sendFrame(device, { stage: '思考', title: '模型处理中', bullets: [text.slice(0, 20)], tone: 'busy' } satisfies ScreenFramePayload)
       } catch (error) {
