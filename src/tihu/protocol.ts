@@ -296,7 +296,7 @@ export interface ScreenFramePayload {
   mode?: 'home' | 'status' | 'reply'
   /** 主页屏：项目列表与翻页。 */
   home?: {
-    projects: { name: string; status: 'running' | 'idle' | 'done'; summary: string }[]
+    projects: { name: string; status: 'running' | 'idle' | 'done'; summary: string; sessionId?: string }[]
     page: { index: number; total: number }
     total: number
   }
@@ -446,7 +446,7 @@ export interface SessionsListPayload {
 /** 屏幕手势：上/下滑（滚动历史）与点击（预留）。 */
 export type ScreenGesturePayload =
   | { action: 'swipe'; dy: number; phase: 'start' | 'move' | 'end' }
-  | { action: 'tap'; x: number; y: number; hit?: 'chip' | 'screen'; targetSessionId?: string }
+  | { action: 'tap'; x: number; y: number; hit?: 'chip' | 'screen' | 'project'; targetSessionId?: string; project?: string; sessionId?: string }
 
 export interface SessionBindPayload {
   /** 要手动绑定的会话 id；`auto: true` 时可省略。 */
@@ -649,8 +649,10 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
         if (payload.action === 'tap') {
           if (typeof payload.x !== 'number' || typeof payload.y !== 'number') return null
           if (!Number.isFinite(payload.x) || !Number.isFinite(payload.y)) return null
-          if (payload.hit !== undefined && payload.hit !== 'chip' && payload.hit !== 'screen') return null
+          if (payload.hit !== undefined && payload.hit !== 'chip' && payload.hit !== 'screen' && payload.hit !== 'project') return null
           if (payload.targetSessionId !== undefined && (typeof payload.targetSessionId !== 'string' || payload.targetSessionId.length > 256)) return null
+          if (payload.project !== undefined && (typeof payload.project !== 'string' || payload.project.length > 256)) return null
+          if (payload.sessionId !== undefined && (typeof payload.sessionId !== 'string' || payload.sessionId.length > 256)) return null
           // 钳制而不是丢弃：页面在真机缩放/横屏下会发出负值或超出 320×240 的点，
           // 直接忽略等于怎么点都没反应（2026-11-07 审计 P2-手势越界）。
           return {

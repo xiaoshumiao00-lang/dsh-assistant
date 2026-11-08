@@ -71,6 +71,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .home-body { display:none; flex:1; overflow:hidden; }
   #screen.home-mode .home-body { display:block; }
   #screen.home-mode .title, #screen.home-mode ul, #screen.home-mode .reply-body, #screen.home-mode .bar { display:none; }
+  #screen .tap-flash { position:absolute; width:28px; height:28px; margin:-14px 0 0 -14px; border-radius:50%;
+    background:rgba(255,255,255,.35); pointer-events:none; z-index:5; animation:tapFlash .18s ease-out forwards; }
+  @keyframes tapFlash { from { opacity:.8; transform:scale(.4); } to { opacity:0; transform:scale(1.4); } }
   #screen .home-item { height:36px; box-sizing:border-box; padding:1px 0; overflow:hidden; }
   #screen .home-row1 { display:flex; align-items:center; gap:6px; font-size:16px; font-weight:700; line-height:20px; white-space:nowrap; }
   #screen .home-dot { width:8px; height:8px; border-radius:50%; flex:none; background:#6b7785; }
@@ -310,7 +313,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     audioCtx: null, pcmSources: [], pcmNextTime: 0, turnPcm: [],
     samplePending: false, sampleTimer: 0,
     voice: 'default', voices: [], voiceEngine: null,
-    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, screenMode: 'status', pending: [], boundProject: '' };
+    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, screenMode: 'status', pending: [], boundProject: '', homeProjects: [], screenScale: 2 };
 
   /* ---------- 会话定位 ----------
      2026-11-07 P0：localStorage **按 origin 隔离**。用户在桌面宿主
@@ -426,9 +429,16 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
   }
 
+  /* 页脚：绑定状态每帧都刷新（旧实现只在主页帧更新，会话屏帧里一直是陈旧的「未绑定」）。 */
+  function updateScrollHint() {
+    $('scrollHint').textContent = state.sessionBound
+      ? ('已绑定：' + (state.boundProject || state.sessionTitle || '未命名会话'))
+      : '未绑定会话 · 点项目进入';
+  }
   function renderScreen(payload) {
     var screen = $('screen');
     renderPending(payload || {});
+    updateScrollHint();
     if (payload && payload.mode === 'home' && payload.home) {
       state.screenMode = 'home';
       state.reply = null;
@@ -438,6 +448,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       var homeBody = $('homeBody');
       homeBody.innerHTML = '';
       var projects = payload.home.projects || [];
+      state.homeProjects = projects;
       for (var pi = 0; pi < projects.length; pi += 1) {
         var project = projects[pi];
         var item = document.createElement('div');
@@ -1278,6 +1289,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   var scaleButtons = document.querySelectorAll('.screen-tools button[data-scale]');
   function applyScale(mode) {
     var spec = SCALE_MODES[mode] || SCALE_MODES['2'];
+    state.screenScale = spec.scale;
     $('device').style.setProperty('--screen-scale', String(spec.scale));
     $('scaleHint').textContent = spec.label;
     for (var i = 0; i < scaleButtons.length; i += 1) {
@@ -1509,16 +1521,21 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var startY = 0;
     var moved = false;
     function swipe(dy, phase) {
-      if (!state.reply && state.screenMode !== 'home') return;
       send('screen.gesture', { action: 'swipe', dy: dy, phase: phase });
     }
+    function tapFlash(visX, visY) {
+      var flash = document.createElement('div');
+      flash.className = 'tap-flash';
+      flash.style.left = visX + 'px';
+      flash.style.top = visY + 'px';
+      screen.appendChild(flash);
+      setTimeout(function () { if (flash.parentNode) flash.parentNode.removeChild(flash); }, 200);
+    }
     screen.addEventListener('wheel', function (event) {
-      if (!state.reply && state.screenMode !== 'home') return;
       event.preventDefault();
       swipe(event.deltaY, 'move');
     }, { passive: false });
     screen.addEventListener('pointerdown', function (event) {
-      if (!state.reply && state.screenMode !== 'home') return;
       dragging = true;
       moved = false;
       lastY = event.clientY;
@@ -1539,44 +1556,39 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       if (!dragging) return;
       dragging = false;
       if (!moved && event) {
+        var scale = state.screenScale || 1;
         var rect = screen.getBoundingClientRect();
-        var x = event.clientX - rect.left;
-        var y = event.clientY - rect.top;
+        var x = (event.clientX - rect.left) / scale;
+        var y = (event.clientY - rect.top) / scale;
+        tapFlash(event.clientX - rect.left, event.clientY - rect.top);
         var hit = null;
         var chips = document.querySelectorAll('#pendingRail .pending-chip');
         for (var ci = 0; ci < chips.length; ci += 1) {
           var chipRect = chips[ci].getBoundingClientRect();
-          if (x >= chipRect.left - rect.left - 8 && x <= chipRect.right - rect.left + 8 &&
-              y >= chipRect.top - rect.top - 8 && y <= chipRect.bottom - rect.top + 8) {
+          if (event.clientX >= chipRect.left - 8 && event.clientX <= chipRect.right + 8 &&
+              event.clientY >= chipRect.top - 8 && event.clientY <= chipRect.bottom + 8) {
             hit = chips[ci].dataset.sessionId;
             break;
           }
         }
-        if (hit) send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'chip', targetSessionId: hit });
-        else send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'screen' });
+        if (hit) { send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'chip', targetSessionId: hit }); return; }
+        if (state.screenMode === 'home' && state.homeProjects && state.homeProjects.length) {
+          var idx = Math.floor((y - $('homeBody').offsetTop) / 36);
+          if (idx >= 0 && idx < state.homeProjects.length) {
+            var proj = state.homeProjects[idx];
+            if (proj && proj.sessionId) {
+              send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'project', project: proj.name, sessionId: proj.sessionId });
+              return;
+            }
+          }
+        }
+        send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'screen' });
         return;
       }
       swipe(0, 'end');
     }
     screen.addEventListener('pointerup', endDrag);
     screen.addEventListener('pointercancel', endDrag);
-    screen.addEventListener('touchstart', function (event) {
-      if (!state.reply || !event.touches.length) return;
-      lastY = event.touches[0].clientY;
-      event.preventDefault();
-    }, { passive: false });
-    screen.addEventListener('touchmove', function (event) {
-      if (!state.reply || !event.touches.length) return;
-      var dy = event.touches[0].clientY - lastY;
-      lastY = event.touches[0].clientY;
-      if (dy !== 0) swipe(dy, 'move');
-      event.preventDefault();
-    }, { passive: false });
-    screen.addEventListener('touchend', function (event) {
-      if (!state.reply) return;
-      swipe(0, 'end');
-      event.preventDefault();
-    }, { passive: false });
   })();
   $('voiceFile').addEventListener('change', function (event) {
     var file = event.target.files && event.target.files[0];

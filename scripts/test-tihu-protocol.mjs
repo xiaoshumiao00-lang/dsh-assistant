@@ -3199,6 +3199,65 @@ test('page：stage=回答中 的新 reply 帧不得清空朗读队列', () => {
   assert.ok(transcriptCase.includes('resetTurnAudio'), 'transcript 仍要停掉上一轮残留音频')
 })
 
+
+await testAsync('lane：主页项目帧带 sessionId，点项目行（hit=project）即绑定进入该会话', async () => {
+  const now = Date.now()
+  const iso = (agoMs) => new Date(now - agoMs).toISOString()
+  const records = [
+    cuRecord('session-a', { preset: 'computer-use', live: true, cwd: 'D:\\磷石膏SCI', lastPromptAt: now - 30_000, title: '磷石膏 会话 A' }),
+    cuRecord('session-b', { preset: 'computer-use', cwd: 'D:\\桥梁温度场', lastPromptAt: now - 20 * 60_000, title: '温度场 会话 B' }),
+  ]
+  const workspaces = [
+    { id: 'ws-a', path: 'D:\\磷石膏SCI', title: '磷石膏SCI', createdAt: iso(400_000), updatedAt: iso(30_000), sessionIds: ['session-a'] },
+    { id: 'ws-b', path: 'D:\\桥梁温度场', title: '桥梁温度场', createdAt: iso(420_000), updatedAt: iso(50_000), sessionIds: ['session-b'] },
+  ]
+  const { runtime } = runtimeFor(records, { workspaceRegistry: workspaceRegistryFixture(workspaces) })
+  const socket = openLane(runtime)
+  // 不带 sessionId、不带 auto：未绑定设备，hello 后直接给主页
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'tap-project', protocol: '0' }, 1)))
+  await waitMs(60)
+  const homes = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home')
+  assert.ok(homes.length > 0, '未绑定设备 hello 后应收主页')
+  const home = homes[homes.length - 1].payload.home
+  const withId = home.projects.filter((item) => typeof item.sessionId === 'string' && item.sessionId !== '')
+  assert.ok(withId.length >= 2, `主页项目应带 sessionId（点项目进入），实际 ${JSON.stringify(home.projects)}`)
+  const target = home.projects.find((item) => item.sessionId === 'session-b')
+  assert.ok(target, 'session-b 应在主页清单里')
+  // 点项目行 → 绑定到 session-b（未绑定设备也要能吃这个 tap）
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 60, hit: 'project', project: target.name, sessionId: 'session-b' }, 2)))
+  await waitMs(80)
+  const bounds = framesOf(socket).filter((frame) => frame.type === 'session.bound')
+  assert.ok(bounds.some((frame) => frame.payload.sessionId === 'session-b'), '点项目后应收 session.bound(session-b)')
+  runtime.dispose()
+})
+
+await testAsync('lane：已绑定设备点别的项目行会换绑，点右下角仍回主页', async () => {
+  const now = Date.now()
+  const iso = (agoMs) => new Date(now - agoMs).toISOString()
+  const records = [
+    cuRecord('session-a', { preset: 'computer-use', live: true, cwd: 'D:\\磷石膏SCI', lastPromptAt: now - 30_000, title: '磷石膏 会话 A' }),
+    cuRecord('session-b', { preset: 'computer-use', cwd: 'D:\\桥梁温度场', lastPromptAt: now - 20 * 60_000, title: '温度场 会话 B' }),
+  ]
+  const workspaces = [
+    { id: 'ws-a', path: 'D:\\磷石膏SCI', title: '磷石膏SCI', createdAt: iso(400_000), updatedAt: iso(30_000), sessionIds: ['session-a'] },
+    { id: 'ws-b', path: 'D:\\桥梁温度场', title: '桥梁温度场', createdAt: iso(420_000), updatedAt: iso(50_000), sessionIds: ['session-b'] },
+  ]
+  const { runtime } = runtimeFor(records, { workspaceRegistry: workspaceRegistryFixture(workspaces) })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'tap-switch', protocol: '0', sessionId: 'session-a' }, 1)))
+  await waitMs(60)
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 96, hit: 'project', project: '桥梁温度场', sessionId: 'session-b' }, 2)))
+  await waitMs(80)
+  const bounds = framesOf(socket).filter((frame) => frame.type === 'session.bound' && frame.payload.sessionId === 'session-b')
+  assert.ok(bounds.length > 0, '已绑定设备点别的项目应收 session.boound(session-b)')
+  // 右下角 tap → 回主页
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 300, y: 200 }, 3)))
+  await waitMs(80)
+  const homes = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home')
+  assert.ok(homes.length > 0, '右下角 tap 仍应回主页')
+  runtime.dispose()
+})
+
 /* ---------- 汇总 ---------- */
 console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
 if (failed > 0) process.exit(1)
