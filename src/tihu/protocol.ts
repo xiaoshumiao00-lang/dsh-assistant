@@ -282,7 +282,8 @@ export interface VoiceCreatedPayload {
 
 /** 320×240 屏幕帧：阶段标签 / 标题 / 要点行 / 进度数字。 */
 export interface ScreenFramePayload {
-  /** 阶段标签，如「聆听」「思考」「动手」「完成」。 */
+  /** 阶段标签，如「聆听」「思考」「动手」「完成」。主页屏这行给的是「项目 总数 个 · 第 x/y 页」，
+   *  朗读屏这行是文案（页面在末尾自己接上窗口位置「· 起始行/总行」）。 */
   stage: string
   /** 标题（一行，最多约 18 个汉字）。 */
   title: string
@@ -342,8 +343,8 @@ export interface ReplyScreenPayload {
   charPos?: number
   /** 已按屏宽折好的行（宿主权威；页面直接渲染，不再自己折行）。 */
   lines?: { text: string; sentenceIndex: number }[]
-  /** 滚动状态：offset=顶部被卷走的行数，maxOffset=最大可滚动行数。 */
-  scroll?: { offset: number; maxOffset: number }
+  /** 滚动状态：offset=顶部被卷走的行数（也就是可视窗口的起始行，0 起），maxOffset=最大可滚动行数，total=整段回复折完后的总行数。 */
+  scroll?: { offset: number; maxOffset: number; total?: number }
   /** 是否跟随朗读自动滚动。 */
   follow?: boolean
 }

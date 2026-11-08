@@ -4507,6 +4507,246 @@ await testAsync('lane.control 薄壳：archiveSession 转调 workspaceRegistry�
 })
 
 
+/* ---------- 2026-11-08 确认的三处改动：底部翻页入口 / 主页 stage 页数 / 朗读屏窗口位置（方案 B） ---------- */
+
+/** 造 N 个互不嵌套的控制室项目（主页 5 条一页，所以 N>5 就出第二页）。 */
+function pagerProjectsFixture(count) {
+  const now = Date.now()
+  const iso = (agoMs) => new Date(now - agoMs).toISOString()
+  const workspaces = []
+  for (let i = 1; i <= count; i += 1) {
+    workspaces.push({
+      id: 'ws-pager-' + i,
+      path: 'D:\\pj-pager-' + i,
+      title: '翻页项目 ' + i,
+      createdAt: iso(600_000 + count - i),
+      updatedAt: iso(600_000 - i * 1_000),
+      sessionIds: i === 1 ? ['session-pager-a'] : [],
+    })
+  }
+  return workspaces
+}
+
+function pagerLaneFixture(count) {
+  const records = [cuRecord('session-pager-a', { preset: 'computer-use', live: true, cwd: 'D:\\pj-pager-1', lastPromptAt: Date.now() - 5_000, title: '翻页会话 A' })]
+  const { runtime, events } = runtimeFor(records, { workspaceRegistry: workspaceRegistryFixture(pagerProjectsFixture(count)) }, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pager', protocol: '0', sessionId: 'session-pager-a' }, 1)))
+  return { runtime, events, socket }
+}
+
+function homeFramesOf(socket) {
+  return framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home')
+}
+
+async function tapPagerButton(socket, actionId, seq) {
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 150, y: 215, hit: 'action', actionId }, seq)))
+  await waitMs(90)
+}
+
+await testAsync('lane：主页 stage 行写清「项目 总数 个 · 第 x/y 页」（两页项目）', async () => {
+  const { runtime, socket } = pagerLaneFixture(7)
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 300, y: 200 }, 2)))
+  await waitMs(90)
+  const frame = homeFramesOf(socket).pop()
+  assert.ok(frame !== undefined, '要点主页帧')
+  assert.equal(frame.payload.home.total, 7)
+  assert.equal(frame.payload.home.page.total, 2, '7 个项目 5 条一页 → 2 页')
+  assert.equal(frame.payload.home.projects.length, 5, '每页仍是 5 条（没改成 6）')
+  assert.equal(frame.payload.stage, '项目 7 个 · 第 1/2 页', '主页 stage 行要带页码：' + frame.payload.stage)
+  assert.ok(measureTextPx(frame.payload.stage, SCREEN_SPEC.stageFontPx) <= CONTENT_WIDTH_PX, 'stage 行不得超 304px（不截断）')
+  // 页面上的旧拼装删掉了：主页 stage 完全来自宿主那一行
+  const pageSource = readFileSync(new URL('../src/tihu/page.ts', import.meta.url), 'utf8')
+  assert.equal(pageSource.includes("'项目 ' + payload.home.total"), false, '页面不许再自己拼「项目 N 个 · p/t」')
+  runtime.dispose()
+})
+
+await testAsync('lane：‹ › 按钮走 screen.action 通道换页并重发帧，越界一侧不发按钮也不响应', async () => {
+  const { runtime, socket } = pagerLaneFixture(7)
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 300, y: 200 }, 2)))
+  await waitMs(90)
+  const first = homeFramesOf(socket).pop()
+  assert.deepEqual((first.payload.actions || []).map((item) => item.id), ['homeNext'], '第一页只给「下一页」按钮')
+  assert.equal((first.payload.actions || []).some((item) => item.id === 'homePrev'), false, '第一页没有上一页按钮')
+  await tapPagerButton(socket, 'homeNext', 3)
+  const second = homeFramesOf(socket).pop()
+  assert.equal(second.payload.home.page.index, 1, '点 › 进第二页')
+  assert.equal(second.payload.stage, '项目 7 个 · 第 2/2 页', 'stage 行跟着页码：' + second.payload.stage)
+  assert.equal(second.payload.home.projects.length, 2, '第二页剩 2 条')
+  assert.deepEqual((second.payload.actions || []).map((item) => item.id), ['homePrev'], '最后一页只给「上一页」按钮')
+  // 越界：最后一页点 › 不该动、也不该再出一帧
+  const before = homeFramesOf(socket).length
+  await tapPagerButton(socket, 'homeNext', 4)
+  assert.equal(homeFramesOf(socket).length, before, '最后一页点「下一页」不该重发主页帧')
+  assert.equal(homeFramesOf(socket).pop().payload.home.page.index, 1, '仍在最后一页')
+  await tapPagerButton(socket, 'homePrev', 5)
+  assert.equal(homeFramesOf(socket).pop().payload.home.page.index, 0, '‹ 回第一页')
+  // 到第一页后再点 ‹：越界一侧不响应
+  const atFirst = homeFramesOf(socket).length
+  await tapPagerButton(socket, 'homePrev', 6)
+  assert.equal(homeFramesOf(socket).length, atFirst, '第一页点「上一页」不该重发主页帧')
+  assert.equal(homeFramesOf(socket).pop().payload.home.page.index, 0, '还在第一页')
+  // 手势切页仍在（不删），且与按钮共用同一份页码
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'swipe', dy: -40, phase: 'move' }, 7)))
+  await waitMs(90)
+  assert.equal(homeFramesOf(socket).pop().payload.home.page.index, 1, '手势切页仍工作（往下一页）')
+  runtime.dispose()
+})
+
+await testAsync('lane：一页主页（5 个项目）不给 ‹ › 按钮，也不出页码尾巴', async () => {
+  const { runtime, socket } = pagerLaneFixture(5)
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 300, y: 200 }, 2)))
+  await waitMs(90)
+  const frame = homeFramesOf(socket).pop()
+  assert.equal(frame.payload.home.page.total, 1)
+  assert.equal(frame.payload.stage, '项目 5 个 · 第 1/1 页', '一页也要写清第 1/1 页：' + frame.payload.stage)
+  assert.deepEqual((frame.payload.actions || []).map((item) => item.id), [], '单页不给翻页按钮')
+  const before = homeFramesOf(socket).length
+  await tapPagerButton(socket, 'homeNext', 3)
+  assert.equal(homeFramesOf(socket).length, before, '单页点 › 什么都不动')
+  await tapPagerButton(socket, 'homePrev', 4)
+  assert.equal(homeFramesOf(socket).length, before, '单页点 ‹ 也什么都不动')
+  runtime.dispose()
+})
+
+test('page：主页底部翻页条在屏内、只在 home-mode 显示、按钮 28px、两个 id 都上报 action', () => {
+  const { ctx } = fakeCtx()
+  const runtime = createTihuRuntime(ctx, { log: () => {}, tts: { disabled: true } })
+  const html = runtime.page()
+  runtime.dispose()
+  assert.ok(html.includes('<div id="homePager" class="home-pager"></div>'), '翻页条要落在主页屏底部（homeBody 之后）')
+  assert.ok(html.indexOf('id="homePager"') > html.indexOf('id="homeBody"'), '翻页条必须在项目列表之后（屏底部）')
+  assert.ok(html.includes('#screen .home-pager { display:none;'), '默认不显示（只在 home-mode 出）')
+  assert.ok(html.includes('#screen.home-mode .home-pager { display:flex; }'), 'home-mode 用 flex 布局显示翻页条')
+  assert.ok(/#screen \.home-pager button \{[^}]*min-height:28px/.test(html), '按钮 min-height 28px')
+  assert.ok(html.includes('#screen .home-pager .page'), '中间要有当前页标签')
+  assert.ok(html.includes("#screen.rail-on .home-pager { width:240px; }") || html.includes(".home-pager { width:240px; }"), '有气泡轨时翻页条要让开右侧 64px')
+  assert.ok(/setAttribute\('data-action', 'homePrev'\)/.test(html), '‹ 要带 homePrev')
+  assert.ok(/setAttribute\('data-action', 'homeNext'\)/.test(html), '› 要带 homeNext')
+  assert.ok(html.includes("actionId === 'homePrev'"), '点按钮要按 action 上报（与主页/上一条同一套）')
+  assert.ok(html.includes("hit: 'action', actionId"), '上报的 gesture 必须是 hit=action 带 actionId')
+  assert.ok(html.includes(".home-pager button.off"), '越界的一侧要置灰')
+  // 屏内高度：stage 14 + 间隙 + 5×30 项目行 + 间隙 + 翻页条 28 必须装得进 224 内容高
+  assert.ok(/#screen \.home-item \{ height:30px/.test(html), '项目行要收进 30px 才装得下翻页条')
+  assert.ok(/#screen \.home-recent \{ display:block; height:20px/.test(html), '最近回答行仍是 20px')
+  const stageLine = html.match(/#screen \.home-pager \{[^}]*\}/)
+  assert.ok(stageLine && stageLine[0].includes('flex:none'), '翻页条不参与 flex 伸缩（固定一行）')
+})
+
+test('page：主页/朗读屏都显式复位 stage 的 display（状态屏曾把它藏起来）', () => {
+  const { ctx } = fakeCtx()
+  const runtime = createTihuRuntime(ctx, { log: () => {}, tts: { disabled: true } })
+  const html = runtime.page()
+  runtime.dispose()
+  const marks = html.split("$('stage').style.display = ''").length - 1
+  assert.ok(marks >= 2, 'home 与 reply 两个分支都要复位 stage：' + marks)
+})
+
+test('page：朗读屏位置指示只在 stage 行末尾追加「· 起始行/总行」，角落提示保持删掉', () => {
+  const { ctx } = fakeCtx()
+  const runtime = createTihuRuntime(ctx, { log: () => {}, tts: { disabled: true } })
+  const html = runtime.page()
+  runtime.dispose()
+  assert.ok(html.includes('function replyStageText'), '朗读屏 stage 要有专门的组装函数')
+  assert.ok(html.includes("' · ' + (offset + 1) + '/' + total"), '位置 = 窗口起始行/总行（宿主 scroll 给的绝对行号）')
+  assert.ok(html.includes('Number(scroll.total)'), '总行数取宿主新加的 scroll.total')
+  assert.ok(html.includes('function stageWithTail'), '超长时要裁文案、保住位置尾巴')
+  assert.ok(html.includes('function textWidthPx'), '尾巴宽度要先量出来才谈得上裁剪')
+  assert.equal(html.includes('下方还有'), false, '「下方还有 N 行」角落提示保持删掉（ecf48fa）')
+  assert.equal(html.includes('.reply-mode .home-pager'), false, '翻页条不许出现在朗读屏（不遮挡主页/上一条/下一条）')
+  assert.ok(html.includes('#screen.home-mode .bar'), '主页屏要把进度条收掉，翻页条才不会和它打架')
+  assert.ok(/var start = 0;/.test(html), '可视窗口仍由宿主切好（页面不自己算窗口）')
+})
+
+await testAsync('lane：回答帧带绝对窗口位置（scroll.total/offset），滑到两端数字都对得上', async () => {
+  process.env.TIHU_HOME_AFTER_MS = '60000'
+  process.env.TIHU_HOME_RECHECK_MS = '60000'
+  const { runtime, events } = runtimeFor([cuRecord('session-pos-1', { live: true, lastPromptAt: 1000 })], {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pos', protocol: '0', sessionId: 'session-pos-1' }, 1)))
+  await waitMs(40)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const long = Array.from({ length: 12 }, (_, i) => `第${i + 1}句内容要足够长这样才能折出多行。`).join('')
+  onSessionEvent({ id: 'session-pos-1', header: { id: 'session-pos-1' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: long }] } },
+  })
+  // 等朗读播完（12 段假 TTS）：窗口位置这时候已经跟着自动朗读走过一遍
+  await waitMs(1800)
+  const replies = screenFramesOf(socket).filter((frame) => frame.payload.mode === 'reply')
+  assert.ok(replies.length > 3, '朗读期间要出多帧，才谈得上位置跟着走：' + replies.length)
+  const firstReply = replies[0].payload.reply
+  const total = firstReply.scroll.total
+  assert.ok(total > SCREEN_SPEC.replyVisibleLines, '长回复折出的总行要比可视窗口多：' + total)
+  assert.equal(total, firstReply.scroll.maxOffset + SCREEN_SPEC.replyVisibleLines, 'total = maxOffset + 可视行数')
+  assert.equal(firstReply.scroll.offset, 0, '刚出帧时窗口起始行是 1')
+  assert.equal(firstReply.lines.length, SCREEN_SPEC.replyVisibleLines, '那一帧给的就是起始 9 行')
+  assert.ok(
+    replies.some((frame) => frame.payload.reply.scroll.offset > 0),
+    '自动朗读要把窗口往下推（位置数字得跟着朗读变）',
+  )
+  assert.ok(
+    replies.every((frame) => frame.payload.stage === '回答中'),
+    'lane 的 stage 文案不动（窗口位置的尾巴是页面自己接上去的）',
+  )
+  const replyOf = () => {
+    const frames = screenFramesOf(socket).filter((frame) => frame.payload.mode === 'reply')
+    return frames[frames.length - 1].payload.reply
+  }
+  // 上滑看更早内容：窗口起始行跟着变，总行不变
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'swipe', dy: -200, phase: 'move' }, 10)))
+  await waitMs(60)
+  let reply = replyOf()
+  assert.ok(reply.scroll.offset > 0, '上滑后窗口起始行往后走')
+  assert.equal(reply.scroll.total, total, '总行数不该变')
+  // 一直滑到窗口最末一屏：offset = maxOffset → 窗口起始行 + 可视行数 = 总行数
+  for (let i = 0; i < 6; i += 1) {
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'swipe', dy: -2000, phase: 'move' }, 11 + i)))
+    await waitMs(30)
+  }
+  reply = replyOf()
+  assert.equal(reply.scroll.offset, reply.scroll.maxOffset, '滑到窗口最末一屏')
+  assert.equal(reply.scroll.offset + reply.lines.length, total, '窗口起始行 + 可视行数 = 总行数（数字对得上）')
+  // 滑回窗口第一屏：回到 1/总行
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'swipe', dy: 9000, phase: 'move' }, 17)))
+  await waitMs(60)
+  reply = replyOf()
+  assert.equal(reply.scroll.offset, 0, '滑回第一屏 → 窗口起始行 1')
+  assert.equal(reply.scroll.total, total)
+  delete process.env.TIHU_HOME_AFTER_MS
+  delete process.env.TIHU_HOME_RECHECK_MS
+  runtime.dispose()
+})
+
+test('protocol：回复屏 scroll 多一个 total 字段仍是 v0 最小增量（旧字段一个都不动）', () => {
+  const payload = {
+    stage: '回答中',
+    title: '',
+    bullets: [],
+    tone: 'ok',
+    mode: 'reply',
+    reply: {
+      sentences: [{ index: 0, start: 0, end: 3, text: '第一句' }],
+      currentIndex: 0,
+      total: 1,
+      totalChars: 3,
+      charPos: 0,
+      lines: [{ text: '第一句', sentenceIndex: 0 }],
+      scroll: { offset: 0, maxOffset: 0, total: 1 },
+      follow: true,
+    },
+    pending: [],
+    pendingCount: 0,
+  }
+  const frame = buildDownstream('screen.frame', payload, 1)
+  assert.ok(isTihuEnvelope(frame))
+  assert.equal(frame.payload.reply.scroll.total, 1, 'total 要留在帧里（不删字段）')
+  assert.equal(frame.payload.reply.scroll.maxOffset, 0)
+  assert.deepEqual(TIHU_DOWNSTREAM_TYPES.filter((type) => type === 'screen.frame'), ['screen.frame'], '不开新协议版本、不加新消息类型')
+  assert.equal(TIHU_PROTOCOL_VERSION, '0')
+})
+
+
 /* ---------- 汇总 ---------- */
 console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
 if (failed > 0) process.exit(1)

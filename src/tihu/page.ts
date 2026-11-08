@@ -72,6 +72,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen.home-mode .home-body { display:block; }
   #screen.home-mode .title, #screen.home-mode ul, #screen.home-mode .reply-body, #screen.home-mode .bar,
   #screen.home-mode .action-bar, #screen.home-mode .run-list { display:none; }
+  /* 首页底部翻页条（用户 2026-11-08 要求）：只在 home-mode 显示，按钮 min-height 28px，flex 布局。
+     这一行占掉底部 28px + 4px 间隙，所以项目行必须收进 30px：224 内容高 = stage 14 + 间隙 4
+     + 最近回答 20 + 5×30 + 间隙 4 + 翻页条 28 = 220（不留半行）。 */
+  #screen .home-pager { display:none; flex:none; align-items:center; gap:6px; }
+  #screen.home-mode .home-pager { display:flex; }
+  #screen .home-pager button { flex:none; width:64px; min-height:28px; padding:0; border-radius:6px;
+    border:1px solid #33414f; background:#1b2430; color:#d9e2ea; font-size:16px; line-height:26px; }
+  #screen .home-pager button.off { opacity:.45; }
+  #screen .home-pager button:active { background:#2c3d4e; }
+  #screen .home-pager .page { flex:1; min-width:0; text-align:center; font-size:13px; line-height:16px;
+    color:#9fb0c0; white-space:nowrap; overflow:hidden; }
   /* 回复屏底部动作条（停止 / 重读 / 主页） */
   #screen .action-bar { display:none; flex:none; gap:6px; padding-top:4px; }
   #screen.reply-mode .action-bar { display:flex; }
@@ -91,11 +102,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .tap-flash { position:absolute; width:28px; height:28px; margin:-14px 0 0 -14px; border-radius:50%;
     background:rgba(255,255,255,.35); pointer-events:none; z-index:5; animation:tapFlash .18s ease-out forwards; }
   @keyframes tapFlash { from { opacity:.8; transform:scale(.4); } to { opacity:0; transform:scale(1.4); } }
-  #screen .home-item { height:36px; box-sizing:border-box; padding:1px 0; overflow:hidden; }
-  #screen .home-row1 { display:flex; align-items:center; gap:6px; font-size:16px; font-weight:700; line-height:20px; white-space:nowrap; }
+  #screen .home-item { height:30px; box-sizing:border-box; padding:0; overflow:hidden; }
+  #screen .home-row1 { display:flex; align-items:center; gap:6px; font-size:16px; font-weight:700; line-height:18px; white-space:nowrap; }
   #screen .home-dot { width:8px; height:8px; border-radius:50%; flex:none; background:#6b7785; }
   #screen .home-row1 .name { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #screen .home-row2 { font-size:12px; line-height:14px; color:#8b97a5; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #screen .home-row2 { font-size:12px; line-height:12px; color:#8b97a5; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen .home-dot.running { background:#35d07f; }
   #screen .home-dot.idle { background:#6b7785; }
   #screen .home-dot.done { background:#4f8ef7; }
@@ -106,7 +117,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .pending-rail { position:absolute; right:0; top:8px; bottom:8px; width:64px; padding:4px; box-sizing:border-box;
     display:none; flex-direction:column; gap:4px; z-index:3; }
   #screen.rail-on .pending-rail { display:flex; }
-  #screen.rail-on .title, #screen.rail-on ul, #screen.rail-on .reply-body, #screen.rail-on .home-body { width:240px; }
+  #screen.rail-on .title, #screen.rail-on ul, #screen.rail-on .reply-body, #screen.rail-on .home-body,
+  #screen.rail-on .home-pager { width:240px; }
   #screen .pending-chip { width:56px; height:34px; box-sizing:border-box; padding:2px 3px; border-radius:5px;
     background:rgba(20,28,40,.82); border:1px solid rgba(120,180,255,.55); overflow:hidden; }
   #screen .pending-name { font-size:11px; line-height:15px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -115,6 +127,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .pending-more { font-size:10px; color:#9fb0bf; text-align:center; }
   #screen .scroll-hint { position:absolute; right:8px; bottom:6px; font-size:11px; line-height:14px;
     color:#9fb0bf; background:rgba(5,8,11,.82); padding:1px 4px; border-radius:3px; pointer-events:none; }
+  /* 主页屏不显示「已绑定」角落提示：那块地方现在是翻页按钮的（› 在右下角），不能被压住 */
+  #screen.home-mode .scroll-hint { display:none; }
   #screen.reply-mode .title, #screen.reply-mode ul, #screen.reply-mode .bar { display:none; }
   #screen.reply-mode .reply-body { display:block; }
   #screen .bar { margin-top:auto; display:flex; align-items:center; gap:6px; font-size:10px; color:var(--dim); }
@@ -193,6 +207,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         <div id="replyBody" class="reply-body"></div>
         <div id="actionBar" class="action-bar"></div>
         <div id="homeBody" class="home-body"></div>
+        <div id="homePager" class="home-pager"></div>
         <div id="pendingRail" class="pending-rail"></div>
         <div id="scrollHint" class="scroll-hint"></div>
         <div class="bar"><span id="progress">—</span><div class="track"><div class="fill" id="fill"></div></div></div>
@@ -495,6 +510,82 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     if (rows.length) screen.classList.add('run-on'); else screen.classList.remove('run-on');
   }
+  /* stage 行可用宽：气泡轨占掉屏右侧 64px，stage 那行也得让开（rail-on 时 240，否则 304）。 */
+  function stageWidthPx() {
+    var width = (SCREEN.widthPx || 320) - 2 * (SCREEN.paddingPx || 8);
+    return state.pending && state.pending.length > 0 ? Math.min(width, width - 64) : width;
+  }
+  /** 估算一行文本的渲染宽度（与 fitTextPx 同一套字宽估算）。 */
+  function textWidthPx(text, fontPx) {
+    var chars = Array.from(String(text || ''));
+    var used = 0;
+    for (var i = 0; i < chars.length; i += 1) {
+      var code = chars[i].codePointAt(0) || 0;
+      var wide = (code >= 0x2e80 && code <= 0xa4cf) || (code >= 0xff00 && code <= 0xff60) || (code >= 0x1f300 && code <= 0x1faff);
+      used += (wide ? 1 : 0.47) * fontPx;
+    }
+    return used;
+  }
+  /** stage 行 = 文案 + 尾巴：超宽就裁文案、保住尾巴（方案 B 要求位置一定看得见）。 */
+  function stageWithTail(body, tail, fontPx) {
+    if (tail === '') return fitTextPx(body, stageWidthPx(), fontPx);
+    var room = Math.max(1, stageWidthPx() - textWidthPx(tail, fontPx));
+    var shown = body === '' ? '' : fitTextPx(body, room, fontPx);
+    return shown === '' ? tail : shown + tail;
+  }
+  /** 主页 stage 行：宿主 lane 已下发「项目 总数 个 · 第 x/y 页」；缺字段的老帧再自己拼同格式。 */
+  function homeStageText(payload) {
+    var home = payload.home || {};
+    var page = home.page || { index: 0, total: 1 };
+    var index = Number(page.index);
+    if (!Number.isFinite(index) || index < 0) index = 0;
+    var total = Number(page.total);
+    if (!Number.isFinite(total) || total < 1) total = 1;
+    var text = String(payload.stage || '').trim();
+    if (text === '') text = '项目 ' + home.total + ' 个 · 第 ' + (index + 1) + '/' + total + ' 页';
+    return fitTextPx(text, stageWidthPx(), SCREEN.stageFontPx || 12);
+  }
+  /**
+   * 朗读屏 stage 行（方案 B）：文案不动，末尾追加「· 窗口起始行/总行」。
+   * 左边的数字取宿主 scroll.offset（绝对窗口起始行，宿主按 scrollOffset 切好可视窗口），
+   * 右边的数字取宿主新加的 scroll.total（整段回复折完的总行）。
+   */
+  function replyStageText(payload) {
+    var reply = payload.reply || {};
+    var scroll = reply.scroll || {};
+    var offset = Number(scroll.offset);
+    if (!Number.isFinite(offset) || offset < 0) offset = 0;
+    var delivered = Array.isArray(reply.lines) ? reply.lines.length : 0;
+    var total = Number(scroll.total);
+    if (!Number.isFinite(total) || total < offset + delivered) total = offset + delivered;
+    return stageWithTail(String(payload.stage || '回答中'), ' · ' + (offset + 1) + '/' + total, SCREEN.stageFontPx || 12);
+  }
+  /** 主页底部翻页条：‹ 上一页 / 第 x/y 页 / › 下一页；越界的一侧置灰（点它宿主也不动页码）。 */
+  function renderHomePager(payload) {
+    var pager = $('homePager');
+    var home = payload.home || {};
+    var page = home.page || { index: 0, total: 1 };
+    var total = Number(page.total);
+    if (!Number.isFinite(total) || total < 1) total = 1;
+    var index = Number(page.index);
+    if (!Number.isFinite(index) || index < 0) index = 0;
+    if (index > total - 1) index = total - 1;
+    pager.innerHTML = '';
+    var prev = document.createElement('button');
+    prev.textContent = '‹';
+    prev.className = index > 0 ? '' : 'off';
+    prev.setAttribute('data-action', 'homePrev');
+    var label = document.createElement('span');
+    label.className = 'page';
+    label.textContent = '第 ' + (index + 1) + '/' + total + ' 页';
+    var next = document.createElement('button');
+    next.textContent = '›';
+    next.className = index < total - 1 ? '' : 'off';
+    next.setAttribute('data-action', 'homeNext');
+    pager.appendChild(prev);
+    pager.appendChild(label);
+    pager.appendChild(next);
+  }
   function renderScreen(payload) {
     var screen = $('screen');
     renderPending(payload || {});
@@ -503,7 +594,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       state.screenMode = 'home';
       state.reply = null;
       state.highlightLock = false;
-      $('stage').textContent = '项目 ' + payload.home.total + ' 个 · ' + (payload.home.page.index + 1) + '/' + payload.home.page.total;
+      // stage 行由宿主 lane 直接下发（「项目 总数 个 · 第 x/y 页」），页面只做像素级 fitting，不再自己拼数字。
+      $('stage').style.display = '';
+      $('stage').textContent = homeStageText(payload);
+      renderHomePager(payload);
       $('replyBody').innerHTML = '';
       var homeBody = $('homeBody');
       homeBody.innerHTML = '';
@@ -559,7 +653,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         state.reply.currentIndex = lockedIndex;
       }
       if (typeof payload.reply.charPos === 'number') state.replyCharPos = payload.reply.charPos;
-      $('stage').textContent = clipScreen(payload.stage || '回答中', SCREEN.stageChars);
+      // 朗读屏 stage 行末尾追加窗口位置（方案 B）：底部不加指示条，那个挡过主页按钮的角落提示仍保持删掉。
+      $('stage').style.display = '';
+      $('stage').textContent = replyStageText(payload);
       screen.className = (payload.tone || 'ok') + ' reply-mode' + (state.pending && state.pending.length ? ' rail-on' : '');
       renderReply();
       state.running = [];
@@ -1674,7 +1770,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
           if (actionId) {
             // 主页/翻页都算「退出本轮朗读」：和停止一样先把页面音频队列掐掉（宿主也会 cancelRound），
             // 差别只是不回「已停止朗读」提示。
-            if (actionId === 'stop' || actionId === 'home' || actionId === 'prev' || actionId === 'next') stopPcm();
+            if (actionId === 'stop' || actionId === 'home' || actionId === 'prev' || actionId === 'next' ||
+                actionId === 'homePrev' || actionId === 'homeNext') stopPcm();
             if (actionId === 'home') tapFlash(event.clientX - rect.left, event.clientY - rect.top);
             send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'action', actionId: actionId });
             return;
