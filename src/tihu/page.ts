@@ -69,7 +69,13 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .home-top { display:none; flex:none; align-items:flex-end; gap:8px; height:14px; box-sizing:border-box; }
   #screen.home-mode .home-top { display:flex; }
   #screen.home-mode .stage { display:none; }
-  #screen .home-top .clock { font-size:12px; line-height:14px; letter-spacing:1px; color:var(--accent);
+  /* 顶行时钟数字加粗（用户 2026-11-08 本轮要求，只加粗这一处）：字号 12px、行高 14px、颜色、位置、
+     三格信号柱、底部翻页条、回答屏与状态屏的 stage 行全部照旧。粗体只把字形撑宽约 6%（12px/700 比常规宽），
+     HH:MM 五个字符加粗后实测约 40px，离可用宽还差得远（304 − 行间隙 8 − 信号柱 19 = 277；rail-on 时 240 − 27 = 213），
+     所以这一行不会换行、不会溢出、也不会被 fitTextPx 裁成省略号，顶行那套尺寸常量（柱宽 5、柱间隙 2、行间隙 8）不用动。
+     这条规则只作用在 .clock 上（屏内 .clock 只有 #homeClock 这一个元素）：首页项目名 .home-row1、摘要行 .home-row2、
+     最近回答行 .home-recent 都不在这条规则上，不会被带着一起变粗。 */
+  #screen .home-top .clock { font-size:12px; line-height:14px; letter-spacing:1px; color:var(--accent); font-weight:bold;
     font-variant-numeric:tabular-nums; white-space:nowrap; overflow:hidden; flex:none; }
   /* 三格信号柱：3 根 ×5px + 2 个间隙 ×2px = 19px（页面 JS 里 HOME_TOP_* 常量要和这两个数字一致）。 */
   #screen .home-top .signal { flex:none; margin-left:auto; display:flex; align-items:flex-end; gap:2px; height:13px; }

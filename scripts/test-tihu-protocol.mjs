@@ -57,7 +57,7 @@ import {
   sanitizeScreenLine,
   summarizeToolResult,
 } from '../src/tihu/progress.ts'
-import { ACTUAL_SIZE_SCALE, CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX, SCREEN_SPEC, TEXT_WRAP_SAFETY_PX, clipScreenTitle, fitLine, fitScreenLines, measureTextPx, wrapTextPx } from '../src/tihu/screen-spec.ts'
+import { ACTUAL_SIZE_SCALE, CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX, SCREEN_SPEC, TEXT_WRAP_SAFETY_PX, TITLE_BOLD_FACTOR, clipScreenTitle, fitLine, fitScreenLines, measureTextPx, wrapTextPx } from '../src/tihu/screen-spec.ts'
 import { fitViewport, replyViewport, replyWindow, splitReplySentences, splitSpeechSegments, wrapReplyLines } from '../src/tihu/reply.ts'
 import { stripToolNoise, toSpeechText } from '../src/tihu/speech-text.ts'
 import { groupProjects, humanTitle, projectNameOf } from '../src/tihu/project-groups.ts'
@@ -4880,6 +4880,51 @@ test('page：顶行在 304（无气泡轨）与 240（rail-on）两种可用宽�
     assert.ok(total <= available, `顶行（时钟 ${Math.round(clockPx)} + 间隙 ${rowGap} + 信号柱 ${barsPx} = ${Math.round(total)}px）必须装进 ${available}px 可用宽`)
   }
   assert.ok(CONTENT_WIDTH_PX === 304 && PENDING_RAIL_WIDTH_PX === 240, '两种可用宽本身别被人改跑（304 / rail-on 240）')
+})
+
+test('page：本轮只给顶行时钟加粗（加粗后的宽度照样排得下，首页其他行与回答屏/状态屏那行照旧）', () => {
+  const html = pageHtmlOf()
+  const source = pageSourceOf()
+  // 加粗写在 #homeClock 对应的那条规则上：屏内 .clock 只有这一个元素
+  assert.ok(/#screen \.home-top \.clock \{[^}]*font-weight:bold/.test(html), '顶行时钟规则要有 font-weight:bold')
+  assert.equal((html.match(/class="clock"/g) || []).length, 1, '屏内 .clock 只此一个（就是 #homeClock）')
+  // 本轮只改粗细：字号 / 行高 / 颜色 / 等宽数字 / 不换行 全部照旧
+  assert.ok(/#screen \.home-top \.clock \{[^}]*font-size:12px/.test(html), '字号照旧 12px')
+  assert.ok(/#screen \.home-top \.clock \{[^}]*line-height:14px/.test(html), '行高照旧 14px')
+  assert.ok(/#screen \.home-top \.clock \{[^}]*color:var\(--accent\)/.test(html), '颜色照旧 var(--accent)')
+  assert.ok(/#screen \.home-top \.clock \{[^}]*font-variant-numeric:tabular-nums/.test(html), '等宽数字照旧（走表不跳动）')
+  assert.ok(/#screen \.home-top \.clock \{[^}]*white-space:nowrap/.test(html), '时钟照旧不换行')
+  assert.ok(/#screen \.home-top \.clock \{[^}]*letter-spacing:1px/.test(html), 'letter-spacing 照旧 1px')
+  // 加粗不许写在容器上（写 .home-top 会让时钟继承，还会把整行别的内容一起带粗）
+  assert.equal(/#screen \.home-top \{[^}]*font-weight/.test(html), false, '顶行容器不加粗')
+  assert.equal(/#screen\.home-mode \.home-top[^}]*font-weight/.test(html), false, 'home-mode 那条也不加粗')
+  assert.equal(homeTopDomOf(html).includes('style='), false, '不加内联样式（只动 CSS 那一条规则）')
+  // 首页其他行照旧：项目名本来就粗、摘要行与最近回答行本来不粗，这轮都没被带粗
+  assert.ok(/#screen \.home-row1 \{[^}]*font-weight:700/.test(html), '首页项目名那行的粗体照旧（700，不是本轮加的）')
+  assert.equal(/#screen \.home-row2 \{[^}]*font-weight/.test(html), false, '摘要行 .home-row2 没被加粗')
+  assert.equal(/#screen \.home-recent \{[^}]*font-weight/.test(html), false, '最近回答行 .home-recent 没被加粗')
+  // 回答屏/状态屏顶行（stage 那行）不动
+  assert.equal(/#screen \.stage \{[^}]*font-weight/.test(html), false, 'stage 行没被加粗')
+  assert.equal(/#screen\.home-mode \.stage \{[^}]*font-weight/.test(html), false, 'home-mode 收掉 stage 那条不变')
+  // 信号柱不动
+  assert.equal(/#screen \.home-top \.signal[^}]*font-weight/.test(html), false, '信号柱不加粗')
+  // 同一套常量照旧，加粗只是把字形撑宽（12px/700 比常规宽约 6%，与标题那档加粗系数同一量级）
+  const barW = Number((source.match(/var SIGNAL_BAR_W = (\d+);/) || [0, 0])[1])
+  const barGap = Number((source.match(/var SIGNAL_GAP_W = (\d+);/) || [0, 0])[1])
+  const rowGap = Number((source.match(/var HOME_TOP_GAP_W = (\d+);/) || [0, 0])[1])
+  assert.equal(barW, 5, '柱宽常量不动')
+  assert.equal(barGap, 2, '柱间隙常量不动')
+  assert.equal(rowGap, 8, '行间隙常量不动')
+  assert.ok(/function renderHomeTop\(\)[\s\S]{0,400}stageWidthPx\(\)[\s\S]{0,120}fitTextPx\(clockText\(\)/.test(source), '顶行排版公式照旧（fitTextPx 收进剩余宽）')
+  const barsPx = barW * 3 + barGap * 2
+  for (const available of [CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX]) {
+    const room = available - barsPx - rowGap
+    const boldClockPx = measureTextPx('19:32', SCREEN_SPEC.stageFontPx) * TITLE_BOLD_FACTOR + 5 /* CSS letter-spacing:1px，五个字符 */
+    assert.ok(boldClockPx <= room, `加粗后的时钟 ${Math.round(boldClockPx)}px 要装进 ${available} 可用宽里的 ${room}px 剩余宽（超了就会被 fitTextPx 裁成省略号）`)
+    assert.ok(boldClockPx + rowGap + barsPx <= available, `顶行整行（时钟 ${Math.round(boldClockPx)} + 间隙 ${rowGap} + 信号柱 ${barsPx}）装进 ${available}px 不换行不溢出`)
+  }
+  // 顶行高照旧：加粗不改行高（14px 那一行不会被撑成两行）
+  assert.ok(/#screen \.home-top \{[^}]*height:14px/.test(html), '顶行仍固定 14px 一行')
 })
 
 test('page：顶行占的还是原来那 14px 一行，首页内容高度预算不被翻页条撑爆', () => {
