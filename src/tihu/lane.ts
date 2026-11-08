@@ -341,8 +341,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     widthPx: number
   }
   const screenStates = new Map<string, ScreenScrollState>()
-  /** 每会话的屏幕模式与回主页计时。 */
-  const homeStates = new Map<string, { mode: 'home' | 'session'; page: number; done: boolean; timer?: ReturnType<typeof setTimeout> }>()
+  /** 每会话的屏幕模式与回主页计时（pages=这一屏分几页，底部翻页按钮按它定边界）。 */
+  const homeStates = new Map<string, { mode: 'home' | 'session'; page: number; done: boolean; timer?: ReturnType<typeof setTimeout>; pages?: number }>()
   /**
    * 最近一帧主页用的是哪份控制室卡片清单（签名）。卡片巡检只和它比：
    * 屏幕上的东西没变就不重发；没人停在主页时也不更新，等它下次回主页自己拿新的。
@@ -594,10 +594,25 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /**
+   * 主页底部翻页按钮（用户 2026-11-08 要求）：‹ 上一页 / › 下一页，走的是回复屏
+   * 那套 screen.action 通道（点按回传 actionId），id 固定 homePrev/homeNext。
+   * 越界的那一侧不发按钮（设备端也可以据此置灰）。
+   */
+  function homeFrameWithPager(frame: ScreenFramePayload): ScreenFramePayload {
+    if (frame.home === undefined || frame.actions !== undefined) return frame
+    const page = frame.home.page
+    const actions: { id: string; label: string }[] = []
+    if (page !== undefined && page.index > 0) actions.push({ id: 'homePrev', label: '‹' })
+    if (page !== undefined && page.index < page.total - 1) actions.push({ id: 'homeNext', label: '›' })
+    return { ...frame, actions }
+  }
+
+  /**
    * 帧附加信息（一处注入，所有发送路径都生效）：
    *   - 回复屏：底部三个按钮（停止 / 重读 / 主页）；
    *   - 状态屏：底部列出**其他**正在运行的会话，点了切过去（用户 2026-11-08 要求）；
-   *   - 主页屏：不加按钮/运行清单，但「最近回答」这一行要由 homeFrameWithRecent 保证在。
+   *   - 主页屏：底部翻页按钮（‹ ›）由 homeFrameWithPager 保证在，「最近回答」行由 homeFrameWithRecent 保证在；
+   *     运行清单不上主页屏。
    */
 
   function withFrameExtras(frame: ScreenFramePayload, sessionId: string | undefined): ScreenFramePayload {
@@ -609,7 +624,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       void running
       return { ...rest, actions: replyActionsFor(sessionId) }
     }
-    if (frame.mode === 'home') return homeFrameWithRecent(frame, sessionId)
+    if (frame.mode === 'home') return homeFrameWithPager(homeFrameWithRecent(frame, sessionId))
     // 只列 Computer Use 模式的会话（用户 2026-11-08 要求）：模式以列表缓存里的 preset 为准，
     // 查不到定级的一律不列（宁可少列，也不把普通会话混进来）。
     const others = [...runningSessions.keys()]
@@ -1152,7 +1167,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         totalChars,
         charPos,
         lines: state.lines.slice(state.offset, state.offset + visibleLines),
-        scroll: { offset: state.offset, maxOffset },
+        // 页面只拿到可视窗口，位置指示要的「总共几行」得宿主给（2026-11-08 方案 B）。
+        scroll: { offset: state.offset, maxOffset, total: state.lines.length },
         follow: state.follow,
       },
       pending: pending.slice(0, 4).map((item) => ({ sessionId: item.sessionId, title: item.title, at: item.at, unread: true as const })),
@@ -1366,6 +1382,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     const totalPages = Math.max(1, Math.ceil(projects.length / pageSize))
     const state = homeStates.get(sessionId) ?? { mode: 'session' as const, page: 0, done: false }
     state.page = Math.max(0, Math.min(state.page, totalPages - 1))
+    state.pages = totalPages
     state.mode = 'home'
     homeStates.set(sessionId, state)
     const pageProjects = projects.slice(state.page * pageSize, (state.page + 1) * pageSize).map((project) => ({
@@ -1381,8 +1398,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       ? undefined
       : { sessionId: owner.sessionId, title: humanTitle(titleForSession(owner.sessionId)), at: owner.at }
     log(`tihu home recent session=${sessionId} owner=${owner?.sessionId ?? '-'} hasLastReply=${String(lastReplies.get(boundOwner) !== undefined)} history=${String(replyHistory.get(boundOwner)?.length ?? 0)}`)
+    // 首页 stage 行（用户 2026-11-08 要求写清页数）：宿主把要显示的一行文本直接给页面，
+    // 页面不再自己拼「p/t」；数字与页数都按 1 起计数，一行 12px 小字必长不过 304px。
     const frame: ScreenFramePayload = {
-      stage: '控制室',
+      stage: `项目 ${projects.length} 个 · 第 ${state.page + 1}/${totalPages} 页`,
       title: '',
       bullets: [],
       tone: 'ok',
@@ -1406,6 +1425,21 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     lastFrames.set(sessionId, frame)
     if (device !== undefined) device.send('screen.frame', withFrameExtras(frame, sessionId))
     else screen(sessionId, frame)
+  }
+
+  /**
+   * 底部翻页按钮（‹ ›）走的这一步：改这一份页码（homeStates.page，手势切页共用），
+   * 越界不动（页面把越界的一侧按钮置灰），成功就把新的 home 帧立刻发出去。
+   */
+  async function stepHomeFrame(device: TihuDevice, sessionId: string, step: number): Promise<void> {
+    const state = homeStates.get(sessionId)
+    if (state?.mode !== 'home') return
+    const total = Math.max(1, state.pages ?? 1)
+    const target = Math.max(0, Math.min(total - 1, state.page + step))
+    if (target === state.page) return
+    state.page = target
+    log(`tihu home page session=${sessionId} ${target + 1}/${total}`)
+    await sendHome(sessionId, device)
   }
 
   /**
@@ -2885,6 +2919,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           }
           if ((actionId === 'prev' || actionId === 'next') && sid !== undefined) {
             browseReplyHistory(device, sid, actionId === 'prev' ? -1 : 1)
+            return
+          }
+          // 主页底部翻页按钮：与手势切页共用一份 homeStates.page，只在边界内动页码。
+          if (actionId === 'homePrev' || actionId === 'homeNext') {
+            await stepHomeFrame(device, sid ?? '__unbound__', actionId === 'homeNext' ? 1 : -1)
             return
           }
           return
