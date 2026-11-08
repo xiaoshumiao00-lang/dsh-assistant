@@ -3577,6 +3577,67 @@ await testAsync('速度行：状态屏第四行是窗口实时速度，不再是
   runtime.dispose()
 })
 
+
+/* ---------- 2026-11-08：状态屏第四行统计小 2 号 ---------- */
+test('统计行字号：SCREEN_SPEC 比正文小 2 号，statusFrame 标出 statsTail', () => {
+  assert.equal(SCREEN_SPEC.statsFontPx, SCREEN_SPEC.bodyFontPx - 2, '第四行要比正文小 2 号')
+  assert.equal(SCREEN_SPEC.statsLineHeightPx, SCREEN_SPEC.bodyLineHeightPx - 2)
+  const state = createProgressState(1000)
+  applySessionEvent(state, { type: 'turn/start', data: { turn: 2 } }, 1000)
+  applySessionEvent(state, { type: 'tool/call', data: { turn: 2, step: 1, name: 'glob', arguments: { pattern: '**/a.ts' } } }, 1500, { stats: { tokPerSec: 128, totalTokens: 5000, contextPercent: 30 } })
+  const frame = applySessionEvent(state, { type: 'tool/call', data: { turn: 2, step: 2, name: 'grep', arguments: { pattern: 'x' } } }, 2000, { stats: { tokPerSec: 128, totalTokens: 5000, contextPercent: 30 } }).screen
+  assert.equal(frame.statsTail, 1, '最后一行才是统计行：' + JSON.stringify(frame.bullets))
+  assert.ok(frame.bullets[frame.bullets.length - 1].includes('tok/s'), '统计行内容不变：' + frame.bullets.join(' / '))
+  assert.ok(frame.bullets[0].includes('查找文件'), '第二行仍是明细：' + frame.bullets[0])
+})
+
+await testAsync('统计行渲染：lane 透传 statsTail，页面用 statsFontPx 排版', async () => {
+  const { runtime } = runtimeFor([cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000 })])
+  const html = runtime.page()
+  assert.ok(html.includes('statsTail'), '页面要读 payload.statsTail')
+  assert.ok(html.includes('SCREEN.statsFontPx'), '页面按 SCREEN_SPEC.statsFontPx 排统计行')
+  assert.ok(html.includes('SCREEN.statsLineHeightPx'), '统计行行高也走规格')
+  runtime.dispose()
+})
+
+
+/* ---------- 2026-11-08：运行中清单显示会话名称，不是会话代号 ---------- */
+await testAsync('运行中清单：投影没标题时读标题快照，屏上显示会话名称', async () => {
+  const records = [
+    cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000 }),
+    {
+      ...cuRecord('session-b', { live: true, cwd: '/b', lastPromptAt: 1000 }),
+      // 投影里刻意不给 title：屏上必须靠标题快照给出名字，不能剩成代号
+      projection: { agentPreset: 'computer-use', sessionListMetadata: { blank: false, lastPromptAt: 1000 } },
+    },
+  ]
+  const asked = [] 
+  const query = {
+    listSessions: async () => records.map(({ projection, ...record }) => record),
+    readTitleSnapshots: async (ids) => {
+      asked.push(ids.slice())
+      return ids.map((id) => ({ session: { id }, title: { title: '名字-' + id } }))
+    },
+  }
+  const { runtime, socket, emit } = await laneWithSession(records, 'session-a', { sessionQuery: query })
+  emit('session-a', { type: 'turn/start', data: { turn: 1 } })   // 设备自己这一轮在跑：状态帧才会带运行中清单
+  emit('session-b', { type: 'turn/start', data: { turn: 1 } })
+  const deadline = Date.now() + 2500
+  let named = false
+  while (Date.now() < deadline && !named) {
+    const frames = framesOf(socket).filter((f) => f.type === 'screen.frame' && Array.isArray(f.payload.running))
+    for (const frame of frames) {
+      for (const item of frame.payload.running) {
+        if (item.sessionId === 'session-b' && item.title.includes('名字-')) named = true
+      }
+    }
+    if (!named) await waitMs(60)
+  }
+  assert.ok(named, '运行中清单要给会话名称：' + JSON.stringify(framesOf(socket).filter((f) => Array.isArray(f.payload.running)).slice(-1)[0]?.payload.running))
+  assert.ok(asked.some((ids) => ids.includes('session-b')), '缺标题的会话必须去读一次标题快照')
+  runtime.dispose()
+})
+
 /* ---------- 汇总 ---------- */
 console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
 if (failed > 0) process.exit(1)

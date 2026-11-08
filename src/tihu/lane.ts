@@ -449,6 +449,8 @@ function screenMetaOf(sessionId: string): { title?: string; stats?: { tokPerSec:
 
 /** 每条会话的解码速度样本窗口与最近一次实时速度。 */
 const speedWindows = new Map<string, TihuDecodeSample[]>()
+/** 标题快照读取节流：同一会话 60 秒内只发一次请求。 */
+const titleFetchAt = new Map<string, number>()
 const speedLive = new Map<string, number>()
 const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bullets?: string[] }>()
 
@@ -475,14 +477,54 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return isComputerUsePreset(row.preset ?? '')
   }
 
-  /** 会话标题：标题缓存 → 列表缓存 → 短 id 兜底（运行中列表要用）。 */
+  /** 会话标题：投影（权威）→ 标题缓存 → 列表缓存 → 短 id 兜底（运行中列表要用）。 */
   function titleForSession(sessionId: string): string {
+    const live = liveSessionOf(sessionId)
+    const projected = live === undefined ? undefined : titleOf(live)
+    if (projected !== undefined && projected !== '') return projected
     const cached = titleCache.get(sessionId)?.title
     if (cached !== undefined && cached !== '') return cached
     const rows = sessionListCache?.rows ?? []
     const hit = rows.find((row) => row.sessionId === sessionId)
     if (hit?.title !== undefined && hit.title !== '') return hit.title
     return shortSessionId(sessionId)
+  }
+
+  /** 取活会话对象：标题与 preset 都从这里读；服务缺失或查不到就给 undefined。 */
+  function liveSessionOf(sessionId: string): any {
+    const sessions = optionalService(ctx, 'sessions')
+    if (sessions === undefined || typeof sessions?.get !== 'function') return undefined
+    try {
+      const live = sessions.get(sessionId)
+      return live === undefined || live === null ? undefined : live
+    } catch { return undefined }
+  }
+
+  /** 运行中清单里还缺标题的会话：读一次标题快照，读到了就重发这一屏。 */
+  function ensureTitlesFor(sessionIds: string[]): void {
+    if (sessionIds.length === 0) return
+    const query = optionalService(ctx, 'sessionQuery')
+    if (query === undefined || typeof query?.readTitleSnapshots !== 'function') return
+    const now = Date.now()
+    const missing = sessionIds.filter((sessionId) => {
+      const fetched = titleFetchAt.get(sessionId)
+      if (fetched !== undefined && now - fetched < 60_000) return false
+      const cached = titleCache.get(sessionId)
+      return cached === undefined || now - cached.at > 60_000
+    })
+    if (missing.length === 0) return
+    for (const sessionId of missing) titleFetchAt.set(sessionId, now)
+    void Promise.resolve().then(async () => {
+      const snapshots = await query.readTitleSnapshots(missing)
+      const at = Date.now()
+      for (const snapshot of Array.isArray(snapshots) ? snapshots : []) {
+        const sessionId = String(snapshot?.session?.id ?? '')
+        const raw = snapshot?.title
+        const title = typeof raw === 'string' ? raw : typeof raw?.title === 'string' ? raw.title : ''
+        if (sessionId !== '' && title !== '') titleCache.set(sessionId, { at, title })
+      }
+      refreshRunningLists()
+    }).catch((error) => { log('tihu running titles failed: ' + String((error as Error)?.message ?? error)) })
   }
 
   /**
@@ -507,7 +549,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       .filter((id) => id !== sessionId && isComputerUseSession(id))
       .slice(0, 3)
     if (others.length === 0) return frame
-    return { ...frame, running: others.map((id) => ({ sessionId: id, title: titleForSession(id) })) }
+    const listed = others.map((id) => ({ sessionId: id, title: titleForSession(id) }))
+    // 还在显示短 id 的那些先去读标题快照，读到了 refreshRunningLists 会重发这屏
+    ensureTitlesFor(others.filter((id) => listed.find((item) => item.sessionId === id)?.title === shortSessionId(id)))
+    return { ...frame, running: listed }
   }
 
   /** 运行中会话增减时，重发每台设备当前那屏，让底部清单实时跟着变。 */
@@ -536,6 +581,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       bullets: frame.bullets ?? [],
       ...(frame.progress === undefined ? {} : { progress: frame.progress }),
       ...(frame.mode === undefined ? {} : { mode: frame.mode }),
+      ...(frame.statsTail === undefined ? {} : { statsTail: frame.statsTail }),
       ...(frame.reply === undefined ? {} : { reply: frame.reply }),
       ...(frame.home === undefined ? {} : { home: frame.home }),
       pending,
@@ -1961,7 +2007,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       void bindSession(device, sessionId, { auto: true, followed: true }).then(() => {
         device.send('event.progress', {
           stage: '跟随',
-          text: `已自动跟随到：${shortSessionId(sessionId)}`,
+          text: `已自动跟随到：${titleForSession(sessionId)}`,
         } satisfies ProgressPayload)
       }).catch((error) => log(`tihu turn/start follow failed: ${(error as Error)?.message ?? String(error)}`))
     }

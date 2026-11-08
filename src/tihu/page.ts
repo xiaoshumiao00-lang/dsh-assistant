@@ -557,9 +557,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     $('title').textContent = payload.title || '';
     var list = $('bullets');
     list.innerHTML = '';
-    fitLines(payload.bullets || [], SCREEN.maxBodyLines, SCREEN.bodyCharsPerLine).forEach(function (line) {
+    var bulletLines = fitLines(payload.bullets || [], SCREEN.maxBodyLines, SCREEN.bodyCharsPerLine);
+    // 第四行统计比正文小 2 号：host 已按正文字号量宽，这里只换字号与行高
+    var tailCount = typeof payload.statsTail === 'number' ? payload.statsTail : 0;
+    if (tailCount > bulletLines.length) tailCount = bulletLines.length;
+    bulletLines.forEach(function (line, index) {
       var li = document.createElement('li');
       li.textContent = line;
+      if (tailCount > 0 && index >= bulletLines.length - tailCount) {
+        li.style.fontSize = (SCREEN.statsFontPx || 14) + 'px';
+        li.style.lineHeight = (SCREEN.statsLineHeightPx || 18) + 'px';
+      }
       list.appendChild(li);
     });
     $('replyBody').innerHTML = '';
