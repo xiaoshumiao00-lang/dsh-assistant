@@ -78,6 +78,12 @@ export const TIHU_PAGE_PATH = '/tihu'
 export const TIHU_LANE_PATH = '/tihu/lane'
 
 /**
+ * 每会话回答历史上限（用户 2026-11-08 要求：最多 8 条，含 sentences/speechSegments/
+ * includeAll 与时间）。朗读屏的「上一条 / 下一条」只在这份历史里翻页，翻页不自动朗读。
+ */
+export const REPLY_HISTORY_LIMIT = 8
+
+/**
  * 试听默认示例语句（页面 `tts.sample` 不带 text 时用）。
  * 选一句自报家门的话：用户点「试听」听到的是真人的声音，而不是一声嘟。
  */
@@ -357,6 +363,26 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const pendingByDisplay = new Map<string, { sessionId: string; title: string; at: number }[]>()
   /** 会话 id → 最近一条回复（点气泡后从头朗读）。 */
   const lastReplies = new Map<string, { sentences: ReplySentence[]; speechSegments: SpeechSegment[]; includeAll: boolean }>()
+  /** 一条回答历史：翻页要能整屏重放（只换屏，不再合成语音）。 */
+  interface ReplyHistoryEntry {
+    text: string
+    sentences: ReplySentence[]
+    speechSegments: SpeechSegment[]
+    includeAll: boolean
+    at: number
+  }
+  /** 会话 id → 回答历史（最新在末尾，最多 REPLY_HISTORY_LIMIT 条）：上一条/下一条 翻页用。 */
+  const replyHistory = new Map<string, ReplyHistoryEntry[]>()
+  /** 会话 id → 当前浏览到历史里的第几条（缺省/越界即最新一条）。 */
+  const replyBrowseIndex = new Map<string, number>()
+  /** 钉在主页的会话：钉住期间 status/reply 帧不再覆盖主页屏（点主页 = 退出朗读 + 钉住）。 */
+  const homePinned = new Set<string>()
+  /** 正在翻历史浏览的会话：10 秒自动回主页暂停，用户显式点主页/项目卡才回（用户 2026-11-08 要求）。 */
+  const browsingHistory = new Set<string>()
+  /** 钉住期间用的主页帧底子：只用它刷气泡轨，屏仍停在主页。 */
+  const pinnedHomeFrames = new Map<string, ScreenFramePayload>()
+  /** 钉住期间最近一次下发给页面的气泡轨签名（一样就不再重发，免得长回复残留帧反复刷屏）。 */
+  const pinnedPendingSig = new Map<string, string>()
   /** 会话 id → 最近一条 assistant 原文（主页摘要用，避免显示裸 id）。 */
   const lastAssistant = new Map<string, ProjectReply>()
   /** 会话 id → 屏幕进度状态（步骤计数 / 用时 / 上一步结果）。 */
@@ -540,7 +566,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       const running = frame.running
       const { running: _drop, ...rest } = frame
       void running
-      return { ...rest, actions: REPLY_ACTIONS.map((item) => ({ id: item.id, label: item.label })) }
+      return { ...rest, actions: replyActionsFor(sessionId) }
     }
     if (frame.mode === 'home') return frame
     // 只列 Computer Use 模式的会话（用户 2026-11-08 要求）：模式以列表缓存里的 preset 为准，
@@ -568,6 +594,22 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   function screen(sessionId: string, frame: Omit<ScreenFramePayload, 'bullets'> & { bullets?: string[] }): void {
+    // 主页钉住：会话帧不覆盖主页屏（气泡轨照常在主页帧上刷新）。否则点完主页又会被
+    // 正在收尾的朗读帧/状态帧拉回会话页（用户 2026-11-08 实测）。
+    if (homePinned.has(sessionId)) {
+      if (frame.mode === 'home') {
+        pinnedHomeFrames.set(sessionId, frame as ScreenFramePayload)
+        pinnedPendingSig.set(sessionId, pendingSigOf(sessionId))
+      } else {
+        const sig = pendingSigOf(sessionId)
+        if (pinnedPendingSig.get(sessionId) !== sig) {
+          const pinned = pinnedHomeFrameOf(sessionId)
+          if (pinned !== undefined) broadcast(sessionId, 'screen.frame', withFrameExtras(pinned, sessionId))
+          pinnedPendingSig.set(sessionId, sig)
+        }
+        return
+      }
+    }
     lastFrames.set(sessionId, frame)
     // 待读气泡必须跟着**每一帧**下发：页面收到帧会整体重画气泡轨，
     // 旧实现只有 reply/主页帧带 pending，思考帧一来就把气泡擦掉了
@@ -607,6 +649,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 所以绕过 screen() 的直发帧会「悄悄吃掉」别的会话完成通知（2026-11-07 审计 P1-7）。
    */
   function sendFrame(device: TihuDevice, frame: ScreenFramePayload, sessionId: string | undefined = device.sessionId): void {
+    // 主页钉住：bind/思考/确认等直发帧也不能把屏从主页拉走（气泡轨照常刷新）。
+    if (sessionId !== undefined && homePinned.has(sessionId) && frame.mode !== 'home') {
+      const sig = pendingSigOf(sessionId)
+      if (pinnedPendingSig.get(sessionId) !== sig) {
+        const pinned = pinnedHomeFrameOf(sessionId)
+        if (pinned !== undefined) device.send('screen.frame', withFrameExtras(pinned, sessionId))
+        pinnedPendingSig.set(sessionId, sig)
+      }
+      return
+    }
     // 记一份「这台设备最后看到的那屏」：运行中清单变化时按它重发（followRunningTurn 跟过来的会话还没有广播帧时也要有基准）。
     if (sessionId !== undefined && frame.mode !== 'reply') {
       lastFrames.set(sessionId, { ...frame, bullets: frame.bullets ?? [] })
@@ -886,8 +938,17 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     options: { auto?: boolean; followed?: boolean } = {},
   ): Promise<void> {
     // 换会话先把上一轮的朗读掐掉（屏已经不显示它了，声音不能继续跟过来）。
-    if (device.sessionId !== undefined && device.sessionId !== sessionId) {
+    const previousSessionId = device.sessionId
+    if (previousSessionId !== undefined && previousSessionId !== sessionId) {
       try { device.cancelRound?.() } catch { /* 忽略 */ }
+      // 换绑定解除上一会话的主页钉住（用户 2026-11-08 规则：钉住不是永久的）。
+      unpinHome(previousSessionId)
+      browsingHistory.delete(previousSessionId)
+    }
+    // 目标会话也要解除钉住（用户主动换过来了，就该正常显示它的屏）；同会话补绑（页面重连）保留钉住。
+    if (previousSessionId !== sessionId) {
+      unpinHome(sessionId)
+      browsingHistory.delete(sessionId)
     }
     const found = await findSession(sessionId)
     if (found.status === 'missing') {
@@ -1141,6 +1202,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /** 主页屏：项目清单优先取宿主 workspace 注册表，取不到才用会话快照按 cwd 分组兜底。 */
   async function sendHome(sessionId: string, device?: TihuDevice): Promise<void> {
+    // 已经回主页：浏览状态结束（下次进回复屏重新算）。
+    browsingHistory.delete(sessionId)
     let rows: TihuSessionRow[] = []
     try { rows = (await collectSessionRows()).rows } catch { rows = [] }
     const projectRows = rows.map((row) => ({ sessionId: row.sessionId, title: row.title, cwd: row.cwd, updatedAt: row.updatedAt, live: row.live }))
@@ -1176,15 +1239,31 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       summary: project.summary,
       ...(project.enterSessionId !== undefined ? { sessionId: project.enterSessionId } : {}),
     }))
+    // 首页顶部「最近回答 · 会话名」：只有**当前绑定的这个会话**真的存了回复才下发。
+    const replyOwner = device?.sessionId ?? sessionId
+    const recentReply = lastReplies.get(replyOwner)
+    const recent = recentReply === undefined
+      ? undefined
+      : { sessionId: replyOwner, title: humanTitle(titleForSession(replyOwner)), at: lastAssistant.get(replyOwner)?.at }
     const frame: ScreenFramePayload = {
       stage: '控制室',
       title: '',
       bullets: [],
       tone: 'ok',
       mode: 'home',
-      home: { projects: pageProjects, page: { index: state.page, total: totalPages }, total: projects.length },
+      home: {
+        projects: pageProjects,
+        page: { index: state.page, total: totalPages },
+        total: projects.length,
+        ...(recent === undefined ? {} : { recent }),
+      },
       pending: (pendingByDisplay.get(sessionId) ?? []).slice(0, 4).map((item) => ({ sessionId: item.sessionId, title: item.title, at: item.at, unread: true as const })),
       pendingCount: (pendingByDisplay.get(sessionId) ?? []).length,
+    }
+    // 钉住期间它就是「屏上那帧」的底子：后续会话帧只用它刷气泡，不替换内容。
+    if (homePinned.has(sessionId)) {
+      pinnedHomeFrames.set(sessionId, frame)
+      pinnedPendingSig.set(sessionId, pendingSigOf(sessionId))
     }
     if (device !== undefined) device.send('screen.frame', frame)
     else screen(sessionId, frame)
@@ -1205,8 +1284,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     const speechSegments = splitSpeechSegments(text)
       .map((segment) => ({ ...segment, text: toSpeechText(segment.text) }))
       .filter((segment) => segment.text !== '')
-    lastReplies.set(sessionId, { sentences, speechSegments, includeAll: [...text].length <= 2000 })
-    lastAssistant.set(sessionId, { text, at: Date.now() })
+    pushReplyHistory(sessionId, text, sentences, speechSegments, [...text].length <= 2000)
     return true
   }
 
@@ -1241,6 +1319,111 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       clearTimeout(state.timer)
       state.timer = undefined
     }
+  }
+
+  /** 主页钉住：点主页时置上；新的 turn/start、换绑定、点项目卡、点最近回答时解除。 */
+  function pinHome(sessionId: string): void {
+    homePinned.add(sessionId)
+    browsingHistory.delete(sessionId)
+    cancelHomeTimer(sessionId)
+    const state = homeStates.get(sessionId)
+    if (state !== undefined) state.mode = 'home'
+  }
+
+  function unpinHome(sessionId: string | undefined): void {
+    if (sessionId === undefined || sessionId === '') return
+    homePinned.delete(sessionId)
+    pinnedHomeFrames.delete(sessionId)
+    pinnedPendingSig.delete(sessionId)
+  }
+
+  /** 气泡轨签名：会话 id + 入队时间（内容一样就不用重发主页帧）。 */
+  function pendingSigOf(sessionId: string): string {
+    return (pendingByDisplay.get(sessionId) ?? []).map((item) => item.sessionId + '@' + item.at).join(',')
+  }
+
+  /** 钉住期间代替会话帧发出去的主页帧：只换气泡轨，屏不离开主页。 */
+  function pinnedHomeFrameOf(sessionId: string): ScreenFramePayload | undefined {
+    const base = pinnedHomeFrames.get(sessionId)
+    if (base === undefined) return undefined
+    const pend = pendingByDisplay.get(sessionId) ?? []
+    return {
+      ...base,
+      pending: pend.slice(0, 4).map((item) => ({ sessionId: item.sessionId, title: item.title, at: item.at, unread: true as const })),
+      pendingCount: pend.length,
+    }
+  }
+
+  /** 回答历史：最新在末尾；同一段正文重复到达只替换末尾那条，不重复入栈。 */
+  function pushReplyHistory(sessionId: string, text: string, sentences: ReplySentence[], speechSegments: SpeechSegment[], includeAll: boolean): void {
+    // 新回复到达：屏要回到最新一条，浏览状态结束（自动回主页计时随后照旧）。
+    browsingHistory.delete(sessionId)
+    const list = replyHistory.get(sessionId) ?? []
+    const entry: ReplyHistoryEntry = { text, sentences, speechSegments, includeAll, at: Date.now() }
+    const last = list[list.length - 1]
+    if (last !== undefined && last.text === text) list[list.length - 1] = entry
+    else list.push(entry)
+    if (list.length > REPLY_HISTORY_LIMIT) list.splice(0, list.length - REPLY_HISTORY_LIMIT)
+    replyHistory.set(sessionId, list)
+    lastReplies.set(sessionId, { sentences, speechSegments, includeAll })
+    lastAssistant.set(sessionId, { text, at: entry.at })
+    replyBrowseIndex.set(sessionId, list.length - 1)
+  }
+
+  /** 把浏览位置拨回最新一条（点气泡 / 重读 / 换会话时屏上就是最新回复）。 */
+  function browseLatest(sessionId: string): void {
+    const list = replyHistory.get(sessionId)
+    replyBrowseIndex.set(sessionId, Math.max(0, (list?.length ?? 1) - 1))
+    browsingHistory.delete(sessionId)
+  }
+
+  /** 当前浏览到历史第几条（没有历史 -1；缺省=最新一条）。 */
+  function browseIndexOf(sessionId: string): number {
+    const list = replyHistory.get(sessionId) ?? []
+    if (list.length === 0) return -1
+    const stored = replyBrowseIndex.get(sessionId)
+    const index = stored === undefined ? list.length - 1 : stored
+    return Math.max(0, Math.min(index, list.length - 1))
+  }
+
+  /**
+   * 回复屏按钮：原三个（停止/重读/主页）恒在；只有确实还有上一条/下一条才追加，
+   * 别把原按钮挤掉（屏宽 304px，页面按按钮数量收小字号）。
+   */
+  function replyActionsFor(sessionId: string): { id: string; label: string }[] {
+    const list = replyHistory.get(sessionId) ?? []
+    const index = browseIndexOf(sessionId)
+    const actions: { id: string; label: string }[] = REPLY_ACTIONS.map((item) => ({ id: item.id, label: item.label }))
+    if (index > 0) actions.push({ id: 'prev', label: '上一条' })
+    if (index >= 0 && index < list.length - 1) actions.push({ id: 'next', label: '下一条' })
+    return actions
+  }
+
+  /**
+   * 上一条/下一条：只换屏，不自动朗读（要朗读点「重读」）。
+   *
+   * 浏览期间暂停 10 秒自动回主页：用户显式点主页/项目卡才回主页（用户 2026-11-08 要求）。
+   * 翻页时把正在念的那一轮静默掐掉：屏已经翻到别的回答，声音不能继续念上一条。
+   */
+  function browseReplyHistory(device: TihuDevice, sessionId: string, step: -1 | 1): void {
+    const list = replyHistory.get(sessionId) ?? []
+    const current = browseIndexOf(sessionId)
+    const target = current < 0 ? -1 : current + step
+    if (target < 0 || target >= list.length) return
+    try { device.cancelRound?.() } catch { /* 忽略 */ }
+    unpinHome(sessionId)
+    browsingHistory.add(sessionId)
+    replyBrowseIndex.set(sessionId, target)
+    screenStates.delete(sessionId)
+    for (const item of devices) if (item.sessionId === sessionId) followByDevice.set(item.id, true)
+    cancelHomeTimer(sessionId)
+    const home = homeStates.get(sessionId) ?? { mode: 'session' as const, page: 0, done: false }
+    home.mode = 'session'
+    home.done = false
+    homeStates.set(sessionId, home)
+    const entry = list[target]
+    sendReply(sessionId, entry.sentences, 0, 0, entry.includeAll)
+    log(`tihu reply browse session=${sessionId} ${target + 1}/${list.length}`)
   }
 
   /** 朗读开始（多设备同会话会并发调用，按计数累加）。 */
@@ -1302,6 +1485,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (current === undefined || !current.done) return
       // 已经在主页：手势重排的那一次不要再补发一张（避免重复 home 帧）。
       if (current.mode === 'home') return
+      // 翻历史浏览期间暂停自动回主页：只有用户显式点主页/项目卡才回（用户 2026-11-08 要求）。
+      // 结束浏览后下一次巡检会重新走一遍，仍然回主页，不会永久卡住。
+      if (browsingHistory.has(sessionId)) {
+        current.timer = setTimeout(() => scheduleHome(sessionId), tihuHomeRecheckMs())
+        return
+      }
       // 浏览状态按设备算：一台在看历史只挡它自己，不能把同会话的另一台也按住
       //（2026-11-07 审计 P1-9：旧实现用会话级 follow，两台设备互相卡死）。
       const bound = [...devices].filter((device) => device.sessionId === sessionId)
@@ -2030,7 +2219,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       const type = String(event?.type ?? '')
       const sessionPreset = presetOf(session)
       if (sessionPreset !== '') sessionPresets.set(sessionId, sessionPreset)
-      if (type === 'turn/start') runningSessions.set(sessionId, Date.now())
+      if (type === 'turn/start') {
+        runningSessions.set(sessionId, Date.now())
+        // 新的一轮开始：解除主页钉住与浏览态，让状态屏正常回到会话（用户 2026-11-08 规则）。
+        unpinHome(sessionId)
+        browsingHistory.delete(sessionId)
+      }
       else if (type === 'turn/end') runningSessions.delete(sessionId)
       // 运行跟踪与自动跟随都在设备早退**之前**：没绑定该会话的设备收不到事件，
       // 若放在早退之后，别的会话的 turn/start/end 会把跟踪与跟随丢得一干二净。
@@ -2116,8 +2310,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         // 新回复：强制回到顶部并恢复跟随；取消回主页计时并切会话屏。
         screenStates.delete(sessionId)
         for (const device of devices) if (device.sessionId === sessionId) followByDevice.set(device.id, true)
-        lastReplies.set(sessionId, { sentences, speechSegments, includeAll })
-        lastAssistant.set(sessionId, { text, at: Date.now() })
+        pushReplyHistory(sessionId, text, sentences, speechSegments, includeAll)
         cancelHomeTimer(sessionId)
         homeStates.set(sessionId, { mode: 'session', page: 0, done: false })
         sendReply(sessionId, sentences, 0, 0, includeAll)
@@ -2399,8 +2592,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             return
           }
           if (actionId === 'replay' && sid !== undefined) {
-            const reply = lastReplies.get(sid)
+            // 重读念「屏上正在看的那条」：翻过历史就念那一条，不跳回最新（用户 2026-11-08 要求）。
+            const list = replyHistory.get(sid) ?? []
+            const index = browseIndexOf(sid)
+            const reply = index >= 0 ? list[index] : lastReplies.get(sid)
             if (reply !== undefined) {
+              if (index < 0) browseLatest(sid)
+              else browsingHistory.delete(sid)
               screenStates.delete(sid)
               sendReply(sid, reply.sentences, 0, 0, reply.includeAll)
               void speakLocally(device, sid, reply.sentences, reply.speechSegments, reply.includeAll).catch((error) => {
@@ -2410,7 +2608,18 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             return
           }
           if (actionId === 'home') {
+            // 点主页 = 退出本轮朗读 + 钉住主页（用户 2026-11-08 要求）：
+            // 不再发「已停止朗读」提示，免得每点一次就刷一条事件；钉住期间 status/reply
+            // 帧不再覆盖主页屏，直到新的 turn/start / 换绑定 / 点项目卡 / 点最近回答。
+            if (sid !== undefined) {
+              try { device.cancelRound?.() } catch { /* 忽略 */ }
+              pinHome(sid)
+            }
             await sendHome(sid ?? '__unbound__', device)
+            return
+          }
+          if ((actionId === 'prev' || actionId === 'next') && sid !== undefined) {
+            browseReplyHistory(device, sid, actionId === 'prev' ? -1 : 1)
             return
           }
           return
@@ -2419,8 +2628,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           const target = (payload as any).targetSessionId as string
           if (target === (device.sessionId ?? '')) return
           await bindSession(device, target)
+          unpinHome(target)
           const reply = lastReplies.get(target)
           if (reply !== undefined) {
+            browseLatest(target)
             screenStates.delete(target)
             homeStates.set(target, { mode: 'session', page: 0, done: true })
             sendReply(target, reply.sentences, 0, 0, reply.includeAll)
@@ -2428,11 +2639,35 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           scheduleHome(target)
           return
         }
+        // 首页「最近回答」行：回到该会话最近那条回答的朗读屏（不自动朗读，要读点「重读」）。
+        if ((payload as any).hit === 'recent' && typeof (payload as any).sessionId === 'string') {
+          const target = (payload as any).sessionId as string
+          const list = replyHistory.get(target) ?? []
+          const index = list.length - 1
+          if (index >= 0) {
+            if (device.sessionId !== target) await bindSession(device, target)
+            unpinHome(target)
+            browseLatest(target)
+            browsingHistory.add(target)
+            screenStates.delete(target)
+            for (const item of devices) if (item.sessionId === target) followByDevice.set(item.id, true)
+            // 从「最近回答」进来算浏览：暂停自动回主页，用户点主页/项目卡才回。
+            cancelHomeTimer(target)
+            const home = homeStates.get(target) ?? { mode: 'session' as const, page: 0, done: false }
+            home.mode = 'session'
+            home.done = false
+            homeStates.set(target, home)
+            sendReply(target, list[index].sentences, 0, 0, list[index].includeAll)
+          }
+          return
+        }
         // 气泡点击：targetSessionId 必须在当前 pending 队列里（防伪造切屏）。
         if (device.sessionId === undefined) {
           // 未绑定设备：点项目直接进入；点右下角回主页（只发给自己）
           if ((payload as any).hit === 'project' && typeof (payload as any).sessionId === 'string') {
             const target = (payload as any).sessionId as string
+            unpinHome(target)
+            browsingHistory.delete(target)
             await bindSession(device, target)
             screenStates.delete(target)
             homeStates.set(target, { mode: 'session', page: 0, done: true })
@@ -2445,6 +2680,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         if ((payload as any).hit === 'project' && typeof (payload as any).sessionId === 'string') {
           // 主页行点击：进入该项目最近会话（sessionId 由主页帧下发，bindSession 会再校验存在性）
           const target = (payload as any).sessionId as string
+          unpinHome(target)
+          browsingHistory.delete(target)
           if (target !== device.sessionId) {
             await bindSession(device, target)
             screenStates.delete(target)
@@ -2463,6 +2700,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             pendingByDisplay.set(display, list)
             const reply = lastReplies.get(target)
             await bindSession(device, target)
+            unpinHome(target)
+            browseLatest(target)
             screenStates.delete(target)
             homeStates.set(target, { mode: 'session', page: 0, done: true })
             if (reply !== undefined) {

@@ -75,8 +75,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   /* 回复屏底部动作条（停止 / 重读 / 主页） */
   #screen .action-bar { display:none; flex:none; gap:6px; padding-top:4px; }
   #screen.reply-mode .action-bar { display:flex; }
-  #screen .action-bar button { flex:1; min-height:28px; border-radius:6px; border:1px solid #33414f;
-    background:#1b2430; color:#d9e2ea; font-size:13px; }
+  #screen .action-bar button { flex:1; min-width:0; min-height:28px; padding:0 2px; white-space:nowrap;
+    border-radius:6px; border:1px solid #33414f; background:#1b2430; color:#d9e2ea; font-size:13px; }
+  /* 有历史可翻时是 5 个按钮（停止/重读/主页/上一条/下一条）：小一号字号，304px 内不换行不溢出 */
+  #screen .action-bar.many button { font-size:11px; }
   #screen .action-bar button:active { background:#2c3d4e; }
   /* 状态屏底部：其他正在运行的会话 */
   #screen .run-list { display:none; flex:none; margin-top:6px; }
@@ -97,6 +99,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .home-dot.running { background:#35d07f; }
   #screen .home-dot.idle { background:#6b7785; }
   #screen .home-dot.done { background:#4f8ef7; }
+  /* 首页顶部「最近回答 · 会话名」行：单行省略，点它回到那条回答的朗读屏 */
+  #screen .home-recent { display:block; height:20px; box-sizing:border-box; margin:0 0 2px; padding:0 4px;
+    border:1px solid #2a5a54; border-radius:4px; background:rgba(20,44,40,.55);
+    font-size:13px; line-height:16px; color:#9fd8cf; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen .pending-rail { position:absolute; right:0; top:8px; bottom:8px; width:64px; padding:4px; box-sizing:border-box;
     display:none; flex-direction:column; gap:4px; z-index:3; }
   #screen.rail-on .pending-rail { display:flex; }
@@ -456,6 +462,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var bar = $('actionBar');
     bar.innerHTML = '';
     var actions = state.actions || [];
+    // 5 个按钮（停止/重读/主页/上一条/下一条）时收小字号，304px 内挤得下、不换行。
+    bar.className = actions.length > 3 ? 'action-bar many' : 'action-bar';
     for (var i = 0; i < actions.length; i += 1) {
       var button = document.createElement('button');
       button.textContent = actions[i].label;
@@ -500,6 +508,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       var homeBody = $('homeBody');
       homeBody.innerHTML = '';
       var projects = payload.home.projects || [];
+      // 首页顶部「最近回答 · 会话名」：只有该会话存了回复才显示（点它回到那条回答的朗读屏）。
+      var recent = payload.home.recent;
+      if (recent && recent.sessionId) {
+        var recentRow = document.createElement('div');
+        recentRow.className = 'home-recent';
+        recentRow.id = 'homeRecent';
+        recentRow.setAttribute('data-session', recent.sessionId);
+        var railOn = state.pending && state.pending.length > 0;
+        recentRow.textContent = fitTextPx('最近回答 · ' + (recent.title || '最近会话'), railOn ? 232 : 292, 13);
+        homeBody.appendChild(recentRow);
+      }
       state.homeProjects = projects;
       state.actions = [];
       state.running = [];
@@ -509,6 +528,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         var project = projects[pi];
         var item = document.createElement('div');
         item.className = 'home-item';
+        if (project.sessionId) item.setAttribute('data-session', project.sessionId);
+        if (project.name) item.setAttribute('data-project', project.name);
         var row1 = document.createElement('div');
         row1.className = 'home-row1';
         var dot = document.createElement('span');
@@ -525,7 +546,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         item.appendChild(row2);
         homeBody.appendChild(item);
       }
-      screen.className = 'home-mode';
+      // 保留 rail-on：renderPending 刚按本帧 pending 加上的类不能被整串覆盖（气泡轨要一直可见）。
+      screen.className = 'home-mode' + (state.pending && state.pending.length ? ' rail-on' : '');
       updateScrollHint();
       return;
     }
@@ -538,7 +560,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       }
       if (typeof payload.reply.charPos === 'number') state.replyCharPos = payload.reply.charPos;
       $('stage').textContent = clipScreen(payload.stage || '回答中', SCREEN.stageChars);
-      screen.className = (payload.tone || 'ok') + ' reply-mode';
+      screen.className = (payload.tone || 'ok') + ' reply-mode' + (state.pending && state.pending.length ? ' rail-on' : '');
       renderReply();
       state.running = [];
       renderRunning();
@@ -581,7 +603,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       list.appendChild(li);
     }
     $('replyBody').innerHTML = '';
-    screen.className = payload.tone || 'idle';
+    screen.className = (payload.tone || 'idle') + (state.pending && state.pending.length ? ' rail-on' : '');
     state.actions = [];
     renderActions();
     state.running = payload.running || [];
@@ -1656,7 +1678,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         if (under && under.getAttribute) {
           var actionId = under.getAttribute('data-action');
           if (actionId) {
-            if (actionId === 'stop') stopPcm();
+            // 主页/翻页都算「退出本轮朗读」：和停止一样先把页面音频队列掐掉（宿主也会 cancelRound），
+            // 差别只是不回「已停止朗读」提示。
+            if (actionId === 'stop' || actionId === 'home' || actionId === 'prev' || actionId === 'next') stopPcm();
             if (actionId === 'home') tapFlash(event.clientX - rect.left, event.clientY - rect.top);
             send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'action', actionId: actionId });
             return;
@@ -1668,12 +1692,18 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
             return;
           }
         }
-        if (state.screenMode === 'home' && state.homeProjects && state.homeProjects.length) {
-          var idx = Math.floor((y - $('homeBody').offsetTop) / 36);
-          if (idx >= 0 && idx < state.homeProjects.length) {
-            var proj = state.homeProjects[idx];
-            if (proj && proj.sessionId) {
-              send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'project', project: proj.name, sessionId: proj.sessionId });
+        var recentEl = under && under.closest ? under.closest('.home-recent') : null;
+        if (recentEl) {
+          var recentSession = recentEl.getAttribute('data-session');
+          if (recentSession) { send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'recent', sessionId: recentSession }); return; }
+        }
+        // 项目行按元素命中：首页顶部多了「最近回答」行，不能再按固定 36px 行高算下标。
+        if (state.screenMode === 'home') {
+          var projectEl = under && under.closest ? under.closest('.home-item') : null;
+          if (projectEl) {
+            var projectSession = projectEl.getAttribute('data-session');
+            if (projectSession) {
+              send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'project', project: projectEl.getAttribute('data-project') || '', sessionId: projectSession });
               return;
             }
           }

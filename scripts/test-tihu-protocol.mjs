@@ -40,7 +40,7 @@ import {
   takeSnapshot,
   targetPathOf,
 } from '../src/tihu/guard.ts'
-import { createTihuRuntime, buildTihuUserMessage, TIHU_LANE_PATH, TIHU_PAGE_PATH } from '../src/tihu/lane.ts'
+import { createTihuRuntime, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH } from '../src/tihu/lane.ts'
 import {
   activityEntryOf,
   applySessionEvent,
@@ -3656,6 +3656,309 @@ test('统计行宽：1234.0M 这类长统计放得下，正文字号才会放不
   assert.ok(measureTextPx(narrowTail, SCREEN_SPEC.statsFontPx) <= PENDING_RAIL_WIDTH_PX, '气泡轨占位时统计行也要放得下：' + narrowTail)
   assert.ok(measureTextPx(tail, SCREEN_SPEC.statsFontPx) <= CONTENT_WIDTH_PX, '按统计字号刚好放得下：' + tail)
   for (const line of frame.bullets.slice(0, -1)) assert.ok(measureTextPx(line, SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX, '明细行超宽：' + line)
+})
+
+/* ---------- 2026-11-08：主页按钮（退出朗读 + 钉住主页）与「最近回答」/上一条/下一条 ---------- */
+
+/** 造一个「按句慢慢合成」的假 TTS：点主页时后续句子还在合成，能验证它们不再下发音频。 */
+function pacedTts() {
+  return {
+    async ensureServer() {},
+    status: () => ({ available: true, model: 'paced-test' }),
+    engineLabel: () => 'paced-test',
+    takeEngineNote: () => '',
+    deviceFallback: () => '',
+    available: () => true,
+    async synthesize(text, options) {
+      // 第一句 20ms 出音频；后续句 300ms 才出——点主页时它们还在合成中。
+      await waitMs(String(text).includes('第一句') ? 20 : 300)
+      if (options.signal?.aborted) throw new Error('aborted')
+      options.onChunk({ data: Buffer.alloc(4800), seq: 0, total: 1, final: true })
+      return { sampleRate: 24000, audioMs: 100, chunks: 1 }
+    },
+    async createVoice() { throw new Error('n/a') },
+    async listVoices() { return [] },
+    dispose() {},
+  }
+}
+
+function screenFramesOf(socket) {
+  return framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+}
+
+/** 一屏回复的正文（单句回复时就是整句）。 */
+function replyTextOf(frame) {
+  if (frame === undefined || frame.payload.reply === undefined) return ''
+  return (frame.payload.reply.sentences || []).map((sentence) => sentence.text).join('')
+}
+
+test('screen.gesture 校验：hit=recent（首页最近回答行）合法，未知 hit 仍忽略', () => {
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'tap', x: 20, y: 22, hit: 'recent', sessionId: 'session-a' }, 65))) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'tap', x: 20, y: 22, hit: 'recent2' }, 66))), null)
+})
+
+await testAsync('lane：主页按钮 = 取消本轮朗读 + 钉住主页（不再发「已停止朗读」）', async () => {
+  const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+  const { runtime, events } = runtimeFor(records, {}, { instance: pacedTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'home-pin', protocol: '0', sessionId: 'session-a' }, 1)))
+  await waitMs(40)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  onSessionEvent({ id: 'session-a', header: { id: 'session-a' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: '第一句。第二句。第三句。第四句。' }] } },
+  })
+  await waitMs(80)
+  const audioBefore = framesOf(socket).filter((frame) => frame.type === 'tts.audio').length
+  assert.ok(audioBefore > 0, '点主页前应已经开始朗读')
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 280, y: 220, hit: 'action', actionId: 'home' }, 2)))
+  await waitMs(500)
+  const frames = framesOf(socket)
+  assert.equal(
+    frames.filter((frame) => frame.type === 'tts.audio').length,
+    audioBefore,
+    '点主页必须取消本轮朗读：后续句子不得再下发音频',
+  )
+  const progress = frames.filter((frame) => frame.type === 'event.progress').map((frame) => String(frame.payload.text ?? ''))
+  assert.ok(!progress.some((text) => text.includes('已停止朗读')), '点主页不得刷「已停止朗读」提示：' + progress.join(' | '))
+  const screens = frames.filter((frame) => frame.type === 'screen.frame')
+  assert.equal(screens[screens.length - 1].payload.mode, 'home', '点主页后屏要停在主页')
+  runtime.dispose()
+})
+
+await testAsync('lane：钉住期间 reply/status 帧不覆盖主页，气泡轨仍可见', async () => {
+  const records = [
+    cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 3000, title: '会话 A' }),
+    cuRecord('session-b', { live: true, cwd: '/b', lastPromptAt: 2000, title: '会话 B' }),
+  ]
+  const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pin-frames', protocol: '0', sessionId: 'session-a' }, 1)))
+  await waitMs(40)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const emit = (id, event) => onSessionEvent({ id, header: { id } }, event)
+  emit('session-a', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '先有一条回答。' }] } } })
+  await waitMs(80)
+  // 点主页 → 钉住
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 280, y: 220, hit: 'action', actionId: 'home' }, 2)))
+  await waitMs(80)
+  const mark = framesOf(socket).length
+  // 钉住期间：状态帧（工具调用）、同会话 reply 帧、别的会话完成的气泡，都不能把屏切走
+  emit('session-a', { type: 'tool/call', data: { turn: 2, step: 1, name: 'read', arguments: { file_path: '/a/x.ts' } } })
+  emit('session-a', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '这条回复不许顶掉主页。' }] } } })
+  emit('session-b', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '会话 B 也完成了。' }] } } })
+  emit('session-b', { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await waitMs(200)
+  const screens = framesOf(socket).slice(mark).filter((frame) => frame.type === 'screen.frame')
+  const nonHome = screens.filter((frame) => frame.payload.mode !== 'home')
+  assert.equal(
+    nonHome.length,
+    0,
+    '钉住期间不得有 status/reply 帧覆盖主页：' + JSON.stringify(nonHome.slice(-2).map((frame) => frame.payload.mode)),
+  )
+  const homes = screens.filter((frame) => frame.payload.mode === 'home')
+  assert.ok(homes.length > 0, '气泡/状态变化时仍应下发主页帧（只刷气泡）')
+  const last = homes[homes.length - 1].payload
+  assert.ok(
+    (last.pending || []).some((item) => item.sessionId === 'session-b'),
+    '气泡轨仍要可见（挂在主页帧上）：' + JSON.stringify(last.pending),
+  )
+  runtime.dispose()
+})
+
+await testAsync('lane：新的 turn/start 解除主页钉住，回到会话屏并正常出回复', async () => {
+  const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+  const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pin-turn', protocol: '0', sessionId: 'session-a' }, 1)))
+  await waitMs(40)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const emit = (event) => onSessionEvent({ id: 'session-a', header: { id: 'session-a' } }, event)
+  emit({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '旧回答。' }] } } })
+  await waitMs(80)
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 280, y: 220, hit: 'action', actionId: 'home' }, 2)))
+  await waitMs(80)
+  const mark = screenFramesOf(socket).length
+  emit({ type: 'turn/start', data: { turn: 2 } })
+  await waitMs(100)
+  const screens = screenFramesOf(socket).slice(mark)
+  assert.ok(screens.length > 0, '新 turn/start 后要重新出会话屏')
+  assert.notEqual(screens[screens.length - 1].payload.mode, 'home', '新 turn/start 必须解除钉住、回到会话屏')
+  emit({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '新回答。' }] } } })
+  await waitMs(120)
+  const last = screenFramesOf(socket).pop()
+  assert.equal(last.payload.mode, 'reply', '解除钉住后新回复要正常出朗读屏')
+  assert.ok(replyTextOf(last).includes('新回答'), '新回复正文要上屏：' + replyTextOf(last))
+  runtime.dispose()
+})
+
+await testAsync('lane：首页「最近回答 · 会话名」行出现，点它回到那条回答的朗读屏', async () => {
+  const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+  const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'recent-row', protocol: '0', sessionId: 'session-a' }, 1)))
+  await waitMs(60)
+  // 还没有存回复：主页帧不带「最近回答」行
+  const initial = screenFramesOf(socket).filter((frame) => frame.payload.mode === 'home').pop()
+  assert.ok(initial !== undefined, '绑定后应收到主页帧')
+  assert.equal(initial.payload.home.recent, undefined, '没有存的回复时不该出「最近回答」行')
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  onSessionEvent({ id: 'session-a', header: { id: 'session-a' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: '刚才那条回答。' }] } },
+  })
+  await waitMs(80)
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 280, y: 220, hit: 'action', actionId: 'home' }, 2)))
+  await waitMs(100)
+  const homeFrame = screenFramesOf(socket).filter((frame) => frame.payload.mode === 'home').pop()
+  const recent = homeFrame.payload.home.recent
+  assert.ok(recent, '有存的回复时首页要出「最近回答」行：' + JSON.stringify(homeFrame.payload.home))
+  assert.equal(recent.sessionId, 'session-a')
+  assert.ok(String(recent.title).includes('会话 A'), '会话名要能读：' + recent.title)
+  assert.equal(/session-|^[0-9a-f]{6,}$/i.test(String(recent.title)), false, '不得显示裸会话 id：' + recent.title)
+  const mark = framesOf(socket).length
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 20, y: 22, hit: 'recent', sessionId: 'session-a' }, 3)))
+  await waitMs(120)
+  const frames = framesOf(socket).slice(mark)
+  const replies = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'reply')
+  assert.ok(replies.length > 0, '点「最近回答」要回到朗读屏')
+  const last = replies[replies.length - 1].payload
+  assert.ok(replyTextOf({ payload: last }).includes('刚才那条回答'), '要回到刚才那条回答：' + replyTextOf({ payload: last }))
+  assert.deepEqual((last.actions || []).map((item) => item.id), ['stop', 'replay', 'home'], '单条历史时只有原来三个按钮')
+  assert.equal(frames.filter((frame) => frame.type === 'tts.audio').length, 0, '点最近回答只回屏，不自动朗读（要朗读点重读）')
+  runtime.dispose()
+})
+
+await testAsync('lane：上一条/下一条 翻页只换屏不自动朗读，浏览期间 10 秒计时器不切走', async () => {
+  process.env.TIHU_HOME_AFTER_MS = '60'
+  process.env.TIHU_HOME_RECHECK_MS = '40'
+  try {
+    const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+    const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+    const socket = openLane(runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'browse', protocol: '0', sessionId: 'session-a' }, 1)))
+    await waitMs(40)
+    const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+    const emit = (event) => onSessionEvent({ id: 'session-a', header: { id: 'session-a' } }, event)
+    for (const text of ['第一条回答。', '第二条回答。', '第三条回答。']) {
+      emit({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } })
+      await waitMs(80)
+    }
+    await waitMs(120)
+    // 回主页（钉住），再从「最近回答」回到最新一条
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 280, y: 220, hit: 'action', actionId: 'home' }, 2)))
+    await waitMs(80)
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 20, y: 22, hit: 'recent', sessionId: 'session-a' }, 3)))
+    await waitMs(120)
+    const lastReply = () => screenFramesOf(socket).filter((frame) => frame.payload.mode === 'reply').pop()
+    const ids = (frame) => (frame.payload.actions || []).map((item) => item.id)
+    assert.ok(lastReply() !== undefined, '点最近回答后应显示朗读屏')
+    assert.equal(replyTextOf(lastReply()), '第三条回答。', '最近回答 = 最新一条')
+    assert.deepEqual(ids(lastReply()), ['stop', 'replay', 'home', 'prev'], '最新一条只有「上一条」')
+    // 翻页前记下音频数：翻页不得触发新的朗读
+    let audioBaseline = framesOf(socket).filter((frame) => frame.type === 'tts.audio').length
+    const homeAtBrowse = screenFramesOf(socket).filter((frame) => frame.payload.mode === 'home').length
+
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 120, y: 220, hit: 'action', actionId: 'prev' }, 4)))
+    await waitMs(80)
+    assert.equal(replyTextOf(lastReply()), '第二条回答。', '上一条回到第 2 条')
+    assert.deepEqual(ids(lastReply()), ['stop', 'replay', 'home', 'prev', 'next'], '中间一条两个翻页按钮都在（加原三个共 5 个）')
+
+    // 重读念「屏上正在看的那条」：翻过历史后重读不能跳回最新
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 160, y: 220, hit: 'action', actionId: 'replay' }, 45)))
+    await waitMs(140)
+    assert.equal(replyTextOf(lastReply()), '第二条回答。', '重读仍停在正在看的那条（不能跳回最新）')
+    audioBaseline = framesOf(socket).filter((frame) => frame.type === 'tts.audio').length
+    assert.ok(audioBaseline > 0, '重读要重新下发这一条的音频')
+
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 120, y: 220, hit: 'action', actionId: 'prev' }, 5)))
+    await waitMs(80)
+    assert.equal(replyTextOf(lastReply()), '第一条回答。', '再上一条回到第 1 条')
+    assert.deepEqual(ids(lastReply()), ['stop', 'replay', 'home', 'next'], '最早一条只剩「下一条」，原三个按钮不被挤掉')
+
+    // 下一条回到最新；最新再点下一条不动
+    for (const seq of [6, 7, 8]) {
+      socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 160, y: 220, hit: 'action', actionId: 'next' }, seq)))
+      await waitMs(80)
+    }
+    assert.equal(replyTextOf(lastReply()), '第三条回答。', '翻到最新就停住')
+    assert.equal(ids(lastReply()).includes('next'), false, '最新一条不该再有「下一条」')
+    assert.equal(framesOf(socket).filter((frame) => frame.type === 'tts.audio').length, audioBaseline, '翻页只换屏，不自动朗读')
+    // 一轮结束（turn/end）会排 10 秒回主页，但正在浏览时必须暂停
+    emit({ type: 'turn/end', data: { turn: 3, reason: { kind: 'completed' } } })
+    await waitMs(320)
+    assert.equal(
+      screenFramesOf(socket).filter((frame) => frame.payload.mode === 'home').length,
+      homeAtBrowse,
+      '浏览期间 10 秒自动回主页必须暂停（turn/end 也不能把屏切走）',
+    )
+    assert.equal(replyTextOf(lastReply()), '第三条回答。', '浏览期间屏仍停在回复上')
+    // 显式点主页才回主页
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 280, y: 220, hit: 'action', actionId: 'home' }, 9)))
+    await waitMs(120)
+    assert.equal(
+      screenFramesOf(socket).filter((frame) => frame.payload.mode === 'home').length,
+      homeAtBrowse + 1,
+      '显式点主页才回主页',
+    )
+    runtime.dispose()
+  } finally {
+    delete process.env.TIHU_HOME_AFTER_MS
+    delete process.env.TIHU_HOME_RECHECK_MS
+  }
+})
+
+await testAsync('lane：每会话回复历史最多 8 条，翻到最早就停住', async () => {
+  assert.equal(REPLY_HISTORY_LIMIT, 8, '历史上限是 8 条')
+  const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+  const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'history-cap', protocol: '0', sessionId: 'session-a' }, 1)))
+  await waitMs(40)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  for (let i = 1; i <= 10; i += 1) {
+    onSessionEvent({ id: 'session-a', header: { id: 'session-a' } }, {
+      type: 'assistant/message',
+      data: { message: { content: [{ type: 'text', text: '第' + i + '条回答。' }] } },
+    })
+    await waitMs(30)
+  }
+  await waitMs(180)
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 280, y: 220, hit: 'action', actionId: 'home' }, 2)))
+  await waitMs(80)
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 20, y: 22, hit: 'recent', sessionId: 'session-a' }, 3)))
+  await waitMs(100)
+  const seen = []
+  const recordLatest = () => {
+    const frame = screenFramesOf(socket).filter((item) => item.payload.mode === 'reply').pop()
+    const text = replyTextOf(frame)
+    if (text !== '' && seen[seen.length - 1] !== text) seen.push(text)
+  }
+  recordLatest()
+  for (let i = 0; i < 12; i += 1) {
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 120, y: 220, hit: 'action', actionId: 'prev' }, 10 + i)))
+    await waitMs(40)
+    recordLatest()
+  }
+  assert.equal(seen.length, 8, '每会话只留 8 条历史：' + JSON.stringify(seen))
+  assert.deepEqual(
+    seen,
+    ['第10条回答。', '第9条回答。', '第8条回答。', '第7条回答。', '第6条回答。', '第5条回答。', '第4条回答。', '第3条回答。'],
+    '超出的旧回复必须被挤掉：' + JSON.stringify(seen),
+  )
+  runtime.dispose()
+})
+
+test('page：首页有「最近回答」行，动作条有上一条/下一条的小字号样式', () => {
+  const { ctx } = fakeCtx()
+  const runtime = createTihuRuntime(ctx, { log: () => {}, tts: { disabled: true } })
+  const html = runtime.page()
+  runtime.dispose()
+  assert.ok(html.includes('homeRecent'), '首页要渲染最近回答行')
+  assert.ok(html.includes('home-recent'), '最近回答行要有自己的样式')
+  assert.ok(html.includes("hit: 'recent'"), '点最近回答行要上报 hit=recent')
+  assert.ok(html.includes('上一条') && html.includes('下一条'), '翻页按钮文案要有上一条/下一条')
+  assert.ok(html.includes('action-bar many'), '5 个按钮时用小字号、不换行')
 })
 
 /* ---------- 汇总 ---------- */
