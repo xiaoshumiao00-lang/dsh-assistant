@@ -40,8 +40,8 @@ export const SCREEN_SPEC = {
   stageFontPx: 12,
   /** stage 最大字符数。 */
   stageChars: 10,
-  /** reply 模式：可视正文行数（16px/20px 行高）。 */
-  replyVisibleLines: 9,
+  /** reply 模式：可视正文行数（16px/20px 行高；正文区固定预留一行安全高度后 7 行，见 REPLY_LAYOUT）。 */
+  replyVisibleLines: 7,
 } as const
 
 /** 物理规格（近似值，仅用于「实际尺寸」显示）。 */
@@ -67,6 +67,53 @@ export const TEXT_WRAP_SAFETY_PX = 4
  * 宿主排版必须用同一个值，否则状态屏三、四行会被 CSS 二次裁掉（2026-11-07 审计 P1-6）。
  */
 export const PENDING_RAIL_WIDTH_PX = 240
+
+/**
+ * 回答屏垂直预算（全部取自页面 CSS 的定量常量，改任何一处都要同步这里）：
+ *
+ *   内容高 224 = 240 − 8×2 内边距
+ *   − 顶行 14（12px / 行高 14，「回答中 · x/y · 已绑定：xxx」）
+ *   − 列间隙 4×2（顶行↔正文、正文↔按钮行）
+ *   − 底部按钮行 32（按钮 min-height 28 + padding-top 4）
+ *   = 正文区 170
+ *
+ * **固定预留一行安全高度 20px**：末行下面这一整行不许被回答气泡（右侧 64px 轨）、
+ * 进度条（reply-mode 已收掉）或顶行占用。
+ *   → 每屏 7 行 × 20 = 140，末行下方实留 30px（20 安全行 + 10 取整余量）。
+ *   → 240 宽有轨时：正文 240 + 气泡轨 64 = 304 ≤ 内容宽，横向也不压字。
+ *
+ * 注：页面 `#screen` 还有 1px 边框（box-sizing:border-box），实际内核内容高是 222，
+ * 正文区实得 168；7 行 140 仍留 28px（≥ 一整行 20px），所以两种口径都过。
+ */
+const REPLY_STAGE_HEIGHT_PX = 14
+const REPLY_ACTION_BAR_HEIGHT_PX = 32
+const REPLY_COLUMN_GAP_PX = 4
+const REPLY_CONTENT_HEIGHT_PX = SCREEN_SPEC.heightPx - SCREEN_SPEC.paddingPx * 2
+const REPLY_BODY_HEIGHT_PX = REPLY_CONTENT_HEIGHT_PX - REPLY_STAGE_HEIGHT_PX - REPLY_ACTION_BAR_HEIGHT_PX - REPLY_COLUMN_GAP_PX * 2
+const REPLY_LINE_HEIGHT_PX = SCREEN_SPEC.bodyLineHeightPx
+const REPLY_SAFE_LINE_PX = SCREEN_SPEC.bodyLineHeightPx
+const REPLY_VISIBLE_LINES = Math.floor((REPLY_BODY_HEIGHT_PX - REPLY_SAFE_LINE_PX) / REPLY_LINE_HEIGHT_PX)
+
+export const REPLY_LAYOUT = {
+  contentHeightPx: REPLY_CONTENT_HEIGHT_PX,
+  stageHeightPx: REPLY_STAGE_HEIGHT_PX,
+  actionBarHeightPx: REPLY_ACTION_BAR_HEIGHT_PX,
+  columnGapPx: REPLY_COLUMN_GAP_PX,
+  bodyHeightPx: REPLY_BODY_HEIGHT_PX,
+  lineHeightPx: REPLY_LINE_HEIGHT_PX,
+  safeLinePx: REPLY_SAFE_LINE_PX,
+  visibleLines: REPLY_VISIBLE_LINES,
+  usedHeightPx: REPLY_VISIBLE_LINES * REPLY_LINE_HEIGHT_PX,
+  bottomFreePx: REPLY_BODY_HEIGHT_PX - REPLY_VISIBLE_LINES * REPLY_LINE_HEIGHT_PX,
+  /** 有气泡轨时的正文宽（240）与轨宽（64）：两者相加不得超过内容宽。 */
+  railBodyWidthPx: PENDING_RAIL_WIDTH_PX,
+  railWidthPx: 64,
+  /** 无轨正文宽（304）。 */
+  plainBodyWidthPx: CONTENT_WIDTH_PX,
+} as const
+
+/** 卡片边框在 box-sizing:border-box 下再吃掉的高度：实际渲染正文区更小。 */
+export const SCREEN_BORDER_PX = 1
 
 /**
  * 标题加粗系数：18px/700 的实测渲染比常规宽约 6%，用常规宽估算会贴着 304px 被裁。

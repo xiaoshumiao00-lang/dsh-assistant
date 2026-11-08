@@ -1,14 +1,22 @@
 /**
- * 本地 TTS sidecar（鹈鹕模块内置，不依赖任何外部插件 / 独立服务 / 别的仓库）。
+ * TTS 引擎（鹈鹕模块内置，不依赖任何外部插件 / 独立服务 / 别的仓库）。
  *
- * 主引擎（2026-11-08 用户拍板）：**Kokoro multi-lang v1.1-zh（sherpa-onnx，纯 CPU）**。
- *   - 驱动脚本在仓库内：`scripts/tihu-kokoro-tts-server.py`（与 `tihu-qwen-tts-server.py` 同级）；
- *   - 常驻 WebSocket 进程，由本模块 spawn / 健康检查 / 失败重启；端口沿用 DEFAULT_PORT 8731；
- *   - 权重 `~/.dsh/tihu/models/kokoro/kokoro-multi-lang-v1_1/model.onnx`（fp32；本机实测 int8
- *     反而慢 2.8–3.5 倍：RTF 1.34 对 0.477，所以这里显式排除 int8）；
+ * 主引擎（2026-11-08 用户拍板，第二轮）：**微软 edge-tts 云健**（`scripts/tihu-edge-tts.py`，
+ * 音色 zh-CN-YunjianNeural 不变）。理由：试听效果比 Kokoro 自然，且不占本机 CPU。
+ * 离线兜底（次选）：**Kokoro multi-lang v1.1-zh（sherpa-onnx，纯 CPU）**，只在
+ * 「显式离线 / 探测不到网络 / edge 请求失败 / edge 未安装」时启用：
+ *   - 驱动脚本在仓库内：`scripts/tihu-kokoro-tts-server.py`；
+ *   - **绝不默认自启**：`backend()` 在 edge 主用下恒为 `none`，`ensureServer()` 不会 spawn；
+ *     只有 `ensureKokoroServer()`（离线兜底触发 / 屏上手切 Kokoro 音色 / 试听）才拉起，
+ *     避免用户机器白吞 ~300MB 模型加载和 4 个核；
+ *   - 权重在仓库 `models/kokoro/kokoro-multi-lang-v1_1/model.onnx`（fp32；实测 int8 反而慢
+ *     2.8–3.5 倍：RTF 1.34 对 0.477，所以显式排除 int8）；
  *   - Python 运行时 `~/.dsh/tihu/venv-sherpa`（sherpa-onnx 2.0.1 + websockets），不进仓库依赖。
- * 兜底：edge-tts 云健（`scripts/tihu-edge-tts.py`，音色 zh-CN-YunjianNeural 不变）。
- * 可选遗留：Qwen3-TTS sidecar 只有显式 `TIHU_TTS_ENGINE=qwen` 才启动（代码保留，默认不加载）。
+ * 可选遗留：Qwen3-TTS sidecar 只有显式 `TIHU_TTS_ENGINE=qwen` 才启动（代码保留）。
+ *
+ * 离线判定只看**明确依据**（见 {@link offlineFlagReason} / {@link probeEdgeReachable}）：
+ * 设备「仅离线」开关、`TIHU_OFFLINE_ONLY=1`、`TIHU_HOST_OFFLINE=1`、网络探测失败、
+ * edge 请求失败。绝不靠猜。
  *
  * 设计：
  *   - **独立进程**：DSH 主进程只做 HTTP / WS 客户端；
@@ -16,8 +24,8 @@
  *   - Kokoro 走内部 WS 协议（JSON 请求 + 二进制 PCM 分块），这里再切成固定 120ms 块；
  *   - 本地合成**串行**（最多 1 路在合）：并池化会把 4 个线程抢成互相等，反而更慢。
  *
- * 失败策略：顺序固定 **Kokoro → edge**；任一路失败都以可读 Error 向上抛，由 lane 发
- * `event.alert` 并让页面降级；绝不静默。
+ * 失败策略：默认 **edge → （离线/不可用时）Kokoro**；任一路失败都以可读 Error 向上抛，
+ * 由 lane 发 `event.alert` 并让页面降级；绝不静默。
  */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync } from 'node:fs'
@@ -61,12 +69,14 @@ export function edgeFirstChunkMs(): number {
 }
 
 /**
- * 本地（Kokoro）首块门限：`TIHU_LOCAL_FIRST_MS`，默认 **2500ms**，夹在 1–60s。
+ * Kokoro（离线兜底）首块门限：`TIHU_LOCAL_FIRST_MS`，默认 **4000ms**，夹在 1–60s。
  *
- * 依据（本轮实测，4 线程 fp32）：20 字首段 ≈ 4s 音频，合成 1.6–2.4s（RTF 0.33–0.48），
- * 2500ms 覆盖 p95；超时立刻切 edge，不让首句空等。
+ * 2026-11-08 第二轮按「edge 主用、Kokoro 兜底」重新取值：兜底路径没有第二条在线路，
+ * 宁可多等一点也不能把这一句判死。实测（4 线程 fp32）：模型冷加载 1251ms（发生在
+ * ensureKokoroServer 里，不计入这个请求预算），之后首块 372–1047ms；2500ms 只留 2.4 倍
+ * 余量，兜底时 CPU 还被别的活抢核，所以取 4000ms（≈1.7× 冷加载+首块 2298ms）。
  */
-const LOCAL_FIRST_MS_DEFAULT = 2_500
+const LOCAL_FIRST_MS_DEFAULT = 4_000
 const LOCAL_FIRST_MS_MIN = 1_000
 const LOCAL_FIRST_MS_MAX = 60_000
 
@@ -76,18 +86,19 @@ export function localFirstChunkMs(): number {
 }
 
 /**
- * 主引擎：`TIHU_TTS_ENGINE` = `kokoro` | `edge` | `qwen`，**默认 kokoro**。
+ * 主引擎：`TIHU_TTS_ENGINE` = `edge`（默认）| `kokoro`（离线兜底 / 手动切）| `qwen`（遗留）。
  *
- * 2026-11-08 用户拍板：Kokoro 本地为主，edge 兜底；qwen 只有**显式**设置才启动
- *（旧值 cpu/q4/qwen-cuda 仍识别成 qwen，但绝不作为默认）。
+ * 2026-11-08 第二轮用户拍板：**微软 edge-tts 主用**，Kokoro 只做离线兜底（试听不如微软自然）；
+ * 屏上仍可手选 Kokoro 音色（见 {@link isKokoroVoice}），这时这一路先走 Kokoro。
+ * `qwen` 只有**显式**设置才启动（旧值 cpu/q4/qwen-cuda 仍识别成 qwen，绝不作为默认）。
  */
-export type TihuTtsEngine = 'kokoro' | 'edge' | 'qwen'
+export type TihuTtsEngine = 'edge' | 'kokoro' | 'qwen'
 
 export function ttsEngine(): TihuTtsEngine {
   const raw = String(process.env.TIHU_TTS_ENGINE ?? '').trim().toLowerCase()
-  if (raw === 'edge') return 'edge'
+  if (raw === 'kokoro') return 'kokoro'
   if (raw === 'qwen' || raw === 'cpu' || raw === 'q4' || raw === 'qwen-cuda') return 'qwen'
-  return 'kokoro'
+  return 'edge'
 }
 
 /** Kokoro 中文音色（sid 与 voices.bin 顺序一致；sherpa-onnx 官方 sid→name 映射）。 */
@@ -156,6 +167,64 @@ export function kokoroSid(raw?: string | number): number {
     if (sid >= 0 && sid <= 102) return sid
   }
   return fallback
+}
+
+/**
+ * 这个音色名是不是 Kokoro 的（`zf_060` / `zm_100` / `35` / `sid35`）。
+ *
+ * 屏上「音色」下拉里 Kokoro 音色一直列着：选中它就是**手动切到 Kokoro**——这一路先走
+ * Kokoro（必要时才 spawn sidecar），没选就按 edge 主引擎走。协议不新增字段，沿用现有
+ * `voice.select { name }`。
+ */
+export function isKokoroVoice(raw?: string | number): boolean {
+  if (typeof raw === 'number') return Number.isInteger(raw) && raw >= 0 && raw <= 102
+  const value = String(raw ?? '').trim().toLowerCase()
+  if (value === '' || value === 'default') return false
+  if (KOKORO_VOICES.some((voice) => voice.name.toLowerCase() === value)) return true
+  const numeric = value.startsWith('sid') ? value.slice(3) : value
+  if (!/^\d+$/.test(numeric)) return false
+  const sid = Number(numeric)
+  return sid >= 0 && sid <= 102
+}
+
+/** 离线判定的**显式依据**（空串 = 没有离线依据）。只看明确开关，不猜。 */
+export function offlineFlagReason(offlineOnly?: boolean): string {
+  if (offlineOnly === true) return '设备勾选了「仅离线」'
+  if (process.env.TIHU_OFFLINE_ONLY === '1') return 'TIHU_OFFLINE_ONLY=1（仅离线）'
+  if (process.env.TIHU_HOST_OFFLINE === '1') return 'TIHU_HOST_OFFLINE=1（宿主处于离线模式）'
+  return ''
+}
+
+/** edge 所在网络探测：HEAD 请求，1.5s 超时；结果缓存 60s（兜底判定用，不在主路径上跑）。 */
+const EDGE_PROBE_TIMEOUT_MS = 1_500
+const EDGE_PROBE_CACHE_MS = 60_000
+/** edge 失败后的冷却：这段时间内后续段直接走离线兜底（不再每段白等两轮 8s 门限）。 */
+const EDGE_DOWN_TTL_MS = 60_000
+export const EDGE_PROBE_URL_DEFAULT = 'https://speech.platform.bing.com/'
+let edgeProbeCache: { at: number; reachable: boolean } | undefined
+
+/**
+ * 网络是否可达（离线判定的硬依据）：能拿到**任意 HTTP 响应**就算可达，连接被拒/超时/
+ * DNS 失败都算「探测不到网络」。`TIHU_EDGE_PROBE_URL` 可覆盖探测目标（测试用）。
+ */
+export async function probeEdgeReachable(): Promise<boolean> {
+  const now = Date.now()
+  if (edgeProbeCache !== undefined && now - edgeProbeCache.at < EDGE_PROBE_CACHE_MS) return edgeProbeCache.reachable
+  const url = process.env.TIHU_EDGE_PROBE_URL ?? EDGE_PROBE_URL_DEFAULT
+  let reachable = false
+  try {
+    await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(EDGE_PROBE_TIMEOUT_MS) })
+    reachable = true
+  } catch {
+    reachable = false
+  }
+  edgeProbeCache = { at: now, reachable }
+  return reachable
+}
+
+/** 清掉网络探测缓存（测试/排障用：换网后不必等 60s）。 */
+export function resetEdgeProbeCache(): void {
+  edgeProbeCache = undefined
 }
 
 /**
@@ -433,6 +502,12 @@ export class TihuTts {
   private lastLabel = ''
   /** 本地合成串行锁：最多 1 路在合（Kokoro 只用 4 线程，并发只会互相等）。 */
   private localLock: Promise<unknown> = Promise.resolve()
+  /**
+   * edge 失败后的冷却窗口：同一轮/连续多段朗读里，edge 刚失败过就不要每段都白等两轮
+   * （首块门限 8s × 2）；60s 内直接走离线兜底，过期后再给 edge 一次机会。
+   */
+  private edgeDownUntil = 0
+  private edgeDownReason = ''
 
   constructor(options: TihuTtsOptions) {
     this.options = options
@@ -440,7 +515,12 @@ export class TihuTts {
     this.port = options.port ?? KOKORO_PORT_DEFAULT
   }
 
-  /** 当前实际会启动的后端：kokoro（默认）/ qwen-cuda / q4 / cpu / none。 */
+  /**
+   * 当前**常驻**后端：kokoro（只有显式 `TIHU_TTS_ENGINE=kokoro` 才算）/ qwen-* / none。
+   *
+   * edge 主用时恒为 `none`：edge 是每次合成现起 Python 进程，不需要常驻 sidecar；
+   * Kokoro 只在离线兜底/手切时由 {@link ensureKokoroServer} 按需拉起，**不在这里自启**。
+   */
   backend(): 'kokoro' | 'qwen-cuda' | 'q4' | 'cpu' | 'none' {
     if (this.options.disabled) return 'none'
     const engine = ttsEngine()
@@ -454,6 +534,19 @@ export class TihuTts {
     return 'none'
   }
 
+  /**
+   * 这一路实际会优先试哪个引擎（屏上/测试用；不发起任何进程）：
+   *   - 显式 `TIHU_TTS_ENGINE=qwen` → qwen（遗留）；
+   *   - 显式 kokoro、手选 Kokoro 音色、仅离线/宿主离线 → kokoro；
+   *   - 其余 → edge（默认）。
+   */
+  engineFor(voice?: string, offlineOnly?: boolean): TihuTtsEngine {
+    const engine = ttsEngine()
+    if (engine === 'qwen') return 'qwen'
+    if (engine === 'kokoro' || isKokoroVoice(voice) || offlineFlagReason(offlineOnly) !== '') return 'kokoro'
+    return 'edge'
+  }
+
   /** 实际出声引擎（状态屏/事件区用）：kokoro | gpu | edge | none。 */
   activeEngine(): 'kokoro' | 'gpu' | 'edge' | 'none' {
     return this.engineInUse
@@ -464,7 +557,7 @@ export class TihuTts {
     return kokoroMissingFiles().length === 0
   }
 
-  /** 主引擎是不是本地 Kokoro（lane 据此把并发压到 1 路）。 */
+  /** 主引擎是不是本地（lane 据此把并发压到 1 路；edge 主用时为 false，最多 3 路）。 */
   localPrimary(): boolean {
     return this.backend() === 'kokoro' || this.backend() === 'qwen-cuda' || this.backend() === 'cpu' || this.backend() === 'q4'
   }
@@ -488,9 +581,9 @@ export class TihuTts {
       existsSync(join(this.qwenModelDir(), 'model.safetensors'))
   }
 
-  /** 引擎是否可用（edge 或本地 Qwen 任一可用）。 */
+  /** 引擎是否可用（edge 或本地 Kokoro/Qwen 任一可用）。 */
   available(): boolean {
-    return this.edgeReady() || this.backend() !== 'none'
+    return this.edgeReady() || this.kokoroReady() || this.backend() !== 'none'
   }
 
   status(): { available: boolean; model?: string; error?: string } {
@@ -507,10 +600,18 @@ export class TihuTts {
     if (backend === 'q4') return { available: true, model: 'qwen3-tts 0.6b-q4' }
     if (backend === 'cpu') return { available: true, model: 'qwen3-tts 0.6b-pt' }
     if (backend === 'qwen-cuda') return { available: true, model: 'qwen3-tts 0.6b-cuda' }
+    // edge 主用：只要 edge 脚本在就算可用；不在时才看 Kokoro 离线兜底是否齐全。
     if (this.edgeReady()) return { available: true, model: 'edge-tts 云健(Yunjian)' }
+    if (this.kokoroReady()) {
+      return {
+        available: true,
+        model: 'Kokoro multi-lang-v1_1（离线兜底）',
+        error: `edge 不可用（缺 Python 运行时或 scripts/tihu-edge-tts.py），已降级到本地 Kokoro`,
+      }
+    }
     return {
       available: false,
-      error: this.lastError || `无语音：edge 不可用且本地引擎未就绪（${this.paths.root}）`,
+      error: this.lastError || `无语音：edge 不可用且本地 Kokoro 未就绪（${this.paths.root}）`,
     }
   }
 
@@ -519,7 +620,7 @@ export class TihuTts {
     return this.fallbackNote
   }
 
-  /** 确保 sidecar 已启动并加载完模型。 */
+  /** 确保 sidecar 已启动并加载完模型（只对常驻后端：显式 kokoro / 遗留 qwen）。 */
   async ensureServer(): Promise<void> {
     const backend = this.backend()
     if (backend === 'none') return
@@ -538,15 +639,62 @@ export class TihuTts {
     return this.starting
   }
 
+  /**
+   * 按需拉起 Kokoro sidecar：**只有**离线兜底触发或用户手切 Kokoro 音色/试听时才调，
+   * 默认 edge 主用路径不会碰它（不占 300MB 模型、不吃 4 个核）。
+   */
+  async ensureKokoroServer(): Promise<void> {
+    if (this.options.disabled) return
+    if (this.modelLoaded) return
+    if (this.starting !== null) return this.starting
+    this.starting = this.launchKokoro().finally(() => { this.starting = null })
+    return this.starting
+  }
+
+  private async launchKokoro(): Promise<void> {
+    await mkdir(this.paths.serverVoices, { recursive: true })
+    const port = await this.pickKokoroPort()
+    this.port = port
+    // pickKokoroPort 命中已有 Kokoro 实例（热重载前遗留）时不再 spawn（此时没有 child，只有 modelLoaded）。
+    if (this.child === null && this.modelLoaded) return
+    await this.startKokoro(port)
+  }
+
+  /** 网络是否可达（离线判定的硬依据；测试可覆盖）。 */
+  edgeNetworkReachable(): Promise<boolean> {
+    return probeEdgeReachable()
+  }
+
+  /**
+   * 离线兜底的判定（按优先级给**明确依据**，空串 = 不该兜底）：
+   *   ① 显式开关：仅离线 / TIHU_OFFLINE_ONLY / TIHU_HOST_OFFLINE；
+   *   ② edge 请求失败：先探测网络（探测不到 = 离线；探测得到 = edge 服务不可用）；
+   *   ③ edge 未安装（缺 Python 运行时或驱动脚本）。
+   * ①②③ 任意一条成立才允许启用 Kokoro。
+   */
+  private async offlineFallbackReason(explicit: string, edgeError: string): Promise<string> {
+    if (explicit !== '') return explicit
+    if (edgeError !== '') {
+      const online = await this.edgeNetworkReachable()
+      if (!online) {
+        return `网络探测失败（${process.env.TIHU_EDGE_PROBE_URL ?? EDGE_PROBE_URL_DEFAULT} 1.5s 不可达）；edge 也失败：${edgeError.slice(0, 120)}`
+      }
+      return `edge 请求失败：${edgeError.slice(0, 120)}`
+    }
+    if (!this.edgeReady()) return 'edge 不可用：缺 Python 运行时或 scripts/tihu-edge-tts.py'
+    return ''
+  }
+
   private async startServer(): Promise<void> {
     await mkdir(this.paths.serverVoices, { recursive: true })
-    const port = await this.pickPort()
-    this.port = port
     const backend = this.backend()
     if (backend === 'kokoro') {
-      await this.startKokoro(port)
+      // 显式 kokoro 主用：走同一套按需启动逻辑（已有 Kokoro 实例则复用，不重复加载）。
+      await this.launchKokoro()
       return
     }
+    const port = await this.pickPort()
+    this.port = port
     let command = this.paths.bin
     let args = [
       '--model', this.paths.codec,
@@ -729,9 +877,34 @@ export class TihuTts {
     return base
   }
 
-  /** 默认端口：Kokoro 走 8731（TIHU_TTS_KOKORO_PORT 可挪）；Qwen 沿用 options/DEFAULT_PORT。 */
+  /**
+   * Kokoro 端口：先找已经在跑的 **Kokoro** 实例复用（热重载/手切来回时不重复加载模型），
+   * 端口被别的 sidecar 占着就往后挪；都没人就返回第一个空闲端口。
+   */
+  private async pickKokoroPort(): Promise<number> {
+    const base = this.options.port ?? this.defaultPort()
+    for (let offset = 0; offset < 8; offset += 1) {
+      const port = base + offset
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(400) })
+        if (!response.ok) continue
+        const info = await response.json().catch(() => null) as { engine?: string } | null
+        if (info?.engine === 'kokoro') {
+          this.port = port
+          this.modelLoaded = true
+          return port
+        }
+      } catch {
+        // 这个端口没人监听 = 就用它（第一处空闲端口）。
+        return port
+      }
+    }
+    return base
+  }
+
+  /** 默认端口：Kokoro（含 edge 主用下的手切/兜底）走 8731（TIHU_TTS_KOKORO_PORT 可挪）；Qwen 沿用 DEFAULT_PORT。 */
   private defaultPort(): number {
-    if (ttsEngine() === 'kokoro') {
+    if (ttsEngine() !== 'qwen') {
       const raw = Number(process.env.TIHU_TTS_KOKORO_PORT ?? '')
       if (Number.isInteger(raw) && raw > 0 && raw < 65536) return raw
       return KOKORO_PORT_DEFAULT
@@ -739,7 +912,7 @@ export class TihuTts {
     return DEFAULT_PORT
   }
 
-  /** edge-tts 兜底是否可用（脚本 + Python；ffmpeg 由系统 PATH 提供）。 */
+  /** edge-tts 主引擎是否可用（脚本 + Python；ffmpeg 由系统 PATH 提供）。 */
   edgeReady(): boolean {
     return existsSync(this.qwenPython()) && existsSync(join(this.paths.root, 'tihu-edge-tts.py'))
   }
@@ -748,9 +921,9 @@ export class TihuTts {
   engineLabel(voice: string): string {
     if (this.engineInUse === 'kokoro') {
       const sid = kokoroSid(voice)
-      return `本地 Kokoro：${kokoroVoiceName(sid)}（sid ${sid}）`
+      return `离线兜底：本地 Kokoro ${kokoroVoiceName(sid)}（sid ${sid}）`
     }
-    if (this.engineInUse === 'edge') return '在线兜底：edge-tts 云健(Yunjian)'
+    if (this.engineInUse === 'edge') return '在线主引擎：edge-tts 云健(Yunjian)'
     if (this.engineInUse === 'none') return '无语音（仅文字）'
     return `本地 TTS：qwen3-tts 0.6b-cuda / 音色 ${voice || 'default'}`
   }
@@ -873,38 +1046,49 @@ export class TihuTts {
     },
   ): Promise<SynthResult> {
     const engine = ttsEngine()
-    // Kokoro 没有克隆概念：voice 在这里是音色名/sid（zf_060、35 都算「选音色」，不是克隆）。
-    const wantsClone = engine !== 'kokoro' && typeof options.voice === 'string' && options.voice !== '' && options.voice !== 'default'
-    const offline = options.offlineOnly === true || process.env.TIHU_OFFLINE_ONLY === '1'
+    // Kokoro 没有克隆概念：voice 在这里是音色名/sid（zf_060、35 都算「手切 Kokoro」，不是克隆）。
+    const kokoroVoice = isKokoroVoice(options.voice)
+    const wantsClone = engine !== 'kokoro' && !kokoroVoice && typeof options.voice === 'string' && options.voice !== '' && options.voice !== 'default'
+    const explicitOffline = offlineFlagReason(options.offlineOnly)
+    /** 手切 Kokoro：显式 TIHU_TTS_ENGINE=kokoro，或屏上选了 Kokoro 音色。 */
+    const manualKokoro = engine === 'kokoro' || kokoroVoice
     let localError = ''
     let edgeError = ''
+    let fallbackReason = ''
+    let kokoroTried = false
 
-    // ① Kokoro（默认主引擎）。克隆音色不支持（只有 qwen 路径能克隆）。
-    if (engine === 'kokoro' && !wantsClone) {
-      if (this.backend() === 'kokoro') {
+    // ① 手切 Kokoro（显式 engine=kokoro / 屏上选 Kokoro 音色）：这一路先走 Kokoro。
+    if (manualKokoro && !wantsClone) {
+      kokoroTried = true
+      if (this.kokoroReady()) {
         try {
           const result = await this.synthesizeKokoro(text, options)
-          this.setEngine('kokoro')
+          this.setEngine('kokoro', options.voice)
           return result
         } catch (error) {
           localError = (error as Error)?.message ?? String(error)
           this.lastError = localError
-          this.log(`kokoro failed（切 edge 兜底）: ${localError}`)
+          this.log(`kokoro failed（手切 Kokoro，失败后切 edge）: ${localError}`)
         }
       } else {
         const missing = kokoroMissingFiles()
-        localError = missing.length > 0
-          ? `Kokoro 未就绪（缺 ${missing.slice(0, 3).join('；')}）。${kokoroInstallHint()}`
-          : 'Kokoro 后端不可用（TIHU_TTS_ENGINE 不是 kokoro 或引擎被禁用）'
+        localError = `Kokoro 未就绪（缺 ${missing.slice(0, 3).join('；')}）。${kokoroInstallHint()}`
         this.log(`kokoro skipped: ${localError}`)
       }
     }
 
-    // ② edge 兜底：音色保持 zh-CN-YunjianNeural（TIHU_EDGE_VOICE 可覆盖），rate 不动。
-    if (!wantsClone && !offline && this.edgeReady()) {
+    // ② edge 主引擎：音色保持 zh-CN-YunjianNeural（TIHU_EDGE_VOICE 可覆盖），rate 不动。
+    //    显式离线时跳过（不白发一次注定失败的请求）；edge 刚失败过（60s 冷却）也跳过，别每段白等。
+    const edgeCooldown = Date.now() < this.edgeDownUntil
+    if (!wantsClone && explicitOffline === '' && edgeCooldown) {
+      edgeError = this.edgeDownReason || 'edge 刚失败过（60s 冷却）'
+      this.log(`edge skipped（60s 冷却：${edgeError}）`)
+    } else if (!wantsClone && explicitOffline === '' && this.edgeReady()) {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
           const result = await this.synthesizeEdge(text, { ...options, edgeVoice: options.edgeVoice })
+          this.edgeDownUntil = 0
+          this.edgeDownReason = ''
           this.setEngine('edge')
           return result
         } catch (error) {
@@ -912,14 +1096,46 @@ export class TihuTts {
           const firstChunkTimeout = edgeError.includes('首块超时')
           const willRetry = firstChunkTimeout && attempt === 0
           this.log(`edge-tts failed${willRetry ? '（首块超时，重试一次 edge）' : ''}: ${edgeError}`)
-          if (!willRetry) break
+          if (!willRetry) {
+            // 取消（换绑/新的一轮取代）不算 edge 故障，不进入冷却。
+            if (/已取消|aborted/i.test(edgeError)) break
+            // 失败即进入 60s 冷却：后面的段直接走离线兜底，不再每段白等两轮。
+            this.edgeDownUntil = Date.now() + EDGE_DOWN_TTL_MS
+            this.edgeDownReason = edgeError
+            break
+          }
         }
       }
     }
 
-    // ③ Qwen3-TTS 遗留路径：只有显式 TIHU_TTS_ENGINE=qwen（或克隆音色 / 仅离线且无 Kokoro）才走。
+    // ③ 离线兜底 Kokoro：只有「显式离线 / 探测不到网络 / edge 请求失败 / edge 未安装」才启用
+    //    （edge 主用时不预热、不常驻，看到这里才 spawn sidecar）。
+    if (!wantsClone && !kokoroTried && engine === 'edge') {
+      fallbackReason = await this.offlineFallbackReason(explicitOffline, edgeError)
+      if (fallbackReason !== '') {
+        this.log(`kokoro offline fallback: ${fallbackReason}`)
+        if (this.kokoroReady()) {
+          try {
+            const result = await this.synthesizeKokoro(text, options)
+            this.setEngine('kokoro', options.voice)
+            this.lastLabel = `${this.engineLabel(options.voice ?? '')}（离线兜底）`
+            return result
+          } catch (error) {
+            localError = (error as Error)?.message ?? String(error)
+            this.lastError = localError
+            this.log(`kokoro offline fallback failed: ${localError}`)
+          }
+        } else {
+          const missing = kokoroMissingFiles()
+          localError = `Kokoro 未就绪（缺 ${missing.slice(0, 3).join('；')}）。${kokoroInstallHint()}`
+          this.log(`kokoro fallback skipped: ${localError}`)
+        }
+      }
+    }
+
+    // ④ Qwen3-TTS 遗留路径：只有显式 TIHU_TTS_ENGINE=qwen（或克隆音色 / 仅离线且无 Kokoro）才走。
     const backend = this.backend()
-    if (backend !== 'none' && (engine === 'qwen' || wantsClone || offline)) {
+    if (backend !== 'none' && (engine === 'qwen' || wantsClone || explicitOffline !== '')) {
       if (cpuFallbackBlocked(wantsClone, backend)) {
         // 快速失败 + 说清原因：不让每一段都空等行业已成空等的本地兜底（CPU 首包 54s）。
         const reason = '本地 Qwen 跑在 CPU（实测首包 8–54s），已不再作为默认音色的兜底；要用请设 TIHU_TTS_CPU_FALLBACK=1'
@@ -949,12 +1165,18 @@ export class TihuTts {
 
     this.engineInUse = 'none'
     this.lastLabel = '无语音（仅文字）'
-    throw new Error(`本次无语音：Kokoro 与 edge 都失败（Kokoro：${localError || '未启用'}；edge：${edgeError || (offline ? '仅离线模式已禁用' : '不可用')}）`)
+    const detail = [
+      edgeError === '' ? '' : `edge：${edgeError}`,
+      localError === '' ? '' : `Kokoro/Qwen：${localError}`,
+      fallbackReason === '' ? '' : `离线依据：${fallbackReason}`,
+      explicitOffline === '' ? '' : `离线开关：${explicitOffline}`,
+    ].filter(Boolean).join('；')
+    throw new Error(`本次无语音：${detail || '没有可用引擎（edge 未安装且 Kokoro 未就绪）'}`)
   }
 
-  private setEngine(engine: 'kokoro' | 'gpu' | 'edge' | 'none'): void {
+  private setEngine(engine: 'kokoro' | 'gpu' | 'edge' | 'none', voice = ''): void {
     this.engineInUse = engine
-    this.lastLabel = this.engineLabel('')
+    this.lastLabel = this.engineLabel(voice)
   }
 
   /** 本地合成串行化：同时只允许 1 路在合（多设备/多段排队，绝不 12 路并上 CPU）。 */
@@ -964,7 +1186,7 @@ export class TihuTts {
     return run
   }
 
-  /** 调用常驻 Kokoro sidecar（内部 WS：JSON 请求 + 二进制 PCM）。 */
+  /** 调用按需拉起的 Kokoro sidecar（内部 WS：JSON 请求 + 二进制 PCM）。 */
   private async synthesizeKokoro(
     text: string,
     options: {
@@ -974,7 +1196,8 @@ export class TihuTts {
       signal?: AbortSignal
     },
   ): Promise<SynthResult> {
-    await this.ensureServer()
+    // 只有走到这里才会 spawn（edge 主用时不会碰它）。
+    await this.ensureKokoroServer()
     return this.serializeLocal(() => this.kokoroRequest(text, options))
   }
 
@@ -1163,12 +1386,18 @@ export class TihuTts {
     return voiceDirOf(workspace)
   }
 
-  /** 列出音色：Kokoro 模式下内置中文音色表 + 默认 + 工作区克隆音色。 */
+  /** 列出音色：默认（edge）+ Kokoro 中文音色（离线兜底/手切）+ 工作区克隆音色。 */
   async listVoices(sessionId?: string): Promise<VoiceInfo[]> {
-    const voices: VoiceInfo[] = [{ name: 'default', kind: 'default', note: this.backend() === 'kokoro' ? `默认 Kokoro ${kokoroVoiceName(kokoroSid())}` : undefined }]
-    if (this.backend() === 'kokoro') {
+    const primaryKokoro = this.engineFor() === 'kokoro'
+    const voices: VoiceInfo[] = [{
+      name: 'default',
+      kind: 'default',
+      note: primaryKokoro ? `默认 Kokoro ${kokoroVoiceName(kokoroSid())}` : '默认：edge-tts 云健(Yunjian)',
+    }]
+    // Kokoro 音色一直列出来（模型齐全时）：选中它就是**手动切到 Kokoro**，切过去的音色设置保留。
+    if (this.kokoroReady()) {
       for (const voice of KOKORO_ZH_VOICES) {
-        voices.push({ name: voice.name, kind: 'default', note: `${voice.gender === 'f' ? '中文女声' : '中文男声'} sid ${voice.sid}` })
+        voices.push({ name: voice.name, kind: 'default', note: `本地 Kokoro · ${voice.gender === 'f' ? '中文女声' : '中文男声'} sid ${voice.sid}` })
       }
     }
     const dir = this.workspaceDir(sessionId)
