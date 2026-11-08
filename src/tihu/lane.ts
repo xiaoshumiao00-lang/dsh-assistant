@@ -957,6 +957,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       name: project.name,
       status: project.status,
       summary: project.summary,
+      ...(project.enterSessionId !== undefined ? { sessionId: project.enterSessionId } : {}),
     }))
     const frame: ScreenFramePayload = {
       stage: '控制室',
@@ -2167,8 +2168,32 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         const home = homeStates.get(device.sessionId)
         if (home !== undefined && home.done && home.mode === 'session') scheduleHome(device.sessionId)
       }
-      if (payload.action === 'tap' && device.sessionId !== undefined && typeof payload.x === 'number' && typeof payload.y === 'number') {
+      if (payload.action === 'tap' && typeof payload.x === 'number' && typeof payload.y === 'number') {
         // 气泡点击：targetSessionId 必须在当前 pending 队列里（防伪造切屏）。
+        if (device.sessionId === undefined) {
+          // 未绑定设备：点项目直接进入；点右下角回主页（只发给自己）
+          if ((payload as any).hit === 'project' && typeof (payload as any).sessionId === 'string') {
+            const target = (payload as any).sessionId as string
+            await bindSession(device, target)
+            screenStates.delete(target)
+            homeStates.set(target, { mode: 'session', page: 0, done: true })
+            scheduleHome(target)
+            return
+          }
+          if (payload.x >= 240 && payload.y >= 180) await sendHome('__unbound__', device)
+          return
+        }
+        if ((payload as any).hit === 'project' && typeof (payload as any).sessionId === 'string') {
+          // 主页行点击：进入该项目最近会话（sessionId 由主页帧下发，bindSession 会再校验存在性）
+          const target = (payload as any).sessionId as string
+          if (target !== device.sessionId) {
+            await bindSession(device, target)
+            screenStates.delete(target)
+            homeStates.set(target, { mode: 'session', page: 0, done: true })
+          }
+          scheduleHome(target)
+          return
+        }
         if ((payload as any).hit === 'chip' && typeof (payload as any).targetSessionId === 'string') {
           const target = (payload as any).targetSessionId as string
           const display = device.sessionId

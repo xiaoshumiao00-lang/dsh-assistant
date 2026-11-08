@@ -45,6 +45,8 @@ export interface ProjectItem {
   status: ProjectStatus
   summary: string
   updatedAt: number
+  /** 点该项目进入的默认会话（组内最近更新的一条）。 */
+  enterSessionId?: string
 }
 
 /** 宿主 workspace 服务（workspaceRegistry.list()）的一条项目：实体字段都是 getter。 */
@@ -119,7 +121,7 @@ function projectItemOf(
     const title = humanTitle(latest?.title ?? '')
     if (title !== '未命名会话') summary = fitLine(toSpeechText(title), 240, 12)
   }
-  return { name, status, summary, updatedAt }
+  return { name, status, summary, updatedAt, enterSessionId: latestRow(group)?.sessionId }
 }
 
 function latestRow(group: readonly ProjectSessionRow[]): ProjectSessionRow | undefined {
