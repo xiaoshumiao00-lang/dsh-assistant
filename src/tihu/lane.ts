@@ -581,11 +581,23 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /**
+   * 主页帧的「最近回答」必须在每条重发路径上都在（钉住补发 / 气泡刷新 / 运行清单重发）：
+   * 存底帧没带 recent 时按现成回复补一条（2026-11-08 实机：主页帧被陈旧底帧重发时就少了这一行）。
+   */
+  function homeFrameWithRecent(frame: ScreenFramePayload, sessionId: string): ScreenFramePayload {
+    if (frame.home === undefined || frame.home.recent !== undefined) return frame
+    const owner = recentReplyOwnerOf(sessionId)
+    if (owner === undefined) return frame
+    return { ...frame, home: { ...frame.home, recent: { sessionId: owner.sessionId, title: humanTitle(titleForSession(owner.sessionId)), at: owner.at } } }
+  }
+
+  /**
    * 帧附加信息（一处注入，所有发送路径都生效）：
    *   - 回复屏：底部三个按钮（停止 / 重读 / 主页）；
    *   - 状态屏：底部列出**其他**正在运行的会话，点了切过去（用户 2026-11-08 要求）；
-   *   - 主页屏：都不加（主页就是项目清单）。
+   *   - 主页屏：不加按钮/运行清单，但「最近回答」这一行要由 homeFrameWithRecent 保证在。
    */
+
   function withFrameExtras(frame: ScreenFramePayload, sessionId: string | undefined): ScreenFramePayload {
     if (sessionId === undefined) return frame
     if (frame.mode === 'reply') {
@@ -595,7 +607,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       void running
       return { ...rest, actions: replyActionsFor(sessionId) }
     }
-    if (frame.mode === 'home') return frame
+    if (frame.mode === 'home') return homeFrameWithRecent(frame, sessionId)
     // 只列 Computer Use 模式的会话（用户 2026-11-08 要求）：模式以列表缓存里的 preset 为准，
     // 查不到定级的一律不列（宁可少列，也不把普通会话混进来）。
     const others = [...runningSessions.keys()]
@@ -1264,6 +1276,63 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return items
   }
 
+  /** 该会话回答历史里的最新一条（与 lastReplies 互为兜底）。 */
+  function latestReplyEntry(sessionId: string): ReplyHistoryEntry | undefined {
+    const list = replyHistory.get(sessionId)
+    if (list === undefined || list.length === 0) return undefined
+    return list[list.length - 1]
+  }
+
+  /** 这条会话是不是真的存着回复（lastReplies 或回答历史任一到）。 */
+  function hasStoredReply(sessionId: string): boolean {
+    return lastReplies.get(sessionId) !== undefined || latestReplyEntry(sessionId) !== undefined
+  }
+
+  /** 朗读/重读要用的那条回复：lastReplies 优先，退回该会话回答历史最新一条。 */
+  function replyPayloadOf(sessionId: string): { sentences: ReplySentence[]; speechSegments: SpeechSegment[]; includeAll: boolean } | undefined {
+    const reply = lastReplies.get(sessionId)
+    if (reply !== undefined) return reply
+    const entry = latestReplyEntry(sessionId)
+    if (entry === undefined) return undefined
+    return { sentences: entry.sentences, speechSegments: entry.speechSegments, includeAll: entry.includeAll }
+  }
+
+  /**
+   * 首页「最近回答」该指到哪条会话（2026-11-08 实机缺陷）。
+   *
+   * 以前只查「绑到这台设备的会话」的 lastReplies：实机上设备常被自动跟随 / 项目卡 / 气泡切屏换到
+   * 另一条会话（那边可能一条回复都还没有），或那条回答只有 replyHistory（符号回复没有可念的语音），
+   * 于是朗读中点主页就没有这一行。三级兜底：
+   *   1. 绑定会话的 lastReplies；
+   *   2. 该会话 replyHistory 最后一条；
+   *   3. 整条 lane 里最近一条有回复的会话（按 lastAssistant / replyHistory 时间排）。
+   */
+  function recentReplyOwnerOf(sessionId: string, device?: TihuDevice): { sessionId: string; at: number } | undefined {
+    const candidates: string[] = []
+    const bound = device?.sessionId
+    if (bound !== undefined && bound !== '') candidates.push(bound)
+    if (sessionId !== '' && !candidates.includes(sessionId)) candidates.push(sessionId)
+    for (const candidate of candidates) {
+      if (lastReplies.get(candidate) !== undefined) {
+        return { sessionId: candidate, at: lastAssistant.get(candidate)?.at ?? Date.now() }
+      }
+      const entry = latestReplyEntry(candidate)
+      if (entry !== undefined) return { sessionId: candidate, at: entry.at }
+    }
+    let best: { sessionId: string; at: number } | undefined
+    for (const [candidate, list] of replyHistory) {
+      const entry = list[list.length - 1]
+      if (entry === undefined) continue
+      if (best === undefined || entry.at > best.at) best = { sessionId: candidate, at: entry.at }
+    }
+    for (const [candidate, reply] of lastAssistant) {
+      if (!hasStoredReply(candidate)) continue
+      const at = Number.isFinite(reply.at) ? reply.at : 0
+      if (best === undefined || at > best.at) best = { sessionId: candidate, at }
+    }
+    return best
+  }
+
   /** 主页屏：项目清单优先取宿主 workspace 注册表，取不到才用会话快照按 cwd 分组兜底。 */
   async function sendHome(sessionId: string, device?: TihuDevice): Promise<void> {
     // 已经回主页：浏览状态结束（下次进回复屏重新算）。
@@ -1303,12 +1372,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       summary: project.summary,
       ...(project.enterSessionId !== undefined ? { sessionId: project.enterSessionId } : {}),
     }))
-    // 首页顶部「最近回答 · 会话名」：只有**当前绑定的这个会话**真的存了回复才下发。
-    const replyOwner = device?.sessionId ?? sessionId
-    const recentReply = lastReplies.get(replyOwner)
-    const recent = recentReply === undefined
+    // 首页顶部「最近回答 · 会话名」：绑定会话查不到就按三级兜底找（recentReplyOwnerOf）。
+    const boundOwner = device?.sessionId ?? sessionId
+    const owner = recentReplyOwnerOf(sessionId, device)
+    const recent = owner === undefined
       ? undefined
-      : { sessionId: replyOwner, title: humanTitle(titleForSession(replyOwner)), at: lastAssistant.get(replyOwner)?.at }
+      : { sessionId: owner.sessionId, title: humanTitle(titleForSession(owner.sessionId)), at: owner.at }
+    log(`tihu home recent session=${sessionId} owner=${owner?.sessionId ?? '-'} hasLastReply=${String(lastReplies.get(boundOwner) !== undefined)} history=${String(replyHistory.get(boundOwner)?.length ?? 0)}`)
     const frame: ScreenFramePayload = {
       stage: '控制室',
       title: '',
@@ -1329,7 +1399,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       pinnedHomeFrames.set(sessionId, frame)
       pinnedPendingSig.set(sessionId, pendingSigOf(sessionId))
     }
-    if (device !== undefined) device.send('screen.frame', frame)
+    // 这一帧也要当「设备最后看到的那屏」：气泡刷新与运行清单重发都以它为基准，
+    // 否则陈旧的状态/回复帧会在重发时把主页（含最近回答）替换掉（2026-11-08 实机）。
+    lastFrames.set(sessionId, frame)
+    if (device !== undefined) device.send('screen.frame', withFrameExtras(frame, sessionId))
     else screen(sessionId, frame)
   }
 
@@ -1367,12 +1440,18 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       pendingByDisplay.set(display, list)
       // 立即推一帧带气泡的屏帧；不触碰音频/朗读。
       const state = screenStates.get(display)
-      if (state !== undefined) {
+      const last = lastFrames.get(display)
+      // 屏正停在主页（钉住或已回主页）：气泡只能刷在主页帧上，既不能把用户拽回旧回复屏，
+      // 也不能把主页换成陈旧状态帧（2026-11-08 实机：那样 home.recent 就跟着没了）。
+      const showsHome = homePinned.has(display) || last?.mode === 'home' || homeStates.get(display)?.mode === 'home'
+      if (!showsHome && state !== undefined) {
         sendReply(display, state.sentences, state.currentIndex, state.charPos, true)
-      } else {
-        // 思考/进度屏（不是 reply 模式）：把最后一帧原样重发一次，让气泡立刻出现。
-        const last = lastFrames.get(display)
-        if (last !== undefined) screen(display, last)
+      } else if (last !== undefined) {
+        // 基准帧自带的气泡不能留：重发前按当前待读清单重挂（screen 自己会补 pending/pendingCount）。
+        const { pending: _dropPending, pendingCount: _dropPendingCount, ...rest } = last
+        screen(display, rest)
+      } else if (state !== undefined) {
+        sendReply(display, state.sentences, state.currentIndex, state.charPos, true)
       }
     }
   }
@@ -1408,7 +1487,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /** 钉住期间代替会话帧发出去的主页帧：只换气泡轨，屏不离开主页。 */
   function pinnedHomeFrameOf(sessionId: string): ScreenFramePayload | undefined {
+    const last = lastFrames.get(sessionId)
     const base = pinnedHomeFrames.get(sessionId)
+      ?? (last !== undefined && last.mode === 'home' ? (last as ScreenFramePayload) : undefined)
     if (base === undefined) return undefined
     const pend = pendingByDisplay.get(sessionId) ?? []
     return {
@@ -1429,7 +1510,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     else list.push(entry)
     if (list.length > REPLY_HISTORY_LIMIT) list.splice(0, list.length - REPLY_HISTORY_LIMIT)
     replyHistory.set(sessionId, list)
-    lastReplies.set(sessionId, { sentences, speechSegments, includeAll })
+    // 只有确实有可念的语音时才记朗读载荷；符号/空白回复没有语音，但回答历史照记（主页「最近
+    // 回答」与上一条/下一条都要认它，重读时只换屏不出声）。
+    if (speechSegments.length > 0) lastReplies.set(sessionId, { sentences, speechSegments, includeAll })
     lastAssistant.set(sessionId, { text, at: entry.at })
     replyBrowseIndex.set(sessionId, list.length - 1)
   }
@@ -2365,6 +2448,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           .filter((segment) => segment.text !== '')
         const includeAll = [...text].length <= 2000
         if (speechSegments.length === 0) {
+          pushReplyHistory(sessionId, text, sentences, [], includeAll)
           sendReply(sessionId, sentences, 0, 0, includeAll)
           broadcast(sessionId, 'event.alert', {
             level: 'error',
@@ -2708,7 +2792,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             // 重读念「屏上正在看的那条」：翻过历史就念那一条，不跳回最新（用户 2026-11-08 要求）。
             const list = replyHistory.get(sid) ?? []
             const index = browseIndexOf(sid)
-            const reply = index >= 0 ? list[index] : lastReplies.get(sid)
+            const reply = index >= 0 ? list[index] : replyPayloadOf(sid)
             if (reply !== undefined) {
               if (index < 0) browseLatest(sid)
               else browsingHistory.delete(sid)
@@ -2742,7 +2826,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           if (target === (device.sessionId ?? '')) return
           await bindSession(device, target)
           unpinHome(target)
-          const reply = lastReplies.get(target)
+          const reply = replyPayloadOf(target)
           if (reply !== undefined) {
             browseLatest(target)
             screenStates.delete(target)
@@ -2811,7 +2895,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           if (index >= 0) {
             list.splice(index, 1)
             pendingByDisplay.set(display, list)
-            const reply = lastReplies.get(target)
+            const reply = replyPayloadOf(target)
             await bindSession(device, target)
             unpinHome(target)
             browseLatest(target)
