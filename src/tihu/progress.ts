@@ -315,6 +315,8 @@ export function activityEntryOf(name: string, args: unknown): TihuActivityEntry 
 
 /** 明细最多留几条（屏上只显示最后两条）。 */
 const ACTIVITY_MAX = 8
+/** 第一拍还不知道模型想了什么，先用这个占位，免得第一步屏幕上是空的（用户 2026-11-08 反馈）。 */
+const THINKING_PLACEHOLDER = '模型推理中…'
 
 function pushActivity(state: TihuProgressState, label: string, detail: string): void {
   const entry: TihuActivityEntry = { label, detail: sanitizeDetail(detail) }
@@ -438,6 +440,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.lastResult = undefined
     state.lastOutput = ''
     state.activity = []
+    pushActivity(state, '思考', THINKING_PLACEHOLDER)
     state.stage = '思考'
     state.title = '开始新一轮'
     state.stageWord = '思考'
@@ -451,6 +454,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
 
   if (type === 'step/start') {
     state.step = Number.isFinite(data.step) ? Number(data.step) : state.step + 1
+    if (state.activity.length === 0) pushActivity(state, '思考', THINKING_PLACEHOLDER)
     state.stage = '思考'
     state.title = '思考下一步'
     state.stageWord = '思考'
@@ -501,7 +505,15 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
 
   if (type === 'assistant/message') {
     const thought = reasoningText(data)
-    if (thought !== '') pushActivity(state, '思考', firstSentence(thought))
+    if (thought !== '') {
+      const detail = sanitizeDetail(firstSentence(thought))
+      const last = state.activity[state.activity.length - 1]
+      if (last !== undefined && last.label === '思考' && last.detail === THINKING_PLACEHOLDER) {
+        state.activity[state.activity.length - 1] = { label: '思考', detail }
+      } else {
+        pushActivity(state, '思考', firstSentence(thought))
+      }
+    }
     const text = messageText(data.message)
     if (text === '') return {}
     const lines = text.split(/\r?\n/).map((line) => sanitizeScreenLine(line)).filter(Boolean)

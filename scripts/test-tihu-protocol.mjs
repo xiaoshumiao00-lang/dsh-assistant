@@ -2129,9 +2129,10 @@ test('进度状态机：步骤递增、失败 tone=alert、完成帧保留、正
   // 新版四行格式：第一行会话标题、第二行「阶段词：第一句」、第三行步骤用时、第四行统计
   assert.equal(call1.screen.stage, '')
   assert.equal(call1.screen.title, '读取 a.ts')
-  assert.equal(call1.screen.bullets[0], '读文件 · a.ts', '第二行是明细条目：' + call1.screen.bullets[0])
-  assert.ok(call1.screen.bullets[1].includes('第 1 步'), '第三行带步骤号：' + call1.screen.bullets[1])
-  assert.equal(call1.screen.bullets[2], '统计中…')
+  assert.ok(call1.screen.bullets[0].startsWith('思考'), 'turn/start 之后第一拍就要有思考占位：' + call1.screen.bullets[0])
+  assert.equal(call1.screen.bullets[1], '读文件 · a.ts', '第二行是明细条目：' + call1.screen.bullets[1])
+  assert.ok(call1.screen.bullets[2].includes('步') && call1.screen.bullets[2].includes('统计中'), '第三行是步数用时与统计合并：' + call1.screen.bullets[2])
+  assert.equal(call1.screen.bullets.length, 3, '两条明细 + 合并统计行，不再留空行')
   push({ type: 'tool/result', data: { turn: 7, step: 1, message: { content: [{ type: 'text', text: 'const a = 1\n第二个文件结尾' }], isError: false } } }, 4000)
   assert.equal(state.tone, 'ok')
   assert.ok(state.lastResult.line.startsWith('✓'))
@@ -2194,9 +2195,9 @@ test('进度屏：步骤开始时不再把上一轮内容顶到「思考」下�
   applySessionEvent(state, { type: 'turn/start', data: { turn: 2 } }, 1000)
   applySessionEvent(state, { type: 'step/start', data: { turn: 2, step: 1 } }, 1000)
   const edit = applySessionEvent(state, { type: 'tool/call', data: { turn: 2, step: 1, name: 'edit', arguments: { file_path: 'D:/dsh-assistant/src/tihu/lane.ts' } } }, 2000)
-  assert.equal(edit.screen.bullets[0], '改文件 · lane.ts')
+  assert.equal(edit.screen.bullets[1], '改文件 · lane.ts')
   const next = applySessionEvent(state, { type: 'step/start', data: { turn: 2, step: 2 } }, 3000)
-  assert.equal(next.screen.bullets[0], '改文件 · lane.ts', '步骤开始不该改写上一条明细：' + next.screen.bullets[0])
+  assert.equal(next.screen.bullets[1], '改文件 · lane.ts', '步骤开始不该改写上一条明细：' + next.screen.bullets[1])
   assert.ok(!next.screen.bullets.some((line) => line.startsWith('思考：')), '不应出现「思考：<上一轮内容>」：' + next.screen.bullets.join(' / '))
 })
 
@@ -2204,8 +2205,9 @@ test('进度屏：明细条目格式「标签 · 明细」，跑命令取真正�
   const state = createProgressState(1000)
   applySessionEvent(state, { type: 'turn/start', data: { turn: 3 } }, 1000)
   const call = applySessionEvent(state, { type: 'tool/call', data: { turn: 3, step: 1, name: 'pwsh', arguments: { command: 'Set-Location "D:\\dsh-assistant"; node scripts/test-tihu-protocol.mjs 2>&1 | Select-Object -Last 3' } } }, 2000)
-  assert.ok(call.screen.bullets[0].startsWith('运行命令 · node scripts/test-tihu-prot'), '明细：' + call.screen.bullets[0])
-  assert.ok(measureTextPx(call.screen.bullets[0], SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX)
+  assert.ok(call.screen.bullets[0].startsWith('思考'), '第一行是思考占位：' + call.screen.bullets[0])
+  assert.ok(call.screen.bullets[1].startsWith('运行命令 · node scripts/test-tihu-prot'), '明细：' + call.screen.bullets[1])
+  assert.ok(measureTextPx(call.screen.bullets[1], SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX)
   const glob = applySessionEvent(state, { type: 'tool/call', data: { turn: 3, step: 1, name: 'glob', arguments: { pattern: '**/*tihu*' } } }, 3000)
   assert.equal(glob.screen.bullets[1], '查找文件 · **/*tihu*', '第二条明细：' + glob.screen.bullets[1])
   const grep = applySessionEvent(state, { type: 'tool/call', data: { turn: 3, step: 1, name: 'grep', arguments: { pattern: 'TIHU_SYNTH_MAX_INFLIGHT' } } }, 4000, { stats: { tokPerSec: 137, totalTokens: 586600, contextPercent: 26 } })
@@ -2253,7 +2255,7 @@ test('进度屏：命令类明细优先 arguments.description（DSH 工具卡同
     type: 'tool/call',
     data: { turn: 1, step: 1, name: 'pwsh', arguments: { description: 'Search asar for workspace service', command: '$files = Get-ChildItem D:\\dsh-assistant' } },
   }, 2000)
-  assert.ok(frame.screen.bullets[0].startsWith('运行命令 · Search asar'), `屏帧明细：${frame.screen.bullets[0]}`)
+  assert.ok(frame.screen.bullets[1].startsWith('运行命令 · Search asar'), `屏帧明细：${frame.screen.bullets[1]}`)
 
   // 其它工具规则不动：读/写/改仍是文件名，pwsh 之外不受 description 影响
   assert.equal(activityEntryOf('read', { file_path: 'src/tihu/lane.ts', description: 'Read lane source' }).detail, 'lane.ts')
@@ -3256,6 +3258,22 @@ await testAsync('lane：已绑定设备点别的项目行会换绑，点右下�
   const homes = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home')
   assert.ok(homes.length > 0, '右下角 tap 仍应回主页')
   runtime.dispose()
+})
+
+
+test('进度屏：第一步就有「思考」占位，真实 thinking 到了原地替换不留两条', () => {
+  const state = createProgressState(1000)
+  const start = applySessionEvent(state, { type: 'turn/start', data: { turn: 9 } }, 1000)
+  assert.ok(start.screen.bullets[0].startsWith('思考'), 'turn/start 首帧就要显示思考：' + start.screen.bullets[0])
+  const step = applySessionEvent(state, { type: 'step/start', data: { turn: 9, step: 1 } }, 1200)
+  assert.ok(step.screen.bullets[0].startsWith('思考'), 'step/start 首帧也要显示思考：' + step.screen.bullets[0])
+  const thought = applySessionEvent(state, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'thinking', thinking: '先看仓库结构，再改 lane.ts。' }, { type: 'text', text: '好。' }] } },
+  }, 2000)
+  const thinkingLines = thought.screen.bullets.filter((line) => line.startsWith('思考'))
+  assert.equal(thinkingLines.length, 1, '只留一条思考：' + thought.screen.bullets.join(' / '))
+  assert.ok(thinkingLines[0].includes('先看仓库结构'), '改成真实思考内容：' + thinkingLines[0])
 })
 
 /* ---------- 汇总 ---------- */
