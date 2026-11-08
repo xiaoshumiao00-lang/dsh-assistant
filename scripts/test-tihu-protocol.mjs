@@ -3457,6 +3457,51 @@ await testAsync('lane：首页项目清单与控制室卡片一致（隐藏/删�
   rmSync(dir, { recursive: true, force: true })
 })
 
+
+await testAsync('lane：绑定后的「已绑定」提示屏停 3 秒就回主页，不必等空闲计时', async () => {
+  process.env.TIHU_BIND_HOME_MS = '120'
+  process.env.TIHU_HOME_AFTER_MS = '60000'
+  try {
+    const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+    const { runtime } = runtimeFor(records, {}, { instance: fakeTts() })
+    const socket = openLane(runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'bind-home', protocol: '0' }, 1)))
+    await waitMs(40)
+    const homesBefore = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home').length
+    // 手动绑定（页面重连后补发 session.bind 就是这条路）：会先出「已绑定」提示屏
+    socket.emit('data', clientFrame(buildUpstream('session.bind', { sessionId: 'session-a' }, 2)))
+    await waitMs(60)
+    const afterBind = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+    assert.ok(afterBind.some((frame) => frame.payload.title.includes('已绑定')), '绑定瞬间应有「已绑定」提示屏')
+    await waitMs(260)
+    const homes = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home').length
+    assert.ok(homes > homesBefore, '绑定后应主动回主页（不能等 TIHU_HOME_AFTER_MS）：' + homesBefore + ' → ' + homes)
+    runtime.dispose()
+  } finally {
+    delete process.env.TIHU_BIND_HOME_MS
+    delete process.env.TIHU_HOME_AFTER_MS
+  }
+})
+
+await testAsync('lane：正在朗读回复时，「绑定回主页」计时不得把屏切走', async () => {
+  process.env.TIHU_BIND_HOME_MS = '120'
+  try {
+    const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+    const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+    const socket = openLane(runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'bind-reply', protocol: '0', sessionId: 'session-a' }, 1)))
+    await waitMs(40)
+    const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+    onSessionEvent({ id: 'session-a', header: { id: 'session-a' } }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '答复第一句。答复第二句。' }] } } })
+    await waitMs(260)
+    const lastFrame = framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()
+    assert.notEqual(lastFrame.payload.mode, 'home', '正在朗读回复时不能被绑定计时切回主页')
+    runtime.dispose()
+  } finally {
+    delete process.env.TIHU_BIND_HOME_MS
+  }
+})
+
 /* ---------- 汇总 ---------- */
 console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
 if (failed > 0) process.exit(1)

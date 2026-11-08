@@ -68,6 +68,18 @@ export interface TihuCardRow {
 }
 
 /**
+ * 可见卡片的签名（id + 名字 + 文件夹，顺序即卡片顺序）。
+ *
+ * 用来判断「控制室的卡片清单一不一样了」：隐藏 / 删除 / 改名 / 新增 / 拖动排序都会换签名。
+ * `cards === undefined`（状态文件读不到）返回 ''，调用方据此跳过刷新——不能拿旧清单去盖屏，
+ * 也不可能在这个时候退回 workspaceRegistry（那会把 193 条旧数据重新翻出来）。
+ */
+export function projectCardsSignature(cards: readonly TihuCardRow[] | undefined): string {
+  if (cards === undefined) return ''
+  return cards.map((card) => `${card.id}\u0001${card.name}\u0001${card.folder ?? ''}`).join('\u0002')
+}
+
+/**
  * 从跨端状态（dsh-assistant-state.json 的 projects）里取「可见卡片」。
  * 控制室的真实来源是 layouts/order/hidden/removed/folders/nameOverrides，不是 workspaceRegistry——
  * 隐藏卡在 hidden 里、删除卡在 removed 里，workspace 表里照样留着行（2026-11-08 调查结论）。
