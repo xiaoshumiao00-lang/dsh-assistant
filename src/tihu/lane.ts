@@ -422,6 +422,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     { id: 'home', label: '主页' },
   ] as const
 
+  /** 这条会话是不是 Computer Use 模式：按列表缓存里的 preset 判，查不到当不是。 */
+  function isComputerUseSession(sessionId: string): boolean {
+    const row = sessionListCache?.rows.find((item) => item.sessionId === sessionId)
+    if (row === undefined) return false
+    return isComputerUsePreset(row.preset ?? '')
+  }
+
   /** 会话标题：标题缓存 → 列表缓存 → 短 id 兜底（运行中列表要用）。 */
   function titleForSession(sessionId: string): string {
     const cached = titleCache.get(sessionId)?.title
@@ -448,7 +455,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       return { ...rest, actions: REPLY_ACTIONS.map((item) => ({ id: item.id, label: item.label })) }
     }
     if (frame.mode === 'home') return frame
-    const others = [...runningSessions.keys()].filter((id) => id !== sessionId).slice(0, 3)
+    // 只列 Computer Use 模式的会话（用户 2026-11-08 要求）：模式以列表缓存里的 preset 为准，
+    // 查不到定级的一律不列（宁可少列，也不把普通会话混进来）。
+    const others = [...runningSessions.keys()]
+      .filter((id) => id !== sessionId && isComputerUseSession(id))
+      .slice(0, 3)
     if (others.length === 0) return frame
     return { ...frame, running: others.map((id) => ({ sessionId: id, title: titleForSession(id) })) }
   }
