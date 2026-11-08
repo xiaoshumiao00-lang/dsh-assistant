@@ -3502,6 +3502,30 @@ await testAsync('lane：正在朗读回复时，「绑定回主页」计时不�
   }
 })
 
+
+await testAsync('lane：刚开的 CU 会话还没进列表缓存，也要立刻出现在运行中清单里', async () => {
+  const records = [
+    cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' }),
+  ]
+  const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'fresh-cu', protocol: '0', sessionId: 'session-a' }, 1)))
+  await waitMs(40)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const emit = (id, event) => onSessionEvent({ id, header: { id } }, event)
+  // a 自己在跑：设备不会跟上别人，屏留在 a
+  emit('session-a', { type: 'turn/start', data: { turn: 1 } })
+  await waitMs(80)
+  // 新会话不在列表缓存里，只从事件里带来 agentPreset
+  onSessionEvent({ id: 'session-new', header: { id: 'session-new', agentPreset: 'computer-use' } }, { type: 'turn/start', data: { turn: 1 } })
+  await waitMs(150)
+  const statusFrames = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && Array.isArray(frame.payload.running))
+  assert.ok(statusFrames.length > 0, '应有带 running 的状态帧')
+  const last = statusFrames[statusFrames.length - 1].payload
+  assert.ok(last.running.some((item) => item.sessionId === 'session-new'), '新开的 CU 会话要立刻进清单：' + JSON.stringify(last.running))
+  runtime.dispose()
+})
+
 /* ---------- 汇总 ---------- */
 console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
 if (failed > 0) process.exit(1)
