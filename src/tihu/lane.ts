@@ -71,6 +71,7 @@ import { replyWindow, splitReplySentences, splitSpeechSegments, type ReplySenten
 import { stripToolNoise, toSpeechText } from './speech-text.ts'
 import { CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
 import { cardsFromState, groupCardProjects, groupProjects, groupWorkspaceProjects, humanTitle, projectCardsSignature, projectNameOf, type ProjectReply, type TihuCardRow, type TihuWorkspaceRow } from './project-groups.ts'
+import { matchSessionRows, type ControlSessionRow, type DeviceStatusView, type SessionProgressView, type TihuControlDevice, type TihuControlSurface } from './control.ts'
 import type { AlertPayload, TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
 
 /** 页面与 WebSocket 的路径（代理侧按这两个前缀放行）。 */
@@ -249,6 +250,7 @@ export interface TihuRuntime {
   /** 卸掉所有监听。 */
   dispose: () => void
   /** 测试/诊断用。 */
+  /** 控制面：tihu 全局工具用（薄壳转调内部函数，契约见 control.ts）。 */
   stats: () => { devices: number; activeSessions: string[]; pendingConfirms: number }
 }
 
@@ -3126,7 +3128,207 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     ;(homeSyncTimer as any).unref?.()
   }
 
+  /* ---------- 控制面（tihu 全局工具用；全是薄壳转调，见 control.ts） ----------
+   *
+   * 单测覆盖说明：会话定位是纯函数（control.ts 的 matchSessionRows，已直接单测）；
+   * bind/openBubble/replay/goHome/browse/openRecent 逐行复刻 screen.gesture 里
+   * 手指点屏的分支，行为以 lane 端到端测试为准，薄壳本身不再重复设断言。
+   * archiveSession 转调宿主 workspaceRegistry（stopActivity=true），
+   * 「绑定中的会话拒绝删除」的守卫在 control.ts（可注入假控制面单测）。
+   */
+
+  /** 控制视图：TihuDevice → 可导出快照。 */
+  function controlDeviceOf(device: TihuDevice): TihuControlDevice {
+    return {
+      id: device.id,
+      ...(typeof device.hello?.clientId === 'string' && device.hello.clientId !== '' ? { clientId: device.hello.clientId } : {}),
+      ...(device.sessionId === undefined ? {} : { sessionId: device.sessionId }),
+      autoFollow: device.autoFollow,
+      voice: device.voice,
+      edgeVoice: device.edgeVoice,
+      offlineOnly: device.offlineOnly,
+    }
+  }
+
+  /** 按 id 或页面 clientId 找在线设备。 */
+  function findControlDevice(deviceId: string): TihuDevice | undefined {
+    return [...devices].find((device) => device.id === deviceId || device.hello?.clientId === deviceId)
+  }
+
+  function controlRowOf(row: TihuSessionRow): ControlSessionRow {
+    return { sessionId: row.sessionId, title: humanTitle(row.title), preset: row.preset, live: row.live, updatedAt: row.updatedAt }
+  }
+
+  const control: TihuControlSurface = {
+    listDevices: () => [...devices].map(controlDeviceOf),
+    deviceOfSession: (sessionId) => {
+      const device = [...devices].find((item) => item.sessionId === sessionId)
+      return device === undefined ? undefined : controlDeviceOf(device)
+    },
+    deviceStatus: (deviceId) => {
+      const device = findControlDevice(deviceId)
+      if (device === undefined) return undefined
+      const display = device.sessionId ?? '__unbound__'
+      const frame = lastFrames.get(display)
+      return {
+        device: controlDeviceOf(device),
+        display,
+        pinned: device.sessionId !== undefined && homePinned.has(device.sessionId),
+        speaking: device.sessionId !== undefined && readingBusy(device.sessionId),
+        pending: (pendingByDisplay.get(display) ?? []).map((item) => ({ sessionId: item.sessionId, title: item.title, at: item.at })),
+        ...(frame === undefined ? {} : { screen: { stage: frame.stage ?? '', title: frame.title ?? '', mode: frame.mode ?? 'status', bullets: frame.bullets ?? [] } }),
+      }
+    },
+    listSessions: async (fragment) => {
+      try {
+        const collected = await collectSessionRows()
+        return matchSessionRows(collected.rows.map(controlRowOf), fragment)
+      } catch {
+        return { kind: 'none' }
+      }
+    },
+    bind: async (deviceId, sessionId) => {
+      const device = findControlDevice(deviceId)
+      if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
+      const found = await findSession(sessionId)
+      if (found.status === 'missing') return `错误：会话 ${shortSessionId(sessionId)} 不存在（可能已归档或删除）`
+      await bindSession(device, sessionId)
+      return `已把设备 ${device.id} 绑定到「${titleForSession(sessionId)}」`
+    },
+    openBubble: async (deviceId, pick) => {
+      const device = findControlDevice(deviceId)
+      if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
+      const display = device.sessionId
+      if (display === undefined) return '错误：这台设备还没绑定会话，屏幕右侧没有可点的气泡'
+      const list = pendingByDisplay.get(display) ?? []
+      if (list.length === 0) return '屏幕右侧现在没有待读气泡'
+      let target: string | undefined
+      if (pick.index !== undefined) {
+        const item = list[Math.trunc(pick.index) - 1]
+        if (item === undefined) return `错误：气泡序号 ${pick.index} 不存在（当前有 ${list.length} 个气泡，序号从 1 开始）`
+        target = item.sessionId
+      } else {
+        const key = String(pick.title ?? '').trim().toLowerCase()
+        const hit = key === '' ? undefined : list.find((item) => item.title.toLowerCase().includes(key))
+        if (hit === undefined) return `错误：没有标题含「${pick.title}」的气泡（当前气泡：${list.map((item) => item.title).join('、')}）`
+        target = hit.sessionId
+      }
+      const at = list.findIndex((item) => item.sessionId === target)
+      if (at >= 0) {
+        list.splice(at, 1)
+        pendingByDisplay.set(display, list)
+      }
+      const reply = replyPayloadOf(target)
+      await bindSession(device, target)
+      unpinHome(target)
+      browseLatest(target)
+      screenStates.delete(target)
+      homeStates.set(target, { mode: 'session', page: 0, done: true })
+      if (reply !== undefined) {
+        sendReply(target, reply.sentences, 0, 0, reply.includeAll)
+        void speakLocally(device, target, reply.sentences, reply.speechSegments, reply.includeAll).catch((error) => log(`tihu control bubble speak failed: ${(error as Error)?.message ?? String(error)}`))
+      }
+      return `已点开气泡：「${titleForSession(target)}」`
+    },
+    progress: async (sessionId) => {
+      const found = await findSession(sessionId)
+      const title = found.row?.title !== undefined && found.row.title !== '' ? humanTitle(found.row.title) : titleForSession(sessionId)
+      const state = progressStates.get(sessionId)
+      return {
+        sessionId,
+        title,
+        running: runningSessions.has(sessionId),
+        speaking: readingBusy(sessionId),
+        ...(state === undefined ? {} : { state: { turn: state.turn, step: state.step, stage: state.stage, stageWord: state.stageWord, title: state.title, turnStartedAt: state.turnStartedAt, activity: state.activity.slice(-6), ...(state.lastResult === undefined ? {} : { lastResult: state.lastResult }), ...(state.stats === undefined ? {} : { stats: state.stats }) } }),
+        stats: screenMetaOf(sessionId).stats,
+      }
+    },
+    archiveSession: async (sessionId) => {
+      const registry = optionalService(ctx, 'workspaceRegistry')
+      if (registry === undefined || typeof registry.archiveSession !== 'function') return '错误：宿主没有 workspaceRegistry 服务，无法归档会话'
+      const found = await findSession(sessionId)
+      if (found.status === 'missing') return `错误：会话 ${shortSessionId(sessionId)} 不存在（可能已归档或删除）`
+      try {
+        await registry.archiveSession(sessionId, { stopActivity: true })
+      } catch (error) {
+        return `错误：归档失败（${(error as Error)?.message ?? String(error)}）`
+      }
+      // 列表缓存作废：下次 listSessions/bind 自然看到归档后的世界。
+      sessionListCache = undefined
+      return `已删除（归档）会话「${found.row?.title !== undefined && found.row.title !== '' ? humanTitle(found.row.title) : shortSessionId(sessionId)}」`
+    },
+    stopSpeaking: async (deviceId) => {
+      const device = findControlDevice(deviceId)
+      if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
+      try { device.cancelRound?.() } catch { /* 忽略 */ }
+      return '已停止朗读（点重读可再来一遍）'
+    },
+    replay: async (deviceId) => {
+      const device = findControlDevice(deviceId)
+      if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
+      const sid = device.sessionId
+      if (sid === undefined) return '错误：这台设备还没绑定会话，没有可重读的回答'
+      const list = replyHistory.get(sid) ?? []
+      const index = browseIndexOf(sid)
+      const reply = index >= 0 ? list[index] : replyPayloadOf(sid)
+      if (reply === undefined) return '错误：这条会话还没有可重读的回答'
+      if (index < 0) browseLatest(sid)
+      else browsingHistory.delete(sid)
+      screenStates.delete(sid)
+      sendReply(sid, reply.sentences, 0, 0, reply.includeAll)
+      void speakLocally(device, sid, reply.sentences, reply.speechSegments, reply.includeAll).catch((error) => log(`tihu control replay failed: ${(error as Error)?.message ?? String(error)}`))
+      return '正在重读当前回答'
+    },
+    goHome: async (deviceId) => {
+      const device = findControlDevice(deviceId)
+      if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
+      const sid = device.sessionId
+      if (sid !== undefined) {
+        try { device.cancelRound?.() } catch { /* 忽略 */ }
+        pinHome(sid)
+      }
+      await sendHome(sid ?? '__unbound__', device)
+      return '已回主页并钉住'
+    },
+    browse: async (deviceId, direction) => {
+      const device = findControlDevice(deviceId)
+      if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
+      const sid = device.sessionId
+      if (sid === undefined) return '错误：这台设备还没绑定会话，没有可翻的回答历史'
+      const before = browseIndexOf(sid)
+      browseReplyHistory(device, sid, direction === 'prev' ? -1 : 1)
+      const list = replyHistory.get(sid) ?? []
+      const after = browseIndexOf(sid)
+      if (after === before) return `已经${direction === 'prev' ? '是最早一条' : '是最新一条'}回答了（这条会话共 ${list.length} 条历史）`
+      return `已翻到第 ${after + 1}/${list.length} 条回答`
+    },
+    openRecent: async (deviceId) => {
+      const device = findControlDevice(deviceId)
+      if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
+      const owner = recentReplyOwnerOf(device.sessionId ?? '__unbound__', device)
+      if (owner === undefined) return '错误：现在没有任何会话有「最近回答」'
+      const target = owner.sessionId
+      const list = replyHistory.get(target) ?? []
+      const index = list.length - 1
+      if (index < 0) return '错误：现在没有任何会话有「最近回答」'
+      if (device.sessionId !== target) await bindSession(device, target)
+      unpinHome(target)
+      browseLatest(target)
+      browsingHistory.add(target)
+      screenStates.delete(target)
+      for (const item of devices) if (item.sessionId === target) followByDevice.set(item.id, true)
+      cancelHomeTimer(target)
+      const home = homeStates.get(target) ?? { mode: 'session' as const, page: 0, done: false }
+      home.mode = 'session'
+      home.done = false
+      homeStates.set(target, home)
+      sendReply(target, list[index].sentences, 0, 0, list[index].includeAll)
+      return `已打开「${titleForSession(target)}」的最近回答（要朗读点「重读」）`
+    },
+  }
+
   return {
+    control,
     page: () => tihuPageHtml({ lanePath: TIHU_LANE_PATH, protocol: TIHU_PROTOCOL_VERSION }),
     handleUpgrade,
     dispose: () => {
