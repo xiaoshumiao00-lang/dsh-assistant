@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>鹈鹕 · 320×240 交付效果图（可截图源）</title>
+<style>
+  /* ─────────────────────────────────────────────────────────────
+     设计 token 全部取自 src/tihu/page.ts / screen-spec.ts
+     （见 design-tokens.md；此处只做 1:1 复刻 + 少量上屏化组合）
+     ───────────────────────────────────────────────────────────── */
+  :root {
+    --bg: #0b0f14; --panel: #121821; --line: #1f2a37;
+    --fg: #e6edf3; --dim: #8b98a5; --accent: #3fb6a8;
+    --warn: #e2b03f; --err: #e05f5f;
+    --screen-bg: #05080b;
+    --body: #c3ccd5; --reply: #d9e2ea; --sub: #8b97a5; --rail-sub: #9fb0bf;
+    --dot-run: #35d07f; --dot-done: #4f8ef7; --dot-idle: #6b7785;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; background: var(--screen-bg); }
+  body {
+    font: 14px/1.45 "Microsoft YaHei", "Microsoft YaHei UI", "Noto Sans SC", "Segoe UI", sans-serif;
+    color: var(--fg);
+    overflow: hidden;
+  }
+  body.board { background: var(--bg); overflow: auto; padding: 28px 28px 36px; }
+  body.board .screen { margin: 0 0 22px; box-shadow: 0 10px 26px rgba(0,0,0,.45); }
+  body.board .board-title { font-size: 18px; font-weight: 700; margin: 0 0 4px; }
+  body.board .board-sub { font-size: 12px; color: var(--dim); margin: 0 0 20px; }
+
+  /* 屏本体：320×240，四边 8px 内边距，flex 列、gap 4 */
+  .screen {
+    position: relative;
+    width: 320px; height: 240px;
+    padding: 8px;
+    display: flex; flex-direction: column; gap: 4px;
+    background: var(--screen-bg);
+    color: var(--fg);
+    border: 1px solid #000;
+    overflow: hidden;
+  }
+
+  /* 状态栏 / 标题 / 正文（字号与行高照 page.ts） */
+  .stage { font-size: 12px; line-height: 14px; letter-spacing: 1px; color: var(--accent);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: none; }
+  .title { font-size: 18px; font-weight: 700; line-height: 22px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: none; }
+  ul.bullets { margin: 0; padding: 0; list-style: none;
+    font-size: 16px; line-height: 20px; color: var(--body); }
+  ul.bullets li { white-space: normal; overflow-wrap: anywhere; }
+
+  /* 主页 */
+  .home-body { flex: 1; overflow: hidden; }
+  .home-item { height: 36px; padding: 1px 0; overflow: hidden; }
+  .home-row1 { display: flex; align-items: center; gap: 6px;
+    font-size: 16px; font-weight: 700; line-height: 20px; white-space: nowrap; }
+  .home-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--dot-idle); }
+  .home-dot.running { background: var(--dot-run); }
+  .home-dot.done { background: var(--dot-done); }
+  .home-dot.idle { background: var(--dot-idle); }
+  .home-row1 .name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .home-row2 { font-size: 12px; line-height: 14px; color: var(--sub);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* 朗读回复 */
+  .reply-body { flex: 1; overflow: hidden; font-size: 16px; line-height: 20px; color: var(--reply); }
+  .reply-line { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .reply-line.cur { background: var(--accent); color: #04110f; border-radius: 3px; }
+
+  /* 待处理气泡轨：右侧 64px，主内容压到 240px */
+  .pending-rail { position: absolute; right: 0; top: 8px; bottom: 8px; width: 64px; padding: 4px;
+    display: flex; flex-direction: column; gap: 4px; z-index: 3; }
+  .pending-chip { width: 56px; height: 34px; padding: 2px 3px; border-radius: 5px;
+    background: rgba(20,28,40,.82); border: 1px solid rgba(120,180,255,.55); overflow: hidden; flex: none; }
+  .pending-name { font-size: 11px; line-height: 15px; font-weight: 700;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pending-sub { font-size: 10px; line-height: 13px; color: var(--rail-sub);
+    display: flex; align-items: center; gap: 3px; }
+  .pending-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--dot-run); flex: none; }
+  .pending-more { font-size: 10px; color: var(--rail-sub); text-align: center; }
+  .rail .title, .rail .reply-body, .rail .home-body, .rail ul.bullets { width: 240px; }
+
+  /* 底部滚动提示 / 进度条 */
+  .scroll-hint { position: absolute; right: 8px; bottom: 6px; z-index: 4;
+    font-size: 11px; line-height: 14px; color: var(--rail-sub);
+    background: rgba(5,8,11,.82); padding: 1px 4px; border-radius: 3px; }
+  .scroll-hint.above-bar { bottom: 24px; }
+  .bar { margin-top: auto; display: flex; align-items: center; gap: 6px;
+    font-size: 10px; color: var(--dim); flex: none; }
+  .track { flex: 1; height: 5px; border-radius: 3px; background: #182230; overflow: hidden; }
+  .fill { height: 100%; width: 0; background: var(--accent); }
+
+  /* tone：busy 黄 / alert 红 / ok 绿 */
+  .busy .stage { color: var(--warn); }
+  .alert .stage { color: var(--err); }
+  .ok .stage { color: var(--accent); }
+
+  .title, ul.bullets { display: block; }
+  .home-mode .title, .home-mode ul.bullets, .home-mode .reply-body, .home-mode .bar { display: none; }
+  .reply-mode .title, .reply-mode ul.bullets, .reply-mode .bar { display: none; }
+  .status-mode .reply-body, .status-mode .home-body { display: none; }
+
+  /* 音频解锁条：真实 .audio-warn（琥珀色） */
+  .audio-warn { flex: none; background: #3a2f12; border: 1px solid #b08a45; color: #ffe9c2;
+    border-radius: 8px; padding: 7px 9px; font-size: 12px; line-height: 1.45; }
+  .audio-warn b { font-weight: 700; }
+
+  /* 无语音红告警：真实 event.alert（红字）+ 面板化 */
+  .alert-strip { flex: none; background: #3a1414; border: 1px solid #b04545; color: #ffd9d9;
+    border-radius: 8px; padding: 6px 8px; font-size: 11.5px; line-height: 1.45; }
+  .alert-strip .who { color: var(--err); font-weight: 700; }
+
+  /* 危险确认弹窗：真实 #ask 卡片（边界红、确认绿） */
+  .ask-mask { position: absolute; inset: 0; z-index: 6; background: rgba(5,8,11,.76);
+    display: flex; align-items: center; justify-content: center; }
+  .ask-card { width: 282px; background: var(--panel); border: 1px solid #b04545; border-radius: 10px;
+    padding: 10px 12px; box-shadow: 0 8px 24px rgba(0,0,0,.5); }
+  .ask-card h4 { margin: 0 0 6px; font-size: 11px; letter-spacing: 1.5px; color: var(--dim); font-weight: 600; }
+  .ask-title { font-size: 18px; line-height: 22px; font-weight: 700;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ask-detail { font-size: 13px; line-height: 19px; color: #e8c5c5; word-break: break-all; margin: 6px 0 9px; }
+  .ask-row { display: flex; gap: 8px; }
+  .btn { flex: 1; font: inherit; font-size: 15px; color: var(--fg); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 9px; padding: 8px 12px; text-align: center; }
+  .btn.yes { background: #1d5f4f; border-color: #2a8f74; }
+
+  /* 按住说话（真实 #talk.rec 红色渐变） */
+  .talk { flex: none; height: 44px; display: flex; align-items: center; justify-content: center; gap: 8px;
+    background: linear-gradient(180deg,#8a2f2f,#5f2222); border: 1px solid #b04545; border-radius: 9px;
+    font-size: 16px; font-weight: 600; color: var(--fg); }
+  .talk .rec-dot { width: 9px; height: 9px; border-radius: 50%; background: #ff6b6b; }
+  .talk-hint { flex: none; text-align: center; font-size: 11px; line-height: 14px; color: var(--rail-sub); }
+
+  /* 音色卡（真实 #voiceCard 的构成） */
+  .voice-card { flex: 1; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+  .voice-card h4 { margin: 0; font-size: 11px; letter-spacing: 1.5px; color: var(--dim); font-weight: 600; }
+  .seg { display: flex; gap: 6px; }
+  .seg-item { flex: 1; text-align: center; font-size: 12px; line-height: 16px; padding: 7px 4px;
+    border: 1px solid var(--line); border-radius: 7px; background: #0d131b; color: var(--dim); }
+  .seg-item.on { border-color: var(--accent); background: #132420; color: var(--fg); font-weight: 700; }
+  .voice-row { display: flex; gap: 6px; align-items: stretch; }
+  .select { flex: 1; display: flex; align-items: center; justify-content: space-between;
+    font-size: 14px; padding: 8px 10px; background: #0d131b; border: 1px solid var(--line);
+    border-radius: 9px; color: var(--fg); }
+  .select .chev { color: var(--dim); font-size: 11px; }
+  .test-btn { font-size: 13px; padding: 8px 14px; border: 1px solid var(--accent); border-radius: 9px;
+    background: #132420; color: var(--fg); font-weight: 700; }
+  .receipt { font-size: 12px; line-height: 16px; color: var(--accent); }
+  .sample { font-size: 12px; line-height: 17px; color: var(--body); }
+  .hint { font-size: 10px; line-height: 14px; color: var(--dim); }
+
+  /* 事件条（真实 #events 的字号/配色） */
+  .events { flex: none; font-size: 11px; line-height: 15px; color: #a9b6c3;
+    border-top: 1px dashed #182230; padding-top: 3px; }
+  .events .alert { color: var(--err); }
+  .events .done { color: var(--accent); }
+
+  /* 手机远程：同一屏加外框 */
+  .phone-wrap { width: 320px; height: 240px; padding: 8px 0 0; background: var(--bg);
+    display: flex; flex-direction: column; align-items: center; }
+  .phone { width: 272px; height: 208px; padding: 8px; border-radius: 20px;
+    background: linear-gradient(180deg,#2a3440,#151c24);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.08), 0 8px 20px rgba(0,0,0,.5); position: relative; }
+  .phone::before { content: ""; position: absolute; top: 4px; left: 50%; transform: translateX(-50%);
+    width: 42px; height: 4px; border-radius: 3px; background: #0a0e13; }
+  .phone-screen { width: 256px; height: 192px; overflow: hidden; border-radius: 3px; background: #05080b; }
+  .phone-screen .screen { transform: scale(.8); transform-origin: top left; border: 0; }
+  .phone-cap { margin-top: 5px; font-size: 11px; line-height: 14px; color: var(--dim); letter-spacing: .3px; }
+</style>
+</head>
+<body>
+<!-- 全部 14 屏；?n=01 只留一屏，供 Chrome 无头截图 -->
+<main id="board">
+
+<!-- 01 控制室主页 · 第 1 页 -->
+<section class="screen home-mode" id="s01">
+  <div class="stage">项目 6 个 · 1/2</div>
+  <div class="home-body">
+    <div class="home-item">
+      <div class="home-row1"><span class="home-dot running"></span><span class="name">dsh-assistant</span></div>
+      <div class="home-row2">朗读预取改成 4 段并发</div>
+    </div>
+    <div class="home-item">
+      <div class="home-row1"><span class="home-dot done"></span><span class="name">磷石膏SCI</span></div>
+      <div class="home-row2">第 3 章抗压数据已核对</div>
+    </div>
+    <div class="home-item">
+      <div class="home-row1"><span class="home-dot idle"></span><span class="name">青年基金申请书</span></div>
+      <div class="home-row2">立项依据已按意见重写</div>
+    </div>
+    <div class="home-item">
+      <div class="home-row1"><span class="home-dot idle"></span><span class="name">STRATA</span></div>
+      <div class="home-row2">显存预留调到 1664 MiB</div>
+    </div>
+    <div class="home-item">
+      <div class="home-row1"><span class="home-dot idle"></span><span class="name">控制室</span></div>
+      <div class="home-row2">项目按 cwd 聚合翻页</div>
+    </div>
+  </div>
+  <div class="scroll-hint">已绑定：dsh-assistant</div>
+</section>
+
+<!-- 02 控制室主页 · 第 2 页 -->
+<section class="screen home-mode" id="s02">
+  <div class="stage">项目 6 个 · 2/2</div>
+  <div class="home-body">
+    <div class="home-item">
+      <div class="home-row1"><span class="home-dot idle"></span><span class="name">其他</span></div>
+      <div class="home-row2">等待新消息</div>
+    </div>
+  </div>
+  <div class="scroll-hint">已绑定：dsh-assistant</div>
+</section>
+
+<!-- 03 会话进行中 -->
+<section class="screen status-mode busy" id="s03">
+  <div class="stage">跑命令</div>
+  <div class="title">执行 npm run build</div>
+  <ul class="bullets">
+    <li>第 7 步 · 已用 1m23s</li>
+    <li>✓ 已生成 42 个模块</li>
+    <li>dist/mockups 已就绪</li>
+  </ul>
+  <div class="bar"><span>7/9</span><div class="track"><div class="fill" style="width:78%"></div></div></div>
+</section>
+
+<!-- 04 朗读回复 -->
+<section class="screen reply-mode ok" id="s04">
+  <div class="stage">回答中 · 3/9</div>
+  <div class="reply-body">
+    <div class="reply-line">朗读预取已经改成四段并发了，</div>
+    <div class="reply-line">单段抖动不会再抽干队列。</div>
+    <div class="reply-line">首块音频到达就开始播放，</div>
+    <div class="reply-line">不必等整段合成完。</div>
+    <div class="reply-line cur">高亮跟着播放时间轴推进，</div>
+    <div class="reply-line cur">文字不会跑到语音前面。</div>
+    <div class="reply-line">长回复按句序号显示进度，</div>
+    <div class="reply-line">上下滑动就能回看历史。</div>
+    <div class="reply-line">预取提前量默认十二秒，</div>
+    <div class="reply-line">并发上限四段。</div>
+  </div>
+  <div class="scroll-hint">↓ 下方还有 7 行</div>
+</section>
+
+<!-- 05 朗读长文 · 回看历史 -->
+<section class="screen reply-mode ok" id="s05">
+  <div class="stage">回答中 · 7/19</div>
+  <div class="reply-body">
+    <div class="reply-line cur">音频先按句切段，再交给合成队列。</div>
+    <div class="reply-line cur">最多四段同时合成，提前量十二秒。</div>
+    <div class="reply-line">首块一到就起播，不等整段合成完。</div>
+    <div class="reply-line">高亮跟着播放时间轴推进。</div>
+    <div class="reply-line">某一段合成失败会自动重试，</div>
+    <div class="reply-line">仍失败就跳过这一句继续念。</div>
+    <div class="reply-line">同时发一条红告警，不会静默停住。</div>
+    <div class="reply-line">后面的句子照常排队。</div>
+    <div class="reply-line">这样长回复也能从头读到尾，</div>
+    <div class="reply-line">不会读到一半没声音。</div>
+  </div>
+  <div class="scroll-hint">↑ 上方还有 12 行</div>
+</section>
+
+<!-- 06 待处理气泡 -->
+<section class="screen reply-mode ok rail" id="s06">
+  <div class="stage">回答中 · 3/8</div>
+  <div class="reply-body">
+    <div class="reply-line">项目列表已经按 cwd 归并，</div>
+    <div class="reply-line">一页固定放五个项目。</div>
+    <div class="reply-line">进行中是绿点，已完成蓝点，</div>
+    <div class="reply-line">空闲显示灰点。</div>
+    <div class="reply-line cur">右侧两个气泡是别的会话，</div>
+    <div class="reply-line cur">点一下就能直接切过去。</div>
+    <div class="reply-line">主内容只剩 240 宽，</div>
+    <div class="reply-line">每行大约十四个汉字。</div>
+    <div class="reply-line">下面的句子还在排队，</div>
+    <div class="reply-line">读完会自动往下滚。</div>
+  </div>
+  <div class="pending-rail">
+    <div class="pending-chip">
+      <div class="pending-name">STRATA</div>
+      <div class="pending-sub"><span class="pending-dot"></span>新回复</div>
+    </div>
+    <div class="pending-chip">
+      <div class="pending-name">青年基金</div>
+      <div class="pending-sub"><span class="pending-dot"></span>新回复</div>
+    </div>
+    <div class="pending-more">+2</div>
+  </div>
+  <div class="scroll-hint">↓ 下方还有 4 行</div>
+</section>
+
+<!-- 07 语音输入中 -->
+<section class="screen status-mode busy" id="s07">
+  <div class="stage">聆听</div>
+  <div class="title">正在转写…</div>
+  <ul class="bullets"><li>本机 speech 服务</li></ul>
+  <div style="flex:1"></div>
+  <div class="talk"><span class="rec-dot"></span>按住说话</div>
+  <div class="talk-hint">松开发送 · 16 kHz 单声道</div>
+  <div class="bar"><span>—</span><div class="track"></div></div>
+</section>
+
+<!-- 08 危险操作确认 -->
+<section class="screen status-mode alert" id="s08" style="align-items:center">
+  <div class="stage" style="width:100%">等待确认</div>
+  <div class="ask-card" style="margin:auto">
+    <h4>⚠ 危险动作确认</h4>
+    <div class="ask-title">删除/移动：需要你确认</div>
+    <div class="ask-detail">reports/tihu-e2e/latest.json</div>
+    <div class="ask-row"><span class="btn yes">确认</span><span class="btn">取消</span></div>
+  </div>
+</section>
+
+<!-- 09 无声告警 + 无音频可用 -->
+<section class="screen reply-mode" id="s09">
+  <div class="audio-warn">🔇 点一下屏幕启用声音（浏览器要求先有一次点击，否则朗读只有数据没有声音）</div>
+  <div class="stage">回答中 · 3/9</div>
+  <div class="reply-body">
+    <div class="reply-line">控制室现在有六个项目，</div>
+    <div class="reply-line">其中一个是进行中。</div>
+    <div class="reply-line">朗读队列已经排好，</div>
+    <div class="reply-line">但本机没有可用的音频。</div>
+  </div>
+  <div class="alert-strip"><span class="who">错误：</span>本次无语音：在线兜底不可用且本地引擎未就绪（原因：未安装模型）</div>
+</section>
+
+<!-- 10 绑定 / 自动跟随 -->
+<section class="screen status-mode" id="s10">
+  <div class="stage">跟随</div>
+  <div class="title">已自动跟随到：鹈鹕朗读链路修复</div>
+  <ul class="bullets">
+    <li>会话：鹈鹕朗读链路修复</li>
+    <li>桌面正开着这个会话</li>
+  </ul>
+  <div class="bar"><span>—</span><div class="track"></div></div>
+  <div class="scroll-hint above-bar">已绑定：dsh-assistant</div>
+</section>
+
+<!-- 11 试听与音色 -->
+<section class="screen" id="s11">
+  <div class="voice-card">
+    <h4>音色 · 本地 TTS（Qwen3-TTS 0.6B）</h4>
+    <div class="seg"><span class="seg-item on">在线 · edge-tts 云健</span><span class="seg-item">本地 · Qwen3-TTS</span></div>
+    <div class="voice-row">
+      <span class="select">兜底音色：云健 Yunjian<span class="chev">▾</span></span>
+      <span class="test-btn">试听</span>
+    </div>
+    <div class="receipt">✓ 已播放试听语音</div>
+    <div class="sample">试听：我是云健，声音正常吗？</div>
+    <div class="hint">仅可用于你本人或已获授权的音色；参考音频只在本机处理，不上传云端。</div>
+  </div>
+  <div class="events"><div class="done">试听：已播放试听语音</div></div>
+</section>
+
+<!-- 12 已完成 -->
+<section class="screen status-mode ok" id="s12">
+  <div class="stage">回答</div>
+  <div class="title">完成 · 共 12 步 · 用时 2m18s</div>
+  <ul class="bullets"><li>✓ 本轮完成</li></ul>
+  <div class="bar"><span>—</span><div class="track"></div></div>
+  <div class="scroll-hint above-bar">点右下角回控制室</div>
+</section>
+
+<!-- 13 空闲回到控制室 -->
+<section class="screen home-mode" id="s13">
+  <div class="stage">项目 6 个 · 1/2</div>
+  <div class="home-body">
+    <div class="home-item">
+      <div class="home-row1"><span class="home-dot done"></span><span class="name">dsh-assistant</span></div>
+      <div class="home-row2">朗读链路已修好并验证</div>
+    </div>
+    <div class="home-item">
+      <div class="home-row1"><span class="home-dot done"></span><span class="name">磷石膏SCI</span></div>
+      <div class="home-row2">第 3 章抗压数据已核对</div>
+    </div>
+    <div class="home-item">
+      <div class="home-row1"><span class="home-dot idle"></span><span class="name">青年基金申请书</span></div>
+      <div class="home-row2">立项依据已按意见重写</div>
+    </div>
+    <div class="home-item">
+      <div class="home-row1"><span class="home-dot idle"></span><span class="name">STRATA</span></div>
+      <div class="home-row2">显存预留调到 1664 MiB</div>
+    </div>
+    <div class="home-item">
+      <div class="home-row1"><span class="home-dot idle"></span><span class="name">控制室</span></div>
+      <div class="home-row2">项目按 cwd 聚合翻页</div>
+    </div>
+  </div>
+  <div class="scroll-hint">已绑定：dsh-assistant</div>
+</section>
+
+<!-- 14 手机远程 -->
+<section class="screen" id="s14" style="padding:0;border:0">
+  <div class="phone-wrap">
+    <div class="phone">
+      <div class="phone-screen">
+        <div class="screen home-mode" style="border:0">
+          <div class="stage">项目 6 个 · 1/2</div>
+          <div class="home-body">
+            <div class="home-item">
+              <div class="home-row1"><span class="home-dot running"></span><span class="name">dsh-assistant</span></div>
+              <div class="home-row2">朗读预取改成 4 段并发</div>
+            </div>
+            <div class="home-item">
+              <div class="home-row1"><span class="home-dot done"></span><span class="name">磷石膏SCI</span></div>
+              <div class="home-row2">第 3 章抗压数据已核对</div>
+            </div>
+            <div class="home-item">
+              <div class="home-row1"><span class="home-dot idle"></span><span class="name">青年基金申请书</span></div>
+              <div class="home-row2">立项依据已按意见重写</div>
+            </div>
+            <div class="home-item">
+              <div class="home-row1"><span class="home-dot idle"></span><span class="name">STRATA</span></div>
+              <div class="home-row2">显存预留调到 1664 MiB</div>
+            </div>
+            <div class="home-item">
+              <div class="home-row1"><span class="home-dot idle"></span><span class="name">控制室</span></div>
+              <div class="home-row2">项目按 cwd 聚合翻页</div>
+            </div>
+          </div>
+          <div class="scroll-hint">已绑定：dsh-assistant</div>
+        </div>
+      </div>
+    </div>
+    <div class="phone-cap">手机浏览器 · 同一份 /tihu 页面 · 触摸/滑动一致</div>
+  </div>
+</section>
+
+</main>
+<script>
+  (function () {
+    var n = new URLSearchParams(location.search).get('n');
+    if (n) {
+      document.body.classList.remove('board');
+      document.querySelectorAll('#board > .screen').forEach(function (el) {
+        if (el.id !== 's' + n) el.remove();
+      });
+    } else {
+      document.body.classList.add('board');
+      var h = document.createElement('div');
+      h.className = 'board-title';
+      h.textContent = '鹈鹕 · ESP32-S3-BOX-3 · 320×240 效果图';
+      var p = document.createElement('div');
+      p.className = 'board-sub';
+      p.textContent = '14 屏 1:1 排版；截图时用 ?n=01…14 单屏输出 4× PNG';
+      document.body.insertBefore(p, document.getElementById('board'));
+      document.body.insertBefore(h, p);
+    }
+  })();
+</script>
+</body>
+</html>
