@@ -3342,6 +3342,75 @@ await testAsync('lane：状态屏底部列出其他运行中会话，运行状�
   runtime.dispose()
 })
 
+
+await testAsync('lane：回复屏带停止/重读/回主页三个按钮，点了各自生效', async () => {
+  const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+  const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'reply-actions', protocol: '0', sessionId: 'session-a' }, 1)))
+  await waitMs(40)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const emit = (id, event) => onSessionEvent({ id, header: { id } }, event)
+  emit('session-a', { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '第一句话。第二句话。' }] } } })
+  await waitMs(150)
+  let replyFrames = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'reply')
+  assert.ok(replyFrames.length > 0, '应有回复帧')
+  const actions = replyFrames[replyFrames.length - 1].payload.actions
+  assert.ok(Array.isArray(actions) && actions.length === 3, '回复帧要带三个按钮：' + JSON.stringify(actions))
+  assert.deepEqual(actions.map((item) => item.id), ['stop', 'replay', 'home'])
+  assert.equal(replyFrames[replyFrames.length - 1].payload.running, undefined, '回复屏不列运行中会话')
+
+  const audioBeforeStop = framesOf(socket).filter((frame) => frame.type === 'tts.audio').length
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 220, hit: 'action', actionId: 'stop' }, 2)))
+  await waitMs(220)
+  const audioAfterStop = framesOf(socket).filter((frame) => frame.type === 'tts.audio').length
+  assert.equal(audioAfterStop, audioBeforeStop, '停止后不得再发音频')
+
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 160, y: 220, hit: 'action', actionId: 'replay' }, 3)))
+  await waitMs(150)
+  replyFrames = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'reply')
+  assert.ok(replyFrames.some((frame) => frame.payload.reply.currentIndex === 0), '重读要先回到第一句')
+  const audioAfterReplay = framesOf(socket).filter((frame) => frame.type === 'tts.audio').length
+  assert.ok(audioAfterReplay > audioAfterStop, '重读要重新发音频')
+
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 280, y: 220, hit: 'action', actionId: 'home' }, 4)))
+  await waitMs(120)
+  assert.ok(framesOf(socket).some((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home'), '回主页按钮要回主页')
+  runtime.dispose()
+})
+
+await testAsync('lane：状态屏底部只列 Computer Use 模式的运行中会话，点了能切过去', async () => {
+  const records = [
+    cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 3000, title: '会话 A' }),
+    cuRecord('session-b', { live: true, cwd: '/b', lastPromptAt: 2000, title: '会话 B' }),
+    cuRecord('session-c', { live: true, cwd: '/c', lastPromptAt: 1000, title: '会话 C' }),
+    cuRecord('session-d', { live: true, cwd: '/d', lastPromptAt: 500, title: '会话 D', preset: 'standard' }),
+  ]
+  const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'running-list', protocol: '0', sessionId: 'session-a' }, 1)))
+  await waitMs(40)
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  const emit = (id, event) => onSessionEvent({ id, header: { id } }, event)
+  emit('session-b', { type: 'turn/start', data: { turn: 1 } })
+  await waitMs(80)
+  emit('session-c', { type: 'turn/start', data: { turn: 1 } })
+  emit('session-d', { type: 'turn/start', data: { turn: 1 } })
+  await waitMs(150)
+  const statusFrames = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode !== 'home' && frame.payload.mode !== 'reply' && Array.isArray(frame.payload.running))
+  assert.ok(statusFrames.length > 0, '状态屏要带 other running 列表')
+  const last = statusFrames[statusFrames.length - 1].payload
+  assert.ok(last.running.some((item) => item.sessionId === 'session-c'), '要列出正在跑的 c：' + JSON.stringify(last.running))
+  assert.ok(!last.running.some((item) => item.sessionId === 'session-b'), '不列自己')
+  assert.ok(!last.running.some((item) => item.sessionId === 'session-d'), '只要 Computer Use 模式的会话，standard 不列：' + JSON.stringify(last.running))
+
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 120, y: 218, hit: 'switch', targetSessionId: 'session-c' }, 2)))
+  await waitMs(150)
+  const bounds = framesOf(socket).filter((frame) => frame.type === 'session.bound')
+  assert.equal(bounds[bounds.length - 1].payload.sessionId, 'session-c', '点了就切到 c')
+  runtime.dispose()
+})
+
 /* ---------- 汇总 ---------- */
 console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
 if (failed > 0) process.exit(1)
