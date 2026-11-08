@@ -5,60 +5,9 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import { randomUUID } from "node:crypto";
 import { brandString } from "@deepseek-ai/dsh-brand";
 import { registerComputerUseBridge } from "../../src/cu-bridge.mjs";
-//#region src/code-agent-unattended.ts
-/** Custom answer when a Code agent asks a free-text question. */
-const UNATTENDED_CUSTOM_ANSWER = "Stop. Return the short result you already have. Do not expand the task.";
-/**
-* Pick answers so a background Code agent never waits for a human.
-* @param questions - the live `ask_user_question` payload.
-* @returns structured answers the tool execute path accepts.
-*/
-function autoAnswerQuestions(questions) {
-	return { answers: questions.map((question) => {
-		if (question.intent?.kind === "plan-review") return {
-			id: question.id,
-			selected: [question.intent.approve]
-		};
-		const options = question.options ?? [];
-		const recommended = options.find((option) => option.label.includes("(Recommended)"));
-		if (recommended !== void 0) return {
-			id: question.id,
-			selected: [recommended.label]
-		};
-		if (options[0] !== void 0) return {
-			id: question.id,
-			selected: question.multiSelect === true ? options.map((option) => option.label) : [options[0].label]
-		};
-		return {
-			id: question.id,
-			selected: [],
-			custom: UNATTENDED_CUSTOM_ANSWER
-		};
-	}) };
-}
-/**
-* Prepend unattended answerers on a live Code agent once.
-* @param code - the delegated standard agent.
-* @param attached - agents that already carry the listeners.
-*/
-function attachUnattendedCodeAgent(code, attached) {
-	if (attached.has(code)) return;
-	attached.add(code);
-	try {
-		code.ctx.effect(() => {
-			const offApproval = code.ctx.on("approval/request", () => Promise.resolve("allowed-once"), { prepend: true });
-			const offQuestions = code.ctx.on("user-questions/request", (request) => Promise.resolve(autoAnswerQuestions(request.questions)), { prepend: true });
-			return () => {
-				offApproval();
-				offQuestions();
-				attached.delete(code);
-			};
-		});
-	} catch {
-		attached.delete(code);
-	}
-}
-//#endregion
+import { attachUnattendedCodeAgent } from "../../src/cu-unattended.mjs";
+// 自动应答挪到 src/cu-unattended.mjs：托管关着时必须 next()，所以它要问宿主门控
+// （src/tuoguan-gate.ts）。这里是 vendor 侧唯一保留的调用点。
 //#region src/select-model.ts
 /**
 * Official `selectModel` always writes the chosen model as the global default.
@@ -371,7 +320,7 @@ function apply(ctx) {
 			const liveCaller = agents?.get(caller.id);
 			const code = agents?.get(sessionId);
 			if (liveCaller !== void 0) rememberCaller(liveCaller, caller.id, byCaller, rememberedCallers, registry);
-			if (code !== void 0) attachUnattendedCodeAgent(code, unattended);
+			if (code !== void 0) attachUnattendedCodeAgent(code, unattended, caller.id);
 			if (code !== void 0) registerComputerUseBridge({
 				agent: code,
 				ctx,

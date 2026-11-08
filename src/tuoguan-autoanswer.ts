@@ -213,19 +213,12 @@ export function createAutoAnswer(deps: AutoAnswerDeps): AutoAnswerController {
   const ancestryOf = typeof deps.ancestryOf === 'function'
     ? deps.ancestryOf
     : (sessionId: string) => [sessionId]
+  // 只读门控与自动应答共用同一份判定（见 createTuoguanGate）：
+  // 显式 off > 显式 on > 默认值；读不到状态 / 拿不到会话链 → 不托管。
+  const gated = createTuoguanGate({ readState: deps.readState, ancestryOf, log })
 
   async function isOnFor(sessionId: string): Promise<boolean> {
-    if (typeof sessionId !== 'string' || sessionId === '') return false
-    try {
-      const state = await deps.readState()
-      const chain = (() => {
-        try { return ancestryOf(sessionId) } catch { return [sessionId] }
-      })()
-      return tuoguanOnForChain(state, Array.isArray(chain) && chain.length > 0 ? chain : [sessionId])
-    } catch (error: unknown) {
-      log(`托管自动应答读不到托管状态（按不托管处理）：${renderThrown(error)}`)
-      return false
-    }
+    return gated(sessionId)
   }
 
   return {
@@ -253,6 +246,60 @@ export function createAutoAnswer(deps: AutoAnswerDeps): AutoAnswerController {
       log(`托管自动应答：${sessionId} 提问 ${questions.length} 题 → ${labels}`)
       return batch
     },
+  }
+}
+
+/** 只读门控的依赖（与自动应答共用同一套读状态 + 会话链）。 */
+export interface TuoguanGateDeps {
+  /** 读托管状态真值（宿主那份 JSON）。 */
+  readState: AutoAnswerDeps['readState']
+  /** 会话链（子代理继承用）；缺省只判自己。 */
+  ancestryOf?: (sessionId: string) => readonly string[]
+  /** 日志。 */
+  log?: (message: string) => void
+}
+
+/**
+ * 只读门控：`(sessionId, parentSessionId?) => Promise<boolean>`，判定与自动应答完全同源
+ * （{@link tuoguanOnForChain} + {@link sessionAncestry}）。
+ *
+ * 后台 Code 会话由 CU 会话派出去，但它在会话头里没有 parentSession（不是子代理），
+ * 所以允许调用方额外传一个「派出它的会话」：它接在会话链最后，仍服从
+ * 「离自己最近的显式设置优先」——CU 会话被显式关掉时，后台会话也跟着闭嘴。
+ *
+ * 读不到状态、拿不到会话链、id 不合法 → false（按不托管处理，绝不猜着放行）。
+ * @param deps - 读状态、会话链、日志。
+ * @returns 门控函数。
+ */
+export function createTuoguanGate(
+  deps: TuoguanGateDeps,
+): (sessionId: string, parentSessionId?: string) => Promise<boolean> {
+  const log = typeof deps.log === 'function' ? deps.log : () => {}
+  const ancestryOf = typeof deps.ancestryOf === 'function'
+    ? deps.ancestryOf
+    : (sessionId: string) => [sessionId]
+  const chainOf = (sessionId: string): string[] => {
+    try {
+      const chain = ancestryOf(sessionId)
+      return Array.isArray(chain) && chain.length > 0 ? chain : [sessionId]
+    } catch {
+      return [sessionId]
+    }
+  }
+  return async function isOnFor(sessionId: string, parentSessionId?: string): Promise<boolean> {
+    if (typeof sessionId !== 'string' || sessionId === '') return false
+    try {
+      const state = await deps.readState()
+      const chain = chainOf(sessionId)
+      // 后台 Code 会话的「派出者」不是会话头里的父会话，这里显式接到链尾（含它自己的祖先）。
+      if (typeof parentSessionId === 'string' && parentSessionId !== '' && !chain.includes(parentSessionId)) {
+        for (const id of chainOf(parentSessionId)) if (!chain.includes(id)) chain.push(id)
+      }
+      return tuoguanOnForChain(state, chain)
+    } catch (error: unknown) {
+      log(`托管门控读不到托管状态（按不托管处理）：${renderThrown(error)}`)
+      return false
+    }
   }
 }
 
