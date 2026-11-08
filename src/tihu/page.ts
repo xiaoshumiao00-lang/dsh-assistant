@@ -433,7 +433,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function updateScrollHint() {
     $('scrollHint').textContent = state.sessionBound
       ? ('已绑定：' + (state.boundProject || state.sessionTitle || '未命名会话'))
-      : '未绑定会话 · 点项目进入';
+      : '';
   }
   function renderScreen(payload) {
     var screen = $('screen');
@@ -470,9 +470,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         homeBody.appendChild(item);
       }
       screen.className = 'home-mode';
-      $('scrollHint').textContent = state.sessionBound
-        ? ('已绑定：' + (state.boundProject || state.sessionTitle || '未命名会话'))
-        : '未绑定会话 · 点项目进入';
+      updateScrollHint();
       return;
     }
     if (payload && payload.mode === 'reply' && payload.reply) {

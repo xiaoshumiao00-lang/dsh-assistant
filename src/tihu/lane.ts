@@ -801,6 +801,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         tone: 'alert',
       } satisfies ScreenFramePayload, sessionId)
     }
+    // 2026-11-08 实测缺陷：只有 hello/turn 事件会排「回主页」定时器，任何一次重新绑定
+    //（页面重连后补发 session.bind、自动跟随、气泡切屏）都会停在「已绑定」信息屏上永不回主页。
+    // 绑定成功就排一次空闲回主页：有人跑 turn / 还在朗读时，守门会自己推迟。
+    const bindHome = homeStates.get(sessionId) ?? { mode: 'session' as const, page: 0, done: true }
+    bindHome.mode = 'session'
+    bindHome.done = true
+    homeStates.set(sessionId, bindHome)
+    scheduleHome(sessionId)
     log(`tihu bind session=${sessionId} status=${found.status} preset=${JSON.stringify(preset)} cu=${String(computerUse)} title=${JSON.stringify(title)}`)
   }
 
