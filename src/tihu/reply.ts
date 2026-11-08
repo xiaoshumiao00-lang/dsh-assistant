@@ -77,8 +77,12 @@ const SPEECH_BREAK = /[，,、：:；;。！？!?\n]/
 /**
  * 把回复切成**语音片段**：先按句，再把长句按逗号/顿号切成 ≤maxChars 的小段。
  * 这样长句不必等整句合成完才发首包；片段下标仍映射回原句（高亮按句）。
+ *
+ * 2026-11-08 用户拍板（治「念半句就断」）：`maxChars` 默认 **32 → 80**，同时
+ * **首段单独压到 `firstChars`（默认 20）**——首句最快开口，后面的段可以大一些，
+ * 避免 32 字切法把一句完整播报拆成三四个碎片（碎片之间要等合成，听着就是断）。
  */
-export function splitSpeechSegments(text: string, maxChars = 32): SpeechSegment[] {
+export function splitSpeechSegments(text: string, maxChars = 80, firstChars = 20): SpeechSegment[] {
   const chars = [...String(text ?? '')]
   const sentences = splitReplySentences(text)
   const out: SpeechSegment[] = []
@@ -91,13 +95,15 @@ export function splitSpeechSegments(text: string, maxChars = 32): SpeechSegment[
     if (cursor >= chars.length) break
     while (sentenceIndex < sentences.length && sentences[sentenceIndex].end <= cursor) sentenceIndex += 1
     if (sentenceIndex >= sentences.length) break
+    // 首段更短：先让第一句最快发声；之后按 maxChars 切。
+    const cap = index === 0 ? Math.max(1, Math.min(maxChars, firstChars)) : maxChars
     let end = cursor
     let lastBreak = -1
     const limit = Math.min(chars.length, sentences[sentenceIndex].end)
     while (end < limit) {
       const char = chars[end]
       if (SPEECH_BREAK.test(char)) { lastBreak = end + 1; break }
-      if (end - cursor + 1 >= maxChars) { lastBreak = end + 1; break }
+      if (end - cursor + 1 >= cap) { lastBreak = end + 1; break }
       end += 1
     }
     if (lastBreak < 0) lastBreak = limit

@@ -1,22 +1,23 @@
 /**
- * 本地 TTS sidecar。
+ * 本地 TTS sidecar（鹈鹕模块内置，不依赖任何外部插件 / 独立服务 / 别的仓库）。
  *
- * 当前主引擎：Qwen3-TTS-12Hz-0.6B-Base 的 PyTorch CPU 实现（`scripts/tihu-qwen-tts-server.py`，
- * 官方 `qwen-tts` 包，fp32 + sdpa + 8 线程），仅绑 127.0.0.1，由本模块 spawn。
- * 引擎：edge-tts 云健（默认，在线）/ Qwen3-TTS GPU（离线、克隆）/ Q4（弃用备用）。
- * 没有机械音兜底；两者都不可用时不发声，由 lane 发 error alert 并保留正文。
+ * 主引擎（2026-11-08 用户拍板）：**Kokoro multi-lang v1.1-zh（sherpa-onnx，纯 CPU）**。
+ *   - 驱动脚本在仓库内：`scripts/tihu-kokoro-tts-server.py`（与 `tihu-qwen-tts-server.py` 同级）；
+ *   - 常驻 WebSocket 进程，由本模块 spawn / 健康检查 / 失败重启；端口沿用 DEFAULT_PORT 8731；
+ *   - 权重 `~/.dsh/tihu/models/kokoro/kokoro-multi-lang-v1_1/model.onnx`（fp32；本机实测 int8
+ *     反而慢 2.8–3.5 倍：RTF 1.34 对 0.477，所以这里显式排除 int8）；
+ *   - Python 运行时 `~/.dsh/tihu/venv-sherpa`（sherpa-onnx 2.0.1 + websockets），不进仓库依赖。
+ * 兜底：edge-tts 云健（`scripts/tihu-edge-tts.py`，音色 zh-CN-YunjianNeural 不变）。
+ * 可选遗留：Qwen3-TTS sidecar 只有显式 `TIHU_TTS_ENGINE=qwen` 才启动（代码保留，默认不加载）。
  *
  * 设计：
- *   - **独立进程**：DSH 主进程只做 HTTP 客户端；
- *   - 模型/二进制放 `~/.dsh/tihu/`，不进仓库；
- *   - 合成走 OpenAI 兼容 `POST /v1/audio/speech`（`response_format: "pcm"`），
- *     服务端按 120ms 分块返回，这里再把字节流重新切成固定 120ms 块；
- *   - 音色：`POST /v1/audio/voices`（multipart）把 speaker embedding 存成
- *     `.embed.pt`（PyTorch）/ `.gguf`（codec），服务重启时自动加载（第二次用同一音色不重算）。
- *     工作区 `.tihu/voices/<name>.wav|.json` 是用户可见的权威副本，json 里记 serverVoiceId。
+ *   - **独立进程**：DSH 主进程只做 HTTP / WS 客户端；
+ *   - 模型 / 二进制放 `~/.dsh/tihu/`，不进仓库；
+ *   - Kokoro 走内部 WS 协议（JSON 请求 + 二进制 PCM 分块），这里再切成固定 120ms 块；
+ *   - 本地合成**串行**（最多 1 路在合）：并池化会把 4 个线程抢成互相等，反而更慢。
  *
- * 失败策略：任何异常都以可读 Error 抛出，由 lane 发 `event.alert` 并让页面降级到
- * 系统语音；绝不静默。
+ * 失败策略：顺序固定 **Kokoro → edge**；任一路失败都以可读 Error 向上抛，由 lane 发
+ * `event.alert` 并让页面降级；绝不静默。
  */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync } from 'node:fs'
@@ -28,6 +29,8 @@ import { toTtsSegments } from './protocol.ts'
 import type { VoiceInfo } from './protocol.ts'
 
 const DEFAULT_PORT = 8731
+/** Kokoro 端口：默认沿用 8731；要和遗留 Qwen sidecar 并跑时用 TIHU_TTS_KOKORO_PORT 挪开。 */
+const KOKORO_PORT_DEFAULT = DEFAULT_PORT
 const HEALTH_TIMEOUT_MS = 180_000
 
 /**
@@ -55,6 +58,231 @@ function clampMs(raw: unknown, min: number, max: number, fallback: number): numb
 /** edge-tts 首块门限（毫秒）。 */
 export function edgeFirstChunkMs(): number {
   return clampMs(process.env.TIHU_EDGE_FIRST_MS, EDGE_FIRST_MS_MIN, EDGE_FIRST_MS_MAX, EDGE_FIRST_MS_DEFAULT)
+}
+
+/**
+ * 本地（Kokoro）首块门限：`TIHU_LOCAL_FIRST_MS`，默认 **2500ms**，夹在 1–60s。
+ *
+ * 依据（本轮实测，4 线程 fp32）：20 字首段 ≈ 4s 音频，合成 1.6–2.4s（RTF 0.33–0.48），
+ * 2500ms 覆盖 p95；超时立刻切 edge，不让首句空等。
+ */
+const LOCAL_FIRST_MS_DEFAULT = 2_500
+const LOCAL_FIRST_MS_MIN = 1_000
+const LOCAL_FIRST_MS_MAX = 60_000
+
+/** 本地首块门限（毫秒）。 */
+export function localFirstChunkMs(): number {
+  return clampMs(process.env.TIHU_LOCAL_FIRST_MS, LOCAL_FIRST_MS_MIN, LOCAL_FIRST_MS_MAX, LOCAL_FIRST_MS_DEFAULT)
+}
+
+/**
+ * 主引擎：`TIHU_TTS_ENGINE` = `kokoro` | `edge` | `qwen`，**默认 kokoro**。
+ *
+ * 2026-11-08 用户拍板：Kokoro 本地为主，edge 兜底；qwen 只有**显式**设置才启动
+ *（旧值 cpu/q4/qwen-cuda 仍识别成 qwen，但绝不作为默认）。
+ */
+export type TihuTtsEngine = 'kokoro' | 'edge' | 'qwen'
+
+export function ttsEngine(): TihuTtsEngine {
+  const raw = String(process.env.TIHU_TTS_ENGINE ?? '').trim().toLowerCase()
+  if (raw === 'edge') return 'edge'
+  if (raw === 'qwen' || raw === 'cpu' || raw === 'q4' || raw === 'qwen-cuda') return 'qwen'
+  return 'kokoro'
+}
+
+/** Kokoro 中文音色（sid 与 voices.bin 顺序一致；sherpa-onnx 官方 sid→name 映射）。 */
+export interface KokoroVoice {
+  sid: number
+  name: string
+  gender: 'f' | 'm'
+}
+
+/** 中文女声 zf_*：sid 3–57（55 个）。 */
+const KOKORO_ZH_FEMALE = [
+  'zf_001', 'zf_002', 'zf_003', 'zf_004', 'zf_005', 'zf_006', 'zf_007', 'zf_008',
+  'zf_017', 'zf_018', 'zf_019', 'zf_021', 'zf_022', 'zf_023', 'zf_024', 'zf_026',
+  'zf_027', 'zf_028', 'zf_032', 'zf_036', 'zf_038', 'zf_039', 'zf_040', 'zf_042',
+  'zf_043', 'zf_044', 'zf_046', 'zf_047', 'zf_048', 'zf_049', 'zf_051', 'zf_059',
+  'zf_060', 'zf_067', 'zf_070', 'zf_071', 'zf_072', 'zf_073', 'zf_074', 'zf_075',
+  'zf_076', 'zf_077', 'zf_078', 'zf_079', 'zf_083', 'zf_084', 'zf_085', 'zf_086',
+  'zf_087', 'zf_088', 'zf_090', 'zf_092', 'zf_093', 'zf_094', 'zf_099',
+]
+/** 中文男声 zm_*：sid 58–102（45 个）。 */
+const KOKORO_ZH_MALE = [
+  'zm_009', 'zm_010', 'zm_011', 'zm_012', 'zm_013', 'zm_014', 'zm_015', 'zm_016',
+  'zm_020', 'zm_025', 'zm_029', 'zm_030', 'zm_031', 'zm_033', 'zm_034', 'zm_035',
+  'zm_037', 'zm_041', 'zm_045', 'zm_050', 'zm_052', 'zm_053', 'zm_054', 'zm_055',
+  'zm_056', 'zm_057', 'zm_058', 'zm_061', 'zm_062', 'zm_063', 'zm_064', 'zm_065',
+  'zm_066', 'zm_068', 'zm_069', 'zm_080', 'zm_081', 'zm_082', 'zm_089', 'zm_091',
+  'zm_095', 'zm_096', 'zm_097', 'zm_098', 'zm_100',
+]
+
+/** 全部 103 个音色（0 af_maple / 1 af_sol / 2 bf_vale，其余中文）。 */
+export const KOKORO_VOICES: readonly KokoroVoice[] = [
+  { sid: 0, name: 'af_maple', gender: 'f' },
+  { sid: 1, name: 'af_sol', gender: 'f' },
+  { sid: 2, name: 'bf_vale', gender: 'f' },
+  ...KOKORO_ZH_FEMALE.map((name, index) => ({ sid: 3 + index, name, gender: 'f' as const })),
+  ...KOKORO_ZH_MALE.map((name, index) => ({ sid: 58 + index, name, gender: 'm' as const })),
+]
+
+/** 中文音色（设备端音色列表只下发这些，外加当前选中的英文音色）。 */
+export const KOKORO_ZH_VOICES: readonly KokoroVoice[] = KOKORO_VOICES.filter((voice) => voice.sid >= 3)
+
+/** 默认音色：TIHU_KOKORO_SID（默认 35 = zf_060 女声）。 */
+export const KOKORO_DEFAULT_SID = 35
+
+/** sid → 音色名（未知 sid 返回 `sid<号>`）。 */
+export function kokoroVoiceName(sid: number): string {
+  return KOKORO_VOICES.find((voice) => voice.sid === sid)?.name ?? `sid${sid}`
+}
+
+/**
+ * 音色名/编号 → sid：支持 `zf_060`、`35`、`sid35`；不认得的回落到 TIHU_KOKORO_SID（默认 35）。
+ * 设备端沿用现有的 `voice.select` 通道（name 字段），不新增协议字段。
+ */
+export function kokoroSid(raw?: string | number): number {
+  const envRaw = process.env.TIHU_KOKORO_SID
+  const parsed = envRaw === undefined || String(envRaw).trim() === '' ? Number.NaN : Number(envRaw)
+  const fallback = Number.isInteger(parsed) && parsed >= 0 && parsed <= 102 ? parsed : KOKORO_DEFAULT_SID
+  if (typeof raw === 'number' && Number.isInteger(raw)) return raw >= 0 && raw <= 102 ? raw : fallback
+  const value = String(raw ?? '').trim().toLowerCase()
+  if (value === '' || value === 'default') return fallback
+  const byName = KOKORO_VOICES.find((voice) => voice.name.toLowerCase() === value)
+  if (byName !== undefined) return byName.sid
+  const numeric = value.startsWith('sid') ? value.slice(3) : value
+  if (/^\d+$/.test(numeric)) {
+    const sid = Number(numeric)
+    if (sid >= 0 && sid <= 102) return sid
+  }
+  return fallback
+}
+
+/**
+ * 当前模块所在目录（不引 `node:url`：仓库没有 @types/node，用 lib.dom 的 URL 即可）。
+ * Windows 下 pathname 形如 `/D:/repo/src/tihu/`，去掉开头斜杠再统一成反斜杠。
+ */
+function moduleDir(): string {
+  const pathname = decodeURIComponent(new URL('.', import.meta.url).pathname)
+  const withoutSlash = pathname.replace(/^\/([A-Za-z]:)/, '$1').replace(/\/+$/, '')
+  return withoutSlash.replace(/\//g, '\\')
+}
+
+/**
+ * 仓库内 Kokoro 模型目录候选（**开箱即用**：模型随仓库走，clone 后不再下载）。
+ * 由模块位置向上两级定位仓库根：开发时 `src/tihu/tts.ts` → `../../`；
+ * 打包后 `lib/index.js` → `../`。桌面插件是 junction 指回本仓库，解析结果仍落在仓库内。
+ */
+export function repoModelDirs(): string[] {
+  const here = moduleDir()
+  const roots = [join(here, '..', '..'), join(here, '..'), process.cwd()]
+  const dirs: string[] = []
+  for (const root of roots) {
+    const dir = join(root, 'models', 'kokoro', 'kokoro-multi-lang-v1_1')
+    if (!dirs.includes(dir)) dirs.push(dir)
+  }
+  return dirs
+}
+
+/**
+ * Kokoro 权重目录：**先仓库内 models/kokoro/kokoro-multi-lang-v1_1**（随仓库分发），
+ * 再回退 `~/.dsh/tihu/models/kokoro/`（旧安装），`TIHU_KOKORO_MODEL_DIR` 可覆盖。
+ */
+export function kokoroModelDir(): string {
+  const explicit = process.env.TIHU_KOKORO_MODEL_DIR
+  if (explicit !== undefined && explicit !== '') return explicit
+  for (const dir of repoModelDirs()) {
+    if (existsSync(join(dir, 'model.onnx'))) return dir
+  }
+  return join(tihuRoot(), 'models', 'kokoro', 'kokoro-multi-lang-v1_1')
+}
+
+/** Kokoro 权重文件（**固定 fp32**；int8 实测更慢，见文件头）。 */
+export function kokoroModelPath(): string {
+  const explicit = process.env.TIHU_KOKORO_MODEL
+  if (explicit !== undefined && explicit !== '') return explicit
+  return join(kokoroModelDir(), 'model.onnx')
+}
+
+/** 词表/音色/espeak/fst 资产目录：fp32 目录里没有就看同级的 int8 包（文本前端资产相同）。 */
+export function kokoroAssetsDir(): string {
+  const modelDir = kokoroModelDir()
+  if (existsSync(join(modelDir, 'tokens.txt'))) return modelDir
+  const sibling = join(dirname(modelDir), 'kokoro-int8-multi-lang-v1_1')
+  return existsSync(join(sibling, 'tokens.txt')) ? sibling : modelDir
+}
+
+/** Python 运行时（独立 venv，不进仓库依赖）。 */
+export function kokoroPythonPath(): string {
+  const explicit = process.env.TIHU_KOKORO_PY
+  if (explicit !== undefined && explicit !== '') return explicit
+  return join(tihuRoot(), 'venv-sherpa', 'Scripts', process.platform === 'win32' ? 'python.exe' : 'python')
+}
+
+/** 驱动脚本：**仓库内** `scripts/tihu-kokoro-tts-server.py`（可用 TIHU_KOKORO_SERVER 覆盖）。 */
+export function kokoroScriptPath(): string {
+  const explicit = process.env.TIHU_KOKORO_SERVER
+  if (explicit !== undefined && explicit !== '') return explicit
+  const here = moduleDir()
+  const candidates = [
+    join(here, '..', '..', 'scripts', 'tihu-kokoro-tts-server.py'), // src/tihu → 仓库根
+    join(here, '..', 'scripts', 'tihu-kokoro-tts-server.py'), // 打包后 lib → 仓库根
+    join(process.cwd(), 'scripts', 'tihu-kokoro-tts-server.py'),
+  ]
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate
+  }
+  return candidates[0]
+}
+
+/** 缺依赖时要跑的一条命令（错误提示里原样给用户）。 */
+export function kokoroInstallHint(): string {
+  const python = kokoroPythonPath()
+  const modelDir = kokoroModelDir()
+  return [
+    `① 装 Python 环境（模型随仓库自带，不用下载）：python -m venv "${dirname(dirname(python))}" && "${python}" -m pip install sherpa-onnx websockets`,
+    `② 只有 models 目录被删空时才需要补模型：HF_ENDPOINT=https://hf-mirror.com "${python}" -c "from huggingface_hub import snapshot_download as d; d('csukuangfj/kokoro-multi-lang-v1_1', local_dir=r'${modelDir}')"`,
+  ].join('；')
+}
+
+/** Kokoro 缺哪些文件（空数组 = 齐全）。 */
+export function kokoroMissingFiles(): string[] {
+  const assets = kokoroAssetsDir()
+  const checks: Array<[string, string]> = [
+    [kokoroPythonPath(), 'Python 运行时（venv-sherpa）'],
+    [kokoroScriptPath(), '驱动脚本 scripts/tihu-kokoro-tts-server.py'],
+    [kokoroModelPath(), 'fp32 权重 model.onnx'],
+    [join(assets, 'tokens.txt'), 'tokens.txt'],
+    [join(assets, 'voices.bin'), 'voices.bin'],
+    [join(assets, 'lexicon-zh.txt'), 'lexicon-zh.txt'],
+    [join(assets, 'espeak-ng-data'), 'espeak-ng-data 目录'],
+    [join(assets, 'number-zh.fst'), 'number-zh.fst'],
+    [join(assets, 'date-zh.fst'), 'date-zh.fst'],
+  ]
+  const missing: string[] = []
+  for (const [path, label] of checks) {
+    if (!existsSync(path)) missing.push(`${label}：${path}`)
+  }
+  return missing
+}
+
+/** 最小 WebSocket 句柄（Node 22+ 全局 WebSocket；刻意不引第三方类型/依赖）。 */
+interface WsLike {
+  binaryType: string
+  onopen: (() => void) | null
+  onerror: (() => void) | null
+  onclose: (() => void) | null
+  onmessage: ((event: { data: unknown }) => void) | null
+  send: (data: string) => void
+  close: () => void
+}
+
+function openWebSocket(url: string): WsLike {
+  const ctor = (globalThis as any)?.WebSocket
+  if (typeof ctor !== 'function') {
+    throw new Error('当前运行时没有全局 WebSocket（需要 Node 22+）；Kokoro 本地引擎无法连接')
+  }
+  return new ctor(url) as WsLike
 }
 
 /**
@@ -200,25 +428,45 @@ export class TihuTts {
   private fallbackNote = ''
   /** GPU 启动/合成失败后本次进程内不再重试（不回退机械音）。 */
   private gpuFailed = false
-  /** 实际出声引擎（用于事件标识）。 */
-  private activeEngine: 'gpu' | 'edge' | 'none' = 'edge'
+  /** 实际出声引擎（用于事件标识）：kokoro / gpu(qwen) / edge / none。 */
+  private engineInUse: 'kokoro' | 'gpu' | 'edge' | 'none' = 'none'
   private lastLabel = ''
+  /** 本地合成串行锁：最多 1 路在合（Kokoro 只用 4 线程，并发只会互相等）。 */
+  private localLock: Promise<unknown> = Promise.resolve()
 
   constructor(options: TihuTtsOptions) {
     this.options = options
     this.paths = { ...defaultTtsPaths(), ...(options.paths ?? {}) }
-    this.port = options.port ?? DEFAULT_PORT
+    this.port = options.port ?? KOKORO_PORT_DEFAULT
   }
 
-  /** 当前后端：qwen-cuda（默认 GPU）/ q4（弃用备用）/ cpu（调试）/ none。 */
-  backend(): 'qwen-cuda' | 'q4' | 'cpu' | 'none' {
+  /** 当前实际会启动的后端：kokoro（默认）/ qwen-cuda / q4 / cpu / none。 */
+  backend(): 'kokoro' | 'qwen-cuda' | 'q4' | 'cpu' | 'none' {
     if (this.options.disabled) return 'none'
-    const engine = process.env.TIHU_TTS_ENGINE ?? ''
-    if (engine === 'q4' && existsSync(this.paths.bin) && existsSync(this.paths.model) && existsSync(this.paths.codec)) return 'q4'
-    if (engine === 'cpu' && this.qwenReady()) return 'cpu'
-    // 2026-11-07 用户要求：千问 TTS 默认跑 CPU，不占显存；显式 TIHU_TTS_DEVICE=cuda 才走 GPU。
+    const engine = ttsEngine()
+    if (engine === 'kokoro') return this.kokoroReady() ? 'kokoro' : 'none'
+    if (engine === 'edge') return 'none'
+    // engine === 'qwen'：只有显式 TIHU_TTS_ENGINE=qwen（或旧值）才走这条遗留路径。
+    const legacy = String(process.env.TIHU_TTS_ENGINE ?? '').trim().toLowerCase()
+    if (legacy === 'q4' && existsSync(this.paths.bin) && existsSync(this.paths.model) && existsSync(this.paths.codec)) return 'q4'
+    if (legacy === 'cpu' && this.qwenReady()) return 'cpu'
     if (this.qwenReady() && !this.gpuFailed) return (process.env.TIHU_TTS_DEVICE ?? 'cpu') === 'cuda' ? 'qwen-cuda' : 'cpu'
     return 'none'
+  }
+
+  /** 实际出声引擎（状态屏/事件区用）：kokoro | gpu | edge | none。 */
+  activeEngine(): 'kokoro' | 'gpu' | 'edge' | 'none' {
+    return this.engineInUse
+  }
+
+  /** 本地 Kokoro 是否就绪（缺文件时与 backend() 一致）。 */
+  private kokoroReady(): boolean {
+    return kokoroMissingFiles().length === 0
+  }
+
+  /** 主引擎是不是本地 Kokoro（lane 据此把并发压到 1 路）。 */
+  localPrimary(): boolean {
+    return this.backend() === 'kokoro' || this.backend() === 'qwen-cuda' || this.backend() === 'cpu' || this.backend() === 'q4'
   }
 
   private qwenPython(): string {
@@ -247,16 +495,22 @@ export class TihuTts {
 
   status(): { available: boolean; model?: string; error?: string } {
     const backend = this.backend()
-    if (this.activeEngine === 'gpu' && backend !== 'none') {
-      if (backend === 'q4') return { available: true, model: 'qwen3-tts 0.6b-q4' }
-      if (backend === 'cpu') return { available: true, model: 'qwen3-tts 0.6b-pt' }
-      return { available: true, model: 'qwen3-tts 0.6b-cuda' }
+    const engine = ttsEngine()
+    if (backend === 'kokoro') return { available: true, model: 'kokoro multi-lang-v1_1 (sherpa-onnx fp32)' }
+    if (engine === 'kokoro') {
+      // 缺依赖必须说清「缺哪个文件 + 该跑哪条命令」，不能只报一个空失败。
+      const missing = kokoroMissingFiles()
+      const reason = `Kokoro 未就绪（缺 ${missing.length} 项：${missing.slice(0, 3).join('；')}${missing.length > 3 ? ' …' : ''}）。${kokoroInstallHint()}`
+      if (this.edgeReady()) return { available: true, model: 'edge-tts 云健(Yunjian)', error: reason }
+      return { available: false, error: `${reason}；edge 兜底也不可用` }
     }
+    if (backend === 'q4') return { available: true, model: 'qwen3-tts 0.6b-q4' }
+    if (backend === 'cpu') return { available: true, model: 'qwen3-tts 0.6b-pt' }
+    if (backend === 'qwen-cuda') return { available: true, model: 'qwen3-tts 0.6b-cuda' }
     if (this.edgeReady()) return { available: true, model: 'edge-tts 云健(Yunjian)' }
-    if (backend !== 'none') return { available: true, model: 'qwen3-tts 0.6b-cuda' }
     return {
       available: false,
-      error: this.lastError || `无语音：edge 不可用且本地 Qwen 未就绪（${this.paths.root}）`,
+      error: this.lastError || `无语音：edge 不可用且本地引擎未就绪（${this.paths.root}）`,
     }
   }
 
@@ -289,6 +543,10 @@ export class TihuTts {
     const port = await this.pickPort()
     this.port = port
     const backend = this.backend()
+    if (backend === 'kokoro') {
+      await this.startKokoro(port)
+      return
+    }
     let command = this.paths.bin
     let args = [
       '--model', this.paths.codec,
@@ -379,9 +637,85 @@ export class TihuTts {
     this.log(`tts sidecar ready in ${Date.now() - started} ms (port ${this.port})`)
   }
 
+  /**
+   * 启动 Kokoro sidecar：仓库内 `scripts/tihu-kokoro-tts-server.py` +
+   * `~/.dsh/tihu/venv-sherpa` 的 Python + fp32 权重。常驻进程，模型只加载一次。
+   */
+  private async startKokoro(port: number): Promise<void> {
+    const missing = kokoroMissingFiles()
+    if (missing.length > 0) {
+      throw new Error(`Kokoro 本地引擎不可用，缺 ${missing.length} 项：${missing.join('；')}。${kokoroInstallHint()}`)
+    }
+    const assets = kokoroAssetsDir()
+    const threads = this.options.threads ?? clampMs(process.env.TIHU_KOKORO_THREADS, 1, 8, 4)
+    const command = kokoroPythonPath()
+    const args = [
+      '-u', kokoroScriptPath(),
+      '--model-dir', kokoroModelDir(),
+      '--model', kokoroModelPath(),
+      '--voices', join(assets, 'voices.bin'),
+      '--tokens', join(assets, 'tokens.txt'),
+      '--lexicon', [join(assets, 'lexicon-us-en.txt'), join(assets, 'lexicon-zh.txt')].join(','),
+      '--data-dir', join(assets, 'espeak-ng-data'),
+      '--dict-dir', join(assets, 'dict'),
+      '--rule-fsts', [join(assets, 'date-zh.fst'), join(assets, 'phone-zh.fst'), join(assets, 'number-zh.fst')].join(','),
+      '--host', '127.0.0.1',
+      '--port', String(port),
+      '--num-threads', String(threads),
+      '--sid', String(kokoroSid()),
+    ]
+    this.log(`starting tts sidecar (kokoro): ${command} (port ${port}, threads ${threads})`)
+    const logPath = join(this.paths.root, 'tts-server.log')
+    try { mkdirSync(this.paths.root, { recursive: true }) } catch { /* 忽略 */ }
+    const appendLog = (line: string): void => {
+      try { appendFileSync(logPath, line) } catch { /* 忽略 */ }
+    }
+    const child = spawn(command, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    this.child = child
+    this.stderrTail = ''
+    appendLog(`\n[${new Date().toISOString()}] start kokoro ${command} ${args.join(' ')}\n`)
+    child.stderr?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString('utf8')
+      this.stderrTail = (this.stderrTail + text).slice(-4000)
+      appendLog(text)
+    })
+    child.stdout?.on('data', (chunk: Buffer) => { appendLog(chunk.toString('utf8')) })
+    child.on('exit', (code, signal) => {
+      const wasLoaded = this.modelLoaded
+      this.child = null
+      this.modelLoaded = false
+      this.lastError = `Kokoro 进程退出（code=${code ?? '?'} signal=${signal ?? '-'}）${this.stderrTail ? '：' + this.stderrTail.split('\n').filter(Boolean).slice(-2).join(' ') : ''}`
+      if (wasLoaded) this.log(`tts sidecar exited: ${this.lastError}`)
+    })
+
+    const started = Date.now()
+    for (;;) {
+      if (Date.now() - started > HEALTH_TIMEOUT_MS) {
+        throw new Error(`Kokoro 启动超时（${Math.round(HEALTH_TIMEOUT_MS / 1000)}s）：${this.stderrTail.split('\n').filter(Boolean).slice(-3).join(' ') || '无输出'}`)
+      }
+      if (this.child === null) throw new Error(this.lastError || 'Kokoro 进程启动失败')
+      try {
+        const response = await fetch(`http://127.0.0.1:${this.port}/health`, { signal: AbortSignal.timeout(1500) })
+        if (response.ok) {
+          const info = await response.json().catch(() => null) as
+            { engine?: string; sample_rate?: number; num_speakers?: number; load_ms?: number } | null
+          if (info?.engine === 'kokoro') {
+            this.activeDevice = 'cpu'
+            this.log(`kokoro health: sr=${info.sample_rate} speakers=${info.num_speakers} load=${info.load_ms}ms`)
+            break
+          }
+        }
+      } catch { /* 继续等 */ }
+      await new Promise((resolve) => setTimeout(resolve, 300))
+    }
+    this.modelLoaded = true
+    this.log(`tts sidecar ready in ${Date.now() - started} ms (port ${this.port})`)
+  }
+
   private async pickPort(): Promise<number> {
+    const base = this.options.port ?? this.defaultPort()
     for (let offset = 0; offset < 8; offset += 1) {
-      const port = (this.options.port ?? DEFAULT_PORT) + offset
+      const port = base + offset
       try {
         const response = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(400) })
         // 已有实例（例如热重载前遗留）：直接复用。
@@ -392,7 +726,17 @@ export class TihuTts {
       } catch { /* 端口空闲 */ }
       return port
     }
-    return this.options.port ?? DEFAULT_PORT
+    return base
+  }
+
+  /** 默认端口：Kokoro 走 8731（TIHU_TTS_KOKORO_PORT 可挪）；Qwen 沿用 options/DEFAULT_PORT。 */
+  private defaultPort(): number {
+    if (ttsEngine() === 'kokoro') {
+      const raw = Number(process.env.TIHU_TTS_KOKORO_PORT ?? '')
+      if (Number.isInteger(raw) && raw > 0 && raw < 65536) return raw
+      return KOKORO_PORT_DEFAULT
+    }
+    return DEFAULT_PORT
   }
 
   /** edge-tts 兜底是否可用（脚本 + Python；ffmpeg 由系统 PATH 提供）。 */
@@ -402,8 +746,12 @@ export class TihuTts {
 
   /** 当前引擎的中文标识（页面事件区）。 */
   engineLabel(voice: string): string {
-    if (this.activeEngine === 'edge') return '在线兜底：edge-tts 云健(Yunjian)'
-    if (this.activeEngine === 'none') return '无语音（仅文字）'
+    if (this.engineInUse === 'kokoro') {
+      const sid = kokoroSid(voice)
+      return `本地 Kokoro：${kokoroVoiceName(sid)}（sid ${sid}）`
+    }
+    if (this.engineInUse === 'edge') return '在线兜底：edge-tts 云健(Yunjian)'
+    if (this.engineInUse === 'none') return '无语音（仅文字）'
     return `本地 TTS：qwen3-tts 0.6b-cuda / 音色 ${voice || 'default'}`
   }
 
@@ -508,7 +856,10 @@ export class TihuTts {
 
   /**
    * 合成一段文本并流式输出 PCM 块。
-   * @returns 首块耗时 / 总时长 / 块数（用于报告与日志）。
+   *
+   * 引擎链（2026-11-08 用户拍板）：**Kokoro 本地 → edge 兜底 → （仅显式 qwen）Qwen**。
+   * Kokoro 首块超过 `TIHU_LOCAL_FIRST_MS`（默认 2500ms）直接切 edge，不让首句空等。
+   * 任一路失败都不静默：向上抛可读错误，lane 发红告警。
    */
   async synthesize(
     text: string,
@@ -521,70 +872,205 @@ export class TihuTts {
       signal?: AbortSignal
     },
   ): Promise<SynthResult> {
-    const wantsClone = typeof options.voice === 'string' && options.voice !== '' && options.voice !== 'default'
+    const engine = ttsEngine()
+    // Kokoro 没有克隆概念：voice 在这里是音色名/sid（zf_060、35 都算「选音色」，不是克隆）。
+    const wantsClone = engine !== 'kokoro' && typeof options.voice === 'string' && options.voice !== '' && options.voice !== 'default'
     const offline = options.offlineOnly === true || process.env.TIHU_OFFLINE_ONLY === '1'
-    let primaryError = ''
+    let localError = ''
     let edgeError = ''
-    let triedEdge = false
 
-    // 默认在线云健（不是克隆音色、且未开仅离线）：首块最快、音质最好。
+    // ① Kokoro（默认主引擎）。克隆音色不支持（只有 qwen 路径能克隆）。
+    if (engine === 'kokoro' && !wantsClone) {
+      if (this.backend() === 'kokoro') {
+        try {
+          const result = await this.synthesizeKokoro(text, options)
+          this.setEngine('kokoro')
+          return result
+        } catch (error) {
+          localError = (error as Error)?.message ?? String(error)
+          this.lastError = localError
+          this.log(`kokoro failed（切 edge 兜底）: ${localError}`)
+        }
+      } else {
+        const missing = kokoroMissingFiles()
+        localError = missing.length > 0
+          ? `Kokoro 未就绪（缺 ${missing.slice(0, 3).join('；')}）。${kokoroInstallHint()}`
+          : 'Kokoro 后端不可用（TIHU_TTS_ENGINE 不是 kokoro 或引擎被禁用）'
+        this.log(`kokoro skipped: ${localError}`)
+      }
+    }
+
+    // ② edge 兜底：音色保持 zh-CN-YunjianNeural（TIHU_EDGE_VOICE 可覆盖），rate 不动。
     if (!wantsClone && !offline && this.edgeReady()) {
-      triedEdge = true
-      // 首块超时重试一次 edge：本地兜底在 CPU 上首包 8–54s，换引擎等于丢掉这一句。
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
           const result = await this.synthesizeEdge(text, { ...options, edgeVoice: options.edgeVoice })
           this.setEngine('edge')
           return result
         } catch (error) {
-          primaryError = (error as Error)?.message ?? String(error)
-          edgeError = primaryError
-          const firstChunkTimeout = primaryError.includes('首块超时')
+          edgeError = (error as Error)?.message ?? String(error)
+          const firstChunkTimeout = edgeError.includes('首块超时')
           const willRetry = firstChunkTimeout && attempt === 0
-          this.log(`edge-tts failed${willRetry ? '（首块超时，重试一次 edge）' : ''}: ${primaryError}`)
+          this.log(`edge-tts failed${willRetry ? '（首块超时，重试一次 edge）' : ''}: ${edgeError}`)
           if (!willRetry) break
         }
       }
     }
 
-    // 本地 Qwen：克隆音色必走；在线失败/仅离线时也走；失败则无语音。
+    // ③ Qwen3-TTS 遗留路径：只有显式 TIHU_TTS_ENGINE=qwen（或克隆音色 / 仅离线且无 Kokoro）才走。
     const backend = this.backend()
-    if (backend !== 'none' && cpuFallbackBlocked(wantsClone, backend)) {
-      // 快速失败 + 说清原因：不让每一段都空等行业已成空等的本地兜底（CPU 首包 54s）。
-      const reason = '本地 Qwen 跑在 CPU（实测首包 8–54s），已不再作为默认音色的兜底；要用请设 TIHU_TTS_CPU_FALLBACK=1'
-      primaryError = reason
-      this.lastError = reason
-      this.log(`tts local fallback skipped: ${reason}`)
-    } else if (backend !== 'none') {
-      try {
-        // 在线失败/仅离线走本地时：GPU/Q4 首包 >4.5s 就放弃，避免页面干等；
-        // CPU 见 localFallbackAbortMs()（实测首包 54s，这里不再单独中止）。
-        const controller = new AbortController()
-        const abortMs = localFallbackAbortMs(wantsClone, backend)
-        const timer = abortMs > 0 ? setTimeout(() => controller.abort(), abortMs) : null
+    if (backend !== 'none' && (engine === 'qwen' || wantsClone || offline)) {
+      if (cpuFallbackBlocked(wantsClone, backend)) {
+        // 快速失败 + 说清原因：不让每一段都空等行业已成空等的本地兜底（CPU 首包 54s）。
+        const reason = '本地 Qwen 跑在 CPU（实测首包 8–54s），已不再作为默认音色的兜底；要用请设 TIHU_TTS_CPU_FALLBACK=1'
+        localError = reason
+        this.lastError = reason
+        this.log(`tts local fallback skipped: ${reason}`)
+      } else {
         try {
-          const result = await this.synthesizeCodec(text, { ...options, signal: options.signal ?? controller.signal })
-          this.setEngine('gpu')
-          return result
-        } finally {
-          if (timer !== null) clearTimeout(timer)
+          const controller = new AbortController()
+          const abortMs = localFallbackAbortMs(wantsClone, backend)
+          const timer = abortMs > 0 ? setTimeout(() => controller.abort(), abortMs) : null
+          try {
+            const result = await this.synthesizeCodec(text, { ...options, signal: options.signal ?? controller.signal })
+            this.setEngine('gpu')
+            return result
+          } finally {
+            if (timer !== null) clearTimeout(timer)
+          }
+        } catch (error) {
+          localError = (error as Error)?.message ?? String(error)
+          this.gpuFailed = true
+          this.fallbackNote = `本地 Qwen 失败：${localError}`
+          this.log(`tts qwen failed: ${localError}`)
         }
-      } catch (error) {
-        primaryError = (error as Error)?.message ?? String(error)
-        this.gpuFailed = true
-        this.fallbackNote = `本地 Qwen 失败：${primaryError}`
-        this.log(`tts qwen failed: ${primaryError}`)
       }
     }
 
-    this.activeEngine = 'none'
+    this.engineInUse = 'none'
     this.lastLabel = '无语音（仅文字）'
-    throw new Error(`本次无语音：在线兜底不可用且本地引擎未就绪（在线：${edgeError || '未启用'}；本地：${primaryError || '未就绪'}）`)
+    throw new Error(`本次无语音：Kokoro 与 edge 都失败（Kokoro：${localError || '未启用'}；edge：${edgeError || (offline ? '仅离线模式已禁用' : '不可用')}）`)
   }
 
-  private setEngine(engine: 'gpu' | 'edge' | 'none'): void {
-    this.activeEngine = engine
+  private setEngine(engine: 'kokoro' | 'gpu' | 'edge' | 'none'): void {
+    this.engineInUse = engine
     this.lastLabel = this.engineLabel('')
+  }
+
+  /** 本地合成串行化：同时只允许 1 路在合（多设备/多段排队，绝不 12 路并上 CPU）。 */
+  private serializeLocal<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.localLock.then(fn, fn)
+    this.localLock = run.then(() => undefined, () => undefined)
+    return run
+  }
+
+  /** 调用常驻 Kokoro sidecar（内部 WS：JSON 请求 + 二进制 PCM）。 */
+  private async synthesizeKokoro(
+    text: string,
+    options: {
+      voice?: string
+      sessionId?: string
+      onChunk: (chunk: { data: Buffer; seq: number; total: number; final: boolean }) => void
+      signal?: AbortSignal
+    },
+  ): Promise<SynthResult> {
+    await this.ensureServer()
+    return this.serializeLocal(() => this.kokoroRequest(text, options))
+  }
+
+  private async kokoroRequest(
+    text: string,
+    options: {
+      voice?: string
+      sessionId?: string
+      onChunk: (chunk: { data: Buffer; seq: number; total: number; final: boolean }) => void
+      signal?: AbortSignal
+    },
+  ): Promise<SynthResult> {
+    const started = Date.now()
+    const sid = kokoroSid(options.voice)
+    const budget = localFirstChunkMs()
+    const chunker = new Pcm16Chunker()
+    let chunks = 0
+    let bytes = 0
+    let firstChunkAt = 0
+    const socket = openWebSocket(`ws://127.0.0.1:${this.port}/tts`)
+    // 关键：默认 binaryType=blob，PCM 会变成 Blob（拿不到字节）→ 必须改成 arraybuffer。
+    socket.binaryType = 'arraybuffer'
+    try {
+      const meta = await new Promise<{ audio_ms?: number; elapsed_ms?: number; cpu_s?: number }>((resolve, reject) => {
+        let settled = false
+        const timers: Array<ReturnType<typeof setTimeout>> = []
+        const cleanup = (): void => { for (const timer of timers) clearTimeout(timer) }
+        const fail = (message: string): void => {
+          if (settled) return
+          settled = true
+          cleanup()
+          try { socket.close() } catch { /* 忽略 */ }
+          reject(new Error(message))
+        }
+        socket.onerror = () => fail('Kokoro sidecar 连接失败（WebSocket error）')
+        socket.onclose = () => { if (!settled) fail('Kokoro sidecar 提前关闭连接') }
+        socket.onopen = () => {
+          try {
+            socket.send(JSON.stringify({ type: 'synth', id: 1, text, sid, speed: 1.0 }))
+          } catch (error) {
+            fail(`Kokoro 请求发送失败：${(error as Error)?.message ?? String(error)}`)
+          }
+        }
+        socket.onmessage = (event: { data: unknown }) => {
+          const data = event.data
+          if (typeof data === 'string') {
+            let message: any
+            try { message = JSON.parse(data) } catch { return }
+            if (message?.type === 'error') {
+              fail(`Kokoro 合成失败：${String(message?.message ?? '未知错误')}`)
+              return
+            }
+            if (message?.type === 'done') {
+              if (settled) return
+              settled = true
+              cleanup()
+              try { socket.close() } catch { /* 忽略 */ }
+              resolve({
+                audio_ms: Number(message?.audio_ms) || 0,
+                elapsed_ms: Number(message?.elapsed_ms) || 0,
+                cpu_s: Number(message?.cpu_s) || 0,
+              })
+            }
+            return
+          }
+          const view = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array((data as any)?.buffer ?? [])
+          if (view.byteLength === 0) return
+          if (firstChunkAt === 0) firstChunkAt = Date.now()
+          bytes += view.byteLength
+          for (const block of chunker.push(view)) {
+            options.onChunk({ data: block, seq: chunks, total: 0, final: false })
+            chunks += 1
+          }
+        }
+        timers.push(setTimeout(() => fail(`Kokoro 首块超时（${budget}ms 未返回音频）`), budget))
+        timers.push(setTimeout(() => fail('Kokoro 合成超时（60s）'), 60_000))
+        const signal = options.signal
+        if (signal !== undefined) {
+          const onAbort = (): void => fail('已取消（本轮朗读被换绑/更新的一轮取代）')
+          if (signal.aborted) onAbort()
+          else signal.addEventListener('abort', onAbort, { once: true })
+        }
+      })
+      const tail = chunker.finish()
+      for (const block of tail) {
+        options.onChunk({ data: block.data, seq: chunks, total: chunks + 1, final: block.final })
+        chunks += 1
+      }
+      const totalMs = Date.now() - started
+      const audioMs = Math.round((bytes / 2 / TTS_SAMPLE_RATE) * 1000)
+      if (audioMs < 50) throw new Error('Kokoro 没有返回有效音频（少于 50ms）')
+      this.log(`kokoro ok chars=${[...text].length} sid=${sid} first=${firstChunkAt === 0 ? '?' : firstChunkAt - started}ms total=${totalMs}ms audio=${audioMs}ms server=${meta.elapsed_ms ?? '?'}ms cpu=${meta.cpu_s ?? '?'}s chunks=${chunks}`)
+      return { sampleRate: TTS_SAMPLE_RATE, firstChunkMs: firstChunkAt === 0 ? totalMs : firstChunkAt - started, audioMs, totalMs, chunks }
+    } finally {
+      try { socket.close() } catch { /* 忽略 */ }
+    }
   }
 
   private async synthesizeCodec(
@@ -677,9 +1163,14 @@ export class TihuTts {
     return voiceDirOf(workspace)
   }
 
-  /** 列出工作区音色（默认 + `.tihu/voices/*.json`）。 */
+  /** 列出音色：Kokoro 模式下内置中文音色表 + 默认 + 工作区克隆音色。 */
   async listVoices(sessionId?: string): Promise<VoiceInfo[]> {
-    const voices: VoiceInfo[] = [{ name: 'default', kind: 'default' }]
+    const voices: VoiceInfo[] = [{ name: 'default', kind: 'default', note: this.backend() === 'kokoro' ? `默认 Kokoro ${kokoroVoiceName(kokoroSid())}` : undefined }]
+    if (this.backend() === 'kokoro') {
+      for (const voice of KOKORO_ZH_VOICES) {
+        voices.push({ name: voice.name, kind: 'default', note: `${voice.gender === 'f' ? '中文女声' : '中文男声'} sid ${voice.sid}` })
+      }
+    }
     const dir = this.workspaceDir(sessionId)
     try {
       const files = await readdir(dir)

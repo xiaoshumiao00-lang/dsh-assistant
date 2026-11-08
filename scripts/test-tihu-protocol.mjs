@@ -62,7 +62,17 @@ import { fitViewport, replyViewport, replyWindow, splitReplySentences, splitSpee
 import { stripToolNoise, toSpeechText } from '../src/tihu/speech-text.ts'
 import { groupProjects, humanTitle, projectNameOf } from '../src/tihu/project-groups.ts'
 import { Pcm16Chunker, TTS_CHUNK_BYTES, TTS_SAMPLE_RATE, validateReferenceWav } from '../src/tihu/audio.ts'
-import { normalizeVoiceName } from '../src/tihu/tts.ts'
+import {
+  KOKORO_ZH_VOICES,
+  kokoroModelPath,
+  kokoroScriptPath,
+  kokoroSid,
+  kokoroVoiceName,
+  localFirstChunkMs,
+  normalizeVoiceName,
+  repoModelDirs,
+  ttsEngine,
+} from '../src/tihu/tts.ts'
 import { WsFrameParser, encodeFrame } from '../src/pocket-host/ws-deflate.mjs'
 
 let passed = 0
@@ -2567,19 +2577,132 @@ test('TTS 文本清洗：markdown/emoji/链接，屏幕原文不动', () => {
   assert.equal(/\s{2,}/.test(toSpeechText('**a**\n\n☑️ b')), false)
 })
 
-test('语音切段：长句按逗号/32 字切分，首包不必等整句', () => {
+test('语音切段：长句按逗号/80 字切分，首段 ≤20 字（先开口）', () => {
   const text = '这是一个用于测试语音切段的长句子，' + '它需要在逗号处断开，'.repeat(12) + '最后结束。'
   const sentences = splitReplySentences(text)
   const segments = splitSpeechSegments(text)
   assert.ok(segments.length > sentences.length)
   assert.equal(segments[0].start, 0)
   for (let i = 1; i < segments.length; i += 1) assert.ok(segments[i].start >= segments[i - 1].end)
+  assert.ok([...segments[0].text].length <= 20, `首段必须 ≤20 字（首包），实际 ${[...segments[0].text].length}：${segments[0].text}`)
   for (const segment of segments) {
-    assert.ok([...segment.text].length <= 32, `片段超长：${segment.text}`)
+    assert.ok([...segment.text].length <= 80, `片段超长：${segment.text}`)
     assert.equal([...text].slice(segment.start, segment.end).join('').trim(), segment.text)
     assert.ok(segment.sentenceIndex >= 0 && segment.sentenceIndex < sentences.length)
     assert.ok(segment.start >= sentences[segment.sentenceIndex].start && segment.end <= sentences[segment.sentenceIndex].end)
   }
+})
+
+/* ---------- Kokoro 主引擎（2026-11-08 用户拍板） ---------- */
+
+/** 临时改环境变量跑一段断言，结束后原样恢复。 */
+function withEnv(vars, fn) {
+  const saved = new Map()
+  for (const [key, value] of Object.entries(vars)) {
+    saved.set(key, process.env[key])
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+  try {
+    fn()
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+test('引擎默认值：Kokoro 主引擎、edge 兜底、qwen 只有显式设置才启用', () => {
+  withEnv({ TIHU_TTS_ENGINE: undefined }, () => assert.equal(ttsEngine(), 'kokoro', '默认必须是 kokoro'))
+  withEnv({ TIHU_TTS_ENGINE: '' }, () => assert.equal(ttsEngine(), 'kokoro'))
+  withEnv({ TIHU_TTS_ENGINE: 'edge' }, () => assert.equal(ttsEngine(), 'edge'))
+  withEnv({ TIHU_TTS_ENGINE: 'qwen' }, () => assert.equal(ttsEngine(), 'qwen', '显式 qwen 才启用旧 sidecar'))
+  withEnv({ TIHU_TTS_ENGINE: 'qwen-cuda' }, () => assert.equal(ttsEngine(), 'qwen', '旧值兼容成 qwen'))
+  withEnv({ TIHU_TTS_ENGINE: 'kokoro' }, () => assert.equal(ttsEngine(), 'kokoro'))
+  withEnv({ TIHU_TTS_ENGINE: 'nonsense' }, () => assert.equal(ttsEngine(), 'kokoro', '不认得的取值回落 kokoro'))
+})
+
+test('本地首块门限：TIHU_LOCAL_FIRST_MS 默认 2500，夹在 1–60s', () => {
+  withEnv({ TIHU_LOCAL_FIRST_MS: undefined }, () => assert.equal(localFirstChunkMs(), 2500, '默认 2500ms'))
+  withEnv({ TIHU_LOCAL_FIRST_MS: '1200' }, () => assert.equal(localFirstChunkMs(), 1200))
+  withEnv({ TIHU_LOCAL_FIRST_MS: '0' }, () => assert.equal(localFirstChunkMs(), 1000, '下限 1000ms'))
+  withEnv({ TIHU_LOCAL_FIRST_MS: '999999' }, () => assert.equal(localFirstChunkMs(), 60000, '上限 60000ms'))
+  withEnv({ TIHU_LOCAL_FIRST_MS: 'abc' }, () => assert.equal(localFirstChunkMs(), 2500, '非数字回落默认'))
+})
+
+test('Kokoro 模型路径：仓库内 fp32 model.onnx，绝不指向 int8', () => {
+  withEnv({ TIHU_KOKORO_MODEL_DIR: undefined, TIHU_KOKORO_MODEL: undefined }, () => {
+    const modelPath = kokoroModelPath()
+    assert.ok(modelPath.endsWith('model.onnx'), `模型文件必须是 model.onnx，实际 ${modelPath}`)
+    assert.equal(/int8/i.test(modelPath), false, `不能指向 int8：${modelPath}`)
+    assert.ok(repoModelDirs()[0].includes(join('models', 'kokoro', 'kokoro-multi-lang-v1_1')), '仓库内 models 路径必须排第一')
+    assert.ok(kokoroScriptPath().endsWith(join('scripts', 'tihu-kokoro-tts-server.py')), '驱动脚本必须在仓库 scripts/ 下')
+  })
+})
+
+test('Kokoro 中文音色：女声 sid 3–57、男声 58–102，默认 sid 35 = zf_060', () => {
+  assert.equal(KOKORO_ZH_VOICES.length, 100, '中文音色 100 个（55 女 + 45 男）')
+  assert.deepEqual(KOKORO_ZH_VOICES[0], { sid: 3, name: 'zf_001', gender: 'f' })
+  assert.deepEqual(KOKORO_ZH_VOICES[KOKORO_ZH_VOICES.length - 1], { sid: 102, name: 'zm_100', gender: 'm' })
+  assert.equal(KOKORO_ZH_VOICES.filter((voice) => voice.gender === 'f').length, 55)
+  assert.equal(KOKORO_ZH_VOICES.filter((voice) => voice.gender === 'm').length, 45)
+  withEnv({ TIHU_KOKORO_SID: undefined }, () => {
+    assert.equal(kokoroSid(), 35, '默认 sid 35')
+    assert.equal(kokoroVoiceName(35), 'zf_060')
+  })
+  assert.equal(kokoroSid('zf_001'), 3, '音色名 → sid')
+  assert.equal(kokoroSid('zm_100'), 102)
+  assert.equal(kokoroSid('58'), 58)
+  assert.equal(kokoroSid('sid70'), 70)
+  withEnv({ TIHU_KOKORO_SID: '58' }, () => assert.equal(kokoroSid('default'), 58, 'TIHU_KOKORO_SID 生效'))
+})
+
+test('Kokoro 驱动脚本接上了 num-threads 与 number/date/phone 词典规则', () => {
+  const script = readFileSync(new URL('./tihu-kokoro-tts-server.py', import.meta.url), 'utf8')
+  for (const token of ['--num-threads', '--rule-fsts', 'number-zh.fst', 'date-zh.fst', 'phone-zh.fst', '--model-dir', '--lexicon', '--data-dir']) {
+    assert.ok(script.includes(token), `驱动脚本缺少 ${token}`)
+  }
+  assert.ok(script.includes('int8'), '脚本要显式拒绝 int8 权重')
+})
+
+testAsync('本地 Kokoro 串行：5 句只允许 1 路在合（不并发抢 CPU）', async () => {
+  let inFlight = 0
+  let maxInFlight = 0
+  const serialTts = {
+    async ensureServer() {},
+    status: () => ({ available: true, model: 'kokoro multi-lang-v1_1 (sherpa-onnx fp32)' }),
+    engineLabel: () => '本地 Kokoro：zf_060（sid 35）',
+    takeEngineNote: () => '',
+    deviceFallback: () => '',
+    available: () => true,
+    localPrimary: () => true,
+    async synthesize(_text, options) {
+      inFlight += 1
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      for (let seq = 0; seq < 2; seq += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 15))
+        options.onChunk({ data: Buffer.alloc(4800), seq, total: 2, final: seq === 1 })
+      }
+      inFlight -= 1
+      return { sampleRate: 24000, firstChunkMs: 20, audioMs: 100, totalMs: 40, chunks: 2 }
+    },
+    async createVoice() { throw new Error('n/a') },
+    async listVoices() { return [{ name: 'default', kind: 'default' }] },
+    dispose() {},
+  }
+  const { runtime, events } = runtimeFor([cuRecord('session-1', { live: true, lastPromptAt: 1000 })], {}, { instance: serialTts })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'serial', protocol: '0', sessionId: 'session-1' }, 1)))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+  onSessionEvent({ id: 'session-1', header: { id: 'session-1' } }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: '甲句。乙句。丙句。丁句。戊句。' }] } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 600))
+  assert.equal(maxInFlight, 1, `本地引擎必须串行（maxInFlight 应为 1，实际 ${maxInFlight}）`)
+  runtime.dispose()
 })
 
 test('回复行不出现省略号：折行留安全边距、页面 CSS 不再 ellipsis', () => {
@@ -2995,6 +3118,8 @@ await testAsync('lane：12 并发下 edge 首块门限不误杀', async () => {
   const instance = new ttsModule.TihuTts({ log: () => {}, threads: 1 })
   let edgeCalls = 0
   let codecCalls = 0
+  // 本机装了 Kokoro 模型时 backend() 会是 kokoro；这条用例只测 edge 重试语义，固定按无本地引擎跑。
+  instance.backend = () => 'none'
   instance.edgeReady = () => true
   instance.synthesizeEdge = async (_text, options) => {
     edgeCalls += 1
@@ -3038,7 +3163,8 @@ await testAsync('tts：本地 Qwen CPU 首包 54s 时不得 4.5s 中止', async 
   )
   process.env.TIHU_TTS_CPU_FALLBACK = '1'
   delete process.env.TIHU_TTS_CPU_FALLBACK
-  // 默认音色 + CPU + edge 失败：立刻给出明确原因，不进 4.5s/45s 的本地等待，更不能静默返回 0 字节
+  // 默认音色 + CPU + edge 失败：立刻给出明确原因，不进 4.5s/45s 的本地等待，更不能静默返回 0 字节。
+  // 2026-11-08 起 Qwen 只有显式 TIHU_TTS_ENGINE=qwen 才启用，这条用例显式开 qwen 才能测到该路径。
   const instance = new ttsModule.TihuTts({ log: () => {}, threads: 1 })
   let codecCalls = 0
   instance.edgeReady = () => true
@@ -3046,11 +3172,16 @@ await testAsync('tts：本地 Qwen CPU 首包 54s 时不得 4.5s 中止', async 
   instance.ensureServer = async () => {}
   instance.synthesizeEdge = async () => { throw new Error('edge-tts 没有返回音频：') }
   instance.synthesizeCodec = async () => { codecCalls += 1; throw new Error('不该走到本地兜底') }
-  await assert.rejects(
-    instance.synthesize('第一句。', { onChunk: () => {} }),
-    /CPU/,
-    'CPU 兜底被禁用时要抛出带 CPU 原因的错，不能静默返回空音频',
-  )
+  process.env.TIHU_TTS_ENGINE = 'qwen'
+  try {
+    await assert.rejects(
+      instance.synthesize('第一句。', { onChunk: () => {} }),
+      /CPU/,
+      'CPU 兜底被禁用时要抛出带 CPU 原因的错，不能静默返回空音频',
+    )
+  } finally {
+    delete process.env.TIHU_TTS_ENGINE
+  }
   assert.equal(codecCalls, 0, `CPU 兜底禁用时不许再发一次 54s 的请求，实际发了 ${codecCalls} 次`)
   instance.dispose()
 })
