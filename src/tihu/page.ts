@@ -90,7 +90,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen ul { margin:0; padding:0; list-style:none; font-size:16px; line-height:20px; color:#c3ccd5; }
   #screen ul li { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #screen .reply-body { display:none; flex:1; overflow:hidden; font-size:16px; line-height:20px; color:#d9e2ea; }
+  /* 回答屏正文（2026-11-08 第二轮：气泡不压文字、末行不裁）：
+     垂直预算 224 = 顶行 14 + 间隙 4×2 + 正文 170 + 按钮行 32（与 screen-spec 的 REPLY_LAYOUT 同一组数字）。
+     正文固定 7 行 × 20px = 140，末行下面留 30px（其中 20px 是一整行安全高度）：
+     右侧气泡轨（64px，正文在 rail-on 时让到 240px）、进度条（reply-mode 收掉）、顶行都进不了这块；
+     宿主只下发 7 行，页面最多也只画 7 行，绝不把第 8 行裁成半行。 */
+  #screen .reply-body { display:none; flex:1; min-height:0; overflow:hidden; font-size:16px; line-height:20px; color:#d9e2ea; }
   #screen .reply-line { white-space:nowrap; overflow:hidden; }
   #screen .reply-line.cur { background:var(--accent); color:#04110f; border-radius:3px; }
   #screen .home-body { display:none; flex:1; overflow:hidden; }
@@ -269,7 +274,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
 </div>
 
 <div class="card" id="voiceCard">
-  <h4>音色 · 本地 TTS（Qwen3-TTS 0.6B）</h4>
+  <h4>音色 · 主引擎 edge-tts（离线兜底：本地 Kokoro）</h4>
   <div class="row">
     <select id="voiceSelect" style="flex:1"></select>
     <button id="audioTest" title="念一句示例语音，验证声音（不出声就点它）">试听</button>
@@ -289,7 +294,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     </select>
   </div>
   <label class="hint" style="display:flex;align-items:center;gap:6px;margin-top:8px">
-    <input id="offlineOnly" type="checkbox" style="width:auto" /> 仅离线（禁用 edge 云健，走本地 Qwen）
+    <input id="offlineOnly" type="checkbox" style="width:auto" /> 仅离线（跳过 edge 云健，改用本地 Kokoro 兜底）
   </label>
   <input id="voiceNote" placeholder="备注（可选）" style="margin-top:8px" />
   <div class="hint" id="voiceHint">仅可用于你本人或已获授权的音色；参考音频只在本机处理，不上传云端。</div>
@@ -842,7 +847,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
   }
 
-  /* reply 模式渲染：句子窗口 → 每行 18 字 → 可视 10 行，当前句反色并居中。 */
+  /* reply 模式渲染：句子窗口 → 按 304/240 像素折行 → 可视 7 行（末行下留一整行安全高度），当前句反色。 */
   function renderReply() {
     var reply = state.reply;
     var body = $('replyBody');
@@ -1342,10 +1347,19 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     if (!select) return;
     select.innerHTML = '';
     for (var i = 0; i < state.voices.length; i += 1) {
+      var voice = state.voices[i];
       var option = document.createElement('option');
-      option.value = state.voices[i].name;
-      option.textContent = state.voices[i].kind === 'default' ? '默认音色' : (state.voices[i].name + (state.voices[i].durationMs ? '（' + Math.round(state.voices[i].durationMs / 1000) + 's）' : ''));
-      if (state.voices[i].name === state.voice) option.selected = true;
+      option.value = voice.name;
+      // 默认项是 edge 云健；Kokoro 音色（zf_/zm_）选中即手动切到本地兜底，名字必须可区分，
+      // 否则 100 个默认项全写「默认音色」就选不出来（切过去的音色设置也不能丢）。
+      if (voice.name === 'default') {
+        option.textContent = voice.note ? String(voice.note) : '默认音色';
+      } else if (voice.kind === 'default') {
+        option.textContent = voice.name + (voice.note ? '（' + String(voice.note).replace('本地 Kokoro · ', '') + '）' : '');
+      } else {
+        option.textContent = voice.name + (voice.durationMs ? '（' + Math.round(voice.durationMs / 1000) + 's）' : '');
+      }
+      if (voice.name === state.voice) option.selected = true;
       select.appendChild(option);
     }
     var engine = state.voiceEngine;
@@ -1353,10 +1367,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       $('voiceHint').textContent = '无语音：' + (engine.error || '在线兜底不可用且本地引擎未就绪') + '（本条只显示文字）。';
     } else {
       var model = (engine && engine.model) || '本地引擎';
-      if (model.indexOf('edge-tts') >= 0) {
-        $('voiceHint').textContent = '在线兜底：edge-tts 云健(Yunjian) / 音色 默认。仅可用于你本人或已获授权的音色。';
+      if (model.indexOf('edge-tts') >= 0 && model.indexOf('Kokoro') < 0) {
+        $('voiceHint').textContent = '主引擎：edge-tts 云健(Yunjian) / 音色默认；选 zf_/zm_ 音色即手动切到本地 Kokoro（离线兜底）。仅可用于你本人或已获授权的音色。';
       } else {
-        $('voiceHint').textContent = '本地 TTS：' + model + ' / 音色 ' + state.voice + '。仅可用于你本人或已获授权的音色；参考音频只在本机处理。';
+        $('voiceHint').textContent = '本地 Kokoro：' + model + ' / 音色 ' + state.voice + '。仅可用于你本人或已获授权的音色；参考音频只在本机处理。';
       }
     }
   }

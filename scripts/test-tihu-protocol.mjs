@@ -57,8 +57,8 @@ import {
   sanitizeScreenLine,
   summarizeToolResult,
 } from '../src/tihu/progress.ts'
-import { ACTUAL_SIZE_SCALE, CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX, SCREEN_SPEC, TEXT_WRAP_SAFETY_PX, TITLE_BOLD_FACTOR, clipScreenTitle, fitLine, fitScreenLines, measureTextPx, wrapTextPx } from '../src/tihu/screen-spec.ts'
-import { fitViewport, replyViewport, replyWindow, splitReplySentences, splitSpeechSegments, wrapReplyLines } from '../src/tihu/reply.ts'
+import { ACTUAL_SIZE_SCALE, CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX, REPLY_LAYOUT, SCREEN_BORDER_PX, SCREEN_SPEC, TEXT_WRAP_SAFETY_PX, TITLE_BOLD_FACTOR, clipScreenTitle, fitLine, fitScreenLines, measureTextPx, wrapTextPx } from '../src/tihu/screen-spec.ts'
+import { fitViewport, replyViewport, replyVisibleWindow, replyWindow, splitReplySentences, splitSpeechSegments, wrapReplyLines } from '../src/tihu/reply.ts'
 import { stripToolNoise, toSpeechText } from '../src/tihu/speech-text.ts'
 import { groupProjects, humanTitle, projectNameOf } from '../src/tihu/project-groups.ts'
 import { Pcm16Chunker, TTS_CHUNK_BYTES, TTS_SAMPLE_RATE, validateReferenceWav } from '../src/tihu/audio.ts'
@@ -68,9 +68,13 @@ import {
   kokoroScriptPath,
   kokoroSid,
   kokoroVoiceName,
+  isKokoroVoice,
   localFirstChunkMs,
   normalizeVoiceName,
+  offlineFlagReason,
+  probeEdgeReachable,
   repoModelDirs,
+  resetEdgeProbeCache,
   ttsEngine,
 } from '../src/tihu/tts.ts'
 import { WsFrameParser, encodeFrame } from '../src/pocket-host/ws-deflate.mjs'
@@ -2540,9 +2544,9 @@ test('回复分句与滚动窗口：800 字下标连续、窗口居中、行不�
   assert.equal(replyWindow(sentences, 0, 2)[0].index, 0)
   assert.equal(replyWindow(sentences, sentences.length - 1, 2).slice(-1)[0].index, sentences.length - 1)
 
-  // 可视窗口：10 行、当前句居中、每行 ≤18 字
+  // 可视窗口：7 行、当前句居中、每行不超宽
   const viewport = replyViewport(sentences, middle)
-  assert.ok(viewport.lines.length <= 10)
+  assert.ok(viewport.lines.length <= 7)
   for (const line of viewport.lines) assert.ok(measureTextPx(line.text, SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX, `行超宽：${line.text}`)
   assert.ok(viewport.currentLine >= 3 && viewport.currentLine <= 6, `当前句应在中部，实际第 ${viewport.currentLine} 行`)
   assert.ok(viewport.lines[viewport.currentLine].sentenceIndex === middle)
@@ -2554,7 +2558,65 @@ test('回复分句与滚动窗口：800 字下标连续、窗口居中、行不�
   // 空文本
   assert.deepEqual(splitReplySentences(''), [])
   assert.deepEqual(fitViewport([], 0).lines, [])
-  assert.equal(SCREEN_SPEC.replyVisibleLines, 9)
+  assert.equal(SCREEN_SPEC.replyVisibleLines, REPLY_LAYOUT.visibleLines)
+})
+
+/* ---------- 回答屏版式：气泡不压文字、末行留一整行安全高度（2026-11-08 第二轮） ---------- */
+
+test('回答屏版式定量：正文 7 行、末行下 30px（含一整行 20px 安全行），304/240 都摆得下', () => {
+  // 224 内容高 = 顶行 14 + 2×4 间隙 + 正文 170 + 按钮行 32
+  assert.equal(REPLY_LAYOUT.contentHeightPx, 224)
+  assert.equal(REPLY_LAYOUT.stageHeightPx, 14)
+  assert.equal(REPLY_LAYOUT.actionBarHeightPx, 32)
+  assert.equal(REPLY_LAYOUT.columnGapPx, 4)
+  assert.equal(REPLY_LAYOUT.bodyHeightPx, 170)
+  assert.equal(REPLY_LAYOUT.bodyHeightPx, 224 - 14 - 32 - 4 * 2)
+  assert.equal(REPLY_LAYOUT.visibleLines, SCREEN_SPEC.replyVisibleLines)
+  assert.equal(REPLY_LAYOUT.visibleLines, 7, '每屏 7 行')
+  assert.equal(REPLY_LAYOUT.usedHeightPx, 140)
+  assert.equal(REPLY_LAYOUT.bottomFreePx, 30, '末行下方 30px')
+  assert.ok(REPLY_LAYOUT.bottomFreePx >= REPLY_LAYOUT.safeLinePx, '末行下至少要留一整行 20px 安全高度')
+  // 页面 #screen 还有 1px 边框：实际内容 222、正文 168，7 行 140 仍留 28 ≥ 20。
+  const actualBody = REPLY_LAYOUT.bodyHeightPx - SCREEN_BORDER_PX * 2
+  assert.equal(actualBody, 168)
+  assert.ok(actualBody - REPLY_LAYOUT.usedHeightPx >= REPLY_LAYOUT.safeLinePx, '带边框时末行下仍有 ≥20px')
+  // 240 宽有轨：正文 240 + 气泡轨 64 = 304 ≤ 内容宽，横向不压字
+  assert.equal(REPLY_LAYOUT.railBodyWidthPx, 240)
+  assert.equal(REPLY_LAYOUT.railWidthPx, 64)
+  assert.ok(REPLY_LAYOUT.railBodyWidthPx + REPLY_LAYOUT.railWidthPx <= REPLY_LAYOUT.plainBodyWidthPx)
+
+  // 304（无轨）与 240（有轨）两种宽度：折行不超安全宽、窗口正好 7 行、高度预算不越界
+  const longText = '这是一段用来验证回答屏版式定量的长文本，包含中文、English 和数字 2026。'.repeat(8)
+  for (const widthPx of [REPLY_LAYOUT.plainBodyWidthPx, REPLY_LAYOUT.railBodyWidthPx]) {
+    const wrapped = wrapTextPx(longText, widthPx, SCREEN_SPEC.bodyFontPx)
+    assert.ok(wrapped.length > REPLY_LAYOUT.visibleLines, `${widthPx}px 折出的行数要多于可视行`)
+    for (const line of wrapped) {
+      assert.ok(measureTextPx(line, SCREEN_SPEC.bodyFontPx) <= widthPx - TEXT_WRAP_SAFETY_PX, `${widthPx}px 行超安全宽：${line}`)
+    }
+    const win = replyVisibleWindow(wrapped.map((text) => ({ text, sentenceIndex: 0 })), 0, { widthPx })
+    assert.equal(win.lines.length, 7, `${widthPx}px 每屏 7 行`)
+    assert.ok(win.lines.length * REPLY_LAYOUT.lineHeightPx + REPLY_LAYOUT.safeLinePx <= REPLY_LAYOUT.bodyHeightPx, `${widthPx}px 高度没给安全行留够`)
+    assert.equal(win.offset, 0)
+    assert.equal(win.maxOffset, wrapped.length - 7)
+  }
+
+  // 装不下的最后一行（例如旧帧按 304 折好、突然切到 240 有轨）：末尾省略号收住，不溢出
+  const wideLines = wrapTextPx('一'.repeat(34), REPLY_LAYOUT.plainBodyWidthPx, SCREEN_SPEC.bodyFontPx)
+  const cut = replyVisibleWindow(wideLines.map((text) => ({ text, sentenceIndex: 0 })), 0, { widthPx: REPLY_LAYOUT.railBodyWidthPx })
+  assert.equal(cut.truncated, true, '超宽最后一行要被收住')
+  assert.ok(cut.lines[cut.lines.length - 1].text.endsWith('…'), '末尾必须是省略号')
+  assert.ok(measureTextPx(cut.lines[cut.lines.length - 1].text, SCREEN_SPEC.bodyFontPx) <= REPLY_LAYOUT.railBodyWidthPx, '省略后不得超宽')
+})
+
+test('回答屏页面 CSS：气泡轨 64px、rail-on 正文 240px、reply-mode 收掉进度条，三者都不进正文区', () => {
+  const pageSource = readFileSync(new URL('../src/tihu/page.ts', import.meta.url), 'utf8')
+  const railRule = pageSource.split(String.fromCharCode(10)).find((line) => line.includes('.pending-rail {') && line.includes('width:64px'))
+  assert.ok(railRule !== undefined, '气泡轨宽度必须是 64px')
+  assert.ok(pageSource.includes('#screen.rail-on .reply-body'), '有气泡轨时正文要缩到 240px 让开')
+  const narrowAt = pageSource.indexOf('#screen.rail-on .title')
+  const narrowWidthAt = narrowAt < 0 ? -1 : pageSource.indexOf('width:240px', narrowAt)
+  assert.ok(narrowAt >= 0 && narrowWidthAt > narrowAt && narrowWidthAt - narrowAt < 300, 'rail-on 时正文可用宽必须是 240px')
+  assert.ok(pageSource.includes('#screen.reply-mode .title, #screen.reply-mode ul, #screen.reply-mode .bar { display:none; }'), '回答屏必须收掉进度条/标题/正文列表')
 })
 
 test('TTS 分段带字符区间：tts.text 的 charStart/charEnd 与句边界一致', () => {
@@ -2613,22 +2675,145 @@ function withEnv(vars, fn) {
   }
 }
 
-test('引擎默认值：Kokoro 主引擎、edge 兜底、qwen 只有显式设置才启用', () => {
-  withEnv({ TIHU_TTS_ENGINE: undefined }, () => assert.equal(ttsEngine(), 'kokoro', '默认必须是 kokoro'))
-  withEnv({ TIHU_TTS_ENGINE: '' }, () => assert.equal(ttsEngine(), 'kokoro'))
+test('引擎默认值：edge 主引擎、Kokoro 只在手动/离线兜底、qwen 只有显式设置才启用', () => {
+  withEnv({ TIHU_TTS_ENGINE: undefined }, () => assert.equal(ttsEngine(), 'edge', '默认必须是 edge'))
+  withEnv({ TIHU_TTS_ENGINE: '' }, () => assert.equal(ttsEngine(), 'edge'))
   withEnv({ TIHU_TTS_ENGINE: 'edge' }, () => assert.equal(ttsEngine(), 'edge'))
   withEnv({ TIHU_TTS_ENGINE: 'qwen' }, () => assert.equal(ttsEngine(), 'qwen', '显式 qwen 才启用旧 sidecar'))
   withEnv({ TIHU_TTS_ENGINE: 'qwen-cuda' }, () => assert.equal(ttsEngine(), 'qwen', '旧值兼容成 qwen'))
-  withEnv({ TIHU_TTS_ENGINE: 'kokoro' }, () => assert.equal(ttsEngine(), 'kokoro'))
-  withEnv({ TIHU_TTS_ENGINE: 'nonsense' }, () => assert.equal(ttsEngine(), 'kokoro', '不认得的取值回落 kokoro'))
+  withEnv({ TIHU_TTS_ENGINE: 'kokoro' }, () => assert.equal(ttsEngine(), 'kokoro', '显式 kokoro 是手动切/离线兜底'))
+  withEnv({ TIHU_TTS_ENGINE: 'nonsense' }, () => assert.equal(ttsEngine(), 'edge', '不认得的取值回落 edge'))
 })
 
-test('本地首块门限：TIHU_LOCAL_FIRST_MS 默认 2500，夹在 1–60s', () => {
-  withEnv({ TIHU_LOCAL_FIRST_MS: undefined }, () => assert.equal(localFirstChunkMs(), 2500, '默认 2500ms'))
+await testAsync('离线判定：只看明确依据（仅离线 / 宿主离线 / 网络探测 / edge 请求失败），不猜', async () => {
+  withEnv({ TIHU_OFFLINE_ONLY: undefined, TIHU_HOST_OFFLINE: undefined }, () => {
+    assert.equal(offlineFlagReason(), '', '没有开关时不算离线')
+    assert.equal(offlineFlagReason(false), '')
+  })
+  assert.ok(offlineFlagReason(true).includes('仅离线'), '设备「仅离线」开关是明确依据')
+  withEnv({ TIHU_OFFLINE_ONLY: '1' }, () => assert.ok(offlineFlagReason().includes('TIHU_OFFLINE_ONLY')))
+  withEnv({ TIHU_HOST_OFFLINE: '1' }, () => assert.ok(offlineFlagReason().includes('TIHU_HOST_OFFLINE')))
+  // 网络探测：指向一个必然连不上的本地端口 → 探测结果必须是 false（不是猜，是实测）。
+  process.env.TIHU_EDGE_PROBE_URL = 'http://127.0.0.1:9/'
+  resetEdgeProbeCache()
+  try {
+    assert.equal(await probeEdgeReachable(), false, '连不上探测目标必须判为离线')
+  } finally {
+    delete process.env.TIHU_EDGE_PROBE_URL
+    resetEdgeProbeCache()
+  }
+})
+
+test('本地首块门限：TIHU_LOCAL_FIRST_MS 默认 4000，夹在 1–60s', () => {
+  withEnv({ TIHU_LOCAL_FIRST_MS: undefined }, () => assert.equal(localFirstChunkMs(), 4000, '默认 4000ms（兜底路径给足余量）'))
   withEnv({ TIHU_LOCAL_FIRST_MS: '1200' }, () => assert.equal(localFirstChunkMs(), 1200))
   withEnv({ TIHU_LOCAL_FIRST_MS: '0' }, () => assert.equal(localFirstChunkMs(), 1000, '下限 1000ms'))
   withEnv({ TIHU_LOCAL_FIRST_MS: '999999' }, () => assert.equal(localFirstChunkMs(), 60000, '上限 60000ms'))
-  withEnv({ TIHU_LOCAL_FIRST_MS: 'abc' }, () => assert.equal(localFirstChunkMs(), 2500, '非数字回落默认'))
+  withEnv({ TIHU_LOCAL_FIRST_MS: 'abc' }, () => assert.equal(localFirstChunkMs(), 4000, '非数字回落默认'))
+})
+
+test('Kokoro 不默认自启：edge 主用时 backend=none、ensureServer 不 spawn、手切才走 Kokoro', async () => {
+  const ttsModule = await import('../src/tihu/tts.ts')
+  const saved = { engine: process.env.TIHU_TTS_ENGINE, offline: process.env.TIHU_OFFLINE_ONLY, host: process.env.TIHU_HOST_OFFLINE }
+  delete process.env.TIHU_TTS_ENGINE
+  delete process.env.TIHU_OFFLINE_ONLY
+  delete process.env.TIHU_HOST_OFFLINE
+  try {
+    const instance = new ttsModule.TihuTts({ log: () => {}, threads: 1 })
+    instance.edgeReady = () => true
+    assert.equal(instance.backend(), 'none', 'edge 主用没有常驻 sidecar')
+    assert.equal(instance.localPrimary(), false, 'edge 主用不按本地单路串行（最多 3 路）')
+    assert.equal(instance.status().model, 'edge-tts 云健(Yunjian)')
+    assert.equal(instance.engineFor(), 'edge')
+    assert.equal(instance.engineFor('zf_060'), 'kokoro', '屏上手选 Kokoro 音色 = 手动切 Kokoro')
+    assert.equal(instance.engineFor('default', true), 'kokoro', '仅离线开关 = 离线兜底')
+    assert.equal(isKokoroVoice('zf_060'), true)
+    assert.equal(isKokoroVoice('sid35'), true)
+    assert.equal(isKokoroVoice('default'), false)
+    assert.equal(isKokoroVoice('my_voice'), false)
+    await instance.ensureServer()
+    assert.equal(instance.child, null, 'edge 主用时 ensureServer 不许 spawn Kokoro sidecar')
+    instance.dispose()
+  } finally {
+    if (saved.engine === undefined) delete process.env.TIHU_TTS_ENGINE
+    else process.env.TIHU_TTS_ENGINE = saved.engine
+    if (saved.offline === undefined) delete process.env.TIHU_OFFLINE_ONLY
+    else process.env.TIHU_OFFLINE_ONLY = saved.offline
+    if (saved.host === undefined) delete process.env.TIHU_HOST_OFFLINE
+    else process.env.TIHU_HOST_OFFLINE = saved.host
+  }
+})
+
+await testAsync('引擎链：edge 主用成功不碰 Kokoro；edge 失败 / 仅离线 / 手切才启用 Kokoro', async () => {
+  const ttsModule = await import('../src/tihu/tts.ts')
+  const result = { sampleRate: 24000, firstChunkMs: 10, audioMs: 100, totalMs: 20, chunks: 1 }
+  const make = (logs = []) => {
+    const instance = new ttsModule.TihuTts({ log: (line) => logs.push(line), threads: 1 })
+    instance.edgeReady = () => true
+    instance.kokoroReady = () => true
+    instance.edgeNetworkReachable = async () => true
+    instance.ensureKokoroServer = async () => {}
+    return instance
+  }
+  const chunk = (options) => options.onChunk({ data: Buffer.alloc(4800), seq: 0, total: 0, final: false })
+
+  // ① 默认 edge：成功就返回，绝不碰 Kokoro
+  const ok = make()
+  let okEdge = 0
+  let okKokoro = 0
+  ok.synthesizeEdge = async (_text, options) => { okEdge += 1; chunk(options); return result }
+  ok.synthesizeKokoro = async (_text, options) => { okKokoro += 1; chunk(options); return result }
+  await ok.synthesize('第一句。', { onChunk: () => {} })
+  assert.equal(okEdge, 1, '默认必须走 edge')
+  assert.equal(okKokoro, 0, 'edge 成功时不许启用 Kokoro')
+  assert.equal(ok.activeEngine(), 'edge')
+  ok.dispose()
+
+  // ② edge 请求失败（网络可达）= edge 不可用 → 启用 Kokoro 兜底
+  const logs = []
+  const bad = make(logs)
+  let badKokoro = 0
+  bad.synthesizeEdge = async () => { throw new Error('edge-tts 失败（exit 1）：403') }
+  bad.synthesizeKokoro = async (_text, options) => { badKokoro += 1; chunk(options); return result }
+  await bad.synthesize('第一句。', { onChunk: () => {} })
+  assert.equal(badKokoro, 1, 'edge 请求失败必须落 Kokoro 兜底')
+  assert.equal(bad.activeEngine(), 'kokoro')
+  assert.ok(logs.some((line) => line.includes('offline fallback')), '兜底要留下明确依据日志：' + logs.join(' | '))
+  bad.dispose()
+
+  // ③ 探测不到网络（edge 失败 + 探测 false）→ 兜底，且日志写明网络探测
+  const netLogs = []
+  const net = make(netLogs)
+  net.edgeNetworkReachable = async () => false
+  let netKokoro = 0
+  net.synthesizeEdge = async () => { throw new Error('fetch failed') }
+  net.synthesizeKokoro = async (_text, options) => { netKokoro += 1; chunk(options); return result }
+  await net.synthesize('第一句。', { onChunk: () => {} })
+  assert.equal(netKokoro, 1)
+  assert.ok(netLogs.some((line) => line.includes('网络探测失败')), '离线依据要说清是网络探测失败：' + netLogs.join(' | '))
+  net.dispose()
+
+  // ④ 仅离线：一次 edge 请求都不发，直接 Kokoro
+  const offline = make()
+  let offlineEdge = 0
+  let offlineKokoro = 0
+  offline.synthesizeEdge = async () => { offlineEdge += 1; return result }
+  offline.synthesizeKokoro = async (_text, options) => { offlineKokoro += 1; chunk(options); return result }
+  await offline.synthesize('第一句。', { offlineOnly: true, onChunk: () => {} })
+  assert.equal(offlineEdge, 0, '仅离线时不许发 edge 请求')
+  assert.equal(offlineKokoro, 1)
+  offline.dispose()
+
+  // ⑤ 手切 Kokoro 音色：先走 Kokoro
+  const manual = make()
+  let manualEdge = 0
+  let manualKokoro = 0
+  manual.synthesizeEdge = async () => { manualEdge += 1; return result }
+  manual.synthesizeKokoro = async (_text, options) => { manualKokoro += 1; chunk(options); return result }
+  await manual.synthesize('第一句。', { voice: 'zf_001', onChunk: () => {} })
+  assert.equal(manualKokoro, 1, '手切 Kokoro 音色必须先走 Kokoro')
+  assert.equal(manualEdge, 0)
+  manual.dispose()
 })
 
 test('Kokoro 模型路径：仓库内 fp32 model.onnx，绝不指向 int8', () => {
@@ -3139,6 +3324,10 @@ await testAsync('lane：12 并发下 edge 首块门限不误杀', async () => {
   let strictEdge = 0
   strict.edgeReady = () => true
   strict.backend = () => 'none'
+  // 这条用例只测「edge 失败后不再重试」，把离线兜底与网络探测钉成确定性空实现，
+  // 免得在单测里真的去 spawn Kokoro / 探测公网（兜底行为由上面的引擎链用例覆盖）。
+  strict.kokoroReady = () => false
+  strict.edgeNetworkReachable = async () => true
   strict.synthesizeEdge = async () => { strictEdge += 1; throw new Error('edge-tts 失败（exit 1）：403') }
   await assert.rejects(strict.synthesize('第一句。', { onChunk: () => {} }), /403/)
   assert.equal(strictEdge, 1, '非首块超时不要重试 edge（避免 403 白等两轮）')

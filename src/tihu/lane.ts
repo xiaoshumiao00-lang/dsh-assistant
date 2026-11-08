@@ -66,10 +66,10 @@ import {
 } from './guard.ts'
 import { tihuPageHtml } from './page.ts'
 import { applyEarlyThinking, applySessionEvent, confirmationFrame, createProgressState, decodeRateOf, pushDecodeSample, type TihuDecodeSample, type TihuProgressState } from './progress.ts'
-import { TihuTts, type TihuTtsPaths } from './tts.ts'
-import { replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
+import { TihuTts, isKokoroVoice, type TihuTtsPaths } from './tts.ts'
+import { replyVisibleWindow, replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
 import { stripToolNoise, toSpeechText } from './speech-text.ts'
-import { CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
+import { CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX, REPLY_LAYOUT, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
 import { cardsFromState, groupCardProjects, groupProjects, groupWorkspaceProjects, humanTitle, projectCardsSignature, projectNameOf, type ProjectReply, type TihuCardRow, type TihuWorkspaceRow } from './project-groups.ts'
 import { matchSessionRows, type ControlSessionRow, type DeviceStatusView, type SessionProgressView, type TihuControlDevice, type TihuControlSurface } from './control.ts'
 import type { AlertPayload, TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
@@ -427,7 +427,11 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     ...(options.tts?.port === undefined ? {} : { port: options.tts.port }),
     ...(options.tts?.paths === undefined ? {} : { paths: options.tts.paths }),
   })
-  // 仅真实插件（pocket-host）启动时预热：Kokoro 常驻进程冷加载 1.1–2.1s，提前拉起省首包。
+  /**
+   * 只对**显式常驻**的后端预热（`TIHU_TTS_ENGINE=kokoro` 或遗留 qwen）。
+   * edge 主用时 backend() 恒为 none → 这里什么都不做：Kokoro 的 ~300MB 模型和 4 个线程
+   * 只有在离线兜底真的触发、或用户手切 Kokoro 音色时（ensureKokoroServer）才允许拉起。
+   */
   if (options.tts?.prewarm === true && options.tts?.disabled !== true && tts.backend() !== 'none') {
     void tts.ensureServer().catch((error) => log(`tihu tts prewarm failed: ${(error as Error)?.message ?? String(error)}`))
   }
@@ -1149,9 +1153,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
     state.currentIndex = currentIndex
     state.charPos = charPos
-    const visibleLines = SCREEN_SPEC.replyVisibleLines
-    const maxOffset = Math.max(0, state.lines.length - visibleLines)
-    state.offset = Math.max(0, Math.min(state.offset, maxOffset))
+    // 回答屏正文窗口：按 REPLY_LAYOUT 固定行数（7 行）切，末行下面留一整行安全高度；
+    // 万一行缓存来自更宽的排版（304→240 切换的旧帧），最后一行用像素省略号收住，绝不溢出。
+    const visible = replyVisibleWindow(state.lines, state.offset, { widthPx, visibleLines: REPLY_LAYOUT.visibleLines })
+    state.offset = visible.offset
     const list = includeAll ? sentences : replyWindow(sentences, currentIndex)
     const totalChars = sentences.length > 0 ? sentences[sentences.length - 1].end : 0
     return {
@@ -1166,9 +1171,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         total: sentences.length,
         totalChars,
         charPos,
-        lines: state.lines.slice(state.offset, state.offset + visibleLines),
+        lines: visible.lines,
         // 页面只拿到可视窗口，位置指示要的「总共几行」得宿主给（2026-11-08 方案 B）。
-        scroll: { offset: state.offset, maxOffset, total: state.lines.length },
+        scroll: { offset: visible.offset, maxOffset: visible.maxOffset, total: state.lines.length },
         follow: state.follow,
       },
       pending: pending.slice(0, 4).map((item) => ({ sessionId: item.sessionId, title: item.title, at: item.at, unread: true as const })),
@@ -1718,9 +1723,21 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       log(`tihu tts cancel previous round device=${device.id} session=${sessionId}`)
       try { previousCancel() } catch { /* 忽略：旧轮自己的清理逻辑不该影响新一轮 */ }
     }
-    // 默认走本地 Kokoro（常驻进程，先确保已拉起）；克隆音色/仅离线同样要本地引擎。
+    // 默认走 edge（每次合成现起进程，不需要常驻）；只有手切 Kokoro 音色 / 仅离线 /
+    // 显式 TIHU_TTS_ENGINE=kokoro 才需要拉起 Kokoro sidecar。
     const localPrimary = typeof (tts as any).localPrimary === 'function' ? Boolean((tts as any).localPrimary()) : false
-    if (localPrimary || (device.voice && device.voice !== 'default') || device.offlineOnly) await tts.ensureServer()
+    const kokoroRequested = isKokoroVoice(device.voice)
+    if (kokoroRequested || device.offlineOnly) {
+      try {
+        if (typeof (tts as any).ensureKokoroServer === 'function') {
+          await tts.ensureKokoroServer()
+        } else {
+          await tts.ensureServer()
+        }
+      } catch { /* 合成阶段会给出可读错误 / 红告警 */ }
+    } else if (localPrimary || (device.voice && device.voice !== 'default')) {
+      await tts.ensureServer()
+    }
     const status = tts.status()
     if (!status.available) {
       device.send('event.alert', { level: 'error', text: `本次无语音：在线兜底不可用且本地引擎未就绪（原因：${status.error ?? '未安装模型'}）` })
@@ -2018,7 +2035,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             if (scrollState !== undefined && scrollState.follow) {
               const lineIndex = scrollState.lines.findIndex((line) => line.sentenceIndex === segment.sentenceIndex)
               if (lineIndex >= 0) {
-                const maxOffset = Math.max(0, scrollState.lines.length - SCREEN_SPEC.replyVisibleLines)
+                const maxOffset = Math.max(0, scrollState.lines.length - REPLY_LAYOUT.visibleLines)
                 scrollState.offset = Math.max(0, Math.min(lineIndex - 2, maxOffset))
               }
             }
@@ -3040,7 +3057,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           // 手指上滑 dy<0 → 看更早内容 → offset 增大；约 20px 一行。
           const delta = -payload.dy / SCREEN_SPEC.bodyLineHeightPx
           if (payload.phase === 'move' || payload.phase === 'end') {
-            const maxOffset = Math.max(0, scrollState.lines.length - SCREEN_SPEC.replyVisibleLines)
+            const maxOffset = Math.max(0, scrollState.lines.length - REPLY_LAYOUT.visibleLines)
             scrollState.offset = Math.max(0, Math.min(scrollState.offset + delta, maxOffset))
             scrollState.follow = scrollState.offset < 0.5
             followByDevice.set(device.id, scrollState.follow)
@@ -3061,7 +3078,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       device.voice = name === '' ? 'default' : name
       if (typeof message.payload?.edgeVoice === 'string' && message.payload.edgeVoice !== '') device.edgeVoice = message.payload.edgeVoice
       if (typeof message.payload?.offlineOnly === 'boolean') device.offlineOnly = message.payload.offlineOnly
-      if (device.voice !== 'default' && tts.available()) {
+      // 手切到 Kokoro 音色 / 勾了仅离线：这时才允许 spawn Kokoro sidecar（edge 主用不预热）。
+      if (isKokoroVoice(device.voice) || device.offlineOnly) {
+        if (typeof (tts as any).ensureKokoroServer === 'function') {
+          void tts.ensureKokoroServer().catch((error) => log(`tihu kokoro prewarm failed: ${(error as Error)?.message ?? String(error)}`))
+        }
+      } else if (device.voice !== 'default' && tts.available()) {
         void tts.ensureServer().catch((error) => log(`tihu tts clone prewarm failed: ${(error as Error)?.message ?? String(error)}`))
       }
       device.send('event.progress', { stage: '音色', text: `音色已切换：${device.voice}` } satisfies ProgressPayload)
@@ -3083,7 +3105,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         } satisfies AlertPayload)
         return
       }
-      if ((device.voice && device.voice !== 'default') || device.offlineOnly) {
+      if (isKokoroVoice(device.voice) || device.offlineOnly) {
+        if (typeof (tts as any).ensureKokoroServer === 'function') {
+          try { await tts.ensureKokoroServer() } catch { /* 合成阶段会给出可读错误 */ }
+        }
+      } else if (device.voice && device.voice !== 'default') {
         try { await tts.ensureServer() } catch { /* 合成阶段会给出可读错误 */ }
       }
       try {

@@ -1,10 +1,11 @@
 /**
  * 回复正文阅读（reply 模式）的分句 / 窗口计算（纯函数）。
  *
- * 屏幕 320×240：正文 16px、行高 20、每行 18 字、可视 10 行（≈180 字/屏）。
+ * 屏幕 320×240：正文 16px、行高 20、每行约 18 字（304 宽）/14 字（240 宽）、
+ * 回答屏可视 7 行（约 126 / 98 字每屏），末行下面固定留一行安全高度。
  * 滚动按**句子**跳：当前朗读句保持在可视区中部；LVGL 固件照这份逻辑实现。
  */
-import { CONTENT_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
+import { CONTENT_WIDTH_PX, REPLY_LAYOUT, SCREEN_SPEC, fitLine, measureTextPx, wrapTextPx } from './screen-spec.ts'
 
 export interface ReplySentence {
   index: number
@@ -144,7 +145,7 @@ export function wrapReplyLines(sentences: ReplySentence[], widthPx = CONTENT_WID
 export function replyViewport(
   sentences: ReplySentence[],
   currentIndex: number,
-  visibleLines = SCREEN_SPEC.replyVisibleLines,
+  visibleLines: number = REPLY_LAYOUT.visibleLines,
   widthPx = CONTENT_WIDTH_PX,
 ): { lines: ReplyLine[]; startLine: number; currentLine: number } {
   const window = replyWindow(sentences, currentIndex)
@@ -156,7 +157,7 @@ export function replyViewport(
 export function fitViewport(
   lines: ReplyLine[],
   currentIndex: number,
-  visibleLines = SCREEN_SPEC.replyVisibleLines,
+  visibleLines: number = SCREEN_SPEC.replyVisibleLines,
 ): { lines: ReplyLine[]; startLine: number; currentLine: number } {
   if (lines.length === 0) return { lines: [], startLine: 0, currentLine: 0 }
   const currentLine = Math.max(0, lines.findIndex((line) => line.sentenceIndex === currentIndex))
@@ -166,4 +167,33 @@ export function fitViewport(
   start = Math.max(0, Math.min(start, lines.length - visibleLines))
   const slice = lines.slice(start, start + visibleLines)
   return { lines: slice, startLine: start, currentLine: Math.max(0, currentLine - start) }
+}
+
+/**
+ * 回答屏真正下发的可视窗口（宿主 lane 与单测共用）：
+ *   - 按 {@link REPLY_LAYOUT.visibleLines}（7 行）切窗口，`offset` 夹在 [0, maxOffset]；
+ *   - 窗口高度 = 7×20 = 140，末行下方固定留 30px（≥ 一整行 20px 安全高度），
+ *     气泡轨 / 进度条 / 顶行都进不了这一块；
+ *   - 最后一行如果比当前可用宽还宽（旧帧从 304 切到 240 的极端情况），末尾用省略号收住，
+ *     绝不让它溢出到右侧气泡轨或底部按钮行。
+ */
+export function replyVisibleWindow(
+  lines: ReplyLine[],
+  offset: number,
+  options: { widthPx?: number; visibleLines?: number } = {},
+): { lines: ReplyLine[]; offset: number; maxOffset: number; truncated: boolean } {
+  const widthPx = options.widthPx ?? CONTENT_WIDTH_PX
+  const visibleLines = Math.max(1, options.visibleLines ?? REPLY_LAYOUT.visibleLines)
+  const maxOffset = Math.max(0, lines.length - visibleLines)
+  const start = Math.max(0, Math.min(Math.round(Number.isFinite(offset) ? offset : 0), maxOffset))
+  const shown = lines.slice(start, start + visibleLines).map((line) => ({ ...line }))
+  let truncated = false
+  if (shown.length > 0) {
+    const last = shown[shown.length - 1]
+    if (measureTextPx(last.text, SCREEN_SPEC.bodyFontPx) > widthPx) {
+      last.text = fitLine(last.text, widthPx, SCREEN_SPEC.bodyFontPx)
+      truncated = true
+    }
+  }
+  return { lines: shown, offset: start, maxOffset, truncated }
 }
