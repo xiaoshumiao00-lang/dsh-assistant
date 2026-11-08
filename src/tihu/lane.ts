@@ -1398,10 +1398,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       ? undefined
       : { sessionId: owner.sessionId, title: humanTitle(titleForSession(owner.sessionId)), at: owner.at }
     log(`tihu home recent session=${sessionId} owner=${owner?.sessionId ?? '-'} hasLastReply=${String(lastReplies.get(boundOwner) !== undefined)} history=${String(replyHistory.get(boundOwner)?.length ?? 0)}`)
-    // 首页 stage 行（用户 2026-11-08 要求写清页数）：宿主把要显示的一行文本直接给页面，
-    // 页面不再自己拼「p/t」；数字与页数都按 1 起计数，一行 12px 小字必长不过 304px。
+    // 首页最上方那一行现在归页面自己画（本地时钟 HH:MM + 三格信号柱，用户 2026-11-08 确认）：
+    // 宿主不再往 stage 写「项目 N 个 · 第 x/y 页」，也不把时间/连接状态塞进帧里（那是页面侧的事）。
+    // home.total / home.page 照留：协议字段只增不删，底部翻页按钮与手势切页都还要用页码。
     const frame: ScreenFramePayload = {
-      stage: `项目 ${projects.length} 个 · 第 ${state.page + 1}/${totalPages} 页`,
+      stage: '',
       title: '',
       bullets: [],
       tone: 'ok',
