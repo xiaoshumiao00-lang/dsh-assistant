@@ -340,6 +340,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
    * 没绑定该会话的设备收不到事件，早退会把跟踪丢掉。
    */
   const runningSessions = new Map<string, number>()
+  /** 事件里带来的会话模式（preset）：列表缓存有 60s TTL，刚建的会话只能靠它判 CU。 */
+  const sessionPresets = new Map<string, string>()
   /**
    * 朗读（音频）状态：sessionId → { speaking, until }。
    *   - speaking：正在跑的 speakLocally 数（合成+下发还没结束就算「在播」）；
@@ -455,6 +457,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /** 这条会话是不是 Computer Use 模式：按列表缓存里的 preset 判，查不到当不是。 */
   function isComputerUseSession(sessionId: string): boolean {
+    const live = sessionPresets.get(sessionId)
+    if (live !== undefined && live !== '') return isComputerUsePreset(live)
     const row = sessionListCache?.rows.find((item) => item.sessionId === sessionId)
     if (row === undefined) return false
     return isComputerUsePreset(row.preset ?? '')
@@ -1967,6 +1971,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         }
       }
       const type = String(event?.type ?? '')
+      const sessionPreset = presetOf(session)
+      if (sessionPreset !== '') sessionPresets.set(sessionId, sessionPreset)
       if (type === 'turn/start') runningSessions.set(sessionId, Date.now())
       else if (type === 'turn/end') runningSessions.delete(sessionId)
       // 运行跟踪与自动跟随都在设备早退**之前**：没绑定该会话的设备收不到事件，
