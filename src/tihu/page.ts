@@ -70,7 +70,22 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .reply-line.cur { background:var(--accent); color:#04110f; border-radius:3px; }
   #screen .home-body { display:none; flex:1; overflow:hidden; }
   #screen.home-mode .home-body { display:block; }
-  #screen.home-mode .title, #screen.home-mode ul, #screen.home-mode .reply-body, #screen.home-mode .bar { display:none; }
+  #screen.home-mode .title, #screen.home-mode ul, #screen.home-mode .reply-body, #screen.home-mode .bar,
+  #screen.home-mode .action-bar, #screen.home-mode .run-list { display:none; }
+  /* 回复屏底部动作条（停止 / 重读 / 主页） */
+  #screen .action-bar { display:none; flex:none; gap:6px; padding-top:4px; }
+  #screen.reply-mode .action-bar { display:flex; }
+  #screen .action-bar button { flex:1; min-height:28px; border-radius:6px; border:1px solid #33414f;
+    background:#1b2430; color:#d9e2ea; font-size:13px; }
+  #screen .action-bar button:active { background:#2c3d4e; }
+  /* 状态屏底部：其他正在运行的会话 */
+  #screen .run-list { display:none; flex:none; margin-top:6px; }
+  #screen.run-on .run-list { display:block; }
+  #screen .run-row { display:flex; align-items:center; gap:6px; height:22px; font-size:13px; color:#9fb0c0;
+    border-top:1px solid #1e2a36; }
+  #screen .run-row .dot { width:6px; height:6px; border-radius:50%; background:#35d07f; flex:none; }
+  #screen .run-row .t { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  #screen .run-row .go { color:#4f8ef7; font-size:12px; flex:none; }
   #screen .tap-flash { position:absolute; width:28px; height:28px; margin:-14px 0 0 -14px; border-radius:50%;
     background:rgba(255,255,255,.35); pointer-events:none; z-index:5; animation:tapFlash .18s ease-out forwards; }
   @keyframes tapFlash { from { opacity:.8; transform:scale(.4); } to { opacity:0; transform:scale(1.4); } }
@@ -168,7 +183,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         <div class="stage" id="stage">连接</div>
         <div class="title" id="title">正在连接宿主…</div>
         <ul id="bullets"></ul>
+        <div id="runList" class="run-list"></div>
         <div id="replyBody" class="reply-body"></div>
+        <div id="actionBar" class="action-bar"></div>
         <div id="homeBody" class="home-body"></div>
         <div id="pendingRail" class="pending-rail"></div>
         <div id="scrollHint" class="scroll-hint"></div>
@@ -313,7 +330,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     audioCtx: null, pcmSources: [], pcmNextTime: 0, turnPcm: [],
     samplePending: false, sampleTimer: 0,
     voice: 'default', voices: [], voiceEngine: null,
-    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, screenMode: 'status', pending: [], boundProject: '', homeProjects: [], screenScale: 2 };
+    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, screenMode: 'status', pending: [], boundProject: '', homeProjects: [], screenScale: 2, actions: [], running: [] };
 
   /* ---------- 会话定位 ----------
      2026-11-07 P0：localStorage **按 origin 隔离**。用户在桌面宿主
@@ -435,6 +452,41 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       ? ('已绑定：' + (state.boundProject || state.sessionTitle || '未命名会话'))
       : '';
   }
+  function renderActions() {
+    var bar = $('actionBar');
+    bar.innerHTML = '';
+    var actions = state.actions || [];
+    for (var i = 0; i < actions.length; i += 1) {
+      var button = document.createElement('button');
+      button.textContent = actions[i].label;
+      button.setAttribute('data-action', actions[i].id);
+      bar.appendChild(button);
+    }
+  }
+  function renderRunning() {
+    var list = $('runList');
+    var screen = $('screen');
+    list.innerHTML = '';
+    var rows = state.running || [];
+    for (var i = 0; i < rows.length; i += 1) {
+      var row = document.createElement('div');
+      row.className = 'run-row';
+      row.setAttribute('data-session', rows[i].sessionId);
+      var dot = document.createElement('span');
+      dot.className = 'dot';
+      var text = document.createElement('span');
+      text.className = 't';
+      text.textContent = rows[i].title;
+      var go = document.createElement('span');
+      go.className = 'go';
+      go.textContent = '切换';
+      row.appendChild(dot);
+      row.appendChild(text);
+      row.appendChild(go);
+      list.appendChild(row);
+    }
+    if (rows.length) screen.classList.add('run-on'); else screen.classList.remove('run-on');
+  }
   function renderScreen(payload) {
     var screen = $('screen');
     renderPending(payload || {});
@@ -449,6 +501,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       homeBody.innerHTML = '';
       var projects = payload.home.projects || [];
       state.homeProjects = projects;
+      state.actions = [];
+      state.running = [];
+      renderActions();
+      renderRunning();
       for (var pi = 0; pi < projects.length; pi += 1) {
         var project = projects[pi];
         var item = document.createElement('div');
@@ -484,6 +540,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       $('stage').textContent = clipScreen(payload.stage || '回答中', SCREEN.stageChars);
       screen.className = (payload.tone || 'ok') + ' reply-mode';
       renderReply();
+      state.running = [];
+      renderRunning();
+      state.actions = payload.actions || [];
+      renderActions();
       return;
     }
     state.screenMode = 'status';
@@ -504,6 +564,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     });
     $('replyBody').innerHTML = '';
     screen.className = payload.tone || 'idle';
+    state.actions = [];
+    renderActions();
+    state.running = payload.running || [];
+    renderRunning();
     var progress = payload.progress;
     if (progress && typeof progress.done === 'number') {
       $('progress').textContent = progress.total ? (progress.done + '/' + progress.total) : String(progress.done);
@@ -1570,6 +1634,22 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
           }
         }
         if (hit) { send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'chip', targetSessionId: hit }); return; }
+        var under = document.elementFromPoint(event.clientX, event.clientY);
+        if (under && under.getAttribute) {
+          var actionId = under.getAttribute('data-action');
+          if (actionId) {
+            if (actionId === 'stop') stopPcm();
+            if (actionId === 'home') tapFlash(event.clientX - rect.left, event.clientY - rect.top);
+            send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'action', actionId: actionId });
+            return;
+          }
+          var rowEl = under.closest ? under.closest('.run-row') : null;
+          var rowSession = rowEl && rowEl.getAttribute('data-session');
+          if (rowSession) {
+            send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'switch', targetSessionId: rowSession });
+            return;
+          }
+        }
         if (state.screenMode === 'home' && state.homeProjects && state.homeProjects.length) {
           var idx = Math.floor((y - $('homeBody').offsetTop) / 36);
           if (idx >= 0 && idx < state.homeProjects.length) {
