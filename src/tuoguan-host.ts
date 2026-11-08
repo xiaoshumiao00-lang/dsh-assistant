@@ -44,7 +44,8 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { installAutoContinue, tuoguanStateIsOn } from './tuoguan-autocontinue'
-import { installAutoAnswer } from './tuoguan-autoanswer'
+import { createTuoguanGate, installAutoAnswer, sessionAncestry } from './tuoguan-autoanswer'
+import { installTuoguanGate } from './tuoguan-gate'
 
 export const name = 'dsh-assistant-tuoguan'
 
@@ -423,6 +424,42 @@ function installAutoAnswerFor(ctx: any, store: TuoguanStore): () => void {
 }
 
 /**
+ * 给跨 bundle 的消费方（vendor/computer-use 的 code_agent）装一个**只读门控**：
+ * 后台 Code 会话的自动应答以前无条件替用户选答案，现在先问一句「这个会话托管吗」。
+ *
+ * 宿主仍然是唯一读状态的人（同一个 TuoguanStore + 同一套判定），vendor 侧不碰文件；
+ * 读不到状态 / 拿不到会话链 → false（按不托管处理，交回官方审批卡与提问卡）。
+ * 危险动作不经过这里：鹈鹕闸挂在 tools/pre-execute 上，审批只是其中一环。
+ * @param ctx - 宿主插件上下文（用来按 id 取 Agent）。
+ * @param readState - 读托管状态（就是 TuoguanStore.read）。
+ * @returns 卸载函数。
+ */
+export function installTuoguanGateForSignals(
+  ctx: any,
+  readState: () => Promise<TuoguanState> | TuoguanState,
+): () => void {
+  const agentOf = (sessionId: string): any => {
+    try {
+      const agents = optionalService(ctx, 'agents') as { get?: (id: string) => unknown } | undefined
+      return agents?.get?.(sessionId) ?? null
+    } catch {
+      return null
+    }
+  }
+  try {
+    const gate = createTuoguanGate({
+      readState,
+      log: hostLog,
+      ancestryOf: (sessionId) => sessionAncestry(sessionId, agentOf),
+    })
+    return installTuoguanGate(gate)
+  } catch (error) {
+    hostLog(`托管门控启用失败：${String((error as Error)?.message ?? error)}`)
+    return () => void 0
+  }
+}
+
+/**
  * 注册托管状态路由 + 自动续写 + 决策自动应答。宿主在 desktop / web profile 下都提供
  * `webServer`；拿不到时降级为纯客户端插件（旧行为），不抛错、不阻塞其它插件。
  */
@@ -435,13 +472,15 @@ export function apply(ctx: any): void {
     registerTuoguanRoutes(ctx, store)
     installAutoContinueFor(ctx, store)
     installAutoAnswerFor(ctx, store)
+    installTuoguanGateForSignals(ctx, () => store.read())
     return
   }
   effect(() => {
     const detach = registerTuoguanRoutes(ctx, store)
     const detachAutoContinue = installAutoContinueFor(ctx, store)
     const detachAutoAnswer = installAutoAnswerFor(ctx, store)
+    const detachGate = installTuoguanGateForSignals(ctx, () => store.read())
     hostLog(`已挂载托管路由 GET/POST ${STATE_ROUTE}`)
-    return () => { detachAutoAnswer(); detachAutoContinue(); detach() }
+    return () => { detachGate(); detachAutoAnswer(); detachAutoContinue(); detach() }
   })
 }

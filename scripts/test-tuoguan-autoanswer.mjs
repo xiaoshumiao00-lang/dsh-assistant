@@ -9,12 +9,16 @@
  *     缺 id 的题没法按契约作答 → 交回人工；
  *   - 子代理的审批跟着父会话的开关走；普通 fork（深度 0）不往上继承；
  *   - 安装器两个监听都带 `prepend: true`（抢在 api-remotes 转发之前），卸载后摘干净。
+ *   - 后台 Code 会话（vendor/computer-use 的 code_agent）的自动应答跟着托管开关走：
+ *     托管关 / 读不到状态 / 没装门控 → next()；托管开 → 仍按默认项与 allowed-once；
+ *     CU 会话被显式关掉时，它派出去的后台会话也不代答。
  */
 import assert from 'node:assert/strict'
 import {
   APPROVAL_OUTCOME,
   FREE_TEXT_DEFAULT,
   createAutoAnswer,
+  createTuoguanGate,
   defaultAnswerBatch,
   defaultAnswerLabel,
   installAutoAnswer,
@@ -22,6 +26,8 @@ import {
   sessionIdOf,
   tuoguanOnForChain,
 } from '../src/tuoguan-autoanswer.ts'
+import { UNATTENDED_CUSTOM_ANSWER, attachUnattendedCodeAgent } from '../src/cu-unattended.mjs'
+import { installTuoguanGate, tuoguanGateOn } from '../src/tuoguan-gate.ts'
 
 /** 一条「不该被走到的」next 兜底：调用即记录，返回 sentinel。 */
 function makeNext(value = 'next-value') {
@@ -300,6 +306,122 @@ cases.push(['安装器：宿主没有事件总线时安静降级，不抛错', (
   const disposeHost = installAutoAnswer(host.ctx, { readState: () => ({ defaultOn: true }), log: () => {} })
   assert.equal((host.hooks.get('approval/request') ?? []).length, 1)
   disposeHost()
+}])
+
+/* ---------- 后台 Code 会话：自动应答跟着托管开关走 ---------- */
+
+/** 造一个只认 ctx.effect / ctx.on 的后台 Code 会话，再加一条简易 waterfall 便于断言。 */
+function makeCodeAgent(id) {
+  const hooks = new Map()
+  const agent = {
+    id,
+    ctx: {
+      effect(fn) {
+        const dispose = fn()
+        return () => { if (typeof dispose === 'function') dispose() }
+      },
+      on(name, listener, options) {
+        const list = hooks.get(name) ?? []
+        const entry = { listener, options: options ?? {} }
+        list.push(entry)
+        hooks.set(name, list)
+        return () => { hooks.set(name, (hooks.get(name) ?? []).filter((item) => item !== entry)) }
+      },
+    },
+  }
+  const call = async (name, request) => {
+    const list = (hooks.get(name) ?? []).slice()
+    const run = async (index) => {
+      const hook = list[index]
+      if (hook === undefined) return 'host-card'
+      return await hook.listener(request, async () => await run(index + 1))
+    }
+    return await run(0)
+  }
+  return { agent, hooks, call }
+}
+
+/** 照宿主 tuoguan-host 的接法装门控：读状态 + 会话链（含派出它的会话）。 */
+function installHostGate(state, options = {}) {
+  const agents = options.agents ?? {}
+  const gate = createTuoguanGate({
+    readState: options.readState ?? (() => state),
+    ancestryOf: options.ancestryOf ?? ((sessionId) => sessionAncestry(sessionId, (id) => agents[id] ?? null)),
+    log: options.log,
+  })
+  return installTuoguanGate(gate)
+}
+
+const codeApproval = (id, toolName = 'pwsh') => ({ agent: { session: { id } }, toolName })
+const codeQuestions = (id, questions) => ({ agent: { session: { id } }, questions })
+
+cases.push(['后台 Code 会话：托管开 → 审批 allowed-once、提问选默认项（老行为不变）', async () => {
+  const { agent, hooks, call } = makeCodeAgent('code1')
+  attachUnattendedCodeAgent(agent, new WeakSet(), 'cu1')
+  for (const name of ['approval/request', 'user-questions/request']) {
+    assert.equal(hooks.get(name)?.[0]?.options.prepend, true, name + ' 仍要 prepend，抢在浏览器转发前')
+  }
+  const dispose = installHostGate({ defaultOn: true })
+  try {
+    assert.equal(await call('approval/request', codeApproval('code1')), 'allowed-once')
+    assert.deepEqual(await call('user-questions/request', codeQuestions('code1', [
+      { id: 'q1', options: [{ label: '(Recommended) 先这样' }, { label: '别的' }] },
+    ])), { answers: [{ id: 'q1', selected: ['(Recommended) 先这样'] }] })
+    assert.deepEqual(await call('user-questions/request', codeQuestions('code1', [{ id: 'free' }])), {
+      answers: [{ id: 'free', selected: [], custom: UNATTENDED_CUSTOM_ANSWER }],
+    }, '没有选项时仍回原来的自由文本')
+  } finally { dispose() }
+}])
+
+cases.push(['后台 Code 会话：托管关 → 两个请求都 next()，交回宿主 / 用户', async () => {
+  const dispose = installHostGate({ defaultOn: true, off: { code1: true } })
+  try {
+    const { agent, call } = makeCodeAgent('code1')
+    attachUnattendedCodeAgent(agent, new WeakSet(), 'cu1')
+    assert.equal(await call('approval/request', codeApproval('code1')), 'host-card')
+    assert.equal(await call('user-questions/request', codeQuestions('code1', [
+      { id: 'q1', options: [{ label: '默认项' }] },
+    ])), 'host-card')
+  } finally { dispose() }
+}])
+
+cases.push(['后台 Code 会话：读不到托管状态 → 按不托管处理', async () => {
+  const logs = []
+  const dispose = installHostGate(undefined, {
+    readState: () => { throw new Error('state file is gone') },
+    log: (line) => logs.push(line),
+  })
+  try {
+    const { agent, call } = makeCodeAgent('code1')
+    attachUnattendedCodeAgent(agent, new WeakSet(), 'cu1')
+    assert.equal(await call('approval/request', codeApproval('code1')), 'host-card')
+    assert.equal(await call('user-questions/request', codeQuestions('code1', [
+      { id: 'q1', options: [{ label: 'A' }] },
+    ])), 'host-card')
+    assert.equal(logs.some((line) => line.includes('读不到托管状态')), true, '要在宿主日志里留一条')
+  } finally { dispose() }
+}])
+
+cases.push(['后台 Code 会话：CU 会话显式 off → 它派出的后台会话也不应答', async () => {
+  const dispose = installHostGate({ defaultOn: true, off: { cu1: true } })
+  try {
+    const { agent, call } = makeCodeAgent('code1')
+    attachUnattendedCodeAgent(agent, new WeakSet(), 'cu1')
+    assert.equal(await call('approval/request', codeApproval('code1')), 'host-card')
+    assert.equal(await call('user-questions/request', codeQuestions('code1', [
+      { id: 'q1', options: [{ label: 'A' }] },
+    ])), 'host-card')
+  } finally { dispose() }
+}])
+
+cases.push(['后台 Code 会话：没装门控 → 一律不代答（不猜着放行）', async () => {
+  assert.equal(await tuoguanGateOn('code1', 'cu1'), false)
+  const { agent, call } = makeCodeAgent('code1')
+  attachUnattendedCodeAgent(agent, new WeakSet(), 'cu1')
+  assert.equal(await call('approval/request', codeApproval('code1')), 'host-card')
+  assert.equal(await call('user-questions/request', codeQuestions('code1', [
+    { id: 'q1', options: [{ label: 'A' }] },
+  ])), 'host-card')
 }])
 
 let failed = 0
