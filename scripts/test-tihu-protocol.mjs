@@ -41,6 +41,7 @@ import {
   targetPathOf,
 } from '../src/tihu/guard.ts'
 import { createTihuRuntime, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH } from '../src/tihu/lane.ts'
+import { TIHU_CONTROL_SECTION_TEXT, createTihuControlRunner, matchSessionRows, tihuActionNames } from '../src/tihu/control.ts'
 import {
   activityEntryOf,
   applyEarlyThinking,
@@ -4280,6 +4281,231 @@ await testAsync('lane：tool/call 到达时若该步已有思考，先替换占�
     delete process.env.TIHU_THINKING_FLUSH_MS
   }
 })
+
+/* ---------- 2026-11-08：鹈鹕设备控制工具 tihu（control.ts + lane control 面） ---------- */
+
+console.log('[tihu] 控制工具')
+
+test('控制工具：action 全集固定，未知 action 报错列出全部合法值', () => {
+  assert.deepEqual(tihuActionNames(), ['status', 'list_devices', 'bind', 'open_bubble', 'progress', 'list_sessions', 'archive', 'stop_speaking', 'replay', 'go_home', 'browse', 'open_recent'])
+})
+
+test('控制工具：提示段落 ≤120 字，含「口头确认」红线', () => {
+  assert.ok(TIHU_CONTROL_SECTION_TEXT.length <= 120, `提示段落 ${TIHU_CONTROL_SECTION_TEXT.length} 字，超 120：` + TIHU_CONTROL_SECTION_TEXT)
+  assert.ok(TIHU_CONTROL_SECTION_TEXT.includes('口头确认'))
+  assert.ok(TIHU_CONTROL_SECTION_TEXT.includes('confirm=true'))
+})
+
+test('控制工具：标题模糊匹配 精确/前缀/包含/多候选/无结果', () => {
+  const rows = [
+    { sessionId: 'session-98bb83cb-aaaa-1111', title: '鹈鹕语音调试', preset: 'computer-use', live: true, updatedAt: 100 },
+    { sessionId: 'session-11cc22dd-bbbb-2222', title: '鹈鹕实验记录', preset: 'standard', live: false, updatedAt: 200 },
+    { sessionId: 'session-7f33e944-cccc-3333', title: '桥梁温度场论文', preset: 'standard', live: true, updatedAt: 300 },
+  ]
+  const byShortId = matchSessionRows(rows, '98bb83cb')
+  assert.equal(byShortId.kind, 'one')
+  assert.equal(byShortId.row.title, '鹈鹕语音调试')
+  const byFullTitle = matchSessionRows(rows, '桥梁温度场论文')
+  assert.equal(byFullTitle.kind, 'one')
+  assert.equal(byFullTitle.row.sessionId, 'session-7f33e944-cccc-3333')
+  const prefixMany = matchSessionRows(rows, '鹈鹕')
+  assert.equal(prefixMany.kind, 'many')
+  assert.equal(prefixMany.rows.length, 2)
+  const containsOne = matchSessionRows(rows, '实验')
+  assert.equal(containsOne.kind, 'one')
+  assert.equal(containsOne.row.title, '鹈鹕实验记录')
+  assert.equal(matchSessionRows(rows, '完全不存在的词').kind, 'none')
+  const all = matchSessionRows(rows, '')
+  assert.equal(all.kind, 'all')
+  assert.equal(all.rows.length, 3)
+})
+
+/** 假控制面：记录调用，供 execute 级用例注入。 */
+function controlSurfaceFixture(options = {}) {
+  const calls = []
+  const archived = []
+  const devices = options.devices ?? [{ id: 'dev-1', sessionId: 'session-98bb83cb-aaaa-1111', autoFollow: false, voice: 'default', edgeVoice: 'zh-CN-YunjianNeural', offlineOnly: false }]
+  const rows = options.rows ?? [
+    { sessionId: 'session-98bb83cb-aaaa-1111', title: '鹈鹕语音调试', preset: 'computer-use', live: true, updatedAt: 100 },
+    { sessionId: 'session-11cc22dd-bbbb-2222', title: '鹈鹕实验记录', preset: 'standard', live: false, updatedAt: 200 },
+  ]
+  return {
+    calls,
+    archived,
+    surface: {
+      listDevices: () => devices.map((device) => ({ ...device })),
+      deviceOfSession: (sessionId) => {
+        const hit = devices.find((device) => device.sessionId === sessionId)
+        return hit === undefined ? undefined : { ...hit }
+      },
+      deviceStatus: (deviceId) => {
+        const hit = devices.find((device) => device.id === deviceId || device.clientId === deviceId)
+        if (hit === undefined) return undefined
+        return {
+          device: { ...hit },
+          display: hit.sessionId ?? '__unbound__',
+          speaking: false,
+          pinned: false,
+          pending: options.pending ?? [],
+          ...(options.screen === undefined ? {} : { screen: options.screen }),
+        }
+      },
+      listSessions: async (fragment) => matchSessionRows(rows, fragment),
+      bind: async (deviceId, sessionId) => { calls.push(['bind', deviceId, sessionId]); return `已绑定 ${sessionId}` },
+      openBubble: async (deviceId, pick) => { calls.push(['openBubble', deviceId, JSON.stringify(pick)]); return '已点开气泡' },
+      progress: async (sessionId) => { calls.push(['progress', sessionId]); return { sessionId, title: '进度标题', running: true, speaking: false } },
+      archiveSession: async (sessionId) => { calls.push(['archive', sessionId]); archived.push(sessionId); return `已删除（归档）会话「${sessionId}」` },
+      stopSpeaking: async (deviceId) => { calls.push(['stopSpeaking', deviceId]); return '已停止朗读' },
+      replay: async (deviceId) => { calls.push(['replay', deviceId]); return '正在重读当前回答' },
+      goHome: async (deviceId) => { calls.push(['goHome', deviceId]); return '已回主页并钉住' },
+      browse: async (deviceId, direction) => { calls.push(['browse', deviceId, direction]); return `已翻到${direction === 'prev' ? '上' : '下'}一条` },
+      openRecent: async (deviceId) => { calls.push(['openRecent', deviceId]); return '已打开最近回答' },
+    },
+  }
+}
+
+await testAsync('控制工具：未知 action 报错信息完整（列出全部合法 action）', async () => {
+  const { surface } = controlSurfaceFixture()
+  const run = createTihuControlRunner(surface)
+  const failure = await run({ action: 'no_such' }).then(() => null, (error) => error)
+  assert.ok(failure instanceof Error, '未知 action 必须报错')
+  assert.ok(failure.message.includes('未知 action「no_such」'), failure.message)
+  for (const name of tihuActionNames()) assert.ok(failure.message.includes(name), `报错要含 ${name}：` + failure.message)
+})
+
+await testAsync('控制工具：archive 未 confirm 直接拒绝，不碰控制面', async () => {
+  const { surface, calls } = controlSurfaceFixture()
+  const run = createTihuControlRunner(surface)
+  const failure = await run({ action: 'archive', session: '实验' }).then(() => null, (error) => error)
+  assert.ok(failure instanceof Error && failure.message.includes('口头确认'), String(failure))
+  assert.equal(calls.length, 0, '未确认不得触发任何控制面调用')
+})
+
+await testAsync('控制工具：archive 拒绝删除在线设备绑定中的会话', async () => {
+  const { surface, calls } = controlSurfaceFixture()
+  const run = createTihuControlRunner(surface)
+  const failure = await run({ action: 'archive', session: '鹈鹕语音调试', confirm: true }).then(() => null, (error) => error)
+  assert.ok(failure instanceof Error && failure.message.includes('拒绝删除'), String(failure))
+  assert.ok(failure.message.includes('dev-1'), '错误要指出是哪台设备：' + failure.message)
+  assert.equal(calls.length, 0, '守卫触发后不得调用 archiveSession')
+})
+
+await testAsync('控制工具：archive 确认后且无人绑定 → 真正归档', async () => {
+  const { surface, calls, archived } = controlSurfaceFixture({ devices: [] })
+  const run = createTihuControlRunner(surface)
+  const text = await run({ action: 'archive', session: '实验', confirm: true })
+  assert.ok(text.includes('已删除（归档）'), text)
+  assert.deepEqual(archived, ['session-11cc22dd-bbbb-2222'])
+  assert.deepEqual(calls, [['archive', 'session-11cc22dd-bbbb-2222']])
+})
+
+await testAsync('控制工具：会话定位 多候选给清单追问 / 无结果建议 list_sessions / 缺 session 报错', async () => {
+  const { surface, calls } = controlSurfaceFixture()
+  const run = createTihuControlRunner(surface)
+  const many = await run({ action: 'progress', session: '鹈鹕' }).then(() => null, (error) => error)
+  assert.ok(many instanceof Error && many.message.includes('匹配到 2 条'), String(many))
+  assert.ok(many.message.includes('鹈鹕语音调试') && many.message.includes('鹈鹕实验记录'), '候选清单要列全：' + many.message)
+  const none = await run({ action: 'progress', session: '不存在的词' }).then(() => null, (error) => error)
+  assert.ok(none instanceof Error && none.message.includes('list_sessions'), String(none))
+  const missingRef = await run({ action: 'bind' }).then(() => null, (error) => error)
+  assert.ok(missingRef instanceof Error && missingRef.message.includes('需要 session'), String(missingRef))
+  const ok = await run({ action: 'progress', session: '实验' })
+  assert.deepEqual(calls, [['progress', 'session-11cc22dd-bbbb-2222']])
+  assert.ok(ok.includes('进度标题'), ok)
+})
+
+await testAsync('控制工具：设备缺省取调用会话绑定的设备；单台兜底；多台无绑定与零台报错', async () => {
+  // ① 绑定到调用会话的那台优先
+  const a = controlSurfaceFixture({ devices: [
+    { id: 'dev-9', sessionId: 'session-x', autoFollow: false, voice: 'default', edgeVoice: 'e', offlineOnly: false },
+    { id: 'dev-8', sessionId: 'session-y', autoFollow: false, voice: 'default', edgeVoice: 'e', offlineOnly: false },
+  ] })
+  const runA = createTihuControlRunner(a.surface)
+  await runA({ action: 'stop_speaking' }, { sessionId: 'session-y' })
+  assert.deepEqual(a.calls, [['stopSpeaking', 'dev-8']])
+  // ② 调用会话没绑设备、只有一台在线 → 缺省用它
+  const b = controlSurfaceFixture({ devices: [{ id: 'dev-only', sessionId: 'other', autoFollow: false, voice: 'default', edgeVoice: 'e', offlineOnly: false }] })
+  const runB = createTihuControlRunner(b.surface)
+  await runB({ action: 'go_home' }, { sessionId: 'session-nobound' })
+  assert.deepEqual(b.calls, [['goHome', 'dev-only']])
+  // ③ 多台在线且没有绑定到调用会话的 → 明确报错
+  const c = controlSurfaceFixture({ devices: [
+    { id: 'dev-1', sessionId: 's1', autoFollow: false, voice: 'default', edgeVoice: 'e', offlineOnly: false },
+    { id: 'dev-2', sessionId: 's2', autoFollow: false, voice: 'default', edgeVoice: 'e', offlineOnly: false },
+  ] })
+  const runC = createTihuControlRunner(c.surface)
+  const ambiguous = await runC({ action: 'replay' }, { sessionId: 'session-nobound' }).then(() => null, (error) => error)
+  assert.ok(ambiguous instanceof Error && ambiguous.message.includes('无法确定'), String(ambiguous))
+  // ④ 零台在线 → 明确报错
+  const d = controlSurfaceFixture({ devices: [] })
+  const runD = createTihuControlRunner(d.surface)
+  const empty = await runD({ action: 'replay' }).then(() => null, (error) => error)
+  assert.ok(empty instanceof Error && empty.message.includes('没有鹈鹕设备在线'), String(empty))
+})
+
+await testAsync('控制工具：browse 用 session 参数传方向；open_bubble 缺 index 与标题报错', async () => {
+  const { surface, calls } = controlSurfaceFixture()
+  const run = createTihuControlRunner(surface)
+  const prev = await run({ action: 'browse', session: 'prev' })
+  assert.ok(prev.includes('上一条'), prev)
+  const next = await run({ action: 'browse' })
+  assert.ok(next.includes('下一条'), next)
+  const bubbleMissing = await run({ action: 'open_bubble' }).then(() => null, (error) => error)
+  assert.ok(bubbleMissing instanceof Error && bubbleMissing.message.includes('index'), String(bubbleMissing))
+  await run({ action: 'open_bubble', index: 1 })
+  assert.deepEqual(calls.filter((call) => call[0] === 'openBubble'), [['openBubble', 'dev-1', '{"index":1}']])
+})
+
+await testAsync('控制工具：status 汇总屏幕/气泡/朗读/音色；list_devices 列在线设备', async () => {
+  const { surface } = controlSurfaceFixture({
+    pending: [{ sessionId: 'session-11cc22dd-bbbb-2222', title: '鹈鹕实验记录', at: 1 }],
+    screen: { stage: '回答', title: '结论先行', mode: 'reply', bullets: ['第一句', '第二句'] },
+  })
+  const run = createTihuControlRunner(surface)
+  const status = await run({ action: 'status' }, { sessionId: 'session-98bb83cb-aaaa-1111' })
+  assert.ok(status.includes('模式=reply'), status)
+  assert.ok(status.includes('鹈鹕实验记录'), '气泡要列出：' + status)
+  assert.ok(status.includes('朗读中：否'), status)
+  assert.ok(status.includes('zh-CN-YunjianNeural'), status)
+  const listed = await run({ action: 'list_devices' })
+  assert.ok(listed.includes('dev-1'), listed)
+})
+
+await testAsync('lane.control 薄壳：listSessions 命中、bind 真换绑并下发 session.bound', async () => {
+  const records = [cuRecord('session-a', { live: true, title: '鹈鹕会话 A' }), cuRecord('session-b', { live: true, title: '桥梁论文' })]
+  const { runtime } = runtimeFor(records)
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'ctl', protocol: '0', sessionId: 'session-a' }, 1)))
+  await waitMs(40)
+  const outcome = await runtime.control.listSessions('桥梁')
+  assert.equal(outcome.kind, 'one')
+  assert.equal(outcome.row.sessionId, 'session-b')
+  const devices = runtime.control.listDevices()
+  assert.equal(devices.length, 1)
+  assert.equal(devices[0].sessionId, 'session-a')
+  const text = await runtime.control.bind(devices[0].id, 'session-b')
+  assert.ok(text.includes('绑定'), text)
+  assert.equal(runtime.control.listDevices()[0].sessionId, 'session-b')
+  const boundFrames = framesOf(socket).filter((frame) => frame.type === 'session.bound')
+  assert.ok(boundFrames.some((frame) => frame.payload.sessionId === 'session-b'), '换绑要下发 session.bound')
+  const status = runtime.control.deviceStatus(devices[0].id)
+  assert.equal(status.device.sessionId, 'session-b')
+  runtime.dispose()
+})
+
+await testAsync('lane.control 薄壳：archiveSession 转调 workspaceRegistry（stopActivity=true），不存在给可读错误', async () => {
+  let archivedWith = null
+  const records = [cuRecord('session-a', { live: true, title: '会话 A' })]
+  const registry = { archiveSession: async (sessionId, options) => { archivedWith = [sessionId, options] } }
+  const { runtime } = runtimeFor(records, { workspaceRegistry: registry })
+  const ok = await runtime.control.archiveSession('session-a')
+  assert.ok(ok.includes('已删除（归档）'), ok)
+  assert.deepEqual(archivedWith, ['session-a', { stopActivity: true }])
+  const missing = await runtime.control.archiveSession('session-not-exist')
+  assert.ok(missing.includes('不存在'), missing)
+  runtime.dispose()
+})
+
 
 /* ---------- 汇总 ---------- */
 console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)

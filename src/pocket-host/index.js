@@ -22,6 +22,7 @@ import { acquirePocketRuntime, releasePocketRuntime } from './runtime.mjs';
 import { installPocketRpc } from './web-rpc.js';
 import { restartHost } from './restart.js';
 import { createTihuRuntime } from '../tihu/lane.ts';
+import { registerTihuControl } from '../tihu/control.ts';
 import { advancedNoticeScript, DEFAULT_INJECT, classifyHost } from './proxy.mjs';
 import { lanEnabled, setLanEnabled, lanAuthEnabled, setLanAuthEnabled, lanIpOverride, setLanIpOverride, pinCustom, setPinCustom, tunnelMode, setTunnelMode, tunnelToken, setTunnelToken, tunnelHostname, setTunnelHostname, resetSettings, proxyPort, cloudflaredPath, sshTunnelConfig, setSshTunnelConfig, ensureFirstRunSettings } from './settings.mjs';
 
@@ -363,6 +364,19 @@ export function apply(ctx, config = {}, internals = {}) {
     logger.info('dsh-pocket: tihu lane ready at /tihu (P0 simulator) | 鹈鹕模拟设备页已挂载');
   } catch (error) {
     logger.warn('dsh-pocket: tihu lane disabled | 鹈鹕 lane 挂载失败: %s', error?.stack ?? error);
+  }
+
+  // 鹈鹕设备控制工具（tihu）：全局注册原生工具 + 系统提示段落。
+  // 任意会话（尤其鹈鹕语音指令）都能用自然语言控制设备；别人部署整套系统时装
+  // dsh-assistant 一个插件即自动获得本工具，无新文件依赖、无额外插件。
+  if (tihuRuntime) {
+    registerTihuControl(ctx, tihuRuntime.control, (line) => {
+      try { (logger.info ?? logger.log).call(logger, line) } catch { /* 日志失败不影响功能 */ }
+    }).then((off) => {
+      if (typeof off === 'function') disposers.push(off);
+    }).catch((error) => {
+      logger.warn('dsh-pocket: tihu control tool disabled | 鹈鹕控制工具注册失败: %s', error?.stack ?? error);
+    });
   }
 
   const runtime = internals.service ? null : acquirePocketRuntime(runtimeRevision, () => createPocketService({
