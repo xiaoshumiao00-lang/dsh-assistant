@@ -70,7 +70,7 @@ import { TihuTts, type TihuTtsPaths } from './tts.ts'
 import { replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
 import { stripToolNoise, toSpeechText } from './speech-text.ts'
 import { CONTENT_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
-import { cardsFromState, groupCardProjects, groupProjects, groupWorkspaceProjects, humanTitle, projectNameOf, type ProjectReply, type TihuCardRow, type TihuWorkspaceRow } from './project-groups.ts'
+import { cardsFromState, groupCardProjects, groupProjects, groupWorkspaceProjects, humanTitle, projectCardsSignature, projectNameOf, type ProjectReply, type TihuCardRow, type TihuWorkspaceRow } from './project-groups.ts'
 import type { AlertPayload, TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
 
 /** 页面与 WebSocket 的路径（代理侧按这两个前缀放行）。 */
@@ -121,6 +121,23 @@ export function tihuTurnStaleMs(): number {
   const raw = Number(process.env.TIHU_TURN_STALE_MS ?? 30 * 60_000)
   if (!Number.isFinite(raw) || raw <= 0) return 30 * 60_000
   return clampInt(raw, 10, 6 * 60 * 60_000)
+}
+
+/**
+ * 控制室卡片变化的巡检间隔（毫秒）。
+ *
+ * 设备停在主页时宿主不会自己重发主页帧（scheduleHome 见 mode==='home' 直接返回、
+ * ping 只回 pong），于是控制室里隐藏/删除/改名一张卡，屏幕上还是旧清单，必须点一次球
+ * 才刷新。这条巡检只在「卡片签名」真的变了时补一帧。
+ *
+ * 默认 30 秒（用户 2026-11-08 要求「刷新频率不用很频繁」）；TIHU_HOME_SYNC_MS=0 关闭；
+ * 非数字回落默认，正数夹在 1s ~ 10min，防止手滑写成 0ms 忙循环。
+ */
+export function tihuHomeSyncMs(): number {
+  const raw = Number(process.env.TIHU_HOME_SYNC_MS ?? 30_000)
+  if (!Number.isFinite(raw)) return 30_000
+  if (raw === 0) return 0
+  return clampInt(raw, 1_000, 10 * 60_000)
 }
 
 /**
@@ -194,6 +211,8 @@ export interface TihuRuntimeOptions {
   tts?: { disabled?: boolean; threads?: number; port?: number; paths?: Partial<TihuTtsPaths>; instance?: TihuTts; prewarm?: boolean }
   /** 危险动作确认器覆盖（单测里注入会抛错的 broker，验证 fail-closed）。 */
   confirmBroker?: ConfirmBroker
+  /** 控制室卡片巡检间隔（毫秒，0 = 关闭；缺省走 tihuHomeSyncMs()/环境变量）。 */
+  homeSyncMs?: number
 }
 
 /** 提供给代理的两个入口 + 卸载函数。 */
@@ -297,6 +316,11 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const screenStates = new Map<string, ScreenScrollState>()
   /** 每会话的屏幕模式与回主页计时。 */
   const homeStates = new Map<string, { mode: 'home' | 'session'; page: number; done: boolean; timer?: ReturnType<typeof setTimeout> }>()
+  /**
+   * 最近一帧主页用的是哪份控制室卡片清单（签名）。卡片巡检只和它比：
+   * 屏幕上的东西没变就不重发；没人停在主页时也不更新，等它下次回主页自己拿新的。
+   */
+  let shownCardSignature = ''
   /** 设备 id → 是否在浏览历史（回主页守门按设备算，避免多设备互相卡住）。 */
   const followByDevice = new Map<string, boolean>()
   /**
@@ -421,6 +445,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     { id: 'replay', label: '重读' },
     { id: 'home', label: '主页' },
   ] as const
+
+  /**「已绑定」提示屏停留时长：默认 3 秒（TIHU_BIND_HOME_MS 可调，0 表示不停留）。 */
+  function bindHomeDelayMs(): number {
+    const raw = Number(process.env.TIHU_BIND_HOME_MS ?? 3000)
+    if (!Number.isFinite(raw)) return 3000
+    return Math.max(0, Math.min(raw, 60_000))
+  }
 
   /** 这条会话是不是 Computer Use 模式：按列表缓存里的 preset 判，查不到当不是。 */
   function isComputerUseSession(sessionId: string): boolean {
@@ -874,6 +905,17 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     bindHome.done = true
     homeStates.set(sessionId, bindHome)
     scheduleHome(sessionId)
+    // 用户 2026-11-08 要求：绑定后「已绑定」提示屏停一下（默认 3s）就回主页，不必等空闲计时。
+    // 正在跑 turn、正在朗读、屏上已经是回复时不动，免得把正在看的内容切走。
+    setTimeout(() => {
+      if (disposed) return
+      if (device.sessionId !== sessionId) return
+      if (runningSessions.has(sessionId) || readingBusy(sessionId)) return
+      if (lastFrames.get(sessionId)?.mode === 'reply') return
+      if (homeStates.get(sessionId)?.mode === 'home') return
+      void sendHome(sessionId, device).catch((error) => log(`tihu bind home failed: ${(error as Error)?.message ?? String(error)}`))
+    }, bindHomeDelayMs())
+
     log(`tihu bind session=${sessionId} status=${found.status} preset=${JSON.stringify(preset)} cu=${String(computerUse)} title=${JSON.stringify(title)}`)
   }
 
@@ -1047,6 +1089,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     // 注册表可用：项目名/顺序来自 workspace（状态按该项目 sessionIds 对应的会话算，不再按 cwd 猜归属）；
     // 拿不到（命令行测试环境没有宿主服务）：完全保持旧的 cwd 分组行为。
     const cards = projectCards()
+    // 记下这一帧用的卡片清单：巡检据此判断控制室里是不是真的变了（隐藏/删除/改名/排序/新增）。
+    shownCardSignature = projectCardsSignature(cards)
     const projects = (() => {
       if (workspaces === undefined) return groupProjects(projectRows, replies, Date.now())
       try {
@@ -2551,11 +2595,41 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
   }
 
+  /**
+   * 控制室卡片变化 → 主页自动跟新（低频巡检，默认 30 秒）。
+   *
+   * 只和「屏幕上这一帧用的卡片清单」比：变了才补一帧，平时每轮只是一次 statSync
+   * （projectCards 有 mtime 缓存），不重排、不重发，页面不会无谓地闪一下。
+   * 没有设备停在主页时什么都不做——它下次回主页时 sendHome 自然画上新清单。
+   *
+   * 签名 '' 表示状态文件暂时读不到：保持现状等它恢复，绝不退回 workspaceRegistry 的旧清单。
+   */
+  let homeSyncTimer: ReturnType<typeof setInterval> | undefined
+  const homeSyncEveryMs = options.homeSyncMs ?? tihuHomeSyncMs()
+  if (homeSyncEveryMs > 0) {
+    homeSyncTimer = setInterval(() => {
+      if (disposed) return
+      const signature = projectCardsSignature(projectCards())
+      // '' = 状态文件暂时读不到：保持现状等它恢复，绝不退回 workspaceRegistry 的旧清单。
+      if (signature === '' || signature === shownCardSignature) return
+      // 只有停在主页的设备才需要补帧；没人停在主页时不更新基线，等它下次回主页自己拿新清单。
+      for (const device of devices) {
+        const sessionId = device.sessionId ?? '__unbound__'
+        const state = homeStates.get(sessionId)
+        if (state === undefined || state.mode !== 'home') continue
+        void sendHome(sessionId, device).catch((error) => log(`tihu home card sync failed: ${(error as Error)?.message ?? String(error)}`))
+      }
+    }, homeSyncEveryMs)
+    // 闲时巡检不该拖住进程退出（单测 / 宿主卸载都靠 dispose 收尾）。
+    ;(homeSyncTimer as any).unref?.()
+  }
+
   return {
     page: () => tihuPageHtml({ lanePath: TIHU_LANE_PATH, protocol: TIHU_PROTOCOL_VERSION }),
     handleUpgrade,
     dispose: () => {
       disposed = true
+      if (homeSyncTimer !== undefined) clearInterval(homeSyncTimer)
       ;(confirmBroker as any).failAll?.('disposed')
       for (const [sessionId, state] of homeStates) {
         if (state.timer !== undefined) clearTimeout(state.timer)
