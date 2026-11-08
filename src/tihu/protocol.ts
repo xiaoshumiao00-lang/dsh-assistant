@@ -302,6 +302,9 @@ export interface ScreenFramePayload {
   }
   /** 回复屏底部按钮（停止朗读 / 重读 / 回主页）。 */
   actions?: { id: string; label: string }[]
+  /** 屏末尾有几行是「统计行」：页面按 statsFontPx 小 2 号字号渲染。 */
+  statsTail?: number
+
   /** 状态屏底部：其他正在运行的会话（最多 3 条，点了切过去）。 */
   running?: { sessionId: string; title: string }[]
   /** 待读会话气泡（最多 4 条，按完成时间排序）。 */

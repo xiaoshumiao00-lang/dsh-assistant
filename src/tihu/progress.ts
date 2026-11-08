@@ -378,6 +378,8 @@ function statusFrame(state: TihuProgressState, now: number, widthPx: number = CO
     stage: '',
     title: fitLine(state.sessionTitle || state.title, widthPx, SCREEN_SPEC.titleFontPx),
     bullets: bullets.map((line) => fitLine(line, widthPx, SCREEN_SPEC.bodyFontPx)).slice(0, SCREEN_SPEC.maxBodyLines),
+    // 最后一行恒为「步数 + 用时 + 统计」，页面用小 2 号字号排它（用户 2026-11-08 要求）
+    statsTail: 1,
     tone: state.tone,
   }
 }

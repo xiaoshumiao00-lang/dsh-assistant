@@ -28,6 +28,10 @@ export const SCREEN_SPEC = {
   bodyCharsPerLine: 18,
   /** 正文最多行数（内容区 224px，16px/20px 行高）。 */
   maxBodyLines: 4,
+  /** 统计行（第四行）字号：比正文小 2 号。 */
+  statsFontPx: 14,
+  /** 统计行行高。 */
+  statsLineHeightPx: 18,
   /** 标题字号（加粗）。 */
   titleFontPx: 18,
   /** 标题最大字符数。 */
