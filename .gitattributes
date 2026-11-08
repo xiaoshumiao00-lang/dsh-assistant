@@ -1,0 +1,9 @@
+# Kokoro fp32 模型随仓库走（开箱即用：clone 后不用再下载）。
+# 体积约 400MB，全部走 Git LFS；int8 权重实测慢 2.8–3.5 倍，不进仓库。
+models/kokoro/kokoro-multi-lang-v1_1/model.onnx filter=lfs diff=lfs merge=lfs -text
+models/kokoro/kokoro-multi-lang-v1_1/voices.bin filter=lfs diff=lfs merge=lfs -text
+models/kokoro/kokoro-multi-lang-v1_1/*.fst filter=lfs diff=lfs merge=lfs -text
+models/kokoro/kokoro-multi-lang-v1_1/tokens.txt filter=lfs diff=lfs merge=lfs -text
+models/kokoro/kokoro-multi-lang-v1_1/lexicon*.txt filter=lfs diff=lfs merge=lfs -text
+models/kokoro/kokoro-multi-lang-v1_1/dict/** filter=lfs diff=lfs merge=lfs -text
+models/kokoro/kokoro-multi-lang-v1_1/espeak-ng-data/** filter=lfs diff=lfs merge=lfs -text

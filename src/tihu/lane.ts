@@ -418,17 +418,17 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const thinkingTimers = new Map<string, ReturnType<typeof setTimeout>>()
   /** 正在 reply 阅读模式的会话（turn/end 不再用「完成」状态帧覆盖正文）。 */
   const replySessions = new Set<string>()
-  /** 本地 TTS sidecar（独立进程；模型缺失时 available=false，页面走系统语音）。 */
+  /** 本地 TTS sidecar（独立进程；Kokoro 主引擎，缺模型/依赖时 available=false，页面走系统语音）。 */
   const tts = options.tts?.instance ?? new TihuTts({
     log,
     workspaceOf: options.workspaceOf,
-    threads: options.tts?.threads ?? 8,
+    ...(options.tts?.threads === undefined ? {} : { threads: options.tts.threads }),
     ...(options.tts?.disabled === true ? { disabled: true } : {}),
     ...(options.tts?.port === undefined ? {} : { port: options.tts.port }),
     ...(options.tts?.paths === undefined ? {} : { paths: options.tts.paths }),
   })
-  // 仅真实插件（pocket-host）启动时预热 GPU；单测传 prewarm=false，避免拉起 sidecar。
-  if (options.tts?.prewarm === true && options.tts?.disabled !== true && tts.backend() === 'qwen-cuda') {
+  // 仅真实插件（pocket-host）启动时预热：Kokoro 常驻进程冷加载 1.1–2.1s，提前拉起省首包。
+  if (options.tts?.prewarm === true && options.tts?.disabled !== true && tts.backend() !== 'none') {
     void tts.ensureServer().catch((error) => log(`tihu tts prewarm failed: ${(error as Error)?.message ?? String(error)}`))
   }
   const confirmBroker: ConfirmBroker = options.confirmBroker ?? createConfirmBroker({
@@ -1718,8 +1718,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       log(`tihu tts cancel previous round device=${device.id} session=${sessionId}`)
       try { previousCancel() } catch { /* 忽略：旧轮自己的清理逻辑不该影响新一轮 */ }
     }
-    // 默认走 edge 云健，不必为每句唤醒 GPU；只有克隆音色或仅离线才需要本地 Qwen。
-    if ((device.voice && device.voice !== 'default') || device.offlineOnly) await tts.ensureServer()
+    // 默认走本地 Kokoro（常驻进程，先确保已拉起）；克隆音色/仅离线同样要本地引擎。
+    const localPrimary = typeof (tts as any).localPrimary === 'function' ? Boolean((tts as any).localPrimary()) : false
+    if (localPrimary || (device.voice && device.voice !== 'default') || device.offlineOnly) await tts.ensureServer()
     const status = tts.status()
     if (!status.available) {
       device.send('event.alert', { level: 'error', text: `本次无语音：在线兜底不可用且本地引擎未就绪（原因：${status.error ?? '未安装模型'}）` })
@@ -1743,12 +1744,15 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
      *   ② 启动段号用 `index + inFlight.size` 推算：后启动的段先完成时会**把同一段
      *      再合成一遍**（实测 12 段被合成 30 次），并发额度全烧在重复合成上；
      *   ③ 任意一段失败就整轮终止（首块 3.5s 门限一到就杀进程），后半段永远不念。
-     * 现在：启动游标单调递增（每段只合成一次）；按「已有着落的音频余量」补位，
-     * 默认最多 4 段并发、目标提前量 12s（TIHU_SYNTH_MAX_INFLIGHT / TIHU_SYNTH_AHEAD_MS 可调）；
+     * 现在：启动游标单调递增（每段只合成一次）；按「已有着落的音频余量」补位。
+     * 2026-11-08 用户拍板：**同一段回答最多 3 路并发**（edge 预取），**本地 Kokoro 一律 1 路**
+     * （4 线程串行；3 个标签页同时说话也只能排队，绝不 12 路并上 CPU）。
      * 单段失败重试一次，仍失败就跳过这一句并**红告警**，后面的照常念。
      * 合成本身并发，但 tts.audio 永远按句 index 顺序下发，首块到达即起播（首屏不等人）。
      */
-    const maxInflight = clampInt(Number(process.env.TIHU_SYNTH_MAX_INFLIGHT ?? 4), 2, 8)
+    const maxInflight = localPrimary
+      ? 1
+      : clampInt(Number(process.env.TIHU_SYNTH_MAX_INFLIGHT ?? 3), 1, 3)
     const aheadTargetMs = clampInt(Number(process.env.TIHU_SYNTH_AHEAD_MS ?? 12_000), 3_000, 30_000)
     const errorText = (value: unknown): string => (value as Error)?.message ?? String(value)
     type SynthResult = { ok: true; audioMs: number } | { ok: false; error: unknown }
