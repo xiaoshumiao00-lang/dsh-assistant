@@ -415,6 +415,56 @@ function screenMetaOf(sessionId: string): { title?: string; stats?: { tokPerSec:
 
 const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bullets?: string[] }>()
 
+  /** 回复屏底部的三个动作按钮（设备端渲染、点按回传 actionId）。 */
+  const REPLY_ACTIONS = [
+    { id: 'stop', label: '停止' },
+    { id: 'replay', label: '重读' },
+    { id: 'home', label: '主页' },
+  ] as const
+
+  /** 会话标题：标题缓存 → 列表缓存 → 短 id 兜底（运行中列表要用）。 */
+  function titleForSession(sessionId: string): string {
+    const cached = titleCache.get(sessionId)?.title
+    if (cached !== undefined && cached !== '') return cached
+    const rows = sessionListCache?.rows ?? []
+    const hit = rows.find((row) => row.sessionId === sessionId)
+    if (hit?.title !== undefined && hit.title !== '') return hit.title
+    return shortSessionId(sessionId)
+  }
+
+  /**
+   * 帧附加信息（一处注入，所有发送路径都生效）：
+   *   - 回复屏：底部三个按钮（停止 / 重读 / 主页）；
+   *   - 状态屏：底部列出**其他**正在运行的会话，点了切过去（用户 2026-11-08 要求）；
+   *   - 主页屏：都不加（主页就是项目清单）。
+   */
+  function withFrameExtras(frame: ScreenFramePayload, sessionId: string | undefined): ScreenFramePayload {
+    if (sessionId === undefined) return frame
+    if (frame.mode === 'reply') {
+      if (frame.actions !== undefined) return frame
+      const running = frame.running
+      const { running: _drop, ...rest } = frame
+      void running
+      return { ...rest, actions: REPLY_ACTIONS.map((item) => ({ id: item.id, label: item.label })) }
+    }
+    if (frame.mode === 'home') return frame
+    const others = [...runningSessions.keys()].filter((id) => id !== sessionId).slice(0, 3)
+    if (others.length === 0) return frame
+    return { ...frame, running: others.map((id) => ({ sessionId: id, title: titleForSession(id) })) }
+  }
+
+  /** 运行中会话增减时，重发每台设备当前那屏，让底部清单实时跟着变。 */
+  function refreshRunningLists(): void {
+    for (const device of devices) {
+      const id = device.sessionId
+      if (id === undefined) continue
+      const last = lastFrames.get(id)
+      if (last === undefined) continue
+      if (last.mode === 'home' || last.mode === 'reply') continue
+      sendFrame(device, last as ScreenFramePayload, id)
+    }
+  }
+
   function screen(sessionId: string, frame: Omit<ScreenFramePayload, 'bullets'> & { bullets?: string[] }): void {
     lastFrames.set(sessionId, frame)
     // 待读气泡必须跟着**每一帧**下发：页面收到帧会整体重画气泡轨，
@@ -423,7 +473,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     const pend = pendingByDisplay.get(sessionId) ?? []
     const pending = frame.pending ?? pend.slice(0, 4).map((item) => ({ sessionId: item.sessionId, title: item.title, at: item.at, unread: true as const }))
     const pendingCount = frame.pendingCount ?? pend.length
-    broadcast(sessionId, 'screen.frame', {
+    broadcast(sessionId, 'screen.frame', withFrameExtras({
       stage: frame.stage,
       title: frame.title,
       bullets: frame.bullets ?? [],
@@ -434,7 +484,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       pending,
       pendingCount,
       tone: frame.tone ?? 'idle',
-    } satisfies ScreenFramePayload)
+    } satisfies ScreenFramePayload, sessionId))
   }
 
   /* ---------- 会话列表（页面自建选择器；复用宿主的 sessionQuery） ----------
@@ -454,14 +504,18 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 所以绕过 screen() 的直发帧会「悄悄吃掉」别的会话完成通知（2026-11-07 审计 P1-7）。
    */
   function sendFrame(device: TihuDevice, frame: ScreenFramePayload, sessionId: string | undefined = device.sessionId): void {
+    // 记一份「这台设备最后看到的那屏」：运行中清单变化时按它重发（followRunningTurn 跟过来的会话还没有广播帧时也要有基准）。
+    if (sessionId !== undefined && frame.mode !== 'reply') {
+      lastFrames.set(sessionId, { ...frame, bullets: frame.bullets ?? [] })
+    }
     const pend = sessionId === undefined ? [] : pendingByDisplay.get(sessionId) ?? []
-    device.send('screen.frame', {
+    device.send('screen.frame', withFrameExtras({
       ...frame,
       ...(frame.pending === undefined
         ? { pending: pend.slice(0, 4).map((item) => ({ sessionId: item.sessionId, title: item.title, at: item.at, unread: true as const })) }
         : {}),
       ...(frame.pendingCount === undefined ? { pendingCount: pend.length } : {}),
-    })
+    } satisfies ScreenFramePayload, sessionId))
   }
 
   const SESSION_LIST_TTL_MS = 60_000
@@ -1824,6 +1878,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       // 运行跟踪与自动跟随都在设备早退**之前**：没绑定该会话的设备收不到事件，
       // 若放在早退之后，别的会话的 turn/start/end 会把跟踪与跟随丢得一干二净。
       if (type === 'turn/start') followRunningTurn(sessionId)
+      // 运行中会话一增一减，绑定别的会话的设备底部清单也要跟着变
+      if (type === 'turn/start' || type === 'turn/end') setTimeout(() => refreshRunningLists(), 0)
       // 没有设备绑定这个会话时也要处 turn/end 的收尾：别的会话跑完了，
       // 当前屏右侧必须冒出「新回复」气泡（2026-11-07 用户实测：新开的 CU 会话完成，鹈鹕屏没通知）。
       if (![...devices].some((device) => device.sessionId === sessionId)) {
@@ -2177,6 +2233,44 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         if (home !== undefined && home.done && home.mode === 'session') scheduleHome(device.sessionId)
       }
       if (payload.action === 'tap' && typeof payload.x === 'number' && typeof payload.y === 'number') {
+        if ((payload as any).hit === 'action' && typeof (payload as any).actionId === 'string') {
+          const actionId = (payload as any).actionId as string
+          const sid = device.sessionId
+          if (actionId === 'stop' && sid !== undefined) {
+            try { device.cancelRound?.() } catch { /* 忽略 */ }
+            device.send('event.progress', { stage: '停止', text: '已停止朗读（点重读可再来一遍）' } satisfies ProgressPayload)
+            return
+          }
+          if (actionId === 'replay' && sid !== undefined) {
+            const reply = lastReplies.get(sid)
+            if (reply !== undefined) {
+              screenStates.delete(sid)
+              sendReply(sid, reply.sentences, 0, 0, reply.includeAll)
+              void speakLocally(device, sid, reply.sentences, reply.speechSegments, reply.includeAll).catch((error) => {
+                log(`tihu replay speak failed: ${(error as Error)?.message ?? String(error)}`)
+              })
+            }
+            return
+          }
+          if (actionId === 'home') {
+            await sendHome(sid ?? '__unbound__', device)
+            return
+          }
+          return
+        }
+        if ((payload as any).hit === 'switch' && typeof (payload as any).targetSessionId === 'string') {
+          const target = (payload as any).targetSessionId as string
+          if (target === (device.sessionId ?? '')) return
+          await bindSession(device, target)
+          const reply = lastReplies.get(target)
+          if (reply !== undefined) {
+            screenStates.delete(target)
+            homeStates.set(target, { mode: 'session', page: 0, done: true })
+            sendReply(target, reply.sentences, 0, 0, reply.includeAll)
+          }
+          scheduleHome(target)
+          return
+        }
         // 气泡点击：targetSessionId 必须在当前 pending 队列里（防伪造切屏）。
         if (device.sessionId === undefined) {
           // 未绑定设备：点项目直接进入；点右下角回主页（只发给自己）

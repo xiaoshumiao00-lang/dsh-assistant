@@ -300,6 +300,10 @@ export interface ScreenFramePayload {
     page: { index: number; total: number }
     total: number
   }
+  /** 回复屏底部按钮（停止朗读 / 重读 / 回主页）。 */
+  actions?: { id: string; label: string }[]
+  /** 状态屏底部：其他正在运行的会话（最多 3 条，点了切过去）。 */
+  running?: { sessionId: string; title: string }[]
   /** 待读会话气泡（最多 4 条，按完成时间排序）。 */
   pending?: { sessionId: string; title: string; at: number; unread: true }[]
   /** 未被 display 的待读总数（>4 时用于 +N）。 */
@@ -446,7 +450,7 @@ export interface SessionsListPayload {
 /** 屏幕手势：上/下滑（滚动历史）与点击（预留）。 */
 export type ScreenGesturePayload =
   | { action: 'swipe'; dy: number; phase: 'start' | 'move' | 'end' }
-  | { action: 'tap'; x: number; y: number; hit?: 'chip' | 'screen' | 'project'; targetSessionId?: string; project?: string; sessionId?: string }
+  | { action: 'tap'; x: number; y: number; hit?: 'chip' | 'screen' | 'project' | 'action' | 'switch'; targetSessionId?: string; project?: string; sessionId?: string; actionId?: string }
 
 export interface SessionBindPayload {
   /** 要手动绑定的会话 id；`auto: true` 时可省略。 */
@@ -649,7 +653,8 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
         if (payload.action === 'tap') {
           if (typeof payload.x !== 'number' || typeof payload.y !== 'number') return null
           if (!Number.isFinite(payload.x) || !Number.isFinite(payload.y)) return null
-          if (payload.hit !== undefined && payload.hit !== 'chip' && payload.hit !== 'screen' && payload.hit !== 'project') return null
+          if (payload.hit !== undefined && payload.hit !== 'chip' && payload.hit !== 'screen' && payload.hit !== 'project' && payload.hit !== 'action' && payload.hit !== 'switch') return null
+          if (payload.actionId !== undefined && (typeof payload.actionId !== 'string' || payload.actionId.length > 32)) return null
           if (payload.targetSessionId !== undefined && (typeof payload.targetSessionId !== 'string' || payload.targetSessionId.length > 256)) return null
           if (payload.project !== undefined && (typeof payload.project !== 'string' || payload.project.length > 256)) return null
           if (payload.sessionId !== undefined && (typeof payload.sessionId !== 'string' || payload.sessionId.length > 256)) return null
