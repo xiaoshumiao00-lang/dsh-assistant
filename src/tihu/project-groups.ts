@@ -59,7 +59,120 @@ export interface TihuWorkspaceRow {
   updatedAt: number
 }
 
+/** 控制室的一张项目卡片（用户在工作台里建的那种）。 */
+export interface TihuCardRow {
+  id: string
+  name: string
+  /** 卡片绑定的文件夹（绝对路径）；「个人助手」这类虚拟卡没有。 */
+  folder?: string
+}
+
+/**
+ * 从跨端状态（dsh-assistant-state.json 的 projects）里取「可见卡片」。
+ * 控制室的真实来源是 layouts/order/hidden/removed/folders/nameOverrides，不是 workspaceRegistry——
+ * 隐藏卡在 hidden 里、删除卡在 removed 里，workspace 表里照样留着行（2026-11-08 调查结论）。
+ */
+export function cardsFromState(state: unknown): TihuCardRow[] {
+  const root = (state ?? {}) as any
+  const projects = root.projects ?? root
+  if (projects === null || typeof projects !== 'object') return []
+  const layouts = Array.isArray(projects.layouts) ? projects.layouts : []
+  const titles = new Map<string, string>()
+  for (const layout of layouts) {
+    if (layout === null || typeof layout !== 'object') continue
+    titles.set(String(layout.id ?? ''), String(layout.title ?? ''))
+  }
+  const ids = (value: unknown): string[] => (Array.isArray(value) ? value.map((item) => String(item)) : [])
+  const hidden = new Set(ids(projects.hidden))
+  const removed = new Set(ids(projects.removed))
+  const folders = (projects.folders ?? {}) as Record<string, unknown>
+  const overrides = (projects.nameOverrides ?? {}) as Record<string, unknown>
+  const ordered = ids(projects.order)
+  // 卡片集合 = 全部 layouts 减去 hidden/removed；order 只决定先后（不在 order 里的卡照样显示，控制室也是这么渲染的）
+  const candidates: string[] = []
+  const pushed = new Set<string>()
+  for (const id of ordered) {
+    if (!titles.has(id) || pushed.has(id)) continue
+    pushed.add(id)
+    candidates.push(id)
+  }
+  for (const id of titles.keys()) {
+    if (pushed.has(id)) continue
+    pushed.add(id)
+    candidates.push(id)
+  }
+  const cards: TihuCardRow[] = []
+  const seen = new Set<string>()
+  for (const id of candidates) {
+    if (id === '' || seen.has(id)) continue
+    seen.add(id)
+    if (hidden.has(id) || removed.has(id)) continue
+    const override = typeof overrides[id] === 'string' ? String(overrides[id]).trim() : ''
+    const name = (override !== '' ? override : titles.get(id) ?? '').trim()
+    const folder = typeof folders[id] === 'string' && String(folders[id]).trim() !== '' ? String(folders[id]) : undefined
+    if (name === '' && folder === undefined) continue
+    cards.push(folder === undefined ? { id, name } : { id, name, folder })
+  }
+  return cards
+}
+
+/** 路径归一：小写、正斜杠、去掉结尾分隔符（与卡片 folders 的写法对齐）。 */
+function normalizeFolder(value: string): string {
+  return String(value ?? '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+}
+
+/** 工作区是否落在卡片文件夹下（含自身）。 */
+function underFolder(path: string, folder: string): boolean {
+  const p = normalizeFolder(path)
+  const f = normalizeFolder(folder)
+  if (p === '' || f === '') return false
+  return p === f || p.startsWith(f + '/')
+}
+
+/**
+ * 按「控制室可见卡片」聚合项目：每张卡一行，状态取该卡名下所有会话。
+ * 没有对应 workspace 行的卡（空卡）不出现在首页——与控制室一致（空卡本来也没内容可显示）。
+ */
+export function groupCardProjects(
+  cards: readonly TihuCardRow[],
+  workspaces: readonly TihuWorkspaceRow[],
+  rows: readonly ProjectSessionRow[],
+  replies: Record<string, ProjectReply | undefined> = {},
+  now: number = Date.now(),
+): ProjectItem[] {
+  const rowsById = new Map<string, ProjectSessionRow>()
+  for (const row of rows) if (!rowsById.has(row.sessionId)) rowsById.set(row.sessionId, row)
+  const items: ProjectItem[] = []
+  for (const card of cards) {
+    const matched = card.folder === undefined
+      ? workspaces.filter((workspace) => hostWorkspaceAliasOf(workspace.path) === card.name)
+      : workspaces.filter((workspace) => underFolder(workspace.path, card.folder as string))
+    if (matched.length === 0) continue
+    const group: ProjectSessionRow[] = []
+    const seenSessions = new Set<string>()
+    let updatedAt = 0
+    for (const workspace of matched) {
+      updatedAt = Math.max(updatedAt, workspace.updatedAt)
+      for (const sessionId of workspace.sessionIds) {
+        if (seenSessions.has(sessionId)) continue
+        seenSessions.add(sessionId)
+        const row = rowsById.get(sessionId)
+        if (row !== undefined) group.push(row)
+      }
+    }
+    const name = card.name !== '' ? card.name : workspaceBasename(matched[0]?.path ?? '')
+    items.push(projectItemOf(name, group, replies, now, updatedAt))
+  }
+  return items.sort((a, b) => b.updatedAt - a.updatedAt || a.name.localeCompare(b.name))
+}
+
+function workspaceBasename(path: string): string {
+  const parts = String(path ?? '').split(/[\\/]+/).filter(Boolean)
+  return parts[parts.length - 1] ?? '未命名项目'
+}
+
 /** 把 cwd 归一到控制室的项目名（合并仓库子目录/已知项目目录）。 */
+
 export function projectNameOf(cwd: string | undefined): string {
   const raw = String(cwd ?? '').replace(/[\\/]+$/, '')
   if (raw === '') return '其他'

@@ -3411,6 +3411,52 @@ await testAsync('lane：状态屏底部只列 Computer Use 模式的运行中会
   runtime.dispose()
 })
 
+
+await testAsync('lane：首页项目清单与控制室卡片一致（隐藏/删除的都不显示）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tihu-cards-'))
+  const file = join(dir, 'state.json')
+  writeFileSync(file, JSON.stringify({
+    projects: {
+      order: ['layout-a', 'wt-assistant', 'layout-hidden', 'layout-removed'],
+      layouts: [{ id: 'layout-a', title: '磷石膏SCI' }, { id: 'layout-hidden', title: '隐藏项目' }, { id: 'layout-removed', title: '删除项目' }],
+      hidden: ['layout-hidden'],
+      removed: ['layout-removed'],
+      nameOverrides: { 'wt-assistant': '个人助手' },
+      folders: {
+        'layout-a': 'D:\\proj\\phosphogypsum',
+        'layout-hidden': 'D:\\proj\\hidden',
+        'layout-removed': 'D:\\proj\\removed',
+      },
+    },
+  }), 'utf8')
+  process.env.TIHU_PROJECTS_STATE = file
+  const now = Date.now()
+  const iso = (ago) => new Date(now - ago).toISOString()
+  const records = [
+    cuRecord('session-a', { preset: 'computer-use', cwd: 'D:\\proj\\phosphogypsum\\a', live: true, lastPromptAt: now - 20_000, title: '会话 A' }),
+    cuRecord('session-h', { preset: 'computer-use', cwd: 'D:\\proj\\hidden', live: true, lastPromptAt: now - 10_000, title: '隐藏会话' }),
+    cuRecord('session-r', { preset: 'computer-use', cwd: 'D:\\proj\\removed', live: true, lastPromptAt: now - 5_000, title: '删掉会话' }),
+    cuRecord('session-g', { preset: 'computer-use', cwd: 'D:\\proj\\never-card', live: true, lastPromptAt: now - 1_000, title: '没建卡' }),
+  ]
+  const workspaces = [
+    { id: 'ws-a', path: 'D:\\proj\\phosphogypsum', title: 'phosphogypsum', createdAt: iso(400_000), updatedAt: iso(20_000), sessionIds: ['session-a'] },
+    { id: 'ws-h', path: 'D:\\proj\\hidden', title: 'hidden', createdAt: iso(400_000), updatedAt: iso(10_000), sessionIds: ['session-h'] },
+    { id: 'ws-r', path: 'D:\\proj\\removed', title: 'removed', createdAt: iso(400_000), updatedAt: iso(5_000), sessionIds: ['session-r'] },
+    { id: 'ws-g', path: 'D:\\proj\\never-card', title: 'never-card', createdAt: iso(400_000), updatedAt: iso(1_000), sessionIds: ['session-g'] },
+  ]
+  const { runtime } = runtimeFor(records, { workspaceRegistry: workspaceRegistryFixture(workspaces) })
+  const socket = openLane(runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'cards', protocol: '0', sessionId: 'session-a' }, 1)))
+  await waitMs(60)
+  const home = await tapHomeFrame(socket)
+  const names = home.projects.map((item) => item.name)
+  assert.deepEqual(names, ['磷石膏SCI'], '只显示控制室可见卡（隐藏/删除/未建卡都不显示），实际 ' + JSON.stringify(names))
+  assert.equal(home.total, 1)
+  runtime.dispose()
+  delete process.env.TIHU_PROJECTS_STATE
+  rmSync(dir, { recursive: true, force: true })
+})
+
 /* ---------- 汇总 ---------- */
 console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
 if (failed > 0) process.exit(1)

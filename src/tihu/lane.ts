@@ -26,7 +26,7 @@
  *        （见 guard.ts）。只对「tihu 正在执行的会话」生效，不干扰桌面正常使用。
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { WsFrameParser, encodeFrame } from '../pocket-host/ws-deflate.mjs'
 import {
@@ -70,7 +70,7 @@ import { TihuTts, type TihuTtsPaths } from './tts.ts'
 import { replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
 import { stripToolNoise, toSpeechText } from './speech-text.ts'
 import { CONTENT_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
-import { groupProjects, groupWorkspaceProjects, humanTitle, projectNameOf, type ProjectReply, type TihuWorkspaceRow } from './project-groups.ts'
+import { cardsFromState, groupCardProjects, groupProjects, groupWorkspaceProjects, humanTitle, projectNameOf, type ProjectReply, type TihuCardRow, type TihuWorkspaceRow } from './project-groups.ts'
 import type { AlertPayload, TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
 
 /** 页面与 WebSocket 的路径（代理侧按这两个前缀放行）。 */
@@ -960,7 +960,43 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /**
-   * 首页项目的真源：DSH 宿主 workspace 服务（@deepseek-ai/dsh-workspace 的
+   * 控制室可见卡片（真实真源）：profile 目录下的 dsh-assistant-state.json 的 projects。
+   * 隐藏卡在 hidden、删除卡在 removed，workspace 表里都还留着行——所以只信这份状态。
+   * 可用 TIHU_PROJECTS_STATE 覆盖文件路径（测试/排障用）。
+   */
+  let cardCache: { mtimeMs: number; cards: TihuCardRow[] } | undefined
+  function projectCards(): TihuCardRow[] | undefined {
+    let file = process.env.TIHU_PROJECTS_STATE ?? ''
+    if (file === '') {
+      let dir = ''
+      try {
+        const profile = optionalService(ctx, 'profileContext')
+        if (typeof profile?.dir === 'string' && profile.dir !== '') dir = profile.dir
+      } catch { /* 忽略 */ }
+      if (dir === '') {
+        try {
+          const homePaths = optionalService(ctx, 'homePaths')
+          if (typeof homePaths?.home === 'string' && homePaths.home !== '') dir = homePaths.home
+        } catch { /* 忽略 */ }
+      }
+      if (dir === '') dir = process.env.DSH_HOME ?? process.cwd()
+      file = join(dir, 'dsh-assistant-state.json')
+    }
+    try {
+      const info = statSync(file)
+      if (cardCache !== undefined && cardCache.mtimeMs === info.mtimeMs) return cardCache.cards
+      const parsed = JSON.parse(readFileSync(file, 'utf8'))
+      const cards = cardsFromState(parsed)
+      cardCache = { mtimeMs: info.mtimeMs, cards }
+      return cards
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * 首页项目的真源：DSH 宿主 workspace 服务
+（@deepseek-ai/dsh-workspace 的
    * Service 名 "workspaceRegistry"，落盘就是 ~/.dsh/storages/workspace.json 的
    * tables.workspaces）。实体字段都是 getter：id / path / title / createdAt /
    * updatedAt（ISO 字符串）/ sessionIds（数组，顺序即显示顺序）。
@@ -1010,9 +1046,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     const workspaces = workspaceRegistryRows()
     // 注册表可用：项目名/顺序来自 workspace（状态按该项目 sessionIds 对应的会话算，不再按 cwd 猜归属）；
     // 拿不到（命令行测试环境没有宿主服务）：完全保持旧的 cwd 分组行为。
+    const cards = projectCards()
     const projects = (() => {
       if (workspaces === undefined) return groupProjects(projectRows, replies, Date.now())
       try {
+        // 控制室卡片是权威：每张可见卡一行；拿不到状态文件才退回按 workspace 列表
+        if (cards !== undefined) return groupCardProjects(cards, workspaces, projectRows, replies, Date.now())
         return groupWorkspaceProjects(workspaces, projectRows, replies, Date.now())
       } catch (error) {
         // 聚合层再兜一层：主页是「兜底屏」，绝不能因为注册表数据异常而发不出帧。
