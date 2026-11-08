@@ -569,3 +569,33 @@ export function confirmationFrame(title: string, detail: string): ScreenFramePay
     tone: 'alert',
   }
 }
+
+/** 解码速度样本：累计解码毫秒 + 累计解码 token + 采样时刻。 */
+export interface TihuDecodeSample {
+  at: number
+  decodeMs: number
+  decodeTokens: number
+}
+
+/** 窗口长度：只统计最近这一段，越旧的样本丢掉，保证屏上是实时速度而不是全程平均。 */
+export const SPEED_WINDOW_MS = 15_000
+const SPEED_MAX_SAMPLES = 24
+const SPEED_MIN_SPAN_MS = 200
+
+/** 追加样本，丢掉窗口外与 token 倒退（换轮重置）的旧样本。 */
+export function pushDecodeSample(samples: TihuDecodeSample[], sample: TihuDecodeSample): TihuDecodeSample[] {
+  const kept = samples.filter((s) => sample.at - s.at <= SPEED_WINDOW_MS && s.decodeTokens <= sample.decodeTokens && s.decodeMs <= sample.decodeMs)
+  kept.push(sample)
+  return kept.slice(-SPEED_MAX_SAMPLES)
+}
+
+/** 窗口里的实时解码速度：token 增量 ÷ 解码毫秒增量；算不动就返回 undefined。 */
+export function decodeRateOf(samples: TihuDecodeSample[]): number | undefined {
+  if (samples.length < 2) return undefined
+  const last = samples[samples.length - 1]
+  const first = samples[0]
+  const dTokens = last.decodeTokens - first.decodeTokens
+  const dMs = last.decodeMs - first.decodeMs
+  if (dTokens <= 0 || dMs < SPEED_MIN_SPAN_MS) return undefined
+  return dTokens / (dMs / 1000)
+}
