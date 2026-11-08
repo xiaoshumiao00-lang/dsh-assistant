@@ -47,6 +47,9 @@ import {
   clipText,
   confirmationFrame,
   createProgressState,
+  decodeRateOf,
+  pushDecodeSample,
+  SPEED_WINDOW_MS,
   describeTool,
   formatElapsed,
   sanitizeScreenLine,
@@ -3523,6 +3526,54 @@ await testAsync('lane：刚开的 CU 会话还没进列表缓存，也要立刻�
   assert.ok(statusFrames.length > 0, '应有带 running 的状态帧')
   const last = statusFrames[statusFrames.length - 1].payload
   assert.ok(last.running.some((item) => item.sessionId === 'session-new'), '新开的 CU 会话要立刻进清单：' + JSON.stringify(last.running))
+  runtime.dispose()
+})
+
+
+/* ---------- 2026-11-08：第四行解码速度改为实时窗口速度 ---------- */
+test('速度窗口：decodeRateOf 只看 token 增量 ÷ 解码毫秒增量', () => {
+  assert.equal(decodeRateOf([]), undefined)
+  assert.equal(decodeRateOf([{ at: 1, decodeMs: 1000, decodeTokens: 100 }]), undefined, '只有一段样本时给不出增量速度')
+  const pair = [{ at: 1000, decodeMs: 10_000, decodeTokens: 1_000 }, { at: 2000, decodeMs: 20_000, decodeTokens: 3_000 }]
+  assert.equal(decodeRateOf(pair), 200)
+  assert.equal(decodeRateOf([{ at: 1, decodeMs: 1000, decodeTokens: 100 }, { at: 2, decodeMs: 1050, decodeTokens: 120 }]), undefined, '不足 200ms 跳动不算速度')
+  const pruned = pushDecodeSample(pair, { at: 3000, decodeMs: 500, decodeTokens: 50 })
+  assert.equal(pruned.length, 1, '换轮重置后只留新样本：' + JSON.stringify(pruned))
+  const aged = pushDecodeSample([{ at: 0, decodeMs: 1000, decodeTokens: 100 }], { at: 20_000, decodeMs: 3000, decodeTokens: 300 })
+  assert.equal(aged.length, 1, '超出 15s 窗口的旧样本丢弃')
+  assert.equal(SPEED_WINDOW_MS, 15_000)
+})
+
+await testAsync('速度行：状态屏第四行是窗口实时速度，不再是全程平均', async () => {
+  const projection = {
+    title: '会话 A',
+    agentPreset: 'computer-use',
+    sessionListMetadata: { blank: false, lastPromptAt: 2000 },
+    sessionStats: { decodeMs: 10_000, decodeTokens: 1_000 },
+    tokenUsage: { totalTokens: 20_000 },
+    contextPressure: { contextWindow: 100_000, pressureTokens: 20_000 },
+  }
+  const records = [{ ...cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000 }), projection }]
+  const { runtime, socket, emit } = await laneWithSession(records, 'session-a', { sessions: { get: () => ({ header: { id: 'session-a' } }) } })
+  const statsLine = () => {
+    const frames = framesOf(socket).filter((f) => f.type === 'screen.frame' && f.payload.mode !== 'home' && f.payload.mode !== 'reply'
+      && Array.isArray(f.payload.bullets) && f.payload.bullets.some((line) => line.includes('tok/s')))
+    const last = frames[frames.length - 1]
+    return last === undefined ? '' : (last.payload.bullets ?? []).join(' / ')
+  }
+  emit('session-a', { type: 'turn/start', data: { turn: 1 } })
+  await waitMs(60)
+  assert.ok(statsLine().includes('100 tok/s'), '首帧只有平均可用：' + statsLine())
+  projection.sessionStats = { decodeMs: 20_000, decodeTokens: 3_000 }
+  emit('session-a', { type: 'tool/call', data: { turn: 1, step: 1, name: 'pwsh', arguments: { command: 'node x.mjs' } } })
+  await waitMs(60)
+  assert.ok(statsLine().includes('200 tok/s'), '第二帧该给窗口增量 200：' + statsLine())
+  projection.sessionStats = { decodeMs: 25_000, decodeTokens: 3_500 }
+  emit('session-a', { type: 'tool/call', data: { turn: 1, step: 2, name: 'glob', arguments: { pattern: '**/*.ts' } } })
+  await waitMs(60)
+  const line = statsLine()
+  assert.ok(line.includes('167 tok/s'), '窗口整体速度 167：' + line)
+  assert.ok(!line.includes('100 tok/s'), '不得再显示全程平均 100：' + line)
   runtime.dispose()
 })
 

@@ -65,7 +65,7 @@ import {
   type TihuActionClass,
 } from './guard.ts'
 import { tihuPageHtml } from './page.ts'
-import { applySessionEvent, confirmationFrame, createProgressState, type TihuProgressState } from './progress.ts'
+import { applySessionEvent, confirmationFrame, createProgressState, decodeRateOf, pushDecodeSample, type TihuDecodeSample, type TihuProgressState } from './progress.ts'
 import { TihuTts, type TihuTtsPaths } from './tts.ts'
 import { replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
 import { stripToolNoise, toSpeechText } from './speech-text.ts'
@@ -432,13 +432,24 @@ function screenMetaOf(sessionId: string): { title?: string; stats?: { tokPerSec:
   )
   const decodeMs = Number(values?.sessionStats?.decodeMs ?? 0)
   const decodeTokens = Number(values?.sessionStats?.decodeTokens ?? 0)
-  const tokPerSec = decodeMs > 0 ? decodeTokens / (decodeMs / 1000) : 0
+  // 实时解码速度：只看最近窗口里的 token 增量 ÷ 解码毫秒增量，不再用全程平均（用户 2026-11-08 要求）
+  const sample = { at: Date.now(), decodeMs, decodeTokens }
+  const averageTokPerSec = decodeMs > 0 ? decodeTokens / (decodeMs / 1000) : 0
+  // 窗口不足两段时先退回全程平均，之后每一帧都改用最近 15 秒的增量速度
+  const speedSamples = pushDecodeSample(speedWindows.get(sessionId) ?? [], sample)
+  speedWindows.set(sessionId, speedSamples)
+  const liveSpeed = decodeRateOf(speedSamples) ?? speedLive.get(sessionId) ?? averageTokPerSec
+  speedLive.set(sessionId, liveSpeed)
+  const tokPerSec = liveSpeed
   const contextWindow = Number(values?.contextPressure?.contextWindow ?? 0)
   const used = Number(values?.contextPressure?.pressureTokens ?? values?.contextPressure?.surfaceTokens ?? 0)
   const contextPercent = contextWindow > 0 ? Math.min(100, (used / contextWindow) * 100) : 0
   return { title: titleOf(live), stats: { tokPerSec, totalTokens, contextPercent } }
 }
 
+/** 每条会话的解码速度样本窗口与最近一次实时速度。 */
+const speedWindows = new Map<string, TihuDecodeSample[]>()
+const speedLive = new Map<string, number>()
 const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bullets?: string[] }>()
 
   /** 回复屏底部的三个动作按钮（设备端渲染、点按回传 actionId）。 */
