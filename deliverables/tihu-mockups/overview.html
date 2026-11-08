@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>鹈鹕 · 14 屏总览</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body { background: #0b0f14; color: #e6edf3;
+    font: 14px/1.45 "Microsoft YaHei", "Microsoft YaHei UI", "Noto Sans SC", "Segoe UI", sans-serif; }
+  a { color: #3fb6a8; text-decoration: none; }
+  .wrap { width: 1280px; padding: 22px 24px 24px; }
+  header { display: block; margin-bottom: 14px; }
+  header h1 { margin: 0 0 4px; font-size: 20px; letter-spacing: .5px; }
+  header p { margin: 0; color: #8b98a5; font-size: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .card { background: #121821; border: 1px solid #1f2a37; border-radius: 10px; padding: 9px; }
+  .card img { display: block; width: 100%; height: auto; border-radius: 4px; background: #05080b; }
+  .meta { display: flex; align-items: baseline; gap: 6px; margin: 7px 2px 2px; }
+  .no { color: #3fb6a8; font-size: 11px; font-weight: 700; letter-spacing: .5px; }
+  .name { font-size: 13.5px; font-weight: 700; }
+  .fn { margin: 0 2px; font-size: 11px; line-height: 1.45; color: #c3ccd5; }
+  .pain { margin: 3px 2px 0; font-size: 10.5px; line-height: 1.45; color: #8b98a5; }
+  .pain b { color: #e2b03f; font-weight: 700; }
+
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>鹈鹕 · ESP32-S3-BOX-3 · 14 屏总览</h1>
+    <p>320×240 · 4× 出图 · 同一份 HTML/CSS 渲染</p>
+  </header>
+  <section class="grid">
+  <article class="card">
+    <img src="01-home-page1.png" alt="01 控制室主页 · 第 1 页">
+    <div class="meta"><span class="no">01</span><span class="name">控制室主页 · 第 1 页</span></div>
+    <p class="fn">五个真实项目同屏，绿 / 蓝 / 灰三色状态点，状态栏写「项目 6 个 · 1/2」。</p>
+    <p class="pain"><b>痛点</b> · 手机里翻会话要滑半天，看不出哪个项目正在跑。</p>
+  </article>
+  <article class="card">
+    <img src="02-home-page2.png" alt="02 控制室主页 · 第 2 页">
+    <div class="meta"><span class="no">02</span><span class="name">控制室主页 · 第 2 页</span></div>
+    <p class="fn">上滑翻页，页码变 2/2，承接第 6 个项目「其他」。</p>
+    <p class="pain"><b>痛点</b> · 项目一多一屏放不下，又不能退化成没有尽头的长列表。</p>
+  </article>
+  <article class="card">
+    <img src="03-session-progress.png" alt="03 会话进行中">
+    <div class="meta"><span class="no">03</span><span class="name">会话进行中</span></div>
+    <p class="fn">阶段、第 7 步、已用 1m23s 与 7/9 进度条同屏。</p>
+    <p class="pain"><b>痛点</b> · 语音交代完只剩干等，不知道它干到哪一步、还要多久。</p>
+  </article>
+  <article class="card">
+    <img src="04-reply-reading.png" alt="04 朗读回复">
+    <div class="meta"><span class="no">04</span><span class="name">朗读回复</span></div>
+    <p class="fn">十行正文窗口，当前句整行反色，右下提示「下方还有 7 行」。</p>
+    <p class="pain"><b>痛点</b> · 朗读没有视觉落点，听到一半不知道读到哪一句。</p>
+  </article>
+  <article class="card">
+    <img src="05-reply-long-history.png" alt="05 朗读长文 · 回看">
+    <div class="meta"><span class="no">05</span><span class="name">朗读长文 · 回看</span></div>
+    <p class="fn">状态栏给出 7/19 句序号，上滑停在历史位置，提示上方还有 12 行。</p>
+    <p class="pain"><b>痛点</b> · 长回答念过去就找不回，想重听前文只能从头再来。</p>
+  </article>
+  <article class="card">
+    <img src="06-pending-bubbles.png" alt="06 待处理气泡">
+    <div class="meta"><span class="no">06</span><span class="name">待处理气泡</span></div>
+    <p class="fn">右侧 64px 气泡轨：两个新回复球 + 「+2」角标，正文压到 240px。</p>
+    <p class="pain"><b>痛点</b> · 别的会话完成了不知道，切过去还得先回主页找。</p>
+  </article>
+  <article class="card">
+    <img src="07-voice-input.png" alt="07 语音输入中">
+    <div class="meta"><span class="no">07</span><span class="name">语音输入中</span></div>
+    <p class="fn">「聆听 / 正在转写…」+ 红色「按住说话」录制态，松开发送。</p>
+    <p class="pain"><b>痛点</b> · 不知道麦克风有没有在录、有没有在识别，只能猜。</p>
+  </article>
+  <article class="card">
+    <img src="08-confirm-danger.png" alt="08 危险操作确认">
+    <div class="meta"><span class="no">08</span><span class="name">危险操作确认</span></div>
+    <p class="fn">confirm.ask 弹窗：动作名、目标路径、确认 / 取消双键。</p>
+    <p class="pain"><b>痛点</b> · 删除、覆盖、执行命令不能在语音里默认放行。</p>
+  </article>
+  <article class="card">
+    <img src="09-audio-alert.png" alt="09 无声 / 无音频告警">
+    <div class="meta"><span class="no">09</span><span class="name">无声 / 无音频告警</span></div>
+    <p class="fn">琥珀色「点一下屏幕启用声音」条 + 红色「本次无语音」告警同屏。</p>
+    <p class="pain"><b>痛点</b> · 静音策略或 TTS 挂掉时，看起来像在读其实没声。</p>
+  </article>
+  <article class="card">
+    <img src="10-bind-follow.png" alt="10 绑定 / 自动跟随">
+    <div class="meta"><span class="no">10</span><span class="name">绑定 / 自动跟随</span></div>
+    <p class="fn">「已自动跟随到：会话标题」，并说明桌面是否正开着该会话。</p>
+    <p class="pain"><b>痛点</b> · 多会话并行时，不知道这句话到底注入了哪一条。</p>
+  </article>
+  <article class="card">
+    <img src="11-voice-sample.png" alt="11 试听与音色">
+    <div class="meta"><span class="no">11</span><span class="name">试听与音色</span></div>
+    <p class="fn">edge-tts 云健 / 本地 Qwen3-TTS 两档切换，试听回执「已播放试听语音」。</p>
+    <p class="pain"><b>痛点</b> · 换音色后没声，分不清是合成失败还是播放被浏览器拦了。</p>
+  </article>
+  <article class="card">
+    <img src="12-done.png" alt="12 已完成">
+    <div class="meta"><span class="no">12</span><span class="name">已完成</span></div>
+    <p class="fn">「完成 · 共 12 步 · 用时 2m18s」，右下角点按可回控制室。</p>
+    <p class="pain"><b>痛点</b> · 任务结束后停在旧界面，不知道怎么回主页。</p>
+  </article>
+  <article class="card">
+    <img src="13-idle-home.png" alt="13 空闲回到控制室">
+    <div class="meta"><span class="no">13</span><span class="name">空闲回到控制室</span></div>
+    <p class="fn">所有会话停止、朗读播完后自动回主页，状态点全部转为蓝 / 灰。</p>
+    <p class="pain"><b>痛点</b> · 长回复读到一半被切主页，或干完活屏幕一直停在旧状态。</p>
+  </article>
+  <article class="card">
+    <img src="14-phone-remote.png" alt="14 手机远程同一屏">
+    <div class="meta"><span class="no">14</span><span class="name">手机远程同一屏</span></div>
+    <p class="fn">同一份 /tihu 页面放进手机外框，触摸 / 滑动与真机一致。</p>
+    <p class="pain"><b>痛点</b> · 离开电脑想瞄一眼进度，不想再装第二个 App。</p>
+  </article>
+  </section>
+</div>
+</body>
+</html>
