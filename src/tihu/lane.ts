@@ -65,11 +65,11 @@ import {
   type TihuActionClass,
 } from './guard.ts'
 import { tihuPageHtml } from './page.ts'
-import { applySessionEvent, confirmationFrame, createProgressState, decodeRateOf, pushDecodeSample, type TihuDecodeSample, type TihuProgressState } from './progress.ts'
+import { applyEarlyThinking, applySessionEvent, confirmationFrame, createProgressState, decodeRateOf, pushDecodeSample, type TihuDecodeSample, type TihuProgressState } from './progress.ts'
 import { TihuTts, type TihuTtsPaths } from './tts.ts'
 import { replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
 import { stripToolNoise, toSpeechText } from './speech-text.ts'
-import { CONTENT_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
+import { CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
 import { cardsFromState, groupCardProjects, groupProjects, groupWorkspaceProjects, humanTitle, projectCardsSignature, projectNameOf, type ProjectReply, type TihuCardRow, type TihuWorkspaceRow } from './project-groups.ts'
 import type { AlertPayload, TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
 
@@ -147,10 +147,29 @@ export function tihuHomeSyncMs(): number {
 }
 
 /**
+ * 流式思考刷屏节流（毫秒）。
+ *
+ * 模型的 reasoning-delta 每几十毫秒一块，屏帧不需要每块都刷：默认 300ms 取一次
+ * 「已经到达的思考文本」→ 第一句话写进「思考」活动行。TIHU_THINKING_FLUSH_MS 可调
+ * （夹在 20ms ~ 5s，0/负数/非数字回落默认），测试里设小。
+ */
+export function tihuThinkingFlushMs(): number {
+  const raw = Number(process.env.TIHU_THINKING_FLUSH_MS ?? 300)
+  if (!Number.isFinite(raw)) return 300
+  return clampInt(raw, 20, 5_000)
+}
+
+/**
  * 朗读收尾余量：lane 的播放时间轴是「首块到达 + 累计音频时长」的投影，页面实际
  * 起播还差一个 ~30ms 的排程缓冲；留这点余量，回主页才不会被最后半句抢跑。
  */
 const SPEAK_TAIL_MARGIN_MS = 120
+
+/**
+ * 每条会话最多留多少思考原文：只需要第一句话，整段思考可能 20KB+（实测 reasoning
+ * 430 块 ≈ 16KB），留在内存里没意义；超出就停止累积（第一句早就够了）。
+ */
+const TIHU_THINKING_MAX_CHARS = 4_000
 
 /** 环境变量整数化 + 夹到安全区间（NaN / 0 / 负数一律回落兜底值）。 */
 function clampInt(value: number, min: number, max: number): number {
@@ -387,6 +406,14 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const lastAssistant = new Map<string, ProjectReply>()
   /** 会话 id → 屏幕进度状态（步骤计数 / 用时 / 上一步结果）。 */
   const progressStates = new Map<string, TihuProgressState>()
+  /**
+   * 会话 id → 本次 attempt 已经收到的思考文本（agent/assistant-stream 的
+   * reasoning-delta 累积；start 重置、end 清空）。宿主 session/event 要等该步
+   * assistant/message 才有思考块，这里补的是模型正在想的那段时间。
+   */
+  const liveThinking = new Map<string, { attemptId: string; text: string }>()
+  /** 会话 id → 思考节流定时器（每会话最多一个，避免每个 token 刷一屏）。 */
+  const thinkingTimers = new Map<string, ReturnType<typeof setTimeout>>()
   /** 正在 reply 阅读模式的会话（turn/end 不再用「完成」状态帧覆盖正文）。 */
   const replySessions = new Set<string>()
   /** 本地 TTS sidecar（独立进程；模型缺失时 available=false，页面走系统语音）。 */
@@ -1121,6 +1148,43 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   function sendReply(sessionId: string, sentences: ReplySentence[], currentIndex: number, charPos: number, includeAll: boolean): void {
     screen(sessionId, replyScreen(sessionId, sentences, currentIndex, charPos, includeAll))
+  }
+
+  /** 把已到达的思考文本写进「思考」活动行（文本没变时 applyEarlyThinking 不出帧）。 */
+  function flushLiveThinking(sessionId: string): void {
+    const buffer = liveThinking.get(sessionId)
+    if (buffer === undefined || buffer.text === '') return
+    const state = progressStates.get(sessionId)
+    if (state === undefined) return
+    const narrow = (pendingByDisplay.get(sessionId)?.length ?? 0) > 0
+    const update = applyEarlyThinking(state, buffer.text, Date.now(), narrow ? PENDING_RAIL_WIDTH_PX : CONTENT_WIDTH_PX)
+    if (update?.screen !== undefined) screen(sessionId, update.screen)
+  }
+
+  /** 节流：一个会话同时只挂一个 flush 定时器。 */
+  function scheduleLiveThinking(sessionId: string): void {
+    if (thinkingTimers.has(sessionId)) return
+    const timer = setTimeout(() => {
+      thinkingTimers.delete(sessionId)
+      try {
+        flushLiveThinking(sessionId)
+      } catch (error) {
+        log(`tihu thinking flush failed: ${(error as Error)?.message ?? String(error)}`)
+      }
+    }, tihuThinkingFlushMs())
+    timer.unref?.()
+    thinkingTimers.set(sessionId, timer)
+  }
+
+  /** 收尾：清掉该会话的缓冲与定时器；flush=true 时把最后一段先写进屏（attempt 结束）。 */
+  function stopLiveThinking(sessionId: string, flush: boolean): void {
+    const timer = thinkingTimers.get(sessionId)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      thinkingTimers.delete(sessionId)
+    }
+    if (flush) flushLiveThinking(sessionId)
+    liveThinking.delete(sessionId)
   }
 
   /**
@@ -2224,6 +2288,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         // 新的一轮开始：解除主页钉住与浏览态，让状态屏正常回到会话（用户 2026-11-08 规则）。
         unpinHome(sessionId)
         browsingHistory.delete(sessionId)
+        // 上一轮如果没收到 end，别把上一条思考留到这一轮（start 事件会重新建缓冲）。
+        stopLiveThinking(sessionId, false)
       }
       else if (type === 'turn/end') runningSessions.delete(sessionId)
       // 运行跟踪与自动跟随都在设备早退**之前**：没绑定该会话的设备收不到事件，
@@ -2262,6 +2328,15 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           if (hs !== undefined && hs.done && hs.mode === 'session') scheduleHome(sessionId)
         }, tihuTurnStaleMs() + 10)
         watchdog.unref?.()
+      }
+      // 该步已经有模型早期思考（流式 reasoning）：先写进「思考」活动行，
+      // 让这一帧 step/start / tool/call 直接带第一句话，而不是占位符。
+      if (type === 'step/start' || type === 'tool/call') {
+        const live = liveThinking.get(sessionId)
+        if (live !== undefined && live.text !== '') {
+          const narrow = (pendingByDisplay.get(sessionId)?.length ?? 0) > 0
+          applyEarlyThinking(state, live.text, Date.now(), narrow ? PENDING_RAIL_WIDTH_PX : CONTENT_WIDTH_PX)
+        }
       }
       const update = applySessionEvent(state, event, Date.now(), {
         ...screenMetaOf(sessionId),
@@ -2348,6 +2423,44 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       }
     } catch (error) {
       log(`tihu session event failed: ${(error as Error)?.stack ?? String(error)}`)
+    }
+  })
+
+  /**
+   * 模型早期思考（进程内直播）：`agent/assistant-stream` 的 reasoning-delta 在模型
+   * 一边想一边到，不等该步 assistant/message。这里按 attempt 累积文本、节流刷屏。
+   *
+   * 事件形状（@deepseek-ai/dsh-agent 的 AgentEventDispatch 注入 agent）：
+   *   { agent, frame: { type: 'start', attemptId, revision, turn, step } }
+   *   { agent, frame: { type: 'chunk', attemptId, revision, index, time,
+   *                     chunk: { type: 'reasoning-delta', index, text } } }
+   *   { agent, frame: { type: 'end', attemptId, revision, index, outcome } }
+   * 只跟「有设备在看」的会话：没屏可刷的会话不占内存；其它 chunk（text/tool-call）忽略。
+   */
+  const disposeAssistantStream = ctx.on?.('agent/assistant-stream', (payload: any) => {
+    try {
+      const sessionId = sessionIdOfAgent(payload?.agent)
+      if (sessionId === undefined) return
+      const frame = payload?.frame
+      if (frame === null || typeof frame !== 'object') return
+      if (frame.type === 'start') {
+        // 新 attempt：先扔掉上一条残留，再把这一次的思考缓冲建起来（中途有设备绑上也接得上）。
+        stopLiveThinking(sessionId, false)
+        liveThinking.set(sessionId, { attemptId: String(frame.attemptId ?? ''), text: '' })
+        return
+      }
+      if (frame.type === 'chunk') {
+        const chunk = frame.chunk
+        if (chunk?.type !== 'reasoning-delta' || typeof chunk.text !== 'string' || chunk.text === '') return
+        const buffer = liveThinking.get(sessionId)
+        if (buffer === undefined) return
+        if (buffer.text.length < TIHU_THINKING_MAX_CHARS) buffer.text += chunk.text
+        scheduleLiveThinking(sessionId)
+        return
+      }
+      if (frame.type === 'end') stopLiveThinking(sessionId, true)
+    } catch (error) {
+      log(`tihu assistant stream failed: ${(error as Error)?.message ?? String(error)}`)
     }
   })
 
@@ -2932,6 +3045,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     dispose: () => {
       disposed = true
       if (homeSyncTimer !== undefined) clearInterval(homeSyncTimer)
+      for (const [sessionId, timer] of thinkingTimers) {
+        clearTimeout(timer)
+        thinkingTimers.delete(sessionId)
+      }
+      liveThinking.clear()
       ;(confirmBroker as any).failAll?.('disposed')
       for (const [sessionId, state] of homeStates) {
         if (state.timer !== undefined) clearTimeout(state.timer)
@@ -2940,7 +3058,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       tts.dispose()
       for (const device of devices) device.close()
       devices.clear()
-      for (const disposer of [disposePre, disposePost, disposeSession]) {
+      for (const disposer of [disposePre, disposePost, disposeSession, disposeAssistantStream]) {
         try { if (typeof disposer === 'function') disposer() } catch { /* 忽略 */ }
       }
     },

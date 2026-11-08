@@ -510,8 +510,13 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     if (thought !== '') {
       const detail = sanitizeDetail(firstSentence(thought))
       const last = state.activity[state.activity.length - 1]
+      // 早期流式思考（agent/assistant-stream）已经写过同一句：不再重复入栈，
+      // 一条思考只留一条（用户 2026-11-08：第二行不能老停在占位符/重复行）。
+      const early = state.activity.slice(-2).some((entry) => entry.label === '思考' && entry.detail === detail)
       if (last !== undefined && last.label === '思考' && last.detail === THINKING_PLACEHOLDER) {
         state.activity[state.activity.length - 1] = { label: '思考', detail }
+      } else if (early) {
+        // 已有同一句，保持原样。
       } else {
         pushActivity(state, '思考', firstSentence(thought))
       }
@@ -560,6 +565,44 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
   }
 
   return {}
+}
+
+/**
+ * 模型早期思考（流式 reasoning-delta 累积文本）→「思考」活动行。
+ *
+ * 为什么需要它：宿主的 `session/event` 只在**该步结束**（assistant/message）时才带
+ * `message.content` 里的 reasoning 块；模型真正思考的那几十秒里，屏上只有
+ * {@link THINKING_PLACEHOLDER}。lane 订阅 `agent/assistant-stream` 的 reasoning-delta，
+ * 把已经到达的文本按这里的口径先写到屏上。
+ *
+ * 取句口径与 assistant/message 完全一致（sanitizeDetail + firstSentence），超宽由
+ * statusFrame 的 entryLine 按 screen-spec 的 fitLine 量宽截断（不出现半行/溢出）。
+ * 文本没变就不返回帧——lane 每个节流窗口调用一次，不会每个 token 都刷屏。
+ *
+ * @param state - 该会话的进度状态（原地更新 activity）。
+ * @param thought - 截至目前累积的思考原文（可以是第一句还没写完的半句）。
+ * @param now - 当前时间（阶段用时/统计用）。
+ * @param widthPx - 气泡轨占位时传 PENDING_RAIL_WIDTH_PX（与页面 240px 对齐）。
+ * @returns 需要下发的状态屏帧；文本没变/为空时 undefined。
+ */
+export function applyEarlyThinking(
+  state: TihuProgressState,
+  thought: string,
+  now = Date.now(),
+  widthPx = CONTENT_WIDTH_PX,
+): ProgressUpdate | undefined {
+  const detail = sanitizeDetail(firstSentence(thought))
+  if (detail === '') return undefined
+  const last = state.activity[state.activity.length - 1]
+  if (last !== undefined && last.label === '思考') {
+    if (last.detail === detail) return undefined
+    last.detail = detail
+  } else {
+    if (detail === THINKING_PLACEHOLDER) return undefined
+    pushActivity(state, '思考', detail)
+  }
+  // 屏帧的正文行由 statusFrame → entryLine 统一按 fitLine 量宽截断（与其它明细同一口径）。
+  return { screen: statusFrame(state, now, widthPx) }
 }
 
 /** 危险动作确认时的屏帧（stage 固定「等待确认」）。 */

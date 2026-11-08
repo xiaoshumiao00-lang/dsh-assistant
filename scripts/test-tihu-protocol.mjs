@@ -43,6 +43,7 @@ import {
 import { createTihuRuntime, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH } from '../src/tihu/lane.ts'
 import {
   activityEntryOf,
+  applyEarlyThinking,
   applySessionEvent,
   clipText,
   confirmationFrame,
@@ -3959,6 +3960,163 @@ test('page：首页有「最近回答」行，动作条有上一条/下一条的
   assert.ok(html.includes("hit: 'recent'"), '点最近回答行要上报 hit=recent')
   assert.ok(html.includes('上一条') && html.includes('下一条'), '翻页按钮文案要有上一条/下一条')
   assert.ok(html.includes('action-bar many'), '5 个按钮时用小字号、不换行')
+})
+
+/* ---------- 2026-11-08：状态屏第二行显示模型真实思考（不再老停在「模型推理中…」） ---------- */
+
+test('进度屏：早思考只取第一句，替换占位符；同一句不重复出帧，超长按屏宽截断', () => {
+  const state = createProgressState(1000)
+  applySessionEvent(state, { type: 'turn/start', data: { turn: 1 } }, 1000)
+  applySessionEvent(state, { type: 'step/start', data: { turn: 1, step: 1 } }, 1100)
+  assert.equal(state.activity.length, 1, '刚进入第一步时只有一条占位')
+  assert.ok(state.activity[0].detail.includes('模型推理中'), '还没有思考文本时才是占位符')
+
+  const first = applyEarlyThinking(state, '先确认宿主有没有早期思考文本。再决定怎么接。', 1200)
+  assert.ok(first?.screen, '有思考文本就要出帧')
+  assert.ok(
+    first.screen.bullets[0].startsWith('思考 · 先确认宿主有没有早期思考文本'),
+    '第二行要换成第一句：' + first.screen.bullets[0],
+  )
+  assert.ok(!first.screen.bullets.some((line) => line.includes('模型推理中')), '占位符必须被替换')
+
+  // 同一句（例如节流窗口重复 flush）不再出帧
+  assert.equal(applyEarlyThinking(state, '先确认宿主有没有早期思考文本。再决定怎么接。', 1300), undefined)
+  // 第一句还没写完（没有句末标点）时要跟着变长
+  const grown = applyEarlyThinking(state, '先确认宿主有没有早期思考', 1400)
+  assert.ok(grown?.screen.bullets[0].includes('早期思考'), '第一句没写完时跟着更新：' + grown?.screen.bullets[0])
+
+  // 超长没有句末标点的思考：按 screen-spec 的 fitLine 量宽截断，不溢出 304px
+  const long = applyEarlyThinking(state, '这是一段没有句号而且非常非常长的思考内容'.repeat(20), 1500)
+  assert.ok(long?.screen, '长文本也要出帧')
+  const line = long.screen.bullets[0]
+  assert.ok(measureTextPx(line, SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX, '思考行不得超宽：' + line)
+  assert.ok(line.endsWith('…'), '超长要省略号收尾：' + line)
+})
+
+test('进度屏：真实宿主的 reasoning 块（type=reasoning/text）与 thinking 块同口径，stream 兜底也认', () => {
+  const reasoningState = createProgressState(1000)
+  applySessionEvent(reasoningState, { type: 'turn/start', data: { turn: 1 } }, 1000)
+  applySessionEvent(reasoningState, {
+    type: 'assistant/message',
+    data: {
+      message: { role: 'assistant', content: [{ type: 'reasoning', text: '先核对宿主事件形状。再改代码。' }, { type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }] },
+    },
+  }, 2000)
+  const reasoningDetail = (reasoningState.activity.find((entry) => entry.label === '思考') || {}).detail ?? ''
+  assert.ok(reasoningDetail.startsWith('先核对宿主事件形状'), 'reasoning 块要认（只有 reasoning+tool-call、没有 text 时也写进活动行）：' + reasoningDetail)
+
+  const streamState = createProgressState(1000)
+  applySessionEvent(streamState, { type: 'turn/start', data: { turn: 1 } }, 1000)
+  const streamFrame = applySessionEvent(streamState, {
+    type: 'assistant/message',
+    data: {
+      message: { role: 'assistant', content: [{ type: 'text', text: '好。' }] },
+      stream: [{ type: 'reasoning-chunks', time0: 1, index: 0, dt: [], texts: ['流式兜底的第一句。后面。'] }],
+    },
+  }, 2000)
+  assert.ok(streamFrame.screen.bullets[0].startsWith('思考 · 流式兜底的第一句'), 'reasoning-chunks 兜底要认：' + streamFrame.screen.bullets[0])
+})
+
+test('进度屏：assistant/message 的思考与早期流式同一句时不重复入栈', () => {
+  const state = createProgressState(1000)
+  applySessionEvent(state, { type: 'turn/start', data: { turn: 1 } }, 1000)
+  applySessionEvent(state, { type: 'step/start', data: { turn: 1, step: 1 } }, 1100)
+  applyEarlyThinking(state, '先看宿主有没有早期思考文本，再决定怎么接。后面还有很长的分析。', 1200)
+  applySessionEvent(state, { type: 'tool/call', data: { turn: 1, step: 1, name: 'read', arguments: { file_path: 'a.ts' } } }, 1300)
+  const frame = applySessionEvent(state, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'reasoning', text: '先看宿主有没有早期思考文本，再决定怎么接。后面还有很长的分析。' }, { type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }] } },
+  }, 1400).screen
+  const thinkingCount = state.activity.filter((entry) => entry.label === '思考').length
+  assert.equal(thinkingCount, 1, '同一句思考只留一条：' + JSON.stringify(state.activity))
+  void frame
+})
+
+await testAsync('lane：agent/assistant-stream 的 reasoning-delta 一到，第二行就从占位符变成第一句', async () => {
+  process.env.TIHU_THINKING_FLUSH_MS = '30'
+  try {
+    const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+    const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+    const socket = openLane(runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'think-stream', protocol: '0', sessionId: 'session-a' }, 1)))
+    await waitMs(40)
+    const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+    const onStream = events.find((entry) => entry.name === 'agent/assistant-stream')?.handler
+    assert.ok(onStream, 'lane 必须订阅 agent/assistant-stream（模型早期思考）')
+    const emit = (event) => onSessionEvent({ id: 'session-a', header: { id: 'session-a' } }, event)
+    const stream = (frame) => onStream({ agent: { session: { id: 'session-a' } }, frame })
+    emit({ type: 'turn/start', data: { turn: 2 } })
+    emit({ type: 'step/start', data: { turn: 2, step: 1 } })
+    await waitMs(40)
+    const statusFrames = () => framesOf(socket)
+      .filter((frame) => frame.type === 'screen.frame' && frame.payload.mode !== 'home' && frame.payload.mode !== 'reply')
+      .map((frame) => frame.payload)
+    assert.ok(
+      statusFrames().some((payload) => (payload.bullets || []).some((line) => line.includes('模型推理中'))),
+      '思考还没开始时先显示占位符',
+    )
+
+    const mark = framesOf(socket).length
+    stream({ type: 'start', attemptId: 'a1', revision: 1, turn: 2, step: 1 })
+    for (const text of ['先看宿主有没有早期思考文本', '，再决定怎么接', '。后面还有很长的分析。']) {
+      stream({ type: 'chunk', attemptId: 'a1', revision: 1, index: 0, time: 1, chunk: { type: 'reasoning-delta', index: 0, text } })
+    }
+    await waitMs(140)
+    const streamed = framesOf(socket).slice(mark)
+      .filter((frame) => frame.type === 'screen.frame' && frame.payload.mode !== 'home' && frame.payload.mode !== 'reply')
+      .map((frame) => frame.payload)
+    assert.ok(streamed.length > 0, '流式思考要出屏帧（不用等该步 assistant/message）')
+    const last = streamed[streamed.length - 1]
+    assert.ok(
+      (last.bullets || []).some((line) => line.startsWith('思考 · 先看宿主有没有早期思考文本')),
+      '第二行是第一句：' + JSON.stringify(last.bullets),
+    )
+    assert.ok(!(last.bullets || []).some((line) => line.includes('模型推理中')), '占位符必须消失：' + JSON.stringify(last.bullets))
+
+    // 该步 assistant/message（只有 reasoning + tool-call、没有 text）到达也不重复
+    stream({ type: 'end', attemptId: 'a1', revision: 1, index: 3, outcome: { kind: 'abandoned' } })
+    emit({
+      type: 'assistant/message',
+      data: { message: { content: [{ type: 'reasoning', text: '先看宿主有没有早期思考文本，再决定怎么接。后面还有很长的分析。' }, { type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }] } },
+    })
+    emit({ type: 'step/start', data: { turn: 2, step: 2 } })
+    await waitMs(60)
+    const afterMessage = statusFrames().pop()
+    const thinkingLines = (afterMessage.bullets || []).filter((line) => line.startsWith('思考'))
+    assert.equal(thinkingLines.length, 1, '第二步的帧里只留一条思考：' + JSON.stringify(afterMessage.bullets))
+    assert.ok(thinkingLines[0].includes('先看宿主有没有早期思考文本'), '思考内容仍是第一句：' + thinkingLines[0])
+    runtime.dispose()
+  } finally {
+    delete process.env.TIHU_THINKING_FLUSH_MS
+  }
+})
+
+await testAsync('lane：tool/call 到达时若该步已有思考，先替换占位符再出帧（不等节流）', async () => {
+  process.env.TIHU_THINKING_FLUSH_MS = '5000'
+  try {
+    const records = [cuRecord('session-a', { live: true, cwd: '/a', lastPromptAt: 2000, title: '会话 A' })]
+    const { runtime, events } = runtimeFor(records, {}, { instance: fakeTts() })
+    const socket = openLane(runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'think-tool', protocol: '0', sessionId: 'session-a' }, 1)))
+    await waitMs(40)
+    const onSessionEvent = events.find((entry) => entry.name === 'session/event').handler
+    const onStream = events.find((entry) => entry.name === 'agent/assistant-stream')?.handler
+    const emit = (event) => onSessionEvent({ id: 'session-a', header: { id: 'session-a' } }, event)
+    const stream = (frame) => onStream({ agent: { session: { id: 'session-a' } }, frame })
+    emit({ type: 'turn/start', data: { turn: 3 } })
+    emit({ type: 'step/start', data: { turn: 3, step: 1 } })
+    stream({ type: 'start', attemptId: 'a2', revision: 2, turn: 3, step: 1 })
+    stream({ type: 'chunk', attemptId: 'a2', revision: 2, index: 0, time: 1, chunk: { type: 'reasoning-delta', index: 0, text: '先确认口径，再动手。后面另说。' } })
+    await waitMs(20) // 节流 5000ms 还没到
+    emit({ type: 'tool/call', data: { turn: 3, step: 1, name: 'read', arguments: { file_path: '/a/x.ts' } } })
+    await waitMs(60)
+    const last = framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop().payload
+    assert.ok(!(last.bullets || []).some((line) => line.includes('模型推理中')), '工具帧不得再带占位符：' + JSON.stringify(last.bullets))
+    assert.ok((last.bullets || []).some((line) => line.startsWith('思考 · 先确认口径')), '工具帧要先带第一句：' + JSON.stringify(last.bullets))
+    runtime.dispose()
+  } finally {
+    delete process.env.TIHU_THINKING_FLUSH_MS
+  }
 })
 
 /* ---------- 汇总 ---------- */
