@@ -61,6 +61,25 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     display:flex; flex-direction:column; gap:4px; }
   #screen .stage { font-size:12px; line-height:14px; letter-spacing:1px; color:var(--accent);
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  /* 首页最上方那一行（用户 2026-11-08 确认）：原来的「项目 N 个 · 第 x/y 页」整段删掉，
+     换成「本地时钟 HH:MM」+「三格信号柱」。这一行占掉 stage 原来那一行的位置（12px/行高 14），
+     总高度不变，底部翻页条不会被顶出 224px 内容高。状态屏 / 回答屏的 stage 行照旧。
+     信号柱是纯 CSS 内联元素（三根 <span>，高度递增、底对齐），没有 emoji、没有图片、没有外部字体图标；
+     断开只靠颜色（红）区分，不写「断开」两个字。 */
+  #screen .home-top { display:none; flex:none; align-items:flex-end; gap:8px; height:14px; box-sizing:border-box; }
+  #screen.home-mode .home-top { display:flex; }
+  #screen.home-mode .stage { display:none; }
+  #screen .home-top .clock { font-size:12px; line-height:14px; letter-spacing:1px; color:var(--accent);
+    font-variant-numeric:tabular-nums; white-space:nowrap; overflow:hidden; flex:none; }
+  /* 三格信号柱：3 根 ×5px + 2 个间隙 ×2px = 19px（页面 JS 里 HOME_TOP_* 常量要和这两个数字一致）。 */
+  #screen .home-top .signal { flex:none; margin-left:auto; display:flex; align-items:flex-end; gap:2px; height:13px; }
+  #screen .home-top .signal .bar { display:block; width:5px; border-radius:1px; background:#6b7785; }
+  #screen .home-top .signal .bar.b1 { height:5px; }
+  #screen .home-top .signal .bar.b2 { height:9px; }
+  #screen .home-top .signal .bar.b3 { height:13px; }
+  #screen .home-top .signal.conn-online .bar { background:#35d07f; }            /* 已连上宿主：绿 */
+  #screen .home-top .signal.conn-connecting .bar { background:#6b7785; opacity:.55; } /* 连接中 / 重连中：灰、柱条稍淡 */
+  #screen .home-top .signal.conn-offline .bar { background:var(--err); }        /* 断开：红（只有颜色） */
   #screen .title { font-size:18px; font-weight:700; line-height:22px;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen ul { margin:0; padding:0; list-style:none; font-size:16px; line-height:20px; color:#c3ccd5; }
@@ -73,8 +92,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen.home-mode .title, #screen.home-mode ul, #screen.home-mode .reply-body, #screen.home-mode .bar,
   #screen.home-mode .action-bar, #screen.home-mode .run-list { display:none; }
   /* 首页底部翻页条（用户 2026-11-08 要求）：只在 home-mode 显示，按钮 min-height 28px，flex 布局。
-     这一行占掉底部 28px + 4px 间隙，所以项目行必须收进 30px：224 内容高 = stage 14 + 间隙 4
-     + 最近回答 20 + 5×30 + 间隙 4 + 翻页条 28 = 220（不留半行）。 */
+     这一行占掉底部 28px + 4px 间隙，所以项目行必须收进 30px：224 内容高 = 顶行 14（时钟 + 信号柱）+ 间隙 4
+     + 最近回答 20 + 5×30 + 间隙 4 + 翻页条 28 = 220（不留半行）。顶行的高度与原来那行 stage 一模一样，
+     换行走不会把翻页条顶出屏幕。 */
   #screen .home-pager { display:none; flex:none; align-items:center; gap:6px; }
   #screen.home-mode .home-pager { display:flex; }
   #screen .home-pager button { flex:none; width:64px; min-height:28px; padding:0; border-radius:6px;
@@ -118,7 +138,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     display:none; flex-direction:column; gap:4px; z-index:3; }
   #screen.rail-on .pending-rail { display:flex; }
   #screen.rail-on .title, #screen.rail-on ul, #screen.rail-on .reply-body, #screen.rail-on .home-body,
-  #screen.rail-on .home-pager { width:240px; }
+  #screen.rail-on .home-pager, #screen.rail-on .home-top { width:240px; }
   #screen .pending-chip { width:56px; height:34px; box-sizing:border-box; padding:2px 3px; border-radius:5px;
     background:rgba(20,28,40,.82); border:1px solid rgba(120,180,255,.55); overflow:hidden; }
   #screen .pending-name { font-size:11px; line-height:15px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -201,6 +221,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       <div class="mics"><span></span><span></span></div>
       <div id="screen">
         <div class="stage" id="stage">连接</div>
+        <div id="homeTop" class="home-top"><span class="clock" id="homeClock">--:--</span><span class="signal conn-connecting" id="homeSignal"><span class="bar b1"></span><span class="bar b2"></span><span class="bar b3"></span></span></div>
         <div class="title" id="title">正在连接宿主…</div>
         <ul id="bullets"></ul>
         <div id="runList" class="run-list"></div>
@@ -347,6 +368,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     sessionBound: false, computerUse: null, sessionPreset: '', cuTotal: 0, total: 0,
     mode: 'auto', lastAutoId: '',
     lastTranscript: '', asking: null, recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0,
+    connState: 'connecting', clockTimer: 0,
     ttsTurnTexts: [], ttsAudioSeen: {},
     audioCtx: null, pcmSources: [], pcmNextTime: 0, turnPcm: [],
     samplePending: false, sampleTimer: 0,
@@ -533,17 +555,45 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var shown = body === '' ? '' : fitTextPx(body, room, fontPx);
     return shown === '' ? tail : shown + tail;
   }
-  /** 主页 stage 行：宿主 lane 已下发「项目 总数 个 · 第 x/y 页」；缺字段的老帧再自己拼同格式。 */
-  function homeStageText(payload) {
-    var home = payload.home || {};
-    var page = home.page || { index: 0, total: 1 };
-    var index = Number(page.index);
-    if (!Number.isFinite(index) || index < 0) index = 0;
-    var total = Number(page.total);
-    if (!Number.isFinite(total) || total < 1) total = 1;
-    var text = String(payload.stage || '').trim();
-    if (text === '') text = '项目 ' + home.total + ' 个 · 第 ' + (index + 1) + '/' + total + ' 页';
-    return fitTextPx(text, stageWidthPx(), SCREEN.stageFontPx || 12);
+  /**
+   * 首页顶行的尺寸常量：必须和 CSS「#screen .home-top .signal」那三条规则一模一样
+   * （柱宽 5px × 3、柱间隙 2px × 2、时间与图标间隙 8px）。
+   * 可用宽度取 stageWidthPx()：有气泡轨时 240，没有时 304，两种都要排得下。
+   */
+  var SIGNAL_BAR_W = 5;
+  var SIGNAL_GAP_W = 2;
+  var SIGNAL_W = SIGNAL_BAR_W * 3 + SIGNAL_GAP_W * 2;   /* 19 */
+  var HOME_TOP_GAP_W = 8;
+
+  /** 本地时钟：只显示到分钟、24 小时制、零补齐 → 19:32。不取宿主帧推送（靠宿主推会 stale）。 */
+  function clockText() {
+    var now = new Date();
+    var hh = now.getHours();
+    var mm = now.getMinutes();
+    return (hh < 10 ? '0' : '') + hh + ':' + (mm < 10 ? '0' : '') + mm;
+  }
+  /**
+   * 连接状态：接页面已有那一份（#conn 那条 + ws 开/关），不新增协议字段。
+   * online = 已连上宿主（绿）；connecting = 连上前 / 2 秒后重连时正在拨号（灰、柱条稍淡）；
+   * offline = 刚刚关掉连接、还没开始下一次重连（红）。断开只有颜色，没有文字。
+   */
+  function setConnState(next) {
+    state.connState = next;
+    renderHomeTop();
+  }
+  function connClassOf() {
+    if (state.connState === 'online') return 'conn-online';
+    if (state.connState === 'offline') return 'conn-offline';
+    return 'conn-connecting';
+  }
+  /** 首页顶行：时钟 + 信号柱，整行宽度和 stage 同一套可用宽（rail-on 240 / 否则 304）。 */
+  function renderHomeTop() {
+    var signal = $('homeSignal');
+    if (signal) signal.className = 'signal ' + connClassOf();
+    var clock = $('homeClock');
+    if (!clock) return;
+    var room = Math.max(1, stageWidthPx() - SIGNAL_W - HOME_TOP_GAP_W);
+    clock.textContent = fitTextPx(clockText(), room, SCREEN.stageFontPx || 12);
   }
   /**
    * 朗读屏 stage 行（方案 B）：文案不动，末尾追加「· 窗口起始行/总行」。
@@ -590,13 +640,18 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var screen = $('screen');
     renderPending(payload || {});
     updateScrollHint();
+    // 收到任何一帧都顺手重画顶行（时钟本来每秒 tick，这里再补一次保证同一帧里不会花掉）。
+    renderHomeTop();
     if (payload && payload.mode === 'home' && payload.home) {
       state.screenMode = 'home';
       state.reply = null;
       state.highlightLock = false;
-      // stage 行由宿主 lane 直接下发（「项目 总数 个 · 第 x/y 页」），页面只做像素级 fitting，不再自己拼数字。
-      $('stage').style.display = '';
-      $('stage').textContent = homeStageText(payload);
+      // 首页最上方那一行现在由页面自己负责：本地时钟 HH:MM + 三格信号柱。
+      // 宿主 home 帧的 stage 已经空着（不再写「项目 N 个 · 第 x/y 页」），那一行在 home-mode 收掉；
+      // 「项目 N 个」总数整段删除、不挪到屏内别的地方；状态屏 / 回答屏的 stage 行保持原样。
+      $('stage').style.display = 'none';
+      $('stage').textContent = '';
+      renderHomeTop();
       renderHomePager(payload);
       $('replyBody').innerHTML = '';
       var homeBody = $('homeBody');
@@ -1260,10 +1315,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function connect() {
     var ws = new WebSocket(laneUrl());
     state.ws = ws;
+    // 正在拨号 = 连接中（信号柱灰）；这一份状态同时喂首页那三格信号柱，不新增协议字段。
+    setConnState('connecting');
     ws.onopen = function () {
       $('conn').textContent = '已连接';
       $('conn').className = 'on';
-      $('stage').textContent = $('stage').textContent.replace(/^离线 · /, '');
+      setConnState('online');
       state.clientId = state.clientId || ('web-' + Math.random().toString(36).slice(2, 10));
       if (!state.sessionId && !state.sessionBound) {
         var picked = pickInitialSession();
@@ -1297,9 +1354,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     ws.onclose = function (event) {
       $('conn').textContent = '已断开' + (event && event.code ? '（' + event.code + '）' : '');
       $('conn').className = 'off';
-      if (state.screenMode === 'home' && !$('stage').textContent.startsWith('离线 · ')) {
-        $('stage').textContent = '离线 · ' + $('stage').textContent;
-      }
+      // 断开：屏内只靠信号柱变红区分，不再往那一行前面塞「离线 · 」文字（那一行现在是时钟）。
+      setConnState('offline');
       state.audioPending = false;
       clearTimeout(state.audioTimer);
       addEvent('alert', '连接已断开，2 秒后自动重连（期间发送的内容不会送达）');
@@ -1849,6 +1905,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
 
   renderSessionBar();
   renderSessionList();
+  /* 首页顶行走表：每秒 tick 一次时钟（时间由页面自己的本地时钟渲染，不等宿主推——
+     宿主那 30 秒一次的控制室巡检（TIHU_HOME_SYNC_MS）只刷新项目清单，帧隔 30 秒推一次时钟就会 stale）。
+     收到 screen.frame 时 renderScreen 也顺手重画一次，保证同一帧里时钟不会花。 */
+  renderHomeTop();
+  state.clockTimer = setInterval(renderHomeTop, 1000);
   connect();
 })();
 </script>

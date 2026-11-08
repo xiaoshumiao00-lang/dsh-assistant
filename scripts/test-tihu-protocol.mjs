@@ -4544,20 +4544,25 @@ async function tapPagerButton(socket, actionId, seq) {
   await waitMs(90)
 }
 
-await testAsync('lane：主页 stage 行写清「项目 总数 个 · 第 x/y 页」（两页项目）', async () => {
+await testAsync('lane：主页帧 stage 行不再写「项目 总数 个 · 第 x/y 页」（顶行归页面时钟）', async () => {
   const { runtime, socket } = pagerLaneFixture(7)
   socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 300, y: 200 }, 2)))
   await waitMs(90)
   const frame = homeFramesOf(socket).pop()
   assert.ok(frame !== undefined, '要点主页帧')
-  assert.equal(frame.payload.home.total, 7)
+  assert.equal(frame.payload.home.total, 7, 'home.total 这个数据字段还在（协议字段只增不删），但屏幕上不显示它')
   assert.equal(frame.payload.home.page.total, 2, '7 个项目 5 条一页 → 2 页')
   assert.equal(frame.payload.home.projects.length, 5, '每页仍是 5 条（没改成 6）')
-  assert.equal(frame.payload.stage, '项目 7 个 · 第 1/2 页', '主页 stage 行要带页码：' + frame.payload.stage)
+  assert.equal(frame.payload.stage, '', '主页帧 stage 行留空：时间 + 连接图标是页面侧的事，「项目 N 个」整段删掉')
+  assert.equal(/项目|个 · |\d+\/\d+ 页/.test(frame.payload.stage), false, '主页帧 stage 不许再出现「项目 … 个 · … 页」：' + frame.payload.stage)
   assert.ok(measureTextPx(frame.payload.stage, SCREEN_SPEC.stageFontPx) <= CONTENT_WIDTH_PX, 'stage 行不得超 304px（不截断）')
-  // 页面上的旧拼装删掉了：主页 stage 完全来自宿主那一行
+  // 帧里也不许塞时间/连接状态：那些只能由页面本地时钟与既有的连接状态渲染
+  const keys = Object.keys(frame.payload)
+  assert.equal(keys.some((key) => /clock|time|conn|signal|battery/i.test(key)), false, '主页帧不带时钟/连接字段：' + keys.join(','))
+  // 页面上的旧拼装彻底删掉了：主页 stage 不再有任何「项目」文本
   const pageSource = readFileSync(new URL('../src/tihu/page.ts', import.meta.url), 'utf8')
   assert.equal(pageSource.includes("'项目 ' + payload.home.total"), false, '页面不许再自己拼「项目 N 个 · p/t」')
+  assert.equal(pageSource.includes('项目 \' +'), false, '页面侧也没有第二处「项目 N 个」拼装')
   runtime.dispose()
 })
 
@@ -4571,7 +4576,8 @@ await testAsync('lane：‹ › 按钮走 screen.action 通道换页并重发帧
   await tapPagerButton(socket, 'homeNext', 3)
   const second = homeFramesOf(socket).pop()
   assert.equal(second.payload.home.page.index, 1, '点 › 进第二页')
-  assert.equal(second.payload.stage, '项目 7 个 · 第 2/2 页', 'stage 行跟着页码：' + second.payload.stage)
+  assert.equal(second.payload.stage, '', 'stage 行跟着页码一起删空（顶行是时钟 + 连接图标）：' + second.payload.stage)
+  assert.equal(/个 · /.test(second.payload.stage), false, '换页后的主页帧也不许出「项目 … 个」')
   assert.equal(second.payload.home.projects.length, 2, '第二页剩 2 条')
   assert.deepEqual((second.payload.actions || []).map((item) => item.id), ['homePrev'], '最后一页只给「上一页」按钮')
   // 越界：最后一页点 › 不该动、也不该再出一帧
@@ -4599,7 +4605,7 @@ await testAsync('lane：一页主页（5 个项目）不给 ‹ › 按钮，也
   await waitMs(90)
   const frame = homeFramesOf(socket).pop()
   assert.equal(frame.payload.home.page.total, 1)
-  assert.equal(frame.payload.stage, '项目 5 个 · 第 1/1 页', '一页也要写清第 1/1 页：' + frame.payload.stage)
+  assert.equal(frame.payload.stage, '', '一页主页也不写「项目 5 个 · 第 1/1 页」了（那一行换成时钟 + 连接图标）：' + frame.payload.stage)
   assert.deepEqual((frame.payload.actions || []).map((item) => item.id), [], '单页不给翻页按钮')
   const before = homeFramesOf(socket).length
   await tapPagerButton(socket, 'homeNext', 3)
@@ -4620,7 +4626,7 @@ test('page：主页底部翻页条在屏内、只在 home-mode 显示、按钮 2
   assert.ok(html.includes('#screen.home-mode .home-pager { display:flex; }'), 'home-mode 用 flex 布局显示翻页条')
   assert.ok(/#screen \.home-pager button \{[^}]*min-height:28px/.test(html), '按钮 min-height 28px')
   assert.ok(html.includes('#screen .home-pager .page'), '中间要有当前页标签')
-  assert.ok(html.includes("#screen.rail-on .home-pager { width:240px; }") || html.includes(".home-pager { width:240px; }"), '有气泡轨时翻页条要让开右侧 64px')
+  assert.ok(/#screen \.rail-on[^{]*\.home-pager[^{]*\{ width:240px; \}/.test(html) || html.includes('#screen.rail-on .home-pager'), '有气泡轨时翻页条要让开右侧 64px（240 宽）')
   assert.ok(/setAttribute\('data-action', 'homePrev'\)/.test(html), '‹ 要带 homePrev')
   assert.ok(/setAttribute\('data-action', 'homeNext'\)/.test(html), '› 要带 homeNext')
   assert.ok(html.includes("actionId === 'homePrev'"), '点按钮要按 action 上报（与主页/上一条同一套）')
@@ -4633,13 +4639,21 @@ test('page：主页底部翻页条在屏内、只在 home-mode 显示、按钮 2
   assert.ok(stageLine && stageLine[0].includes('flex:none'), '翻页条不参与 flex 伸缩（固定一行）')
 })
 
-test('page：主页/朗读屏都显式复位 stage 的 display（状态屏曾把它藏起来）', () => {
+test('page：主页屏把 stage 收掉（顶行归时钟 + 信号柱），回答屏/状态屏那行保持原样', () => {
   const { ctx } = fakeCtx()
   const runtime = createTihuRuntime(ctx, { log: () => {}, tts: { disabled: true } })
   const html = runtime.page()
   runtime.dispose()
+  // 回答屏与状态屏还显式管着 stage 的 display（状态屏曾把它藏起来，切回会话屏要复位）
   const marks = html.split("$('stage').style.display = ''").length - 1
-  assert.ok(marks >= 2, 'home 与 reply 两个分支都要复位 stage：' + marks)
+  assert.ok(marks >= 1, 'reply 分支仍要复位 stage 的 display：' + marks)
+  assert.ok(html.includes("$('stage').style.display = stageText === '' ? 'none' : ''"), '状态屏仍按 stage 有没有文本决定 display')
+  // home 分支：这一行换成顶行（时钟 + 信号柱），stage 收掉
+  assert.ok(/mode === 'home' \&\& payload\.home[\s\S]{0,400}\$\('stage'\)\.style\.display = 'none'/.test(html), 'home 分支要把 stage 收掉')
+  assert.ok(html.includes('#screen.home-mode .stage { display:none; }'), 'CSS 层也在 home-mode 收掉 stage')
+  assert.equal(html.includes('homeStageText'), false, '旧的「主页 stage 拼装」函数已经删掉')
+  assert.ok(html.includes("$('stage').textContent = replyStageText(payload)"), '回答屏 stage 行不动（窗口位置尾巴还在）')
+  assert.ok(html.includes("clipScreen(payload.stage || '', SCREEN.stageChars)"), '状态屏 stage 行不动')
 })
 
 test('page：朗读屏位置指示只在 stage 行末尾追加「· 起始行/总行」，角落提示保持删掉', () => {
@@ -4744,6 +4758,203 @@ test('protocol：回复屏 scroll 多一个 total 字段仍是 v0 最小增量�
   assert.equal(frame.payload.reply.scroll.maxOffset, 0)
   assert.deepEqual(TIHU_DOWNSTREAM_TYPES.filter((type) => type === 'screen.frame'), ['screen.frame'], '不开新协议版本、不加新消息类型')
   assert.equal(TIHU_PROTOCOL_VERSION, '0')
+})
+
+/* ---------- 2026-11-08 第二轮：首页顶行改成「本地时钟 + 连接状态图标」 ---------- */
+
+/** 页面源码（CSS + 屏内 DOM + 屏内 JS 都从这份文本里查）。 */
+function pageSourceOf() {
+  return readFileSync(new URL('../src/tihu/page.ts', import.meta.url), 'utf8')
+}
+
+/** 渲染出来的真机屏 HTML（含 CSS 与脚本）。 */
+function pageHtmlOf() {
+  const { ctx } = fakeCtx()
+  const runtime = createTihuRuntime(ctx, { log: () => {}, tts: { disabled: true } })
+  const html = runtime.page()
+  runtime.dispose()
+  return html
+}
+
+/** 顶行那一截 DOM（只它一个元素，用来证明屏内那一行没有 emoji / 图片 / 图标字体 / 多写的「断开」）。 */
+function homeTopDomOf(html) {
+  const match = html.match(/<div id="homeTop"[\s\S]*?<\/div>/)
+  assert.ok(match !== null, '屏内要有 #homeTop 这一行（首页最上方那一行）')
+  return match[0]
+}
+
+test('page：首页最上方那一行换成本地时钟 + 三格信号柱（纯 CSS 内联元素，不用 emoji/图片/字体图标）', () => {
+  const html = pageHtmlOf()
+  const top = homeTopDomOf(html)
+  // 旧那一行整段删掉：屏内没有任何「项目 N 个」文本，也没有那个「第 x/y 页」的 stage 拼装
+  assert.equal(top.includes('项目'), false, '顶行不含「项目 …」计数')
+  assert.equal(/个 · |\/\d+ 页/.test(top), false, '顶行不含「N 个 · x/y 页」尾巴')
+  assert.equal(html.includes('homeStageText'), false, '主页 stage 拼装函数已删')
+  // 时钟 + 信号柱都在屏内、且在项目列表之前（屏最上方那一行）
+  assert.ok(/id="homeClock"/.test(top) && /id="homeSignal"/.test(top), '顶行要有时钟与信号柱两个元素')
+  assert.ok(html.indexOf('id="homeTop"') < html.indexOf('id="homeBody"'), '顶行必须排在项目列表之前（屏最上方）')
+  assert.ok(html.indexOf('id="homeTop"') < html.indexOf('id="homePager"'), '顶行必须在底部翻页条之前')
+  // 三格信号柱：三根柱、纯内联元素，没有 emoji、没有图片、没有外部字体图标
+  const bars = top.match(/<span class="bar b\d"><\/span>/g) || []
+  assert.equal(bars.length, 3, '三格信号柱要有三根柱：' + bars.length)
+  assert.equal(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}]/u.test(top), false, '顶行不许用 emoji/符号图形')
+  assert.equal(/<img|url\(|background-image|@font-face|font-icon|iconfont/i.test(top), false, '不许用图片、背景图、图标字体')
+  // 只在主页屏出现：状态屏 / 回答屏那一行（stage）保持原样
+  assert.ok(html.includes('#screen .home-top { display:none;'), '顶行默认不显示（只在 home-mode 出）')
+  assert.ok(html.includes('#screen.home-mode .home-top { display:flex; }'), 'home-mode 用 flex 显示顶行')
+  assert.ok(html.includes('#screen.home-mode .stage { display:none; }'), 'home-mode 收掉旧 stage 那一行')
+  assert.equal(html.includes('#screen.reply-mode .home-top'), false, '回答屏不许出顶行')
+})
+
+test('page：时钟只显示到分钟（HH:MM、24 小时制、零补齐），走表刷新且不靠宿主帧', () => {
+  const source = pageSourceOf()
+  const fn = source.match(/function clockText\(\)\s*\{[\s\S]*?\n\s*\}/)
+  assert.ok(fn !== null, '要有页面自己的时钟函数 clockText()')
+  const body = fn[0]
+  assert.ok(/getHours\(\)/.test(body) && /getMinutes\(\)/.test(body), '24 小时制（getHours）+ 只到分钟（getMinutes）')
+  assert.equal(/getSeconds\(/.test(body), false, '只显示到分钟：不取秒')
+  assert.equal(/toLocaleTimeString|toLocaleDateString|12\s*\)/.test(body), false, '不许按 locale 的 12 小时制走')
+  assert.ok(body.includes("(hh < 10 ? '0' : '')") && body.includes("(mm < 10 ? '0' : '')"), '时与分都要零补齐（19:32）')
+  assert.ok(body.includes("':'"), '输出形如 HH:MM')
+  // 走表刷新：每秒 tick 一次；收到 screen.frame 时也重画一次
+  assert.ok(/setInterval\(renderHomeTop,\s*1000\)/.test(source), '页面要每秒 tick 重画顶行')
+  assert.ok(/function renderScreen\(payload\)\s*\{[\s\S]{0,300}?renderHomeTop\(\);/.test(source), '每来一帧也重画一次顶行')
+  // 顶行不读宿主帧内容：时钟与连接都由页面本地状态出
+  const renderBody = (source.match(/function renderHomeTop\(\)\s*\{[\s\S]*?\n\s*\}/) || [''])[0]
+  assert.ok(renderBody !== '', '要有 renderHomeTop()')
+  assert.equal(/payload/.test(renderBody), false, '顶行渲染不取 payload（不依赖宿主推时间）')
+  assert.equal(/SCREEN\.clock|home\.clock/.test(source), false, '宿主帧里没有时钟字段可读')
+})
+
+test('page：连接图标接的是页面已有的那一份连接状态（绿/灰/红三档，断开只有颜色不写文字）', () => {
+  const source = pageSourceOf()
+  const html = pageHtmlOf()
+  // 三档颜色：已连上=绿、连接中/重连中=灰（柱条稍淡）、断开=红
+  assert.ok(/\.signal\.conn-online \.bar \{ background:#35d07f;/.test(html), '已连上宿主 → 绿')
+  assert.ok(/\.signal\.conn-connecting \.bar \{ background:#6b7785; opacity:\.\d+;/.test(html), '连接中/重连中 → 灰、柱条稍淡')
+  assert.ok(/\.signal\.conn-offline \.bar \{ background:var\(--err\);/.test(html), '断开 → 红')
+  // 接同一份状态：#conn 那条 + ws.onopen/onclose 都要落到 setConnState
+  assert.ok(html.includes("$('conn').textContent = '已连接'") && html.includes("$('conn').className = 'on'"), '屏外那条 conn 不动')
+  assert.ok(html.includes("$('conn').textContent = '已断开'"), '断开事件仍走同一份状态（conn 元素）')
+  assert.ok(/ws\.onopen = function \(\)\s*\{[\s\S]{0,200}?setConnState\('online'\)/.test(html), 'onopen 置 online（绿）')
+  assert.ok(/ws\.onclose = function \(event\)\s*\{[\s\S]{0,200}?setConnState\('offline'\)/.test(html), 'onclose 置 offline（红）')
+  assert.ok(/function connect\(\)\s*\{[\s\S]{0,200}?setConnState\('connecting'\)/.test(html), '拨号中（含每 2 秒重连）置 connecting（灰）')
+  assert.ok(html.includes("setTimeout(connect, 2000)"), '断开后照旧自动重连（重连中该是灰）')
+  // 断开只靠颜色区分：屏内那一行不写「断开」/「离线」文字
+  assert.equal(homeTopDomOf(html).includes('断开'), false, '顶行不加「断开」文字')
+  assert.equal(homeTopDomOf(html).includes('离线'), false, '顶行不加「离线」文字')
+  assert.equal(html.includes("'离线 · '"), false, '旧的「离线 · 」前缀已去掉（那一行现在是时钟）')
+  // 不新增协议字段：连接状态只在页面内部转，不往 lane 发新消息
+  assert.equal(/send\('conn|send\('clock|send\('status/.test(html), false, '页面不上报连接状态（不新增协议字段）')
+  // 宿主侧不掺和时钟与连接：lane 里没有时钟、也没有连接状态
+  const laneSource = readFileSync(new URL('../src/tihu/lane.ts', import.meta.url), 'utf8')
+  assert.equal(/clockText|connState|getHours\(\)/.test(laneSource), false, '时钟与连接归页面侧，lane 不掺和')
+})
+
+test('page：顶行在 304（无气泡轨）与 240（rail-on）两种可用宽里都排得下、不换行不截断', () => {
+  const html = pageHtmlOf()
+  const source = pageSourceOf()
+  // 页面常量要和 CSS 那三个尺寸一模一样（改 CSS 就得同时改常量，测试先把住它）
+  const barW = Number((source.match(/var SIGNAL_BAR_W = (\d+);/) || [0, 0])[1])
+  const barGap = Number((source.match(/var SIGNAL_GAP_W = (\d+);/) || [0, 0])[1])
+  const rowGap = Number((source.match(/var HOME_TOP_GAP_W = (\d+);/) || [0, 0])[1])
+  assert.equal(barW, 5, '柱宽常量要和 CSS width:5px 对齐')
+  assert.equal(barGap, 2, '柱间隙常量要和 CSS gap:2px 对齐')
+  assert.equal(rowGap, 8, '时间与图标之间的间隙常量要和 CSS gap:8px 对齐')
+  assert.ok(/#screen \.home-top \.signal \{[^}]*gap:2px/.test(html), '信号柱容器用 gap:2px')
+  assert.ok(/#screen \.home-top \.signal \.bar \{[^}]*width:5px/.test(html), '三根柱宽 5px')
+  assert.ok(/#screen \.home-top \{[^}]*gap:8px/.test(html), '顶行容器 gap:8px')
+  // 顶行走的是 stage 同一套可用宽（rail-on 240 / 否则 304），时钟按 fitTextPx 收进剩余宽度
+  assert.ok(/function renderHomeTop\(\)[\s\S]{0,400}stageWidthPx\(\)[\s\S]{0,120}fitTextPx\(clockText\(\)/.test(source), '顶行按 stageWidthPx + fitTextPx 排版')
+  assert.ok(html.includes('#screen.rail-on .home-top') || /#screen\.rail-on[^{]*\{[^}]*\.home-top/.test(html) || html.includes('.rail-on .title,') && html.includes('home-top { width:240px; }'), '有气泡轨时顶行也要让开右侧 64px')
+  assert.ok(/#screen \.home-top \.clock \{[^}]*white-space:nowrap/.test(html), '时钟不许换行')
+  assert.ok(/#screen \.home-top \{[^}]*flex:none/.test(html), '顶行不参与伸缩（固定一行，不会被压扁/挤出屏）')
+  assert.ok(/#screen \.home-top \.signal \{[^}]*margin-left:auto/.test(html), '信号柱靠右摆放')
+  // 定量验证：时钟 + 间隙 + 三根柱，304 与 240 两种宽度都要装得下
+  const font = SCREEN_SPEC.stageFontPx
+  const clockChars = 5 /* HH:MM */
+  const clockPx = measureTextPx('19:32', font) + clockChars * 1 /* CSS letter-spacing:1px */
+  const barsPx = barW * 3 + barGap * 2
+  const total = clockPx + rowGap + barsPx
+  for (const available of [CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX]) {
+    assert.ok(total <= available, `顶行（时钟 ${Math.round(clockPx)} + 间隙 ${rowGap} + 信号柱 ${barsPx} = ${Math.round(total)}px）必须装进 ${available}px 可用宽`)
+  }
+  assert.ok(CONTENT_WIDTH_PX === 304 && PENDING_RAIL_WIDTH_PX === 240, '两种可用宽本身别被人改跑（304 / rail-on 240）')
+})
+
+test('page：顶行占的还是原来那 14px 一行，首页内容高度预算不被翻页条撑爆', () => {
+  const html = pageHtmlOf()
+  assert.ok(/#screen \.home-top \{[^}]*height:14px/.test(html), '顶行高 14px（与 stage 那一行同高）')
+  assert.ok(/#screen \.home-top \.signal \{[^}]*height:13px/.test(html), '信号柱容器高 13px（不越过行高）')
+  assert.ok(/#screen \.home-top \.signal \.bar\.b3 \{ height:13px/.test(html), '最长那根柱 13px')
+  const itemH = Number((html.match(/#screen \.home-item \{ height:(\d+)px/) || [0, 0])[1])
+  const recentH = Number((html.match(/#screen \.home-recent \{[^}]*height:(\d+)px/) || [0, 0])[1])
+  const pagerH = Number((html.match(/#screen \.home-pager button \{[^}]*min-height:(\d+)px/) || [0, 0])[1])
+  const rowH = Number((html.match(/#screen \.home-top \{[^}]*height:(\d+)px/) || [0, 0])[1])
+  const gap = 4 /* #screen 的 flex gap */
+  const used = rowH + gap + recentH + 5 * itemH + gap + pagerH
+  assert.equal(rowH, 14, '顶行行高')
+  assert.ok(used <= SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx, `首页内容高 ${used}px 不得超过 ${SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx}px（半行都不许留）`)
+})
+
+test('page：底部那一排「‹ 第 1/5 页 ›」保持上一轮原样（翻页条与顶行的页码无关）', () => {
+  const html = pageHtmlOf()
+  assert.ok(html.includes('<div id="homePager" class="home-pager"></div>'), '翻页条 DOM 不动')
+  assert.ok(html.includes("#screen.rail-on .home-pager") || html.includes('.home-pager { width:240px; }'), '翻页条仍给气泡轨让开 64px')
+  assert.ok(/label\.textContent = '第 ' \+ \(index \+ 1\) \+ '\/' \+ total \+ ' 页'/.test(html), '页码标签仍写在底部那一排')
+  assert.ok(/className = index > 0 \? '' : 'off'/.test(html), '‹ 越界一侧置灰')
+  assert.ok(/className = index < total - 1 \? '' : 'off'/.test(html), '› 越界一侧置灰')
+  assert.ok(html.includes("'‹'") && html.includes("'›'"), '两个按钮符号仍用 ‹ ›（不是 emoji）')
+  const top = homeTopDomOf(html)
+  assert.equal(/第 /.test(top), false, '顶行不再出现「第 x/y 页」')
+})
+
+await testAsync('lane：主页帧只留数据（recent/页码），不推时间也不推连接状态', async () => {
+  const { runtime, socket } = pagerLaneFixture(7)
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 300, y: 200 }, 2)))
+  await waitMs(90)
+  const frame = homeFramesOf(socket).pop()
+  assert.equal(frame.payload.stage, '', '主页帧 stage 留空')
+  assert.ok(frame.payload.home.page.total >= 2, '页码数据照留（翻页按钮要用）')
+  assert.ok(frame.payload.home.projects.every((item) => item.name !== undefined), '项目清单照上屏')
+  const keys = Object.keys(frame.payload)
+  assert.equal(keys.some((key) => /clock|time|conn|signal|online|offline/i.test(key)), false, '宿主帧不塞时钟与连接状态：' + keys.join(','))
+  assert.equal(keys.includes('stage'), true, 'stage 这个必填字段还在（没删字段）')
+  await tapPagerButton(socket, 'homeNext', 3)
+  const second = homeFramesOf(socket).pop()
+  assert.equal(second.payload.home.page.index, 1, 'homeNext 仍在：点它仍换页')
+  assert.deepEqual((second.payload.actions || []).map((item) => item.id), ['homePrev'], 'homePrev 仍在：最后一页给上一页按钮')
+  runtime.dispose()
+})
+
+test('protocol：主页帧 stage 留空仍是 v0 最小增量（不新增必填字段、不加新消息类型）', () => {
+  const frame = buildDownstream('screen.frame', {
+    stage: '',
+    title: '',
+    bullets: [],
+    tone: 'ok',
+    mode: 'home',
+    home: {
+      projects: [{ name: '项目一', status: 'idle', summary: '' }],
+      page: { index: 0, total: 1 },
+      total: 1,
+    },
+    pending: [],
+    pendingCount: 0,
+  }, 1)
+  assert.ok(isTihuEnvelope(frame))
+  assert.equal(frame.payload.stage, '', 'stage 留空也算合法帧（不新增必填字段）')
+  assert.equal(frame.payload.home.total, 1, 'home.total 数据字段没删（协议字段只增不删）')
+  assert.equal(Object.keys(frame.payload).some((key) => /clock|conn/i.test(key)), false, '不加时钟/连接字段')
+  assert.equal(TIHU_PROTOCOL_VERSION, '0')
+  assert.equal(TIHU_DOWNSTREAM_TYPES.length, 14, '不开新的下行消息类型')
+  assert.deepEqual(TIHU_UPSTREAM_TYPES.filter((type) => /conn|clock/i.test(type)), [], '也不开新的上行消息类型')
+  // 源码层再钉一遍：ScreenFramePayload 的必填字段还是那三个，没被人偷偷加必填
+  const protocol = readFileSync(new URL('../src/tihu/protocol.ts', import.meta.url), 'utf8')
+  const block = protocol.match(/export interface ScreenFramePayload \{[\s\S]*?\n\}/)
+  assert.ok(block !== null, 'ScreenFramePayload 还在')
+  const required = [...String(block[0]).matchAll(/^\s{2}(\w+): [^\s?]/gm)].map((m) => m[1])
+  assert.deepEqual(required, ['stage', 'title', 'bullets'], '必填字段只有 stage/title/bullets 三个（没新增必填）')
 })
 
 

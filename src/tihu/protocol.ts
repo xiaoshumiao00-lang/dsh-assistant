@@ -282,7 +282,9 @@ export interface VoiceCreatedPayload {
 
 /** 320×240 屏幕帧：阶段标签 / 标题 / 要点行 / 进度数字。 */
 export interface ScreenFramePayload {
-  /** 阶段标签，如「聆听」「思考」「动手」「完成」。主页屏这行给的是「项目 总数 个 · 第 x/y 页」，
+  /** 阶段标签，如「聆听」「思考」「动手」「完成」。主页屏这一行现在空着（不给文本）：
+   *  首页最上方那一行是页面自己画的「本地时钟 HH:MM + 三格信号柱」（用户 2026-11-08 确认），
+   *  宿主不推时间、也不推连接状态，更没有「项目 总数 个 · 第 x/y 页」那一行。
    *  朗读屏这行是文案（页面在末尾自己接上窗口位置「· 起始行/总行」）。 */
   stage: string
   /** 标题（一行，最多约 18 个汉字）。 */
@@ -299,6 +301,7 @@ export interface ScreenFramePayload {
   home?: {
     projects: { name: string; status: 'running' | 'idle' | 'done'; summary: string; sessionId?: string }[]
     page: { index: number; total: number }
+    /** 项目总数：只作数据留着（协议字段只增不删；底部翻页边界也算它）。屏幕上不再显示「项目 N 个」那一行。 */
     total: number
     /**
      * 首页顶部的「最近回答」行（用户 2026-11-08 要求）：只有**当前绑定的这个会话**
