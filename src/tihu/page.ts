@@ -557,19 +557,29 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     $('title').textContent = payload.title || '';
     var list = $('bullets');
     list.innerHTML = '';
-    var bulletLines = fitLines(payload.bullets || [], SCREEN.maxBodyLines, SCREEN.bodyCharsPerLine);
-    // 第四行统计比正文小 2 号：host 已按正文字号量宽，这里只换字号与行高
+    var rawBullets = payload.bullets || [];
+    // 第四行统计：小 2 号字号，按它自己的字号量宽与折行，不再套正文字符数
     var tailCount = typeof payload.statsTail === 'number' ? payload.statsTail : 0;
-    if (tailCount > bulletLines.length) tailCount = bulletLines.length;
-    bulletLines.forEach(function (line, index) {
+    if (tailCount > rawBullets.length) tailCount = rawBullets.length;
+    var headCount = rawBullets.length - tailCount;
+    var statsFont = SCREEN.statsFontPx || 14;
+    var statsWidth = (SCREEN.widthPx || 320) - 2 * (SCREEN.paddingPx || 8) - 4;
+    var entries = fitLines(rawBullets.slice(0, headCount), SCREEN.maxBodyLines, SCREEN.bodyCharsPerLine).map(function (line) {
+      return { text: line, stats: false };
+    });
+    for (var b = headCount; b < rawBullets.length; b += 1) {
+      var wrapped = wrapPx(rawBullets[b], statsWidth, statsFont);
+      for (var w = 0; w < wrapped.length; w += 1) entries.push({ text: wrapped[w], stats: true });
+    }
+    for (var e = 0; e < entries.length; e += 1) {
       var li = document.createElement('li');
-      li.textContent = line;
-      if (tailCount > 0 && index >= bulletLines.length - tailCount) {
-        li.style.fontSize = (SCREEN.statsFontPx || 14) + 'px';
+      li.textContent = entries[e].text;
+      if (entries[e].stats) {
+        li.style.fontSize = statsFont + 'px';
         li.style.lineHeight = (SCREEN.statsLineHeightPx || 18) + 'px';
       }
       list.appendChild(li);
-    });
+    }
     $('replyBody').innerHTML = '';
     screen.className = payload.tone || 'idle';
     state.actions = [];

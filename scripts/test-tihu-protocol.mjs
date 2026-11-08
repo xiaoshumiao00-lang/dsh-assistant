@@ -55,7 +55,7 @@ import {
   sanitizeScreenLine,
   summarizeToolResult,
 } from '../src/tihu/progress.ts'
-import { ACTUAL_SIZE_SCALE, CONTENT_WIDTH_PX, SCREEN_SPEC, TEXT_WRAP_SAFETY_PX, clipScreenTitle, fitLine, fitScreenLines, measureTextPx, wrapTextPx } from '../src/tihu/screen-spec.ts'
+import { ACTUAL_SIZE_SCALE, CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX, SCREEN_SPEC, TEXT_WRAP_SAFETY_PX, clipScreenTitle, fitLine, fitScreenLines, measureTextPx, wrapTextPx } from '../src/tihu/screen-spec.ts'
 import { fitViewport, replyViewport, replyWindow, splitReplySentences, splitSpeechSegments, wrapReplyLines } from '../src/tihu/reply.ts'
 import { stripToolNoise, toSpeechText } from '../src/tihu/speech-text.ts'
 import { groupProjects, humanTitle, projectNameOf } from '../src/tihu/project-groups.ts'
@@ -3636,6 +3636,26 @@ await testAsync('运行中清单：投影没标题时读标题快照，屏上显
   assert.ok(named, '运行中清单要给会话名称：' + JSON.stringify(framesOf(socket).filter((f) => Array.isArray(f.payload.running)).slice(-1)[0]?.payload.running))
   assert.ok(asked.some((ids) => ids.includes('session-b')), '缺标题的会话必须去读一次标题快照')
   runtime.dispose()
+})
+
+
+/* ---------- 2026-11-08：统计行按小字号量宽，不再被省略号裁掉 ---------- */
+test('统计行宽：1234.0M 这类长统计放得下，正文字号才会放不下', () => {
+  const state = createProgressState(1000)
+  applySessionEvent(state, { type: 'turn/start', data: { turn: 1 } }, 1000)
+  const stats = { tokPerSec: 99, totalTokens: 1_234_000_000, contextPercent: 41 }
+  applySessionEvent(state, { type: 'tool/call', data: { turn: 1, step: 25, name: 'glob', arguments: { pattern: '**/a.ts' } } }, 2000, { stats })
+  const frame = applySessionEvent(state, { type: 'tool/call', data: { turn: 1, step: 26, name: 'grep', arguments: { pattern: 'x' } } }, 439_000, { stats }).screen
+  const tail = frame.bullets[frame.bullets.length - 1]
+  assert.ok(tail.includes('1234.0M'), '总 token 不该被裁：' + tail)
+  assert.ok(!tail.endsWith('\u2026'), '统计行不该带省略号：' + tail)
+  // 同样的统计串按正文字号量宽更挤，小 2 号才有地方放完整文本
+  assert.ok(fitLine(tail, CONTENT_WIDTH_PX, SCREEN_SPEC.statsFontPx) === tail, '统计行该是完整串：' + tail)
+  const narrow = applySessionEvent(state, { type: 'tool/call', data: { turn: 1, step: 26, name: 'grep', arguments: { pattern: 'x' } } }, 439_000, { stats, narrow: true }).screen
+  const narrowTail = narrow.bullets[narrow.bullets.length - 1]
+  assert.ok(measureTextPx(narrowTail, SCREEN_SPEC.statsFontPx) <= PENDING_RAIL_WIDTH_PX, '气泡轨占位时统计行也要放得下：' + narrowTail)
+  assert.ok(measureTextPx(tail, SCREEN_SPEC.statsFontPx) <= CONTENT_WIDTH_PX, '按统计字号刚好放得下：' + tail)
+  for (const line of frame.bullets.slice(0, -1)) assert.ok(measureTextPx(line, SCREEN_SPEC.bodyFontPx) <= CONTENT_WIDTH_PX, '明细行超宽：' + line)
 })
 
 /* ---------- 汇总 ---------- */
