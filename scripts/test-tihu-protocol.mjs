@@ -4672,6 +4672,86 @@ test('page：朗读屏位置指示只在 stage 行末尾追加「· 起始行/�
   assert.ok(/var start = 0;/.test(html), '可视窗口仍由宿主切好（页面不自己算窗口）')
 })
 
+test('page：「已绑定：xxx」从右下角搬进回答屏顶行末尾（先裁文案、保住 1/5 与绑定尾巴；右下角空掉）', () => {
+  const html = pageHtmlOf()
+  const source = pageSourceOf()
+  // 回答屏顶行 = 文案 + 「· 起始/总行」+「· 已绑定：…」：同一套「 · 」分隔，窗口位置数字尾巴照旧
+  assert.ok(html.includes('function bindTailOf'), '要有组装「 · 已绑定：…」尾巴的函数')
+  assert.ok(html.includes('function stageWithTails'), '要有「文案 + 必保尾巴 + 可选尾巴」的组装函数')
+  assert.ok(/'\s·\s' \+ \(offset \+ 1\) \+ '\/' \+ total, bindTailOf\(\)/.test(source), 'replyStageText 把绑定尾巴接在位置数字尾巴后面（01ec073 那套 offset+1/total 语义不动）')
+  assert.ok(html.includes("'已绑定：' + (state.boundProject || state.sessionTitle || '未命名会话')"), '绑定文字还是原来那一份语义（项目名 → 会话名 → 未命名会话兜底）')
+  assert.ok(/function bindTailOf\(\) \{[\s\S]*?label === '' \? '' : ' · ' \+ label/.test(source), '未绑定就整段不出，不写「未绑定」占位')
+  assert.ok(html.includes('function stageFitPx'), 'stage 行要有把 letter-spacing 也算进去的截断函数')
+  assert.ok(/stageFitPx\(optional, room, fontPx\)/.test(source), '实在放不下时用省略号裁绑定文字（而不是裁位置数字）')
+  // 右下角角落提示：CSS 直接藏掉，文字也不写
+  assert.ok(/#screen \.scroll-hint \{[^}]*display:none/.test(html), '角落提示 CSS display:none')
+  assert.ok(html.includes("$('scrollHint').textContent = '';"), 'updateScrollHint 只写空串')
+  assert.equal(/scrollHint'\)\.textContent = state\.sessionBound/.test(source), false, '角落提示不再按绑定状态写「已绑定」')
+  // 只出现在回答屏顶行：首页顶行（时钟 + 信号柱）与状态屏顶行都不掺和
+  assert.equal(/已绑定|bindLabelOf|bindTailOf/.test(homeTopDomOf(html)), false, '首页顶行不含绑定信息')
+  const homeBranch = source.split("payload.mode === 'home' && payload.home")[1].split("payload.mode === 'reply'")[0]
+  assert.equal(/bindLabelOf|bindTailOf/.test(homeBranch), false, 'home 分支不调用绑定尾巴')
+  const statusBranch = source.split("state.screenMode = 'status'")[1]
+  assert.ok(statusBranch.includes("clipScreen(payload.stage || '', SCREEN.stageChars)"), '状态屏 stage 行照旧只裁宿主给的文案')
+  assert.equal(/bindLabelOf|bindTailOf/.test(statusBranch), false, '状态屏顶行不加绑定信息')
+  const replyBranch = source.split("payload.mode === 'reply' && payload.reply")[1]
+  assert.ok(/replyStageText\(payload\)/.test(replyBranch), '回答屏顶行走 replyStageText（绑定尾巴唯一入口）')
+  // 不换行的兜底：stage 行 CSS 照旧
+  assert.ok(/#screen \.stage \{[^}]*white-space:nowrap/.test(html) && /#screen \.stage \{[^}]*overflow:hidden/.test(html), 'stage 行 nowrap + overflow:hidden，绝不换行')
+  // 定量：用页面同一套估算（窄字符 0.47em、CJK 1em、letter-spacing 每格 1px），304 与 240 两种可用宽都要装得下
+  assert.ok(/#screen \.stage \{[^}]*letter-spacing:1px/.test(html), 'CSS letter-spacing 与常量同步')
+  const spacing = Number((source.match(/var STAGE_LETTER_SPACING_W = (\d+);/) || [0, 0])[1])
+  assert.equal(spacing, 1, 'STAGE_LETTER_SPACING_W 要和 CSS letter-spacing:1px 是同一个数字')
+  const font = SCREEN_SPEC.stageFontPx
+  const isWide = (ch) => { const code = ch.codePointAt(0) || 0; return (code >= 0x2e80 && code <= 0xa4cf) || (code >= 0xff00 && code <= 0xff60) || (code >= 0x1f300 && code <= 0x1faff) }
+  const emWidth = (ch) => (isWide(ch) ? 1 : 0.47) * font
+  const stageTextWidth = (text) => { let used = 0; for (const ch of Array.from(text)) used += emWidth(ch); return used + Array.from(text).length * spacing }
+  const fitTailLike = (text, width) => {
+    let used = 0; let out = ''
+    for (const ch of Array.from(text)) {
+      const w = emWidth(ch) + spacing   // 镜像页面 stageFitPx：每格带上 letter-spacing
+      if (used + w > width) return out === '' ? '…' : out + '…'
+      out += ch; used += w
+    }
+    return out
+  }
+  const stageWithTailsLikePage = (body, keepTail, optionalTail, available) => {
+    const optional = optionalTail || ''
+    if (optional === '') return body + keepTail
+    const keepW = stageTextWidth(keepTail); const optW = stageTextWidth(optional)
+    if (keepW + optW <= available) {
+      // 两个尾巴都保：只裁文案（letter-spacing 计入，整行不超宽）
+      const room = Math.max(1, available - keepW - optW)
+      const shown = body === '' ? '' : fitTailLike(body, room)
+      return shown === '' ? keepTail + optional : shown + keepTail + optional
+    }
+    // 尾巴自己就超宽：先裁文案保住位置数字，剩下的宽度才给绑定文字上省略号
+    const shownBody = body === '' ? '' : fitTailLike(body, Math.max(1, available - keepW))
+    const base = shownBody === '' ? keepTail : shownBody + keepTail
+    const room = Math.max(0, available - stageTextWidth(base))
+    if (room < stageTextWidth('…')) return base
+    return base + fitTailLike(optional, room)
+  }
+  const keepTail = ' · 12/99'   // 两位数字的极端窗口位置
+  const bindTail = ' · 已绑定：个人助手工作室'   // 9 字项目名，典型偏长
+  const bodyLong = '正在等待对方输入回复内容'   // 长文案，先被裁的是它
+  const bindHuge = ' · 已绑定：' + '超长项目名字符串要在这里被省略号收住才行'.repeat(2)   // 病超长，绑定尾巴自己要被裁
+  for (const available of [CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX]) {
+    const row1 = stageWithTailsLikePage('回答中', keepTail, bindTail, available)
+    assert.ok(row1.includes('12/99'), `${available}px：窗口位置数字尾巴必须保住`)
+    assert.ok(row1.includes('已绑定：个人助手工作室'), `${available}px：典型项目名整段出现`)
+    assert.ok(stageTextWidth(row1) <= available, `${available}px：典型回答整行不超宽`)
+    const row2 = stageWithTailsLikePage(bodyLong, keepTail, bindTail, available)
+    assert.ok(row2.includes('12/99'), `${available}px：长文案时窗口位置数字照样保住`)
+    assert.ok(row2.includes('已绑定：'), `${available}px：长文案时绑定尾巴照样保住`)
+    assert.ok(stageTextWidth(row2) <= available, `${available}px：长文案时整行不超宽（先裁的是文案）`)
+    const row3 = stageWithTailsLikePage(bodyLong, keepTail, bindHuge, available)
+    assert.ok(row3.includes('12/99'), `${available}px：病超长绑定时也只裁绑定文字，位置数字永不被动`)
+    assert.ok(row3.endsWith('…'), `${available}px：病超长绑定时绑定尾巴被省略号收住`)
+    assert.ok(stageTextWidth(row3) <= available, `${available}px：任何情况下整行不超宽（不换行、不溢出）`)
+  }
+})
+
 await testAsync('lane：回答帧带绝对窗口位置（scroll.total/offset），滑到两端数字都对得上', async () => {
   process.env.TIHU_HOME_AFTER_MS = '60000'
   process.env.TIHU_HOME_RECHECK_MS = '60000'

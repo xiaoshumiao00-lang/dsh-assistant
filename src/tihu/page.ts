@@ -151,9 +151,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .pending-sub { font-size:10px; line-height:13px; color:#9fb0bf; display:flex; align-items:center; gap:3px; }
   #screen .pending-dot { width:5px; height:5px; border-radius:50%; background:#35d07f; }
   #screen .pending-more { font-size:10px; color:#9fb0bf; text-align:center; }
-  #screen .scroll-hint { position:absolute; right:8px; bottom:6px; font-size:11px; line-height:14px;
+  /* 右下角那行「已绑定：xxx」本轮搬进回答屏顶行末尾（用户 2026-11-08 确认）：这块地方整个空出来，
+     右下角不再写任何文字、也不显示任何东西（上一轮 ecf48fa 删掉的滚动余量角落提示「还有 N 行」
+     继续保持删除，不恢复）。回答屏底部那排按钮（停止/重读/主页/上一条/下一条）位置与样式都不动。 */
+  #screen .scroll-hint { display:none; position:absolute; right:8px; bottom:6px; font-size:11px; line-height:14px;
     color:#9fb0bf; background:rgba(5,8,11,.82); padding:1px 4px; border-radius:3px; pointer-events:none; }
-  /* 主页屏不显示「已绑定」角落提示：那块地方现在是翻页按钮的（› 在右下角），不能被压住 */
+  /* 主页屏也从来不显示角落提示：那块地方是翻页按钮的（› 在右下角），不能被压住 */
   #screen.home-mode .scroll-hint { display:none; }
   #screen.reply-mode .title, #screen.reply-mode ul, #screen.reply-mode .bar { display:none; }
   #screen.reply-mode .reply-body { display:block; }
@@ -495,11 +498,21 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
   }
 
-  /* 页脚：绑定状态每帧都刷新（旧实现只在主页帧更新，会话屏帧里一直是陈旧的「未绑定」）。 */
-  function updateScrollHint() {
-    $('scrollHint').textContent = state.sessionBound
+  /**
+   * 绑定信息：本轮从右下角搬到回答屏顶行末尾（用户 2026-11-08 确认）。文字内容取的还是本来那一套
+   * 状态——state.sessionBound 决定出不出，内容用 state.boundProject（项目名优先）→ state.sessionTitle →
+   * 「未命名会话」兜底，跟旧的角落提示一模一样，没有换成语义不同的东西；未绑定就整段不出（不写「未绑定」占位）。
+   * 只用在回答屏（reply 分支，见 replyStageText / bindTailOf）：首页顶行仍是上一轮的加粗时钟 + 三格信号柱，
+   * 状态屏顶行也不加绑定信息；右下角那个角落提示什么都不显示（CSS display:none + 不写任何文字）。
+   */
+  function bindLabelOf() {
+    return state.sessionBound
       ? ('已绑定：' + (state.boundProject || state.sessionTitle || '未命名会话'))
       : '';
+  }
+  function updateScrollHint() {
+    // 角落提示不再显示任何东西（CSS .scroll-hint 也已 display:none）；绑定文字改由回答屏顶行排
+    $('scrollHint').textContent = '';
   }
   function renderActions() {
     var bar = $('actionBar');
@@ -562,6 +575,57 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     return shown === '' ? tail : shown + tail;
   }
   /**
+   * stage 那一行的 letter-spacing（CSS「#screen .stage { … letter-spacing:1px 」同一个数字）：
+   * 尾巴越接越长（本轮又接了「· 已绑定：…」），只按字宽量会撑过 304/240，所以量这一行要带上它。
+   * （首页顶行那套常量——柱宽 5、柱间隙 2、行间隙 8——本轮没有变，还是和 CSS 一模一样。）
+   */
+  var STAGE_LETTER_SPACING_W = 1;
+  /** 按 stage 行算宽：字宽估算 + 每格 1px 的 letter-spacing。 */
+  function stageTextWidthPx(text, fontPx) {
+    return textWidthPx(text, fontPx) + Array.from(String(text || '')).length * STAGE_LETTER_SPACING_W;
+  }
+  /** stage 行专用的截断：和 fitTextPx 同规则（超宽才省略），但每格带上 letter-spacing，算出来的行宽就是渲染行宽。 */
+  function stageFitPx(text, width, fontPx) {
+    var chars = Array.from(String(text || ''));
+    var out = '';
+    var used = 0;
+    for (var i = 0; i < chars.length; i += 1) {
+      var code = chars[i].codePointAt(0) || 0;
+      var wide = (code >= 0x2e80 && code <= 0xa4cf) || (code >= 0xff00 && code <= 0xff60) || (code >= 0x1f300 && code <= 0x1faff);
+      var w = (wide ? 1 : 0.47) * fontPx + STAGE_LETTER_SPACING_W;
+      if (used + w > width) return out === '' ? '…' : out + '…';
+      out += chars[i];
+      used += w;
+    }
+    return out;
+  }
+  /**
+   * stage 行 = 文案 + 必保尾巴（窗口位置数字）+ 可选尾巴（已绑定信息）。溢出时的优先顺序
+   * （用户 2026-11-08 确认）：先裁文案，「1/5」数字和「已绑定：…」两个尾巴都保住；两个尾巴
+   * 自己就撑满一整行时，才用省略号裁绑定文字（位置数字永不被动）。
+   * 这一行 CSS 是 white-space:nowrap + overflow:hidden，绝不换行；宽度全由这里定量算掉
+   * （letter-spacing 也计入，整行渲染宽保证不超过 304 / rail-on 240）。
+   */
+  function stageWithTails(body, keepTail, optionalTail, fontPx) {
+    var available = stageWidthPx();
+    var optional = optionalTail || '';
+    if (optional === '') return stageWithTail(body, keepTail, fontPx);   /* 未绑定：上一轮方案 B 原样 */
+    var keepW = stageTextWidthPx(keepTail, fontPx);
+    var optW = stageTextWidthPx(optional, fontPx);
+    if (keepW + optW <= available) {
+      // 两个尾巴都保：只裁文案
+      var room = Math.max(1, available - keepW - optW);
+      var shown = body === '' ? '' : stageFitPx(body, room, fontPx);
+      return shown === '' ? keepTail + optional : shown + keepTail + optional;
+    }
+    // 尾巴自己就超宽：先裁文案保住位置数字，剩下的宽度才给绑定文字上省略号
+    var base = body === '' ? '' : stageFitPx(body, Math.max(1, available - keepW), fontPx);
+    base = base === '' ? keepTail : base + keepTail;
+    var room = Math.max(0, available - stageTextWidthPx(base, fontPx));
+    if (room < stageTextWidthPx('…', fontPx)) return base;
+    return base + stageFitPx(optional, room, fontPx);
+  }
+  /**
    * 首页顶行的尺寸常量：必须和 CSS「#screen .home-top .signal」那三条规则一模一样
    * （柱宽 5px × 3、柱间隙 2px × 2、时间与图标间隙 8px）。
    * 可用宽度取 stageWidthPx()：有气泡轨时 240，没有时 304，两种都要排得下。
@@ -602,10 +666,16 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     clock.textContent = fitTextPx(clockText(), room, SCREEN.stageFontPx || 12);
   }
   /**
-   * 朗读屏 stage 行（方案 B）：文案不动，末尾追加「· 窗口起始行/总行」。
-   * 左边的数字取宿主 scroll.offset（绝对窗口起始行，宿主按 scrollOffset 切好可视窗口），
-   * 右边的数字取宿主新加的 scroll.total（整段回复折完的总行）。
+   * 朗读屏 stage 行（方案 B + 本轮绑定信息）：文案不动，末尾追加「· 窗口起始行/总行」，
+   * 再接「· 已绑定：<项目名>」。左边的数字取宿主 scroll.offset（绝对窗口起始行，宿主按
+   * scrollOffset 切好可视窗口），右边的数字取宿主新加的 scroll.total（整段回复折完的总行）。
+   * 绑定文字是页面侧已有的那份状态（bindLabelOf），宿主 lane 不为它新增协议字段或消息类型。
+   * 首页顶行（加粗时钟 + 三格信号柱）与状态屏顶行都不加绑定信息。
    */
+  function bindTailOf() {
+    var label = bindLabelOf();
+    return label === '' ? '' : ' · ' + label;
+  }
   function replyStageText(payload) {
     var reply = payload.reply || {};
     var scroll = reply.scroll || {};
@@ -614,7 +684,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var delivered = Array.isArray(reply.lines) ? reply.lines.length : 0;
     var total = Number(scroll.total);
     if (!Number.isFinite(total) || total < offset + delivered) total = offset + delivered;
-    return stageWithTail(String(payload.stage || '回答中'), ' · ' + (offset + 1) + '/' + total, SCREEN.stageFontPx || 12);
+    return stageWithTails(String(payload.stage || '回答中'), ' · ' + (offset + 1) + '/' + total, bindTailOf(), SCREEN.stageFontPx || 12);
   }
   /** 主页底部翻页条：‹ 上一页 / 第 x/y 页 / › 下一页；越界的一侧置灰（点它宿主也不动页码）。 */
   function renderHomePager(payload) {
