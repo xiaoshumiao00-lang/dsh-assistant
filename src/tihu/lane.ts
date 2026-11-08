@@ -2051,14 +2051,42 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
   }
 
+  /** 鹈鹕语音尾巴的固定介绍段（2026-11-08 用户定稿）：让任意不知情的模型读完即知整套系统。 */
+  const TIHU_VOICE_TAIL_INTRO = '———————————————\n【系统提示 · 本条消息来自鹈鹕语音设备】\n你是运行在「鹈鹕」AI 语音助手（ESP32 智能音箱，唤醒词「你好，鹈鹕」）里的 AI。用户对着设备说出了上面这段话，语音已自动转成文字。你的回复会通过设备喇叭朗读出来，同时显示在设备的触摸屏上。用户可以直接点屏幕操作；你也可以调用 tihu 工具替用户操作设备（切换会话、打开新回复、查看进度、停止朗读等）。'
+
+  /** 语音尾巴的动态段：按注入那一刻的真实设备状态拼（屏幕帧、气泡、朗读进度），不写死。 */
+  function voiceTailOf(sessionId: string): string {
+    const lines: string[] = []
+    const last = lastFrames.get(sessionId)
+    const pending = pendingByDisplay.get(sessionId) ?? []
+    const reading = readingBusy(sessionId)
+    const scroll = screenStates.get(sessionId)
+    if (last?.mode === 'home') {
+      lines.push(`屏幕正显示首页（项目列表${homePinned.has(sessionId) ? '，已钉住' : ''}）`)
+    } else if (last?.mode === 'reply') {
+      const total = scroll?.sentences.length ?? 0
+      const at = total > 0 ? `，正读到第 ${Math.min((scroll?.currentIndex ?? 0) + 1, total)}/${total} 句` : ''
+      lines.push(`屏幕正显示回答页《${last.title || '最近回答'}》${reading ? at : ''}`)
+    } else if (last !== undefined) {
+      const b = last.bullets ?? []
+      const detail = b.length > 0 ? `：${b.slice(0, 2).join('；')}` : ''
+      lines.push(`屏幕正显示「${last.title || '会话'}」${detail}`)
+    } else {
+      lines.push('屏幕当前没有内容')
+    }
+    if (pending.length > 0) lines.push(`右侧有 ${pending.length} 条未读新回复`)
+    lines.push(reading ? '正在朗读' : '当前没有朗读')
+    return `${TIHU_VOICE_TAIL_INTRO}\n\n设备当前状态：${lines.join('；')}`
+  }
   /** 把文本注入当前会话（与用户手打一条消息同一条入口）。 */
-  function inject(sessionId: string, text: string): void {
+  function inject(sessionId: string, text: string, tail?: string): void {
     const agents = optionalService(ctx, 'agents')
     const agent = agents?.get?.(sessionId)
     if (agent === undefined || agent === null || typeof agent.followup !== 'function') {
       throw new Error(`会话 ${sessionId.slice(0, 8)}… 当前没有活动 agent（先在手机上把这个会话打开）`)
     }
     const message = buildTihuUserMessage(text)
+    if (typeof tail === 'string' && tail !== '') message.content.push({ type: 'text', text: tail })
     // 窗口只在「这条消息开始的 turn」里有效：记下消息 id，执行工具时回查会话里
     // 最后一条 user 消息是不是它——用户后来自己打的字不算 tihu 链路。
     activeSessions.set(sessionId, { until: Date.now() + ACTIVE_WINDOW_MS, messageId: String(message.id) })
@@ -3090,7 +3118,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         // 先回 transcript 再注入：即使这个会话已经被关掉/没有 agent，屏上也先看到
         // 「我听到的是什么」，而不是只剩一条「注入失败」（E2E 脚本也靠这条核对转写）。
         device.send('transcript', { text, final: true, source, retryable: true } satisfies TranscriptPayload)
-        inject(device.sessionId, text)
+        inject(device.sessionId, text, voiceTailOf(device.sessionId))
         device.send('event.progress', { stage: '注入', text: '已送入当前会话' } satisfies ProgressPayload)
         sendFrame(device, { stage: '思考', title: '模型处理中', bullets: [text.slice(0, 20)], tone: 'busy' } satisfies ScreenFramePayload)
       } catch (error) {
