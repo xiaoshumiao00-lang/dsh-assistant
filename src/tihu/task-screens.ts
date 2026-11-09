@@ -117,7 +117,8 @@ export function awaitingFrame(input: {
   const defaultLabel = options[defaultIndex]
   const seconds = Math.max(0, Math.trunc(input.secondsLeft))
   const bullets: string[] = [`${input.projectName} · ${input.sessionTitle}`]
-  if (input.detail !== undefined && input.detail.trim() !== '') bullets.push(input.detail.trim())
+  const detailLine = String(input.detail ?? '').replace(/\s+/g, ' ').trim()
+  if (detailLine !== '') bullets.push(fitScreenLines([detailLine], 1)[0] ?? '')
   bullets.push(`${seconds} 秒不答，就按「${defaultLabel}」走`)
   bullets.push('说「确认」或「留着」也行')
   return {
@@ -154,7 +155,7 @@ export function doneFrame(input: {
     actions: [
       { id: 'stop', label: '停止' },
       { id: 'replay', label: '重读' },
-      { id: 'taskBoard', label: '棋盘' },
+      { id: 'taskBoard', label: '主页' },
     ],
     taskId: input.taskId,
     tone: 'ok',

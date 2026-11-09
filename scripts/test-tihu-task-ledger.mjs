@@ -34,6 +34,7 @@ import {
   ringOf,
   routeQuick,
   scoreCardAlias,
+  stripWakeWord,
   subLineOf,
   taskTitleOf,
 } from '../src/tihu/task-ledger.ts'
@@ -78,11 +79,35 @@ test('新任务是排队态：没有步数、没有会话、不编用时', () =>
   assert.equal(capsuleOf(task.state), '排队')
 })
 
-test('绑上会话即执行中；attachSession 不重复加同一条会话', () => {
+test('七态登记簿：排队→派单→执行中→待决策→完成→已播报→归档', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: '七态', projectId: 'p', projectName: 'P', now: 1000 })
+  assert.equal(task.state, 'queued')
+  ledger.attachSession(task.taskId, 's7', 1100)
+  assert.equal(task.state, 'dispatched')
+  ledger.markRunning(task.taskId, 1200)
+  assert.equal(task.state, 'running')
+  ledger.ask(task.taskId, { question: '删？', options: ['确认删除', '先留着'], defaultIndex: 0, timeoutMs: 60_000, now: 1300 })
+  assert.equal(task.state, 'awaiting')
+  ledger.answer(task.taskId, '设备点选', 1400)
+  assert.equal(task.state, 'running')
+  ledger.complete(task.taskId, { resultLine: '好了', now: 1500 })
+  assert.equal(task.state, 'done')
+  ledger.markSpoken(task.taskId, 1600)
+  assert.equal(task.state, 'announced')
+  assert.equal(capsuleOf('announced'), '完成', '屏上胶囊仍写完成；已播报是登记簿态')
+  ledger.archive(task.taskId, 1700)
+  assert.equal(task.state, 'archived')
+})
+
+test('绑上会话＝派单态；turn/start 才进执行中；attachSession 不重复加同一条会话', () => {
   const ledger = new TaskLedger()
   const task = ledger.add({ title: 'x', projectId: 'p1', projectName: 'P', now: 1000 })
   ledger.attachSession(task.taskId, 'session-aaaa', 1100)
   ledger.attachSession(task.taskId, 'session-aaaa', 1200)
+  assert.equal(task.state, 'dispatched')
+  assert.equal(capsuleOf(task.state), '派单')
+  ledger.markRunning(task.taskId, 1300)
   assert.equal(task.state, 'running')
   assert.deepEqual(task.sessionIds, ['session-aaaa'])
   assert.equal(ledger.ofSession('session-aaaa')?.taskId, 't1')
@@ -92,6 +117,7 @@ test('步数只增不减（乱序到达的 tool/call 不能把第 7 步改回第
   const ledger = new TaskLedger()
   const task = ledger.add({ title: 'x', projectId: 'p1', projectName: 'P' })
   ledger.attachSession(task.taskId, 'session-step')
+  ledger.markRunning(task.taskId)
   ledger.noteStep(task.taskId, 3)
   ledger.noteStep(task.taskId, 1)
   ledger.noteStep(task.taskId, 7)
@@ -180,6 +206,7 @@ test('顶行三段计数在跑/等你/排队，完成不计数', () => {
   const c = ledger.add({ title: 'c', projectId: '3', projectName: '3' })
   const d = ledger.add({ title: 'd', projectId: '4', projectName: '4' })
   ledger.attachSession(a.taskId, 'sa')
+  ledger.markRunning(a.taskId)
   ledger.attachSession(b.taskId, 'sb')
   ledger.ask(b.taskId, { question: 'q', options: ['x', 'y'], defaultIndex: 0, timeoutMs: 60_000 })
   ledger.complete(d.taskId, { resultLine: 'ok' })
@@ -213,6 +240,7 @@ test('时长环：满圈 30 分钟，超过继续满圈但转琥珀；排队空�
   const ledger = new TaskLedger()
   const task = ledger.add({ title: 'x', projectId: 'p', projectName: 'P', now: 0 })
   ledger.attachSession(task.taskId, 's', 0)
+  ledger.markRunning(task.taskId, 0)
   assert.deepEqual(ringOf(task, 0), { percent: 0, tone: 'normal' })
   assert.equal(ringOf(task, RING_FULL_MS / 2).percent, 0.5)
   const late = ringOf(task, RING_FULL_MS * 2)
@@ -386,6 +414,30 @@ test('别名打分：整名 > 片段；公共片段按字长给分', () => {
   assert.equal(longestCommonRun('青年基金', '青年基金申请书'), 4)
 })
 
+test('整名优先：点名 dsh-assistant 不被 assistant 文件夹误判成歧义', () => {
+  const cards = [
+    { id: 'c-dsh', name: 'dsh-assistant', folder: 'D:/dsh-assistant' },
+    { id: 'wt-assistant', name: '个人助手', folder: 'C:/Users/chen/.dsh/assistant' },
+    { id: 'c-hpg', name: 'HPG', folder: 'D:/hpg' },
+  ]
+  assert.equal(scoreCardAlias('dsh-assistant', cards[0]).via, 'name')
+  assert.equal(scoreCardAlias('dsh-assistant', cards[1]).via, 'folder')
+  const route = routeQuick({ text: 'dsh-assistant 用 pwsh 删掉临时文件', cards, tasks: [] })
+  assert.equal(route.kind, 'card')
+  assert.equal(route.card.id, 'c-dsh')
+})
+
+test('两个整名 → 屏 7 候选保留 HPG，不被个人助手挤掉', () => {
+  const cards = [
+    { id: 'c-dsh', name: 'dsh-assistant', folder: 'D:/dsh-assistant' },
+    { id: 'wt-assistant', name: '个人助手', folder: 'C:/Users/chen/.dsh/assistant' },
+    { id: 'c-hpg', name: 'HPG', folder: 'D:/hpg' },
+  ]
+  const route = routeQuick({ text: 'dsh-assistant 和 HPG 都看一下', cards, tasks: [] })
+  assert.equal(route.kind, 'ambiguous')
+  assert.deepEqual(route.candidates.map((card) => card.id), ['c-dsh', 'c-hpg'])
+})
+
 test('文件夹兜底按顺序取第一个非空', () => {
   assert.equal(firstFolderOf([undefined, '', 'D:/a']), 'D:/a')
   assert.equal(firstFolderOf([undefined, '']), undefined)
@@ -407,6 +459,20 @@ test('口头命令：回棋盘 / 看任务 / 停止 / 撤单 / 确认 / 拒绝',
 test('任务句里带「确认」不算命令（否则会把任务吞掉）', () => {
   assert.equal(parseScreenCommand('确认一下这个基金的预算表有没有算错'), undefined)
   assert.equal(parseScreenCommand('把取消掉的三个文件恢复回来'), undefined)
+})
+
+test('带唤醒词的口头命令：先剥「你好，鹈鹕」再判命令', () => {
+  assert.equal(stripWakeWord('你好，鹈鹕'), '')
+  assert.equal(stripWakeWord('你好鹈鹕'), '')
+  assert.equal(stripWakeWord('你好，鹈鹕，帮我查一下明天的课'), '帮我查一下明天的课')
+  assert.equal(stripWakeWord('回棋盘'), '回棋盘')
+  assert.equal(stripWakeWord('鹈鹕能吃吗'), '能吃吗')
+  assert.deepEqual(parseScreenCommand('你好，鹈鹕回棋盘'), { kind: 'board' })
+  assert.deepEqual(parseScreenCommand('你好鹈鹕，回棋盘'), { kind: 'board' })
+  assert.deepEqual(parseScreenCommand('嗨鹈鹕看第 2 条'), { kind: 'open', index: 2 })
+  assert.deepEqual(parseScreenCommand('鹈鹕停止'), { kind: 'stop' })
+  // 正文里的「鹈鹕」不是唤醒词：剥不出命令就按原文当任务。
+  assert.equal(parseScreenCommand('鹈鹕是什么'), undefined)
 })
 
 test('中文序号', () => {

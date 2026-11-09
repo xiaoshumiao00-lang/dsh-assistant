@@ -55,6 +55,10 @@ export interface TihuTask {
   state: TihuTaskState
   /** 第几步工具调用（没有分母）。 */
   step: number
+  /** 最近 8 步耗时（毫秒）：棋盘微条用，纯展示，不参与状态。 */
+  stepDurations?: number[]
+  /** 上一步发生的时刻（算微条间隔）。 */
+  lastStepAt?: number
   /** 第几轮 turn。 */
   turn: number
   /** 派单时刻（时长环从它算起）。 */
@@ -94,12 +98,21 @@ export type TihuTaskState = TaskState | 'archived'
 export function capsuleOf(state: TihuTaskState): string {
   switch (state) {
     case 'queued': return '排队'
+    case 'dispatched': return '派单'
     case 'running': return '执行中'
     case 'awaiting': return '待决策'
     case 'done': return '完成'
+    // 屏 1 的胶囊与图一致仍写「完成」；`announced` 是登记簿的第七态（已播报），
+    // 用于播报去重与归档，不再多造一个屏上词。
+    case 'announced': return '完成'
     case 'archived': return '已归档'
     default: return '排队'
   }
+}
+
+/** 完成家族：棋盘胶囊还分「完成/已播报」，但时长环、排序、归档按同一族处理。 */
+export function isFinishedState(state: TihuTaskState): boolean {
+  return state === 'done' || state === 'announced'
 }
 
 /** 排序权重：**要人的永远在最上**，完成沉底。 */
@@ -107,9 +120,11 @@ function stateRank(state: TihuTaskState): number {
   switch (state) {
     case 'awaiting': return 0
     case 'running': return 1
-    case 'queued': return 2
-    case 'done': return 3
-    default: return 4
+    case 'dispatched': return 2
+    case 'queued': return 3
+    case 'done': return 4
+    case 'announced': return 5
+    default: return 6
   }
 }
 
@@ -132,15 +147,16 @@ export function subLineOf(task: TihuTask, projectName?: string): string {
   const project = String(projectName ?? task.projectName ?? '').trim()
   const head = project === '' ? '' : project
   if (task.state === 'queued') return head === '' ? '排队中' : `${head} · 排队中`
-  if (task.state === 'done') return head === '' ? '已完成' : `${head} · 已完成`
+  if (task.state === 'dispatched') return head === '' ? '已派出' : `${head} · 已派出`
+  if (isFinishedState(task.state)) return head === '' ? '已完成' : `${head} · 已完成`
   if (task.step <= 0) return head === '' ? '已派出' : `${head} · 已派出`
   return head === '' ? `第 ${task.step} 步` : `${head} · 第 ${task.step} 步`
 }
 
-/** 时长环：排队空环、完成满环、跑久了转琥珀（30 分钟为界）。 */
+/** 时长环：排队/派单空环、完成满环、跑久了转琥珀（30 分钟为界）。 */
 export function ringOf(task: TihuTask, now: number): TaskBoardRow['ring'] {
-  if (task.state === 'queued' || task.state === 'archived') return { percent: 0, tone: 'empty' }
-  if (task.state === 'done') return { percent: 1, tone: 'done' }
+  if (task.state === 'queued' || task.state === 'dispatched' || task.state === 'archived') return { percent: 0, tone: 'empty' }
+  if (isFinishedState(task.state)) return { percent: 1, tone: 'done' }
   const end = task.state === 'awaiting' ? task.updatedAt : now
   const elapsed = Math.max(0, end - task.startedAt)
   const percent = Math.min(1, elapsed / RING_FULL_MS)
@@ -161,6 +177,7 @@ export function rowOf(task: TihuTask, now: number): TaskBoardRow {
     row.badge = 'ask'
     row.ring = { percent: 0, tone: 'empty' }
   }
+  if (task.stepDurations !== undefined && task.stepDurations.length > 0) row.micro = task.stepDurations.slice(-8)
   return row
 }
 
@@ -177,8 +194,8 @@ export function boardOf(tasks: readonly TihuTask[], now: number, page = 0): Task
     const byRank = stateRank(a.state) - stateRank(b.state)
     if (byRank !== 0) return byRank
     // 同状态：新动静的在前（完成态用完成时刻，避免「刚完成的反而排后面」）。
-    const aAt = a.state === 'done' ? a.finishedAt ?? a.updatedAt : a.updatedAt
-    const bAt = b.state === 'done' ? b.finishedAt ?? b.updatedAt : b.updatedAt
+    const aAt = isFinishedState(a.state) ? a.finishedAt ?? a.updatedAt : a.updatedAt
+    const bAt = isFinishedState(b.state) ? b.finishedAt ?? b.updatedAt : b.updatedAt
     if (aAt !== bAt) return bAt - aAt
     return a.taskId.localeCompare(b.taskId)
   })
@@ -215,7 +232,7 @@ export function countsOf(tasks: readonly TihuTask[]): TaskBoardPayload['counts']
   for (const task of tasks) {
     if (task.state === 'running') running += 1
     else if (task.state === 'awaiting') awaiting += 1
-    else if (task.state === 'queued') queued += 1
+    else if (task.state === 'queued' || task.state === 'dispatched') queued += 1
   }
   return { running, awaiting, queued }
 }
@@ -311,29 +328,36 @@ export class TaskLedger {
     const task = this.tasks.get(taskId)
     if (task === undefined) return undefined
     if (!task.sessionIds.includes(sessionId)) task.sessionIds.push(sessionId)
-    task.state = 'running'
+    // 七态第 2 态「派单」：会话已建、消息还没开跑；turn/start 才进执行中。
+    if (task.state === 'queued') task.state = 'dispatched'
     task.startedAt = task.startedAt === 0 ? now : task.startedAt
     task.updatedAt = now
     return task
   }
 
-  /** 会话开始跑（turn/start）：排队 → 执行中。 */
+  /** 会话开始跑（turn/start）：排队/派单/回答完 → 执行中。 */
   markRunning(taskId: string, now = Date.now()): TihuTask | undefined {
     const task = this.tasks.get(taskId)
     if (task === undefined) return undefined
-    if (task.state === 'queued' || task.state === 'awaiting') {
+    if (task.state === 'queued' || task.state === 'dispatched' || task.state === 'awaiting') {
       task.state = 'running'
       task.updatedAt = now
     }
     return task
   }
 
-  /** 步数推进（tool/call）：只增不减。 */
+  /** 步数推进（tool/call）：只增不减；顺手记最近 8 步耗时给棋盘微条。 */
   noteStep(taskId: string, step: number, now = Date.now()): void {
     const task = this.tasks.get(taskId)
     if (task === undefined) return
     const next = Number.isFinite(step) ? Math.max(0, Math.trunc(step)) : task.step + 1
-    if (next > task.step) task.step = next
+    if (next > task.step) {
+      const from = task.lastStepAt ?? task.startedAt
+      const elapsed = Math.max(0, now - from)
+      task.stepDurations = [...(task.stepDurations ?? []), elapsed].slice(-8)
+      task.lastStepAt = now
+      task.step = next
+    }
     task.updatedAt = now
   }
 
@@ -401,11 +425,12 @@ export class TaskLedger {
     return task
   }
 
-  /** 标记已播报（同一条不重复念）。 */
+  /** 标记已播报（同一条不重复念）；七态第 6 态「已播报」。 */
   markSpoken(taskId: string, now = Date.now()): void {
     const task = this.tasks.get(taskId)
     if (task === undefined) return
     task.spokenAt = now
+    if (task.state === 'done') task.state = 'announced'
   }
 
   /** 撤单：还没起跑的排队任务直接从棋盘拿掉（起跑过的要先停再撤，那是危险动作）。 */
@@ -439,11 +464,11 @@ export class TaskLedger {
     }
     if (this.tasks.size <= LEDGER_MAX_TASKS) {
       for (const task of this.tasks.values()) {
-        if (task.state === 'done' && task.finishedAt !== undefined && now - task.finishedAt > DONE_KEEP_MS) keep(task.taskId)
+        if (isFinishedState(task.state) && task.finishedAt !== undefined && now - task.finishedAt > DONE_KEEP_MS) keep(task.taskId)
       }
       return
     }
-    const byAge = this.list().filter((task) => task.state === 'done' || task.state === 'queued')
+    const byAge = this.list().filter((task) => isFinishedState(task.state) || task.state === 'queued' || task.state === 'dispatched')
     while (this.tasks.size > LEDGER_MAX_TASKS && byAge.length > 0) {
       const oldest = byAge.shift()
       if (oldest !== undefined) keep(oldest.taskId)
@@ -466,7 +491,7 @@ export function journalLineOf(task: TihuTask, now = Date.now()): string {
     task.projectName || '未分项目',
     task.sessionIds.length === 0 ? '无会话' : task.sessionIds.map((id) => id.replace(/^session-/, '').slice(0, 8)).join('+'),
     `用时 ${formatUsedMs(used)}`,
-    task.resultLine ?? (task.state === 'done' ? '已完成' : '已归档'),
+    task.resultLine ?? (isFinishedState(task.state) ? '已完成' : '已归档'),
   ]
   if (task.answeredBy !== undefined) parts.push(task.answeredBy)
   return `- ${parts.join(' / ')}`
@@ -618,12 +643,43 @@ export function chineseIndex(text: string): number | undefined {
 }
 
 /**
+ * 句首唤醒词：「你好，鹈鹕」「嗨鹈鹕」「鹈鹕，」——设备级噪声，不是任务正文。
+ *
+ * 真机固件与浏览器的关键词聆听都会把唤醒词一起转写进来（2026-11-09 实测：
+ * 「你好，鹈鹕回棋盘」没被当命令，反而作为一条任务派给了个人助手）。这里只剥
+ * **句首**的唤醒词，正文里出现的「鹈鹕」一个字都不动。
+ */
+const WAKE_WORD_PREFIX = /^(?:你好|嗨|嘿|喂)?[，,、。．.！!？?～~\s]*鹈鹕[，,、。．.！!？?～~\s]*/
+
+/** 去掉句首唤醒词；整句只有唤醒词时返回空串（上层当空话丢弃）。 */
+export function stripWakeWord(text: string): string {
+  const raw = String(text ?? '').trim()
+  if (raw === '') return ''
+  return raw.replace(WAKE_WORD_PREFIX, '').trim()
+}
+
+/**
  * 一句口头指令 → 屏上命令。返回 undefined 表示「不是命令，是任务」。
  *
  * 只认完整短句（`^…$`）：任务本身可能包含「取消」「确认」这些词（「确认一下这个基金的
  * 预算表」），用包含匹配就会把任务当成命令吞掉——那是比不识别更糟的错。
+ *
+ * 唤醒词先剥一层再判（「你好，鹈鹕回棋盘」＝「回棋盘」）；剥不出命令就按原文继续走路由，
+ * 所以「鹈鹕是什么」这类正文不会被误吞。
  */
 export function parseScreenCommand(text: string): ScreenCommand | undefined {
+  const raw = String(text ?? '')
+  const stripped = stripWakeWord(raw)
+  const candidates = stripped !== '' && stripped !== raw.trim() ? [raw, stripped] : [raw]
+  for (const candidate of candidates) {
+    const command = commandOfText(candidate)
+    if (command !== undefined) return command
+  }
+  return undefined
+}
+
+/** parseScreenCommand 的正文匹配（已剥过唤醒词的候选句）。 */
+function commandOfText(text: string): ScreenCommand | undefined {
   const clean = String(text ?? '').replace(/[，,。！!？?\s]+/g, '')
   if (clean === '' || clean.length > 14) return undefined
   const index = chineseIndex(clean)
@@ -666,28 +722,36 @@ export function looksSimpleTask(text: string): boolean {
 }
 
 /** 文本与卡片名的匹配分：整名命中 100+，否则按最长公共片段给分（≥2 字才算）。 */
-export function scoreCardAlias(text: string, card: TihuCardRow): { score: number; matched: string } {
+export function scoreCardAlias(text: string, card: TihuCardRow): { score: number; matched: string; via: 'name' | 'folder' | 'fragment' } {
   const haystack = normalizeAlias(text)
-  if (haystack === '') return { score: 0, matched: '' }
-  const names = [card.name, folderBase(card.folder)].map((value) => normalizeAlias(value)).filter((value) => value !== '' && [...value].length >= 2)
+  if (haystack === '') return { score: 0, matched: '', via: 'fragment' }
+  const names: { value: string; via: 'name' | 'folder' }[] = [
+    { value: card.name, via: 'name' },
+    ...(folderBase(card.folder) === '' ? [] : [{ value: folderBase(card.folder), via: 'folder' as const }]),
+  ].filter((item) => normalizeAlias(item.value).length >= 2) as { value: string; via: 'name' | 'folder' }[]
   let best = 0
   let matched = ''
-  for (const name of names) {
+  let via: 'name' | 'folder' | 'fragment' = 'fragment'
+  for (const item of names) {
+    const name = normalizeAlias(item.value)
     if (haystack.includes(name)) {
       const score = 100 + [...name].length
-      if (score > best) {
+      // 同分时保住「整名」：用户点名了卡片，不能被另一个卡的文件夹短名挤成歧义。
+      if (score > best || (score === best && item.via === 'name')) {
         best = score
-        matched = name
+        matched = item.value
+        via = item.via
       }
       continue
     }
     const common = longestCommonRun(haystack, name)
     if (common >= 2 && common * 10 > best) {
       best = common * 10
-      matched = name
+      matched = item.value
+      via = 'fragment'
     }
   }
-  return { score: best, matched }
+  return { score: best, matched, via }
 }
 
 function normalizeAlias(value: unknown): string {
@@ -744,21 +808,26 @@ export function routeQuick(input: {
     .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score)
   const exact = scored.filter((item) => item.score >= 100)
+  // 整名命中优先于「文件夹短名」：`dsh-assistant` 里包含 `assistant`，旧实现会把
+  // 个人助手（文件夹 ...\assistant）当成第二个整名，把真正点名的 HPG 挤掉。
+  // 只要有一张卡是整名命中，就只在整名命中里判歧义；只有全是文件夹命中时才用文件夹。
+  const namedExact = exact.filter((item) => item.via === 'name')
+  const decisive = namedExact.length > 0 ? namedExact : exact
   // 两个卡名都整字出现：这句真的能派给两处，必须问（屏 7）。
-  if (exact.length > 1) return { kind: 'ambiguous', candidates: exact.slice(0, 2).map((item) => item.card) }
+  if (decisive.length > 1) return { kind: 'ambiguous', candidates: decisive.slice(0, 2).map((item) => item.card) }
 
   // 「接着 / 继续 / 再…」＝同一件事接着说：优先追加到点名那张卡的在办任务，
   // 没点名就追加到最近在办的那条（设计 §6 快路径第 2 条：上一条任务接续）。
   const activeOf = (projectId: string | undefined): TihuTask | undefined =>
     input.tasks
-      .filter((task) => task.state === 'running' || task.state === 'awaiting' || task.state === 'queued')
+      .filter((task) => task.state === 'running' || task.state === 'awaiting' || task.state === 'queued' || task.state === 'dispatched')
       .filter((task) => projectId === undefined || task.projectId === projectId)
       .sort((a, b) => b.updatedAt - a.updatedAt)[0]
 
-  if (exact.length === 1) {
-    const follow = CONTINUATION.test(text) ? activeOf(exact[0].card.id) : undefined
+  if (decisive.length === 1) {
+    const follow = CONTINUATION.test(text) ? activeOf(decisive[0].card.id) : undefined
     if (follow !== undefined) return { kind: 'append', task: follow }
-    return { kind: 'card', card: exact[0].card, matched: exact[0].matched }
+    return { kind: 'card', card: decisive[0].card, matched: decisive[0].matched }
   }
 
   if (CONTINUATION.test(text)) {
