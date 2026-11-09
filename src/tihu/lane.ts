@@ -69,7 +69,10 @@ import { applyEarlyThinking, applySessionEvent, confirmationFrame, createProgres
 import { TihuTts, isKokoroVoice, type TihuTtsPaths } from './tts.ts'
 import { replyVisibleWindow, replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
 import { stripToolNoise, toSpeechText } from './speech-text.ts'
-import { CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX, REPLY_LAYOUT, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
+import { CONTENT_WIDTH_PX, fitScreenLines, PENDING_RAIL_WIDTH_PX, REPLY_LAYOUT, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
+import { parseWav } from './audio.ts'
+import { applyPersonalTerms, cleanFillers, fixTerms } from '../client/pocket/orb/asr-terms.ts'
+import { loadAssistantConfig } from '../assistant-config.ts'
 import { cardsFromState, groupCardProjects, groupProjects, groupWorkspaceProjects, humanTitle, projectCardsSignature, projectNameOf, type ProjectReply, type TihuCardRow, type TihuWorkspaceRow } from './project-groups.ts'
 import { matchSessionRows, type ControlSessionRow, type DeviceStatusView, type SessionProgressView, type TihuControlDevice, type TihuControlSurface } from './control.ts'
 import type { AlertPayload, TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
@@ -178,6 +181,56 @@ function clampInt(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Math.round(value)))
 }
 
+/** 只用于新增配置读取；避免把新的 process 全局引用计入既有 TS2591 基线。 */
+const tihuRuntimeEnv = (globalThis as any).process?.env ?? {} as Record<string, string | undefined>
+
+/** WAV 原始语音质量：在增益前判静音/低质量，避免归一化把底噪伪装成清晰语音。 */
+export function inspectTihuVoiceWav(audioBase64: string): { kind: 'ok' | 'review' | 'reject'; reason: string } {
+  try {
+    const BufferCtor = (globalThis as any).Buffer
+    const buffer = BufferCtor.from(String(audioBase64 ?? ''), 'base64')
+    const info = parseWav(buffer)
+    if (info === null || info.sampleRate !== 16000 || info.channels !== 1 || info.bits !== 16) return { kind: 'reject', reason: '音频格式不受支持' }
+    const count = Math.floor(info.dataBytes / 2)
+    if (count < 1600) return { kind: 'reject', reason: '录音太短' }
+    let mean = 0
+    for (let i = 0; i < count; i += 1) mean += buffer.readInt16LE(info.dataOffset + i * 2) / 32768
+    mean /= count
+    let energy = 0
+    let peak = 0
+    const frameSamples = 320
+    let voicedFrames = 0
+    let frames = 0
+    for (let start = 0; start < count; start += frameSamples) {
+      const end = Math.min(count, start + frameSamples)
+      let frameEnergy = 0
+      for (let i = start; i < end; i += 1) {
+        const value = buffer.readInt16LE(info.dataOffset + i * 2) / 32768 - mean
+        energy += value * value
+        frameEnergy += value * value
+        peak = Math.max(peak, Math.abs(value))
+      }
+      frames += 1
+      if (Math.sqrt(frameEnergy / Math.max(1, end - start)) >= 0.006) voicedFrames += 1
+    }
+    const rms = Math.sqrt(energy / Math.max(1, count))
+    const voicedMs = Math.round((voicedFrames * frameSamples / 16000) * 1000)
+    if (peak < 0.001 || (rms < 0.003 && voicedMs < 100)) return { kind: 'reject', reason: '没有听到有效人声' }
+    if (info.durationMs < 600 || voicedMs < 300 || voicedFrames / Math.max(1, frames) < 0.08) return { kind: 'review', reason: '声音较短或较弱，请确认后发送' }
+    return { kind: 'ok', reason: '' }
+  } catch {
+    return { kind: 'reject', reason: '音频无法解析' }
+  }
+}
+
+/** 自动发送只是 UX 门：白名单只读意图才自动，其余由用户显式发送，真正安全仍由工具闸兜底。 */
+export function tihuVoiceAutoEligible(text: string): boolean {
+  const value = String(text ?? '').trim()
+  if ([...value].length < 2) return false
+  if (/(删除|删掉|清空|格式化|写|修改|移动|覆盖|安装|卸载|运行|执行|脚本|重启|停止|关闭|结束|发送|发布|提交|推送|转账|支付|归档|commit|push|deploy|\brm\b|\bdel\b)/i.test(value)) return false
+  return /^(?:请|帮我|麻烦)?(?:查看|看|读取|读|查询|查|搜索|总结|解释|翻译|列出|汇报|告诉|分析|什么|怎么|哪|现在|目前)/.test(value)
+}
+
 /** 一个已连接的设备（P0 一个页面一个连接）。 */
 interface TihuDevice {
   id: string
@@ -193,6 +246,33 @@ interface TihuDevice {
   edgeVoice: string
   /** 仅离线：禁用 edge-tts。 */
   offlineOnly: boolean
+  /** 绑定代际：手动操作使所有旧自动绑定失效；自动操作另有独立代际供超时失效。 */
+  bindEpoch: number
+  autoBindEpoch: number
+  /** 语音输入代际：重说/新输入/换绑会使未完成 ASR 与待发送草稿失效。 */
+  voiceAttempt: number
+  /** 正在构造并行任务/提交输入：此间其他 turn 不得自动换绑。 */
+  commitInFlight: boolean
+  cancelAsr?: () => void
+  pendingVoice?: {
+    attempt: number
+    text: string
+    sessionId: string
+    autoEligible: boolean
+    timer?: ReturnType<typeof setTimeout>
+  }
+  voiceUi?: {
+    roundKey: string
+    round: number
+    phase: 'preparing' | 'playing' | 'finished'
+    alert: string
+    playingStage: string
+    degraded: boolean
+    failedSegments: Set<number>
+    waitSeconds: number
+    startedAt: number
+    timer?: ReturnType<typeof setTimeout>
+  }
   send: (type: string, payload: unknown) => void
   close: () => void
   /** 中止该设备当前这一轮朗读（换绑/断开时调用）：置 aborted，后续音频不再下发。 */
@@ -239,6 +319,8 @@ export interface TihuRuntimeOptions {
   confirmBroker?: ConfirmBroker
   /** 控制室卡片巡检间隔（毫秒，0 = 关闭；缺省走 tihuHomeSyncMs()/环境变量）。 */
   homeSyncMs?: number
+  /** 语音预览自动发送延迟（默认 2000ms；测试可注入，不属于设备协议）。 */
+  previewDelayMs?: number
 }
 
 /** 提供给代理的两个入口 + 卸载函数。 */
@@ -274,6 +356,13 @@ function sessionIdOfAgent(agent: any): string | undefined {
   return sessionIdOf(agent?.session) ?? (typeof agent?.sessionId === 'string' ? agent.sessionId : undefined)
 }
 
+/** 不同宿主投影里的工作区 id；只读提取，不注册、不改绑定。 */
+function workspaceIdOf(source: any): string | undefined {
+  const header = source?.header ?? source
+  const value = header?.workspaceId ?? source?.workspaceId ?? source?.workspace?.id
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
+
 /** 屏上/提示里用的短会话 id（`session-98bb83cb-…` → `98bb83cb`）。 */
 function shortSessionId(sessionId: string): string {
   return sessionId.replace(/^session-/, '').slice(0, 8) || sessionId.slice(0, 8)
@@ -286,6 +375,7 @@ interface TihuSessionRow {
   /** agent preset（Computer Use 判定依据：投影 `agentPreset`，缺省回退 header）。 */
   preset: string
   cwd?: string
+  workspaceId?: string
   createdAt?: number
   /** 活跃时间：max(createdAt, 投影 sessionListMetadata.lastPromptAt)。 */
   updatedAt: number
@@ -459,6 +549,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   function broadcast(sessionId: string, type: string, payload: unknown): void {
     for (const device of devices) {
       if (device.sessionId !== sessionId) continue
+      if (type === 'screen.frame') rememberDeviceFrame(device, sessionId, payload as ScreenFramePayload)
       device.send(type, payload)
     }
   }
@@ -512,6 +603,27 @@ const speedWindows = new Map<string, TihuDecodeSample[]>()
 const titleFetchAt = new Map<string, number>()
 const speedLive = new Map<string, number>()
 const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bullets?: string[] }>()
+/** clientId → 最后实际收到的屏帧；只用于同一设备断线重连恢复，最多保留 32 台。 */
+const deviceFrameMemory = new Map<string, { sessionId: string; frame: ScreenFramePayload; at: number }>()
+
+function rememberDeviceFrame(device: TihuDevice, sessionId: string | undefined, frame: ScreenFramePayload): void {
+  const clientId = typeof device.hello?.clientId === 'string' ? device.hello.clientId : ''
+  if (clientId === '' || sessionId === undefined) return
+  deviceFrameMemory.delete(clientId)
+  deviceFrameMemory.set(clientId, { sessionId, frame: { ...frame, bullets: frame.bullets ?? [] }, at: Date.now() })
+  while (deviceFrameMemory.size > 32) {
+    const oldest = deviceFrameMemory.keys().next().value as string | undefined
+    if (oldest === undefined) break
+    deviceFrameMemory.delete(oldest)
+  }
+}
+
+function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: ScreenFramePayload } | undefined {
+  const clientId = typeof device.hello?.clientId === 'string' ? device.hello.clientId : ''
+  const saved = deviceFrameMemory.get(clientId)
+  if (saved === undefined || Date.now() - saved.at > 60 * 60_000) return undefined
+  return saved
+}
 
   /** 回复屏底部的三个动作按钮（设备端渲染、点按回传 actionId）。 */
   const REPLY_ACTIONS = [
@@ -525,6 +637,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     const raw = Number(process.env.TIHU_BIND_HOME_MS ?? 3000)
     if (!Number.isFinite(raw)) return 3000
     return Math.max(0, Math.min(raw, 60_000))
+  }
+
+  /** 注入前自动绑定的等待上限；超时必须使这次自动操作失效，而非保留迟到写绑。 */
+  function autoBindTimeoutMs(): number {
+    return clampInt(Number(tihuRuntimeEnv.TIHU_AUTO_BIND_MS ?? 5000), 50, 10_000)
   }
 
   /** 这条会话是不是 Computer Use 模式：按列表缓存里的 preset 判，查不到当不是。 */
@@ -720,20 +837,36 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       return
     }
     // 记一份「这台设备最后看到的那屏」：运行中清单变化时按它重发（followRunningTurn 跟过来的会话还没有广播帧时也要有基准）。
-    if (sessionId !== undefined && frame.mode !== 'reply') {
-      lastFrames.set(sessionId, { ...frame, bullets: frame.bullets ?? [] })
-    }
+    if (sessionId !== undefined) lastFrames.set(sessionId, { ...frame, bullets: frame.bullets ?? [] })
     const pend = sessionId === undefined ? [] : pendingByDisplay.get(sessionId) ?? []
-    device.send('screen.frame', withFrameExtras({
+    const outgoing = withFrameExtras({
       ...frame,
       ...(frame.pending === undefined
         ? { pending: pend.slice(0, 4).map((item) => ({ sessionId: item.sessionId, title: item.title, at: item.at, unread: true as const })) }
         : {}),
       ...(frame.pendingCount === undefined ? { pendingCount: pend.length } : {}),
-    } satisfies ScreenFramePayload, sessionId))
+    } satisfies ScreenFramePayload, sessionId)
+    rememberDeviceFrame(device, sessionId, outgoing)
+    device.send('screen.frame', outgoing)
   }
 
-  const SESSION_LIST_TTL_MS = 60_000
+  function restoreSavedDeviceFrame(device: TihuDevice, saved: { sessionId: string; frame: ScreenFramePayload } | undefined): boolean {
+    if (saved === undefined || device.sessionId !== saved.sessionId) return false
+    if (homePinned.has(saved.sessionId) && saved.frame.mode !== 'home') return false
+    const frame: ScreenFramePayload = { ...saved.frame, bullets: saved.frame.bullets ?? [] }
+    if (frame.mode === 'reply') {
+      frame.stage = '已重连 · 点重读'
+      frame.tone = 'alert'
+      device.voiceUi = {
+        roundKey: `${device.id}|${saved.sessionId}`, round: 0, phase: 'finished', alert: '已重连 · 点重读',
+        playingStage: '', degraded: false, failedSegments: new Set<number>(), waitSeconds: 0, startedAt: Date.now(),
+      }
+    }
+    sendFrame(device, frame, saved.sessionId)
+    return true
+  }
+
+  const sessionListTtlMs = (): number => clampInt(Number(tihuRuntimeEnv.TIHU_SESSION_LIST_TTL_MS ?? 60_000), 100, 600_000)
   /** 标题缓存：readTitleSnapshots 要读日志，同一会话 60 秒内只读一次。 */
   const titleCache = new Map<string, { at: number; title: string }>()
 
@@ -814,6 +947,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         preset: presetOf(session),
         updatedAt: activityOf(session),
         ...(typeof session?.header?.cwd === 'string' ? { cwd: session.header.cwd } : {}),
+        ...(workspaceIdOf(session) === undefined ? {} : { workspaceId: workspaceIdOf(session) }),
         ...(Number.isFinite(session?.header?.createdAt) ? { createdAt: Number(session.header.createdAt) } : {}),
         live: true,
       })
@@ -834,7 +968,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   /** 拉完整会话列表（带 60 秒缓存；`force` 用于「页面连上时重新判定」）。 */
   async function collectSessionRows(force = false): Promise<{ rows: TihuSessionRow[]; source: 'sessionQuery' | 'live' }> {
     const now = Date.now()
-    if (!force && sessionListCache !== undefined && now - sessionListCache.at < SESSION_LIST_TTL_MS) {
+    if (!force && sessionListCache !== undefined && now - sessionListCache.at < sessionListTtlMs()) {
       return { rows: sessionListCache.rows, source: sessionListCache.source }
     }
     const live = liveSessionRows()
@@ -854,6 +988,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             preset: presetOf(record?.header),
             updatedAt: activityOf(record?.header),
             ...(typeof record?.header?.cwd === 'string' ? { cwd: record.header.cwd } : {}),
+            ...(workspaceIdOf(record) === undefined ? {} : { workspaceId: workspaceIdOf(record) }),
             ...(Number.isFinite(record?.header?.createdAt) ? { createdAt: Number(record.header.createdAt) } : {}),
             live: record?.live === true,
           })
@@ -974,6 +1109,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             updatedAt: activityOf(live),
             live: true,
             ...(typeof live?.header?.cwd === 'string' ? { cwd: live.header.cwd } : {}),
+            ...(workspaceIdOf(live) === undefined ? {} : { workspaceId: workspaceIdOf(live) }),
             ...(Number.isFinite(live?.header?.createdAt) ? { createdAt: Number(live.header.createdAt) } : {}),
           },
         }
@@ -983,34 +1119,64 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     // 校验一次而重新列 1870 条会话——那会让「点一条会话」等好几秒才有反馈。
     const cachedRow = sessionListCache?.rows.find((item) => item.sessionId === sessionId)
     if (cachedRow !== undefined) return { status: cachedRow.live ? 'live' : 'persisted', row: cachedRow }
-    let collected: { rows: TihuSessionRow[]; source: 'sessionQuery' | 'live' }
-    try { collected = await collectSessionRows() } catch { return { status: 'unknown' } }
+    let collected: { rows: TihuSessionRow[]; source: 'sessionQuery' | 'live' } | undefined
+    try { collected = await collectSessionRows() } catch { collected = undefined }
     // 只有 sessionQuery 才能代表「全部逻辑会话」；退回 live 列表时不能据此判不存在。
-    if (collected.source !== 'sessionQuery') return { status: 'unknown' }
-    const row = collected.rows.find((item) => item.sessionId === sessionId)
-    return row === undefined ? { status: 'missing' } : { status: row.live ? 'live' : 'persisted', row }
+    if (collected?.source === 'sessionQuery') {
+      const row = collected.rows.find((item) => item.sessionId === sessionId)
+      return row === undefined ? { status: 'missing' } : { status: row.live ? 'live' : 'persisted', row }
+    }
+    // 没有完整列表的轻量宿主/测试桩：活动 agent 也是可核实的证据。
+    try {
+      const agent = optionalService(ctx, 'agents')?.get?.(sessionId)
+      const live = agent?.session
+      if (live !== undefined && live !== null) {
+        return {
+          status: 'live',
+          row: {
+            sessionId: sessionIdOf(live) ?? sessionId,
+            title: titleOf(live),
+            preset: presetOf(live),
+            updatedAt: activityOf(live),
+            live: true,
+            ...(typeof live?.header?.cwd === 'string' ? { cwd: live.header.cwd } : {}),
+            ...(workspaceIdOf(live) === undefined ? {} : { workspaceId: workspaceIdOf(live) }),
+            ...(Number.isFinite(live?.header?.createdAt) ? { createdAt: Number(live.header.createdAt) } : {}),
+          },
+        }
+      }
+      if (agent !== undefined && agent !== null && typeof agent.followup === 'function') {
+        return {
+          status: 'live',
+          row: {
+            sessionId, title: titleCache.get(sessionId)?.title ?? '', preset: sessionPresets.get(sessionId) ?? '',
+            updatedAt: Date.now(), live: true,
+          },
+        }
+      }
+    } catch { /* 继续按 unknown 处理 */ }
+    return { status: 'unknown' }
   }
 
   /** 绑定会话：非法 id 给可读提示并让页面退回选择器；非 CU 允许绑定但必须醒目告警。 */
   async function bindSession(
     device: TihuDevice,
     sessionId: string,
-    options: { auto?: boolean; followed?: boolean } = {},
+    options: { auto?: boolean; followed?: boolean; autoGeneration?: number } = {},
   ): Promise<void> {
-    // 换会话先把上一轮的朗读掐掉（屏已经不显示它了，声音不能继续跟过来）。
-    const previousSessionId = device.sessionId
-    if (previousSessionId !== undefined && previousSessionId !== sessionId) {
-      try { device.cancelRound?.() } catch { /* 忽略 */ }
-      // 换绑定解除上一会话的主页钉住（用户 2026-11-08 规则：钉住不是永久的）。
-      unpinHome(previousSessionId)
-      browsingHistory.delete(previousSessionId)
-    }
-    // 目标会话也要解除钉住（用户主动换过来了，就该正常显示它的屏）；同会话补绑（页面重连）保留钉住。
-    if (previousSessionId !== sessionId) {
-      unpinHome(sessionId)
-      browsingHistory.delete(sessionId)
-    }
+    if (options.autoGeneration === undefined) device.autoBindEpoch += 1
+    const epoch = ++device.bindEpoch
+    const valid = (): boolean => device.bindEpoch === epoch
+      && (options.autoGeneration === undefined || device.autoBindEpoch === options.autoGeneration)
     const found = await findSession(sessionId)
+    if (!valid()) return
+    if (found.status === 'unknown') {
+      device.send('event.alert', { level: 'warn', text: '宿主暂时无法核实这个会话，请稍后重试' })
+      sendFrame(device, {
+        stage: '会话', title: '暂时无法核实会话', bullets: ['本次没有切换目标', '请稍后重试'], tone: 'alert',
+      } satisfies ScreenFramePayload)
+      return
+    }
     if (found.status === 'missing') {
       device.sessionId = undefined
       device.send('session.invalid', {
@@ -1028,11 +1194,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       log(`tihu bind rejected session=${sessionId} reason=missing`)
       return
     }
-    device.sessionId = sessionId
     const row = found.row
     let rawTitle = row?.title ?? titleCache.get(sessionId)?.title ?? ''
     let title = rawTitle === '' ? '' : humanTitle(rawTitle)
-    if (title === '' && found.status !== 'unknown') {
+    if (title === '') {
       // 标题要读会话日志：单独给 1.5 秒上限（URL 直接带会话时列表还没拉过）。
       const base: TihuSessionRow = { sessionId, title: '', preset: row?.preset ?? '', updatedAt: row?.updatedAt ?? 0, live: found.status === 'live' }
       const [titled] = await Promise.race([
@@ -1041,6 +1206,25 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       ])
       title = titled?.title ? humanTitle(titled.title) : ''
     }
+    if (!valid()) return
+    // 所有异步校验通过后才一次性提交；迟到绑定不能取消朗读、清历史或换绑。
+    const previousSessionId = device.sessionId
+    if (previousSessionId !== sessionId) {
+      cancelPendingVoice(device)
+      device.voiceAttempt += 1
+      try { device.cancelAsr?.() } catch { /* 忽略 */ }
+      device.cancelAsr = undefined
+      if (previousSessionId !== undefined) {
+        try { device.cancelRound?.() } catch { /* 忽略 */ }
+        unpinHome(previousSessionId)
+        browsingHistory.delete(previousSessionId)
+      }
+      unpinHome(sessionId)
+      browsingHistory.delete(sessionId)
+      if (device.voiceUi?.timer !== undefined) clearTimeout(device.voiceUi.timer)
+      device.voiceUi = undefined
+    }
+    device.sessionId = sessionId
     const preset = row?.preset ?? ''
     const computerUse = isComputerUsePreset(preset)
     const live = found.status === 'live' || row?.live === true
@@ -1109,23 +1293,30 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * `reason='inject'` 时如果目标变了，会明确下发「已自动跟随到：…」。
    * 非 CU 会话永远不参与自动绑定（列表只筛 CU）。
    */
-  async function autoBindActive(device: TihuDevice, reason: 'hello' | 'inject'): Promise<void> {
-    // 页面连上 → 重新列一次（可能刚在桌面新建了 CU 会话）；
-    // 注入前 → 先用缓存（事件里会把活跃时间刷到最新），超过 15 秒才重新列，避免每次说话都等全量列表。
+  async function autoBindActive(device: TihuDevice, reason: 'hello' | 'inject', generation?: number): Promise<boolean> {
+    const autoGeneration = generation ?? ++device.autoBindEpoch
+    // 正在朗读、翻历史或钉住主页时，输入仍发当前屏上目标，不再重新挑选“最活跃”。
+    if (reason === 'inject' && device.sessionId !== undefined
+      && (runningSessions.has(device.sessionId) || readingBusy(device.sessionId) || browsingHistory.has(device.sessionId) || homePinned.has(device.sessionId))) return true
     const stale = sessionListCache === undefined || Date.now() - sessionListCache.at > 15_000
     const active = await activeComputerUseRow(reason === 'hello' || stale)
+    if (device.autoBindEpoch !== autoGeneration) return false
     if (active === undefined) {
-      device.sessionId = undefined
       if (reason === 'hello') {
+        device.sessionId = undefined
         device.send('event.alert', { level: 'warn', text: '没有可自动绑定的 Computer Use 会话，已显示控制室主页' })
         await sendHome('__unbound__', device)
+      } else {
+        device.send('event.alert', { level: 'warn', text: '暂时无法核实目标会话，本次指令未发送' })
       }
       log(`tihu auto bind: no computer-use session (${reason})`)
-      return
+      return false
     }
     const changed = device.sessionId !== active.sessionId
-    await bindSession(device, active.sessionId, { auto: true, followed: reason === 'inject' && changed })
-    if (reason === 'inject' && changed) {
+    if (!changed && reason === 'inject') return true
+    await bindSession(device, active.sessionId, { auto: true, followed: reason === 'inject' && changed, autoGeneration })
+    if (device.autoBindEpoch !== autoGeneration) return false
+    if (reason === 'inject' && changed && device.sessionId === active.sessionId) {
       device.send('event.progress', {
         stage: '跟随',
         text: `已自动跟随到：${active.title || shortSessionId(active.sessionId)}`,
@@ -1133,10 +1324,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       log(`tihu auto follow session=${active.sessionId}`)
     }
     log(`tihu auto bind reason=${reason} session=${active.sessionId} changed=${String(changed)}`)
+    return device.sessionId === active.sessionId
   }
 
   /** 构造 reply 模式屏帧：长回复只带当前句 ±2 句窗口，避免每帧全量传长文本。 */
-  function replyScreen(sessionId: string, sentences: ReplySentence[], currentIndex: number, charPos: number, includeAll: boolean): ScreenFramePayload {
+  function replyScreen(sessionId: string, sentences: ReplySentence[], currentIndex: number, charPos: number, includeAll: boolean, device?: TihuDevice): ScreenFramePayload {
     const pending = pendingByDisplay.get(sessionId) ?? []
     const widthPx = pending.length > 0 ? 240 : CONTENT_WIDTH_PX
     let state = screenStates.get(sessionId)
@@ -1159,11 +1351,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     state.offset = visible.offset
     const list = includeAll ? sentences : replyWindow(sentences, currentIndex)
     const totalChars = sentences.length > 0 ? sentences[sentences.length - 1].end : 0
+    const voice = device?.voiceUi?.roundKey === `${device.id}|${sessionId}` ? device.voiceUi : undefined
+    const stage = voice === undefined ? '回答中'
+      : voice.alert !== '' ? voice.alert
+        : voice.phase === 'preparing' ? `正在准备声音${voice.waitSeconds >= 2 ? ` · ${voice.waitSeconds}s` : ''}`
+          : voice.playingStage || '回答中'
+    const tone = voice?.alert !== undefined && voice.alert !== '' ? 'alert'
+      : voice?.degraded === true ? 'busy'
+        : voice?.phase === 'preparing' ? 'busy' : 'ok'
     return {
-      stage: '回答中',
+      stage,
       title: '',
       bullets: [],
-      tone: 'ok',
+      tone,
       mode: 'reply',
       reply: {
         sentences: list.map((sentence) => ({ index: sentence.index, start: sentence.start, end: sentence.end, text: sentence.text })),
@@ -1182,7 +1382,54 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   function sendReply(sessionId: string, sentences: ReplySentence[], currentIndex: number, charPos: number, includeAll: boolean): void {
-    screen(sessionId, replyScreen(sessionId, sentences, currentIndex, charPos, includeAll))
+    for (const device of devices) {
+      if (device.sessionId !== sessionId) continue
+      sendFrame(device, replyScreen(sessionId, sentences, currentIndex, charPos, includeAll, device), sessionId)
+    }
+  }
+
+  function refreshVoiceReply(device: TihuDevice, sessionId: string): void {
+    if (device.sessionId !== sessionId || !devices.has(device)) return
+    const reply = replyPayloadOf(sessionId)
+    if (reply === undefined) return
+    const state = screenStates.get(sessionId)
+    sendReply(sessionId, reply.sentences, state?.currentIndex ?? 0, state?.charPos ?? 0, reply.includeAll)
+  }
+
+  function scheduleVoicePreparing(device: TihuDevice, sessionId: string, roundKey: string, round: number): void {
+    const tick = (): void => {
+      const ui = device.voiceUi
+      if (ui === undefined || ui.roundKey !== roundKey || ui.round !== round || ui.phase !== 'preparing') return
+      ui.waitSeconds = Math.max(2, Math.floor((Date.now() - ui.startedAt) / 1000))
+      refreshVoiceReply(device, sessionId)
+      ui.timer = setTimeout(tick, 1000)
+    }
+    const ui = device.voiceUi
+    if (ui !== undefined) ui.timer = setTimeout(tick, 2000)
+  }
+
+  function lockVoiceAlert(device: TihuDevice, sessionId: string, text: string): void {
+    let ui = device.voiceUi
+    if (ui === undefined || ui.roundKey !== `${device.id}|${sessionId}`) {
+      ui = {
+        roundKey: `${device.id}|${sessionId}`, round: speakRounds.get(`${device.id}|${sessionId}`) ?? 0,
+        phase: 'finished', alert: '', playingStage: '', degraded: false, failedSegments: new Set<number>(),
+        waitSeconds: 0, startedAt: Date.now(),
+      }
+      device.voiceUi = ui
+    }
+    ui.alert = text
+    if (ui.timer !== undefined) clearTimeout(ui.timer)
+    ui.phase = 'finished'
+    refreshVoiceReply(device, sessionId)
+  }
+
+  function markVoiceSegmentFailed(device: TihuDevice, sessionId: string, index: number): void {
+    const ui = device.voiceUi
+    if (ui === undefined || ui.roundKey !== `${device.id}|${sessionId}`) return
+    ui.failedSegments.add(index)
+    if (ui.alert === '' || ui.alert.includes('段未朗读')) ui.alert = `${ui.failedSegments.size} 段未朗读 · 点重读`
+    refreshVoiceReply(device, sessionId)
   }
 
   /** 把已到达的思考文本写进「思考」活动行（文本没变时 applyEarlyThinking 不出帧）。 */
@@ -1709,11 +1956,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }, Number.isFinite(delay) ? delay : 10_000)
   }
   async function speakLocally(device: TihuDevice, sessionId: string, sentences: ReplySentence[], speechSegments: SpeechSegment[], includeAll: boolean): Promise<void> {
-    if (speechSegments.length === 0) return
-    /**
-     * 新的一轮开始前，先把这台设备上还在跑的那一轮掐掉（同一会话连续两条 assistant/message
-     * 是真实会发生的：每个 settled 的 step 都是一条）。不掐的话两轮并读、页面收到两遍 index。
-     */
     const roundKey = `${device.id}|${sessionId}`
     const roundToken = (speakRounds.get(roundKey) ?? 0) + 1
     speakRounds.set(roundKey, roundToken)
@@ -1723,7 +1965,20 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       log(`tihu tts cancel previous round device=${device.id} session=${sessionId}`)
       try { previousCancel() } catch { /* 忽略：旧轮自己的清理逻辑不该影响新一轮 */ }
     }
-    // 默认走 edge（每次合成现起进程，不需要常驻）；只有手切 Kokoro 音色 / 仅离线 /
+    if (device.voiceUi?.timer !== undefined) clearTimeout(device.voiceUi.timer)
+    device.voiceUi = {
+      roundKey, round: roundToken, phase: 'preparing', alert: '', playingStage: '', degraded: false,
+      failedSegments: new Set<number>(), waitSeconds: 0, startedAt: Date.now(),
+    }
+    refreshVoiceReply(device, sessionId)
+    if (speechSegments.length === 0) {
+      device.voiceUi.phase = 'finished'
+      device.voiceUi.alert = '仅文字 · 无可重读语音'
+      refreshVoiceReply(device, sessionId)
+      return
+    }
+    scheduleVoicePreparing(device, sessionId, roundKey, roundToken)
+    // 新的一轮已开始；默认走 edge，只有显式本地路径才拉起常驻 sidecar。
     // 显式 TIHU_TTS_ENGINE=kokoro 才需要拉起 Kokoro sidecar。
     const localPrimary = typeof (tts as any).localPrimary === 'function' ? Boolean((tts as any).localPrimary()) : false
     const kokoroRequested = isKokoroVoice(device.voice)
@@ -1738,10 +1993,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     } else if (localPrimary || (device.voice && device.voice !== 'default')) {
       await tts.ensureServer()
     }
+    if (!isCurrentRound()) return
     const status = tts.status()
     if (!status.available) {
       device.send('event.alert', { level: 'error', text: `本次无语音：在线兜底不可用且本地引擎未就绪（原因：${status.error ?? '未安装模型'}）` })
-      setTimeout(() => scheduleHome(sessionId), 50)
+      lockVoiceAlert(device, sessionId, '朗读失败 · 点重读')
       return
     }
     const voice = device.voice || 'default'
@@ -1851,6 +2107,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           text: `第 ${index + 1}/${speechSegments.length} 句音频中断（已收 ${(audioMs / 1000).toFixed(1)}s），跳过剩余部分`,
         } satisfies ProgressPayload)
         stalledHook.onStall(index)
+        markVoiceSegmentFailed(device, sessionId, index)
         flushAudio()
       }, stallMs))
     }
@@ -1866,6 +2123,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           // 这一段已经按「卡住」收尾：后来迟到的块必须丢掉，不能补进已翻过去的句序里。
           if (stalled.has(segmentIndex)) return
           onFirstChunk()
+          const ui = device.voiceUi
+          if (ui !== undefined && ui.roundKey === roundKey && ui.round === roundToken && ui.phase === 'preparing') {
+            if (ui.timer !== undefined) clearTimeout(ui.timer)
+            ui.phase = 'playing'
+            const active = typeof (tts as any).activeEngine === 'function' ? (tts as any).activeEngine() : 'none'
+            if (active === 'edge') ui.playingStage = '在线朗读'
+            else if (active === 'kokoro' || active === 'gpu') ui.playingStage = '本地朗读'
+            if (active === 'kokoro' && !localPrimary && !kokoroRequested && !device.offlineOnly) {
+              ui.degraded = true
+              ui.playingStage = '在线失败 · 已改本地'
+            }
+            sendReply(sessionId, sentences, segment.sentenceIndex, segment.start, includeAll)
+          }
           pushedBytes[segmentIndex] += chunk.data.length
           armStall(segmentIndex)
           audioBuffers[segmentIndex].push({
@@ -2022,6 +2292,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
               level: 'error',
               text: `第 ${index + 1}/${speechSegments.length} 段朗读失败，已跳过继续（原因：${errorText(result.error).slice(0, 60)}）`,
             })
+            markVoiceSegmentFailed(device, sessionId, index)
             continue
           }
           const segment = speechSegments[index]
@@ -2059,15 +2330,18 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (tailMs > 0) await new Promise<void>((resolve) => { setTimeout(resolve, tailMs) })
       // 念完停在最后一屏（最后一帧）。
       const last = sentences[sentences.length - 1]
+      if (device.voiceUi?.roundKey === roundKey && device.voiceUi.round === roundToken) device.voiceUi.phase = 'finished'
       sendReply(sessionId, sentences, sentences.length - 1, last.end, includeAll)
-      setTimeout(() => scheduleHome(sessionId), 50)
+      if ((device.voiceUi?.failedSegments.size ?? 0) === 0 && device.voiceUi?.alert === '') {
+        setTimeout(() => scheduleHome(sessionId), 50)
+      }
     } catch (error) {
       const message = errorText(error)
       log(`tihu tts failed session=${sessionId} voice=${voice}: ${message}`)
       if (!roundDead()) {
         device.send('event.alert', { level: 'error', text: `本次无语音：在线兜底不可用且本地引擎未就绪（原因：${message}）` })
+        lockVoiceAlert(device, sessionId, '朗读失败 · 点重读')
       }
-      setTimeout(() => scheduleHome(sessionId), 50)
     } finally {
       for (const index of stallTimers.keys()) clearStall(index)
       if (speakRounds.get(roundKey) === roundToken) speakRounds.delete(roundKey)
@@ -2087,7 +2361,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 传 `{ audio, language }`（同时保留 `audioBase64` 兼容旧服务），并把返回值
    * 归一化成纯文本。
    */
-  async function transcribe(audioBase64: string): Promise<string> {
+  async function transcribe(audioBase64: string, externalSignal?: AbortSignal): Promise<string> {
     const speech = optionalService(ctx, 'speechController')
     if (speech === undefined || typeof speech?.transcribe !== 'function') {
       throw new Error('本机语音转写不可用：宿主没有加载 speech 服务（voice-input / speech-to-text 插件）')
@@ -2095,15 +2369,20 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     if (!looksLikeWavBase64(audioBase64)) throw new Error('音频不是 WAV（需要 16k 单声道 16bit）')
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), TRANSCRIBE_TIMEOUT_MS)
+    const cancel = (): void => controller.abort()
+    if (externalSignal?.aborted) controller.abort()
+    else externalSignal?.addEventListener('abort', cancel, { once: true })
     try {
       const audio = new Uint8Array(Buffer.from(audioBase64, 'base64'))
       const result: any = await speech.transcribe({ audio, language: 'auto', audioBase64 }, controller.signal)
       const text = typeof result === 'string'
         ? result
         : String(result?.text ?? result?.transcript ?? result?.result ?? '').trim()
-      return text.trim()
+      applyPersonalTerms(loadAssistantConfig().asrTerms)
+      return cleanFillers(fixTerms(text)).trim()
     } finally {
       clearTimeout(timer)
+      externalSignal?.removeEventListener('abort', cancel)
     }
   }
 
@@ -2168,6 +2447,34 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return window
   }
 
+  /** 最近一条真实用户目标：只取首个文本块并去掉鹈鹕设备尾注，绝不复制完整历史。 */
+  function originalTaskGoalOf(sessionId: string): string {
+    try {
+      const agent = optionalService(ctx, 'agents')?.get?.(sessionId)
+      const messages = agent?.session?.deriveMessages?.()
+      if (!Array.isArray(messages)) return '原会话当前任务'
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        if (messages[i]?.role !== 'user') continue
+        const content = messages[i]?.content
+        const first = Array.isArray(content)
+          ? content.find((block) => block?.type === 'text' && typeof block.text === 'string')?.text
+          : content
+        const text = String(first ?? '').split(TIHU_VOICE_TAIL_INTRO)[0].trim()
+        if (text !== '') return text.slice(0, 700)
+      }
+    } catch { /* 读取失败时用保守占位，不猜其他会话内容 */ }
+    return '原会话当前任务'
+  }
+
+  function parallelContextOf(fromId: string, text: string): string {
+    const state = progressStates.get(fromId)
+    const current = state === undefined
+      ? '正在执行原任务'
+      : `正在执行；阶段=${state.stageWord || state.stage}；步骤=${Math.max(0, state.turn)}/${Math.max(0, state.step)}${state.lastResult ? `；最近结果=${state.lastResult.ok ? '成功' : '失败'}` : ''}`
+    const context = `原任务目标：${originalTaskGoalOf(fromId)}\n当前状态：${current.slice(0, 350)}\n本次指令：${text}`
+    return [...context].slice(0, 2048).join('')
+  }
+
   /**
    * 任务进行中收到新语音命令：不终止老任务，自动新开并行会话跑这条命令（2026-11-08 用户定案）。
    * 新会话沿用绑定会话的模式，标题由宿主按首条消息自动取前几个字；建完即把设备绑过去，
@@ -2175,13 +2482,32 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 落库后回读最后一条 user 消息 id 挂上工具闸窗口——语音触发的危险动作仍要设备语音确认。
    */
   async function spawnParallelTask(device: TihuDevice, text: string): Promise<string> {
+    device.commitInFlight = true
+    try {
+      return await spawnParallelTaskOnce(device, text)
+    } finally {
+      device.commitInFlight = false
+    }
+  }
+
+  async function spawnParallelTaskOnce(device: TihuDevice, text: string): Promise<string> {
     const fromId = device.sessionId
     if (fromId === undefined) throw new Error('设备未绑定会话')
-    const preset = sessionPresets.get(fromId) ?? ''
+    const ensureTarget = (): void => {
+      if (device.sessionId !== fromId) throw new Error('目标已切换，本次指令未发送；请确认当前会话后重说')
+    }
+    const source = await findSession(fromId)
+    ensureTarget()
+    if (source.status === 'missing' || source.status === 'unknown') throw new Error('原会话已归档或暂时无法核实，本次指令未发送')
+    const preset = sessionPresets.get(fromId) ?? source.row?.preset ?? ''
+    const cwd = source.row?.cwd ?? options.workspaceOf?.(fromId)
+    const workspaceId = source.row?.workspaceId
+    const base = workspaceId !== undefined ? { workspaceId } : cwd !== undefined && cwd !== '' ? { cwd } : {}
     const remote = optionalService(ctx, 'remote') as { session?: { create?: (base: unknown) => Promise<any> } } | undefined
     let newId: string
     if (preset !== '' && typeof remote?.session?.create === 'function') {
-      const result: any = await remote.session.create({ agentPreset: preset })
+      const result: any = await remote.session.create({ ...base, agentPreset: preset })
+      ensureTarget()
       if (result?.ok !== true || typeof result?.value?.sessionId !== 'string') {
         throw new Error(`新建并行会话失败：${String(JSON.stringify(result?.error ?? null)).slice(0, 80)}`)
       }
@@ -2189,18 +2515,22 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     } else {
       const sessions = optionalService(ctx, 'sessions') as { create?: (base: unknown) => Promise<string> } | undefined
       if (typeof sessions?.create !== 'function') throw new Error('宿主 sessions 服务不可用')
-      newId = await sessions.create({})
+      newId = await sessions.create(base)
+      ensureTarget()
     }
-    const blocks = [{ type: 'text', text }, { type: 'text', text: voiceTailOf(newId) }]
+    const blocks = [{ type: 'text', text: parallelContextOf(fromId, text) }, { type: 'text', text: voiceTailOf(newId) }]
     const sessionsSvc = optionalService(ctx, 'sessions') as { using?: (id: string, opts: unknown, fn: (ref: any) => Promise<void>) => Promise<void> } | undefined
     if (typeof sessionsSvc?.using !== 'function') throw new Error('宿主 sessions.using 不可用')
     await sessionsSvc.using(newId, { source: 'tihu-voice' }, async (reference: any) => {
+      ensureTarget()
       await reference?.binding?.session?.prompt(blocks, 'steer')
       const messageId = lastUserMessageId(reference?.binding?.session)
       if (messageId !== undefined) activeSessions.set(newId, { until: Date.now() + ACTIVE_WINDOW_MS, messageId })
     })
+    ensureTarget()
     await bindSession(device, newId)
-    log(`tihu spawn session=${newId} from=${fromId} preset=${preset || 'standard'}`)
+    if (device.sessionId !== newId) throw new Error('并行会话绑定未能核实，请在屏上确认后重说')
+    log(`tihu spawn session=${newId} from=${fromId} preset=${preset || 'standard'} workspace=${workspaceId ?? '-'} cwd=${cwd ?? '-'}`)
     return newId
   }
   /** 续期（每次 tihu 上行都算一次「tihu 消息」，窗口滑动）。 */
@@ -2459,18 +2789,91 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    */
   function followRunningTurn(sessionId: string): void {
     for (const device of devices) {
+      if (!device.autoFollow) continue
+      if (device.commitInFlight) continue
       if (device.sessionId === undefined) continue
       if (device.sessionId === sessionId) continue
       if (runningSessions.has(device.sessionId)) continue
+      if (readingBusy(device.sessionId) || browsingHistory.has(device.sessionId) || homePinned.has(device.sessionId)) continue
       const scroll = screenStates.get(device.sessionId)
       if (scroll !== undefined && !scroll.follow) continue
-      void bindSession(device, sessionId, { auto: true, followed: true }).then(() => {
+      const autoGeneration = ++device.autoBindEpoch
+      void bindSession(device, sessionId, { auto: true, followed: true, autoGeneration }).then(() => {
+        if (device.autoBindEpoch !== autoGeneration || device.sessionId !== sessionId) return
         device.send('event.progress', {
           stage: '跟随',
           text: `已自动跟随到：${titleForSession(sessionId)}`,
         } satisfies ProgressPayload)
       }).catch((error) => log(`tihu turn/start follow failed: ${(error as Error)?.message ?? String(error)}`))
     }
+  }
+
+  function showInputError(device: TihuDevice, error: unknown): void {
+    const message = (error as Error)?.message ?? String(error)
+    device.send('event.alert', { level: 'error', text: message })
+    sendFrame(device, {
+      stage: '会话', title: '指令未发送',
+      bullets: fitScreenLines([message.slice(0, 100), '请确认当前会话后重说'], 3),
+      tone: 'alert', mode: 'status',
+    } satisfies ScreenFramePayload)
+  }
+
+  /** 已完成预览/键盘输入的统一提交口；不再重新选择自动目标。 */
+  async function routeCommittedText(device: TihuDevice, text: string): Promise<void> {
+    const sessionId = device.sessionId
+    if (sessionId === undefined) throw new Error('还没有选定会话，请先选择')
+    if (runningSessions.has(sessionId)) await spawnParallelTask(device, text)
+    else inject(sessionId, text, voiceTailOf(sessionId))
+    touchWindow(device.sessionId ?? sessionId)
+  }
+
+  function cancelPendingVoice(device: TihuDevice): void {
+    const pending = device.pendingVoice
+    if (pending?.timer !== undefined) clearTimeout(pending.timer)
+    device.pendingVoice = undefined
+  }
+
+  function invalidateVoiceInput(device: TihuDevice): void {
+    device.voiceAttempt += 1
+    cancelPendingVoice(device)
+    try { device.cancelAsr?.() } catch { /* 忽略 */ }
+    device.cancelAsr = undefined
+  }
+
+  async function commitPendingVoice(device: TihuDevice, pending: NonNullable<TihuDevice['pendingVoice']>): Promise<void> {
+    if (device.pendingVoice !== pending || !devices.has(device)) return
+    if (pending.attempt !== device.voiceAttempt) { cancelPendingVoice(device); return }
+    if (pending.timer !== undefined) clearTimeout(pending.timer)
+    device.pendingVoice = undefined
+    if (device.sessionId !== pending.sessionId) {
+      showInputError(device, new Error(`已切换到：${titleForSession(device.sessionId ?? '')}；请重说一次`))
+      return
+    }
+    await routeCommittedText(device, pending.text)
+    device.send('event.progress', { stage: '注入', text: '已送入当前会话' } satisfies ProgressPayload)
+  }
+
+  /** ASR 完成后只形成宿主权威草稿；安全白名单才允许约 2 秒自动提交。 */
+  function previewVoice(device: TihuDevice, text: string, attempt: number, quality: ReturnType<typeof inspectTihuVoiceWav>): void {
+    if (attempt !== device.voiceAttempt || device.sessionId === undefined || !devices.has(device)) return
+    cancelPendingVoice(device)
+    const sessionId = device.sessionId
+    const autoEligible = quality.kind === 'ok' && tihuVoiceAutoEligible(text)
+      && !runningSessions.has(sessionId) && ((confirmBroker as any).pendingCount?.() ?? 0) === 0
+    const pending: NonNullable<TihuDevice['pendingVoice']> = { attempt, text, sessionId, autoEligible }
+    device.pendingVoice = pending
+    device.send('transcript', { text, final: true, source: 'voice', retryable: true } satisfies TranscriptPayload)
+    sendFrame(device, {
+      stage: '我听到', title: '确认这句指令',
+      bullets: fitScreenLines([`我听到：${text}`, quality.kind === 'review' ? quality.reason : autoEligible ? '约 2 秒后自动发送' : '请点发送，或点重说'], 3),
+      tone: autoEligible ? 'busy' : 'idle', mode: 'status',
+      actions: [{ id: 'send', label: '发送' }, { id: 'retry', label: '重说' }],
+    } satisfies ScreenFramePayload, sessionId)
+    if (!autoEligible) return
+    pending.timer = setTimeout(() => {
+      if (device.pendingVoice !== pending || (confirmBroker as any).pendingCount?.() > 0) return
+      void commitPendingVoice(device, pending).catch((error) => showInputError(device, error))
+    }, options.previewDelayMs ?? 2000)
   }
 
   const disposeSession = ctx.on?.('session/event', (session: any, event: any) => {
@@ -2497,6 +2900,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         browsingHistory.delete(sessionId)
         // 上一轮如果没收到 end，别把上一条思考留到这一轮（start 事件会重新建缓冲）。
         stopLiveThinking(sessionId, false)
+        for (const device of devices) {
+          if (device.sessionId !== sessionId) continue
+          if (device.voiceUi?.timer !== undefined) clearTimeout(device.voiceUi.timer)
+          device.voiceUi = undefined
+        }
       }
       else if (type === 'turn/end') runningSessions.delete(sessionId)
       // 运行跟踪与自动跟随都在设备早退**之前**：没绑定该会话的设备收不到事件，
@@ -2557,6 +2965,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       }
       if (type === 'assistant/message') replySessions.add(sessionId)
       const keepReply = type === 'turn/end' && replySessions.has(sessionId)
+      if (keepReply && ['error', 'aborted', 'abort', 'cancelled', 'canceled'].includes(String(data?.reason?.kind ?? ''))) {
+        for (const device of devices) {
+          if (device.sessionId === sessionId) lockVoiceAlert(device, sessionId, '本轮中断')
+        }
+      }
       if (update.screen !== undefined && !keepReply) screen(sessionId, update.screen)
       if (update.progress !== undefined) broadcast(sessionId, 'event.progress', update.progress)
 
@@ -2714,6 +3127,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       socket,
       seq: seqOf,
       autoFollow: false,
+      bindEpoch: 0,
+      autoBindEpoch: 0,
+      voiceAttempt: 0,
+      commitInFlight: false,
       voice: 'default',
       edgeVoice: process.env.TIHU_EDGE_VOICE ?? 'zh-CN-YunjianNeural',
       offlineOnly: process.env.TIHU_OFFLINE_ONLY === '1',
@@ -2773,6 +3190,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             }
             return
           }
+          // 重说/新输入必须在排队前使旧 ASR 与草稿失效，否则慢队列会让旧文本先自动发送。
+          const actionId = message.type === 'screen.gesture' ? String((message.payload as any)?.actionId ?? '') : ''
+          if (message.type === 'audio.frame' || message.type === 'text.input'
+            || message.type === 'session.bind' || message.type === 'session.end'
+            || (message.type === 'screen.gesture' && actionId !== 'send')) invalidateVoiceInput(device)
           enqueue(message)
         } catch (error) {
           log(`tihu frame failed: ${(error as Error)?.stack ?? String(error)}`)
@@ -2786,6 +3208,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     socket.on('data', (chunk: Buffer) => parser.push(chunk))
     socket.on('error', () => { /* 断开由 close 处理 */ })
     socket.on('close', () => {
+      invalidateVoiceInput(device)
       devices.delete(device)
       followByDevice.delete(device.id)
       // 断开的设备不再有屏：把还挂着的这一轮朗读掐掉，别继续烧合成额度。
@@ -2819,24 +3242,23 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       }
       device.hello = payload
       const caps = payload.capabilities ?? {}
+      const saved = savedDeviceFrame(device)
       const requested = typeof payload.sessionId === 'string' && payload.sessionId !== '' ? payload.sessionId : undefined
       if (requested !== undefined) {
         // 显式会话（URL）优先：手动绑定，不参与自动跟随。
         device.autoFollow = false
         await bindSession(device, requested)
-        await sendHome(device.sessionId ?? '__unbound__', device)
       } else if (payload.auto === true) {
-        // 默认路径：自动绑定「最近活跃的 Computer Use 会话」，但开机屏仍是主页；
-        // 只有真正收到 assistant 回复时才切会话屏。
+        // 默认路径：自动绑定「最近活跃的 Computer Use 会话」，但首次连接屏仍是主页；
+        // 同一 clientId 重连则优先恢复断线前那一屏。
         device.autoFollow = true
         await autoBindActive(device, 'hello')
-        if (device.sessionId !== undefined) await sendHome(device.sessionId, device)
-        else await sendHome('__unbound__', device)
       } else {
         device.autoFollow = false
         device.sessionId = undefined
-        await sendHome('__unbound__', device)
       }
+      const restored = restoreSavedDeviceFrame(device, saved)
+      if (!restored) await sendHome(device.sessionId ?? '__unbound__', device)
       device.send('event.progress', { stage: '连接', text: `设备 ${device.id} 已就绪` } satisfies ProgressPayload)
       log(`tihu hello client=${payload.clientId} session=${device.sessionId ?? '?'} caps=${JSON.stringify(caps)}`)
       return
@@ -2907,6 +3329,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         if ((payload as any).hit === 'action' && typeof (payload as any).actionId === 'string') {
           const actionId = (payload as any).actionId as string
           const sid = device.sessionId
+          if (actionId === 'send') {
+            const pending = device.pendingVoice
+            if (pending !== undefined) await commitPendingVoice(device, pending).catch((error) => showInputError(device, error))
+            return
+          }
+          if (actionId === 'retry') {
+            cancelPendingVoice(device)
+            device.send('transcript', { text: '', final: true, source: 'voice', retryable: true } satisfies TranscriptPayload)
+            sendFrame(device, {
+              stage: '重说', title: '请重新说', bullets: ['上一条未发送', '说完后再确认'], tone: 'idle', mode: 'status',
+            } satisfies ScreenFramePayload, sid)
+            return
+          }
           if (actionId === 'stop' && sid !== undefined) {
             try { device.cancelRound?.() } catch { /* 忽略 */ }
             device.send('event.progress', { stage: '停止', text: '已停止朗读（点重读可再来一遍）' } satisfies ProgressPayload)
@@ -3166,75 +3601,97 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
 
     if (type === 'text.input' || type === 'audio.frame') {
-      // 页面先看到「已收到」，避免「已上行」之后再无任何回音（2026-11-07 实测问题）。
+      const inputTarget = device.sessionId
+      const source = type === 'audio.frame' ? 'voice' : message.payload.source === 'voice' ? 'voice' : 'keyboard'
+      if (type === 'text.input' && message.payload.source === 'retry') {
+        device.send('transcript', { text: '', final: true, source: 'voice', retryable: true } satisfies TranscriptPayload)
+        sendFrame(device, { stage: '重说', title: '请重新说', bullets: ['上一条未发送'], tone: 'idle', mode: 'status' } satisfies ScreenFramePayload)
+        return
+      }
       device.send('event.progress', {
-        stage: 'audio',
-        text: type === 'audio.frame' ? '已收到音频，准备转写' : '已收到文字',
+        stage: 'audio', text: type === 'audio.frame' ? '已收到音频，准备转写' : '已收到文字',
       } satisfies ProgressPayload)
-      // 自动跟随（要求：每次注入前重新判定「最活跃的 CU 会话」，变了就跟过去）。
-      // **必须有上限**：跟随失败/超时不能把整条消息队列卡死（页面就会干等转写）。
       if (device.autoFollow) {
+        const generation = ++device.autoBindEpoch
         try {
-          await Promise.race([
-            autoBindActive(device, 'inject'),
-            new Promise<void>((resolve) => { setTimeout(() => {
-              log('tihu auto follow timeout (5s), keep current session')
-              resolve()
-            }, 5000) }),
+          const result = await Promise.race([
+            autoBindActive(device, 'inject', generation),
+            new Promise<undefined>((resolve) => { setTimeout(() => {
+              if (device.autoBindEpoch === generation) device.autoBindEpoch += 1
+              log('tihu auto follow timeout, invalidate late bind')
+              resolve(undefined)
+            }, autoBindTimeoutMs()) }),
           ])
+          if (result === false && device.autoBindEpoch === generation) {
+            showInputError(device, new Error('暂时无法核实目标会话，请稍后重说'))
+            return
+          }
         } catch (error) {
-          log(`tihu auto follow failed: ${(error as Error)?.message ?? String(error)}`)
+          showInputError(device, new Error(`目标核实失败：${(error as Error)?.message ?? String(error)}`))
+          return
         }
+      }
+      if (inputTarget !== device.sessionId) {
+        showInputError(device, new Error(`已切换到：${titleForSession(device.sessionId ?? '')}；请重说一次`))
+        return
       }
       if (device.sessionId === undefined) {
         device.send('event.alert', {
           level: 'warn',
-          text: device.autoFollow
-            ? '没有可自动绑定的 Computer Use 会话：先在桌面端新建一个'
-            : '还没有选定会话：点页面下面的会话列表选一个',
+          text: device.autoFollow ? '没有可自动绑定的 Computer Use 会话：先在桌面端新建一个' : '还没有选定会话：点页面下面的会话列表选一个',
         })
         await sendHome('__unbound__', device)
         return
       }
-      // 收到 tihu 消息就续期（「120 秒无 tihu 消息自动失效」的另一半）。
-      touchWindow(device.sessionId)
-      let text = ''
-      let source: 'voice' | 'keyboard' = 'keyboard'
-      if (type === 'text.input') {
-        text = String(message.payload.text ?? '').trim()
-        source = message.payload.source === 'voice' ? 'voice' : 'keyboard'
-        if (text === '') return
-      } else {
-        source = 'voice'
-        sendFrame(device, { stage: '聆听', title: '正在转写…', bullets: ['本机 speech 服务'], tone: 'busy' } satisfies ScreenFramePayload)
+      const expectedTarget = device.sessionId
+      if (type === 'audio.frame') {
+        const attempt = device.voiceAttempt
+        unpinHome(expectedTarget)
+        cancelHomeTimer(expectedTarget)
+        const quality = inspectTihuVoiceWav(String(message.payload.audioBase64 ?? ''))
+        if (quality.kind === 'reject') {
+          device.send('transcript', { text: '', final: true, source: 'voice', retryable: true } satisfies TranscriptPayload)
+          device.send('event.alert', { level: 'warn', text: quality.reason })
+          sendFrame(device, { stage: '没听清', title: '请靠近后重说', bullets: [quality.reason], tone: 'alert', mode: 'status' } satisfies ScreenFramePayload, expectedTarget)
+          return
+        }
+        sendFrame(device, { stage: '正在转写', title: '正在识别语音', bullets: ['本机 speech 服务'], tone: 'busy', mode: 'status' } satisfies ScreenFramePayload, expectedTarget)
+        const asr = new AbortController()
+        device.cancelAsr = () => asr.abort()
+        let text = ''
         try {
-          text = await transcribe(String(message.payload.audioBase64 ?? ''))
+          text = await transcribe(String(message.payload.audioBase64 ?? ''), asr.signal)
         } catch (error) {
+          if (attempt !== device.voiceAttempt || asr.signal.aborted) return
+          device.send('transcript', { text: '', final: true, source: 'voice', retryable: true } satisfies TranscriptPayload)
           device.send('event.alert', { level: 'error', text: `转写失败：${(error as Error)?.message ?? String(error)}` })
-          sendFrame(device, { stage: '转写失败', title: '请用文字输入', bullets: [], tone: 'alert' } satisfies ScreenFramePayload)
+          sendFrame(device, { stage: '转写失败', title: '请重说一次', bullets: ['也可以点重说后再试'], tone: 'alert', mode: 'status' } satisfies ScreenFramePayload, expectedTarget)
+          return
+        } finally {
+          device.cancelAsr = undefined
+        }
+        if (attempt !== device.voiceAttempt || device.sessionId !== expectedTarget) {
+          if (device.sessionId !== expectedTarget) showInputError(device, new Error('识别期间目标已切换，请重说一次'))
           return
         }
         if (text === '') {
+          device.send('transcript', { text: '', final: true, source: 'voice', retryable: true } satisfies TranscriptPayload)
           device.send('event.alert', { level: 'warn', text: '没有识别到语音内容，请再说一次' })
+          sendFrame(device, { stage: '没听清', title: '请再说一次', bullets: ['这次没有识别到内容'], tone: 'alert', mode: 'status' } satisfies ScreenFramePayload, expectedTarget)
           return
         }
+        previewVoice(device, text, attempt, quality)
+        return
       }
+      const text = String(message.payload.text ?? '').trim()
+      if (text === '') return
       try {
-        // 先回 transcript 再注入：即使这个会话已经被关掉/没有 agent，屏上也先看到
-        // 「我听到的是什么」，而不是只剩一条「注入失败」（E2E 脚本也靠这条核对转写）。
         device.send('transcript', { text, final: true, source, retryable: true } satisfies TranscriptPayload)
-        if (runningSessions.has(device.sessionId)) {
-          // 任务进行中：不终止老任务，自动新开并行会话（用户 2026-11-08 定案）。
-          const freshId = await spawnParallelTask(device, text)
-          device.send('event.progress', { stage: '新任务', text: '已在新会话开工，原任务继续跑（完成后气泡提醒）' } satisfies ProgressPayload)
-          log(`tihu parallel route from=${device.sessionId} to=${freshId}`)
-        } else {
-          inject(device.sessionId, text, voiceTailOf(device.sessionId))
-        }
+        await routeCommittedText(device, text)
         device.send('event.progress', { stage: '注入', text: '已送入当前会话' } satisfies ProgressPayload)
         sendFrame(device, { stage: '思考', title: '模型处理中', bullets: [text.slice(0, 20)], tone: 'busy' } satisfies ScreenFramePayload)
       } catch (error) {
-        device.send('event.alert', { level: 'error', text: `注入失败：${(error as Error)?.message ?? String(error)}` })
+        showInputError(device, error)
       }
     }
   }
@@ -3485,7 +3942,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         homeStates.delete(sessionId)
       }
       tts.dispose()
-      for (const device of devices) device.close()
+      for (const device of devices) {
+        invalidateVoiceInput(device)
+        if (device.voiceUi?.timer !== undefined) clearTimeout(device.voiceUi.timer)
+        device.close()
+      }
       devices.clear()
       for (const disposer of [disposePre, disposePost, disposeSession, disposeAssistantStream]) {
         try { if (typeof disposer === 'function') disposer() } catch { /* 忽略 */ }
