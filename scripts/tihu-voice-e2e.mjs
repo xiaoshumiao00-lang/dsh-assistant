@@ -122,7 +122,7 @@ req.on('upgrade', (res, socket) => {
         try { message = JSON.parse(payload.toString('utf8')) } catch { continue }
         const type = String(message.type ?? '?')
         seen.push({ type, at: Date.now() - startedAt })
-        if (type === 'screen.frame' && message.payload?.stage === '聆听') {
+        if (type === 'screen.frame' && message.payload?.stage === '正在转写') {
           // 已开始转写：这一刻起算
           return
         }
@@ -130,7 +130,8 @@ req.on('upgrade', (res, socket) => {
           transcript = String(message.payload?.text ?? '')
           transcriptAt = Date.now()
           console.log(`[${t()}] transcript: ${transcript}`)
-          // 等注入回屏（screen.frame 思考）再收尾
+          // 新流程先进入屏内预览；E2E 显式点“发送”，避免等待自动发送窗口。
+          send(socket, 'screen.gesture', { action: 'tap', x: 20, y: 200, hit: 'action', actionId: 'send' })
           setTimeout(() => finish(socket, 0), 5000)
         }
         if (type === 'event.progress') console.log(`[${t()}] progress[${message.payload?.stage ?? ''}] ${message.payload?.text ?? ''}`)

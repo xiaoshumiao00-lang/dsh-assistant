@@ -304,6 +304,62 @@ export function kokoroScriptPath(): string {
   return candidates[0]
 }
 
+/** edge 探测只需环境读取；用运行时的 process 句柄，避免把新 Node 全局引用计入既有 TS2591 基线。 */
+const edgeRuntime = (globalThis as any).process ?? { env: {} as Record<string, string | undefined>, platform: '' }
+
+/** edge 驱动与 Kokoro 同样从仓库 scripts 定位，绝不依赖旧 Qwen 运行目录里的手拷副本。 */
+export function edgeScriptPath(): string {
+  const explicit = edgeRuntime.env.TIHU_EDGE_SERVER
+  if (explicit !== undefined && explicit !== '') return explicit
+  const here = moduleDir()
+  const candidates = [
+    join(here, '..', '..', 'scripts', 'tihu-edge-tts.py'),
+    join(here, '..', 'scripts', 'tihu-edge-tts.py'),
+    join(typeof edgeRuntime.cwd === 'function' ? edgeRuntime.cwd() : '', 'scripts', 'tihu-edge-tts.py'),
+  ]
+  return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0]
+}
+
+/** edge Python 与 Qwen 解耦：显式覆盖 → 兼容既有独立 venv → 系统 Python。 */
+export function edgePythonCandidates(): string[] {
+  const explicit = [edgeRuntime.env.TIHU_EDGE_PY, edgeRuntime.env.TIHU_EDGE_PYTHON]
+    .filter((value): value is string => typeof value === 'string' && value.trim() !== '')
+  const win = edgeRuntime.platform === 'win32'
+  const legacy = join(tihuRoot(), 'venv', win ? 'Scripts' : 'bin', win ? 'python.exe' : 'python')
+  const system = win ? ['python', 'py'] : ['python3', 'python']
+  return [...new Set([...explicit, legacy, ...system])]
+}
+
+export interface EdgeDependencyStatus {
+  ok: boolean
+  python: string
+  script: string
+  ffmpeg: string
+  error: string
+}
+
+type EdgeProbeRunner = (command: string, args: string[]) => { status?: number | null; error?: unknown }
+
+function edgeProbeRun(command: string, args: string[]): { status?: number | null; error?: unknown } {
+  return spawnSync(command, args, { timeout: 3000, stdio: 'ignore', windowsHide: true, shell: false })
+}
+
+/** 同步、可注入的 edge 环境探测；只验证本机依赖，不访问网络。 */
+export function probeEdgeDependencies(
+  paths: { python: string; script: string; ffmpeg: string },
+  run: EdgeProbeRunner = edgeProbeRun,
+): EdgeDependencyStatus {
+  const base = { python: paths.python, script: paths.script, ffmpeg: paths.ffmpeg }
+  if (!existsSync(paths.script)) return { ...base, ok: false, error: `缺 edge 驱动脚本：${paths.script}` }
+  const version = run(paths.python, ['--version'])
+  if (version.status !== 0 || version.error !== undefined) return { ...base, ok: false, error: `Python 不可运行：${paths.python}` }
+  const imported = run(paths.python, ['-c', 'import edge_tts'])
+  if (imported.status !== 0 || imported.error !== undefined) return { ...base, ok: false, error: `Python 缺少 edge_tts：${paths.python}` }
+  const ffmpeg = run(paths.ffmpeg, ['-version'])
+  if (ffmpeg.status !== 0 || ffmpeg.error !== undefined) return { ...base, ok: false, error: `ffmpeg 不可运行：${paths.ffmpeg}` }
+  return { ...base, ok: true, error: '' }
+}
+
 /** 缺依赖时要跑的一条命令（错误提示里原样给用户）。 */
 export function kokoroInstallHint(): string {
   const python = kokoroPythonPath()
@@ -508,6 +564,8 @@ export class TihuTts {
    */
   private edgeDownUntil = 0
   private edgeDownReason = ''
+  /** 本机依赖短缓存；与网络探测、edge 失败 cooldown 完全独立。 */
+  private edgeDepsCache: { at: number; key: string; status: EdgeDependencyStatus } | null = null
 
   constructor(options: TihuTtsOptions) {
     this.options = options
@@ -600,18 +658,19 @@ export class TihuTts {
     if (backend === 'q4') return { available: true, model: 'qwen3-tts 0.6b-q4' }
     if (backend === 'cpu') return { available: true, model: 'qwen3-tts 0.6b-pt' }
     if (backend === 'qwen-cuda') return { available: true, model: 'qwen3-tts 0.6b-cuda' }
-    // edge 主用：只要 edge 脚本在就算可用；不在时才看 Kokoro 离线兜底是否齐全。
+    // edge 主用：脚本、Python、edge_tts 与 ffmpeg 全部通过本机探测才算可用。
     if (this.edgeReady()) return { available: true, model: 'edge-tts 云健(Yunjian)' }
+    const edgeReason = this.edgeDependencies().error
     if (this.kokoroReady()) {
       return {
         available: true,
         model: 'Kokoro multi-lang-v1_1（离线兜底）',
-        error: `edge 不可用（缺 Python 运行时或 scripts/tihu-edge-tts.py），已降级到本地 Kokoro`,
+        error: `edge 不可用（${edgeReason}），已降级到本地 Kokoro`,
       }
     }
     return {
       available: false,
-      error: this.lastError || `无语音：edge 不可用且本地 Kokoro 未就绪（${this.paths.root}）`,
+      error: this.lastError || `无语音：edge 不可用（${edgeReason}）且本地 Kokoro 未就绪（${this.paths.root}）`,
     }
   }
 
@@ -681,7 +740,7 @@ export class TihuTts {
       }
       return `edge 请求失败：${edgeError.slice(0, 120)}`
     }
-    if (!this.edgeReady()) return 'edge 不可用：缺 Python 运行时或 scripts/tihu-edge-tts.py'
+    if (!this.edgeReady()) return `edge 不可用：${this.edgeDependencies().error}`
     return ''
   }
 
@@ -912,9 +971,31 @@ export class TihuTts {
     return DEFAULT_PORT
   }
 
-  /** edge-tts 主引擎是否可用（脚本 + Python；ffmpeg 由系统 PATH 提供）。 */
+  /** edge 依赖：仓库脚本 + 可运行 Python/import edge_tts + ffmpeg；30 秒缓存避免每段重复探测。 */
+  private edgeDependencies(): EdgeDependencyStatus {
+    const script = edgeScriptPath()
+    const ffmpeg = edgeRuntime.env.TIHU_FFMPEG ?? 'ffmpeg'
+    const cached = this.edgeDepsCache
+    const key = `${script}\u0001${ffmpeg}\u0001${edgePythonCandidates().join('\u0001')}`
+    if (cached !== null && cached.key === key && Date.now() - cached.at < 30_000) return cached.status
+    let last: EdgeDependencyStatus | null = null
+    for (const python of edgePythonCandidates()) {
+      const status = probeEdgeDependencies({ python, script, ffmpeg })
+      if (status.ok) {
+        this.edgeDepsCache = { at: Date.now(), key, status }
+        return status
+      }
+      last = status
+      // 脚本是所有 Python 共用的前置条件，不缺脚本才继续尝试下一个 Python。
+      if (!existsSync(script)) break
+    }
+    const status = last ?? { ok: false, python: '', script, ffmpeg, error: '没有可候选的 Python' }
+    this.edgeDepsCache = { at: Date.now(), key, status }
+    return status
+  }
+
   edgeReady(): boolean {
-    return existsSync(this.qwenPython()) && existsSync(join(this.paths.root, 'tihu-edge-tts.py'))
+    return this.edgeDependencies().ok
   }
 
   /** 当前引擎的中文标识（页面事件区）。 */
@@ -948,8 +1029,10 @@ export class TihuTts {
     },
   ): Promise<SynthResult> {
     const started = Date.now()
+    const deps = this.edgeDependencies()
+    if (!deps.ok) throw new Error(`edge 依赖不可用：${deps.error}`)
     const voice = options.edgeVoice || process.env.TIHU_EDGE_VOICE || 'zh-CN-YunjianNeural'
-    const py = spawn(this.qwenPython(), ['-u', join(this.paths.root, 'tihu-edge-tts.py'), '--text', text, '--voice', voice], {
+    const py = spawn(deps.python, ['-u', deps.script, '--text', text, '--voice', voice], {
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
@@ -996,6 +1079,7 @@ export class TihuTts {
         })
         ff.on('error', (error) => reject(error))
         ff.on('close', done)
+        py.on('error', (error) => reject(new Error(`edge Python 启动失败：${error.message}`)))
         py.on('close', (code) => {
           if (code !== 0 && firstAt === 0) reject(new Error(`edge-tts 失败（exit ${code}）：${stderr.split('\n').filter(Boolean).slice(-2).join(' ').slice(0, 200)}`))
         })

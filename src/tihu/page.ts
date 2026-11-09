@@ -13,6 +13,7 @@
  * TTS 只播放宿主下发的 PCM（edge 云健 / Qwen GPU）；页面不再使用浏览器语音。
  */
 import { ACTUAL_SIZE_SCALE, SCREEN_SPEC } from './screen-spec.ts'
+import { condition as conditionVoicePcm, trimSilence as trimVoiceSilence } from '../client/pocket/orb/voice.ts'
 export function tihuPageHtml(options: { lanePath: string; protocol: string }): string {
   const lane = JSON.stringify(options.lanePath)
   const protocol = JSON.stringify(options.protocol)
@@ -61,6 +62,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     display:flex; flex-direction:column; gap:4px; }
   #screen .stage { font-size:12px; line-height:14px; letter-spacing:1px; color:var(--accent);
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #screen.alert { border-color:var(--err); }
+  #screen.alert .title, #screen.alert .stage { color:var(--err); }
   /* 首页最上方那一行（用户 2026-11-08 确认）：原来的「项目 N 个 · 第 x/y 页」整段删掉，
      换成「本地时钟 HH:MM」+「三格信号柱」。这一行占掉 stage 原来那一行的位置（12px/行高 14），
      总高度不变，底部翻页条不会被顶出 224px 内容高。状态屏 / 回答屏的 stage 行照旧。
@@ -116,7 +119,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     color:#9fb0c0; white-space:nowrap; overflow:hidden; }
   /* 回复屏底部动作条（停止 / 重读 / 主页） */
   #screen .action-bar { display:none; flex:none; gap:6px; padding-top:4px; }
-  #screen.reply-mode .action-bar { display:flex; }
+  #screen.reply-mode .action-bar, #screen.has-actions .action-bar { display:flex; }
   #screen .action-bar button { flex:1; min-width:0; min-height:28px; padding:0 2px; white-space:nowrap;
     border-radius:6px; border:1px solid #33414f; background:#1b2430; color:#d9e2ea; font-size:13px; }
   /* 有历史可翻时是 5 个按钮（停止/重读/主页/上一条/下一条）：小一号字号，304px 内不换行不溢出 */
@@ -337,6 +340,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
 <script>
 (function () {
   'use strict';
+  var TARGET_RATE = 16000;
+  var condition = ${conditionVoicePcm.toString()};
+  var trimSilence = ${trimVoiceSilence.toString()};
   var LANE = ${lane};
   var PROTOCOL = ${protocol};
   /* 真机屏幕规格：与 src/tihu/screen-spec.ts 同一份常量（页面只消费，不另写数值）。 */
@@ -384,10 +390,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     lastTranscript: '', asking: null, recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0,
     connState: 'connecting', clockTimer: 0,
     ttsTurnTexts: [], ttsAudioSeen: {},
-    audioCtx: null, pcmSources: [], pcmNextTime: 0, turnPcm: [],
+    audioCtx: null, pcmSources: [], pcmNextTime: 0, turnPcm: [], droppedAudio: false,
     samplePending: false, sampleTimer: 0,
     voice: 'default', voices: [], voiceEngine: null,
-    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, screenMode: 'status', pending: [], boundProject: '', homeProjects: [], screenScale: 2, actions: [], running: [] };
+    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, hostAlert: false, screenMode: 'status', pending: [], boundProject: '', homeProjects: [], screenScale: 2, actions: [], running: [] };
 
   /* ---------- 会话定位 ----------
      2026-11-07 P0：localStorage **按 origin 隔离**。用户在桌面宿主
@@ -725,6 +731,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     renderHomeTop();
     if (payload && payload.mode === 'home' && payload.home) {
       state.screenMode = 'home';
+      state.hostAlert = false;
       state.reply = null;
       state.highlightLock = false;
       // 首页最上方那一行现在由页面自己负责：本地时钟 HH:MM + 三格信号柱。
@@ -783,6 +790,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     if (payload && payload.mode === 'reply' && payload.reply) {
       state.screenMode = 'reply';
+      state.hostAlert = payload.tone === 'alert';
       var lockedIndex = state.highlightLock && state.reply ? state.reply.currentIndex : null;
       state.reply = payload.reply;
       if (lockedIndex !== null && payload.reply.sentences.some(function (s) { return s.index === lockedIndex; })) {
@@ -798,10 +806,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       renderRunning();
       state.actions = payload.actions || [];
       renderActions();
+      applyAudioRecovery();
       return;
     }
     state.screenMode = 'status';
     state.reply = null;
+    state.hostAlert = payload.tone === 'alert';
     // 严格按 320×240 规格排版：stage ≤10、标题 ≤28 且单行、正文最多 3 行 ×18 字。
     // 多出来的内容留在事件区，屏幕上不允许出现半行或滚动条。
     var stageText = clipScreen(payload.stage || '', SCREEN.stageChars);
@@ -835,8 +845,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       list.appendChild(li);
     }
     $('replyBody').innerHTML = '';
-    screen.className = (payload.tone || 'idle') + (state.pending && state.pending.length ? ' rail-on' : '');
-    state.actions = [];
+    state.actions = Array.isArray(payload.actions) ? payload.actions : [];
+    screen.className = (payload.tone || 'idle') + (state.pending && state.pending.length ? ' rail-on' : '') + (state.actions.length ? ' has-actions' : '');
     renderActions();
     state.running = payload.running || [];
     renderRunning();
@@ -845,6 +855,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       $('progress').textContent = progress.total ? (progress.done + '/' + progress.total) : String(progress.done);
       $('fill').style.width = progress.total ? Math.min(100, Math.round(progress.done / progress.total * 100)) + '%' : '0%';
     }
+    applyAudioRecovery();
   }
 
   /* reply 模式渲染：句子窗口 → 按 304/240 像素折行 → 可视 7 行（末行下留一整行安全高度），当前句反色。 */
@@ -1078,8 +1089,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.showList = false;
     var cu = payload.computerUse === true;
     setComputerUseNotice(cu, payload.preset);
-    // 手动记忆只记手动选中的 CU 会话；自动模式不写 dsh.tihu.session，避免把自动锁死。
-    rememberSessionId(!auto && cu ? payload.sessionId : '');
+    // 自动绑定只更新展示，不删除上次手动记忆；显式「恢复自动」才由对应按钮清除。
+    if (!auto && cu) rememberSessionId(payload.sessionId);
     if (auto) {
       state.lastAutoId = payload.sessionId;
       rememberAutoSessionId(payload.sessionId);
@@ -1142,7 +1153,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     if (ctx.state !== 'suspended') return null;
     try {
       var task = ctx.resume();
-      if (task && typeof task.then === 'function') task.catch(function () { /* 解锁失败：等下一次手势 */ });
+      if (task && typeof task.then === 'function') task.then(function () {
+        if (audioRunning(ctx)) { hideAudioWarn(); applyAudioRecovery(); }
+      }).catch(function () { /* 解锁失败：等下一次手势 */ });
       return task;
     } catch (e) { return null; }
   }
@@ -1153,6 +1166,25 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function hideAudioWarn() {
     var warn = $('audioWarn');
     if (warn) warn.className = 'audio-warn';
+  }
+  /** 禁音/丢块是屏内恢复状态，不是屏外横幅；后续正常屏帧也不能把它抹掉。 */
+  function applyAudioRecovery() {
+    if (!state.droppedAudio || state.hostAlert) return;
+    var message = audioRunning(state.audioCtx) ? '声音已启用 · 点重读' : '点屏启用声音 · 解锁后点重读';
+    if (state.screenMode === 'reply' && state.reply) {
+      $('stage').style.display = '';
+      $('stage').textContent = replyStageText({ stage: message, reply: state.reply });
+      $('screen').className = 'alert reply-mode' + (state.pending && state.pending.length ? ' rail-on' : '');
+    } else if (state.screenMode === 'status') {
+      $('stage').style.display = '';
+      $('stage').textContent = clipScreen(message, SCREEN.stageChars);
+      $('screen').classList.add('alert');
+    }
+  }
+  function markAudioDropped() {
+    state.droppedAudio = true;
+    showAudioWarn();
+    applyAudioRecovery();
   }
   function audioRunning(ctx) {
     return ctx !== null && ctx !== undefined && ctx.state === 'running';
@@ -1167,14 +1199,14 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function playPcm(base64, sampleRate, cache) {
     if (!base64) return null;
     var ctx = ensureAudio();
-    if (!ctx) return null;
+    if (!ctx) { markAudioDropped(); return null; }
     // 未解锁：先 resume，等不到 running 就**丢弃这段**并提示点一下页面——
     // 绝不排队（suspended 时 currentTime 冻结，排进去的时间轴一旦恢复会全部炸响）。
     if (!audioRunning(ctx)) {
       resumeAudio();
       if (!audioRunning(ctx)) {
         state.pcmNextTime = 0;
-        showAudioWarn();
+        markAudioDropped();
         return null;
       }
     }
@@ -1204,7 +1236,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       // 重读缓存（本轮完整 PCM）；试听音频不进缓存（否则下次「重读」会念成试听句）。
       if (cache !== false) state.turnPcm.push(samples);
       return { startAt: startAt, duration: buffer.duration };
-    } catch (e) { /* 解码失败：本条只显示文字 */ }
+    } catch (e) { markAudioDropped(); /* 解码失败：屏内保留重读恢复 */ }
     return null;
   }
   /** 按真实播放时刻切换当前句：不再用 tts.audio 到达即跳。 */
@@ -1236,6 +1268,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.turnPcm = [];
     state.highlightLock = false;
     state.audioStarted = false;
+    state.droppedAudio = false;
   }
   function replayPcm() {
     var chunks = state.turnPcm;
@@ -1504,6 +1537,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         break;
       case 'tts.text': {
         var ttsText = String(payload.text || '').trim();
+        if (payload.index === 0) {
+          state.droppedAudio = false;
+          hideAudioWarn();
+        }
         if (ttsText) state.ttsTurnTexts.push(ttsText);
         break;
       }
@@ -1696,8 +1733,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         var frac = pos - lo;
         samples[i] = source[lo] * (1 - frac) + source[hi] * frac;
       }
+      var conditioned = trimSilence(condition(samples));
       try { context.close(); } catch (e) { /* 忽略 */ }
-      return { wav: encodeWav(samples, target), durationMs: Math.round(length / target * 1000), sampleRate: target };
+      return { wav: encodeWav(conditioned, target), durationMs: Math.round(conditioned.length / target * 1000), sampleRate: target };
     });
   }
   function decodeAndResample(arrayBuffer) {
@@ -1745,7 +1783,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       addEvent('alert', '这个浏览器没有麦克风接口：请用「选 WAV 文件」');
       return;
     }
-    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, autoGainControl: true, noiseSuppression: false } }).then(function (stream) {
       var recorder = new MediaRecorder(stream);
       state.recorder = recorder;
       state.chunks = [];
@@ -1801,15 +1839,21 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       return;
     }
     send('text.input', { text: text, source: 'keyboard' });
+    state.droppedAudio = false;
+    hideAudioWarn();
     $('transcript').textContent = text;
     $('transcript').className = '';
     $('text').value = '';
   };
   $('retry').onclick = function () {
+    // 有预览/待发草稿时走宿主重说：真正取消草稿与在途 ASR，而不是只擦页面文字。
+    if (state.lastTranscript) {
+      send('screen.gesture', { action: 'tap', x: 1, y: 1, hit: 'action', actionId: 'retry' });
+    }
     state.lastTranscript = '';
     $('transcript').textContent = '（还没有内容）';
     $('transcript').className = 'empty';
-    addEvent('progress', '已撤回上一条转写，请重新说');
+    addEvent('progress', '已取消上一条转写，请重新说');
   };
   /* 重读一遍：把本轮所有 tts 段拼回来的全文**从头重播**（不是只读最后一段）。 */
   $('speak').onclick = function () {
@@ -1918,6 +1962,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
             // 差别只是不回「已停止朗读」提示。
             if (actionId === 'stop' || actionId === 'home' || actionId === 'prev' || actionId === 'next' ||
                 actionId === 'homePrev' || actionId === 'homeNext') stopPcm();
+            if (actionId === 'replay' && audioRunning(state.audioCtx)) {
+              state.droppedAudio = false;
+              hideAudioWarn();
+            }
             if (actionId === 'home') tapFlash(event.clientX - rect.left, event.clientY - rect.top);
             send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'action', actionId: actionId });
             return;

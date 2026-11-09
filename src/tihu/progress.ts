@@ -543,7 +543,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     const reason = String(asRecord(data.reason).kind ?? 'stop')
     // completed / stop 都算正常完成；error / aborted / cancelled 之类才算失败。
     const okReason = reason === 'completed' || reason === 'stop'
-    const doneTitle = fitLine(`完成 · 共 ${state.step} 步 · 用时 ${formatElapsed(now - state.turnStartedAt)}`, widthPx, SCREEN_SPEC.titleFontPx)
+    const doneTitle = fitLine(`${okReason ? '完成' : '本轮中断'} · 共 ${state.step} 步 · 用时 ${formatElapsed(now - state.turnStartedAt)}`, widthPx, SCREEN_SPEC.titleFontPx)
     state.stage = '回答'
     state.title = doneTitle
     state.tone = okReason ? 'ok' : 'alert'

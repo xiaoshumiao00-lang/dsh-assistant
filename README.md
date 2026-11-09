@@ -311,10 +311,11 @@ npm run lint       # scripts/lint-standards.mjs（不靠 eslint：查个人化�
 
 ## 鹈鹕（tihu）本地 TTS 运行时
 
-- 默认在线兜底：`edge-tts` + `zh-CN-YunjianNeural`（云健），默认语速 `TIHU_EDGE_RATE=+45%`，代理 `TIHU_EDGE_PROXY=http://127.0.0.1:7897`。
+- 主 TTS：`edge-tts` + `zh-CN-YunjianNeural`（云健），默认语速 `TIHU_EDGE_RATE=+45%`。
+- 网络代理**默认不使用**；需要时显式设置 `TIHU_EDGE_PROXY`（例如 `http://127.0.0.1:7897`）。运行时会独立探测仓库内 edge 脚本、Python、`edge_tts` 与 ffmpeg。
 - **edge-tts 必须 ≥ 7.3.1**：7.2.x 的 Sec-MS-GEC/DRM 已过期，Bing WSS 会 403。本机 PyPI 直连不通，用清华镜像升级：
   `python -m pip install -U edge-tts -i https://pypi.tuna.tsinghua.edu.cn/simple`
-- 运行时用 `~/.dsh/tihu/venv`（已装 7.3.1）；edge 失败自动走 Qwen3-TTS GPU，两者都失败则无语音并红字告警（正文仍显示）。
+- edge 依赖缺失或请求失败时按既有策略降级到本地 Kokoro；两者都不可用则无语音并在设备屏内明确提示，正文仍保留。
 
 ## 致谢
 
