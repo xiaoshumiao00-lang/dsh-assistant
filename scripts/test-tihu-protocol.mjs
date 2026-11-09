@@ -157,14 +157,18 @@ test('screen.gesture 校验：swipe/tap 字段合法才收', () => {
 
 test('版本号与类型清单固定', () => {
   assert.equal(TIHU_PROTOCOL_VERSION, '0')
-  assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'session.end', 'sessions.query', 'session.bind', 'screen.gesture', 'voice.list', 'voice.create', 'voice.select', 'tts.sample', 'ping'])
-  assert.equal(TIHU_DOWNSTREAM_TYPES.length, 14)
+  assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'confirm.reply', 'session.end', 'sessions.query', 'session.bind', 'screen.gesture', 'voice.list', 'voice.create', 'voice.select', 'tts.sample', 'task.reply', 'ping'])
+  // 2026-11-09 统一指挥会话：下行 +3（task.list / task.update / task.notify），协议版本仍是 '0'。
+  assert.equal(TIHU_DOWNSTREAM_TYPES.length, 17)
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('tts.audio'))
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('sessions.list'))
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('session.bound'))
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('session.invalid'))
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('voice.list'))
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('voice.created'))
+  assert.ok(TIHU_DOWNSTREAM_TYPES.includes('task.list'))
+  assert.ok(TIHU_DOWNSTREAM_TYPES.includes('task.update'))
+  assert.ok(TIHU_DOWNSTREAM_TYPES.includes('task.notify'))
   assert.equal(TIHU_PAGE_PATH, '/tihu')
   assert.equal(TIHU_LANE_PATH, '/tihu/lane')
 })
@@ -4628,7 +4632,7 @@ await testAsync('lane：tool/call 到达时若该步已有思考，先替换占�
 console.log('[tihu] 控制工具')
 
 test('控制工具：action 全集固定，未知 action 报错列出全部合法值', () => {
-  assert.deepEqual(tihuActionNames(), ['status', 'list_devices', 'bind', 'open_bubble', 'progress', 'list_sessions', 'archive', 'stop_speaking', 'replay', 'go_home', 'browse', 'open_recent'])
+  assert.deepEqual(tihuActionNames(), ['status', 'list_devices', 'bind', 'open_bubble', 'progress', 'list_sessions', 'archive', 'stop_speaking', 'replay', 'go_home', 'browse', 'open_recent', 'dispatch', 'list_tasks', 'cancel'])
 })
 
 test('控制工具：提示段落 ≤120 字，含「口头确认」红线', () => {
@@ -5287,7 +5291,8 @@ test('page：顶行在 304（无气泡轨）与 240（rail-on）两种可用宽�
   assert.ok(/#screen \.home-top \.signal \.bar \{[^}]*width:5px/.test(html), '三根柱宽 5px')
   assert.ok(/#screen \.home-top \{[^}]*gap:8px/.test(html), '顶行容器 gap:8px')
   // 顶行走的是 stage 同一套可用宽（rail-on 240 / 否则 304），时钟按 fitTextPx 收进剩余宽度
-  assert.ok(/function renderHomeTop\(\)[\s\S]{0,400}stageWidthPx\(\)[\s\S]{0,120}fitTextPx\(clockText\(\)/.test(source), '顶行按 stageWidthPx + fitTextPx 排版')
+  assert.ok(/function renderHomeTop\(\)[\s\S]{0,500}stageWidthPx\(\)[\s\S]{0,200}fitTextPx\(/.test(source), '顶行按 stageWidthPx + fitTextPx 排版')
+  assert.ok(/function renderHomeTop\(\)[\s\S]{0,600}clockText\(\)/.test(source), '时钟文案仍来自 clockText()')
   assert.ok(html.includes('#screen.rail-on .home-top') || /#screen\.rail-on[^{]*\{[^}]*\.home-top/.test(html) || html.includes('.rail-on .title,') && html.includes('home-top { width:240px; }'), '有气泡轨时顶行也要让开右侧 64px')
   assert.ok(/#screen \.home-top \.clock \{[^}]*white-space:nowrap/.test(html), '时钟不许换行')
   assert.ok(/#screen \.home-top \{[^}]*flex:none/.test(html), '顶行不参与伸缩（固定一行，不会被压扁/挤出屏）')
@@ -5337,7 +5342,7 @@ test('page：本轮只给顶行时钟加粗（加粗后的宽度照样排得下�
   assert.equal(barW, 5, '柱宽常量不动')
   assert.equal(barGap, 2, '柱间隙常量不动')
   assert.equal(rowGap, 8, '行间隙常量不动')
-  assert.ok(/function renderHomeTop\(\)[\s\S]{0,400}stageWidthPx\(\)[\s\S]{0,120}fitTextPx\(clockText\(\)/.test(source), '顶行排版公式照旧（fitTextPx 收进剩余宽）')
+  assert.ok(/function renderHomeTop\(\)[\s\S]{0,500}stageWidthPx\(\)[\s\S]{0,200}fitTextPx\(/.test(source), '顶行排版公式照旧（fitTextPx 收进剩余宽）')
   const barsPx = barW * 3 + barGap * 2
   for (const available of [CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX]) {
     const room = available - barsPx - rowGap
@@ -5414,8 +5419,9 @@ test('protocol：主页帧 stage 留空仍是 v0 最小增量（不新增必填�
   assert.equal(frame.payload.home.total, 1, 'home.total 数据字段没删（协议字段只增不删）')
   assert.equal(Object.keys(frame.payload).some((key) => /clock|conn/i.test(key)), false, '不加时钟/连接字段')
   assert.equal(TIHU_PROTOCOL_VERSION, '0')
-  assert.equal(TIHU_DOWNSTREAM_TYPES.length, 14, '不开新的下行消息类型')
-  assert.deepEqual(TIHU_UPSTREAM_TYPES.filter((type) => /conn|clock/i.test(type)), [], '也不开新的上行消息类型')
+  assert.equal(TIHU_DOWNSTREAM_TYPES.length, 17, '任务登记簿的三条下行（task.list/update/notify）之外不再加类型')
+  assert.deepEqual(TIHU_DOWNSTREAM_TYPES.filter((type) => type.startsWith('task.')), ['task.list', 'task.update', 'task.notify'])
+  assert.deepEqual(TIHU_UPSTREAM_TYPES.filter((type) => /conn|clock/i.test(type)), [], '不开时钟/连接这类上行消息类型')
   // 源码层再钉一遍：ScreenFramePayload 的必填字段还是那三个，没被人偷偷加必填
   const protocol = readFileSync(new URL('../src/tihu/protocol.ts', import.meta.url), 'utf8')
   const block = protocol.match(/export interface ScreenFramePayload \{[\s\S]*?\n\}/)
@@ -5709,7 +5715,384 @@ await testAsync('P1-1：纯静音不进 ASR；危险指令不自动发；ASR 中
 })
 
 
-/* ---------- 汇总 ---------- */
-console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
+/* ---------- 2026-11-09 统一指挥会话：指挥会话 + 派单器 + 任务登记簿 ----------
+ *
+ * 这一组钉住三件事：
+ *   1. 设备默认绑**唯一指挥会话**（不再挑最活跃会话、不再有会话选择器）；
+ *   2. 一句话走派单器落到**项目文件夹**（卡片文件夹 / 助手 home / 追加不新建）；
+ *   3. 完成由**任务**驱动：屏 6 ＋ 一句播报（八秒窗口合并），不需要点进任何会话。
+ */
+
+/** 造一套「有控制室卡片 + 有一条指挥会话」的工作区；顺手把两个环境变量指到临时目录。 */
+function unifiedWorkspace(options = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'tihu-unified-'))
+  const home = join(root, 'assistant')
+  const fundFolder = join(root, 'fixed-fund')
+  mkdirSync(home, { recursive: true })
+  mkdirSync(fundFolder, { recursive: true })
+  const stateFile = join(root, 'dsh-assistant-state.json')
+  const cards = options.cards ?? [{ id: 'card-fund', name: '青年基金申请书', folder: fundFolder }]
+  writeFileSync(stateFile, JSON.stringify({
+    projects: {
+      layouts: cards.map((card) => ({ id: card.id, title: card.name })),
+      folders: Object.fromEntries(cards.map((card) => [card.id, card.folder])),
+      nameOverrides: {},
+      order: cards.map((card) => card.id),
+      hidden: [],
+      removed: [],
+    },
+    view: null,
+    revision: 1,
+    updatedAt: new Date(0).toISOString(),
+  }), 'utf8')
+  process.env.DSH_ASSISTANT_HOME = home
+  process.env.TIHU_PROJECTS_STATE = stateFile
+  const created = []
+  const prompted = []
+  const records = [cuRecord('session-cmd', { live: true, preset: 'standard', title: '鹈鹕指挥台' })]
+  const remote = {
+    session: {
+      create: async (base) => {
+        created.push(base)
+        const id = 'session-task-' + created.length
+        records.push(cuRecord(id, { live: true, preset: base.agentPreset, cwd: base.cwd, title: '任务 ' + created.length }))
+        return { ok: true, value: { sessionId: id } }
+      },
+    },
+  }
+  const sessions = {
+    using: async (id, _opts, fn) => fn({
+      binding: {
+        session: {
+          prompt: async (blocks) => prompted.push({ id, blocks }),
+          // 宿主用它给「tihu 语音链路」挂工具闸窗口：派单也算一次 tihu 注入。
+          deriveMessages: () => [{ role: 'user', id: 'msg-' + id }],
+        },
+      },
+    }),
+  }
+  const fixture = runtimeFor(records, { remote, sessions }, options.tts ?? {})
+  return {
+    ...fixture,
+    root,
+    home,
+    fundFolder,
+    stateFile,
+    cards,
+    created,
+    prompted,
+    records,
+    cleanup: () => {
+      fixture.runtime.dispose()
+      delete process.env.DSH_ASSISTANT_HOME
+      delete process.env.TIHU_PROJECTS_STATE
+      try { rmSync(root, { recursive: true, force: true }) } catch { /* 忽略 */ }
+    },
+  }
+}
+
+await testAsync('统一指挥：hello 绑唯一指挥会话，屏上是空棋盘（不是项目清单）', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u1', protocol: '0' }, 1)))
+  await waitMs(60)
+  const frames = framesOf(socket)
+  const bound = frames.filter((frame) => frame.type === 'session.bound').pop()
+  assert.ok(bound !== undefined, '应下发 session.bound')
+  assert.equal(bound.payload.sessionId, 'session-cmd', '要绑标题含「鹈鹕指挥台」的那条会话')
+  const board = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop()
+  assert.ok(board !== undefined, '屏帧要带 board（任务棋盘投影）')
+  assert.equal(board.payload.mode, 'home')
+  assert.equal(board.payload.board.empty, true, '一个任务都没有 = 同一版式的空态')
+  assert.deepEqual(board.payload.board.counts, { running: 0, awaiting: 0, queued: 0 })
+  assert.ok(frames.some((frame) => frame.type === 'task.list'), '棋盘数据也要单独发一条 task.list')
+  assert.equal(w.created.length, 0, '已有指挥会话就不要再建')
+  assert.equal(frames.some((frame) => frame.type === 'event.alert' && String(frame.payload.text).includes('Computer Use')), false,
+    '指挥会话不是 CU 模式，但不该按「非 CU」告警')
+  w.cleanup()
+})
+
+await testAsync('统一指挥：日常小事派到「个人助手」文件夹，回执屏带三拍圆点与 5 秒倒计时', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u2', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+  await waitMs(90)
+  assert.equal(w.created.length, 1, '要新建一条任务会话')
+  assert.equal(w.created[0].cwd, w.home, '日常任务落助手 home（与长按悬浮球一致）')
+  assert.equal(w.created[0].agentPreset, 'standard', '日常任务一律 standard')
+  assert.equal(w.prompted.length, 1, '原话要进任务会话')
+  assert.equal(w.prompted[0].blocks[0].text, '现在几点了')
+  assert.ok(String(w.prompted[0].blocks[1].text).includes('派单'), '要带一句「这是派单」的上下文')
+  const frames = framesOf(socket)
+  const receipt = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
+  assert.ok(receipt !== undefined, '要出派单回执屏（屏 2）')
+  assert.equal(receipt.payload.title, '已派给 个人助手')
+  assert.deepEqual(receipt.payload.steps.map((step) => step.state), ['done', 'done', 'active'])
+  assert.deepEqual(receipt.payload.actions.map((item) => item.id), ['taskOpen', 'taskCancel'])
+  assert.equal(receipt.payload.countdown.seconds, 5)
+  const list = frames.filter((frame) => frame.type === 'task.list').pop()
+  assert.equal(list.payload.board.rows.length, 1)
+  assert.equal(list.payload.board.rows[0].capsule, '执行中')
+  assert.equal(list.payload.board.rows[0].sub, '个人助手 · 已派出')
+  w.cleanup()
+})
+
+await testAsync('统一指挥：点名项目卡 → 落那张卡的文件夹，且不改控制室状态', async () => {
+  const w = unifiedWorkspace()
+  const before = readFileSync(w.stateFile, 'utf8')
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u3', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '青年基金申请书第 3 段再改一遍，要有数据支撑', source: 'voice' }, 2)))
+  await waitMs(90)
+  assert.equal(w.created.length, 1)
+  assert.equal(w.created[0].cwd, w.fundFolder, '复杂任务跟项目卡片走')
+  const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
+  assert.equal(receipt.payload.title, '已派给 青年基金申请书')
+  assert.equal(readFileSync(w.stateFile, 'utf8'), before, '已有卡就不要再写状态文件')
+  w.cleanup()
+})
+
+await testAsync('统一指挥：两个卡名都点到 → 追问屏（只问一次），答「一」才派', async () => {
+  const w = unifiedWorkspace({
+    cards: [
+      { id: 'card-fund', name: '青年基金申请书', folder: join(tmpdir(), 'tihu-fund-folder') },
+      { id: 'card-lin', name: '磷石膏SCI', folder: join(tmpdir(), 'tihu-lin-folder') },
+    ],
+  })
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u4', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把青年基金申请书和磷石膏SCI都整理一下投出去', source: 'voice' }, 2)))
+  await waitMs(90)
+  const ask = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '追问 · 只问一次').pop()
+  assert.ok(ask !== undefined, '有歧义必须问，不许猜')
+  assert.equal(ask.payload.title, '这句话派给谁？')
+  assert.deepEqual(ask.payload.actions.map((item) => item.id), ['pick1', 'pick2', 'pickNone'])
+  assert.equal(w.created.length, 0, '没答之前不许乱派')
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '一', source: 'voice' }, 3)))
+  await waitMs(90)
+  assert.equal(w.created.length, 1, '答「一」才派单')
+  assert.ok(String(w.created[0].cwd).includes('tihu-fund-folder'))
+  w.cleanup()
+})
+
+await testAsync('统一指挥：任务 turn/end → 屏 6「完成」＋ 一行播报（八秒窗口合并）', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u5', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+  await waitMs(90)
+  const taskSession = w.prompted[0].id
+  emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
+  emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '现在十七点三十一分。' }] } } })
+  emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await waitMs(90)
+  const frames = framesOf(socket)
+  const done = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').pop()
+  assert.ok(done !== undefined, '完成要有屏 6（不必点进会话）')
+  assert.equal(done.payload.title, '现在十七点三十一分', '标题是第一句结果（屏上标题不带句号）')
+  assert.ok(done.payload.actions.some((item) => item.id === 'taskBoard'), '完成屏要能回棋盘')
+  const note = frames.filter((frame) => frame.type === 'task.notify').pop()
+  assert.ok(note !== undefined, '完成要进通知总线（屏气泡＋播报）')
+  assert.equal(note.payload.level, 1)
+  assert.ok(note.payload.text.includes('现在几点了'), '播报用任务标题，不念会话 id：' + note.payload.text)
+  await waitMs(600)
+  const spoken = framesOf(socket).filter((frame) => frame.type === 'task.notify' && frame.payload.spoken === true).pop()
+  assert.ok(spoken !== undefined, '过了单条延迟要念（八秒窗口下第一条很快念）')
+  w.cleanup()
+})
+
+await testAsync('统一指挥：说「回棋盘」/「看第 1 条」按屏上命令走，不需要模型', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u6', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '青年基金申请书第 3 段再改一遍', source: 'voice' }, 2)))
+  await waitMs(90)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+  await waitMs(60)
+  let board = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop()
+  assert.ok(board !== undefined)
+  assert.equal(board.payload.board.rows.length, 1, '回棋盘要看到刚派的那条')
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '看第 1 条', source: 'voice' }, 4)))
+  await waitMs(60)
+  const detail = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && Array.isArray(frame.payload.actions)
+    && frame.payload.actions.some((item) => item.id === 'taskSession')).pop()
+  assert.ok(detail !== undefined, '「看第 1 条」要进任务详情（屏 4）')
+  assert.ok(detail.payload.title.startsWith('第 '), '详情标题是「第 N 步 · 已用 …」：' + detail.payload.title)
+  assert.equal(w.created.length, 1, '看任务不新建会话')
+  w.cleanup()
+})
+
+await testAsync('统一指挥：点棋盘上一行（gesture hit=task）进详情，不换会话绑定', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u7', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '青年基金申请书第 3 段再改一遍', source: 'voice' }, 2)))
+  await waitMs(90)
+  const before = framesOf(socket).filter((frame) => frame.type === 'session.bound').length
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 60, hit: 'task', taskId: 't1' }, 3)))
+  await waitMs(60)
+  const frames = framesOf(socket)
+  const detail = frames.filter((frame) => frame.type === 'screen.frame' && Array.isArray(frame.payload.actions)
+    && frame.payload.actions.some((item) => item.id === 'taskBoard')).pop()
+  assert.ok(detail !== undefined, '点行要看任务详情')
+  assert.equal(frames.filter((frame) => frame.type === 'session.bound').length, before, '点行不许换会话绑定')
+  w.cleanup()
+})
+
+await testAsync('协议：task.reply 只收实质内容，坏帧一律忽略', async () => {
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('task.reply', { command: 'board' }, 1))) !== null)
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('task.reply', { taskId: 't3', optionIndex: 1 }, 2))) !== null)
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('task.reply', { text: '先留着' }, 3))) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('task.reply', {}, 4))), null, '全空 = 坏帧')
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('task.reply', { optionIndex: 9 }, 5))), null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('task.reply', { command: 'x' }, 6))), null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('task.reply', { taskId: 'x'.repeat(80) }, 7))), null)
+})
+
+await testAsync('协议：task.list / task.update / task.notify 都是合法 v0 下行信封', async () => {
+  const board = {
+    rows: [{ taskId: 't1', title: '改写第 3 段', state: 'running', capsule: '执行中', sub: '青年基金申请书 · 第 7 步', ring: { percent: 0.4, tone: 'normal' } }],
+    counts: { running: 1, awaiting: 0, queued: 0 },
+    page: { index: 0, total: 1 },
+    total: 1,
+    empty: false,
+  }
+  const list = buildDownstream('task.list', { board }, 1)
+  assert.ok(isTihuEnvelope(list))
+  assert.equal(list.payload.board.rows[0].capsule, '执行中')
+  const update = buildDownstream('task.update', { taskId: 't1', state: 'done', capsule: '完成', sub: '青年基金申请书 · 已完成', ring: { percent: 1, tone: 'done' } }, 2)
+  assert.ok(isTihuEnvelope(update))
+  const notify = buildDownstream('task.notify', { level: 1, taskId: 't1', text: '改写完成', spoken: true }, 3)
+  assert.ok(isTihuEnvelope(notify))
+  assert.equal(notify.payload.level, 1)
+  // 屏帧上的任务棋盘与附加块都是可选字段（必填仍只有 stage/title/bullets）
+  const frame = buildDownstream('screen.frame', { stage: '', title: '', bullets: [], board, steps: [{ label: '已入队', state: 'done' }], countdown: { seconds: 5 }, more: { count: 2, text: '另有 2 条' }, taskId: 't1' }, 4)
+  assert.ok(isTihuEnvelope(frame))
+  assert.equal(Object.keys(frame.payload).includes('board'), true)
+})
+
+await testAsync('统一指挥：危险动作 → 屏 5 待决策 ＋ P0 播报，屏上答「确认」才放行', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u8', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '青年基金申请书第 3 段再改一遍', source: 'voice' }, 2)))
+  await waitMs(90)
+  const taskSession = w.prompted[0].id
+  const pre = w.events.find((entry) => entry.name === 'tools/pre-execute').handler
+  // 这条任务会话正处在「tihu 派单的那一轮」：危险命令必须等人拍板，不许设备离线就直接拒。
+  const pending = pre({
+    callId: 'call-1',
+    name: 'pwsh',
+    arguments: { command: 'Remove-Item -Recurse -Force .tihu' },
+    agent: { session: { id: taskSession, deriveMessages: () => [{ role: 'user', id: 'msg-' + taskSession }] } },
+  }, async () => ({ kind: 'ok' }))
+  await waitMs(80)
+  const frames = framesOf(socket)
+  const asking = frames.filter((frame) => frame.type === 'screen.frame' && String(frame.payload.stage || '').includes('待决策')).pop()
+  assert.ok(asking !== undefined, '要弹待决策屏（屏 5）')
+  assert.ok(asking.payload.stage.includes('托管未开'), '待决策只出现在托管没点亮时：' + asking.payload.stage)
+  assert.ok(asking.payload.actions.some((item) => item.id === 'taskOption0'))
+  assert.ok(asking.payload.actions.some((item) => item.id === 'taskOption1'))
+  assert.ok(asking.payload.countdown && asking.payload.countdown.seconds > 0, '要有 60 秒倒计时')
+  const urgent = frames.filter((frame) => frame.type === 'task.notify' && frame.payload.level === 0).pop()
+  assert.ok(urgent !== undefined, 'P0 要人必须立刻播（不等八秒窗口）')
+  assert.ok(urgent.payload.text.includes('确认'), urgent.payload.text)
+  assert.equal(frames.some((frame) => frame.type === 'confirm.ask'), false, '统一指挥下走屏 5，不再发老的 confirm.ask')
+  // 屏上点「确认」（第 0 个选项）→ broker 放行 → 工具照常执行
+  socket.emit('data', clientFrame(buildUpstream('task.reply', { taskId: 't1', optionIndex: 0 }, 3)))
+  const outcome = await pending
+  assert.notEqual(outcome && outcome.kind, 'deny', '确认后不许再拒：' + JSON.stringify(outcome))
+  await waitMs(40)
+  const answered = framesOf(socket).filter((frame) => frame.type === 'event.progress' && String(frame.payload.text || '').includes('已答')).pop()
+  assert.ok(answered !== undefined, '要说一句「已答」，别让人怀疑点没点上')
+  w.cleanup()
+})
+
+await testAsync('§13 验收：同一项目连打 10 句，零错派（全落那张卡的文件夹）', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u9', protocol: '0' }, 1)))
+  await waitMs(50)
+  const sentences = [
+    '青年基金申请书第 1 段加一句数据支撑',
+    '青年基金的图 3 换成矢量图',
+    '把青年基金申请书那节的参考文献补齐',
+    '青年基金那边预算表再核一遍',
+    '青年基金申请书的摘要压到 300 字',
+    '青年基金第 4 段的逻辑要理顺一下',
+    '青年基金的创新点写得更具体',
+    '青年基金申请书里补一张技术路线图',
+    '青年基金那篇的致谢别忘基金号',
+    '青年基金申请书再通读一遍改错别字',
+  ]
+  for (let i = 0; i < sentences.length; i += 1) {
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: sentences[i], source: 'voice' }, i + 2)))
+    await waitMs(30)
+  }
+  await waitMs(150)
+  assert.equal(w.created.length, sentences.length, '10 句各派一条任务会话')
+  for (const base of w.created) {
+    assert.equal(base.cwd, w.fundFolder, '每一句都必须落在青年基金卡的文件夹：' + JSON.stringify(base))
+  }
+  assert.equal(w.prompted.length, sentences.length, '每句都要真的投进任务会话')
+  const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop()
+  assert.ok(board.payload.board.total >= 1)
+  w.cleanup()
+})
+
+await testAsync('统一指挥：同一句播报第二次走预录，不再合成（P3 缓存命中）', async () => {
+  const prerollDir = mkdtempSync(join(tmpdir(), 'tihu-preroll-lane-'))
+  const before = process.env.TIHU_PREROLL_DIR
+  process.env.TIHU_PREROLL_DIR = prerollDir
+  try {
+    const synthCalls = []
+    const engine = fakeTts()
+    const realSynth = engine.synthesize
+    engine.synthesize = async (text, options) => {
+      synthCalls.push(text)
+      return realSynth(text, options)
+    }
+    // 先往预录里塞一条「这句话已经念过」的 PCM（100ms / 4800 字节）
+    const prerollModule = await import('../src/tihu/preroll.ts')
+    const seeded = Buffer.alloc(4800)
+    const announcementText = '现在几点了——现在十七点三十一分'
+    assert.equal(new prerollModule.TihuPreroll(prerollDir).put('default', announcementText, seeded), true)
+
+    const w = unifiedWorkspace({ tts: { instance: engine } })
+    const socket = openLane(w.runtime)
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u10', protocol: '0' }, 1)))
+    await waitMs(50)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+    await waitMs(90)
+    const taskSession = w.prompted[0].id
+    emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
+    emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '现在十七点三十一分。' }] } } })
+    emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(600)
+    assert.equal(synthCalls.length, 0, '命中预录就不该再合成：' + JSON.stringify(synthCalls))
+    const audio = framesOf(socket).filter((frame) => frame.type === 'tts.audio').pop()
+    assert.ok(audio !== undefined, '命中也必须真的把 PCM 发下去')
+    assert.equal(Buffer.from(audio.payload.data, 'base64').length, seeded.length, '发下去的就是缓存里那段 PCM')
+    assert.equal(audio.payload.sampleRate, 24000)
+    assert.equal(audio.payload.final, true)
+    w.cleanup()
+  } finally {
+    if (before === undefined) delete process.env.TIHU_PREROLL_DIR
+    else process.env.TIHU_PREROLL_DIR = before
+    try { rmSync(prerollDir, { recursive: true, force: true }) } catch { /* 忽略 */ }
+  }
+})
+
+/* ---------- 汇总 ---------- */console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
 if (failed > 0) process.exit(1)
 process.exit(0)
