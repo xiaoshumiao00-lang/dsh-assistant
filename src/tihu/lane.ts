@@ -13,7 +13,7 @@
  * 数据流（P0，模拟设备页）：
  *
  *   页面 ──audio.frame(base64 WAV)──► handleUpgrade → 本 lane
- *        ◄─transcript / screen.frame / tts.text / event.* / confirm.ask──
+ *        ◄─transcript / screen.frame / tts.audio / event.* / task.*──
  *
  *   本 lane 做的事：
  *     1. 语音：走官方 speech 服务（`ctx.get('speechController')`，也就是客户端
@@ -21,9 +21,9 @@
  *     2. 注入：`agents.get(sessionId).followup(message)` —— 与用户在会话里发消息
  *        同一条入口（普通 user/message），不另建并行会话；
  *     3. 屏：订阅 `session/event`（turn/start、tool/call、assistant/message、
- *        turn/end）→ screen.frame / event.progress / event.done / tts.text；
- *     4. 闸：`tools/pre-execute` / `tools/post-execute` → 快照、审计、危险确认
- *        （见 guard.ts）。只对「tihu 正在执行的会话」生效，不干扰桌面正常使用。
+ *        turn/end）→ screen.frame / event.progress / task.notify / tts.audio；
+ *     4. 闸：`tools/pre-execute` / `tools/post-execute` → 快照、审计（见 guard.ts）。
+ *        危险动作的授权只在电脑端，绝不上设备屏。只对「tihu 正在执行的会话」生效。
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
@@ -54,18 +54,16 @@ import {
   appendAudit,
   classifyTool,
   commandOf,
-  createConfirmBroker,
   diffSummary,
   readTextOrEmpty,
   takeSnapshot,
   targetPathOf,
   tihuDirOf,
   timestampSlug,
-  type ConfirmBroker,
   type TihuActionClass,
 } from './guard.ts'
 import { tihuPageHtml } from './page.ts'
-import { applyEarlyThinking, applySessionEvent, confirmationFrame, createProgressState, decodeRateOf, formatTokens, pushDecodeSample, type TihuDecodeSample, type TihuProgressState } from './progress.ts'
+import { applyEarlyThinking, applySessionEvent, createProgressState, decodeRateOf, formatTokens, pushDecodeSample, type TihuDecodeSample, type TihuProgressState } from './progress.ts'
 import { TihuTts, isKokoroVoice, type TihuTtsPaths } from './tts.ts'
 import { replyVisibleWindow, replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
 import { stripToolNoise, toSpeechText } from './speech-text.ts'
@@ -97,7 +95,6 @@ import {
 import {
   RECEIPT_SECONDS,
   askWhichFrame,
-  awaitingFrame,
   boardFrame,
   detailFrame,
   doneAnnouncementOf,
@@ -139,8 +136,8 @@ const TRANSCRIBE_TIMEOUT_MS = 45_000
  *   - 窗口 120 秒滑动，页面「结束本次语音会话」立即清零。
  */
 const ACTIVE_WINDOW_MS = 120_000
-/** 确认超时（设备在线但没人点）。 */
-const CONFIRM_TIMEOUT_MS = 60_000
+/** 朗读结束后自动回棋盘的等待（用户 2026-11-09：60 秒）。 */
+export const HOME_AFTER_SPEECH_MS = 60_000
 /**
  * 回主页守门重试间隔：scheduleHome 的 timer 触发时若还有任何会话的 turn 在跑
  * （runningSessions 非空），不回主页，按这个间隔再查一次。
@@ -328,8 +325,12 @@ interface TihuDevice {
   focusedTask?: string
   /** 屏停在棋盘上（只有它才跟着登记簿自动重画）。 */
   onBoard?: boolean
-  /** 棋盘当前页码（上/下滑与翻页键共用；越界不动）。 */
-  boardPage?: number
+  /** 刚连上：第一次电脑端同步跑完时，若已有任务在跑就自动切到它的进度页。 */
+  followPending?: boolean
+  /** 朗读结束后 60 秒自动回棋盘的计时器（任何交互都取消）。 */
+  homeTimer?: ReturnType<typeof setTimeout>
+  /** 这个计时器是为哪条任务装的（undefined＝指挥会话的回答屏）。 */
+  homeTask?: string
   /** 歧义追问待选：用户下一句「一 / 二」就是在答它。 */
   pendingPick?: { candidates: { id: string; name: string; folder?: string }[]; text: string }
   /** 派单回执自动回棋盘的计时器（任何交互都取消它）。 */
@@ -409,8 +410,6 @@ export interface TihuRuntimeOptions {
   workspaceOf?: (sessionId: string) => string | undefined
   /** 本地 TTS 覆盖（单测里禁用/注入假引擎）。 */
   tts?: { disabled?: boolean; threads?: number; port?: number; paths?: Partial<TihuTtsPaths>; instance?: TihuTts; prewarm?: boolean }
-  /** 危险动作确认器覆盖（单测里注入会抛错的 broker，验证 fail-closed）。 */
-  confirmBroker?: ConfirmBroker
   /** 控制室卡片巡检间隔（毫秒，0 = 关闭；缺省走 tihuHomeSyncMs()/环境变量）。 */
   homeSyncMs?: number
   /** 语音预览自动发送延迟（默认 2000ms；测试可注入，不属于设备协议）。 */
@@ -427,7 +426,7 @@ export interface TihuRuntime {
   dispose: () => void
   /** 测试/诊断用。 */
   /** 控制面：tihu 全局工具用（薄壳转调内部函数，契约见 control.ts）。 */
-  stats: () => { devices: number; activeSessions: string[]; pendingConfirms: number; tasks: number }
+  stats: () => { devices: number; activeSessions: string[]; tasks: number }
 }
 
 /** 可选服务：cordis 对未 inject 的服务直读会 throw，一律 ctx.get + try。 */
@@ -562,10 +561,6 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const preroll = new TihuPreroll()
   /** 正在念播报的设备（避免一条播报被两台设备重复合成）。 */
   const announcing = new Set<string>()
-  /** 任务 → 挂起的危险动作确认 id（屏上答「确认/取消」要按它回 broker）。 */
-  const confirmOfTask = new Map<string, string>()
-  /** 任务 → 待决策超时定时器（到点按默认项走）。 */
-  const awaitingTimers = new Map<string, ReturnType<typeof setTimeout>>()
   /**
    * 会话 id → 本次 attempt 已经收到的思考文本（agent/assistant-stream 的
    * reasoning-delta 累积；start 重置、end 清空）。宿主 session/event 要等该步
@@ -593,62 +588,6 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   if (options.tts?.prewarm === true && options.tts?.disabled !== true && tts.backend() !== 'none') {
     void tts.ensureServer().catch((error) => log(`tihu tts prewarm failed: ${(error as Error)?.message ?? String(error)}`))
   }
-  const confirmBroker: ConfirmBroker = options.confirmBroker ?? createConfirmBroker({
-    onAsk: (request) => {
-      // 统一指挥：危险动作属于某条任务 → 记成待决策（P0 档），屏 5 弹同一个问题。
-      const task = request.sessionId === undefined ? undefined : tasks.ofSession(request.sessionId)
-      if (task !== undefined) {
-        // 选项与电脑端同一个问题、同一组顺序；删除类用「确认删除 / 先留着，别删」，
-        // 其余危险动作保持「确认 / 取消」。默认项仍是首选项。
-        const looksDelete = /删除|删掉|Remove-Item|\bdel\b|\brm\b|\berase\b/i.test(`${request.detail ?? ''} ${request.title ?? ''}`)
-        const options = looksDelete ? ['确认删除', '先留着，别删'] : ['确认', '取消']
-        // 标题必须是「电脑端同一个问题」的可读摘要，不能只写「执行命令：需要你确认」。
-        const detailText = String(request.detail ?? '').replace(/\s+/g, ' ').trim()
-        const fileHit = detailText.match(/([^\s'"`]+\.(?:txt|log|md|json|csv|png|pdf|xlsx|docx|zip))(?=['"\s]|$)/i)
-        const fileBase = fileHit ? (fileHit[1].split(/[\\/]/).pop() ?? '') : ''
-        const question = looksDelete
-          ? (fileBase !== '' ? `删除 ${fileBase}？` : '删掉这个文件？')
-          : (detailText !== '' ? `执行命令：${detailText.slice(0, 24)}${detailText.length > 24 ? '…' : ''}？` : request.title)
-        tasks.ask(task.taskId, {
-          question,
-          options,
-          // 默认项＝首选项（与托管开着时的自动 approve 同一条规则）。
-          defaultIndex: 0,
-          timeoutMs: request.timeoutMs,
-          ...(request.detail === '' ? {} : { detail: request.detail }),
-        })
-        confirmOfTask.set(task.taskId, request.id)
-        // 比 confirmBroker 的 60 秒超时早 750ms 走默认项：两个 setTimeout 同到期时
-        // broker 先入队、会先判 timeout≈拒绝，屏上写着「60 秒按确认走」却执行不了。
-        // 提前一点让设备侧先 reply，结论与屏上文案一致。
-        armAwaitingTimer(task.taskId, (task.decisionDeadline ?? Date.now() + request.timeoutMs) - 750)
-        const frame = awaitingFrameOf(task)
-        for (const device of devices) {
-          if (!device.unified) continue
-          const display = device.sessionId ?? '__unbound__'
-          // 待决策要独占屏：上一条回执的 5 秒计时/未答追问都不能盖它。
-          if (device.receiptTimer !== undefined) {
-            clearTimeout(device.receiptTimer)
-            device.receiptTimer = undefined
-          }
-          device.pendingPick = undefined
-          device.focusedTask = task.taskId
-          lastFrames.set(display, frame)
-          device.send('screen.frame', frame)
-        }
-        pushTaskNotify(task, 0, `要你确认：${question}`)
-        log(`tihu confirm.ask task=${task.taskId} id=${request.id} title=${JSON.stringify(request.title)}`)
-        return
-      }
-      // 没有任务的危险动作（例如指挥会话自己踩到）：不再上旧确认屏，只提示去电脑端点；
-      // broker 60 秒后按「取消」超时（安全侧默认）。
-      for (const device of devices) {
-        if (request.sessionId !== undefined && device.sessionId !== request.sessionId) continue
-        device.send('event.alert', { level: 'warn', text: `要你确认「${request.title}」，但没有可挂的任务：请在电脑端处理` })
-      }
-      log(`tihu confirm.ask id=${request.id} title=${JSON.stringify(request.title)}`)
-    },
-  } as any)
 
   /** 发一条下行给「绑定到某会话」的所有设备。 */
   function broadcast(sessionId: string, type: string, payload: unknown): void {
@@ -1289,7 +1228,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     // 不再依赖 messageId 相等——fallback inject 可能把「正文＋派单尾注」投成两条
     // user 消息，最后一条 id 与 arm 时的第一条不等，旧判定会把整段闸门漏掉。
     const task = tasks.ofSession(sessionId)
-    if (task !== undefined && task.state !== 'done' && task.state !== 'announced' && task.state !== 'archived') return sessionId
+    // 电脑端任务（source='pc'）是只读镜像：它的 shell/写文件归电脑端审批，
+    // 绝不再当成「鹈鹕语音轮」拦下来（2026-11-09 实测：电脑端 rg/构建被镜像成设备屏待决策）。
+    if (task !== undefined && task.source !== 'pc'
+      && task.state !== 'done' && task.state !== 'announced' && task.state !== 'archived') return sessionId
     if (window === undefined) return undefined
     if (last === undefined) return sessionId
     // 空 id＝prompt 刚投进去、宿主还没投影出这条 user 消息。此时必须按「tihu 轮」
@@ -1297,17 +1239,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     // 就会整段绕过危险动作闸（2026-11-09 实测 `pwsh Remove-Item` 无 confirm/audit）。
     if (window.messageId === '') return sessionId
     return last === window.messageId ? sessionId : undefined
-  }
-
-  /** 本会话当前是否有设备在线（决定危险动作是「等确认」还是「立刻拒绝」）。 */
-  function deviceOnlineFor(sessionId: string): boolean {
-    for (const device of devices) {
-      if (device.sessionId === sessionId) return true
-      // 统一指挥：设备绑的是**指挥会话**，但它能替任何一条任务会话确认。
-      // 这一条必须留，否则「危险动作要人拍板」会因为「没绑这条会话」被直接拒掉（设计里的 P0 档就废了）。
-      if (device.unified) return true
-    }
-    return false
   }
 
   /** 工具参数：宿主用 `arguments`，旧快照/单测里用 `args`。 */
@@ -1359,29 +1290,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         const detail = action.kind === 'shell'
           ? String(command ?? '').slice(0, 300)
           : String(rawTarget ?? target ?? '')
-        // 设备不在线：立刻拒绝（旧实现要等 60 秒超时，把一次吐字拖成一条失败命令）。
-        if (!deviceOnlineFor(sessionId)) {
-          appendAudit(workspace, {
-            ts: new Date().toISOString(),
-            source: 'tihu',
-            sessionId,
-            action: action.kind,
-            tool,
-            ...(detail === '' ? {} : { target: detail }),
-            ...(snapshotRoot === undefined ? {} : { snapshot: snapshotRoot }),
-            decision: 'offline',
-            note: '设备不在线，危险动作直接拒绝（不等待）',
-          })
-          return { kind: 'deny', reason: 'tihu: 设备不在线，危险动作默认取消' }
-        }
-        const answer = await (confirmBroker as any).ask({
-          title: `${action.label}：需要你确认`,
-          detail,
-          timeoutMs: CONFIRM_TIMEOUT_MS,
-          risk: action.kind === 'send' ? 'medium' : 'high',
-          sessionId,
-        })
-        const approved = answer.outcome === 'approved'
+        // 2026-11-09 P0（用户实机反馈）：设备屏**永不显示**命令行与授权请求。
+        // 这里只留快照与审计，授权交给电脑端：宿主的 approval/request 面板
+        // （托管开着时由托管自动应答；没开就在电脑端处理，绝不再等设备）。
         appendAudit(workspace, {
           ts: new Date().toISOString(),
           source: 'tihu',
@@ -1390,17 +1301,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           tool,
           ...(detail === '' ? {} : { target: detail }),
           ...(snapshotRoot === undefined ? {} : { snapshot: snapshotRoot }),
-          decision: approved ? `confirm-${answer.outcome}` : answer.outcome,
-          note: approved ? '设备确认通过' : '未获确认，已拒绝执行',
+          decision: 'host-approval',
+          note: '危险动作交电脑端审批（设备屏不显示授权请求）',
         })
-        if (!approved) {
-          const reason = answer.outcome === 'timeout'
-            ? 'tihu: 危险动作确认超时，按取消处理'
-            : answer.outcome === 'offline'
-              ? 'tihu: 设备不在线，危险动作默认取消'
-              : 'tihu: 用户在设备上取消了这次操作'
-          return { kind: 'deny', reason }
-        }
       } else {
         appendAudit(workspace, {
           ts: new Date().toISOString(),
@@ -1535,7 +1438,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     cancelPendingVoice(device)
     const sessionId = device.sessionId
     const autoEligible = quality.kind === 'ok' && tihuVoiceAutoEligible(text)
-      && !runningSessions.has(sessionId) && ((confirmBroker as any).pendingCount?.() ?? 0) === 0
+      && !runningSessions.has(sessionId)
     const pending: NonNullable<TihuDevice['pendingVoice']> = { attempt, text, sessionId, autoEligible }
     device.pendingVoice = pending
     device.send('transcript', { text, final: true, source: 'voice', retryable: true } satisfies TranscriptPayload)
@@ -1547,7 +1450,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     } satisfies ScreenFramePayload, sessionId)
     if (!autoEligible) return
     pending.timer = setTimeout(() => {
-      if (device.pendingVoice !== pending || (confirmBroker as any).pendingCount?.() > 0) return
+      if (device.pendingVoice !== pending) return
       void commitPendingVoice(device, pending).catch((error) => showInputError(device, error))
     }, options.previewDelayMs ?? 2000)
   }
@@ -1620,6 +1523,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         if (type === 'turn/start') {
           tasks.syncExternal(taskOfSession.taskId, { state: 'running', startedAt: at, at })
           refreshBoards()
+          // 电脑端有任务在跑 → 设备自动切到这条任务的「进度」页（不是待决策）。
+          followRunningTask(taskOfSession)
         } else if (type === 'assistant/message') {
           const pcLine = plainSummaryOf(lastAssistant.get(sessionId)?.text ?? '')
           if (pcLine !== '') {
@@ -1632,7 +1537,25 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           const pcOk = pcReason === 'stop' || pcReason === 'completed'
           const pcResult = plainSummaryOf(lastAssistant.get(sessionId)?.text ?? '') || (pcOk ? '做完了' : `中断（${pcReason}）`)
           tasks.syncExternal(taskOfSession.taskId, { state: 'done', summary: pcResult, at })
-          pushTaskNotify(taskOfSession, 1, doneAnnouncementOf(taskOfSession))
+          // 完成/回答页：任务完成就上完成屏，并从这里开始朗读（读完 60 秒回棋盘）。
+          const doneTask = tasks.get(taskOfSession.taskId) ?? taskOfSession
+          const doneReply = lastAssistant.get(sessionId)?.text ?? ''
+          const done = doneFrame({
+            taskId: doneTask.taskId,
+            resultLine: firstSentenceOf(doneReply) || pcResult,
+            bullets: replyBulletsOf(doneReply),
+          })
+          for (const device of devices) {
+            if (!device.unified) continue
+            if (device.receiptTimer !== undefined || device.pendingPick !== undefined) continue
+            disarmAutoHome(device)
+            device.focusedTask = doneTask.taskId
+            device.onBoard = false
+            lastFrames.set(device.sessionId ?? device.id, done)
+            device.send('screen.frame', done)
+            sendTaskUpdate(device, doneTask)
+          }
+          pushTaskNotify(doneTask, 1, doneAnnouncementOf(doneTask))
           refreshBoards()
           log(`tihu pc done task=${taskOfSession.taskId} ok=${String(pcOk)} line=${JSON.stringify(pcResult)}`)
         }
@@ -1706,7 +1629,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           const frame = noticeFrame({ stage: '回答', title: line, lines, tone: 'ok' })
           lastFrames.set(key, frame)
           device.send('screen.frame', frame)
-          void speakAnnouncement(device, line).catch((error) => log(`tihu answer speak failed: ${(error as Error)?.message ?? String(error)}`))
+          void speakAnnouncement(device, line)
+            .then((spokenMs) => { if (spokenMs >= 0) armAutoHome(device, spokenMs) })
+            .catch((error) => log(`tihu answer speak failed: ${(error as Error)?.message ?? String(error)}`))
         }
       }
     } catch (error) {
@@ -1879,9 +1804,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       devices.delete(device)
       // 断开的设备不再有屏：把还挂着的这一轮朗读掐掉，别继续烧合成额度。
       try { device.cancelRound?.() } catch { /* 忽略 */ }
-      // 设备全断了：还挂着的危险动作确认一律按「离线」拒绝（安全侧默认）。
       if (devices.size === 0) {
-        (confirmBroker as any).failAll?.('offline')
         // 没有屏可刷了：电脑端会话的轮询也停掉，等下一次 hello 再起。
         stopPcSync()
       }
@@ -1932,6 +1855,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         device.send('event.progress', { stage: '指挥', text: '统一指挥已就绪：说一句话就派单，不用挑会话' } satisfies ProgressPayload)
         // 电脑端会话也上棋盘：起一次轮询（列表请求仍由 sessionListTtlMs 节流）并立刻同步一遍。
         ensurePcSync()
+        // 先挂「连上后要不要跟随正在跑的任务」，再触发同步：同步是异步的，
+        // 等它把电脑端任务写进登记簿后，由 syncExternalSessions 决定跳不跳（只跳一次）。
+        device.followPending = true
         void syncExternalSessions().catch((error) => log(`tihu pc sync failed: ${(error as Error)?.message ?? String(error)}`))
         sendBoard(device)
       } else {
@@ -1956,8 +1882,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         return
       }
       const ended = endSession(sessionId)
-      // 还挂着的危险动作确认也一并拒掉（用户已经明确结束本次会话）。
-      ;(confirmBroker as any).failAll?.('rejected')
       device.send('event.progress', {
         stage: '会话',
         text: ended ? `已结束本次语音会话（${payload.reason ?? '页面按钮'}）` : '当前没有进行中的语音会话',
@@ -1977,24 +1901,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         const target = payload.taskId ?? device.focusedTask
         if (target !== undefined && openTask(device, target)) return
         await runScreenCommand(device, { kind: 'open' })
-        return
-      }
-      if (payload.optionIndex !== undefined) {
-        const task = payload.taskId !== undefined ? tasks.get(payload.taskId) : undefined
-        const defaultIndex = task?.defaultIndex ?? 0
-        await answerAwaiting(device, payload.optionIndex === defaultIndex, payload.optionIndex)
-        return
-      }
-      if (payload.text !== undefined) {
-        // 自由文本＝等价于手输回答：**不执行**原来那个危险动作（安全侧默认），
-        // 把这句话接着派回那条任务会话，由它按人的意思继续。
-        const awaiting = tasks.list().filter((item) => item.state === 'awaiting').sort((a, b) => b.updatedAt - a.updatedAt)[0]
-        await answerAwaiting(device, false)
-        const sessionId = awaiting?.sessionIds[awaiting.sessionIds.length - 1]
-        if (sessionId !== undefined && payload.text.trim() !== '') {
-          await promptSession(sessionId, [{ type: 'text', text: payload.text }])
-          device.send('event.progress', { stage: '待决策', text: '已把你的回答送回去（原动作没执行）' } satisfies ProgressPayload)
-        }
         return
       }
       return
@@ -2023,11 +1929,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           if (actionId === 'taskStop') {
             try { device.cancelRound?.() } catch { /* 忽略 */ }
             device.send('event.progress', { stage: '停止', text: '已停止朗读（任务还在跑）' } satisfies ProgressPayload)
-            return
-          }
-          if (actionId.startsWith('taskOption')) {
-            const index = Number(actionId.slice('taskOption'.length))
-            if (Number.isFinite(index)) await answerAwaiting(device, index === 0, index)
             return
           }
           if (actionId === 'pick1' || actionId === 'pick2') {
@@ -2072,11 +1973,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         // 右下角 tap = 回棋盘。
         if (payload.x >= 240 && payload.y >= 180) await runScreenCommand(device, { kind: 'board' })
         return
-      }
-      // 上滑/下滑：任务棋盘翻页（唯一的分页手势；旧主页/回答滚动已删除）。
-      if (payload.action === 'swipe' && typeof payload.dy === 'number' && (payload.phase === 'move' || payload.phase === 'end')) {
-        if (payload.dy === 0) return
-        await stepBoard(device, payload.dy < 0 ? 1 : -1)
       }
       return
     }
@@ -2567,6 +2463,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         })) changed = true
       }
       if (changed) refreshBoards()
+      // 设备刚连上：登记簿里已经有在跑的电脑端任务，就直接切到它的「进度」页（不是待决策）。
+      // 只做一次（followPending）：用户主动回棋盘后，不许下一次轮询又把人拽走。
+      for (const device of devices) {
+        if (!device.unified || device.followPending !== true) continue
+        device.followPending = false
+        const runningTask = tasks.list()
+          .filter((task) => task.source === 'pc' && task.state === 'running')
+          .sort((a, b) => b.updatedAt - a.updatedAt)[0]
+        if (runningTask !== undefined) followRunningTask(runningTask)
+      }
     } finally {
       pcSyncing = false
     }
@@ -2600,6 +2506,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       clearTimeout(device.receiptTimer)
       device.receiptTimer = undefined
     }
+    disarmAutoHome(device)
     device.pendingPick = undefined
     device.focusedTask = task.taskId
     device.onBoard = false
@@ -2622,26 +2529,22 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
   }
 
-  /** 棋盘一帧（含翻页键）。页码按设备记：只有新棋盘有分页。 */
-  function boardFrameFor(device: TihuDevice): { frame: ScreenFramePayload; board: TaskBoardPayload } {
-    const board = boardOf(tasks.list(), Date.now(), device.boardPage ?? 0)
-    device.boardPage = board.page.index
-    const actions: { id: string; label: string }[] = []
-    if (board.page.total > 1 && board.page.index > 0) actions.push({ id: 'homePrev', label: '‹' })
-    if (board.page.total > 1 && board.page.index < board.page.total - 1) actions.push({ id: 'homeNext', label: '›' })
-    const frame = boardFrame(board)
-    return { frame: actions.length === 0 ? frame : { ...frame, actions }, board }
+  /** 棋盘一帧：固定第 0 页（最近 5 条）。旧式翻页控件已删除，320×240 放 5 行。 */
+  function boardFrameFor(): { frame: ScreenFramePayload; board: TaskBoardPayload } {
+    const board = boardOf(tasks.list(), Date.now(), 0)
+    return { frame: boardFrame(board), board }
   }
 
   /** 屏 1：任务棋盘（含空态）。同一版式，有任务就是棋盘、没任务就是空盘。 */
   function sendBoard(device: TihuDevice): void {
     const key = device.sessionId ?? device.id
-    const { frame, board } = boardFrameFor(device)
+    const { frame, board } = boardFrameFor()
     // 回棋盘＝明确离开回执/追问/详情：旧计时器与待选项一起清掉。
     if (device.receiptTimer !== undefined) {
       clearTimeout(device.receiptTimer)
       device.receiptTimer = undefined
     }
+    disarmAutoHome(device)
     device.pendingPick = undefined
     device.focusedTask = undefined
     device.onBoard = true
@@ -2649,15 +2552,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     device.send('screen.frame', frame)
     device.send('task.list', { board } satisfies TaskListPayload)
     log(`tihu board device=${device.id} rows=${board.rows.length} running=${board.counts.running} awaiting=${board.counts.awaiting} queued=${board.counts.queued}`)
-  }
-
-  /** 棋盘一页：上/下滑（或翻页键）都在边界内动，越界不动。 */
-  async function stepBoard(device: TihuDevice, step: number): Promise<void> {
-    const board = boardOf(tasks.list(), Date.now(), device.boardPage ?? 0)
-    const target = Math.max(0, Math.min(board.page.total - 1, board.page.index + step))
-    if (target === board.page.index) return
-    device.boardPage = target
-    sendBoard(device)
   }
 
   /** 棋盘变化：还停在棋盘上的设备刷一帧（详情屏/回执屏不动，免得把人弹走）。 */
@@ -2668,6 +2562,59 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (device.onBoard !== true) continue
       sendBoard(device)
     }
+  }
+
+  /** 电脑端任务开跑：设备自动切到这条任务的「进度」页（屏 4，不是待决策）。 */
+  function followRunningTask(task: TihuTask): void {
+    if (task.source !== 'pc') return
+    for (const device of devices) {
+      if (!device.unified) continue
+      if (device.receiptTimer !== undefined || device.pendingPick !== undefined) continue
+      if (device.pendingVoice !== undefined) continue
+      const frame = taskDetailFrameOf(task)
+      if (frame === undefined) continue
+      disarmAutoHome(device)
+      device.focusedTask = task.taskId
+      device.onBoard = false
+      sendFrame(device, frame, device.sessionId)
+      log(`tihu follow task=${task.taskId} device=${device.id}`)
+    }
+  }
+
+  /** 取消「读完回棋盘」的计时（任何交互都取消）。 */
+  function disarmAutoHome(device: TihuDevice): void {
+    if (device.homeTimer !== undefined) clearTimeout(device.homeTimer)
+    device.homeTimer = undefined
+    device.homeTask = undefined
+  }
+
+  /**
+   * 朗读结束 → 60 秒后自动回棋盘（用户 2026-11-09）。
+   *
+   * 只在设备还停在「刚念完的那一屏」、期间没人交互时才回：用户点了别的任务、
+   * 已经自己回棋盘、或在看另一条完成屏，都不许被这个计时器抢走。
+   */
+  function armAutoHome(device: TihuDevice, spokenMs: number, taskId?: string): void {
+    disarmAutoHome(device)
+    device.homeTask = taskId
+    const wait = Math.max(0, Math.round(Number(spokenMs) || 0)) + HOME_AFTER_SPEECH_MS
+    const timer = setTimeout(() => {
+      device.homeTimer = undefined
+      if (!devices.has(device)) return
+      if (device.onBoard === true) return
+      if (device.homeTask !== taskId) return
+      if (taskId !== undefined) {
+        if (device.focusedTask !== taskId) return
+      } else if ((lastFrames.get(device.sessionId ?? device.id)?.stage ?? '') !== '回答') {
+        return
+      }
+      device.homeTask = undefined
+      log(`tihu auto home device=${device.id} task=${taskId ?? '-'}`)
+      sendBoard(device)
+    }, wait)
+    timer.unref?.()
+    device.homeTimer = timer
+    log(`tihu auto home armed device=${device.id} after=${wait}ms`)
   }
 
   /** 单行变更（协议里的 task.update；固件按它只改一行，不重画整屏）。 */
@@ -2748,7 +2695,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         text: item.text,
         spoken: true,
       } satisfies TaskNotifyPayload)
-      void speakAnnouncement(device, item.text).catch((error) => log(`tihu announce speak failed: ${(error as Error)?.message ?? String(error)}`))
+      void speakAnnouncement(device, item.text)
+        .then((spokenMs) => { if (spokenMs >= 0) armAutoHome(device, spokenMs, item.taskIds[0] || undefined) })
+        .catch((error) => log(`tihu announce speak failed: ${(error as Error)?.message ?? String(error)}`))
     }
     log(`tihu announce level=${item.level} tasks=${item.taskIds.join(',')} text=${JSON.stringify(item.text)}`)
     scheduleAnnounce()
@@ -2764,14 +2713,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 单句播报先查**预录缓存**（`~/.dsh/tihu/preroll/`）：同一句话第二次念不再合成，
    * 直接把裸 PCM 发下去——这是「完成 → 3 秒内听到」最省的一刀（设计 §11 P3）。
    */
-  async function speakAnnouncement(device: TihuDevice, text: string): Promise<void> {
+  async function speakAnnouncement(device: TihuDevice, text: string): Promise<number> {
     const key = device.sessionId ?? '__unbound__'
     const segments = splitSpeechSegments(text)
       .map((segment) => ({ ...segment, text: toSpeechText(segment.text) }))
       .filter((segment) => segment.text !== '')
-    if (segments.length === 0) return
-    if (announcing.has(device.id)) return
+    if (segments.length === 0) return -1
+    if (announcing.has(device.id)) return -1
     announcing.add(device.id)
+    /** 本次下发的 PCM 总时长（毫秒）：页面按同一时间轴排程，用来算「读完」。 */
+    let spokenMs = 0
     const cacheable = segments.length === 1
     const sendPcm = (pcm: Buffer, segment: { text: string; index: number; start: number; end: number }, final = true): void => {
       device.send('tts.audio', {
@@ -2794,7 +2745,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         if (cached !== undefined) {
           sendPcm(cached, segments[0])
           log(`tihu announce preroll hit chars=${[...segments[0].text].length} audio=${prerollAudioMs(cached.length)}ms`)
-          return
+          return prerollAudioMs(cached.length)
         }
       }
       if (!tts.available()) {
@@ -2803,7 +2754,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       const status = tts.status()
       if (!status.available) {
         device.send('event.alert', { level: 'error', text: `本次无语音：${status.error ?? '本地引擎未就绪'}（任务结果已上屏）` })
-        return
+        return 0
       }
       for (const segment of segments) {
         const startedAt = Date.now()
@@ -2815,6 +2766,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           offlineOnly: device.offlineOnly,
           onChunk: (chunk) => {
             if (cacheable) parts.push(chunk.data)
+            spokenMs += chunk.data.length / 2 / 24000 * 1000
             device.send('tts.audio', {
               seq: chunk.seq,
               total: chunk.total,
@@ -2836,9 +2788,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         }
         // 播放时间轴＝首块到达时刻 ＋ 累计音频时长（与页面 AudioContext 排程同口径）。
       }
+      return spokenMs
     } catch (error) {
       log(`tihu announce synth failed: ${(error as Error)?.message ?? String(error)}`)
       device.send('event.alert', { level: 'error', text: `播报没念出来：${(error as Error)?.message ?? String(error)}（任务结果已上屏）` })
+      return spokenMs
     } finally {
       announcing.delete(device.id)
     }
@@ -2869,28 +2823,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     })
   }
 
-  /** 屏 5 的数据源。 */
-  function awaitingFrameOf(task: TihuTask): ScreenFramePayload {
-    const sessionId = task.sessionIds[task.sessionIds.length - 1]
-    const deadline = task.decisionDeadline ?? Date.now() + CONFIRM_TIMEOUT_MS
-    const secondsLeft = Math.max(0, Math.round((deadline - Date.now()) / 1000))
-    return awaitingFrame({
-      taskId: task.taskId,
-      question: task.question ?? '要你定一下',
-      options: task.options ?? ['确认', '取消'],
-      defaultIndex: task.defaultIndex ?? 0,
-      projectName: task.projectName,
-      sessionTitle: sessionId === undefined ? '刚派出' : humanTitle(titleForSession(sessionId)),
-      ...(task.folder === undefined ? {} : { folder: task.folder }),
-      ...(task.detail === undefined ? {} : { detail: task.detail }),
-      secondsLeft: secondsLeft === 0 ? Math.round(CONFIRM_TIMEOUT_MS / 1000) : secondsLeft,
-    })
-  }
-
-  /** 看一条任务：电脑端外部任务走 session.bind 详情；鹈鹕任务走详情（屏 4）或待决策（屏 5）。 */
+  /** 看一条任务：电脑端外部任务走 session.bind 详情；鹈鹕任务走详情（屏 4）。 */
   function openTask(device: TihuDevice, taskId: string): boolean {
     const task = tasks.get(taskId)
     if (task === undefined) return false
+    disarmAutoHome(device)
     if (task.source === 'pc') {
       // 外部任务卡是只读镜像：打开＝绑那条会话看详情（不派单、不建会话、不发尾巴）。
       void openExternalTask(device, task).catch((error) => log(`tihu pc open failed: ${(error as Error)?.message ?? String(error)}`))
@@ -2900,7 +2837,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       clearTimeout(device.receiptTimer)
       device.receiptTimer = undefined
     }
-    const frame = task.state === 'awaiting' ? awaitingFrameOf(task) : taskDetailFrameOf(task)
+    const frame = taskDetailFrameOf(task)
     if (frame === undefined) {
       sendBoard(device)
       return false
@@ -2929,6 +2866,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     const targets = [...devices].filter((item) => item.unified)
     if (targets.length === 0) targets.push(device)
     for (const target of targets) {
+      disarmAutoHome(target)
       target.focusedTask = task.taskId
       target.send('screen.frame', frame)
       sendTaskUpdate(target, task)
@@ -3062,6 +3000,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         clearTimeout(target.receiptTimer)
         target.receiptTimer = undefined
       }
+      disarmAutoHome(target)
       target.pendingPick = undefined
       target.focusedTask = undefined
       target.send('screen.frame', frame)
@@ -3187,7 +3126,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       return
     }
     if (command.kind === 'confirm') {
-      await answerAwaiting(device, command.approved)
+      // 设备屏不承载授权：这类话只在电脑端处理（不弹、不念、不执行）。
+      device.send('event.progress', { stage: '授权', text: '需要在电脑端确认，设备屏不处理授权' } satisfies ProgressPayload)
       return
     }
     if (command.kind === 'pick') {
@@ -3203,75 +3143,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       const rows = boardOf(tasks.list(), Date.now()).rows
       const target = rows[command.index - 1]
       if (target !== undefined) openTask(device, target.taskId)
-    }
-  }
-
-  /** 待决策的回答：点选项 / 口头确认 → 回那条任务（经由登记簿解析出的会话）。 */
-  async function answerAwaiting(device: TihuDevice, approved: boolean, optionIndex?: number): Promise<void> {
-    const task = device.focusedTask !== undefined && tasks.get(device.focusedTask)?.state === 'awaiting'
-      ? tasks.get(device.focusedTask)
-      : tasks.list().filter((item) => item.state === 'awaiting').sort((a, b) => b.updatedAt - a.updatedAt)[0]
-    if (task === undefined) {
-      device.send('screen.frame', noticeFrame({ stage: '待决策', title: '现在没有等你定的问题', lines: [], tone: 'idle' }))
-      return
-    }
-    const options = task.options ?? []
-    const defaultIndex = task.defaultIndex ?? 0
-    // 点选项：给的 index 就是「第几个」（0 起，与屏上按钮同序）；口头确认：「确认」＝默认项。
-    const index = optionIndex !== undefined
-      ? Math.max(0, Math.min(optionIndex, Math.max(0, options.length - 1)))
-      : defaultIndex
-    const chosen = options[index] ?? (approved ? '确认' : '取消')
-    const finalApproved = optionIndex !== undefined ? index === defaultIndex : approved
-    const confirmId = confirmOfTask.get(task.taskId)
-    if (confirmId !== undefined) {
-      confirmOfTask.delete(task.taskId)
-      ;(confirmBroker as any).reply(confirmId, finalApproved)
-    }
-    clearAwaitingTimer(task.taskId)
-    tasks.answer(task.taskId, `设备点选「${chosen}」`)
-    device.focusedTask = task.taskId
-    device.send('event.progress', { stage: '待决策', text: `已答：${chosen}` } satisfies ProgressPayload)
-    const frame = taskDetailFrameOf(task)
-    if (frame !== undefined) device.send('screen.frame', frame)
-    refreshBoards()
-    log(`tihu awaiting answer task=${task.taskId} approved=${String(finalApproved)} option=${JSON.stringify(chosen)}`)
-  }
-
-  /** 待决策超时：按默认项（首选项）走，与托管开着时的自动选择同一条规则。 */
-  function armAwaitingTimer(taskId: string, deadline: number): void {
-    clearAwaitingTimer(taskId)
-    const timer = setTimeout(() => {
-      awaitingTimers.delete(taskId)
-      const task = tasks.get(taskId)
-      if (task === undefined || task.state !== 'awaiting') return
-      const confirmId = confirmOfTask.get(taskId)
-      const defaultIndex = task.defaultIndex ?? 0
-      if (confirmId !== undefined) {
-        confirmOfTask.delete(taskId)
-        ;(confirmBroker as any).reply(confirmId, defaultIndex === 0)
-      }
-      const chosen = (task.options ?? [])[defaultIndex] ?? '默认项'
-      tasks.answer(taskId, `60 秒没答 · 按「${chosen}」走`)
-      // 屏 5 不能停在过期的倒计时上：超时作答后立刻回棋盘（任务仍会继续跑，
-      // 完成时照常出屏 6）。只清「正看着这条任务」的设备，别的屏不动。
-      for (const device of devices) {
-        if (!device.unified || device.focusedTask !== taskId) continue
-        device.focusedTask = undefined
-        sendBoard(device)
-      }
-      log(`tihu awaiting timeout task=${taskId} default=${JSON.stringify(chosen)}`)
-      refreshBoards()
-    }, Math.max(0, deadline - Date.now()))
-    timer.unref?.()
-    awaitingTimers.set(taskId, timer)
-  }
-
-  function clearAwaitingTimer(taskId: string): void {
-    const timer = awaitingTimers.get(taskId)
-    if (timer !== undefined) {
-      clearTimeout(timer)
-      awaitingTimers.delete(taskId)
     }
   }
 
@@ -3439,7 +3310,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         .filter((task) => task.state === 'done' || task.state === 'announced')
         .sort((a, b) => (b.finishedAt ?? b.updatedAt) - (a.finishedAt ?? a.updatedAt))[0]
       if (latest === undefined) return '现在没有可重读的完成结果'
-      void speakAnnouncement(device, doneAnnouncementOf(latest)).catch((error) => log(`tihu control replay failed: ${(error as Error)?.message ?? String(error)}`))
+      void speakAnnouncement(device, doneAnnouncementOf(latest))
+        .then((spokenMs) => { if (spokenMs >= 0) armAutoHome(device, spokenMs, latest.taskId) })
+        .catch((error) => log(`tihu control replay failed: ${(error as Error)?.message ?? String(error)}`))
       return `正在重读：${latest.title}`
     },
     goHome: async (deviceId) => {
@@ -3449,16 +3322,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       sendBoard(device)
       return '已回棋盘'
     },
-    browse: async (deviceId, direction) => {
+    browse: async (deviceId) => {
       const device = findControlDevice(deviceId)
       if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
-      // 新界面只有棋盘分页：prev/next 就是上/下一页。
-      const board = boardOf(tasks.list(), Date.now(), device.boardPage ?? 0)
-      const target = Math.max(0, Math.min(board.page.total - 1, board.page.index + (direction === 'prev' ? -1 : 1)))
-      if (target === board.page.index) return `已经${direction === 'prev' ? '是第一页' : '是最后一页'}（共 ${board.page.total} 页）`
-      device.boardPage = target
-      sendBoard(device)
-      return `已翻到第 ${target + 1}/${board.page.total} 页`
+      return '棋盘固定显示最近 5 条，没有上一页/下一页了'
     },
     openRecent: async (deviceId) => {
       const device = findControlDevice(deviceId)
@@ -3523,20 +3390,18 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       stopPcSync()
       if (announceTimer !== undefined) clearTimeout(announceTimer)
       announceTimer = undefined
-      for (const timer of awaitingTimers.values()) clearTimeout(timer)
-      awaitingTimers.clear()
-      confirmOfTask.clear()
       notifyBus.clear()
       for (const device of devices) {
         if (device.receiptTimer !== undefined) clearTimeout(device.receiptTimer)
         device.receiptTimer = undefined
+        if (device.homeTimer !== undefined) clearTimeout(device.homeTimer)
+        device.homeTimer = undefined
       }
       for (const [sessionId, timer] of thinkingTimers) {
         clearTimeout(timer)
         thinkingTimers.delete(sessionId)
       }
       liveThinking.clear()
-      ;(confirmBroker as any).failAll?.('disposed')
       tts.dispose()
       for (const device of devices) {
         invalidateVoiceInput(device)
@@ -3548,7 +3413,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         try { if (typeof disposer === 'function') disposer() } catch { /* 忽略 */ }
       }
     },
-    stats: () => ({ devices: devices.size, activeSessions: [...activeSessions.keys()], pendingConfirms: (confirmBroker as any).pendingCount?.() ?? 0, tasks: tasks.size() }),
+    stats: () => ({ devices: devices.size, activeSessions: [...activeSessions.keys()], tasks: tasks.size() }),
   }
 }
 

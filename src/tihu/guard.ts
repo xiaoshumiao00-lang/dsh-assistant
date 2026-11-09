@@ -8,8 +8,9 @@
  *      `<工作区>/.tihu/snapshots/<时间戳>/<相对路径>`。删掉/改坏能捞回来。
  *   2. 审计：每次动手往 `<工作区>/.tihu/audit.jsonl` 追加一行（时间 / 来源=tihu /
  *      动作 / 目标 / 决策 / diff 摘要）。JSONL 便于 grep，也便于以后接日志分析。
- *   3. 危险动作确认：删除、覆盖已有文件、执行命令、对外发送 → 先发 confirm.ask，
- *      设备点「确认」才放行；超时或设备不在线一律**按取消处理**（安全侧默认）。
+ *   3. 危险动作**不弹设备**：删除、覆盖已有文件、执行命令、对外发送只写审计，
+ *      授权交给电脑端（宿主 approval/request；托管开着时由托管自动应答）。
+ *      设备屏永不显示命令行与授权请求（2026-11-09 用户实机反馈）。
  *
  * 本文件不依赖 cordis / WebSocket，纯函数 + 文件系统，`scripts/test-tihu-guard.mjs`
  * 可以直接 import 来跑。
@@ -385,85 +386,6 @@ export function readTextOrEmpty(path: string): string {
   try { return existsSync(path) ? readFileSync(path, 'utf8') : '' } catch { return '' }
 }
 
-/* ---------- 危险动作确认 ---------- */
-
-export interface ConfirmRequest {
-  /** 确认 id。 */
-  id: string
-  /** 一行标题。 */
-  title: string
-  /** 详情。 */
-  detail: string
-  /** 超时毫秒（默认 60s）。 */
-  timeoutMs: number
-  /** 风险等级。 */
-  risk?: 'high' | 'medium'
-  /** 归属会话（只推给绑定该会话的设备；缺省推给所有设备）。 */
-  sessionId?: string
-}
-
-export type ConfirmOutcome = 'approved' | 'rejected' | 'timeout' | 'offline' | 'disposed'
-
-export interface ConfirmBroker {
-  /** 发起一次确认，等待设备回应（或超时）。 */
-  ask: (input: { title: string; detail: string; timeoutMs?: number; risk?: 'high' | 'medium'; sessionId?: string }) => Promise<{ outcome: ConfirmOutcome; id: string }>
-  /** 设备回了 confirm.reply。返回是否命中一个在等的请求。 */
-  reply: (confirmId: string, approved: boolean) => boolean
-  /** 当前在等的确认数（调试/测试）。 */
-  pendingCount: () => number
-  /** 设备不在线时由 lane 调用：把在等的请求全部判 offline。 */
-  failAll: (outcome?: ConfirmOutcome) => void
-}
-
-/**
- * 确认代理：lane 建一个，`ask()` 的返回值就是「准不准」。
- *
- * 语义写死在这里：
- *   - 默认 60 s 超时，超时按 **rejected** 之外的 `timeout` 处理，调用方一律当拒绝；
- *   - 设备断开时 lane 调 `failAll('offline')`；
- *   - `ask()` 只保存 resolver，不主动推送——推送由 lane 的 onAsk 回调负责，
- *     这样本文件不依赖协议/WS，单测能直接测「问→超时→拒」。
- */
-export function createConfirmBroker(options: { onAsk?: (request: ConfirmRequest) => void } = {}): ConfirmBroker {
-  const pending = new Map<string, { resolve: (outcome: ConfirmOutcome) => void; timer: ReturnType<typeof setTimeout>; request: ConfirmRequest }>()
-  let counter = 0
-
-  const settle = (id: string, outcome: ConfirmOutcome) => {
-    const entry = pending.get(id)
-    if (!entry) return false
-    pending.delete(id)
-    clearTimeout(entry.timer)
-    entry.resolve(outcome)
-    return true
-  }
-
-  return {
-    ask(input) {
-      counter += 1
-      const id = `confirm-${Date.now().toString(36)}-${counter}`
-      const timeoutMs = Number.isFinite(input.timeoutMs) ? Math.max(1000, Math.floor(input.timeoutMs as number)) : 60_000
-      const request: ConfirmRequest = { id, title: String(input.title ?? ''), detail: String(input.detail ?? ''), timeoutMs, risk: input.risk, sessionId: input.sessionId }
-      return new Promise<{ outcome: ConfirmOutcome; id: string }>((resolvePromise) => {
-        const timer = setTimeout(() => {
-          pending.delete(id)
-          resolvePromise({ outcome: 'timeout', id })
-        }, timeoutMs)
-        // 注意：这里**不能** unref——确认 promise 没 settle 之前进程必须活着，
-        // 否则单测里唯一的 await 会因「没有 ref 的句柄」被判 unsettled TLA 直接退出。
-        pending.set(id, { resolve: (outcome) => resolvePromise({ outcome, id }), timer, request })
-        try { options.onAsk?.(request) } catch { /* 推送失败按超时处理 */ }
-      })
-    },
-    reply(confirmId, approved) {
-      return settle(confirmId, approved ? 'approved' : 'rejected')
-    },
-    pendingCount() { return pending.size },
-    failAll(outcome = 'offline') {
-      for (const id of [...pending.keys()]) settle(id, outcome)
-    },
-  }
-}
-
 /* ---------- 测试辅助 ---------- */
 
 /** 直接写一份测试用文件（保证父目录存在）。 */
@@ -483,5 +405,4 @@ export const tihuGuardTestSurface = {
   readAudit,
   diffSummary,
   timestampSlug,
-  createConfirmBroker,
 }

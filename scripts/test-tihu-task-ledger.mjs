@@ -41,10 +41,8 @@ import {
   taskTitleOf,
 } from '../src/tihu/task-ledger.ts'
 import {
-  DECISION_SECONDS,
   RECEIPT_SECONDS,
   askWhichFrame,
-  awaitingFrame,
   boardFrame,
   detailFrame,
   doneAnnouncementOf,
@@ -558,26 +556,6 @@ test('任务详情（屏 4）：标题只有「第 N 步 · 已用」，正文�
   assert.deepEqual(frame.actions.map((item) => item.label), ['停止', '回棋盘'])
 })
 
-test('待决策（屏 5）：托管未开 + 默认项标记 + 60 秒倒计时', () => {
-  const frame = awaitingFrame({
-    taskId: 't5',
-    question: '删掉 3 个旧结果文件？',
-    options: ['确认删除', '先留着，别删'],
-    defaultIndex: 1,
-    projectName: '青年基金申请书',
-    sessionTitle: '改写第 3 段',
-    detail: '.tihu/snapshots/20261109-1542/',
-    secondsLeft: 60,
-  })
-  assert.equal(frame.stage, '待决策 · 托管未开')
-  assert.equal(frame.title, '删掉 3 个旧结果文件？')
-  assert.ok(frame.bullets.includes('来源：青年基金申请书'), '要显示哪个项目卡')
-  assert.ok(frame.bullets.some((line) => line.startsWith('文件夹 ')) === false, '没给 folder 时不编文件夹')
-  assert.deepEqual(frame.actions.map((item) => item.label), ['确认删除', '先留着，别删·默认'])
-  assert.equal(frame.countdown.seconds, 60)
-  assert.equal(frame.countdown.totalSeconds, DECISION_SECONDS)
-  assert.equal(frame.tone, 'warn')
-})
 
 test('完成播报（屏 6）：「另有 N 条」收进状态行，不再单独占气泡带', () => {
   const single = doneFrame({ taskId: 't6', resultLine: '第 3 段改写完成', others: 0 })
@@ -615,7 +593,6 @@ test('所有任务屏的共同契约：不新增必填字段、按钮 id 不重�
   const frames = [
     receiptFrame({ taskId: 't', projectName: '一个非常非常非常长的项目名字用来测试标题省略', folder: 'D:/x', queueAhead: 1 }),
     detailFrame({ taskId: 't', stageWord: '思考', step: 1, elapsedMs: 0, activity: [], statsLine: '上下文 3%', projectName: 'P', sessionTitle: 'S' }),
-    awaitingFrame({ taskId: 't', question: '一个非常非常非常长的问题句用来测试标题省略行为是否正确', options: ['a', 'b'], defaultIndex: 0, projectName: 'P', sessionTitle: 'S', secondsLeft: 30 }),
     doneFrame({ taskId: 't', resultLine: '一个非常非常非常长的结果行用来测试标题省略行为是否正确', others: 3 }),
     askWhichFrame({ candidates: [] }),
   ]

@@ -67,12 +67,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen.alert { border-color:#000; }
   #screen.warn { border-color:#000; }
   #screen.warn .stage, #screen.warn .title { color:var(--warn); }
-  #screen.awaiting-mode .cd-row { display:none !important; }
-  #screen.awaiting-mode .cd-row, #screen.awaiting-mode .cd-track, #screen.awaiting-mode .cd-fill, #screen.awaiting-mode .bar, #screen.awaiting-mode #progress { display:none !important; }
   #screen.ask-mode .cd-row, #screen.ask-mode .cd-track, #screen.ask-mode .cd-fill, #screen.ask-mode .bar, #screen.ask-mode #progress { display:none !important; }
   #screen.detail-mode .cd-row, #screen.detail-mode .cd-track, #screen.detail-mode .cd-fill, #screen.detail-mode .bar, #screen.detail-mode #progress { display:none !important; }
-  /* 追问/详情/待决策是纯状态屏：底部只留黑底，连状态屏残留的 1px 分隔线也不显示。 */
-  #screen.ask-mode::after, #screen.detail-mode::after, #screen.awaiting-mode::after {
+  /* 追问/详情是纯状态屏：底部只留黑底，连状态屏残留的 1px 分隔线也不显示。 */
+  #screen.ask-mode::after, #screen.detail-mode::after {
     content:''; position:absolute; left:0; right:0; bottom:0; height:18px; background:#05080b; z-index:20; pointer-events:none;
   }
   /* 完成播报的朗读波形（CSS 动态，7 根） */
@@ -90,14 +88,14 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen.alert .title, #screen.alert .stage { color:var(--err); }
   /* 首页最上方那一行（用户 2026-11-08 确认）：原来的「项目 N 个 · 第 x/y 页」整段删掉，
      换成「本地时钟 HH:MM」+「三格信号柱」。这一行占掉 stage 原来那一行的位置（12px/行高 14），
-     总高度不变，底部翻页条不会被顶出 224px 内容高。状态屏 / 回答屏的 stage 行照旧。
+     总高度不变（底部翻页条已在 2026-11-09 删除）。状态屏的 stage 行照旧。
      信号柱是纯 CSS 内联元素（三根 <span>，高度递增、底对齐），没有 emoji、没有图片、没有外部字体图标；
      断开只靠颜色（红）区分，不写「断开」两个字。 */
   #screen .home-top { display:none; flex:none; align-items:flex-end; gap:8px; height:14px; box-sizing:border-box; }
   #screen.home-mode .home-top { display:flex; }
   #screen.home-mode .stage { display:none; }
   /* 顶行时钟数字加粗（用户 2026-11-08 本轮要求，只加粗这一处）：字号 12px、行高 14px、颜色、位置、
-     三格信号柱、底部翻页条、回答屏与状态屏的 stage 行全部照旧。粗体只把字形撑宽约 6%（12px/700 比常规宽），
+     三格信号柱与状态屏的 stage 行全部照旧（底部翻页条已删）。粗体只把字形撑宽约 6%（12px/700 比常规宽），
      HH:MM 五个字符加粗后实测约 40px，离可用宽还差得远（304 − 行间隙 8 − 信号柱 19 = 277），
      所以这一行不会换行、不会溢出、也不会被 fitTextPx 裁成省略号，顶行那套尺寸常量（柱宽 5、柱间隙 2、行间隙 8）不用动。
    * 这条规则只作用在 .clock 上（屏内 .clock 只有 #homeClock 这一个元素）。 */
@@ -124,17 +122,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen.home-mode .home-body { display:block; }
   #screen.home-mode .title, #screen.home-mode ul, #screen.home-mode .bar,
   #screen.home-mode .action-bar { display:none; }
-  /* 棋盘底部翻页条：只在 home-mode 显示，按钮 min-height 28px。
-     这一行占掉底部 28px + 4px 间隙，所以 5 行任务必须收进 170px：
-     224 内容高 = 顶行 14 + 间隙 4 + 5×34 + 间隙 4 + 翻页条 28 = 220（不留半行）。 */
-  #screen .home-pager { display:none; flex:none; align-items:center; gap:6px; }
-  #screen.home-mode .home-pager { display:flex; }
-  #screen .home-pager button { flex:none; width:64px; min-height:28px; padding:0; border-radius:6px;
-    border:1px solid #33414f; background:#1b2430; color:#d9e2ea; font-size:16px; line-height:26px; }
-  #screen .home-pager button.off { opacity:.45; }
-  #screen .home-pager button:active { background:#2c3d4e; }
-  #screen .home-pager .page { flex:1; min-width:0; text-align:center; font-size:13px; line-height:16px;
-    color:#9fb0c0; white-space:nowrap; overflow:hidden; }
+  /* 旧式翻页条已整体删除（用户 2026-11-09：设备屏不要翻页控件）。
+     棋盘固定显示最近 5 条：那 28px 分给 5 行任务（每行 40px），320×240 内不溢出。 */
   /* 状态屏/回执/完成屏的底部动作条 */
   #screen .action-bar { display:none; flex:none; gap:6px; padding-top:4px; }
   #screen .action-bar button { flex:1; min-width:0; min-height:28px; padding:0 2px; white-space:nowrap;
@@ -148,16 +137,14 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   @keyframes tapFlash { from { opacity:.8; transform:scale(.4); } to { opacity:0; transform:scale(1.4); } }
 
   /* ── 任务棋盘（屏 1，2026-11-09 统一指挥会话）──
-     与首页同一副骨架（顶行 14 + 5 行 + 底部翻页 28），只是行的语义从「项目」变成「任务」：
-     一行 34px（比项目行高 4px，要塞下「胶囊 + 任务名」和「项目 · 第 N 步」两行字）。
-     内容高 224 = 顶行 14 + 间隙 4 + 5×34 + 间隙 4 + 翻页 28 = 220，仍不留半行。 */
+     只有顶行 14 + 最近 5 行，不再有底部翻页条：
+     内容高 224 = 顶行 14 + 间隙 4 + 5×40 + 余 10，一行 40px 要塞下两行字。 */
   #screen.board-mode .home-top { display:flex; }
   #screen.board-mode .stage, #screen.board-mode .title, #screen.board-mode ul,
   #screen.board-mode .bar, #screen.board-mode .action-bar { display:none; }
   #screen.board-mode .home-body { display:block; }
-  #screen.board-mode .home-pager { display:flex; }
-  #screen .board-item { height:34px; box-sizing:border-box; padding:1px 0; overflow:hidden; }
-  #screen .board-row1 { display:flex; align-items:center; gap:6px; font-size:15px; font-weight:700; line-height:18px; white-space:nowrap; overflow:hidden; }
+  #screen .board-item { height:40px; box-sizing:border-box; padding:2px 0; overflow:hidden; }
+  #screen .board-row1 { display:flex; align-items:center; gap:6px; font-size:15px; font-weight:700; line-height:20px; white-space:nowrap; overflow:hidden; }
   /* 状态胶囊：文字优先（色盲/强光下也读得出），颜色只做辅助 */
   #screen .board-capsule { flex:none; font-size:11px; line-height:14px; font-weight:700; letter-spacing:.5px;
     padding:1px 5px; border-radius:4px; background:#1b2430; color:#9fb0c0; border:1px solid #2b3a4a; }
@@ -174,7 +161,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .ask-source { font-size:10px; line-height:12px; color:#9fb0c0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #screen .board-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
   #screen .board-merged { flex:none; font-size:11px; color:#7c8b99; }
-  #screen .board-row2 { display:flex; align-items:center; gap:6px; font-size:12px; line-height:14px; color:#8b97a5; }
+  #screen .board-row2 { display:flex; align-items:center; gap:6px; font-size:12px; line-height:16px; color:#8b97a5; }
   #screen .board-sub { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
   /* 时长环（满圈＝30 分钟）：进行中按已用时长画弧，跑久了转琥珀，完成满环，排队空环。
      环只做辅助，精确时长在详情屏用文字给。 */
@@ -256,23 +243,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   .screen-tools button.unsupported { opacity:.45; }
   .screen-tools .hint { margin-left:auto; }
   select, #voiceName, #voiceNote { font:inherit; color:var(--fg); background:#0d131b; border:1px solid var(--line); border-radius:9px; padding:8px 10px; width:100%; }
-  /* 屏下的会话选择器：没有会话时展开、绑定后收起（按钮可再展开） */
-  .sess-now { font-size:13px; line-height:1.35; margin:0 0 8px; word-break:break-word; }
-  .sess-now.none { color:var(--warn); }
-  .sess-now.bad { color:var(--err); }
-  .cu-warn { display:none; background:#3a1414; border:1px solid #b04545; color:#ffd9d9;
-    border-radius:8px; padding:8px 10px; font-size:12px; line-height:1.45; margin:0 0 8px; }
   /* 音频解锁横幅：浏览器自动播放策略会把手动创建的 AudioContext 置为 suspended，
      此时 PCM 全部「到达但不出声」。点一次页面即可解锁（resume）。 */
   .audio-warn { display:none; background:#3a2f12; border:1px solid #b08a45; color:#ffe9c2;
     border-radius:8px; padding:8px 10px; font-size:12px; line-height:1.45; margin:8px 12px 0; cursor:pointer; }
   .audio-warn.on { display:block; }
-  .sess-item.off { opacity:.55; border-style:dashed; cursor:default; }
-  .sess-list { display:flex; flex-direction:column; gap:6px; max-height:34vh; overflow:auto; }
-  .sess-item { text-align:left; display:flex; flex-direction:column; gap:2px; padding:8px 10px; }
-  .sess-item .t { font-size:13px; line-height:1.3; }
-  .sess-item .m { font-size:11px; color:var(--dim); }
-  .sess-item.on { border-color:var(--accent); background:#132420; }
   .row { display:flex; gap:8px; align-items:stretch; }
   button { font:inherit; color:var(--fg); background:var(--panel); border:1px solid var(--line); border-radius:9px; padding:10px 12px; }
   button:active { background:#1a2431; }
@@ -318,7 +293,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         <ul id="bullets"></ul>
         <div id="actionBar" class="action-bar"></div>
         <div id="homeBody" class="home-body"></div>
-        <div id="homePager" class="home-pager"></div>
         <div id="cdRow" class="cd-row"><span id="cdText"></span><div class="cd-track"><div class="cd-fill" id="cdFill"></div></div></div>
         <div id="listen" class="listen">
           <div class="l0">在听 · 已唤醒</div>
@@ -444,17 +418,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     return out;
   }
   var $ = function (id) { return document.getElementById(id); };
-  var state = { ws: null, seq: 0, clientId: '', sessionId: '', sessionTitle: '', 
-    showList: false,
-    sessionBound: false, 
+  var state = { ws: null, seq: 0, clientId: '', sessionId: '', 
     
     lastTranscript: '', recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0,
     connState: 'connecting', clockTimer: 0,
     
     audioCtx: null, pcmSources: [], pcmNextTime: 0, droppedAudio: false,
+    /* 朗读自检：收到多少块 / 最后一块是否已排程 / 被丢掉的块数（页面事件区与 __tihuAudioCheck 可查） */
+    ttsChunks: 0, ttsFinalSeen: false, ttsDropped: 0,
     samplePending: false, sampleTimer: 0,
     voice: 'default', voices: [], voiceEngine: null,
-    highlightLock: false, hostAlert: false, screenMode: 'status', boundProject: '', screenScale: 2, actions: [], 
+    highlightLock: false, hostAlert: false, screenMode: 'status', screenScale: 2, actions: [], 
     /* 任务棋盘（屏 1）与派单回执 / 待决策的附加块（2026-11-09 统一指挥会话） */
     board: null, steps: [], countdown: null, countdownTimer: 0,
     /* 免按住（唤醒词聆听）：browser 关键词 → 屏 3「在听」→ 停 3 秒发送；10 秒没说话退出 */
@@ -487,13 +461,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     return out;
   }
-  /**
-   * 绑定信息：本轮从右下角搬到回答屏顶行末尾（用户 2026-11-08 确认）。文字内容取的还是本来那一套
-   * 状态——state.sessionBound 决定出不出，内容用 state.boundProject（项目名优先）→ state.sessionTitle →
-   * 「未命名会话」兜底，跟旧的角落提示一模一样，没有换成语义不同的东西；未绑定就整段不出（不写「未绑定」占位）。
-   * 只用在回答屏（reply 分支，见 replyStageText / bindTailOf）：首页顶行仍是上一轮的加粗时钟 + 三格信号柱，
-   * 状态屏顶行也不加绑定信息；右下角那个角落提示什么都不显示（CSS display:none + 不写任何文字）。
-   */
   function renderActions() {
     var bar = $('actionBar');
     bar.innerHTML = '';
@@ -551,49 +518,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       counts.textContent = state.screenMode === 'board' ? fitTextPx(boardCountsText(state.board && state.board.counts), 170, 11) : '';
     }
   }
-  /** 主页底部翻页条：‹ 上一页 / 第 x/y 页 / › 下一页；越界的一侧置灰（点它宿主也不动页码）。 */
+
   /* ---------- 任务棋盘（屏 1）：一行一任务 ----------
-   * 版式照设计：顶行三段计数（●N 在跑 ●N 等你 ●N 排队）→ 5 行任务 → 底部翻页。
+   * 版式：顶行三段计数（●N 在跑 等你 排队）→ 最近 5 行任务。旧式翻页条已整体删除
+   * （用户 2026-11-09：设备屏不要上一页/下一页），5 行分掉原来那 28px，320×240 不溢出。
    * 每行只说三件事：状态胶囊（文字）、任务名、副行「项目 · 第 N 步」＋右侧时长环。
-   * 待决策行右侧是琥珀问号（不显示时长）；同一项目连续多条折叠成「+N 条」。
-   * 没有任务时是**同一张棋盘的另一种脸**（空态），不另开一屏。
-   */
-  function renderHomePager(payload) {
-    var pager = $('homePager');
-    var home = payload.home || {};
-    var page = home.page || { index: 0, total: 1 };
-    var total = Number(page.total);
-    if (!Number.isFinite(total) || total < 1) total = 1;
-    // 只有一页时不显示翻页条（避免屏底留一排无效箭头/页码）。
-    if (total <= 1) {
-      pager.innerHTML = '';
-      pager.style.display = 'none';
-      return;
-    }
-    pager.style.display = 'flex';
-    var index = Number(page.index);
-    if (!Number.isFinite(index) || index < 0) index = 0;
-    if (index > total - 1) index = total - 1;
-    pager.innerHTML = '';
-    var prev = document.createElement('button');
-    prev.textContent = '‹';
-    prev.className = index > 0 ? '' : 'off';
-    prev.setAttribute('data-action', 'homePrev');
-    var label = document.createElement('span');
-    label.className = 'page';
-    label.textContent = '第 ' + (index + 1) + '/' + total + ' 页';
-    var next = document.createElement('button');
-    next.textContent = '›';
-    next.className = index < total - 1 ? '' : 'off';
-    next.setAttribute('data-action', 'homeNext');
-    pager.appendChild(prev);
-    pager.appendChild(label);
-    pager.appendChild(next);
-  }
-  /* ---------- 任务棋盘（屏 1）：一行一任务 ----------
-   * 版式照设计：顶行三段计数（●N 在跑 ●N 等你 ●N 排队）→ 5 行任务 → 底部翻页。
-   * 每行只说三件事：状态胶囊（文字）、任务名、副行「项目 · 第 N 步」＋右侧时长环。
-   * 待决策行右侧是琥珀问号（不显示时长）；同一项目连续多条折叠成「+N 条」。
    * 没有任务时是**同一张棋盘的另一种脸**（空态），不另开一屏。
    */
 
@@ -626,7 +555,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     $('stage').textContent = '';
     var clock = $('homeClock');
     if (clock) renderHomeTop();
-    renderHomePager({ home: { page: board.page || { index: 0, total: 1 } } });
     renderSteps([]);
     renderCountdown(null);
     var body = $('homeBody');
@@ -842,7 +770,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       list.appendChild(li);
     }
     state.actions = Array.isArray(payload.actions) ? payload.actions : [];
-    applyScreenClass((payload.tone || 'idle') + (state.actions.length ? ' has-actions' : '') + (String(payload.stage || '').indexOf('待决策') === 0 ? ' awaiting-mode' : '') + (payload.stage === '追问' ? ' ask-mode' : '') + (payload.stage === '进度' ? ' detail-mode' : ''));
+    applyScreenClass((payload.tone || 'idle') + (state.actions.length ? ' has-actions' : '') + (payload.stage === '追问' ? ' ask-mode' : '') + (payload.stage === '进度' ? ' detail-mode' : ''));
     renderActions();
     var progress = payload.progress;
     if (progress && typeof progress.done === 'number') {
@@ -852,7 +780,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     applyAudioRecovery();
   }
 
-  /* reply 模式渲染：句子窗口 → 按 304/240 像素折行 → 可视 7 行（末行下留一整行安全高度），当前句反色。 */
   function addEvent(kind, text) {
     var row = document.createElement('div');
     row.className = kind;
@@ -860,12 +787,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     $('events').appendChild(row);
   }
 
-  /* ---------- 会话选择器（屏下，只列 Computer Use 模式） ----------
-   * 鹈鹕要靠 GUI 看屏幕、点按钮：只有 Computer Use / 电脑操作模式的会话能接这活。
-   * 模式判定**只认宿主返回的 agentPreset**（投影 agentPreset，回退 header），
-   * 不靠标题猜。宿主只下发 CU 会话；非 CU 会话在页面上只能是「当前（不可用）」灰色行。
-   */
-  /** 手动会话失效 / 不是 CU：按优先级回落到「自动绑定最近活跃 CU」。 */
   /* ---------- 本地 TTS（PCM）播放 ----------
      sidecar 以 24kHz/pcm16 流式下发，页面用 WebAudio 无缝排队拼接。
      页面只播放宿主合成的 PCM（edge 云健 / Qwen GPU），不再使用浏览器语音。 */
@@ -968,6 +889,13 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         var index = state.pcmSources.indexOf(source);
         if (index >= 0) state.pcmSources.splice(index, 1);
         if (state.audioCtx && state.pcmNextTime <= state.audioCtx.currentTime + 0.05) state.highlightLock = false;
+        // 朗读结束自检：最后一块播完、队列清空 → 记一行（宿主 60 秒后自动回棋盘）。
+        if (state.ttsFinalSeen && state.pcmSources.length === 0) {
+          state.ttsFinalSeen = false;
+          var endedOk = audioRunning(state.audioCtx);
+          console.assert(endedOk, '[tihu] 朗读播完时 AudioContext 不是 running：' + (state.audioCtx && state.audioCtx.state));
+          addEvent(endedOk ? 'done' : 'alert', endedOk ? '朗读结束：60 秒后自动回棋盘' : '朗读结束时音频仍未解锁（点一下屏幕再点重读）');
+        }
       };
       // 重读缓存（本轮完整 PCM）；试听音频不进缓存（否则下次「重读」会念成试听句）。
       return { startAt: startAt, duration: buffer.duration };
@@ -1032,6 +960,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   /** 收到试听音频：播放 + 明确回执；试听 PCM 不进本轮朗读缓存。 */
   function playSampleAudio(base64, sampleRate) {
     state.samplePending = false;
+    state.ttsChunks = 0;
+    state.ttsFinalSeen = false;
     clearTimeout(state.sampleTimer);
     var played = playPcm(base64, sampleRate, false);
     var hint = $('audioTestHint');
@@ -1202,6 +1132,24 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
           playSampleAudio(String(payload.data || ''), Number(payload.sampleRate) || 24000);
           break;
         }
+        // 正式朗读（完成页/回答页）：宿主按块下发 24kHz PCM，这里排队播放。
+        // 2026-11-09 断音根因：上一轮删「旧朗读链路」时把这一段一起删了，只剩试听分支，
+        // 于是 tts.audio 全部到达、页面一个字节都不播（完成页看着就是没声音）。
+        resumeAudio();
+        var audioRate = Number(payload.sampleRate) || 24000;
+        if (audioRate !== 24000) {
+          console.warn('[tihu] 朗读采样率异常', audioRate);
+          addEvent('alert', '朗读采样率异常：' + audioRate + '（期望 24000）');
+        }
+        var chunkPlayed = playPcm(String(payload.data || ''), audioRate, true);
+        if (chunkPlayed) {
+          state.ttsChunks += 1;
+          window.__tihuAudioCheck = { chunks: state.ttsChunks, lastRate: audioRate, lastAt: Date.now(), playing: state.pcmSources.length };
+          if (state.ttsChunks === 1) addEvent('progress', '朗读开始：' + audioRate + 'Hz');
+          if (payload.final === true) { state.ttsFinalSeen = true; addEvent('progress', '朗读：最后一块已排入播放队列'); }
+        } else {
+          state.ttsDropped += 1;
+        }
         break;
       }
       case 'voice.list': {
@@ -1241,7 +1189,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         // 本地 TTS 失败：立刻把所有待念文本交给系统语音，别让用户等 4 秒兜底。
         addEvent('alert', (payload.level === 'error' ? '错误：' : '') + (payload.text || ''));
         break;
-      case 'session.bound': state.sessionBound = true; state.sessionId = payload.sessionId || ''; state.sessionTitle = payload.title || ''; break;
+      case 'session.bound': state.sessionId = payload.sessionId || ''; break;
       /* 任务登记簿（2026-11-09 统一指挥）：棋盘数据既随 screen.frame.board 下发，
          也单独发一条 task.list（固件只认这条也没问题）；播报帧只在事件区记一行。 */
       case 'task.list':
@@ -1258,8 +1206,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       default: break; /* 未知 type：忽略 */
     }
   }
-
-  /* ---------- 危险动作确认 ---------- */
 
   /* ---------- 真机屏幕：缩放三档 + 外壳开关（只影响显示，不改 320×240 内容） ---------- */
   var SCALE_MODES = {
@@ -1356,12 +1302,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     return merged;
   }
-  function sendAudio(arrayBuffer, label) {
-    if (!state.sessionId) {
-      addEvent('alert', '还没有选定会话：点下面的会话列表选一个');
-      state.showList = true;
-      return;
-    }
+  /** 把一段音频（录音文件/拖进来的 WAV）解码成 16k 单声道后上行（audio.frame）。
+      统一指挥没有「选会话」这回事：这里不再读 state.sessionId，也不弹旧会话列表。 */
+  function uploadWav(arrayBuffer, label) {
     decodeAndResample(arrayBuffer).then(function (result) {
       addEvent('progress', label + '：' + result.durationMs + ' ms，已上行，等待转写…');
       send('audio.frame', {
@@ -1396,7 +1339,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       recorder.onstop = function () {
         stream.getTracks().forEach(function (t) { t.stop(); });
         var blob = new Blob(state.chunks, { type: recorder.mimeType || 'audio/webm' });
-        blob.arrayBuffer().then(function (buffer) { sendAudio(buffer, '录音'); });
+        blob.arrayBuffer().then(function (buffer) { uploadWav(buffer, '录音'); });
       };
       recorder.start();
       talk.classList.add('rec');
@@ -1420,7 +1363,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   $('file').addEventListener('change', function (event) {
     var file = event.target.files && event.target.files[0];
     if (!file) return;
-    file.arrayBuffer().then(function (buffer) { sendAudio(buffer, file.name); });
+    file.arrayBuffer().then(function (buffer) { uploadWav(buffer, file.name); });
     event.target.value = '';
   });
   var drop = $('drop');
@@ -1430,18 +1373,13 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     event.preventDefault();
     drop.classList.remove('on');
     var file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
-    if (file) file.arrayBuffer().then(function (buffer) { sendAudio(buffer, file.name); });
+    if (file) file.arrayBuffer().then(function (buffer) { uploadWav(buffer, file.name); });
   });
 
   /* ---------- 文本 / 撤回 ---------- */
   $('send').onclick = function () {
     var text = $('text').value.trim();
     if (!text) return;
-    if (!state.sessionId) {
-      addEvent('alert', '还没有选定会话：点下面的会话列表选一个');
-      state.showList = true;
-      return;
-    }
     send('text.input', { text: text, source: 'keyboard' });
     state.droppedAudio = false;
     hideAudioWarn();
@@ -1688,10 +1626,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         if (under && under.getAttribute) {
           var actionId = under.getAttribute('data-action');
           if (actionId) {
-            // 主页/翻页都算「退出本轮朗读」：和停止一样先把页面音频队列掐掉（宿主也会 cancelRound），
+            // 停止/回主页都算「退出本轮朗读」：和停止一样先把页面音频队列掐掉（宿主也会 cancelRound），
             // 差别只是不回「已停止朗读」提示。
-            if (actionId === 'stop' || actionId === 'home' || actionId === 'prev' || actionId === 'next' ||
-                actionId === 'homePrev' || actionId === 'homeNext') stopPcm();
+            if (actionId === 'stop' || actionId === 'home' || actionId === 'prev' || actionId === 'next') stopPcm();
             if (actionId === 'replay' && audioRunning(state.audioCtx)) {
               state.droppedAudio = false;
               hideAudioWarn();

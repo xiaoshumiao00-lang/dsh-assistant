@@ -7,17 +7,13 @@
  *     带旧宿主不认识的字段，旧宿主不认识就忽略，不能因此判整条消息非法）。
  *   - **未知 type 必须忽略**：`parseUpstream()` 对不认识的 type、坏 JSON、超长的
  *     文本一律返回 `null`，绝不抛错——设备端以后加消息类型时，老宿主不能崩。
- *   - 上行十种：hello / audio.frame / text.input / confirm.reply / session.end /
- *     sessions.query / session.bind / ping（另有 tihu 专属的 voice.* / screen.gesture /
- *     tts.sample）。
- *   - 下行十一种：transcript / tts.text / screen.frame / event.progress /
- *     event.alert / event.done / confirm.ask / sessions.list / session.bound /
- *     session.invalid（以及宿主回给设备的 ping 回执 pong）。
+ *   - 上行：hello / audio.frame / text.input / session.end / screen.gesture /
+ *     voice.* / tts.sample / task.reply / ping。
+ *   - 下行：transcript / tts.audio / screen.frame / event.progress / event.alert /
+ *     session.bound / voice.* / task.* / pong。设备屏上不存在任何「授权请求」消息。
  *
- * 2026-11-07 P0 会话绑定：页面不再只靠 `localStorage['dsh.sessions.current']`
- * （localStorage 按 origin 隔离，公网 origin 下读不到桌面宿主选的会话），改成
- * 连上 lane 后向宿主拉会话列表、自己选一个；`sessions.query` / `session.bind`
- * 与对应的三条下行就是这条路。协议仍遵守「字段只增不删、未知 type 忽略」。
+ * 2026-11-09 统一指挥：页面开机发裸 hello，宿主绑到唯一的指挥会话；设备只认任务七屏，
+ * 没有会话选择器、没有授权屏。协议仍遵守「字段只增不删、未知 type 忽略」。
  *
  * 为什么单独一层：P1 要换成真板子（ESP32-S3-BOX-3）固件，协议必须能脱离
  * WebSocket 实现被单测覆盖——`scripts/test-tihu-protocol.mjs` 直接 import 本文件。
@@ -73,7 +69,7 @@ export interface TihuEnvelope<T extends string, P> {
   v: typeof TIHU_PROTOCOL_VERSION
   /** 消息类型。 */
   type: T
-  /** 消息 id（回声用：confirm.reply 必须带上对面 confirm.ask 的 id）。 */
+  /** 消息 id（回声用：设备回执带回原消息 id）。 */
   id: string
   /** 发送方自增序号，便于发现丢帧；宿主不依赖它排序。 */
   seq: number

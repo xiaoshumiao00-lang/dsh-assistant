@@ -8,7 +8,7 @@
  *   - 字段只增不删：多余字段保留，旧字段少一个才判非法；
  *   - audio.frame 必须是 16k / 单声道 / 16 bit 的 WAV（P0 只认这一种）；
  *   - 屏帧要点行与 TTS 分段有上限（320×240 屏装不下长文本）；
- *   - 三道闸：危险动作才确认、超时按取消、写前快照落在 .tihu/snapshots、审计是 JSONL；
+ *   - 两道闸：写前快照落在 .tihu/snapshots、审计是 JSONL；危险动作的授权只在电脑端（设备屏永不显示）；
  *   - lane：hello 绑会话 + text.input 注入走 agents.followup（不是另建会话体系）。
  */
 import assert from 'node:assert/strict'
@@ -33,7 +33,6 @@ import {
 import {
   appendAudit,
   classifyTool,
-  createConfirmBroker,
   diffSummary,
   isReadOnlyCommand,
   readAudit,
@@ -47,7 +46,6 @@ import {
   applyEarlyThinking,
   applySessionEvent,
   clipText,
-  confirmationFrame,
   createProgressState,
   decodeRateOf,
   pushDecodeSample,
@@ -431,26 +429,6 @@ try {
     assert.equal(diffSummary('same\n', 'same\n').summary, '内容未变化')
   })
 
-  await testAsync('确认：设备点确认 → approved；取消 → rejected；超时 → timeout', async () => {
-    const seen = []
-    const broker = createConfirmBroker({ onAsk: (request) => seen.push(request.id) })
-    const approved = broker.ask({ title: '删除', detail: 'tmp/a.txt', timeoutMs: 1000 })
-    assert.equal(seen.length, 1)
-    assert.equal(broker.reply(seen[0], true), true)
-    assert.equal((await approved).outcome, 'approved')
-
-    const rejected = broker.ask({ title: '删除', detail: 'tmp/b.txt', timeoutMs: 1000 })
-    assert.equal(broker.reply(seen[1], false), true)
-    assert.equal((await rejected).outcome, 'rejected')
-
-    const timedOut = await broker.ask({ title: '命令', detail: 'rm -rf', timeoutMs: 1000 })
-    assert.equal(timedOut.outcome, 'timeout')
-
-    const offline = broker.ask({ title: '命令', detail: 'x', timeoutMs: 5000 })
-    broker.failAll('offline')
-    assert.equal((await offline).outcome, 'offline')
-    assert.equal(broker.pendingCount(), 0)
-  })
 } finally {
   rmSync(workspace, { recursive: true, force: true })
 }
@@ -1063,7 +1041,6 @@ test('屏幕文本按像素截断：标题 ≤304px，正文按宽度折行', ()
   assert.deepEqual(bullets, ['第一行', '第二行', '第三行'])
   assert.equal(formatElapsed(12500), '13s')
   assert.equal(formatElapsed(65000), '1m05s')
-  assert.equal(confirmationFrame('删除文件', 'tmp/a.txt').stage, '等待确认')
   assert.equal(summarizeToolResult('ok\nlast line', false).output, 'last line')
   // 屏幕摘要去掉 markdown 噪音
   assert.equal(sanitizeScreenLine('```json'), '')
@@ -2335,43 +2312,6 @@ await testAsync('lane.control 薄壳：archiveSession 转调 workspaceRegistry�
 })
 
 
-/* ---------- 2026-11-08 确认的三处改动：底部翻页入口 / 主页 stage 页数 / 朗读屏窗口位置（方案 B） ---------- */
-
-/** 造 N 个互不嵌套的控制室项目（主页 5 条一页，所以 N>5 就出第二页）。 */
-function pagerProjectsFixture(count) {
-  const now = Date.now()
-  const iso = (agoMs) => new Date(now - agoMs).toISOString()
-  const workspaces = []
-  for (let i = 1; i <= count; i += 1) {
-    workspaces.push({
-      id: 'ws-pager-' + i,
-      path: 'D:\\pj-pager-' + i,
-      title: '翻页项目 ' + i,
-      createdAt: iso(600_000 + count - i),
-      updatedAt: iso(600_000 - i * 1_000),
-      sessionIds: i === 1 ? ['session-pager-a'] : [],
-    })
-  }
-  return workspaces
-}
-
-function pagerLaneFixture(count) {
-  const records = [cuRecord('session-pager-a', { preset: 'computer-use', live: true, cwd: 'D:\\pj-pager-1', lastPromptAt: Date.now() - 5_000, title: '翻页会话 A' })]
-  const { runtime, events } = runtimeFor(records, { workspaceRegistry: workspaceRegistryFixture(pagerProjectsFixture(count)) }, { instance: fakeTts() })
-  const socket = openLane(runtime)
-  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pager', protocol: '0', sessionId: 'session-pager-a' }, 1)))
-  return { runtime, events, socket }
-}
-
-function homeFramesOf(socket) {
-  return framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home')
-}
-
-async function tapPagerButton(socket, actionId, seq) {
-  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 150, y: 215, hit: 'action', actionId }, seq)))
-  await waitMs(90)
-}
-
 test('protocol：回复屏 scroll 多一个 total 字段仍是 v0 最小增量（旧字段一个都不动）', () => {
   const payload = {
     stage: '回答中',
@@ -2433,7 +2373,6 @@ test('page：首页最上方那一行换成本地时钟 + 三格信号柱（纯 
   // 时钟 + 信号柱都在屏内、且在项目列表之前（屏最上方那一行）
   assert.ok(/id="homeClock"/.test(top) && /id="homeSignal"/.test(top), '顶行要有时钟与信号柱两个元素')
   assert.ok(html.indexOf('id="homeTop"') < html.indexOf('id="homeBody"'), '顶行必须排在项目列表之前（屏最上方）')
-  assert.ok(html.indexOf('id="homeTop"') < html.indexOf('id="homePager"'), '顶行必须在底部翻页条之前')
   // 三格信号柱：三根柱、纯内联元素，没有 emoji、没有图片、没有外部字体图标
   const bars = top.match(/<span class="bar b\d"><\/span>/g) || []
   assert.equal(bars.length, 3, '三格信号柱要有三根柱：' + bars.length)
@@ -2491,19 +2430,16 @@ test('page：连接图标接的是页面已有的那一份连接状态（绿/灰
   assert.equal(/clockText|connState|getHours\(\)/.test(laneSource), false, '时钟与连接归页面侧，lane 不掺和')
 })
 
-test('page：顶行占的还是原来那 14px 一行，首页内容高度预算不被翻页条撑爆', () => {
+test('page：顶行 14px，棋盘不再有旧式翻页条，5 行 ×40px 收进 224 内容高', () => {
   const html = pageHtmlOf()
   assert.ok(/#screen \.home-top \{[^}]*height:14px/.test(html), '顶行高 14px（与 stage 那一行同高）')
   assert.ok(/#screen \.home-top \.signal \{[^}]*height:13px/.test(html), '信号柱容器高 13px（不越过行高）')
   assert.ok(/#screen \.home-top \.signal \.bar\.b3 \{ height:13px/.test(html), '最长那根柱 13px')
-  const itemH = Number((html.match(/#screen \.home-item \{ height:(\d+)px/) || [0, 0])[1])
-  const recentH = Number((html.match(/#screen \.home-recent \{[^}]*height:(\d+)px/) || [0, 0])[1])
-  const pagerH = Number((html.match(/#screen \.home-pager button \{[^}]*min-height:(\d+)px/) || [0, 0])[1])
-  const rowH = Number((html.match(/#screen \.home-top \{[^}]*height:(\d+)px/) || [0, 0])[1])
-  const gap = 4 /* #screen 的 flex gap */
-  const used = rowH + gap + recentH + 5 * itemH + gap + pagerH
-  assert.equal(rowH, 14, '顶行行高')
-  assert.ok(used <= SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx, `首页内容高 ${used}px 不得超过 ${SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx}px（半行都不许留）`)
+  assert.equal(html.includes('home-pager'), false, '旧式翻页条（上一页/下一页）已整体删除')
+  const itemH = Number((html.match(/#screen \.board-item \{[^}]*height:(\d+)px/) || [0, 0])[1])
+  assert.equal(itemH, 40, '棋盘一行 40px（原翻页条那 28px 分给 5 行）')
+  const used = 14 + 4 + 5 * itemH
+  assert.ok(used <= SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx, `棋盘内容高 ${used}px 不得超过 ${SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx}px`)
 })
 
 
@@ -3065,7 +3001,7 @@ await testAsync('协议：task.list / task.update / task.notify 都是合法 v0 
   assert.equal(Object.keys(frame.payload).includes('board'), true)
 })
 
-await testAsync('统一指挥：危险动作 → 屏 5 待决策 ＋ P0 播报，屏上答「确认」才放行', async () => {
+await testAsync('统一指挥：危险动作不上设备屏、不弹授权（只在电脑端审批）', async () => {
   const w = unifiedWorkspace()
   const socket = openLane(w.runtime)
   socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u8', protocol: '0' }, 1)))
@@ -3074,32 +3010,18 @@ await testAsync('统一指挥：危险动作 → 屏 5 待决策 ＋ P0 播报�
   await waitMs(90)
   const taskSession = w.prompted[0].id
   const pre = w.events.find((entry) => entry.name === 'tools/pre-execute').handler
-  // 这条任务会话正处在「tihu 派单的那一轮」：危险命令必须等人拍板，不许设备离线就直接拒。
-  const pending = pre({
+  // 设备屏永远不显示命令行/授权请求：危险动作直接放给电脑端（宿主 approval/request）。
+  const outcome = await pre({
     callId: 'call-1',
     name: 'pwsh',
     arguments: { command: 'Remove-Item -Recurse -Force .tihu' },
     agent: { session: { id: taskSession, deriveMessages: () => [{ role: 'user', id: 'msg-' + taskSession }] } },
   }, async () => ({ kind: 'ok' }))
-  await waitMs(80)
+  assert.notEqual(outcome && outcome.kind, 'deny', '设备屏不再拦危险动作：授权只在电脑端处理')
   const frames = framesOf(socket)
-  const asking = frames.filter((frame) => frame.type === 'screen.frame' && String(frame.payload.stage || '').includes('待决策')).pop()
-  assert.ok(asking !== undefined, '要弹待决策屏（屏 5）')
-  assert.ok(asking.payload.stage.includes('托管未开'), '待决策只出现在托管没点亮时：' + asking.payload.stage)
-  assert.ok(asking.payload.actions.some((item) => item.id === 'taskOption0'))
-  assert.ok(asking.payload.actions.some((item) => item.id === 'taskOption1'))
-  assert.ok(asking.payload.countdown && asking.payload.countdown.seconds > 0, '要有 60 秒倒计时')
-  const urgent = frames.filter((frame) => frame.type === 'task.notify' && frame.payload.level === 0).pop()
-  assert.ok(urgent !== undefined, 'P0 要人必须立刻播（不等八秒窗口）')
-  assert.ok(urgent.payload.text.includes('确认'), urgent.payload.text)
-  assert.equal(frames.some((frame) => frame.type === 'confirm.ask'), false, '统一指挥下走屏 5，不再发老的 confirm.ask')
-  // 屏上点「确认」（第 0 个选项）→ broker 放行 → 工具照常执行
-  socket.emit('data', clientFrame(buildUpstream('task.reply', { taskId: 't1', optionIndex: 0 }, 3)))
-  const outcome = await pending
-  assert.notEqual(outcome && outcome.kind, 'deny', '确认后不许再拒：' + JSON.stringify(outcome))
-  await waitMs(40)
-  const answered = framesOf(socket).filter((frame) => frame.type === 'event.progress' && String(frame.payload.text || '').includes('已答')).pop()
-  assert.ok(answered !== undefined, '要说一句「已答」，别让人怀疑点没点上')
+  assert.equal(frames.some((frame) => frame.type === 'screen.frame' && String(frame.payload.stage || '').includes('待决策')), false, '绝不能把待决策弹到设备屏')
+  assert.equal(frames.some((frame) => frame.type === 'task.notify' && frame.payload.level === 0), false, '不再有 P0 授权播报')
+  assert.equal(frames.some((frame) => frame.type === 'confirm.ask'), false, '协议里也没有确认屏了')
   w.cleanup()
 })
 
@@ -3269,11 +3191,14 @@ await testAsync('电脑端会话：turn/end → 完成卡＋一句播报，不�
   assert.ok(note.payload.text.includes('改好了'), '完成摘要取最后一条助手回复：' + note.payload.text)
   assert.equal(note.payload.text.includes('dsh-assistant'), false, '播报里不能念长路径：' + note.payload.text)
   assert.equal(note.payload.text.includes('**'), false, '播报里不能留 markdown：' + note.payload.text)
-  const rows = framesOf(socket).filter((frame) => frame.type === 'task.list').pop().payload.board.rows
-  assert.equal(rows.length, 1)
-  assert.equal(rows[0].state, 'done')
-  assert.equal(rows[0].capsule, '完成')
-  assert.equal(rows[0].sub, '电脑端 · 论文')
+  // 2026-11-09：完成时设备自动切到完成屏（紧跟 turn/end），棋盘行改用 task.update 下发。
+  const doneUpdate = framesOf(socket).filter((frame) => frame.type === 'task.update').pop()
+  assert.ok(doneUpdate !== undefined, '完成要下发 task.update（棋盘行状态）')
+  assert.equal(doneUpdate.payload.state, 'done')
+  assert.equal(doneUpdate.payload.capsule, '完成')
+  assert.equal(doneUpdate.payload.sub, '电脑端 · 论文')
+  const doneScreen = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && String(frame.payload.stage) === '完成').pop()
+  assert.ok(doneScreen !== undefined, '完成要自动进完成屏并开始朗读')
   w.cleanup()
 })
 
