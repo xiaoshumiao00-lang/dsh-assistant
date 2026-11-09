@@ -521,6 +521,7 @@ function fakeCtx(overrides = {}) {
       if (id === 'speechController') return overrides.speechController ?? { transcribe: async () => '读一下 README' }
       if (id === 'sessions') return overrides.sessions
       if (id === 'remote') return overrides.remote
+      if (id === 'sessionController') return overrides.sessionController
       if (id === 'workspaces') return overrides.workspaces
       if (id === 'sessionQuery') return overrides.sessionQuery
       if (id === 'sessionProjections') return overrides.sessionProjections
@@ -3565,11 +3566,14 @@ await testAsync('lane：主页项目帧带 sessionId，点项目行（hit=projec
   ]
   const { runtime } = runtimeFor(records, { workspaceRegistry: workspaceRegistryFixture(workspaces) })
   const socket = openLane(runtime)
-  // 不带 sessionId、不带 auto：未绑定设备，hello 后直接给主页
-  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'tap-project', protocol: '0' }, 1)))
+  // 老逃生口：显式带 sessionId 手动绑一条（非统一指挥设备），主页仍是项目卡片列表。
+  // 统一指挥设备的主页改成任务棋盘，这条老路只在 ?session= / 会话选择器下走。
+  process.env.TIHU_BIND_HOME_MS = '0'
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'tap-project', protocol: '0', sessionId: 'session-a' }, 1)))
   await waitMs(60)
+  delete process.env.TIHU_BIND_HOME_MS
   const homes = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.mode === 'home')
-  assert.ok(homes.length > 0, '未绑定设备 hello 后应收主页')
+  assert.ok(homes.length > 0, '手动绑定设备回主页后应收项目卡片')
   const home = homes[homes.length - 1].payload.home
   const withId = home.projects.filter((item) => typeof item.sessionId === 'string' && item.sessionId !== '')
   assert.ok(withId.length >= 2, `主页项目应带 sessionId（点项目进入），实际 ${JSON.stringify(home.projects)}`)
@@ -5749,7 +5753,25 @@ function unifiedWorkspace(options = {}) {
   process.env.TIHU_PROJECTS_STATE = stateFile
   const created = []
   const prompted = []
-  const records = [cuRecord('session-cmd', { live: true, preset: 'standard', title: '鹈鹕指挥台' })]
+  const renamed = []
+  const records = options.seedCommander === false
+    ? []
+    : [cuRecord('session-cmd', { live: true, preset: 'standard', title: '鹈鹕指挥台' })]
+  // 宿主真实建会话入口（2026-11-09 修复）：sessionController.create/rename。
+  const sessionController = {
+    create: async (request) => {
+      created.push(request)
+      const id = 'session-task-' + created.length
+      records.push(cuRecord(id, { live: true, preset: request.agentPreset, cwd: request.cwd, title: '任务 ' + created.length }))
+      return { sessionId: id }
+    },
+    rename: async ({ sessionId, title }) => {
+      renamed.push({ sessionId, title })
+      const record = records.find((item) => item.header.id === sessionId)
+      if (record !== undefined) record.projection.title = title
+      return { title, seq: 1 }
+    },
+  }
   const remote = {
     session: {
       create: async (base) => {
@@ -5771,7 +5793,9 @@ function unifiedWorkspace(options = {}) {
       },
     }),
   }
-  const fixture = runtimeFor(records, { remote, sessions }, options.tts ?? {})
+  const fixture = runtimeFor(records, options.noCreate === true
+    ? { sessions }
+    : { remote, sessions, sessionController }, options.tts ?? {})
   return {
     ...fixture,
     root,
@@ -5781,6 +5805,7 @@ function unifiedWorkspace(options = {}) {
     cards,
     created,
     prompted,
+    renamed,
     records,
     cleanup: () => {
       fixture.runtime.dispose()
@@ -5809,6 +5834,59 @@ await testAsync('统一指挥：hello 绑唯一指挥会话，屏上是空棋盘
   assert.equal(w.created.length, 0, '已有指挥会话就不要再建')
   assert.equal(frames.some((frame) => frame.type === 'event.alert' && String(frame.payload.text).includes('Computer Use')), false,
     '指挥会话不是 CU 模式，但不该按「非 CU」告警')
+  w.cleanup()
+})
+
+await testAsync('统一指挥：没有指挥会话时 hello 自动建「鹈鹕指挥台」并进空棋盘', async () => {
+  const w = unifiedWorkspace({ seedCommander: false })
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u0', protocol: '0' }, 1)))
+  await waitMs(80)
+
+  const frames = framesOf(socket)
+  assert.equal(w.created.length, 1, '没有指挥会话时要新建一条')
+  assert.equal(w.created[0].cwd, w.home, '指挥会话落助手 home')
+  assert.equal(w.created[0].agentPreset, 'standard', '指挥会话用 standard（它只看单、不看屏）')
+  assert.equal(w.renamed.length, 1, '新建后要写一次标题')
+  assert.deepEqual(w.renamed[0], { sessionId: 'session-task-1', title: '鹈鹕指挥台' }, '标题必须是「鹈鹕指挥台」，下次才找得回')
+
+  const bound = frames.filter((frame) => frame.type === 'session.bound').pop()
+  assert.ok(bound !== undefined, '应下发 session.bound')
+  assert.equal(bound.payload.sessionId, 'session-task-1')
+  const board = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop()
+  assert.ok(board !== undefined, '屏帧要带 board')
+  assert.equal(board.payload.board.empty, true)
+  assert.equal(board.payload.board.rows.length, 0)
+  assert.deepEqual(board.payload.board.counts, { running: 0, awaiting: 0, queued: 0 }, '顶行三段计数归零')
+  assert.ok(frames.some((frame) => frame.type === 'task.list'))
+  assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.home !== undefined), false,
+    '绝不能退回项目卡片 home')
+
+  // 第二次 hello 复用同一条（标题已落库），不再新建。
+  const second = openLane(w.runtime)
+  second.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u0b', protocol: '0' }, 1)))
+  await waitMs(60)
+  assert.equal(w.created.length, 1, '第二次 hello 要复用，不再新建指挥会话')
+  const secondBound = framesOf(second).filter((frame) => frame.type === 'session.bound').pop()
+  assert.equal(secondBound.payload.sessionId, 'session-task-1')
+  w.cleanup()
+})
+
+await testAsync('统一指挥：建不出指挥会话时也进空棋盘，不退回项目卡片', async () => {
+  const w = unifiedWorkspace({ seedCommander: false, noCreate: true })
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u9', protocol: '0' }, 1)))
+  await waitMs(70)
+
+  const frames = framesOf(socket)
+  assert.equal(w.created.length, 0)
+  const board = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop()
+  assert.ok(board !== undefined, '建不出指挥会话也要上棋盘空态')
+  assert.equal(board.payload.board.empty, true)
+  assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.home !== undefined), false,
+    '兜底不得退回项目卡片 home')
+  assert.ok(frames.some((frame) => frame.type === 'event.alert' && String(frame.payload.text).includes('统一指挥')),
+    '要留下可诊断告警')
   w.cleanup()
 })
 

@@ -2716,21 +2716,31 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     const cwd = source.row?.cwd ?? options.workspaceOf?.(fromId)
     const workspaceId = source.row?.workspaceId
     const base = workspaceId !== undefined ? { workspaceId } : cwd !== undefined && cwd !== '' ? { cwd } : {}
+    // 建并行会话同样只能走宿主真实服务：sessionController 优先，remote 仅老宿主兼容。
+    // （`sessions.create(base)` 是错的：SessionStore.create(id, options) 第一参是会话 id。）
+    const controller = optionalService(ctx, 'sessionController') as {
+      create?: (request: { cwd?: string; workspaceId?: string; agentPreset?: string }) => Promise<any>
+    } | undefined
     const remote = optionalService(ctx, 'remote') as { session?: { create?: (base: unknown) => Promise<any> } } | undefined
-    let newId: string
-    if (preset !== '' && typeof remote?.session?.create === 'function') {
+    let newId: string | undefined
+    if (preset !== '' && typeof controller?.create === 'function') {
+      const created: any = await controller.create({ ...base, agentPreset: preset })
+      ensureTarget()
+      if (typeof created?.sessionId !== 'string' || created.sessionId === '') {
+        throw new Error(`新建并行会话失败：${String(JSON.stringify(created ?? null)).slice(0, 80)}`)
+      }
+      newId = created.sessionId
+    }
+    if (newId === undefined && preset !== '' && typeof remote?.session?.create === 'function') {
       const result: any = await remote.session.create({ ...base, agentPreset: preset })
       ensureTarget()
       if (result?.ok !== true || typeof result?.value?.sessionId !== 'string') {
         throw new Error(`新建并行会话失败：${String(JSON.stringify(result?.error ?? null)).slice(0, 80)}`)
       }
       newId = result.value.sessionId
-    } else {
-      const sessions = optionalService(ctx, 'sessions') as { create?: (base: unknown) => Promise<string> } | undefined
-      if (typeof sessions?.create !== 'function') throw new Error('宿主 sessions 服务不可用')
-      newId = await sessions.create(base)
-      ensureTarget()
     }
+    if (newId === undefined) throw new Error('宿主没有可用的建会话服务（sessionController / remote.session）')
+    sessionListCache = undefined
     const blocks = [{ type: 'text', text: parallelContextOf(fromId, text) }, { type: 'text', text: voiceTailOf(newId) }]
     const sessionsSvc = optionalService(ctx, 'sessions') as { using?: (id: string, opts: unknown, fn: (ref: any) => Promise<void>) => Promise<void> } | undefined
     if (typeof sessionsSvc?.using !== 'function') throw new Error('宿主 sessions.using 不可用')
@@ -3530,6 +3540,7 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       const caps = payload.capabilities ?? {}
       const saved = savedDeviceFrame(device)
       const requested = typeof payload.sessionId === 'string' && payload.sessionId !== '' ? payload.sessionId : undefined
+      let unifiedUnavailable: string | undefined
       if (requested !== undefined) {
         // 显式会话（URL ?session= / 老页面）：手动绑定，逃生口保留。
         device.autoFollow = false
@@ -3552,15 +3563,20 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
             text: '统一指挥已就绪：说一句话就派单，不用挑会话',
           } satisfies ProgressPayload)
         } else {
-          // 宿主还没有新建会话的能力（老宿主/命令行桩）：退回「未绑定 + 主页」。
-          device.unified = false
+          // 指挥会话建不出来（老宿主/宿主服务缺失）：**仍然进空棋盘**，绝不退回项目卡片 home。
+          // 同时留一条可诊断告警，别让「统一指挥不可用」再变成静默降级。
+          device.unified = true
           device.sessionId = undefined
-          log('tihu unified mode unavailable: no session create service')
+          unifiedUnavailable = '统一指挥暂不可用：宿主建不出「鹈鹕指挥台」会话（见 tihu create/rename 日志）'
+          log('tihu unified mode unavailable: commander session could not be created')
         }
       }
       // 统一指挥设备重连一律回棋盘：它的「家」就是任务棋盘，恢复旧的状态/回复屏反而奇怪。
       const restored = device.unified ? false : restoreSavedDeviceFrame(device, saved)
       if (!restored) await sendHome(device.sessionId ?? '__unbound__', device)
+      if (unifiedUnavailable !== undefined) {
+        device.send('event.alert', { level: 'error', text: unifiedUnavailable })
+      }
       device.send('event.progress', { stage: '连接', text: `设备 ${device.id} 已就绪` } satisfies ProgressPayload)
       log(`tihu hello client=${payload.clientId} session=${device.sessionId ?? '?'} caps=${JSON.stringify(caps)}`)
       return
@@ -4149,29 +4165,75 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     try { return ensureAssistantHome().dir } catch { return process.env.DSH_ASSISTANT_HOME ?? process.cwd() }
   }
 
-  /** 在指定文件夹新建一条会话（remote.session.create 优先，退回 sessions.create）。 */
+  /**
+   * 在指定文件夹新建一条会话。
+   *
+   * **宿主真实入口是 `sessionController.create()`**：它就是 Typert 暴露成 `ctx.remote.session`
+   * 的宿主本体（`dsh-api-session-controller` 里 `super(ctx, 'sessionController', { namespace: 'session' })`），
+   * 返回 `{ sessionId }`、顺手拉起 agent。
+   *
+   * 2026-11-09 线上实测的旧实现两处都错，写在这里免得改回去：
+   *   - `ctx.get('remote')` 在宿主 ctx 里是**客户端**网关服务（`dsh-api-gateway/lib/client.js`
+   *     的 `super(ctx, 'remote')`），宿主侧拿不到；现在只当老宿主兼容路；
+   *   - `sessions.create(base)` 签名错：`SessionStore.create(id, options)` 第一个参数是会话 id、
+   *     返回 Session 而非 id，把 options 当 id 传必抛。
+   * 两条都失败 → 指挥会话建不出来 → 裸 hello 无声退回项目卡片主页（这次的线上现象）。
+   */
   async function createSessionAt(folder: string, preset: string): Promise<string | undefined> {
     const base = folder !== '' ? { cwd: folder } : {}
+    const controller = optionalService(ctx, 'sessionController') as {
+      create?: (request: { cwd?: string; agentPreset?: string }) => Promise<any>
+    } | undefined
+    if (typeof controller?.create === 'function') {
+      try {
+        const created: any = await controller.create({ ...base, agentPreset: preset })
+        const sessionId = typeof created === 'string'
+          ? created
+          : typeof created?.sessionId === 'string' ? created.sessionId : undefined
+        if (typeof sessionId === 'string' && sessionId !== '') {
+          // 刚建的会话还没进列表缓存；不清掉的话 findSession 会判 missing，
+          // bindSession 立刻回 session.invalid（2026-11-09 实测：建完却绑不上）。
+          sessionListCache = undefined
+          return sessionId
+        }
+        log(`tihu sessionController.create returned no sessionId: ${String(JSON.stringify(created ?? null)).slice(0, 140)}`)
+      } catch (error) {
+        log(`tihu sessionController.create failed: ${(error as Error)?.message ?? String(error)}`)
+      }
+    }
+    // 老宿主兼容：有的版本把同一个 create 转成 remote.session 的 { ok, value } 信封。
     const remote = optionalService(ctx, 'remote') as { session?: { create?: (base: unknown) => Promise<any> } } | undefined
     if (typeof remote?.session?.create === 'function') {
       try {
         const result: any = await remote.session.create({ ...base, agentPreset: preset })
-        if (result?.ok === true && typeof result?.value?.sessionId === 'string' && result.value.sessionId !== '') return result.value.sessionId
-        log(`tihu create session rejected: ${String(JSON.stringify(result?.error ?? null)).slice(0, 140)}`)
+        if (result?.ok === true && typeof result?.value?.sessionId === 'string' && result.value.sessionId !== '') {
+          sessionListCache = undefined
+          return result.value.sessionId
+        }
+        log(`tihu remote.session.create rejected: ${String(JSON.stringify(result?.error ?? null)).slice(0, 140)}`)
       } catch (error) {
-        log(`tihu create session failed: ${(error as Error)?.message ?? String(error)}`)
+        log(`tihu remote.session.create failed: ${(error as Error)?.message ?? String(error)}`)
       }
     }
-    const sessionsSvc = optionalService(ctx, 'sessions') as { create?: (base: unknown) => Promise<string> } | undefined
-    if (typeof sessionsSvc?.create === 'function') {
-      try {
-        const created = await sessionsSvc.create(base)
-        if (typeof created === 'string' && created !== '') return created
-      } catch (error) {
-        log(`tihu sessions.create failed: ${(error as Error)?.message ?? String(error)}`)
-      }
-    }
+    log(`tihu create session unavailable: ${['sessionController', 'remote', 'sessions', 'agents']
+      .map((id) => `${id}=${optionalService(ctx, id) === undefined ? 'missing' : 'ok'}`)
+      .join(' ')}`)
     return undefined
+  }
+
+  /** 给会话写标题：指挥会话靠标题被下次 hello 找回（宿主 sessionTitle 服务，经 sessionController 暴露）。 */
+  async function titleSession(sessionId: string, title: string): Promise<boolean> {
+    const controller = optionalService(ctx, 'sessionController') as {
+      rename?: (request: { sessionId: string; title: string }) => Promise<any>
+    } | undefined
+    if (typeof controller?.rename !== 'function') return false
+    try {
+      await controller.rename({ sessionId, title })
+      return true
+    } catch (error) {
+      log(`tihu rename session=${sessionId} failed: ${(error as Error)?.message ?? String(error)}`)
+      return false
+    }
   }
 
   /**
@@ -4221,7 +4283,9 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     const created = await createSessionAt(assistantFolder(), TASK_PRESET)
     if (created === undefined) return undefined
     commanderSessionId = created
-    log(`tihu commander created session=${created}`)
+    // 标题必须落库：下次 hello 靠「标题含 鹈鹕指挥台」找回同一条；不写就会每次新建一条。
+    const titled = await titleSession(created, COMMANDER_TITLE)
+    log(`tihu commander created session=${created}${titled ? ' titled' : ' (title not set)'}`)
     return created
   }
 
@@ -4570,7 +4634,7 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     const sessionId = await createSessionAt(folder, TASK_PRESET)
     if (sessionId === undefined) {
       tasks.drop(task.taskId)
-      const message = '宿主还不能新建会话（remote.session.create / sessions.create 都不可用），这次没派出去'
+      const message = '宿主还不能新建会话（sessionController.create 不可用，见 tihu 日志），这次没派出去'
       if (device !== undefined) {
         showInputError(device, new Error(message))
       }
