@@ -606,14 +606,6 @@ export function applyEarlyThinking(
 }
 
 /** 危险动作确认时的屏帧（stage 固定「等待确认」）。 */
-export function confirmationFrame(title: string, detail: string): ScreenFramePayload {
-  return {
-    stage: '等待确认',
-    title: clipText(`等待确认 ${title || '危险操作'}`, TIHU_TITLE_CHARS),
-    bullets: [clipText(detail || '请确认是否执行', TIHU_LINE_CHARS), '在下方点确认或取消'],
-    tone: 'alert',
-  }
-}
 
 /** 解码速度样本：累计解码毫秒 + 累计解码 token + 采样时刻。 */
 export interface TihuDecodeSample {

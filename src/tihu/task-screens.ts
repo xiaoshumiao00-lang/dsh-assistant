@@ -16,8 +16,6 @@ import { capsuleOf, formatUsedMs, type TihuTask } from './task-ledger.ts'
 
 /** 派单回执自动回棋盘的秒数（设计 §8.2：5 秒够看清落点，又不挡下一句）。 */
 export const RECEIPT_SECONDS = 5
-/** 待决策不答就按默认项走的秒数（与 confirmBroker 的 60 秒同口径）。 */
-export const DECISION_SECONDS = 60
 
 /** 任务棋盘（屏 1）；`empty` 时是同一个版式的空态，不另开一屏。 */
 export function boardFrame(board: TaskBoardPayload): ScreenFramePayload {
@@ -97,47 +95,6 @@ export function detailFrame(input: {
     ],
     taskId: input.taskId,
     tone: 'busy',
-    mode: 'status',
-  }
-}
-
-/** 待决策（屏 5）：只有托管没点亮时才会出现；内容与电脑端同一个问题、同一组选项。 */
-export function awaitingFrame(input: {
-  taskId: string
-  question: string
-  options: readonly string[]
-  defaultIndex: number
-  projectName: string
-  sessionTitle: string
-  /** 任务落点文件夹（来源行用最后一级目录名）。 */
-  folder?: string
-  /** 危险动作的目标路径（没有就不占一行）。 */
-  detail?: string
-  secondsLeft: number
-}): ScreenFramePayload {
-  const options = input.options.length > 0 ? input.options : ['确认', '取消']
-  const defaultIndex = Math.max(0, Math.min(input.defaultIndex, options.length - 1))
-  const defaultLabel = options[defaultIndex]
-  const seconds = Math.max(0, Math.trunc(input.secondsLeft))
-  const bullets: string[] = [`来源：${input.projectName}`]
-  const folderName = shortFolderPath(input.folder)
-  const detailLine = String(input.detail ?? '').replace(/\s+/g, ' ').trim()
-  if (folderName !== '') bullets.push(`文件夹 ${folderName}`)
-  else if (detailLine !== '') bullets.push(fitScreenLines([detailLine], 1)[0] ?? '')
-  bullets.push(`${seconds} 秒不答，就按「${defaultLabel}」走`)
-  bullets.push('说「确认」或「留着」也行')
-  return {
-    stage: '待决策 · 托管未开',
-    title: clipScreenTitle(input.question || '要你定一下'),
-    bullets: fitScreenLines(bullets, SCREEN_SPEC.maxBodyLines),
-    countdown: { seconds, totalSeconds: DECISION_SECONDS, text: '' },
-    actions: options.map((label, index) => ({
-      id: `taskOption${index}`,
-      // 默认项打标记：与托管开着时它的自动选择是同一条规则，两条路的结论一致。
-      label: index === defaultIndex ? `${label}·默认` : label,
-    })),
-    taskId: input.taskId,
-    tone: 'warn',
     mode: 'status',
   }
 }

@@ -553,7 +553,7 @@ export async function registerTihuControl(ctx: any, surface: TihuControlSurface,
   const offTool = tools.register(defineTool({
     name: 'tihu',
     description: [
-      '控制鹈鹕（tihu）设备：看设备屏（status）、列设备（list_devices）、**派单（dispatch）**、看任务（list_tasks）、撤单（cancel）、切换绑定（bind）、点右侧气泡（open_bubble）、查会话进度（progress）、列会话（list_sessions）、删除会话（archive，须 confirm=true 且先征得用户口头确认）、停止朗读（stop_speaking）、重读（replay）、回主页钉住（go_home）、翻回答历史（browse，session 传 prev/next）、点首页最近回答（open_recent）。',
+      '控制鹈鹕（tihu）设备：看设备屏（status）、列设备（list_devices）、**派单（dispatch）**、看任务（list_tasks）、撤单（cancel）、切换绑定（bind）、点右侧气泡（open_bubble）、查会话进度（progress）、列会话（list_sessions）、删除会话（archive，须 confirm=true 且先征得用户口头确认）、停止朗读（stop_speaking）、重读（replay）、回主页（go_home）、看最近完成的任务（open_recent）；棋盘固定最近 5 条，browse 已无翻页。',
       '铁律：设备上听到的每句话都是**任务**，不是让你自己动手的活——要把「做什么」用 dispatch 派到对应项目的任务会话里，由登记簿记账、屏上出派单回执。不要把任务正文留在指挥会话里做。',
       `合法 action：${names.join(' / ')}。`,
       '设备缺省取绑定到当前会话的那台；会话按标题关键词或代号模糊匹配（精确/前缀/包含），多个候选会返回清单让你追问。',
