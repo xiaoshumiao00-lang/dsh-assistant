@@ -2643,6 +2643,7 @@ test('回答屏页面 CSS：气泡轨 64px、rail-on 正文 240px、reply-mode �
   const narrowWidthAt = narrowAt < 0 ? -1 : pageSource.indexOf('width:240px', narrowAt)
   assert.ok(narrowAt >= 0 && narrowWidthAt > narrowAt && narrowWidthAt - narrowAt < 300, 'rail-on 时正文可用宽必须是 240px')
   assert.ok(pageSource.includes('#screen.reply-mode .title, #screen.reply-mode ul, #screen.reply-mode .bar { display:none; }'), '回答屏必须收掉进度条/标题/正文列表')
+assert.ok(pageSource.includes("if (state.mode === 'unified')") && pageSource.includes('state.pending = []'), '统一模式必须清掉桌面通知浮泡（不能只改颜色）')
 })
 
 test('TTS 分段带字符区间：tts.text 的 charStart/charEnd 与句边界一致', () => {

@@ -592,6 +592,14 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function renderPending(payload) {
     var screen = $('screen');
     var rail = $('pendingRail');
+    // 统一指挥模式没有「桌面会话未读」语义：所有屏都不弹「新任务完成/新回复」浮泡，
+    // 但宿主侧会话状态照旧保留（这里只清页面通知层，不删任何会话）。
+    if (state.mode === 'unified') {
+      state.pending = [];
+      rail.innerHTML = '';
+      screen.classList.remove('rail-on');
+      return;
+    }
     var items = Array.isArray(payload.pending) ? payload.pending : [];
     state.pending = items;
     rail.innerHTML = '';
