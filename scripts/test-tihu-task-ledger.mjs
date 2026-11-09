@@ -79,6 +79,10 @@ test('新任务是排队态：没有步数、没有会话、不编用时', () =>
   assert.equal(capsuleOf(task.state), '排队')
 })
 
+test('自动归档不早于 3 天（用户要求静置超过 3 天才允许）', () => {
+  assert.ok(DONE_KEEP_MS >= 3 * 24 * 60 * 60 * 1000, `DONE_KEEP_MS=${DONE_KEEP_MS}`)
+})
+
 test('七态登记簿：排队→派单→执行中→待决策→完成→已播报→归档', () => {
   const ledger = new TaskLedger()
   const task = ledger.add({ title: '七态', projectId: 'p', projectName: 'P', now: 1000 })
@@ -529,7 +533,7 @@ test('任务详情（屏 4）：标题只有「第 N 步 · 已用」，正文�
     projectName: '青年基金申请书',
     sessionTitle: '改写第 3 段',
   })
-  assert.equal(frame.stage, '跑命令')
+  assert.equal(frame.stage, '进度')
   assert.equal(frame.title, '第 7 步 · 已用 1m23s')
   assert.equal(frame.bullets.length, SCREEN_SPEC.maxBodyLines)
   assert.equal(frame.bullets[0], '工具 · read_image')
@@ -552,12 +556,12 @@ test('待决策（屏 5）：托管未开 + 默认项标记 + 60 秒倒计时', 
   })
   assert.equal(frame.stage, '待决策 · 托管未开')
   assert.equal(frame.title, '删掉 3 个旧结果文件？')
-  assert.ok(frame.bullets.includes('来源：青年基金申请书 · 改写第 3 段'), '要显示哪个项目、哪条会话')
+  assert.ok(frame.bullets.includes('来源：青年基金申请书'), '要显示哪个项目卡')
   assert.ok(frame.bullets.some((line) => line.startsWith('文件夹 ')) === false, '没给 folder 时不编文件夹')
   assert.deepEqual(frame.actions.map((item) => item.label), ['确认删除', '先留着，别删·默认'])
   assert.equal(frame.countdown.seconds, 60)
   assert.equal(frame.countdown.totalSeconds, DECISION_SECONDS)
-  assert.equal(frame.tone, 'alert')
+  assert.equal(frame.tone, 'warn')
 })
 
 test('完成播报（屏 6）：「另有 N 条」收进状态行，不再单独占气泡带', () => {
@@ -571,7 +575,7 @@ test('完成播报（屏 6）：「另有 N 条」收进状态行，不再单独
 
 test('歧义追问（屏 7）：两个候选 + 「都不是」，序号用数字', () => {
   const frame = askWhichFrame({ candidates: [{ projectName: '青年基金申请书', doing: '在改第 3 段' }, { projectName: '磷石膏SCI', doing: '在出图' }] })
-  assert.equal(frame.stage, '追问 · 只问一次')
+  assert.equal(frame.stage, '追问')
   assert.equal(frame.title, '这句话派给谁？')
   assert.deepEqual(frame.bullets, ['1 青年基金申请书 · 在改第 3 段', '2 磷石膏SCI · 在出图'])
   assert.deepEqual(frame.actions.map((item) => item.label), ['1', '2', '都不是'])

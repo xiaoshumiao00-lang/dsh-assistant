@@ -33,8 +33,8 @@ export const ANNOUNCE_SINGLE_DELAY_MS = 400
 export const BOARD_PAGE_SIZE = 5
 /** 登记簿内存上限：棋盘只显示最近这些，更早的直接归档。 */
 export const LEDGER_MAX_TASKS = 60
-/** 完成态在棋盘上留多久后自动归档（毫秒）。 */
-export const DONE_KEEP_MS = 30 * 60_000
+/** 完成/已播报态在棋盘上留多久后自动归档（毫秒）：用户要求至少 3 天，不能更早。 */
+export const DONE_KEEP_MS = 3 * 24 * 60 * 60_000
 
 /** 一条任务。字段最小集：屏/播报/归档各自只用自己需要的那些。 */
 export interface TihuTask {

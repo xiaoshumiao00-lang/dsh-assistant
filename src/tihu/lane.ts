@@ -4683,6 +4683,8 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
         { id: 'taskBoard', label: '主页' },
       ],
       taskId: task.taskId,
+      pending: [],
+      pendingCount: 0,
       ...(others > 0 ? { more: { count: others, text: `另有 ${others} 条` } } : {}),
       reply: { ...base.reply, highlightCurrent: true } as any,
     }

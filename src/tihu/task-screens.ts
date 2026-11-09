@@ -42,7 +42,7 @@ export function receiptFrame(input: {
   etaText?: string
 }): ScreenFramePayload {
   const ahead = Math.max(0, Math.trunc(input.queueAhead))
-  const folderName = folderBase(input.folder)
+  const folderName = shortFolderPath(input.folder)
   const bullets: string[] = []
   if (folderName !== '') bullets.push(`文件夹 ${folderName}`)
   bullets.push(input.etaText !== undefined && input.etaText !== '' ? `约 ${input.etaText}后开始跑` : '马上开始跑')
@@ -61,6 +61,8 @@ export function receiptFrame(input: {
       { id: 'taskOpen', label: '看任务' },
       { id: 'taskCancel', label: '撤单' },
     ],
+    pending: [],
+    pendingCount: 0,
     taskId: input.taskId,
     tone: 'busy',
     mode: 'status',
@@ -87,7 +89,7 @@ export function detailFrame(input: {
   const stepLine = `第 ${input.step} 步 · 已用 ${formatUsedMs(input.elapsedMs)}`
   const bullets = [...recent, input.statsLine, `${input.projectName} · ${input.sessionTitle}`]
   return {
-    stage: input.stageWord,
+    stage: '进度',
     title: clipScreenTitle(stepLine),
     bullets: fitScreenLines(bullets.filter((line) => line !== ''), SCREEN_SPEC.maxBodyLines),
     statsTail: 1,
@@ -99,6 +101,8 @@ export function detailFrame(input: {
     taskId: input.taskId,
     tone: 'busy',
     mode: 'status',
+    pending: [],
+    pendingCount: 0,
   }
 }
 
@@ -120,8 +124,8 @@ export function awaitingFrame(input: {
   const defaultIndex = Math.max(0, Math.min(input.defaultIndex, options.length - 1))
   const defaultLabel = options[defaultIndex]
   const seconds = Math.max(0, Math.trunc(input.secondsLeft))
-  const bullets: string[] = [`来源：${input.projectName} · ${input.sessionTitle}`]
-  const folderName = folderBase(input.folder)
+  const bullets: string[] = [`来源：${input.projectName}`]
+  const folderName = shortFolderPath(input.folder)
   const detailLine = String(input.detail ?? '').replace(/\s+/g, ' ').trim()
   if (folderName !== '') bullets.push(`文件夹 ${folderName}`)
   else if (detailLine !== '') bullets.push(fitScreenLines([detailLine], 1)[0] ?? '')
@@ -138,8 +142,10 @@ export function awaitingFrame(input: {
       label: index === defaultIndex ? `${label}·默认` : label,
     })),
     taskId: input.taskId,
-    tone: 'alert',
+    tone: 'warn',
     mode: 'status',
+    pending: [],
+    pendingCount: 0,
   }
 }
 
@@ -166,6 +172,8 @@ export function doneFrame(input: {
     taskId: input.taskId,
     tone: 'ok',
     mode: 'status',
+    pending: [],
+    pendingCount: 0,
   }
 }
 
@@ -182,7 +190,7 @@ export function askWhichFrame(input: {
   const actions = input.candidates.slice(0, 2).map((_item, index) => ({ id: `pick${index + 1}`, label: String(index + 1) }))
   actions.push({ id: 'pickNone', label: '都不是' })
   return {
-    stage: '追问 · 只问一次',
+    stage: '追问',
     title: clipScreenTitle('这句话派给谁？'),
     bullets: fitScreenLines(bullets, SCREEN_SPEC.maxBodyLines),
     ask: {
@@ -196,6 +204,8 @@ export function askWhichFrame(input: {
     ...(input.taskId === undefined ? {} : { taskId: input.taskId }),
     tone: 'alert',
     mode: 'status',
+    pending: [],
+    pendingCount: 0,
   }
 }
 
@@ -231,6 +241,20 @@ export function dispatchedAnnouncementOf(task: TihuTask): string {
 export function folderBase(folder: string | undefined): string {
   const parts = String(folder ?? '').split(/[\\/]+/).filter(Boolean)
   return parts.length === 0 ? '' : parts[parts.length - 1]
+}
+
+/**
+ * 屏上文件夹路径：保留地址首尾（盘符/根 + 末级目录），中间用「…」。
+ * 例：`C:\Users\me\.dsh\assistant` → `C:\…\assistant`。
+ */
+export function shortFolderPath(folder: string | undefined): string {
+  const raw = String(folder ?? '')
+  const parts = raw.split(/[\\/]+/).filter(Boolean)
+  if (parts.length === 0) return ''
+  if (parts.length <= 2) return raw
+  const last = [...parts[parts.length - 1]].slice(-10).join('')
+  const sep = raw.includes('\\') ? '\\' : '/'
+  return `${parts[0]}${sep}…${sep}${last}`
 }
 
 /** 棋盘上「项目 · 第 N 步」的胶囊文案（供页面/测试复用，避免两处各写一遍）。 */
