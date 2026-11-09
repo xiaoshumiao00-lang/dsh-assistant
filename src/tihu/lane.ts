@@ -4802,7 +4802,7 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       { type: 'text' as const, text },
       {
         type: 'text' as const,
-        text: `【派单 · 鹈鹕】这是主人对着鹈鹕设备说的一句话，已派到「${card.name}」这个项目的任务会话里（落在 ${folder}）。直接开始做；做完用一两句话说明结果；需要人拍板就按项目规矩问。`,
+        text: `【派单 · 鹈鹕】鹈鹕是主人家里的语音小屏助手，负责把设备上说的话转交给对应项目，电脑端再执行任务。这句话已派到「${card.name}」，工作目录是 ${folder}。做完后用简洁中文说明结果：先给结论，再给关键数字或进展，文字不要太长，适合直接朗读；不要表格、列表、代码块或长路径。`,
       },
     ]
     // 先挂到任务再投消息：工具调用可能抢在 prompt() 返回前发生，闸门按
