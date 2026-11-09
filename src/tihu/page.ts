@@ -59,10 +59,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen { position:relative; width:320px; height:240px; box-sizing:border-box; padding:8px; overflow:hidden;
     touch-action:none;
     background:#05080b; color:var(--fg); border:1px solid #000; border-radius:3px;
+    outline:none;
     display:flex; flex-direction:column; gap:4px; }
+  #screen:focus, #screen:focus-visible { outline:none; }
   #screen .stage { font-size:12px; line-height:14px; letter-spacing:1px; color:var(--accent);
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #screen.alert { border-color:var(--err); }
+  #screen.alert { border-color:#000; }
   #screen.alert .title, #screen.alert .stage { color:var(--err); }
   /* 首页最上方那一行（用户 2026-11-08 确认）：原来的「项目 N 个 · 第 x/y 页」整段删掉，
      换成「本地时钟 HH:MM」+「三格信号柱」。这一行占掉 stage 原来那一行的位置（12px/行高 14），
