@@ -809,11 +809,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
    */
   function boardCountsText(counts) {
     var c = counts || {};
-    var parts = [];
-    if (Number(c.running) > 0) parts.push('●' + c.running + ' 在跑');
-    if (Number(c.awaiting) > 0) parts.push('●' + c.awaiting + ' 等你');
-    if (Number(c.queued) > 0) parts.push('●' + c.queued + ' 排队');
-    return parts.length === 0 ? '● 0 在跑' : parts.join('　');
+    // 三段计数**始终都在**（空盘也要看到三个 0）：设计 §8「顶行三段计数归零」，
+    // 不能因为某一档是 0 就把它省掉——省掉以后空盘顶行只剩「● 0 在跑」，和文档不一致。
+    // 宽度由 fitTextPx 兜底缩放，320px 放得下「●0 在跑　●0 等你　●0 排队」。
+    return '●' + (Number(c.running) || 0) + ' 在跑　●' + (Number(c.awaiting) || 0) + ' 等你　●' + (Number(c.queued) || 0) + ' 排队';
   }
   function renderBoard(payload) {
     var screen = $('screen');
