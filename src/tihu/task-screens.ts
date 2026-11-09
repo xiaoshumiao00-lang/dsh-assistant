@@ -45,7 +45,7 @@ export function receiptFrame(input: {
   const folderName = folderBase(input.folder)
   const bullets: string[] = []
   if (folderName !== '') bullets.push(`文件夹 ${folderName}`)
-  bullets.push(ahead === 0 ? '马上开始跑' : input.etaText !== undefined && input.etaText !== '' ? `约 ${input.etaText} 后开始跑` : '等前面的跑完就轮到它')
+  bullets.push(input.etaText !== undefined && input.etaText !== '' ? `约 ${input.etaText}后开始跑` : '马上开始跑')
   bullets.push(`${RECEIPT_SECONDS} 秒后自动回棋盘`)
   return {
     stage: '派单',
@@ -82,6 +82,8 @@ export function detailFrame(input: {
   sessionTitle: string
 }): ScreenFramePayload {
   const recent = input.activity.slice(-2).map((entry) => (entry.detail === '' ? entry.label : `${entry.label} · ${entry.detail}`))
+    // 详情只有 4 行：工具/思考各占一行，不能因为一条长命令换行把底部「项目 · 会话」挤掉。
+    .map((line) => fitScreenLines([line], 1)[0] ?? line)
   const stepLine = `第 ${input.step} 步 · 已用 ${formatUsedMs(input.elapsedMs)}`
   const bullets = [...recent, input.statsLine, `${input.projectName} · ${input.sessionTitle}`]
   return {
@@ -179,6 +181,13 @@ export function askWhichFrame(input: {
     stage: '追问 · 只问一次',
     title: clipScreenTitle('这句话派给谁？'),
     bullets: fitScreenLines(bullets, SCREEN_SPEC.maxBodyLines),
+    ask: {
+      candidates: input.candidates.slice(0, 2).map((item, index) => ({
+        index: index + 1,
+        projectName: item.projectName,
+        source: String(item.doing ?? '').trim(),
+      })),
+    },
     actions,
     ...(input.taskId === undefined ? {} : { taskId: input.taskId }),
     tone: 'alert',

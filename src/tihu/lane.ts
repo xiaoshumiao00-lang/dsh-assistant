@@ -616,8 +616,15 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
         // 其余危险动作保持「确认 / 取消」。默认项仍是首选项。
         const looksDelete = /删除|删掉|Remove-Item|\bdel\b|\brm\b|\berase\b/i.test(`${request.detail ?? ''} ${request.title ?? ''}`)
         const options = looksDelete ? ['确认删除', '先留着，别删'] : ['确认', '取消']
+        // 标题必须是「电脑端同一个问题」的可读摘要，不能只写「执行命令：需要你确认」。
+        const detailText = String(request.detail ?? '').replace(/\s+/g, ' ').trim()
+        const fileHit = detailText.match(/([^\s'"`]+\.(?:txt|log|md|json|csv|png|pdf|xlsx|docx|zip))(?=['"\s]|$)/i)
+        const fileBase = fileHit ? (fileHit[1].split(/[\\/]/).pop() ?? '') : ''
+        const question = looksDelete
+          ? (fileBase !== '' ? `删除 ${fileBase}？` : '删掉这个文件？')
+          : (detailText !== '' ? `执行命令：${detailText.slice(0, 24)}${detailText.length > 24 ? '…' : ''}？` : request.title)
         tasks.ask(task.taskId, {
-          question: request.title,
+          question,
           options,
           // 默认项＝首选项（与托管开着时的自动 approve 同一条规则）。
           defaultIndex: 0,
@@ -645,7 +652,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
           lastFrames.set(display, frame)
           device.send('screen.frame', frame)
         }
-        pushTaskNotify(task, 0, `要你确认：${request.title}`)
+        pushTaskNotify(task, 0, `要你确认：${question}`)
         log(`tihu confirm.ask task=${task.taskId} id=${request.id} title=${JSON.stringify(request.title)}`)
         return
       }
@@ -3195,6 +3202,13 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       const taskOfSession = tasks.ofSession(sessionId)
       if (taskOfSession !== undefined) {
         const at = Date.now()
+        // 任务会话通常没有设备绑定，通用进度映射的「设备早退」会把它挡掉；
+        // 详情的工具/思考流就永远空。这里在早退之前先给任务维护一份进度态。
+        if (![...devices].some((device) => device.sessionId === sessionId)) {
+          const progress = progressStates.get(sessionId) ?? createProgressState()
+          progressStates.set(sessionId, progress)
+          applySessionEvent(progress, event, at, screenMetaOf(sessionId))
+        }
         const eventData = event?.data ?? {}
         const stepValue = Number((eventData as any)?.step)
         if (type === 'turn/start') {
@@ -4670,7 +4684,7 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       ],
       taskId: task.taskId,
       ...(others > 0 ? { more: { count: others, text: `另有 ${others} 条` } } : {}),
-      reply: { ...base.reply, highlightCurrent: true, noPosition: true } as any,
+      reply: { ...base.reply, highlightCurrent: true } as any,
     }
   }
 
@@ -4727,7 +4741,7 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       projectName: task.projectName,
       ...(task.folder === undefined ? {} : { folder: task.folder }),
       queueAhead: queuedAhead,
-      ...(queuedAhead > 0 ? { etaText: `${queuedAhead} 分钟` } : {}),
+      ...(queuedAhead > 0 ? { etaText: `${queuedAhead} 分钟` } : { etaText: '1 分钟' }),
     })
     unpinHome(key)
     cancelHomeTimer(key)
@@ -4835,7 +4849,7 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     homeStates.set(key, hs)
     unpinHome(key)
     cancelHomeTimer(key)
-    const frame = askWhichFrame({ candidates: list.map((card) => ({ projectName: card.name, doing: doingOf(card.id) })) })
+    const frame = askWhichFrame({ candidates: list.map((card) => ({ projectName: card.name, doing: doingOf(card.id) || (card.folder ? `文件夹 ${folderBase(card.folder)}` : '暂无在跑任务') })) })
     lastFrames.set(key, frame)
     // 与回执一样：所有统一设备看同一张追问屏。
     const targets = [...devices].filter((item) => item.unified)

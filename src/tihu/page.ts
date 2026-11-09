@@ -168,6 +168,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-capsule.awaiting { color:#f7d98a; border-color:#7a5c1f; background:#241d0f; }
   #screen .board-capsule.done { color:#a9c8ff; border-color:#2b4a7a; background:#101a2b; }
   #screen .board-capsule.announced { color:#93a9c4; border-color:#33465c; background:#111820; }
+  /* 屏 7 歧义候选卡：项目名 + 来源（图 3） */
+  #screen .ask-card { display:flex; align-items:center; gap:7px; margin:4px 0; padding:5px 7px; border:1px solid #2b3a4a; border-radius:7px; background:#111a24; }
+  #screen .ask-no { flex:none; width:15px; height:15px; border:1px solid #3fb6a8; border-radius:50%; color:#8ef0c4; font-size:10px; line-height:15px; text-align:center; }
+  #screen .ask-main { min-width:0; display:flex; flex-direction:column; }
+  #screen .ask-name { font-size:13px; font-weight:700; line-height:15px; color:#e6edf3; }
+  #screen .ask-source { font-size:10px; line-height:12px; color:#9fb0c0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #screen .board-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
   #screen .board-merged { flex:none; font-size:11px; color:#7c8b99; }
   #screen .board-row2 { display:flex; align-items:center; gap:6px; font-size:12px; line-height:14px; color:#8b97a5; }
@@ -326,13 +332,13 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         <div class="stage" id="stage">连接</div>
         <div id="homeTop" class="home-top"><span class="clock" id="homeClock">--:--</span><span class="signal conn-connecting" id="homeSignal"><span class="bar b1"></span><span class="bar b2"></span><span class="bar b3"></span></span></div>
         <div class="title" id="title">正在连接宿主…</div>
+        <div id="steps" class="steps"></div>
         <ul id="bullets"></ul>
         <div id="runList" class="run-list"></div>
         <div id="replyBody" class="reply-body"></div>
         <div id="actionBar" class="action-bar"></div>
         <div id="homeBody" class="home-body"></div>
         <div id="homePager" class="home-pager"></div>
-        <div id="steps" class="steps"></div>
         <div id="cdRow" class="cd-row"><span id="cdText"></span><div class="cd-track"><div class="cd-fill" id="cdFill"></div></div></div>
         <div id="listen" class="listen">
           <div class="l0">在听 · 已唤醒</div>
@@ -827,7 +833,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     if (!screen) return;
     // 免按住聆听「在听 · 已唤醒」是盖在屏上的一层；任何宿主屏帧重画 className 时
     // 必须保留它，否则后台任务一推帧，唤醒屏就在 10 秒前被擦掉（2026-11-09 实测）。
-    screen.className = base + (state.listenOn ? ' listen-on' : '');
+    // 派单三步圆点同理：renderSteps 先加 steps-on，后一次 className 不能把它抹掉。
+    var steps = state.steps && state.steps.length ? ' steps-on' : '';
+    screen.className = base + (state.listenOn ? ' listen-on' : '') + steps;
   }
   function renderBoard(payload) {
     var screen = $('screen');
@@ -1090,6 +1098,30 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var list = $('bullets');
     list.innerHTML = '';
     var rawBullets = payload.bullets || [];
+    var askCards = payload.ask && Array.isArray(payload.ask.candidates) ? payload.ask.candidates : [];
+    if (askCards.length > 0) {
+      for (var ai = 0; ai < askCards.length; ai += 1) {
+        var card = document.createElement('li');
+        card.className = 'ask-card';
+        var no = document.createElement('span');
+        no.className = 'ask-no';
+        no.textContent = String(askCards[ai].index || (ai + 1));
+        var main = document.createElement('span');
+        main.className = 'ask-main';
+        var nm = document.createElement('span');
+        nm.className = 'ask-name';
+        nm.textContent = askCards[ai].projectName || '';
+        var src = document.createElement('span');
+        src.className = 'ask-source';
+        src.textContent = askCards[ai].source || '';
+        main.appendChild(nm);
+        main.appendChild(src);
+        card.appendChild(no);
+        card.appendChild(main);
+        list.appendChild(card);
+      }
+      rawBullets = [];
+    }
     // 第四行统计：小 2 号字号，按它自己的字号量宽与折行，不再套正文字符数
     var tailCount = typeof payload.statsTail === 'number' ? payload.statsTail : 0;
     if (tailCount > rawBullets.length) tailCount = rawBullets.length;
