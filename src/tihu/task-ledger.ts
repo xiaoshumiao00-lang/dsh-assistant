@@ -36,10 +36,20 @@ export const LEDGER_MAX_TASKS = 60
 /** 完成/已播报态在棋盘上留多久后自动归档（毫秒）：用户要求至少 3 天，不能更早。 */
 export const DONE_KEEP_MS = 3 * 24 * 60 * 60_000
 
+/**
+ * 任务来源：
+ *   - `tihu`：鹈鹕自己派出去的任务（`t1`、`t2`…，有派单/等待/确认这条完整链路）；
+ *   - `pc`：电脑端（DSH 主 GUI）里已有/新建的会话（`p1`、`p2`…，只读镜像：
+ *     不派单、不投 prompt、不触发派单尾巴，状态由会话活动推导）。
+ */
+export type TihuTaskSource = 'tihu' | 'pc'
+
 /** 一条任务。字段最小集：屏/播报/归档各自只用自己需要的那些。 */
 export interface TihuTask {
-  /** 稳定短号（`t1`、`t2`…）：屏与播报都用它。 */
+  /** 稳定短号（`t1`、`t2`… / 电脑端会话是 `p1`、`p2`…）：屏与播报都用它。 */
   taskId: string
+  /** 任务来源（缺省按鹈鹕派单处理，老数据不受影响）。 */
+  source: TihuTaskSource
   /** 一句话意图的规范化短语。 */
   title: string
   /** 项目卡 id（日常任务是 `wt-assistant`）。 */
@@ -142,9 +152,15 @@ export function taskTitleOf(text: unknown, maxChars = 18): string {
   return `${chars.slice(0, Math.max(1, maxChars - 1)).join('')}…`
 }
 
-/** 副行「项目 · 第 N 步」；还没起跑时不编步数。 */
+/**
+ * 副行：鹈鹕派单是「项目 · 第 N 步」；电脑端会话固定「电脑端 · 项目名」。
+ *
+ * 电脑端卡片的状态已经在左边胶囊里写了（执行中／完成／排队），副行再写一遍
+ * 「· 已完成」就是同一屏重复同一事实，所以这里只标来源与项目。
+ */
 export function subLineOf(task: TihuTask, projectName?: string): string {
   const project = String(projectName ?? task.projectName ?? '').trim()
+  if (task.source === 'pc') return project === '' ? '电脑端' : `电脑端 · ${project}`
   const head = project === '' ? '' : project
   if (task.state === 'queued') return head === '' ? '排队中' : `${head} · 排队中`
   if (task.state === 'dispatched') return head === '' ? '已派出' : `${head} · 已派出`
@@ -256,7 +272,31 @@ export interface NewTaskInput {
   folder?: string
   preset?: string
   sessionIds?: string[]
+  /** 任务来源：缺省 `tihu`（鹈鹕派单）；`pc` 时短号走 `p` 前缀。 */
+  source?: TihuTaskSource
+  /** 初始状态：电脑端会话一上屏就是推导出来的状态，不必先排队再翻。 */
+  state?: TihuTaskState
+  /** 起跑时刻（时长环从它算）：电脑端会话＝最后一次活动时间。 */
+  startedAt?: number
   now?: number
+}
+
+/**
+ * 电脑端会话的登记簿同步入参（`TaskLedger.syncExternal`）。
+ *
+ * 只做「按会话活动推导出来的状态」：running / done / queued 三态由上层算，
+ * 登记簿不猜时间；`summary` 是完成摘要（助手回复的纯文本一行）。
+ */
+export interface ExternalSyncInput {
+  title?: string
+  projectName?: string
+  folder?: string
+  state: 'queued' | 'running' | 'done'
+  /** 这轮活动的起点（时长环用；只在进入执行中时更新）。 */
+  startedAt?: number
+  /** 完成摘要（只留最后一条助手回复的一行纯文本）。 */
+  summary?: string
+  at: number
 }
 
 /**
@@ -265,6 +305,8 @@ export interface NewTaskInput {
 export class TaskLedger {
   private readonly tasks = new Map<string, TihuTask>()
   private seq = 0
+  /** 电脑端会话的短号计数器：与派单的 `t` 序列分开，屏上截图才对得上号。 */
+  private pcSeq = 0
   /**
    * 归档行的落地口（lane 传「往 journal 追加一行」）。
    * 自动归档（prune）也走它：不然清掉老任务时那一行就悄悄丢了。
@@ -280,25 +322,28 @@ export class TaskLedger {
   /** 新派（或追加）一条任务。返回登记簿里的这一条（同一对象，后续原地更新）。 */
   add(input: NewTaskInput): TihuTask {
     const now = input.now ?? Date.now()
+    const source: TihuTaskSource = input.source === 'pc' ? 'pc' : 'tihu'
     // 短号严格递增：撤单/归档也不回退（屏上截图对不上号最容易被当成 bug）。
-    this.seq += 1
+    const seq = source === 'pc' ? (this.pcSeq += 1) : (this.seq += 1)
     const task: TihuTask = {
-      taskId: `t${this.seq}`,
+      taskId: `${source === 'pc' ? 'p' : 't'}${seq}`,
+      source,
       title: taskTitleOf(input.title),
       projectId: input.projectId,
       projectName: input.projectName,
       sessionIds: [...(input.sessionIds ?? [])],
       preset: input.preset ?? 'standard',
-      state: 'queued',
+      state: input.state ?? 'queued',
       step: 0,
       turn: 0,
-      startedAt: now,
+      startedAt: input.startedAt ?? now,
       updatedAt: now,
       summary: '',
       ...(input.folder === undefined || input.folder === '' ? {} : { folder: input.folder }),
     }
     this.tasks.set(task.taskId, task)
-    this.prune()
+    // 用同一只时钟剪枝：调用方传了 now（单测假时钟）就不能拿真实时间比 3 天窗口。
+    this.prune(now)
     return task
   }
 
@@ -315,9 +360,14 @@ export class TaskLedger {
     return undefined
   }
 
-  /** 全部任务（含归档；棋盘投影自己会滤掉归档）。 */
+  /**
+   * 全部任务（含归档；棋盘投影自己会滤掉归档）。
+   *
+   * 顺序＝入簿顺序（Map 的插入序）：`t` 与 `p` 混排时也能保留真实先后，
+   * 不能按短号数字排——`p2` 与 `t2` 会撞号。
+   */
   list(): TihuTask[] {
-    return [...this.tasks.values()].sort((a, b) => Number(a.taskId.slice(1)) - Number(b.taskId.slice(1)))
+    return [...this.tasks.values()]
   }
 
   size(): number {
@@ -355,6 +405,60 @@ export class TaskLedger {
       task.updatedAt = now
     }
     return task
+  }
+
+  /**
+   * 电脑端（外部）会话的状态同步：状态由**会话活动**推导，不走「派单→执行→完成」的事件链。
+   *
+   * 与 `markRunning/complete` 的区别（也是这里单独一个方法的原因）：
+   *   - 允许 `done → running`：电脑端会话随时可能再被说一句话，任务卡要回到执行中；
+   *   - 只有**屏上看得见的字段**（标题/项目/状态/起跑时刻）变了才动 `updatedAt`，
+   *     否则每 10 秒一次轮询都会把卡片重新排到最前，棋盘会自己跳；
+   *   - 不改 `spokenAt` 之外的播报状态：要不要念由 lane 决定（这里只管数据）。
+   *
+   * 返回 true 表示「棋盘该重画了」（标题/副行/状态/胶囊变了）。
+   */
+  syncExternal(taskId: string, input: ExternalSyncInput): boolean {
+    const task = this.tasks.get(taskId)
+    if (task === undefined) return false
+    const at = Number.isFinite(input.at) ? input.at : Date.now()
+    let changed = false
+    const title = String(input.title ?? '').trim()
+    if (title !== '' && task.title !== title) {
+      task.title = taskTitleOf(title)
+      changed = true
+    }
+    const project = String(input.projectName ?? '').trim()
+    if (project !== '' && task.projectName !== project) {
+      task.projectName = project
+      changed = true
+    }
+    const folder = String(input.folder ?? '').trim()
+    if (folder !== '' && task.folder !== folder) task.folder = folder
+    const summary = String(input.summary ?? '').trim()
+    if (summary !== '') task.resultLine = summary
+    // 会话标题变了/摘要变了：summary 不上棋盘，但结果行要跟着最新一条回复走。
+    if (task.state !== input.state) {
+      task.state = input.state
+      task.updatedAt = at
+      changed = true
+      if (input.state === 'running') {
+        task.finishedAt = undefined
+        task.spokenAt = undefined
+        const started = Number(input.startedAt)
+        task.startedAt = Number.isFinite(started) && started > 0 ? started : at
+        if (summary !== '') task.summary = summary
+      } else if (input.state === 'done') {
+        task.finishedAt = at
+        if (summary !== '') task.summary = summary
+      } else {
+        task.finishedAt = undefined
+        if (Number.isFinite(Number(input.startedAt))) task.startedAt = Number(input.startedAt)
+      }
+    } else if (changed) {
+      task.updatedAt = at
+    }
+    return changed
   }
 
   /** 步数推进（tool/call）：只增不减；顺手记最近 8 步耗时给棋盘微条。 */
@@ -476,6 +580,9 @@ export class TaskLedger {
     if (this.tasks.size <= LEDGER_MAX_TASKS) {
       for (const task of this.tasks.values()) {
         if (isFinishedState(task.state) && task.finishedAt !== undefined && now - task.finishedAt > DONE_KEEP_MS) keep(task.taskId)
+        // 电脑端外部会话：静置超过同一个 3 天窗口就下屏（与完成态的归档窗口同一条规则），
+        // 不因为「它一直没跑完」就永远占着棋盘。
+        else if (task.source === 'pc' && now - task.updatedAt > DONE_KEEP_MS) keep(task.taskId)
       }
       return
     }
@@ -829,8 +936,10 @@ export function routeQuick(input: {
 
   // 「接着 / 继续 / 再…」＝同一件事接着说：优先追加到点名那张卡的在办任务，
   // 没点名就追加到最近在办的那条（设计 §6 快路径第 2 条：上一条任务接续）。
+  // 电脑端（pc）任务只读镜像：往里追加就等于给电脑端会话投 prompt，绝对不能走这条路。
   const activeOf = (projectId: string | undefined): TihuTask | undefined =>
     input.tasks
+      .filter((task) => task.source !== 'pc')
       .filter((task) => task.state === 'running' || task.state === 'awaiting' || task.state === 'queued' || task.state === 'dispatched')
       .filter((task) => projectId === undefined || task.projectId === projectId)
       .sort((a, b) => b.updatedAt - a.updatedAt)[0]
@@ -865,6 +974,42 @@ export function routeQuick(input: {
   const close = scored.filter((item) => item.score * 100 >= best.score * 80)
   if (close.length > 1) return { kind: 'ambiguous', candidates: close.slice(0, 2).map((item) => item.card) }
   return { kind: 'card', card: best.card, matched: best.matched }
+}
+
+/**
+ * 一段助手回复 → 一行「纯文本摘要」（电脑端会话完成时上卡片、进播报）。
+ *
+ * 纪律（用户 2026-11-09 要求）：
+ *   - 去 markdown：代码块/行内代码/标题/列表/表格/加粗/链接，全部只留字；
+ *   - 去长路径：`D:\…\xx.md`、`/home/…/x.py` 这类含分隔符的长 token 直接扔掉
+ *     （念出来是一串噪音，屏上也放不下）；
+ *   - 只取第一句，按字数截断（默认 48 字，播报一句正好）。
+ */
+export function plainSummaryOf(text: unknown, maxChars = 48): string {
+  const raw = String(text ?? '')
+  const withoutBlocks = raw
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`\n]*)`/g, '$1')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/<[^>\n]{1,120}>/g, ' ')
+    .replace(/^\s{0,3}#{1,6}\s*/gm, '')
+    .replace(/^\s{0,3}[-*+]\s+/gm, '')
+    .replace(/^\s{0,3}>\s?/gm, '')
+    .replace(/^\s*\|.*\|\s*$/gm, ' ')
+    .replace(/[*_~]{1,3}/g, '')
+  const kept: string[] = []
+  for (const token of withoutBlocks.split(/\s+/)) {
+    if (token === '') continue
+    if (/(?:[\\/])/.test(token) && (token.length >= 12 || /^[A-Za-z]:[\\/]/.test(token))) continue
+    kept.push(token)
+  }
+  const clean = kept.join(' ').replace(/\s+/g, ' ').trim()
+  if (clean === '') return ''
+  const first = clean.split(/[。！？!?\n]/).map((part) => part.trim()).find((part) => part !== '') ?? ''
+  if (first === '') return ''
+  const chars = [...first]
+  return chars.length > maxChars ? `${chars.slice(0, Math.max(1, maxChars - 1)).join('')}…` : first
 }
 
 /**

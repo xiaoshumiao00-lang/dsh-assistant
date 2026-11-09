@@ -32,6 +32,7 @@ import {
   longestCommonRun,
   mergeAnnouncements,
   parseScreenCommand,
+  plainSummaryOf,
   ringOf,
   routeQuick,
   scoreCardAlias,
@@ -554,7 +555,7 @@ test('任务详情（屏 4）：标题只有「第 N 步 · 已用」，正文�
   assert.ok(frame.bullets.some((line) => line.includes('82 tok/s')))
   assert.ok(frame.bullets.some((line) => line === '青年基金申请书 · 改写第 3 段'))
   assert.equal(frame.statsTail, 1)
-  assert.deepEqual(frame.actions.map((item) => item.label), ['看会话', '停止', '回棋盘'])
+  assert.deepEqual(frame.actions.map((item) => item.label), ['停止', '回棋盘'])
 })
 
 test('待决策（屏 5）：托管未开 + 默认项标记 + 60 秒倒计时', () => {
@@ -628,6 +629,116 @@ test('所有任务屏的共同契约：不新增必填字段、按钮 id 不重�
     // 18px 加粗标题：按像素量宽必须落在 304 以内（clipScreenTitle 保证）
     assert.ok(frame.title.length <= SCREEN_SPEC.titleChars * 2, `标题不该无限长：${frame.title}`)
   }
+})
+
+/* ---------- 2026-11-09 新增：电脑端（DSH 主 GUI）会话 → 外部任务（source='pc'） ----------
+ *
+ * 需求：电脑端新建/运行的会话也要同步到鹈鹕屏，两端状态一致。登记簿这一侧要保证：
+ *   - 外部任务有自己的 source 与 p 前缀短号，不占派单的 t 序号；
+ *   - 副行写「电脑端 · 项目名」（状态已经在胶囊里，不重复写「已完成」）；
+ *   - 状态可以从 done 回到 running（电脑端随时会再说一句），轮询不变时不抖 updatedAt；
+ *   - 「接着/继续」永远追加不到外部任务上（外部任务是只读镜像，不能投 prompt）；
+ *   - 完成摘要只留纯文本（去 markdown、去长路径）。
+ */
+
+test('电脑端外部任务：source=pc / p 前缀短号 / 副行「电脑端 · 项目名」', () => {
+  const ledger = new TaskLedger()
+  // 用同一个时间基准：prune 会按「静置 3 天」归档电脑端任务，假时钟跨 3 天会把这条测试弄假。
+  const now = Date.now()
+  const task = ledger.add({
+    title: '把第三节的结果补上',
+    projectId: 'pc:session-1',
+    projectName: '论文',
+    sessionIds: ['session-1'],
+    source: 'pc',
+    state: 'running',
+    startedAt: now - 1000,
+    now,
+  })
+  assert.equal(task.taskId, 'p1')
+  assert.equal(task.source, 'pc')
+  assert.equal(task.state, 'running')
+  assert.equal(task.startedAt, now - 1000)
+  assert.deepEqual(task.sessionIds, ['session-1'])
+  assert.equal(subLineOf(task), '电脑端 · 论文', '副行＝电脑端＋项目名，状态不重复写')
+  task.state = 'done'
+  assert.equal(subLineOf(task), '电脑端 · 论文')
+  // 两套短号各走各的：p1 不会把鹈鹕派单的 t1 顶成 t2。
+  const dispatch = ledger.add({ title: '派单的', projectId: 'p', projectName: 'P', now: now + 10 })
+  assert.equal(dispatch.taskId, 't1')
+  assert.equal(dispatch.source, 'tihu', '缺省仍是鹈鹕派单（老流程不受影响）')
+  const second = ledger.add({ title: '第二条外部', projectId: 'pc:session-2', projectName: '', source: 'pc', now: now + 20 })
+  assert.equal(second.taskId, 'p2')
+  assert.equal(subLineOf(second), '电脑端', '没有项目名时就直接「电脑端」')
+})
+
+test('电脑端外部任务计入「在跑/排队」，完成不计数；棋盘胶囊与鹈鹕任务同一套文字', () => {
+  const ledger = new TaskLedger()
+  ledger.add({ title: '跑着的', projectId: 'pc:a', projectName: 'A', sessionIds: ['a'], source: 'pc', state: 'running' })
+  ledger.add({ title: '排队的', projectId: 'pc:b', projectName: 'B', sessionIds: ['b'], source: 'pc', state: 'queued' })
+  ledger.add({ title: '完成的', projectId: 'pc:c', projectName: 'C', sessionIds: ['c'], source: 'pc', state: 'done' })
+  assert.deepEqual(countsOf(ledger.list()), { running: 1, awaiting: 0, queued: 1 })
+  const board = boardOf(ledger.list(), 10)
+  assert.equal(board.total, 3)
+  assert.deepEqual(board.rows.map((row) => row.capsule), ['执行中', '排队', '完成'])
+  assert.deepEqual(board.rows.map((row) => row.sub), ['电脑端 · A', '电脑端 · B', '电脑端 · C'])
+})
+
+test('syncExternal：done→running 可复活；状态没变就不动 updatedAt（轮询不抖棋盘）', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: 'a', projectId: 'pc:a', projectName: 'A', sessionIds: ['a'], source: 'pc', state: 'running', startedAt: 1000, now: 2000 })
+  assert.equal(ledger.syncExternal(task.taskId, { state: 'done', summary: '做完了', at: 5000 }), true)
+  assert.equal(task.state, 'done')
+  assert.equal(task.finishedAt, 5000)
+  assert.equal(task.resultLine, '做完了')
+  assert.equal(ledger.syncExternal(task.taskId, { state: 'done', at: 9000 }), false, '同一状态不算棋盘变化')
+  assert.equal(task.updatedAt, 5000, '每 10 秒轮询一次不能把卡片重新顶到最前')
+  assert.equal(ledger.syncExternal(task.taskId, { state: 'running', summary: '又有新进展', at: 12_000, startedAt: 11_000 }), true)
+  assert.equal(task.state, 'running')
+  assert.equal(task.finishedAt, undefined)
+  assert.equal(task.startedAt, 11_000, '新一轮的活动重新起算时长环')
+  assert.equal(task.resultLine, '又有新进展')
+  // 标题/项目变了也算棋盘变化，标题仍按 taskTitleOf 截断
+  assert.equal(ledger.syncExternal(task.taskId, { title: '很长的标题'.repeat(12), projectName: 'B', state: 'running', at: 13_000 }), true)
+  assert.ok([...task.title].length <= 18, '标题必须截断：' + task.title)
+  assert.equal(subLineOf(task), '电脑端 · B')
+})
+
+test('外部任务绝不被「接着/继续」追加（只读镜像，不能往电脑端会话投 prompt）', () => {
+  const ledger = new TaskLedger()
+  const external = ledger.add({ title: '外部那条', projectId: 'pc:a', projectName: 'A', sessionIds: ['a'], source: 'pc', state: 'running' })
+  const route = routeQuick({ text: '接着把图也改一下', cards: [], tasks: ledger.list() })
+  assert.notEqual(route.kind, 'append')
+  assert.notEqual(route.kind === 'append' ? route.task.taskId : '', external.taskId)
+  // 鹈鹕自己的任务照旧可以追加
+  const own = ledger.add({ title: '派单那条', projectId: 'p', projectName: 'P' })
+  ledger.attachSession(own.taskId, 'own-session')
+  ledger.markRunning(own.taskId)
+  assert.equal(routeQuick({ text: '接着改', cards: [], tasks: ledger.list() }).kind, 'append')
+})
+
+test('电脑端外部任务：超过 3 天没活动按同一归档窗口自动下屏（prune）', () => {
+  const ledger = new TaskLedger()
+  const stale = ledger.add({ title: '老会话', projectId: 'pc:old', projectName: 'A', sessionIds: ['old'], source: 'pc', state: 'running', now: 1000 })
+  const fresh = ledger.add({ title: '新会话', projectId: 'pc:new', projectName: 'B', sessionIds: ['new'], source: 'pc', state: 'running', now: DONE_KEEP_MS + 5000 })
+  const dispatch = ledger.add({ title: '派单的', projectId: 'p', projectName: 'P', now: DONE_KEEP_MS + 5000 })
+  ledger.prune(DONE_KEEP_MS + 6000)
+  assert.equal(stale.state, 'archived', '超过 3 天没活动的电脑端任务要下屏')
+  assert.equal(fresh.state, 'running', '窗口内的任务不动')
+  assert.equal(dispatch.state, 'queued', '还在排队的鹈鹕派单任务不受这条规则影响')
+  assert.equal(boardOf(ledger.list(), DONE_KEEP_MS + 6000).rows.length, 2)
+  assert.equal(DONE_KEEP_MS, 3 * 24 * 60 * 60_000, '窗口与完成态归档是同一个常量')
+})
+
+test('plainSummaryOf：去 markdown / 去长路径 / 只取第一句 / 超长省略', () => {
+  assert.equal(plainSummaryOf('## 结论\n**已经改好了**，温度场收敛。第二句不要。'), '结论 已经改好了，温度场收敛')
+  assert.equal(plainSummaryOf('结果在 D:\\dsh-assistant\\src\\tihu\\lane.ts 里'), '结果在 里')
+  assert.equal(plainSummaryOf('脚本 /home/user/projects/tihu/render.py 跑完了'), '脚本 跑完了')
+  assert.equal(plainSummaryOf('- 第一条\n- 第二条'), '第一条 第二条')
+  assert.equal(plainSummaryOf('`npm run build` 通过了'), 'npm run build 通过了')
+  assert.equal(plainSummaryOf('一二三四五六七八九十', 5), '一二三四…')
+  assert.equal(plainSummaryOf(''), '')
+  assert.equal(plainSummaryOf('```\ncode only\n```'), '')
 })
 
 console.log(`\n${passed} tests passed（task-ledger + task-screens）`)

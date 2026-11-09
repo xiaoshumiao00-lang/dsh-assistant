@@ -39,10 +39,7 @@ export const TIHU_UPSTREAM_TYPES = [
   'hello',
   'audio.frame',
   'text.input',
-  'confirm.reply',
   'session.end',
-  'sessions.query',
-  'session.bind',
   'screen.gesture',
   'voice.list',
   'voice.create',
@@ -54,16 +51,11 @@ export const TIHU_UPSTREAM_TYPES = [
 /** 下行消息类型（宿主 → 设备）。 */
 export const TIHU_DOWNSTREAM_TYPES = [
   'transcript',
-  'tts.text',
   'tts.audio',
   'screen.frame',
   'event.progress',
   'event.alert',
-  'event.done',
-  'confirm.ask',
-  'sessions.list',
   'session.bound',
-  'session.invalid',
   'voice.list',
   'voice.created',
   'task.list',
@@ -152,13 +144,6 @@ export interface TextInputPayload {
   source?: 'voice' | 'keyboard' | 'retry'
 }
 
-export interface ConfirmReplyPayload {
-  /** 对应 confirm.ask 的 id。 */
-  confirmId: string
-  /** 用户点了「确认」还是「取消」。 */
-  approved: boolean
-}
-
 export interface PingPayload {
   /** 设备生成的随机数，宿主原样回在 pong 里。 */
   nonce?: string
@@ -175,21 +160,6 @@ export interface TranscriptPayload {
   source: 'voice' | 'keyboard'
   /** 是否允许设备「撤回重说」（转写错误时）。 */
   retryable?: boolean
-}
-
-export interface TtsTextPayload {
-  /** 待朗读文本。 */
-  text: string
-  /** 分段序号（长回复按句切段，从 0 开始）。 */
-  index?: number
-  /** 总段数。 */
-  total?: number
-  /** 语言（P0 固定 zh-CN；浏览器 speechSynthesis 用）。 */
-  lang?: string
-  /** 本段在整段回复里的起始字符下标（Unicode 码点）。 */
-  charStart?: number
-  /** 结束字符下标（不含）。 */
-  charEnd?: number
 }
 
 /**
@@ -297,35 +267,14 @@ export interface ScreenFramePayload {
   bullets: string[]
   /** 进度：已完成 / 总数；没有总量的阶段给 done。 */
   progress?: { done: number; total?: number }
-  /** 视觉基调：idle | busy | ok | alert。 */
-  tone?: 'idle' | 'busy' | 'ok' | 'alert'
-  /** 屏幕模式：home=控制室主页；status/reply=会话屏。 */
-  mode?: 'home' | 'status' | 'reply'
-  /** 主页屏：项目列表与翻页。 */
-  home?: {
-    projects: { name: string; status: 'running' | 'idle' | 'done'; summary: string; sessionId?: string }[]
-    page: { index: number; total: number }
-    /** 项目总数：只作数据留着（协议字段只增不删；底部翻页边界也算它）。屏幕上不再显示「项目 N 个」那一行。 */
-    total: number
-    /**
-     * 首页顶部的「最近回答」行（用户 2026-11-08 要求）：只有**当前绑定的这个会话**
-     * 真的存了回复才下发。点它回到那条回答的朗读屏（带 停止/重读/主页 按钮）。
-     */
-    recent?: { sessionId: string; title: string; at?: number }
-  }
-  /** 回复屏底部按钮（停止朗读 / 重读 / 回主页；有历史时再追加 上一条/下一条）。 */
+  /** 视觉基调：idle | busy | ok | alert（warn＝待决策/追问的琥珀色）。 */
+  tone?: 'idle' | 'busy' | 'ok' | 'alert' | 'warn'
+  /** 屏幕模式：home=任务棋盘（含空态）；status=状态屏。 */
+  mode?: 'home' | 'status'
+  /** 底部按钮（停止 / 重读 / 回棋盘…；由屏帧自己给）。 */
   actions?: { id: string; label: string }[]
   /** 屏末尾有几行是「统计行」：页面按 statsFontPx 小 2 号字号渲染。 */
   statsTail?: number
-
-  /** 状态屏底部：其他正在运行的会话（最多 3 条，点了切过去）。 */
-  running?: { sessionId: string; title: string }[]
-  /** 待读会话气泡（最多 4 条，按完成时间排序）。 */
-  pending?: { sessionId: string; title: string; at: number; unread: true }[]
-  /** 未被 display 的待读总数（>4 时用于 +N）。 */
-  pendingCount?: number
-  /** reply 模式的正文窗口（长回复只传当前窗口 ±2 句）。 */
-  reply?: ReplyScreenPayload
 
   /**
    * 任务棋盘投影（屏 1，含空态）。有它就代表这一帧是棋盘：
@@ -350,34 +299,6 @@ export interface ScreenFramePayload {
   taskId?: string
 }
 
-/** reply 模式的一句（字符下标用于与朗读同步）。 */
-export interface ReplyScreenSentence {
-  index: number
-  start: number
-  end: number
-  text: string
-}
-
-/** reply 模式载荷：只传当前可视窗口的句子。 */
-export interface ReplyScreenPayload {
-  /** 句子窗口（当前句 ±2 句）。 */
-  sentences: ReplyScreenSentence[]
-  /** 当前朗读句索引（0 起，整段回复内的绝对索引）。 */
-  currentIndex: number
-  /** 整段回复的总句数。 */
-  total: number
-  /** 整段回复的总字符数。 */
-  totalChars?: number
-  /** 当前播放到的字符位置（用于高亮/估算进度）。 */
-  charPos?: number
-  /** 已按屏宽折好的行（宿主权威；页面直接渲染，不再自己折行）。 */
-  lines?: { text: string; sentenceIndex: number }[]
-  /** 滚动状态：offset=顶部被卷走的行数（也就是可视窗口的起始行，0 起），maxOffset=最大可滚动行数，total=整段回复折完后的总行数。 */
-  scroll?: { offset: number; maxOffset: number; total?: number }
-  /** 是否跟随朗读自动滚动。 */
-  follow?: boolean
-}
-
 export interface ProgressPayload {
   /** 阶段。 */
   stage: string
@@ -396,30 +317,6 @@ export interface AlertPayload {
   text: string
 }
 
-export interface DonePayload {
-  /** 收尾文本（可空）。 */
-  text?: string
-  /** 是否正常完成。 */
-  ok?: boolean
-  /** 本次动作落在哪个会话（便于设备端核对）。 */
-  sessionId?: string
-}
-
-export interface ConfirmAskPayload {
-  /** 确认请求 id（设备回 confirm.reply 时必须带同一个）。 */
-  confirmId: string
-  /** 一行标题，如「删除文件」。 */
-  title: string
-  /** 详情（目标路径 / 命令原文）。 */
-  detail: string
-  /** 两个动作的文案（P0 固定「确认 / 取消」）。 */
-  options: [string, string]
-  /** 超时毫秒；超时按「取消」处理（安全侧默认）。 */
-  timeoutMs: number
-  /** 风险等级。 */
-  risk?: 'high' | 'medium'
-}
-
 export interface SessionEndPayload {
   /** 要结束的会话；不填则用设备 hello 里绑定的那个。 */
   sessionId?: string
@@ -427,75 +324,11 @@ export interface SessionEndPayload {
   reason?: string
 }
 
-/**
- * 会话列表查询（页面自己建会话选择用）。
- *
- * 为什么由设备主动要：公网 origin（http://<公网IP>:<端口>/tihu）与桌面宿主
- * （http://127.0.0.1:…）不是同一个 origin，localStorage 互相隔离，页面读不到
- * 桌面选过的会话。所以「当前会话」必须由宿主告诉页面，而不是页面自己猜。
- */
-export interface SessionsQueryPayload {
-  /** 最多返回多少条；缺省 10，宿主上限 50。 */
-  limit?: number
-  /** 页面当前准备绑定的会话 id；宿主在完整列表里核对它是否还存在。 */
-  checkId?: string
-}
-
-/** 屏下选择器的一行。 */
-export interface SessionChoice {
-  /** 会话 id（`session-…`）。 */
-  sessionId: string
-  /** 会话名（宿主折叠不到标题时为空串，页面退回短 id）。 */
-  title: string
-  /** 工作目录（P0 只用于悬停提示）。 */
-  cwd?: string
-  /** 创建时间（毫秒）。 */
-  createdAt?: number
-  /**
-   * 活跃时间（毫秒）：宿主会话列表用的 `updatedAt = max(header.createdAt, 投影
-   * sessionListMetadata.lastPromptAt)` —— 也就是「最后一次用户发言时间」，
-   * 桌面端会话列表就按它排序。自动绑定取这个字段最大的一条 CU 会话。
-   */
-  updatedAt?: number
-  /** 是否正在宿主内存里（桌面正开着）。 */
-  live?: boolean
-  /**
-   * 会话的 agent preset（宿主投影 `agentPreset`，缺省回退 `session.header.agentPreset`）。
-   * 这是判断「Computer Use 模式」的唯一可靠依据——**不看标题猜**。
-   */
-  preset?: string
-  /** 是否 Computer Use 模式（preset === 'computer-use'）。语音操作只在这个模式下可用。 */
-  computerUse?: boolean
-}
-
-/** 下行：会话列表 + 对 checkId 的核对结果。 */
-export interface SessionsListPayload {
-  /** 最近 N 条**可语音操作**（Computer Use 模式）的会话。 */
-  sessions: SessionChoice[]
-  /** 逻辑会话总数（不只这 N 条）。 */
-  total: number
-  /** 其中 Computer Use 模式的会话数（页面据此提示「先去新建一个」）。 */
-  cuTotal: number
-  /** checkId 是否存在、是什么模式；没传 checkId 时没有这个字段。 */
-  check?: { sessionId: string; found: boolean; preset?: string; computerUse?: boolean }
-  /** 当前「最近活跃的 Computer Use 会话」id（自动绑定目标）；没有则为空。 */
-  activeSessionId?: string
-  /** 数据源（诊断用）。 */
-  source: 'sessionQuery' | 'live' | 'none'
-}
-
 /** 上行：绑定一个会话，或切回「自动跟随」。 */
 /** 屏幕手势：上/下滑（滚动历史）与点击（预留）。 */
 export type ScreenGesturePayload =
   | { action: 'swipe'; dy: number; phase: 'start' | 'move' | 'end' }
-  | { action: 'tap'; x: number; y: number; hit?: 'chip' | 'screen' | 'project' | 'action' | 'switch' | 'recent' | 'task'; targetSessionId?: string; project?: string; sessionId?: string; actionId?: string; taskId?: string }
-
-export interface SessionBindPayload {
-  /** 要手动绑定的会话 id；`auto: true` 时可省略。 */
-  sessionId?: string
-  /** true = 切回自动跟随（宿主自动绑定最近活跃的 CU 会话）。 */
-  auto?: boolean
-}
+  | { action: 'tap'; x: number; y: number; hit?: 'screen' | 'action' | 'task'; actionId?: string; taskId?: string }
 
 /** 下行：绑定成功（宿主是权威，标题/是否 live/模式以这里为准）。 */
 export interface SessionBoundPayload {
@@ -514,16 +347,6 @@ export interface SessionBoundPayload {
   auto?: boolean
   /** 这次绑定是否因为「最活跃的 CU 会话变了」而自动跟随（页面提示「已自动跟随到」）。 */
   followed?: boolean
-}
-
-/** 下行：会话 id 非法（不存在 / 已归档 / 写错），页面据此退回选择器。 */
-export interface SessionInvalidPayload {
-  /** 非法/找不到的会话 id。 */
-  sessionId: string
-  /** 给用户看的一行原因（可操作：从下面选一个）。 */
-  reason: string
-  /** 是否建议立刻显示选择器（P0 恒为 true）。 */
-  showPicker?: boolean
 }
 
 /* ---------- 任务登记簿（Task Ledger）投影 ----------
@@ -626,10 +449,7 @@ export type TihuUpstreamMessage =
   | TihuEnvelope<'hello', HelloPayload>
   | TihuEnvelope<'audio.frame', AudioFramePayload>
   | TihuEnvelope<'text.input', TextInputPayload>
-  | TihuEnvelope<'confirm.reply', ConfirmReplyPayload>
   | TihuEnvelope<'session.end', SessionEndPayload>
-  | TihuEnvelope<'sessions.query', SessionsQueryPayload>
-  | TihuEnvelope<'session.bind', SessionBindPayload>
   | TihuEnvelope<'screen.gesture', ScreenGesturePayload>
   | TihuEnvelope<'voice.list', Record<string, never>>
   | TihuEnvelope<'voice.create', VoiceCreatePayload>
@@ -640,16 +460,11 @@ export type TihuUpstreamMessage =
 
 export type TihuDownstreamMessage =
   | TihuEnvelope<'transcript', TranscriptPayload>
-  | TihuEnvelope<'tts.text', TtsTextPayload>
   | TihuEnvelope<'tts.audio', TtsAudioPayload>
   | TihuEnvelope<'screen.frame', ScreenFramePayload>
   | TihuEnvelope<'event.progress', ProgressPayload>
   | TihuEnvelope<'event.alert', AlertPayload>
-  | TihuEnvelope<'event.done', DonePayload>
-  | TihuEnvelope<'confirm.ask', ConfirmAskPayload>
-  | TihuEnvelope<'sessions.list', SessionsListPayload>
   | TihuEnvelope<'session.bound', SessionBoundPayload>
-  | TihuEnvelope<'session.invalid', SessionInvalidPayload>
   | TihuEnvelope<'voice.list', VoiceListPayload>
   | TihuEnvelope<'voice.created', VoiceCreatedPayload>
   | TihuEnvelope<'task.list', TaskListPayload>
@@ -731,31 +546,10 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
         if (payload.text.length > TIHU_MAX_TEXT_CHARS) return null
         return value as TihuUpstreamMessage
       }
-      case 'confirm.reply': {
-        if (typeof payload.confirmId !== 'string' || payload.confirmId === '') return null
-        if (typeof payload.approved !== 'boolean') return null
-        return value as TihuUpstreamMessage
-      }
       case 'session.end': {
         // 结束本次语音会话：只带可选的 sessionId（不填就用设备绑定的那个）。
         if (payload.sessionId !== undefined && (typeof payload.sessionId !== 'string' || payload.sessionId.length > 256)) return null
         if (payload.reason !== undefined && typeof payload.reason !== 'string') return null
-        return value as TihuUpstreamMessage
-      }
-      case 'sessions.query': {
-        // 页面拉会话列表：limit/checkId 都可选，但给了就必须合法（超限直接忽略这条）。
-        if (payload.limit !== undefined) {
-          if (typeof payload.limit !== 'number' || !Number.isSafeInteger(payload.limit) || payload.limit < 1 || payload.limit > 50) return null
-        }
-        if (payload.checkId !== undefined && (typeof payload.checkId !== 'string' || payload.checkId.length > 256)) return null
-        return value as TihuUpstreamMessage
-      }
-      case 'session.bind': {
-        // 手动绑定要 id；切回自动跟随用 { auto: true }（id 可省）。
-        if (payload.auto !== undefined && typeof payload.auto !== 'boolean') return null
-        if (payload.sessionId !== undefined && (typeof payload.sessionId !== 'string' || payload.sessionId.length > 256)) return null
-        const manual = typeof payload.sessionId === 'string' && payload.sessionId !== ''
-        if (!manual && payload.auto !== true) return null
         return value as TihuUpstreamMessage
       }
       case 'voice.list': return value as TihuUpstreamMessage
@@ -789,12 +583,9 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
         if (payload.action === 'tap') {
           if (typeof payload.x !== 'number' || typeof payload.y !== 'number') return null
           if (!Number.isFinite(payload.x) || !Number.isFinite(payload.y)) return null
-          if (payload.hit !== undefined && payload.hit !== 'chip' && payload.hit !== 'screen' && payload.hit !== 'project' && payload.hit !== 'action' && payload.hit !== 'switch' && payload.hit !== 'recent' && payload.hit !== 'task') return null
+          if (payload.hit !== undefined && payload.hit !== 'screen' && payload.hit !== 'action' && payload.hit !== 'task') return null
           if (payload.actionId !== undefined && (typeof payload.actionId !== 'string' || payload.actionId.length > 32)) return null
           if (payload.taskId !== undefined && (typeof payload.taskId !== 'string' || payload.taskId.length > 64)) return null
-          if (payload.targetSessionId !== undefined && (typeof payload.targetSessionId !== 'string' || payload.targetSessionId.length > 256)) return null
-          if (payload.project !== undefined && (typeof payload.project !== 'string' || payload.project.length > 256)) return null
-          if (payload.sessionId !== undefined && (typeof payload.sessionId !== 'string' || payload.sessionId.length > 256)) return null
           // 钳制而不是丢弃：页面在真机缩放/横屏下会发出负值或超出 320×240 的点，
           // 直接忽略等于怎么点都没反应（2026-11-07 审计 P2-手势越界）。
           return {
