@@ -65,6 +65,24 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .stage { font-size:12px; line-height:14px; letter-spacing:1px; color:var(--accent);
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen.alert { border-color:#000; }
+  #screen.warn { border-color:#000; }
+  #screen.warn .stage, #screen.warn .title { color:var(--warn); }
+  #screen.awaiting-mode .cd-row { display:none !important; }
+  #screen.awaiting-mode .bar, #screen.awaiting-mode #progress { display:none !important; }
+  #screen.ask-mode .cd-row, #screen.ask-mode .bar, #screen.ask-mode #progress { display:none !important; }
+  #screen.detail-mode .cd-row, #screen.detail-mode .bar, #screen.detail-mode #progress { display:none !important; }
+  /* 完成播报的朗读波形（CSS 动态，7 根） */
+  #screen .done-wave { display:none; position:absolute; top:7px; right:9px; gap:2px; align-items:center; height:12px; }
+  #screen.done-mode .done-wave { display:flex; }
+  #screen.done-mode .stage { padding-right:24px; }
+  #screen .done-wave span { display:block; width:2px; height:4px; border-radius:1px; background:var(--accent); animation:tihu-done-wave .9s ease-in-out infinite; }
+  #screen .done-wave span:nth-child(2) { animation-delay:.1s; }
+  #screen .done-wave span:nth-child(3) { animation-delay:.2s; }
+  #screen .done-wave span:nth-child(4) { animation-delay:.3s; }
+  #screen .done-wave span:nth-child(5) { animation-delay:.4s; }
+  #screen .done-wave span:nth-child(6) { animation-delay:.5s; }
+  #screen .done-wave span:nth-child(7) { animation-delay:.6s; }
+  @keyframes tihu-done-wave { 0%,100% { height:4px; } 50% { height:12px; } }
   #screen.alert .title, #screen.alert .stage { color:var(--err); }
   /* 首页最上方那一行（用户 2026-11-08 确认）：原来的「项目 N 个 · 第 x/y 页」整段删掉，
      换成「本地时钟 HH:MM」+「三格信号柱」。这一行占掉 stage 原来那一行的位置（12px/行高 14），
@@ -84,6 +102,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     font-variant-numeric:tabular-nums; white-space:nowrap; overflow:hidden; flex:none; }
   /* 三格信号柱：3 根 ×5px + 2 个间隙 ×2px = 19px（页面 JS 里 HOME_TOP_* 常量要和这两个数字一致）。 */
   #screen .home-top .signal { flex:none; margin-left:auto; display:flex; align-items:flex-end; gap:2px; height:13px; }
+  #screen .home-top .home-counts { margin-left:auto; font-size:11px; line-height:14px; color:var(--dim); white-space:nowrap; }
+  #screen.board-mode .home-top .signal { display:none; }
   #screen .home-top .signal .bar { display:block; width:5px; border-radius:1px; background:#6b7785; }
   #screen .home-top .signal .bar.b1 { height:5px; }
   #screen .home-top .signal .bar.b2 { height:9px; }
@@ -209,8 +229,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-empty .l2 { font-size:12px; line-height:16px; color:#9fb0c0; }
   #screen .board-empty .l3 { font-size:12px; line-height:16px; color:#6f7d8b; }
   /* 派单回执的三拍圆点（已入队 / 排队 N 个 / 开始跑）：只在 steps 帧出现 */
-  #screen .steps { display:none; flex:none; gap:6px; margin-top:4px; }
+  #screen .steps { display:none; flex:none; gap:5px; margin:5px 0 6px; }
   #screen.steps-on .steps { display:flex; }
+  #screen .step-arrow { flex:none; color:#5f7183; font-size:10px; line-height:14px; align-self:flex-start; margin-top:0; }
   #screen .step { flex:1; min-width:0; font-size:11px; line-height:14px; text-align:center; color:#6b7785; white-space:nowrap; overflow:hidden; }
   #screen .step::before { content:''; display:block; width:7px; height:7px; border-radius:50%; margin:0 auto 2px; background:#26323e; }
   #screen .step.done { color:var(--accent); }
@@ -220,8 +241,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   /* 倒计时条（派单回执 5 秒回棋盘 / 待决策 60 秒按默认项）：文字给秒数，条只给感觉 */
   #screen .cd-row { display:none; flex:none; align-items:center; gap:6px; font-size:11px; line-height:14px; color:#9fb0c0; }
   #screen.cd-on .cd-row { display:flex; }
-  #screen .cd-track { flex:1; height:4px; border-radius:2px; background:#182230; overflow:hidden; }
-  #screen .cd-fill { height:100%; width:100%; background:var(--accent); transition:width .95s linear; }
+  #screen .cd-track { flex:1; height:6px; border-radius:3px; background:#182230; overflow:hidden; }
+  #screen .cd-fill { height:100%; width:100%; background:repeating-linear-gradient(90deg,var(--accent) 0 8px,transparent 8px 11px); background-size:11px 100%; transition:width .95s linear; animation:tihu-cd-flow .9s linear infinite; }
+  @keyframes tihu-cd-flow { from { background-position:0 0; } to { background-position:11px 0; } }
+  #screen > .bar { display:none; }
+  #screen #progress { display:none; }
   /* 「在听 · 已唤醒」（屏 3）：唤醒词命中后盖在屏上，说完停 3 秒自动发送 */
   #screen .listen { display:none; position:absolute; inset:0; z-index:6; background:#05080b;
     padding:8px; box-sizing:border-box; flex-direction:column; align-items:center; justify-content:center; gap:4px; }
@@ -332,7 +356,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       <div class="mics"><span></span><span></span></div>
       <div id="screen">
         <div class="stage" id="stage">连接</div>
-        <div id="homeTop" class="home-top"><span class="clock" id="homeClock">--:--</span><span class="signal conn-connecting" id="homeSignal"><span class="bar b1"></span><span class="bar b2"></span><span class="bar b3"></span></span></div>
+        <div id="doneWave" class="done-wave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+        <div id="homeTop" class="home-top"><span class="clock" id="homeClock">--:--</span><span class="home-counts" id="boardCounts"></span><span class="signal conn-connecting" id="homeSignal"><span class="bar b1"></span><span class="bar b2"></span><span class="bar b3"></span></span></div>
         <div class="title" id="title">正在连接宿主…</div>
         <div id="steps" class="steps"></div>
         <ul id="bullets"></ul>
@@ -762,10 +787,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     if (signal) signal.className = 'signal ' + connClassOf();
     var clock = $('homeClock');
     if (!clock) return;
-    // 棋盘模式这一行是三段计数，其余模式是本地时钟——两者走同一条 fitTextPx 排版。
-    var text = state.screenMode === 'board' ? boardCountsText(state.board && state.board.counts) : clockText();
-    var room = Math.max(1, stageWidthPx() - SIGNAL_W - HOME_TOP_GAP_W);
-    clock.textContent = fitTextPx(text, room, SCREEN.stageFontPx || 12);
+    // 左上角始终是本地时钟（HH:MM，随分钟刷新）；棋盘三段计数挪到右端。
+    clock.textContent = fitTextPx(clockText(), Math.max(1, stageWidthPx() - 176 - HOME_TOP_GAP_W), SCREEN.stageFontPx || 12);
+    var counts = $('boardCounts');
+    if (counts) {
+      counts.textContent = state.screenMode === 'board' ? fitTextPx(boardCountsText(state.board && state.board.counts), 170, 11) : '';
+    }
   }
   /**
    * 朗读屏 stage 行（方案 B + 本轮绑定信息）：文案不动，末尾追加「· 窗口起始行/总行」，
@@ -789,7 +816,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     // 完成播报不显示「第 x/y 段」位置；改由 stage 右端带「另有 N 条」。
     var position = reply.noPosition === true ? '' : ' · ' + (offset + 1) + '/' + total;
     var more = payload.more && payload.more.text ? ' · ' + payload.more.text : '';
-    return stageWithTails(String(payload.stage || '回答中'), position + more, bindTailOf(), SCREEN.stageFontPx || 12);
+    // 完成屏右上让给朗读波形，不再接「已绑定」尾巴（图 3 的完成 stage 只留位置/另有）。
+    var bindTail = payload.stage === '完成' ? '' : bindTailOf();
+    return stageWithTails(String(payload.stage || '回答中'), position + more, bindTail, SCREEN.stageFontPx || 12);
   }
   /** 主页底部翻页条：‹ 上一页 / 第 x/y 页 / › 下一页；越界的一侧置灰（点它宿主也不动页码）。 */
   function renderHomePager(payload) {
@@ -855,7 +884,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     $('stage').textContent = '';
     $('replyBody').innerHTML = '';
     var clock = $('homeClock');
-    if (clock) clock.textContent = fitTextPx(boardCountsText(board.counts), Math.max(1, stageWidthPx() - SIGNAL_W - HOME_TOP_GAP_W), SCREEN.stageFontPx || 12);
+    if (clock) renderHomeTop();
     renderHomePager({ home: { page: board.page || { index: 0, total: 1 } } });
     renderSteps([]);
     renderCountdown(null);
@@ -951,6 +980,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     box.innerHTML = '';
     if (!state.steps.length) { screen.classList.remove('steps-on'); return; }
     for (var i = 0; i < state.steps.length; i += 1) {
+      if (i > 0) {
+        var arrow = document.createElement('span');
+        arrow.className = 'step-arrow';
+        arrow.textContent = '→';
+        box.appendChild(arrow);
+      }
       var step = document.createElement('span');
       step.className = 'step ' + (state.steps[i].state || 'pending');
       step.textContent = state.steps[i].label || '';
@@ -1075,7 +1110,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       // 朗读屏 stage 行末尾追加窗口位置（方案 B）：底部不加指示条，那个挡过主页按钮的角落提示仍保持删掉。
       $('stage').style.display = '';
       $('stage').textContent = replyStageText(payload);
-      applyScreenClass((payload.tone || 'ok') + ' reply-mode' + (state.pending && state.pending.length ? ' rail-on' : ''));
+      applyScreenClass((payload.tone || 'ok') + ' reply-mode' + (state.pending && state.pending.length ? ' rail-on' : '') + (payload.stage === '完成' ? ' done-mode' : ''));
       renderReply();
       state.running = [];
       renderRunning();
@@ -1148,7 +1183,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     $('replyBody').innerHTML = '';
     state.actions = Array.isArray(payload.actions) ? payload.actions : [];
-    applyScreenClass((payload.tone || 'idle') + (state.pending && state.pending.length ? ' rail-on' : '') + (state.actions.length ? ' has-actions' : ''));
+    applyScreenClass((payload.tone || 'idle') + (state.pending && state.pending.length ? ' rail-on' : '') + (state.actions.length ? ' has-actions' : '') + (String(payload.stage || '').indexOf('待决策') === 0 ? ' awaiting-mode' : '') + (payload.stage === '追问' ? ' ask-mode' : '') + (payload.stage === '进度' ? ' detail-mode' : ''));
     renderActions();
     state.running = payload.running || [];
     renderRunning();
