@@ -532,7 +532,11 @@ export interface SessionInvalidPayload {
  */
 
 /** 任务状态（屏上胶囊文案就是它的中文映射，见 task-ledger.ts 的 capsuleOf）。 */
-export type TaskState = 'queued' | 'running' | 'awaiting' | 'done'
+/**
+ * 任务七态（设计 §5）：排队 → 派单 → 执行中 → 待决策 → 完成 → 已播报 → 归档。
+ * `announced` 是「完成且已播过」；归档在登记簿里用 `archived`（不移入下行屏）。
+ */
+export type TaskState = 'queued' | 'dispatched' | 'running' | 'awaiting' | 'done' | 'announced'
 
 /** 棋盘一行（任务棋盘：屏 1）。 */
 export interface TaskBoardRow {
@@ -555,6 +559,8 @@ export interface TaskBoardRow {
   badge?: 'ask'
   /** 同一项目连续多条被折叠时的「+N 条」。 */
   merged?: number
+  /** 最近 8 步耗时（毫秒）：棋盘微条，只做节奏感，不参与状态。 */
+  micro?: number[]
 }
 
 /** 任务棋盘整屏。 */

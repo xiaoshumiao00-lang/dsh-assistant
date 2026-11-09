@@ -39,7 +39,6 @@ import {
   parseUpstream,
   randomId,
   summarizeForLog,
-  toBullets,
   type ConfirmAskPayload,
   type DonePayload,
   type HelloPayload,
@@ -83,6 +82,7 @@ import { cardsFromState, groupCardProjects, groupProjects, groupWorkspaceProject
 import { matchSessionRows, matchTaskRows, type ControlSessionRow, type ControlTaskRow, type DeviceStatusView, type SessionProgressView, type TihuControlDevice, type TihuControlSurface } from './control.ts'
 import type { AlertPayload, TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
 import {
+  ANNOUNCE_WINDOW_MS,
   TaskLedger,
   TaskNotifyBus,
   boardOf,
@@ -91,6 +91,7 @@ import {
   parseScreenCommand,
   routeQuick,
   scoreCardAlias,
+  stripWakeWord,
   subLineOf,
   taskTitleOf,
   type ScreenCommand,
@@ -555,6 +556,14 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   let commanderSessionId: string | undefined
   /** 播报定时器（每台设备共用一条队，串行念）。 */
   let announceTimer: ReturnType<typeof setTimeout> | undefined
+  /**
+   * P1/P2 合并窗口的「最早可取」时刻。
+   *
+   * 任务总线单条只等 400ms；但一条完成落袋时若还有别的任务在跑，就等满 8 秒再取，
+   * 让同一批的后续完成并进同一句（否则「三件事完了」永远凑不齐）。
+   * P0 一律清零：要人的话不能等。
+   */
+  let announceHoldUntil = 0
   /** 播报预录缓存（`~/.dsh/tihu/preroll/`）：同一句话第二次念不再合成。 */
   const preroll = new TihuPreroll()
   /** 正在念播报的设备（避免一条播报被两台设备重复合成）。 */
@@ -603,20 +612,33 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       // 统一指挥：危险动作属于某条任务 → 记成待决策（P0 档），屏 5 弹同一个问题。
       const task = request.sessionId === undefined ? undefined : tasks.ofSession(request.sessionId)
       if (task !== undefined) {
+        // 选项与电脑端同一个问题、同一组顺序；删除类用「确认删除 / 先留着，别删」，
+        // 其余危险动作保持「确认 / 取消」。默认项仍是首选项。
+        const looksDelete = /删除|删掉|Remove-Item|\bdel\b|\brm\b|\berase\b/i.test(`${request.detail ?? ''} ${request.title ?? ''}`)
+        const options = looksDelete ? ['确认删除', '先留着，别删'] : ['确认', '取消']
         tasks.ask(task.taskId, {
           question: request.title,
-          options: ['确认', '取消'],
+          options,
           // 默认项＝首选项（与托管开着时的自动 approve 同一条规则）。
           defaultIndex: 0,
           timeoutMs: request.timeoutMs,
           ...(request.detail === '' ? {} : { detail: request.detail }),
         })
         confirmOfTask.set(task.taskId, request.id)
-        armAwaitingTimer(task.taskId, task.decisionDeadline ?? Date.now() + request.timeoutMs)
+        // 比 confirmBroker 的 60 秒超时早 750ms 走默认项：两个 setTimeout 同到期时
+        // broker 先入队、会先判 timeout≈拒绝，屏上写着「60 秒按确认走」却执行不了。
+        // 提前一点让设备侧先 reply，结论与屏上文案一致。
+        armAwaitingTimer(task.taskId, (task.decisionDeadline ?? Date.now() + request.timeoutMs) - 750)
         const frame = awaitingFrameOf(task)
         for (const device of devices) {
           if (!device.unified) continue
           const display = device.sessionId ?? '__unbound__'
+          // 待决策要独占屏：上一条回执的 5 秒计时/未答追问都不能盖它。
+          if (device.receiptTimer !== undefined) {
+            clearTimeout(device.receiptTimer)
+            device.receiptTimer = undefined
+          }
+          device.pendingPick = undefined
           device.focusedTask = task.taskId
           unpinHome(display)
           cancelHomeTimer(display)
@@ -1375,6 +1397,10 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       if (runningSessions.has(sessionId) || readingBusy(sessionId)) return
       if (lastFrames.get(sessionId)?.mode === 'reply') return
       if (homeStates.get(sessionId)?.mode === 'home') return
+      // 统一指挥的「派单回执 / 歧义追问 / 任务详情 / 待决策」是用户正在看的屏：
+      // 绑定后 3 秒的自动回主页不能把它们抢掉（2026-11-09 实测：连接后 1.5 秒派单，
+      // 回执 1.4 秒就被这条计时器拉回棋盘）。
+      if (device.receiptTimer !== undefined || device.pendingPick !== undefined || device.focusedTask !== undefined) return
       void sendHome(sessionId, device).catch((error) => log(`tihu bind home failed: ${(error as Error)?.message ?? String(error)}`))
     }, bindHomeDelayMs())
 
@@ -1693,7 +1719,7 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     const scored = cards
       .map((card) => ({ card, ...scoreCardAlias(text, card) }))
       .filter((item) => item.score > 0)
-      .sort((a, b) => b.score - a.score)
+      .sort((a, b) => (b.via === 'name' ? 1 : 0) - (a.via === 'name' ? 1 : 0) || b.score - a.score)
     if (scored.length > 0) return scored[0].card
     if (key === '') return undefined
     // 给了一个具体目录：建一张新卡（复杂任务跟项目卡片走）
@@ -2810,11 +2836,20 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
    */
   function tihuTurnOf(exec: any): string | undefined {
     const sessionId = sessionIdOfAgent(exec?.agent)
-    if (sessionId === undefined) return undefined
-    const window = windowOf(sessionId)
-    if (window === undefined) return undefined
+    const window = sessionId === undefined ? undefined : windowOf(sessionId)
     const last = lastUserMessageId(exec?.agent?.session)
+    if (sessionId === undefined) return undefined
+    // 派单建立的**任务会话**里的工具调用一律算 tihu 轮：任务在册就受闸门管。
+    // 不再依赖 messageId 相等——fallback inject 可能把「正文＋派单尾注」投成两条
+    // user 消息，最后一条 id 与 arm 时的第一条不等，旧判定会把整段闸门漏掉。
+    const task = tasks.ofSession(sessionId)
+    if (task !== undefined && task.state !== 'done' && task.state !== 'announced' && task.state !== 'archived') return sessionId
+    if (window === undefined) return undefined
     if (last === undefined) return sessionId
+    // 空 id＝prompt 刚投进去、宿主还没投影出这条 user 消息。此时必须按「tihu 轮」
+    // 处理：派单建立的任务会话里工具调用可能抢在 prompt() 返回前发生，漏掉这一步
+    // 就会整段绕过危险动作闸（2026-11-09 实测 `pwsh Remove-Item` 无 confirm/audit）。
+    if (window.messageId === '') return sessionId
     return last === window.messageId ? sessionId : undefined
   }
 
@@ -3046,21 +3081,27 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     } satisfies ScreenFramePayload)
   }
 
-  /** 已完成预览/键盘输入的统一提交口；统一指挥模式下走派单器，老路径仍注当前会话。 */
-  async function routeCommittedText(device: TihuDevice, text: string): Promise<void> {
+  /**
+   * 已完成预览/键盘输入的统一提交口；统一指挥模式下走派单器，老路径仍注当前会话。
+   *
+   * 返回 true 表示「路由已经自己出了一屏」（回执/追问/棋盘/详情/提示）——调用方
+   * 不能再补一条通用的「思考 · 模型处理中」帧，否则屏 2/7 会被 1ms 内盖掉。
+   */
+  async function routeCommittedText(device: TihuDevice, text: string): Promise<boolean> {
     // 统一指挥（2026-11-09）：设备只绑指挥会话，一句话先过派单器（快路径 → 慢路径），
     // 绝不直接注入「设备当前绑的那条会话」——那正是「得先找到是哪条会话」的老毛病。
     if (device.unified) {
       await dispatchUtterance(device, text)
       const key = device.sessionId
       if (key !== undefined) touchWindow(key)
-      return
+      return true
     }
     const sessionId = device.sessionId
     if (sessionId === undefined) throw new Error('还没有选定会话，请先选择')
     if (runningSessions.has(sessionId)) await spawnParallelTask(device, text)
     else inject(sessionId, text, voiceTailOf(sessionId))
     touchWindow(device.sessionId ?? sessionId)
+    return false
   }
 
   function cancelPendingVoice(device: TihuDevice): void {
@@ -3164,6 +3205,9 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
           // 正在看这条任务的详情屏：实时刷新（别的屏不动，免得把人弹走）
           for (const device of devices) {
             if (device.focusedTask !== taskOfSession.taskId) continue
+            // 回执/追问/待决策是「要人先看清」的屏：进度帧不能把它盖掉。
+            if (device.receiptTimer !== undefined || device.pendingPick !== undefined) continue
+            if (taskOfSession.state === 'awaiting') continue
             const frame = taskDetailFrameOf(taskOfSession)
             if (frame !== undefined) device.send('screen.frame', frame)
           }
@@ -3182,13 +3226,13 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
             && (item.finishedAt ?? 0) > at - 15_000).length
           for (const device of devices) {
             if (!device.unified) continue
+            // 回执/追问/待决策期间，完成帧也不能夺屏：屏 2/5/7 是 P0 的「先看清」，
+            // 任务完成照常进 task.update 与播报，5 秒回执结束后棋盘自然显示完成。
+            if (device.receiptTimer !== undefined || device.pendingPick !== undefined) continue
+            const focused = device.focusedTask === undefined ? undefined : tasks.get(device.focusedTask)
+            if (focused?.state === 'awaiting') continue
             const display = device.sessionId ?? '__unbound__'
-            const frame = doneFrame({
-              taskId: taskOfSession.taskId,
-              resultLine,
-              bullets: toBullets(reply, 3),
-              others,
-            })
+            const frame = taskDoneFrame(device, taskOfSession, sessionId, reply, others)
             device.focusedTask = taskOfSession.taskId
             unpinHome(display)
             cancelHomeTimer(display)
@@ -4098,9 +4142,13 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       if (text === '') return
       try {
         device.send('transcript', { text, final: true, source, retryable: true } satisfies TranscriptPayload)
-        await routeCommittedText(device, text)
+        const screenOwned = await routeCommittedText(device, text)
         device.send('event.progress', { stage: '注入', text: '已送入当前会话' } satisfies ProgressPayload)
-        sendFrame(device, { stage: '思考', title: '模型处理中', bullets: [text.slice(0, 20)], tone: 'busy' } satisfies ScreenFramePayload)
+        // 统一指挥的路由自己已经出了屏（回执/追问/棋盘/详情）：通用「思考」帧会把它
+        // 盖掉。这里只给老路径补帧；屏内「思考 ·」活动行本身不动。
+        if (!screenOwned) {
+          sendFrame(device, { stage: '思考', title: '模型处理中', bullets: [text.slice(0, 20)], tone: 'busy' } satisfies ScreenFramePayload)
+        }
       } catch (error) {
         showInputError(device, error)
       }
@@ -4151,6 +4199,9 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
 
   /** 指挥会话的会话名：重启后按标题找回同一条，不再新建第二条。 */
   const COMMANDER_TITLE = '鹈鹕指挥台'
+
+  /** 「问答记忆」入口：自己直接答，不落任务（派单四出口之一）。 */
+  const MEMORY_QUESTION = /^(?:你还记得|还记得|上次|之前|刚才|我们说过|记不记得)/
 
   /** 日常任务的固定卡片（id 与客户端 ASSISTANT_PROJECT_ID 一致，落点＝助手 home）。 */
   const ASSISTANT_CARD = { id: 'wt-assistant', name: '个人助手' } as const
@@ -4236,30 +4287,58 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     }
   }
 
+  /** 给一条会话开「tihu 轮」窗口；messageId 空串表示刚投进去、还没投影出这条消息。 */
+  function armTihuWindow(sessionId: string, messageId = ''): void {
+    activeSessions.set(sessionId, { until: Date.now() + ACTIVE_WINDOW_MS, messageId })
+  }
+
+  /** 取活会话对象（用于读最后一条 user 消息 id；拿不到就返回 undefined）。 */
+  function sessionForMessageId(sessionId: string): any {
+    try {
+      return optionalService(ctx, 'agents')?.get?.(sessionId)?.session ?? liveSessionOf(sessionId)
+    } catch { return undefined }
+  }
+
   /**
    * 往一条会话投一组消息（与用户手打同一条入口）。
    * 优先 `sessions.using(...).prompt()`（宿主会顺手拉起 agent），
    * 没有这个服务就退回 `agents.followup`（老宿主/测试桩）。
+   *
+   * **先 arm 再 prompt**：派单建立的会话里，工具调用可能抢在 prompt() 返回前开跑；
+   * 旧实现只在 sessions.using 分支、prompt 之后才记 activeSessions，fallback inject
+   * 分支更是一条都不记，于是危险动作闸判「不是 tihu 轮」整段放行（2026-11-09 实测
+   * `pwsh Remove-Item` 无 confirm、无 audit）。空 messageId 在 tihuTurnOf 里按 tihu 轮算。
    */
   async function promptSession(sessionId: string, blocks: { type: 'text'; text: string }[]): Promise<boolean> {
     const sessionsSvc = optionalService(ctx, 'sessions') as { using?: (id: string, opts: unknown, fn: (ref: any) => Promise<void>) => Promise<void> } | undefined
     if (typeof sessionsSvc?.using === 'function') {
+      armTihuWindow(sessionId)
+      let before: string | undefined
       try {
         await sessionsSvc.using(sessionId, { source: 'tihu-dispatch' }, async (reference: any) => {
-          await reference?.binding?.session?.prompt(blocks, 'steer')
-          const messageId = lastUserMessageId(reference?.binding?.session)
-          if (messageId !== undefined) activeSessions.set(sessionId, { until: Date.now() + ACTIVE_WINDOW_MS, messageId })
+          const session = reference?.binding?.session
+          before = lastUserMessageId(session)
+          await session?.prompt(blocks, 'steer')
+          const after = lastUserMessageId(session)
+          if (after !== undefined && after !== before) armTihuWindow(sessionId, after)
         })
         return true
       } catch (error) {
+        // 投递失败就别把窗口留着，免得后续用户自己的工具调用被误判成 tihu 轮。
+        activeSessions.delete(sessionId)
         log(`tihu prompt session=${sessionId} failed: ${(error as Error)?.message ?? String(error)}`)
         return false
       }
     }
+    armTihuWindow(sessionId)
     try {
+      const before = lastUserMessageId(sessionForMessageId(sessionId))
       inject(sessionId, String(blocks[0]?.text ?? ''), blocks.slice(1).map((block) => block.text).join('\n'))
+      const after = lastUserMessageId(sessionForMessageId(sessionId))
+      if (after !== undefined && after !== before) armTihuWindow(sessionId, after)
       return true
     } catch (error) {
+      activeSessions.delete(sessionId)
       log(`tihu inject session=${sessionId} failed: ${(error as Error)?.message ?? String(error)}`)
       return false
     }
@@ -4327,6 +4406,13 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
   function sendBoard(device: TihuDevice): void {
     const key = device.sessionId ?? '__unbound__'
     const { frame, board } = boardFrameFor(device)
+    // 回棋盘＝明确离开回执/追问：旧计时器与待选项一起清掉，否则 5 秒后又会补一帧，
+    // 且完成帧会被「回执期间不夺屏」的守卫误挡（单测：回棋盘后 turn/end 无屏 6）。
+    if (device.receiptTimer !== undefined) {
+      clearTimeout(device.receiptTimer)
+      device.receiptTimer = undefined
+    }
+    device.pendingPick = undefined
     device.focusedTask = undefined
     lastFrames.set(key, frame)
     if (homePinned.has(key)) pinnedHomeFrames.set(key, frame)
@@ -4366,6 +4452,16 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
   function pushTaskNotify(task: TihuTask | undefined, level: 0 | 1 | 2 | 3, text: string): void {
     const taskId = task?.taskId ?? ''
     notifyBus.push(level, taskId, text)
+    // P0 永远立刻；P1/P2 若还有别的任务在跑，就把 8 秒合并窗口打开（只由这一批的
+    // 第一条开窗，后续完成不再顺延）。否则单条 400ms 就出队，同一批的后续完成
+    // 永远并不到一句里（2026-11-09 实测三条完成被念三遍）。
+    if (level === 0) {
+      announceHoldUntil = 0
+    } else if ((level === 1 || level === 2) && announceHoldUntil === 0
+      && tasks.list().some((item) => item.taskId !== taskId
+        && (item.state === 'running' || item.state === 'queued' || item.state === 'awaiting'))) {
+      announceHoldUntil = Date.now() + ANNOUNCE_WINDOW_MS
+    }
     for (const device of devices) {
       if (!device.unified) continue
       device.send('task.notify', { level, taskId, text, ...(taskId === '' ? {} : { bubbleId: taskId }), spoken: false } satisfies TaskNotifyPayload)
@@ -4379,8 +4475,9 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       clearTimeout(announceTimer)
       announceTimer = undefined
     }
-    const at = notifyBus.nextAt()
-    if (at === undefined) return
+    const next = notifyBus.nextAt()
+    if (next === undefined) return
+    const at = Math.max(next, announceHoldUntil)
     announceTimer = setTimeout(() => {
       announceTimer = undefined
       try {
@@ -4398,6 +4495,8 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       scheduleAnnounce()
       return
     }
+    // 这一批已经取走：窗口关掉，下一批重新开（否则会把下一批也拖到旧窗口）。
+    announceHoldUntil = 0
     for (const taskId of item.taskIds) if (taskId !== '') tasks.markSpoken(taskId)
     for (const device of devices) {
       if (!device.unified) continue
@@ -4539,6 +4638,42 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     })
   }
 
+  /** 屏 6：完成播报用回复屏版式（7 行正文＋当前句反色），stage 带「另有 N 条」。 */
+  function taskDoneFrame(device: TihuDevice, task: TihuTask, sessionId: string, reply: string, others: number): ScreenFramePayload {
+    const text = String(reply ?? '').trim()
+    if (text === '') {
+      return doneFrame({
+        taskId: task.taskId,
+        resultLine: task.resultLine ?? '做完了',
+        ...(others > 0 ? { others } : {}),
+      })
+    }
+    // 从第一句开始给完整 7 行窗口；turn/end 后不再沿用朗读中途的滚动位置。
+    screenStates.delete(sessionId)
+    const base = replyScreen(sessionId, splitReplySentences(text), 0, 0, true, device)
+    if (base.reply === undefined) {
+      return doneFrame({
+        taskId: task.taskId,
+        resultLine: task.resultLine ?? text.slice(0, 80),
+        ...(others > 0 ? { others } : {}),
+      })
+    }
+    return {
+      ...base,
+      stage: '完成',
+      title: firstSentenceOf(text) || task.title,
+      tone: 'ok',
+      actions: [
+        { id: 'stop', label: '停止' },
+        { id: 'replay', label: '重读' },
+        { id: 'taskBoard', label: '主页' },
+      ],
+      taskId: task.taskId,
+      ...(others > 0 ? { more: { count: others, text: `另有 ${others} 条` } } : {}),
+      reply: { ...base.reply, highlightCurrent: true, noPosition: true } as any,
+    }
+  }
+
   /** 屏 5 的数据源。 */
   function awaitingFrameOf(task: TihuTask): ScreenFramePayload {
     const sessionId = task.sessionIds[task.sessionIds.length - 1]
@@ -4594,7 +4729,6 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       queueAhead: queuedAhead,
       ...(queuedAhead > 0 ? { etaText: `${queuedAhead} 分钟` } : {}),
     })
-    device.focusedTask = task.taskId
     unpinHome(key)
     cancelHomeTimer(key)
     const state = homeStates.get(key) ?? { mode: 'session' as const, page: 0, done: true }
@@ -4602,18 +4736,24 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     state.done = true
     homeStates.set(key, state)
     lastFrames.set(key, frame)
-    device.send('screen.frame', frame)
-    sendTaskUpdate(device, task)
-    // 回执期间棋盘数据也要是最新的：另一台停在棋盘上的设备（或回执结束后这台）拿到的就是这条。
-    device.send('task.list', { board: boardOf(tasks.list(), Date.now()) } satisfies TaskListPayload)
-    if (device.receiptTimer !== undefined) clearTimeout(device.receiptTimer)
-    device.receiptTimer = setTimeout(() => {
-      device.receiptTimer = undefined
-      if (!devices.has(device)) return
-      if (device.focusedTask !== task.taskId) return
-      sendBoard(device)
-    }, RECEIPT_SECONDS * 1000)
-    device.receiptTimer.unref?.()
+    // 统一指挥是「一台设备一张屏」：回执必须发给**所有**统一设备，而不是只发
+    // 派单的那台。否则第二台停在棋盘上，任务完成时它会先弹完成屏（实测两设备分叉）。
+    const targets = [...devices].filter((item) => item.unified)
+    if (targets.length === 0) targets.push(device)
+    for (const target of targets) {
+      target.focusedTask = task.taskId
+      target.send('screen.frame', frame)
+      sendTaskUpdate(target, task)
+      target.send('task.list', { board: boardOf(tasks.list(), Date.now()) } satisfies TaskListPayload)
+      if (target.receiptTimer !== undefined) clearTimeout(target.receiptTimer)
+      target.receiptTimer = setTimeout(() => {
+        target.receiptTimer = undefined
+        if (!devices.has(target)) return
+        if (target.focusedTask !== task.taskId) return
+        sendBoard(target)
+      }, RECEIPT_SECONDS * 1000)
+      target.receiptTimer.unref?.()
+    }
   }
 
   /** 派单：建任务 ＋ 建会话 ＋ 投消息 ＋ 出回执。 */
@@ -4648,13 +4788,15 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
         text: `【派单 · 鹈鹕】这是主人对着鹈鹕设备说的一句话，已派到「${card.name}」这个项目的任务会话里（落在 ${folder}）。直接开始做；做完用一两句话说明结果；需要人拍板就按项目规矩问。`,
       },
     ]
+    // 先挂到任务再投消息：工具调用可能抢在 prompt() 返回前发生，闸门按
+    // tasks.ofSession 找任务、待决策屏按任务取问题，晚挂一步就会漏。
+    tasks.attachSession(task.taskId, sessionId)
     const ok = await promptSession(sessionId, blocks)
     if (!ok) {
       tasks.drop(task.taskId)
       if (device !== undefined) showInputError(device, new Error('任务会话没有接住这条消息，请重说'))
       return undefined
     }
-    tasks.attachSession(task.taskId, sessionId)
     log(`tihu dispatch task=${task.taskId} project=${card.id} session=${sessionId} folder=${folder}`)
     if (device !== undefined) {
       showReceipt(device, task)
@@ -4685,15 +4827,65 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
   /** 歧义追问（屏 7）：只问一次；用户答「一 / 二 / 都不是」。 */
   function askWhich(device: TihuDevice, candidates: readonly TihuCardRow[], text: string): void {
     const list = candidates.slice(0, 2).map((card) => ({ id: card.id, name: card.name, ...(card.folder === undefined ? {} : { folder: card.folder }) }))
-    device.pendingPick = { candidates: list, text }
     const key = device.sessionId ?? '__unbound__'
+    // 追问屏期间把主页模式关掉：任务事件触发的 refreshBoards 不能把棋盘盖回来。
+    const hs = homeStates.get(key) ?? { mode: 'session' as const, page: 0, done: true }
+    hs.mode = 'session'
+    hs.done = true
+    homeStates.set(key, hs)
     unpinHome(key)
     cancelHomeTimer(key)
     const frame = askWhichFrame({ candidates: list.map((card) => ({ projectName: card.name, doing: doingOf(card.id) })) })
     lastFrames.set(key, frame)
-    device.send('screen.frame', frame)
+    // 与回执一样：所有统一设备看同一张追问屏。
+    const targets = [...devices].filter((item) => item.unified)
+    if (targets.length === 0) targets.push(device)
+    for (const target of targets) {
+      target.pendingPick = { candidates: list, text }
+      // 上一次派单的 5 秒回棋盘计时不能把这屏追问抢走。
+      if (target.receiptTimer !== undefined) {
+        clearTimeout(target.receiptTimer)
+        target.receiptTimer = undefined
+      }
+      target.focusedTask = undefined
+      target.send('screen.frame', frame)
+    }
     pushTaskNotify(undefined, 0, `这句话派给谁：${list.map((card, index) => `${index + 1} ${card.name}`).join('，')}`)
     log(`tihu ask-which device=${device.id} candidates=${list.map((card) => card.id).join(',')}`)
+  }
+
+  /** 派单四出口之一：自己直接答（问答记忆，不落任务）。 */
+  async function answerDirect(device: TihuDevice, text: string): Promise<void> {
+    const commander = await ensureCommanderSession()
+    if (commander === undefined) {
+      showInputError(device, new Error('指挥会话还没建好：先手动绑一条会话（或让宿主支持新建会话）'))
+      return
+    }
+    if (device.sessionId !== commander) await bindSession(device, commander)
+    device.unified = true
+    const key = device.sessionId ?? '__unbound__'
+    const hs = homeStates.get(key) ?? { mode: 'session' as const, page: 0, done: true }
+    hs.mode = 'session'
+    hs.done = true
+    homeStates.set(key, hs)
+    const frame = noticeFrame({ stage: '回答', title: '我在，直接答', lines: [taskTitleOf(text, 18)], tone: 'busy' })
+    lastFrames.set(key, frame)
+    const targets = [...devices].filter((item) => item.unified)
+    if (targets.length === 0) targets.push(device)
+    for (const target of targets) {
+      if (target.receiptTimer !== undefined) {
+        clearTimeout(target.receiptTimer)
+        target.receiptTimer = undefined
+      }
+      target.pendingPick = undefined
+      target.focusedTask = undefined
+      target.send('screen.frame', frame)
+    }
+    const ok = await promptSession(commander, [
+      { type: 'text', text },
+      { type: 'text', text: '【只读问答 · 鹈鹕】这是记忆/只读问答：直接回答主人；不要调用 tihu dispatch，不要新建任务。' },
+    ])
+    if (!ok) showInputError(device, new Error('指挥会话没有接住这句话，请重说'))
   }
 
   /** 慢路径：交给指挥会话的模型判项目（它再调 tihu dispatch）。 */
@@ -4706,9 +4898,23 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     if (device.sessionId !== commander) await bindSession(device, commander)
     device.unified = true
     const key = device.sessionId ?? '__unbound__'
+    const hs = homeStates.get(key) ?? { mode: 'session' as const, page: 0, done: true }
+    hs.mode = 'session'
+    hs.done = true
+    homeStates.set(key, hs)
     const frame = noticeFrame({ stage: '派单', title: '正在看该派给谁', lines: [taskTitleOf(text, 16)], tone: 'busy' })
     lastFrames.set(key, frame)
-    device.send('screen.frame', frame)
+    const targets = [...devices].filter((item) => item.unified)
+    if (targets.length === 0) targets.push(device)
+    for (const target of targets) {
+      // 新一句话要看的屏（慢路径的「正在看该派给谁」）不能被上一条回执的 5 秒计时抢走。
+      if (target.receiptTimer !== undefined) {
+        clearTimeout(target.receiptTimer)
+        target.receiptTimer = undefined
+      }
+      target.focusedTask = undefined
+      target.send('screen.frame', frame)
+    }
     const ok = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: COMMANDER_TAIL }])
     if (!ok) showInputError(device, new Error('指挥会话没有接住这句话，请重说'))
   }
@@ -4866,6 +5072,13 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       }
       const chosen = (task.options ?? [])[defaultIndex] ?? '默认项'
       tasks.answer(taskId, `60 秒没答 · 按「${chosen}」走`)
+      // 屏 5 不能停在过期的倒计时上：超时作答后立刻回棋盘（任务仍会继续跑，
+      // 完成时照常出屏 6）。只清「正看着这条任务」的设备，别的屏不动。
+      for (const device of devices) {
+        if (!device.unified || device.focusedTask !== taskId) continue
+        device.focusedTask = undefined
+        sendBoard(device)
+      }
       log(`tihu awaiting timeout task=${taskId} default=${JSON.stringify(chosen)}`)
       refreshBoards()
     }, Math.max(0, deadline - Date.now()))
@@ -4886,7 +5099,9 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
    * 顺序：歧义待选 → 屏上命令 → 快路径规则 → 慢路径（指挥会话的模型）。
    */
   async function dispatchUtterance(device: TihuDevice, text: string): Promise<void> {
-    const value = String(text ?? '').trim()
+    // 唤醒词是设备噪声（「你好，鹈鹕，帮我查一下…」）：进门先剥掉一层，
+    // 屏上命令、任务标题、派单文本都不再带「你好，鹈鹕」。
+    const value = stripWakeWord(String(text ?? ''))
     if (value === '') return
     const pick = device.pendingPick
     if (pick !== undefined) {
@@ -4903,6 +5118,11 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
         return
       }
       device.pendingPick = undefined
+    }
+    // 派单四出口之一：问答记忆，自己直接答，不落任务。
+    if (MEMORY_QUESTION.test(value)) {
+      await answerDirect(device, value)
+      return
     }
     const command = parseScreenCommand(value)
     if (command !== undefined) {

@@ -5027,7 +5027,8 @@ test('page：「已绑定：xxx」从右下角搬进回答屏顶行末尾（先�
   // 回答屏顶行 = 文案 + 「· 起始/总行」+「· 已绑定：…」：同一套「 · 」分隔，窗口位置数字尾巴照旧
   assert.ok(html.includes('function bindTailOf'), '要有组装「 · 已绑定：…」尾巴的函数')
   assert.ok(html.includes('function stageWithTails'), '要有「文案 + 必保尾巴 + 可选尾巴」的组装函数')
-  assert.ok(/'\s·\s' \+ \(offset \+ 1\) \+ '\/' \+ total, bindTailOf\(\)/.test(source), 'replyStageText 把绑定尾巴接在位置数字尾巴后面（01ec073 那套 offset+1/total 语义不动）')
+  assert.ok(source.includes("' · ' + (offset + 1) + '/' + total"), '位置数字尾巴照旧（offset+1/total）')
+  assert.ok(/var position = reply\.noPosition[\s\S]*?bindTailOf\(\)/.test(source), 'replyStageText 把绑定尾巴接在位置尾巴后面（完成屏可 noPosition）')
   assert.ok(html.includes("'已绑定：' + (state.boundProject || state.sessionTitle || '未命名会话')"), '绑定文字还是原来那一份语义（项目名 → 会话名 → 未命名会话兜底）')
   assert.ok(/function bindTailOf\(\) \{[\s\S]*?label === '' \? '' : ' · ' \+ label/.test(source), '未绑定就整段不出，不写「未绑定」占位')
   assert.ok(html.includes('function stageFitPx'), 'stage 行要有把 letter-spacing 也算进去的截断函数')
@@ -5890,6 +5891,21 @@ await testAsync('统一指挥：建不出指挥会话时也进空棋盘，不退
   w.cleanup()
 })
 
+await testAsync('统一指挥：问答记忆 → 自己直接答，不落任务', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-answer', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '你还记得上次青年基金那件事吗', source: 'voice' }, 2)))
+  await waitMs(90)
+  assert.equal(w.created.length, 0, '问答记忆不建任务会话')
+  assert.equal(w.prompted.length, 1, '直接投给指挥会话')
+  assert.equal(w.prompted[0].id, 'session-cmd')
+  const last = framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()
+  assert.equal(last.payload.stage, '回答', '屏上进入直接回答')
+  w.cleanup()
+})
+
 await testAsync('统一指挥：日常小事派到「个人助手」文件夹，回执屏带三拍圆点与 5 秒倒计时', async () => {
   const w = unifiedWorkspace()
   const socket = openLane(w.runtime)
@@ -5912,7 +5928,7 @@ await testAsync('统一指挥：日常小事派到「个人助手」文件夹，
   assert.equal(receipt.payload.countdown.seconds, 5)
   const list = frames.filter((frame) => frame.type === 'task.list').pop()
   assert.equal(list.payload.board.rows.length, 1)
-  assert.equal(list.payload.board.rows[0].capsule, '执行中')
+  assert.equal(list.payload.board.rows[0].capsule, '派单', '回执阶段的登记簿态是「派单」')
   assert.equal(list.payload.board.rows[0].sub, '个人助手 · 已派出')
   w.cleanup()
 })
@@ -5933,6 +5949,58 @@ await testAsync('统一指挥：点名项目卡 → 落那张卡的文件夹，�
   w.cleanup()
 })
 
+await testAsync('统一指挥：回执 5 秒内不被通用思考帧与任务进度帧覆盖', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-receipt', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+  await waitMs(90)
+  const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
+  assert.ok(receipt !== undefined, '派单要有回执屏')
+  const afterReceipt = () => framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()
+  assert.equal(afterReceipt().payload.stage, '派单', '回执后不能再补通用「思考」帧')
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  emit({ id: w.prompted[0].id }, { type: 'step/start', data: { turn: 1, step: 2 } })
+  await waitMs(60)
+  assert.equal(afterReceipt().payload.stage, '派单', '回执期间任务进度帧不得夺屏')
+  w.cleanup()
+})
+
+await testAsync('统一指挥：连接后 3 秒的 bindHome 不得抢走回执', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-bindhome', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+  await waitMs(90)
+  await waitMs(3100)
+  const last = framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()
+  assert.equal(last.payload.stage, '派单', 'bindHome 3 秒计时遇到回执必须让路')
+  w.cleanup()
+})
+
+await testAsync('统一指挥：回执/追问期间「回棋盘」可清掉旧的 5 秒计时', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-boardclear', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+  await waitMs(90)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+  await waitMs(60)
+  const board = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop()
+  assert.ok(board !== undefined, '回棋盘要立刻出棋盘')
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  emit({ id: w.prompted[0].id }, { type: 'turn/start', data: { turn: 1 } })
+  emit({ id: w.prompted[0].id }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await waitMs(80)
+  const done = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').pop()
+  assert.ok(done !== undefined, '回棋盘后完成帧不能被旧回执计时挡住')
+  w.cleanup()
+})
+
+
 await testAsync('统一指挥：两个卡名都点到 → 追问屏（只问一次），答「一」才派', async () => {
   const w = unifiedWorkspace({
     cards: [
@@ -5947,6 +6015,7 @@ await testAsync('统一指挥：两个卡名都点到 → 追问屏（只问一�
   await waitMs(90)
   const ask = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '追问 · 只问一次').pop()
   assert.ok(ask !== undefined, '有歧义必须问，不许猜')
+  assert.equal(framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop().payload.stage, '追问 · 只问一次', '追问屏不能被通用思考帧盖掉')
   assert.equal(ask.payload.title, '这句话派给谁？')
   assert.deepEqual(ask.payload.actions.map((item) => item.id), ['pick1', 'pick2', 'pickNone'])
   assert.equal(w.created.length, 0, '没答之前不许乱派')
@@ -5965,6 +6034,10 @@ await testAsync('统一指挥：任务 turn/end → 屏 6「完成」＋ 一行�
   await waitMs(50)
   socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
   await waitMs(90)
+  // 回执要停满 5 秒；这里先显式回棋盘再看完成帧（同一会话在回执期间完成时，
+  // 屏 2 优先，完成照常进 task.notify——见 live 验收）。
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+  await waitMs(60)
   const taskSession = w.prompted[0].id
   emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
   emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '现在十七点三十一分。' }] } } })
@@ -5982,6 +6055,58 @@ await testAsync('统一指挥：任务 turn/end → 屏 6「完成」＋ 一行�
   await waitMs(600)
   const spoken = framesOf(socket).filter((frame) => frame.type === 'task.notify' && frame.payload.spoken === true).pop()
   assert.ok(spoken !== undefined, '过了单条延迟要念（八秒窗口下第一条很快念）')
+  w.cleanup()
+})
+
+await testAsync('统一指挥：完成屏＝回复版式（7 行正文＋当前句反色＋另有 N 条）', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-done7', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+  await waitMs(90)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+  await waitMs(60)
+  const taskSession = w.prompted[0].id
+  const long = '第 3 段改写完成。温度场结果已收敛，跨中腹板温差 1.1 ℃，比目标 1.5 ℃ 还好。'
+    + '第 4 步把边界拆成了两段：夜间常数 2.448 ℃，白天用 ERA5。图 1 和表 2 已落到 04-结果目录。'
+    + '文件名按昨天的规范改了，正文引用编号也同步。'
+  emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
+  emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: long }] } } })
+  emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await waitMs(100)
+  const done = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成' && frame.payload.mode === 'reply').pop()
+  assert.ok(done !== undefined, '完成屏要走回复版式')
+  assert.equal(done.payload.reply.lines.length, 7, '可视窗口 7 行')
+  assert.equal(done.payload.reply.highlightCurrent, true, '当前句要反色')
+  assert.equal(done.payload.more, undefined, '同批没有其它完成时不出「另有」')
+  assert.deepEqual(done.payload.actions.map((item) => item.label), ['停止', '重读', '主页'])
+  w.cleanup()
+})
+
+await testAsync('统一指挥：同一批两条完成 → 八秒窗口合并成一句播报', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-merge', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+  await waitMs(80)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '今天几号', source: 'voice' }, 3)))
+  await waitMs(120)
+  assert.equal(w.prompted.length, 2, '两条都要派出')
+  const first = w.prompted[0].id
+  const second = w.prompted[1].id
+  emit({ id: first }, { type: 'turn/start', data: { turn: 1 } })
+  emit({ id: second }, { type: 'turn/start', data: { turn: 1 } })
+  emit({ id: first }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await waitMs(500)
+  emit({ id: second }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await waitMs(8600)
+  const spoken = framesOf(socket).filter((frame) => frame.type === 'task.notify' && frame.payload.spoken === true)
+  assert.equal(spoken.length, 1, '同一批只念一次（实测曾念三遍）：' + JSON.stringify(spoken.map((item) => item.payload.text)))
+  assert.ok(spoken[0].payload.text.includes('两件事完了'), '两条完成要压成「两件事完了」：' + spoken[0].payload.text)
   w.cleanup()
 })
 
@@ -6004,6 +6129,23 @@ await testAsync('统一指挥：说「回棋盘」/「看第 1 条」按屏上�
   assert.ok(detail !== undefined, '「看第 1 条」要进任务详情（屏 4）')
   assert.ok(detail.payload.title.startsWith('第 '), '详情标题是「第 N 步 · 已用 …」：' + detail.payload.title)
   assert.equal(w.created.length, 1, '看任务不新建会话')
+  w.cleanup()
+})
+
+await testAsync('统一指挥：带唤醒词「你好，鹈鹕回棋盘」也按屏上命令走，不算任务', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u6w', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '青年基金申请书第 3 段再改一遍', source: 'voice' }, 2)))
+  await waitMs(90)
+  const created = w.created.length
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '你好，鹈鹕回棋盘', source: 'voice' }, 3)))
+  await waitMs(60)
+  const board = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop()
+  assert.ok(board !== undefined, '带唤醒词的回棋盘要立刻出棋盘')
+  assert.equal(board.payload.board.rows.length, 1, '棋盘上仍是刚派的那条')
+  assert.equal(w.created.length, created, '唤醒词回棋盘不新建会话')
   w.cleanup()
 })
 

@@ -164,8 +164,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-capsule { flex:none; font-size:11px; line-height:14px; font-weight:700; letter-spacing:.5px;
     padding:1px 5px; border-radius:4px; background:#1b2430; color:#9fb0c0; border:1px solid #2b3a4a; }
   #screen .board-capsule.running { color:#8ef0c4; border-color:#2a6b56; background:#10241e; }
+  #screen .board-capsule.dispatched { color:#9fd8ff; border-color:#2b5a7a; background:#0f1c26; }
   #screen .board-capsule.awaiting { color:#f7d98a; border-color:#7a5c1f; background:#241d0f; }
   #screen .board-capsule.done { color:#a9c8ff; border-color:#2b4a7a; background:#101a2b; }
+  #screen .board-capsule.announced { color:#93a9c4; border-color:#33465c; background:#111820; }
   #screen .board-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
   #screen .board-merged { flex:none; font-size:11px; color:#7c8b99; }
   #screen .board-row2 { display:flex; align-items:center; gap:6px; font-size:12px; line-height:14px; color:#8b97a5; }
@@ -178,6 +180,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-ring.warn { --ring: var(--warn); }
   #screen .board-ring.done { --ring: #4f8ef7; }
   #screen .board-ring.empty { background:#26323e; }
+  /* 微条：最近 8 步耗时（只给节奏感，不显示数字） */
+  #screen .board-micro { display:flex; flex:none; align-items:flex-end; gap:2px; height:10px; margin-left:auto; margin-right:5px; }
+  #screen .board-micro span { width:2px; min-height:2px; background:#3fb6a8; border-radius:1px; opacity:.85; }
   /* 待决策行右侧是琥珀问号徽标（不显示时长：这条在等人，不是「跑得久」） */
   #screen .board-ask { flex:none; width:14px; height:14px; border-radius:50%; background:var(--warn);
     color:#241d0f; font-size:11px; line-height:14px; font-weight:700; text-align:center; }
@@ -773,7 +778,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var delivered = Array.isArray(reply.lines) ? reply.lines.length : 0;
     var total = Number(scroll.total);
     if (!Number.isFinite(total) || total < offset + delivered) total = offset + delivered;
-    return stageWithTails(String(payload.stage || '回答中'), ' · ' + (offset + 1) + '/' + total, bindTailOf(), SCREEN.stageFontPx || 12);
+    // 完成播报不显示「第 x/y 段」位置；改由 stage 右端带「另有 N 条」。
+    var position = reply.noPosition === true ? '' : ' · ' + (offset + 1) + '/' + total;
+    var more = payload.more && payload.more.text ? ' · ' + payload.more.text : '';
+    return stageWithTails(String(payload.stage || '回答中'), position + more, bindTailOf(), SCREEN.stageFontPx || 12);
   }
   /** 主页底部翻页条：‹ 上一页 / 第 x/y 页 / › 下一页；越界的一侧置灰（点它宿主也不动页码）。 */
   function renderHomePager(payload) {
@@ -813,6 +821,13 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     // 不能因为某一档是 0 就把它省掉——省掉以后空盘顶行只剩「● 0 在跑」，和文档不一致。
     // 宽度由 fitTextPx 兜底缩放，320px 放得下「●0 在跑　●0 等你　●0 排队」。
     return '●' + (Number(c.running) || 0) + ' 在跑　●' + (Number(c.awaiting) || 0) + ' 等你　●' + (Number(c.queued) || 0) + ' 排队';
+  }
+  function applyScreenClass(base) {
+    var screen = $('screen');
+    if (!screen) return;
+    // 免按住聆听「在听 · 已唤醒」是盖在屏上的一层；任何宿主屏帧重画 className 时
+    // 必须保留它，否则后台任务一推帧，唤醒屏就在 10 秒前被擦掉（2026-11-09 实测）。
+    screen.className = base + (state.listenOn ? ' listen-on' : '');
   }
   function renderBoard(payload) {
     var screen = $('screen');
@@ -885,6 +900,18 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       sub.className = 'board-sub';
       sub.textContent = row.sub || '';
       row2.appendChild(sub);
+      if (Array.isArray(row.micro) && row.micro.length > 0) {
+        var micro = document.createElement('span');
+        micro.className = 'board-micro';
+        var maxMicro = Math.max.apply(null, row.micro.map(function (value) { return Number(value) || 0; })) || 1;
+        for (var mi = 0; mi < row.micro.length; mi += 1) {
+          var bar = document.createElement('span');
+          var ratio = Math.max(0, Math.min(1, (Number(row.micro[mi]) || 0) / maxMicro));
+          bar.style.height = Math.max(2, Math.round(2 + ratio * 8)) + 'px';
+          micro.appendChild(bar);
+        }
+        row2.appendChild(micro);
+      }
       if (row.badge === 'ask') {
         var ask = document.createElement('span');
         ask.className = 'board-ask';
@@ -902,7 +929,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       item.appendChild(row2);
       body.appendChild(item);
     }
-    screen.className = 'board-mode' + (state.pending && state.pending.length ? ' rail-on' : '');
+    applyScreenClass('board-mode' + (state.pending && state.pending.length ? ' rail-on' : ''));
     updateScrollHint();
   }
 
@@ -1022,7 +1049,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         homeBody.appendChild(item);
       }
       // 保留 rail-on：renderPending 刚按本帧 pending 加上的类不能被整串覆盖（气泡轨要一直可见）。
-      screen.className = 'home-mode' + (state.pending && state.pending.length ? ' rail-on' : '');
+      applyScreenClass('home-mode' + (state.pending && state.pending.length ? ' rail-on' : ''));
       updateScrollHint();
       return;
     }
@@ -1038,7 +1065,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       // 朗读屏 stage 行末尾追加窗口位置（方案 B）：底部不加指示条，那个挡过主页按钮的角落提示仍保持删掉。
       $('stage').style.display = '';
       $('stage').textContent = replyStageText(payload);
-      screen.className = (payload.tone || 'ok') + ' reply-mode' + (state.pending && state.pending.length ? ' rail-on' : '');
+      applyScreenClass((payload.tone || 'ok') + ' reply-mode' + (state.pending && state.pending.length ? ' rail-on' : ''));
       renderReply();
       state.running = [];
       renderRunning();
@@ -1053,6 +1080,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     // 严格按 320×240 规格排版：stage ≤10、标题 ≤28 且单行、正文最多 3 行 ×18 字。
     // 多出来的内容留在事件区，屏幕上不允许出现半行或滚动条。
     var stageText = clipScreen(payload.stage || '', SCREEN.stageChars);
+    // 屏 6「另有 N 条」收进状态行右端（图 3：完成 + 另有 2 条）。
+    var moreText = payload.more && payload.more.text ? String(payload.more.text).trim() : '';
+    if (moreText !== '') stageText = stageText === '' ? moreText : stageText + ' · ' + moreText;
     $('stage').textContent = stageText;
     // 新四行格式第一行就是会话标题，没有阶段小字时不要留空行。
     $('stage').style.display = stageText === '' ? 'none' : '';
@@ -1084,7 +1114,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     $('replyBody').innerHTML = '';
     state.actions = Array.isArray(payload.actions) ? payload.actions : [];
-    screen.className = (payload.tone || 'idle') + (state.pending && state.pending.length ? ' rail-on' : '') + (state.actions.length ? ' has-actions' : '');
+    applyScreenClass((payload.tone || 'idle') + (state.pending && state.pending.length ? ' rail-on' : '') + (state.actions.length ? ' has-actions' : ''));
     renderActions();
     state.running = payload.running || [];
     renderRunning();
@@ -1116,6 +1146,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     var current = typeof reply.currentIndex === 'number' ? reply.currentIndex : 0;
     var visible = SCREEN.replyVisibleLines;
+    var highlight = state.audioStarted || reply.highlightCurrent === true;
     var currentLine = 0;
     for (var j = 0; j < lines.length; j += 1) { if (lines[j].index === current) { currentLine = j; break; } }
     // 宿主已经按 scrollOffset 切好可视窗口，页面直接渲染，不再自行居中。
@@ -1123,7 +1154,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     body.innerHTML = '';
     for (var k = start; k < Math.min(start + visible, lines.length); k += 1) {
       var div = document.createElement('div');
-      div.className = 'reply-line' + (state.audioStarted && lines[k].index === current ? ' cur' : '');
+      div.className = 'reply-line' + (highlight && lines[k].index === current ? ' cur' : '');
       div.textContent = lines[k].text;
       body.appendChild(div);
     }
