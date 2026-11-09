@@ -110,6 +110,8 @@ export function awaitingFrame(input: {
   defaultIndex: number
   projectName: string
   sessionTitle: string
+  /** 任务落点文件夹（来源行用最后一级目录名）。 */
+  folder?: string
   /** 危险动作的目标路径（没有就不占一行）。 */
   detail?: string
   secondsLeft: number
@@ -118,9 +120,11 @@ export function awaitingFrame(input: {
   const defaultIndex = Math.max(0, Math.min(input.defaultIndex, options.length - 1))
   const defaultLabel = options[defaultIndex]
   const seconds = Math.max(0, Math.trunc(input.secondsLeft))
-  const bullets: string[] = [`${input.projectName} · ${input.sessionTitle}`]
+  const bullets: string[] = [`来源：${input.projectName} · ${input.sessionTitle}`]
+  const folderName = folderBase(input.folder)
   const detailLine = String(input.detail ?? '').replace(/\s+/g, ' ').trim()
-  if (detailLine !== '') bullets.push(fitScreenLines([detailLine], 1)[0] ?? '')
+  if (folderName !== '') bullets.push(`文件夹 ${folderName}`)
+  else if (detailLine !== '') bullets.push(fitScreenLines([detailLine], 1)[0] ?? '')
   bullets.push(`${seconds} 秒不答，就按「${defaultLabel}」走`)
   bullets.push('说「确认」或「留着」也行')
   return {

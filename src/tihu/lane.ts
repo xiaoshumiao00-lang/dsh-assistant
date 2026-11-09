@@ -4700,6 +4700,7 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       defaultIndex: task.defaultIndex ?? 0,
       projectName: task.projectName,
       sessionTitle: sessionId === undefined ? '刚派出' : humanTitle(titleForSession(sessionId)),
+      ...(task.folder === undefined ? {} : { folder: task.folder }),
       ...(task.detail === undefined ? {} : { detail: task.detail }),
       secondsLeft: secondsLeft === 0 ? Math.round(CONFIRM_TIMEOUT_MS / 1000) : secondsLeft,
     })
@@ -4841,6 +4842,12 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
   /** 歧义追问（屏 7）：只问一次；用户答「一 / 二 / 都不是」。 */
   function askWhich(device: TihuDevice, candidates: readonly TihuCardRow[], text: string): void {
     const list = candidates.slice(0, 2).map((card) => ({ id: card.id, name: card.name, ...(card.folder === undefined ? {} : { folder: card.folder }) }))
+    // 候选顺序跟用户原话里出现的先后走（图 3：先说青年基金，就排第一），不按分数重排。
+    list.sort((a, b) => {
+      const ai = text.indexOf(a.name)
+      const bi = text.indexOf(b.name)
+      return (ai < 0 ? Number.MAX_SAFE_INTEGER : ai) - (bi < 0 ? Number.MAX_SAFE_INTEGER : bi)
+    })
     const key = device.sessionId ?? '__unbound__'
     // 追问屏期间把主页模式关掉：任务事件触发的 refreshBoards 不能把棋盘盖回来。
     const hs = homeStates.get(key) ?? { mode: 'session' as const, page: 0, done: true }
