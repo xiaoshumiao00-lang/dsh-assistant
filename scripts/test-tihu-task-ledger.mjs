@@ -21,6 +21,7 @@ import {
   TaskLedger,
   TaskNotifyBus,
   boardOf,
+  boardTitleOf,
   capsuleOf,
   chineseIndex,
   countsOf,
@@ -127,6 +128,19 @@ test('步数只增不减（乱序到达的 tool/call 不能把第 7 步改回第
   ledger.noteStep(task.taskId, 7)
   assert.equal(task.step, 7)
   assert.equal(subLineOf(task, '青年基金申请书'), '青年基金申请书 · 第 7 步')
+})
+
+test('棋盘标题只留「状态 + 会话名」，项目名只留在副行', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: '个人助手 今天几号', projectId: 'p1', projectName: '个人助手' })
+  ledger.attachSession(task.taskId, 'session-title')
+  ledger.markRunning(task.taskId)
+  const row = boardOf(ledger.list(), 1).rows[0]
+  assert.equal(row.title, '今天几号')
+  assert.ok(row.sub.includes('个人助手'), '项目名要留在副行')
+  // 项目名是更长卡名的前缀时不能误删（青年基金 vs 青年基金申请书）。
+  const longer = ledger.add({ title: '青年基金申请书 改写第 3 段', projectId: 'p2', projectName: '青年基金' })
+  assert.equal(boardTitleOf(longer), '青年基金申请书 改写第 3 段')
 })
 
 test('待决策＝托管没开：带问题、选项、默认项、截止时刻', () => {
