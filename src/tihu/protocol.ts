@@ -48,6 +48,7 @@ export const TIHU_UPSTREAM_TYPES = [
   'voice.create',
   'voice.select',
   'tts.sample',
+  'task.reply',
   'ping',
 ] as const
 /** 下行消息类型（宿主 → 设备）。 */
@@ -65,6 +66,9 @@ export const TIHU_DOWNSTREAM_TYPES = [
   'session.invalid',
   'voice.list',
   'voice.created',
+  'task.list',
+  'task.update',
+  'task.notify',
   'pong',
 ] as const
 
@@ -322,6 +326,26 @@ export interface ScreenFramePayload {
   pendingCount?: number
   /** reply 模式的正文窗口（长回复只传当前窗口 ±2 句）。 */
   reply?: ReplyScreenPayload
+
+  /**
+   * 任务棋盘投影（屏 1，含空态）。有它就代表这一帧是棋盘：
+   * `empty: true` 是同一个版式的空态（不另开一屏）。
+   */
+  board?: TaskBoardPayload
+  /**
+   * 三拍小圆点（派单回执用）：已入队 → 排队 2 个 → 开始跑。
+   * 页面按 state 画实心/空心，不自己推断进度。
+   */
+  steps?: { label: string; state: 'done' | 'active' | 'pending' }[]
+  /**
+   * 倒计时条（派单回执 5 秒回棋盘、待决策 60 秒按默认项）。
+   * `totalSeconds` 不给就按 `seconds` 画满。
+   */
+  countdown?: { seconds: number; totalSeconds?: number; text?: string }
+  /** 完成屏右端「另有 N 条 ▸」（其它完成收进状态行，不再单独占一条气泡带）。 */
+  more?: { count: number; text: string }
+  /** 这一帧属于哪条任务（屏上点按/答问句时用它回 task.reply）。 */
+  taskId?: string
 }
 
 /** reply 模式的一句（字符下标用于与朗读同步）。 */
@@ -462,7 +486,7 @@ export interface SessionsListPayload {
 /** 屏幕手势：上/下滑（滚动历史）与点击（预留）。 */
 export type ScreenGesturePayload =
   | { action: 'swipe'; dy: number; phase: 'start' | 'move' | 'end' }
-  | { action: 'tap'; x: number; y: number; hit?: 'chip' | 'screen' | 'project' | 'action' | 'switch' | 'recent'; targetSessionId?: string; project?: string; sessionId?: string; actionId?: string }
+  | { action: 'tap'; x: number; y: number; hit?: 'chip' | 'screen' | 'project' | 'action' | 'switch' | 'recent' | 'task'; targetSessionId?: string; project?: string; sessionId?: string; actionId?: string; taskId?: string }
 
 export interface SessionBindPayload {
   /** 要手动绑定的会话 id；`auto: true` 时可省略。 */
@@ -500,7 +524,95 @@ export interface SessionInvalidPayload {
   showPicker?: boolean
 }
 
+/* ---------- 任务登记簿（Task Ledger）投影 ----------
+ *
+ * 2026-11-09 统一指挥会话：屏与播报的事实源从「会话 id」换成「任务 id」。
+ * 这三个下行类型是登记簿的线格式；`screen.frame.board` 是它的屏投影（页面按它画任务棋盘），
+ * `task.list` / `task.update` / `task.notify` 给固件与后续页面用同一份数据，不另造形状。
+ */
+
+/** 任务状态（屏上胶囊文案就是它的中文映射，见 task-ledger.ts 的 capsuleOf）。 */
+export type TaskState = 'queued' | 'running' | 'awaiting' | 'done'
+
+/** 棋盘一行（任务棋盘：屏 1）。 */
+export interface TaskBoardRow {
+  /** 稳定短号（屏与播报都用它）。 */
+  taskId: string
+  /** 一句话意图（规范化后的短语）。 */
+  title: string
+  /** 状态（文字胶囊的依据，不只靠颜色）。 */
+  state: TaskState
+  /** 胶囊文字：排队 / 执行中 / 待决策 / 完成。 */
+  capsule: string
+  /** 副行：「项目 · 第 N 步」。 */
+  sub: string
+  /**
+   * 右端时长环：percent 0–1（满圈＝30 分钟），tone 决定颜色语义。
+   * empty＝排队（空环）、done＝满环、warn＝跑久了（转琥珀）、normal＝进行中。
+   */
+  ring: { percent: number; tone: 'normal' | 'warn' | 'done' | 'empty' }
+  /** 待决策行的琥珀问号徽标。 */
+  badge?: 'ask'
+  /** 同一项目连续多条被折叠时的「+N 条」。 */
+  merged?: number
+}
+
+/** 任务棋盘整屏。 */
+export interface TaskBoardPayload {
+  rows: TaskBoardRow[]
+  /** 顶行三段计数（在跑 / 等你 / 排队）。 */
+  counts: { running: number; awaiting: number; queued: number }
+  page: { index: number; total: number }
+  total: number
+  /** 一个任务都没有：同一版式的空态（不另开一屏）。 */
+  empty: boolean
+}
+
+/** 下行：整张棋盘（主页数据源）。 */
+export interface TaskListPayload {
+  board: TaskBoardPayload
+}
+
+/** 下行：单行变更（替代按会话帧刷屏）。 */
+export interface TaskUpdatePayload {
+  taskId: string
+  state: TaskState
+  capsule: string
+  sub: string
+  ring: { percent: number; tone: 'normal' | 'warn' | 'done' | 'empty' }
+  /** 结果摘要（完成时的一行话，不是正文）。 */
+  summary?: string
+}
+
+/** 播报优先级：P0 需要人（打断）／P1 完成／P2 里程碑／P3 进度（不播）。 */
+export type TaskNotifyLevel = 0 | 1 | 2 | 3
+
+/** 下行：通知总线 → 屏与播报。 */
+export interface TaskNotifyPayload {
+  level: TaskNotifyLevel
+  taskId: string
+  /** 一句播报/气泡文案。 */
+  text: string
+  /** 气泡 id（点气泡＝看这条任务，不切会话）。 */
+  bubbleId?: string
+  /** 这句是否已经交给语音播报（8 秒窗口合并后的结果）。 */
+  spoken: boolean
+}
+
+/** 上行：设备上点选项 / 答问句 / 轻命令 → 回指挥会话（不是回任务会话）。 */
+export interface TaskReplyPayload {
+  /** 目标任务；缺省由登记簿按「当前屏上这条」解析。 */
+  taskId?: string
+  /** 点了第几个选项（0 起，与 confirm.ask 的 options 同序）。 */
+  optionIndex?: number
+  /** 自由文本回答（等价于手输）。 */
+  text?: string
+  /** 轻命令：看任务／回棋盘／撤单／停止。 */
+  command?: 'open' | 'board' | 'cancel' | 'stop'
+}
+
 /* ---------- 消息联合类型 ---------- */
+
 
 export type TihuUpstreamMessage =
   | TihuEnvelope<'hello', HelloPayload>
@@ -515,6 +627,7 @@ export type TihuUpstreamMessage =
   | TihuEnvelope<'voice.create', VoiceCreatePayload>
   | TihuEnvelope<'voice.select', VoiceSelectPayload>
   | TihuEnvelope<'tts.sample', TtsSamplePayload>
+  | TihuEnvelope<'task.reply', TaskReplyPayload>
   | TihuEnvelope<'ping', PingPayload>
 
 export type TihuDownstreamMessage =
@@ -531,6 +644,9 @@ export type TihuDownstreamMessage =
   | TihuEnvelope<'session.invalid', SessionInvalidPayload>
   | TihuEnvelope<'voice.list', VoiceListPayload>
   | TihuEnvelope<'voice.created', VoiceCreatedPayload>
+  | TihuEnvelope<'task.list', TaskListPayload>
+  | TihuEnvelope<'task.update', TaskUpdatePayload>
+  | TihuEnvelope<'task.notify', TaskNotifyPayload>
   | TihuEnvelope<'pong', PingPayload>
 
 /* ---------- 解析与构造 ---------- */
@@ -665,8 +781,9 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
         if (payload.action === 'tap') {
           if (typeof payload.x !== 'number' || typeof payload.y !== 'number') return null
           if (!Number.isFinite(payload.x) || !Number.isFinite(payload.y)) return null
-          if (payload.hit !== undefined && payload.hit !== 'chip' && payload.hit !== 'screen' && payload.hit !== 'project' && payload.hit !== 'action' && payload.hit !== 'switch' && payload.hit !== 'recent') return null
+          if (payload.hit !== undefined && payload.hit !== 'chip' && payload.hit !== 'screen' && payload.hit !== 'project' && payload.hit !== 'action' && payload.hit !== 'switch' && payload.hit !== 'recent' && payload.hit !== 'task') return null
           if (payload.actionId !== undefined && (typeof payload.actionId !== 'string' || payload.actionId.length > 32)) return null
+          if (payload.taskId !== undefined && (typeof payload.taskId !== 'string' || payload.taskId.length > 64)) return null
           if (payload.targetSessionId !== undefined && (typeof payload.targetSessionId !== 'string' || payload.targetSessionId.length > 256)) return null
           if (payload.project !== undefined && (typeof payload.project !== 'string' || payload.project.length > 256)) return null
           if (payload.sessionId !== undefined && (typeof payload.sessionId !== 'string' || payload.sessionId.length > 256)) return null
@@ -682,6 +799,18 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
           } as TihuUpstreamMessage
         }
         return null
+      }
+      case 'task.reply': {
+        // 回指挥会话的答复：必须至少带一样实质内容（选项/文本/命令），全空就是坏帧。
+        if (payload.taskId !== undefined && (typeof payload.taskId !== 'string' || payload.taskId.length > 64)) return null
+        if (payload.optionIndex !== undefined) {
+          if (typeof payload.optionIndex !== 'number' || !Number.isSafeInteger(payload.optionIndex)) return null
+          if (payload.optionIndex < 0 || payload.optionIndex > 8) return null
+        }
+        if (payload.text !== undefined && (typeof payload.text !== 'string' || payload.text.length > TIHU_MAX_TEXT_CHARS)) return null
+        if (payload.command !== undefined && payload.command !== 'open' && payload.command !== 'board' && payload.command !== 'cancel' && payload.command !== 'stop') return null
+        if (payload.optionIndex === undefined && payload.text === undefined && payload.command === undefined) return null
+        return value as TihuUpstreamMessage
       }
       case 'ping': return value as TihuUpstreamMessage
       default: return null

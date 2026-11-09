@@ -92,6 +92,30 @@ export interface SessionProgressView {
   stats?: { tokPerSec: number; totalTokens: number; contextPercent: number }
 }
 
+/** 登记簿一行（tihu 工具 list_tasks 用；不带会话正文）。 */
+export interface ControlTaskRow {
+  taskId: string
+  title: string
+  /** 排队 / 执行中 / 待决策 / 完成。 */
+  capsule: string
+  /** 「项目 · 第 N 步」。 */
+  sub: string
+  /** 归档了没有（list_tasks 默认只列未归档）。 */
+  archived?: boolean
+}
+
+/** 派单入参（指挥会话调用 dispatch 时给的东西）。 */
+export interface ControlDispatchInput {
+  /** 用户原话（派单器据此写标题、判文件夹）。 */
+  text: string
+  /** 指定项目：卡片名 / 文件夹关键词（不给就按规则自己判）。 */
+  project?: string
+  /** 指定文件夹（绝对路径；给了就优先）。 */
+  folder?: string
+  /** 指定标题（不给就用原话规范化）。 */
+  title?: string
+}
+
 /**
  * lane 暴露的控制面。所有方法都是薄壳：内部转调 lane 既有函数，
  * 不重新实现任何设备/会话逻辑（保证与手指点屏效果一致）。
@@ -118,6 +142,12 @@ export interface TihuControlSurface {
   goHome(deviceId: string): Promise<string>
   browse(deviceId: string, direction: 'prev' | 'next'): Promise<string>
   openRecent(deviceId: string): Promise<string>
+  /** 派单：把一句话派到某个项目/文件夹的新会话里跑（登记簿记账，屏上出回执）。 */
+  dispatch(input: ControlDispatchInput): Promise<string>
+  /** 登记簿里还没归档的任务（棋盘数据源）。 */
+  listTasks(): ControlTaskRow[]
+  /** 撤一条还没起跑的任务（起跑过的要先停再撤）。 */
+  cancelTask(ref?: string): Promise<string>
 }
 
 /* ---------- 纯函数（脚本测试直接验） ---------- */
@@ -163,14 +193,52 @@ export function unknownActionError(action: string, names: readonly string[]): st
   return `未知 action「${action}」。合法 action：${names.join(' / ')}。用法见工具描述。`
 }
 
+/** 任务定位结果：精确号 > 号前缀 > 标题包含；单层多条即「多候选」。 */
+export type TaskRowsOutcome =
+  | { kind: 'all'; rows: ControlTaskRow[] }
+  | { kind: 'none' }
+  | { kind: 'one'; row: ControlTaskRow }
+  | { kind: 'many'; rows: ControlTaskRow[] }
+
+/**
+ * 按任务号/标题定位任务。任务号是登记簿发的短号（`t1`、`t7`），用户口头会说「第 7 条」，
+ * 所以 `7`、`t7` 都要认；标题包含只在没有命中号时才用（避免「第 3 步」这类词误伤）。
+ */
+export function matchTaskRows(rows: readonly ControlTaskRow[], ref?: string): TaskRowsOutcome {
+  const key = String(ref ?? '').trim()
+  if (key === '') return { kind: 'all', rows: rows.slice(0, 12) }
+  const lower = key.toLowerCase()
+  const idKey = /^\d+$/.test(lower) ? `t${lower}` : lower
+  const exact = rows.filter((row) => row.taskId.toLowerCase() === idKey)
+  if (exact.length === 1) return { kind: 'one', row: exact[0] }
+  const prefix = rows.filter((row) => row.taskId.toLowerCase().startsWith(idKey))
+  if (prefix.length === 1) return { kind: 'one', row: prefix[0] }
+  if (prefix.length > 1) return { kind: 'many', rows: prefix.slice(0, 8) }
+  const contains = rows.filter((row) => row.title.toLowerCase().includes(lower))
+  if (contains.length === 1) return { kind: 'one', row: contains[0] }
+  if (contains.length > 1) return { kind: 'many', rows: contains.slice(0, 8) }
+  return { kind: 'none' }
+}
+
+/** 任务清单排版（一条一行，带胶囊与副行）。 */
+export function formatTaskRows(rows: readonly ControlTaskRow[]): string {
+  return rows.map((row) => `${row.taskId}. ${row.title}（${row.capsule} · ${row.sub}）`).join('\n')
+}
+
 /* ---------- 动作注册表 ---------- */
 
-/** 工具入参（只有这四个；越宽越自由，校验都在 execute 里做）。 */
+/** 工具入参（action/session/index/confirm 固定四个，另加派单用的 text/target）。 */
 export interface TihuControlArgs {
   action: string
   session?: string
   index?: number
   confirm?: boolean
+  /** 派单：用户原话（dispatch 必填）。 */
+  text?: string
+  /** 派单：目标项目卡名或文件夹关键词（可选）。 */
+  target?: string
+  /** 派单：自定义标题（可选；不给就按原话规范化）。 */
+  title?: string
 }
 
 /** handler 可用的上下文。 */
@@ -202,7 +270,21 @@ export function normalizeControlArgs(raw: unknown): TihuControlArgs {
   const indexRaw = input.index
   const index = typeof indexRaw === 'number' && Number.isFinite(indexRaw) ? Math.trunc(indexRaw) : undefined
   const confirm = input.confirm === true
-  return { action, ...(session === undefined ? {} : { session }), ...(index === undefined ? {} : { index }), confirm }
+  const textRaw = input.text
+  const text = typeof textRaw === 'string' && textRaw.trim() !== '' ? textRaw.trim() : undefined
+  const targetRaw = input.target
+  const target = typeof targetRaw === 'string' && targetRaw.trim() !== '' ? targetRaw.trim() : undefined
+  const titleRaw = input.title
+  const title = typeof titleRaw === 'string' && titleRaw.trim() !== '' ? titleRaw.trim() : undefined
+  return {
+    action,
+    ...(session === undefined ? {} : { session }),
+    ...(index === undefined ? {} : { index }),
+    confirm,
+    ...(text === undefined ? {} : { text }),
+    ...(target === undefined ? {} : { target }),
+    ...(title === undefined ? {} : { title }),
+  }
 }
 
 /** 设备缺省约定：调用会话绑定的那台 → 只有一台在线就用那台 → 报错并给操作指引。 */
@@ -355,6 +437,35 @@ defineAction('open_recent', '点首页「最近回答」行，打开最近有回
   return api.surface.openRecent(device.id)
 })
 
+/**
+ * 派单（第 13 个 action，2026-11-09 统一指挥会话）。
+ *
+ * 这是**指挥会话唯一的动手方式**：它自己不做正文，只把用户那句话派给某条任务会话，
+ * 由登记簿记账、屏上出派单回执。`target` 只是「我建议落在哪个项目」，最终落点仍由
+ * lane 的派单器按「卡片文件夹 → 模板最新步骤目录 → 绑定会话 cwd → 助手 home」定，
+ * 模型指错也不会写错地方。
+ */
+defineAction('dispatch', '派单：把用户的一句话派给某个项目文件夹的新任务会话去执行（text 必填＝用户原话；target 可选＝项目卡名或文件夹关键词）。指挥会话自己不要动手做正文，一律走这个 action。', async (args, api) => {
+  if (args.text === undefined) {
+    throw new Error('dispatch 需要 text 参数（用户原话）。只传项目名不行：要派的是「做什么」。')
+  }
+  return api.surface.dispatch({
+    text: args.text,
+    ...(args.target === undefined ? {} : { project: args.target }),
+    ...(args.title === undefined ? {} : { title: args.title }),
+  })
+})
+
+defineAction('list_tasks', '列出任务登记簿里还没归档的任务（任务号、标题、状态、项目·第几步）。', async (_args, api) => {
+  const rows = api.surface.listTasks()
+  if (rows.length === 0) return '登记簿里现在没有任务（棋盘是空的）。'
+  return `任务（${rows.length} 条）：\n${formatTaskRows(rows)}`
+})
+
+defineAction('cancel', '撤掉一条还没起跑的任务（session 传任务号如 t3，或标题关键词；不传就撤最近一条排队中的）。', async (args, api) => {
+  return api.surface.cancelTask(args.session)
+})
+
 /* ---------- 执行器（单测用假控制面直接驱动） ---------- */
 
 /**
@@ -374,7 +485,7 @@ export function createTihuControlRunner(surface: TihuControlSurface) {
 
 export const TIHU_CONTROL_SECTION_NAME = 'tihu:control'
 
-export const TIHU_CONTROL_SECTION_TEXT = '控制鹈鹕设备（切换会话、点气泡、查进度、删会话等）用 tihu 工具，参数与合法 action 见工具描述。删除会话前必须先让用户口头确认，再以 confirm=true 调用。'
+export const TIHU_CONTROL_SECTION_TEXT = '鹈鹕设备上听到的任务一律用 tihu 的 dispatch 派单（别自己动手做正文），看任务用 list_tasks。删除会话前必须先让用户口头确认，再以 confirm=true 调用。'
 
 /** 挂系统提示段落（失败只记日志，绝不影响插件启动）。 */
 function registerControlSection(ctx: any, log: (line: string) => void): (() => void) | undefined {
@@ -442,7 +553,8 @@ export async function registerTihuControl(ctx: any, surface: TihuControlSurface,
   const offTool = tools.register(defineTool({
     name: 'tihu',
     description: [
-      '控制鹈鹕（tihu）设备：看设备屏（status）、列设备（list_devices）、切换绑定（bind）、点右侧气泡（open_bubble）、查会话进度（progress）、列会话（list_sessions）、删除会话（archive，须 confirm=true 且先征得用户口头确认）、停止朗读（stop_speaking）、重读（replay）、回主页钉住（go_home）、翻回答历史（browse，session 传 prev/next）、点首页最近回答（open_recent）。',
+      '控制鹈鹕（tihu）设备：看设备屏（status）、列设备（list_devices）、**派单（dispatch）**、看任务（list_tasks）、撤单（cancel）、切换绑定（bind）、点右侧气泡（open_bubble）、查会话进度（progress）、列会话（list_sessions）、删除会话（archive，须 confirm=true 且先征得用户口头确认）、停止朗读（stop_speaking）、重读（replay）、回主页钉住（go_home）、翻回答历史（browse，session 传 prev/next）、点首页最近回答（open_recent）。',
+      '铁律：设备上听到的每句话都是**任务**，不是让你自己动手的活——要把「做什么」用 dispatch 派到对应项目的任务会话里，由登记簿记账、屏上出派单回执。不要把任务正文留在指挥会话里做。',
       `合法 action：${names.join(' / ')}。`,
       '设备缺省取绑定到当前会话的那台；会话按标题关键词或代号模糊匹配（精确/前缀/包含），多个候选会返回清单让你追问。',
     ].join(''),
@@ -466,6 +578,21 @@ export async function registerTihuControl(ctx: any, surface: TihuControlSurface,
         type: 'boolean',
         required: false,
         description: 'archive 专用：必须 true（已让用户口头确认）才会删除。',
+      },
+      text: {
+        type: 'string',
+        required: false,
+        description: 'dispatch 专用：用户原话（要做什么）。',
+      },
+      target: {
+        type: 'string',
+        required: false,
+        description: 'dispatch 专用（可选）：项目卡名或文件夹关键词；不填就按规则自动判落点。',
+      },
+      title: {
+        type: 'string',
+        required: false,
+        description: 'dispatch 专用（可选）：任务标题；不填就按原话规范化。',
       },
     },
     execute: async (args: unknown, exec: any) => run(args, { sessionId: callerSessionIdOf(exec) }),

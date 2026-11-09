@@ -1,0 +1,548 @@
+#!/usr/bin/env node
+/**
+ * 任务登记簿（Task Ledger）与任务屏（task-screens）单测。
+ *
+ * 这两块是「统一指挥会话」的事实源与投影层，全部是纯函数／可注入时钟，
+ * 所以能在这里把边界条件钉死：
+ *   - 状态机只允许设计里那几条边（完成的东西不会被一条迟到事件拉回执行中）；
+ *   - 棋盘排序固定（要人的永远在最上）、同行只折叠「连续同一项目」；
+ *   - 时长环满圈 30 分钟、完成后满环、排队空环；
+ *   - 播报 P0 插队、P1 八秒合并、P3 永不播；
+ *   - 派单快路径：点名卡 / 追加 / 日常 / 歧义追问，各走一条。
+ */
+import assert from 'node:assert/strict'
+
+import {
+  ANNOUNCE_SINGLE_DELAY_MS,
+  ANNOUNCE_WINDOW_MS,
+  BOARD_PAGE_SIZE,
+  DONE_KEEP_MS,
+  RING_FULL_MS,
+  TaskLedger,
+  TaskNotifyBus,
+  boardOf,
+  capsuleOf,
+  chineseIndex,
+  countsOf,
+  firstFolderOf,
+  formatUsedMs,
+  journalLineOf,
+  looksSimpleTask,
+  longestCommonRun,
+  mergeAnnouncements,
+  parseScreenCommand,
+  ringOf,
+  routeQuick,
+  scoreCardAlias,
+  subLineOf,
+  taskTitleOf,
+} from '../src/tihu/task-ledger.ts'
+import {
+  DECISION_SECONDS,
+  RECEIPT_SECONDS,
+  askWhichFrame,
+  awaitingFrame,
+  boardFrame,
+  detailFrame,
+  doneAnnouncementOf,
+  doneFrame,
+  folderBase,
+  noticeFrame,
+  receiptFrame,
+} from '../src/tihu/task-screens.ts'
+import { fitScreenLines, SCREEN_SPEC } from '../src/tihu/screen-spec.ts'
+
+let passed = 0
+function test(name, fn) {
+  try {
+    fn()
+    passed += 1
+    console.log(`  ok  ${name}`)
+  } catch (error) {
+    console.error(`FAIL  ${name}`)
+    throw error
+  }
+}
+
+/* ---------- 登记簿：状态机 ---------- */
+
+test('新任务是排队态：没有步数、没有会话、不编用时', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: '把青年基金第 3 段改写', projectId: 'p1', projectName: '青年基金申请书', now: 1000 })
+  assert.equal(task.taskId, 't1')
+  assert.equal(task.state, 'queued')
+  assert.equal(task.step, 0)
+  assert.deepEqual(task.sessionIds, [])
+  assert.equal(subLineOf(task, task.projectName), '青年基金申请书 · 排队中')
+  assert.equal(ringOf(task, 1000).tone, 'empty')
+  assert.equal(capsuleOf(task.state), '排队')
+})
+
+test('绑上会话即执行中；attachSession 不重复加同一条会话', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: 'x', projectId: 'p1', projectName: 'P', now: 1000 })
+  ledger.attachSession(task.taskId, 'session-aaaa', 1100)
+  ledger.attachSession(task.taskId, 'session-aaaa', 1200)
+  assert.equal(task.state, 'running')
+  assert.deepEqual(task.sessionIds, ['session-aaaa'])
+  assert.equal(ledger.ofSession('session-aaaa')?.taskId, 't1')
+})
+
+test('步数只增不减（乱序到达的 tool/call 不能把第 7 步改回第 2 步）', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: 'x', projectId: 'p1', projectName: 'P' })
+  ledger.attachSession(task.taskId, 'session-step')
+  ledger.noteStep(task.taskId, 3)
+  ledger.noteStep(task.taskId, 1)
+  ledger.noteStep(task.taskId, 7)
+  assert.equal(task.step, 7)
+  assert.equal(subLineOf(task, '青年基金申请书'), '青年基金申请书 · 第 7 步')
+})
+
+test('待决策＝托管没开：带问题、选项、默认项、截止时刻', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: 'x', projectId: 'p1', projectName: 'P', now: 1000 })
+  ledger.attachSession(task.taskId, 'session-b', 1000)
+  ledger.ask(task.taskId, { question: '删掉 3 个旧结果文件？', options: ['确认删除', '先留着，别删'], defaultIndex: 1, timeoutMs: 60_000, now: 2000 })
+  assert.equal(task.state, 'awaiting')
+  assert.equal(task.question, '删掉 3 个旧结果文件？')
+  assert.equal(task.options.length, 2)
+  assert.equal(task.defaultIndex, 1)
+  assert.equal(task.decisionDeadline, 62_000)
+  assert.equal(capsuleOf(task.state), '待决策')
+  // 待决策行不显示时长环，给琥珀问号徽标
+  const row = boardOf(ledger.list(), 3000).rows[0]
+  assert.equal(row.badge, 'ask')
+  assert.equal(row.ring.tone, 'empty')
+})
+
+test('回答了（人点/口头/60 秒到点走默认）回到执行中并记下谁拍的板', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: 'x', projectId: 'p1', projectName: 'P' })
+  ledger.attachSession(task.taskId, 'session-c')
+  ledger.ask(task.taskId, { question: 'q', options: ['a', 'b'], defaultIndex: 0, timeoutMs: 60_000 })
+  ledger.answer(task.taskId, '设备 60 秒超时 · 默认项')
+  assert.equal(task.state, 'running')
+  assert.equal(task.answeredBy, '设备 60 秒超时 · 默认项')
+  assert.equal(task.question, undefined)
+  assert.equal(task.options, undefined)
+})
+
+test('完成写一行结果；完成后不会被迟到的「开始跑」拉回去', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: 'x', projectId: 'p1', projectName: 'P', now: 1000 })
+  ledger.attachSession(task.taskId, 'session-d', 1000)
+  ledger.complete(task.taskId, { resultLine: '第 3 段改写完成', now: 5000 })
+  assert.equal(task.state, 'done')
+  assert.equal(task.resultLine, '第 3 段改写完成')
+  assert.equal(task.finishedAt, 5000)
+  ledger.markRunning(task.taskId, 6000)
+  assert.equal(task.state, 'done', '完成是终态，迟到事件不能倒回去')
+  assert.deepEqual(ringOf(task, 9000), { percent: 1, tone: 'done' })
+})
+
+/* ---------- 棋盘投影 ---------- */
+
+test('棋盘排序固定：待决策 → 执行中 → 排队 → 完成', () => {
+  const ledger = new TaskLedger()
+  const done = ledger.add({ title: '完成的', projectId: 'p3', projectName: 'C' })
+  const queued = ledger.add({ title: '排队的', projectId: 'p4', projectName: 'D' })
+  const running = ledger.add({ title: '跑着的', projectId: 'p2', projectName: 'B' })
+  const asking = ledger.add({ title: '等你的', projectId: 'p1', projectName: 'A' })
+  ledger.complete(done.taskId, { resultLine: '好了' })
+  ledger.attachSession(running.taskId, 'session-r')
+  ledger.attachSession(asking.taskId, 'session-a')
+  ledger.ask(asking.taskId, { question: 'q', options: ['a', 'b'], defaultIndex: 0, timeoutMs: 60_000 })
+  assert.deepEqual(boardOf(ledger.list(), 10).rows.map((row) => row.taskId), [asking.taskId, running.taskId, queued.taskId, done.taskId])
+})
+
+test('同一项目「连续」多条只留最新一条并折叠成 +N（中间夹了别的项目就不折叠）', () => {
+  const ledger = new TaskLedger()
+  const a1 = ledger.add({ title: 'A1', projectId: 'pa', projectName: 'A' })
+  const a2 = ledger.add({ title: 'A2', projectId: 'pa', projectName: 'A' })
+  const b1 = ledger.add({ title: 'B1', projectId: 'pb', projectName: 'B' })
+  ledger.attachSession(a1.taskId, 's1')
+  ledger.attachSession(a2.taskId, 's2')
+  ledger.attachSession(b1.taskId, 's3')
+  ledger.noteStep(a1.taskId, 2)
+  ledger.noteStep(a2.taskId, 5)
+  const board = boardOf(ledger.list(), 10)
+  const sameProject = board.rows.filter((row) => row.sub.startsWith('A'))
+  assert.equal(sameProject.length, 1, 'A 只留一行')
+  assert.equal(sameProject[0].merged, 1, '另一条折叠成 +1')
+  assert.ok(board.rows.some((row) => row.sub.startsWith('B')), '夹着的 B 不被吞掉')
+})
+
+test('顶行三段计数在跑/等你/排队，完成不计数', () => {
+  const ledger = new TaskLedger()
+  const a = ledger.add({ title: 'a', projectId: '1', projectName: '1' })
+  const b = ledger.add({ title: 'b', projectId: '2', projectName: '2' })
+  const c = ledger.add({ title: 'c', projectId: '3', projectName: '3' })
+  const d = ledger.add({ title: 'd', projectId: '4', projectName: '4' })
+  ledger.attachSession(a.taskId, 'sa')
+  ledger.attachSession(b.taskId, 'sb')
+  ledger.ask(b.taskId, { question: 'q', options: ['x', 'y'], defaultIndex: 0, timeoutMs: 60_000 })
+  ledger.complete(d.taskId, { resultLine: 'ok' })
+  assert.deepEqual(countsOf(ledger.list()), { running: 1, awaiting: 1, queued: 1 })
+  assert.equal(ledger.list().length, 4)
+})
+
+test('没有任务 = 同一版式的空态（empty=true，不是另一屏）', () => {
+  const ledger = new TaskLedger()
+  const board = boardOf(ledger.list(), 1)
+  assert.equal(board.empty, true)
+  assert.deepEqual(board.rows, [])
+  assert.deepEqual(board.counts, { running: 0, awaiting: 0, queued: 0 })
+  assert.deepEqual(board.page, { index: 0, total: 1 })
+  const frame = boardFrame(board)
+  assert.equal(frame.mode, 'home')
+  assert.equal(frame.board.empty, true)
+  assert.equal(frame.tone, 'idle')
+})
+
+test(`棋盘每页 ${BOARD_PAGE_SIZE} 行，页码越界自动夹住`, () => {
+  const ledger = new TaskLedger()
+  for (let i = 0; i < 7; i += 1) ledger.add({ title: `task-${i}`, projectId: `p${i}`, projectName: `P${i}` })
+  assert.equal(boardOf(ledger.list(), 1, 0).rows.length, BOARD_PAGE_SIZE)
+  assert.equal(boardOf(ledger.list(), 1, 0).page.total, 2)
+  assert.equal(boardOf(ledger.list(), 1, 2).page.index, 1, '越界夹到最后一页')
+  assert.equal(boardOf(ledger.list(), 1, 2).rows.length, 2)
+})
+
+test('时长环：满圈 30 分钟，超过继续满圈但转琥珀；排队空环', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: 'x', projectId: 'p', projectName: 'P', now: 0 })
+  ledger.attachSession(task.taskId, 's', 0)
+  assert.deepEqual(ringOf(task, 0), { percent: 0, tone: 'normal' })
+  assert.equal(ringOf(task, RING_FULL_MS / 2).percent, 0.5)
+  const late = ringOf(task, RING_FULL_MS * 2)
+  assert.equal(late.percent, 1)
+  assert.equal(late.tone, 'warn')
+})
+
+test('内存上限：超了先归档最老的完成态，会话不删', () => {
+  const ledger = new TaskLedger()
+  const first = ledger.add({ title: 'old', projectId: 'p', projectName: 'P', now: 0 })
+  ledger.attachSession(first.taskId, 'session-keep', 0)
+  ledger.complete(first.taskId, { resultLine: 'ok', now: 1 })
+  // 手动把它挪到很久以前，触发 DONE_KEEP_MS 归档
+  first.finishedAt = 0
+  ledger.prune(DONE_KEEP_MS + 10)
+  assert.equal(first.state, 'archived')
+  assert.deepEqual(first.sessionIds, ['session-keep'], '归档不动会话')
+})
+
+test('自动归档也要落 journal 一行（不能悄悄丢）', () => {
+  const lines = []
+  const ledger = new TaskLedger((line) => lines.push(line))
+  const task = ledger.add({ title: '老任务', projectId: 'p', projectName: 'P', now: 0 })
+  ledger.complete(task.taskId, { resultLine: '做完了', now: 1 })
+  task.finishedAt = 0
+  ledger.prune(DONE_KEEP_MS + 10)
+  assert.equal(lines.length, 1, '自动归档要写一行')
+  assert.ok(lines[0].includes('[t1] 老任务'))
+  assert.equal(ledger.archive(task.taskId), undefined, '再手动归档不许写第二行')
+  assert.equal(lines.length, 1)
+})
+
+/* ---------- 归档 / journal ---------- */
+
+test('归档只写一行 journal、只写一次；任务移出棋盘', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: '改写第 3 段', projectId: 'p1', projectName: '青年基金申请书', now: 0 })
+  ledger.attachSession(task.taskId, 'session-98bb83cb-ffff', 0)
+  ledger.complete(task.taskId, { resultLine: '第 3 段改写完成', now: 83_000 })
+  const line = ledger.archive(task.taskId)
+  assert.ok(line !== undefined && line.includes('[t1] 改写第 3 段'))
+  assert.ok(line.includes('青年基金申请书'))
+  assert.ok(line.includes('98bb83cb'))
+  assert.ok(line.includes('1m23s'), `要写用时：${line}`)
+  assert.ok(line.includes('第 3 段改写完成'))
+  assert.equal(ledger.archive(task.taskId), undefined, '不重复写')
+  assert.equal(boardOf(ledger.list(), 100).rows.length, 0)
+})
+
+test('journal 行带上「谁拍的板」', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: 'x', projectId: 'p', projectName: 'P', now: 0 })
+  ledger.attachSession(task.taskId, 's', 0)
+  ledger.ask(task.taskId, { question: 'q', options: ['a', 'b'], defaultIndex: 0, timeoutMs: 60_000 })
+  ledger.answer(task.taskId, '设备点选')
+  ledger.complete(task.taskId, { resultLine: 'ok', now: 1000 })
+  assert.ok(journalLineOf(task, 1000).includes('设备点选'))
+})
+
+test('用时格式：秒 / 分秒 / 时分', () => {
+  assert.equal(formatUsedMs(0), '0s')
+  assert.equal(formatUsedMs(45_000), '45s')
+  assert.equal(formatUsedMs(83_000), '1m23s')
+  assert.equal(formatUsedMs(3_900_000), '1h05m')
+})
+
+/* ---------- 播报总线 ---------- */
+
+test('P3 进度永远不播', () => {
+  const bus = new TaskNotifyBus()
+  bus.push(3, 't1', '第 7 步', 0)
+  assert.equal(bus.pending(), 0)
+  assert.equal(bus.take(0), undefined)
+})
+
+test('只有一条：过了单条延迟立刻念', () => {
+  const bus = new TaskNotifyBus()
+  bus.push(1, 't1', '基金稿改完', 0)
+  assert.equal(bus.take(0), undefined, '刚到就念会把同一秒的其它完成拆散')
+  const got = bus.take(ANNOUNCE_SINGLE_DELAY_MS)
+  assert.deepEqual(got, { level: 1, taskIds: ['t1'], text: '基金稿改完' })
+  assert.equal(bus.pending(), 0)
+})
+
+test('多条：八秒窗口内压成一句只念一次', () => {
+  const bus = new TaskNotifyBus()
+  bus.push(1, 't1', '基金稿改完', 0)
+  bus.push(1, 't2', '磷石膏出图', 1000)
+  assert.equal(bus.take(4000), undefined, '窗口没到不乱念')
+  const got = bus.take(ANNOUNCE_WINDOW_MS)
+  assert.ok(got !== undefined)
+  assert.deepEqual(got.taskIds, ['t1', 't2'])
+  assert.equal(got.text, '两件事完了：基金稿改完、磷石膏出图')
+  assert.equal(bus.pending(), 0)
+})
+
+test('P0 插队：不等窗口，立即念', () => {
+  const bus = new TaskNotifyBus()
+  bus.push(1, 't1', '基金稿改完', 0)
+  bus.push(0, 't2', '要你确认删除', 10)
+  const got = bus.take(20)
+  assert.deepEqual(got, { level: 0, taskIds: ['t2'], text: '要你确认删除' })
+  assert.equal(bus.pending(), 1, 'P1 还留在队里')
+})
+
+test('合并措辞：一到三件事，超过三件说「等」', () => {
+  assert.equal(mergeAnnouncements([]), '')
+  assert.equal(mergeAnnouncements([{ text: 'A', level: 1 }]), 'A')
+  assert.equal(mergeAnnouncements([{ text: 'A', level: 1 }, { text: 'B', level: 1 }]), '两件事完了：A、B')
+  assert.equal(mergeAnnouncements([{ text: 'A', level: 1 }, { text: 'B', level: 1 }, { text: 'C', level: 1 }]), '三件事完了：A、B、C')
+  assert.equal(
+    mergeAnnouncements([{ text: 'A', level: 1 }, { text: 'B', level: 1 }, { text: 'C', level: 1 }, { text: 'D', level: 1 }]),
+    '4 件事完了：A、B、C等',
+  )
+  assert.equal(mergeAnnouncements([{ text: 'A', level: 2 }, { text: 'B', level: 2 }]), 'A；B', '里程碑不套「几件事完了」')
+})
+
+test('nextAt：给调用方挂定时器用，不用轮询', () => {
+  const bus = new TaskNotifyBus()
+  assert.equal(bus.nextAt(), undefined)
+  bus.push(1, 't1', 'A', 1000)
+  assert.equal(bus.nextAt(), 1000 + ANNOUNCE_SINGLE_DELAY_MS)
+  bus.push(1, 't2', 'B', 1200)
+  assert.equal(bus.nextAt(), 1000 + ANNOUNCE_WINDOW_MS)
+})
+
+/* ---------- 派单路由 ---------- */
+
+const CARDS = [
+  { id: 'c-fund', name: '青年基金申请书', folder: 'D:/proj/青年基金2027' },
+  { id: 'c-lin', name: '磷石膏SCI', folder: 'D:/proj/lin-shigao' },
+  { id: 'wt-assistant', name: '个人助手', folder: 'C:/Users/chen/.dsh/assistant' },
+]
+
+test('点名项目卡 → 派给它（整名命中优先于片段命中）', () => {
+  const route = routeQuick({ text: '把青年基金申请书第 3 段再改一遍，要有数据支撑', cards: CARDS, tasks: [] })
+  assert.equal(route.kind, 'card')
+  assert.equal(route.card.id, 'c-fund')
+})
+
+test('同一项目「接着」说 → 追加到已有任务，不新建', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: '改写第 3 段', projectId: 'c-fund', projectName: '青年基金申请书' })
+  ledger.attachSession(task.taskId, 's1')
+  const route = routeQuick({ text: '接着把参考文献也补一下，要最新的三篇', cards: CARDS, tasks: ledger.list() })
+  assert.equal(route.kind, 'append')
+  assert.equal(route.task.taskId, task.taskId)
+})
+
+test('日常小事 → 个人助手（与长按悬浮球同一个文件夹）', () => {
+  assert.equal(routeQuick({ text: '现在几点了', cards: CARDS, tasks: [] }).kind, 'daily')
+  assert.equal(routeQuick({ text: '帮我查一下明天武汉天气', cards: CARDS, tasks: [] }).kind, 'daily')
+  assert.equal(looksSimpleTask('这篇论文的摘要润色一下'), false, '要产出东西的不算日常')
+})
+
+test('两个卡名都点到 → 追问（屏 7），绝不猜', () => {
+  const route = routeQuick({ text: '把青年基金申请书和磷石膏SCI都整理一下投出去', cards: CARDS, tasks: [] })
+  assert.equal(route.kind, 'ambiguous')
+  assert.equal(route.candidates.length, 2)
+})
+
+test('什么都不像 → 快路径放弃，交给慢路径', () => {
+  const route = routeQuick({ text: '这个事儿你看着办，弄完告诉我', cards: CARDS, tasks: [] })
+  assert.equal(route.kind, 'none')
+})
+
+test('别名打分：整名 > 片段；公共片段按字长给分', () => {
+  assert.ok(scoreCardAlias('青年基金申请书', CARDS[0]).score >= 100)
+  assert.ok(scoreCardAlias('基金那边', CARDS[0]).score > 0)
+  assert.equal(scoreCardAlias('完全无关的一句话', CARDS[1]).score, 0)
+  assert.equal(longestCommonRun('青年基金', '青年基金申请书'), 4)
+})
+
+test('文件夹兜底按顺序取第一个非空', () => {
+  assert.equal(firstFolderOf([undefined, '', 'D:/a']), 'D:/a')
+  assert.equal(firstFolderOf([undefined, '']), undefined)
+})
+
+/* ---------- 口头命令 ---------- */
+
+test('口头命令：回棋盘 / 看任务 / 停止 / 撤单 / 确认 / 拒绝', () => {
+  assert.deepEqual(parseScreenCommand('回棋盘'), { kind: 'board' })
+  assert.deepEqual(parseScreenCommand('主页'), { kind: 'board' })
+  assert.deepEqual(parseScreenCommand('停止'), { kind: 'stop' })
+  assert.deepEqual(parseScreenCommand('撤单'), { kind: 'cancel' })
+  assert.deepEqual(parseScreenCommand('确认'), { kind: 'confirm', approved: true })
+  assert.deepEqual(parseScreenCommand('先留着'), { kind: 'confirm', approved: false })
+  assert.deepEqual(parseScreenCommand('看第 2 条'), { kind: 'open', index: 2 })
+  assert.deepEqual(parseScreenCommand('第二条'), { kind: 'pick', index: 2 })
+})
+
+test('任务句里带「确认」不算命令（否则会把任务吞掉）', () => {
+  assert.equal(parseScreenCommand('确认一下这个基金的预算表有没有算错'), undefined)
+  assert.equal(parseScreenCommand('把取消掉的三个文件恢复回来'), undefined)
+})
+
+test('中文序号', () => {
+  assert.equal(chineseIndex('一'), 1)
+  assert.equal(chineseIndex('第3条'), 3)
+  assert.equal(chineseIndex('九个'), 9)
+  assert.equal(chineseIndex('春眠不觉晓'), undefined)
+})
+
+/* ---------- 屏版式 ---------- */
+
+test('标题规范化：去标点、超长省略、空句给占位', () => {
+  assert.equal(taskTitleOf('  改写第 3 段。 '), '改写第 3 段')
+  assert.equal(taskTitleOf(''), '这条任务')
+  assert.equal([...taskTitleOf('一二三四五六七八九十一二三四五六七八九十')].length, 18)
+})
+
+test(`正文不超过 ${SCREEN_SPEC.maxBodyLines} 行、每行不超屏宽（fitScreenLines 兜底）`, () => {
+  const frame = receiptFrame({ taskId: 't1', projectName: '青年基金申请书', folder: 'D:/proj/青年基金2027', queueAhead: 2, etaText: '1 分钟' })
+  assert.ok(frame.bullets.length <= SCREEN_SPEC.maxBodyLines)
+  for (const line of frame.bullets) assert.ok(fitScreenLines([line], 1).length === 1, `这一行放得下：${line}`)
+})
+
+test('派单回执（屏 2）：三拍圆点 + 文件夹 + 倒计时 + 两个键', () => {
+  const frame = receiptFrame({ taskId: 't2', projectName: '青年基金申请书', folder: 'D:/proj/青年基金2027', queueAhead: 2, etaText: '1 分钟' })
+  assert.equal(frame.stage, '派单')
+  assert.equal(frame.title, '已派给 青年基金申请书')
+  assert.deepEqual(frame.steps.map((step) => step.label), ['已入队', '排队 2 个', '开始跑'])
+  assert.deepEqual(frame.steps.map((step) => step.state), ['done', 'active', 'pending'])
+  assert.ok(frame.bullets.some((line) => line.includes('青年基金2027')), '要看得清落在哪个文件夹')
+  assert.equal(frame.bullets.filter((line) => line.includes('青年基金申请书')).length, 0, '标题说过了，正文不再重复项目名')
+  assert.equal(frame.countdown.seconds, RECEIPT_SECONDS)
+  assert.deepEqual(frame.actions.map((item) => item.label), ['看任务', '撤单'])
+  assert.equal(frame.taskId, 't2')
+})
+
+test('派单回执：没有排队时第三拍是「开始跑」', () => {
+  const frame = receiptFrame({ taskId: 't3', projectName: 'A', folder: undefined, queueAhead: 0 })
+  assert.deepEqual(frame.steps.map((step) => step.state), ['done', 'done', 'active'])
+  assert.ok(frame.bullets.includes('马上开始跑'))
+})
+
+test('任务详情（屏 4）：标题只有「第 N 步 · 已用」，正文四行含统计与「项目 · 会话」', () => {
+  const frame = detailFrame({
+    taskId: 't4',
+    stageWord: '跑命令',
+    step: 7,
+    elapsedMs: 83_000,
+    activity: [
+      { label: '工具', detail: 'read_image' },
+      { label: '思考', detail: 's05 now shows 项目 · 会话 and …' },
+    ],
+    statsLine: '82 tok/s · 12.3k tok · 上下文 41%',
+    projectName: '青年基金申请书',
+    sessionTitle: '改写第 3 段',
+  })
+  assert.equal(frame.stage, '跑命令')
+  assert.equal(frame.title, '第 7 步 · 已用 1m23s')
+  assert.equal(frame.bullets.length, SCREEN_SPEC.maxBodyLines)
+  assert.equal(frame.bullets[0], '工具 · read_image')
+  assert.ok(frame.bullets.some((line) => line.includes('82 tok/s')))
+  assert.ok(frame.bullets.some((line) => line === '青年基金申请书 · 改写第 3 段'))
+  assert.equal(frame.statsTail, 1)
+  assert.deepEqual(frame.actions.map((item) => item.label), ['看会话', '停止', '回棋盘'])
+})
+
+test('待决策（屏 5）：托管未开 + 默认项标记 + 60 秒倒计时', () => {
+  const frame = awaitingFrame({
+    taskId: 't5',
+    question: '删掉 3 个旧结果文件？',
+    options: ['确认删除', '先留着，别删'],
+    defaultIndex: 1,
+    projectName: '青年基金申请书',
+    sessionTitle: '改写第 3 段',
+    detail: '.tihu/snapshots/20261109-1542/',
+    secondsLeft: 60,
+  })
+  assert.equal(frame.stage, '待决策 · 托管未开')
+  assert.equal(frame.title, '删掉 3 个旧结果文件？')
+  assert.ok(frame.bullets.includes('青年基金申请书 · 改写第 3 段'), '要显示哪个项目、哪条会话')
+  assert.deepEqual(frame.actions.map((item) => item.label), ['确认删除', '先留着，别删·默认'])
+  assert.equal(frame.countdown.seconds, 60)
+  assert.equal(frame.countdown.totalSeconds, DECISION_SECONDS)
+  assert.equal(frame.tone, 'alert')
+})
+
+test('完成播报（屏 6）：「另有 N 条」收进状态行，不再单独占气泡带', () => {
+  const single = doneFrame({ taskId: 't6', resultLine: '第 3 段改写完成', others: 0 })
+  assert.equal(single.stage, '完成')
+  assert.equal(single.more, undefined)
+  const multi = doneFrame({ taskId: 't7', resultLine: '设备联调通过', others: 2 })
+  assert.deepEqual(multi.more, { count: 2, text: '另有 2 条' })
+  assert.ok(multi.actions.some((item) => item.id === 'taskBoard'))
+})
+
+test('歧义追问（屏 7）：两个候选 + 「都不是」，序号用数字', () => {
+  const frame = askWhichFrame({ candidates: [{ projectName: '青年基金申请书', doing: '在改第 3 段' }, { projectName: '磷石膏SCI', doing: '在出图' }] })
+  assert.equal(frame.stage, '追问 · 只问一次')
+  assert.equal(frame.title, '这句话派给谁？')
+  assert.deepEqual(frame.bullets, ['1 青年基金申请书 · 在改第 3 段', '2 磷石膏SCI · 在出图'])
+  assert.deepEqual(frame.actions.map((item) => item.label), ['1', '2', '都不是'])
+})
+
+test('完成播报的一句话：用任务标题，不念会话 id', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: '把磷石膏那组图重画', projectId: 'p', projectName: '磷石膏SCI' })
+  ledger.complete(task.taskId, { resultLine: '三张图已更新' })
+  assert.equal(doneAnnouncementOf(task), '把磷石膏那组图重画——三张图已更新')
+})
+
+test('提示屏与文件夹取值', () => {
+  const frame = noticeFrame({ stage: '撤单', title: '已撤掉：改写第 3 段', lines: ['还没开始跑，直接拿掉了'] })
+  assert.equal(frame.mode, 'status')
+  assert.equal(frame.title, '已撤掉：改写第 3 段')
+  assert.equal(folderBase('D:\\proj\\青年基金2027\\'), '青年基金2027')
+  assert.equal(folderBase(undefined), '')
+})
+
+test('所有任务屏的共同契约：不新增必填字段、按钮 id 不重复、超长标题被省略', () => {
+  const frames = [
+    receiptFrame({ taskId: 't', projectName: '一个非常非常非常长的项目名字用来测试标题省略', folder: 'D:/x', queueAhead: 1 }),
+    detailFrame({ taskId: 't', stageWord: '思考', step: 1, elapsedMs: 0, activity: [], statsLine: '上下文 3%', projectName: 'P', sessionTitle: 'S' }),
+    awaitingFrame({ taskId: 't', question: '一个非常非常非常长的问题句用来测试标题省略行为是否正确', options: ['a', 'b'], defaultIndex: 0, projectName: 'P', sessionTitle: 'S', secondsLeft: 30 }),
+    doneFrame({ taskId: 't', resultLine: '一个非常非常非常长的结果行用来测试标题省略行为是否正确', others: 3 }),
+    askWhichFrame({ candidates: [] }),
+  ]
+  for (const frame of frames) {
+    assert.equal(typeof frame.stage, 'string')
+    assert.equal(typeof frame.title, 'string')
+    assert.ok(Array.isArray(frame.bullets))
+    assert.ok(frame.bullets.length <= SCREEN_SPEC.maxBodyLines)
+    const ids = (frame.actions ?? []).map((item) => item.id)
+    assert.equal(new Set(ids).size, ids.length, '按钮 id 不能重复')
+    // 18px 加粗标题：按像素量宽必须落在 304 以内（clipScreenTitle 保证）
+    assert.ok(frame.title.length <= SCREEN_SPEC.titleChars * 2, `标题不该无限长：${frame.title}`)
+  }
+})
+
+console.log(`\n${passed} tests passed（task-ledger + task-screens）`)

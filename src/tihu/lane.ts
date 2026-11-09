@@ -26,7 +26,7 @@
  *        （见 guard.ts）。只对「tihu 正在执行的会话」生效，不干扰桌面正常使用。
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { WsFrameParser, encodeFrame } from '../pocket-host/ws-deflate.mjs'
 import {
@@ -39,6 +39,7 @@ import {
   parseUpstream,
   randomId,
   summarizeForLog,
+  toBullets,
   type ConfirmAskPayload,
   type DonePayload,
   type HelloPayload,
@@ -49,6 +50,11 @@ import {
   type SessionsListPayload,
   type TranscriptPayload,
   type TtsTextPayload,
+  type TaskBoardPayload,
+  type TaskListPayload,
+  type TaskNotifyPayload,
+  type TaskReplyPayload,
+  type TaskUpdatePayload,
 } from './protocol.ts'
 import {
   appendAudit,
@@ -65,7 +71,7 @@ import {
   type TihuActionClass,
 } from './guard.ts'
 import { tihuPageHtml } from './page.ts'
-import { applyEarlyThinking, applySessionEvent, confirmationFrame, createProgressState, decodeRateOf, pushDecodeSample, type TihuDecodeSample, type TihuProgressState } from './progress.ts'
+import { applyEarlyThinking, applySessionEvent, confirmationFrame, createProgressState, decodeRateOf, formatTokens, pushDecodeSample, type TihuDecodeSample, type TihuProgressState } from './progress.ts'
 import { TihuTts, isKokoroVoice, type TihuTtsPaths } from './tts.ts'
 import { replyVisibleWindow, replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
 import { stripToolNoise, toSpeechText } from './speech-text.ts'
@@ -74,8 +80,36 @@ import { parseWav } from './audio.ts'
 import { applyPersonalTerms, cleanFillers, fixTerms } from '../client/pocket/orb/asr-terms.ts'
 import { loadAssistantConfig } from '../assistant-config.ts'
 import { cardsFromState, groupCardProjects, groupProjects, groupWorkspaceProjects, humanTitle, projectCardsSignature, projectNameOf, type ProjectReply, type TihuCardRow, type TihuWorkspaceRow } from './project-groups.ts'
-import { matchSessionRows, type ControlSessionRow, type DeviceStatusView, type SessionProgressView, type TihuControlDevice, type TihuControlSurface } from './control.ts'
+import { matchSessionRows, matchTaskRows, type ControlSessionRow, type ControlTaskRow, type DeviceStatusView, type SessionProgressView, type TihuControlDevice, type TihuControlSurface } from './control.ts'
 import type { AlertPayload, TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
+import {
+  TaskLedger,
+  TaskNotifyBus,
+  boardOf,
+  capsuleOf,
+  chineseIndex,
+  parseScreenCommand,
+  routeQuick,
+  scoreCardAlias,
+  subLineOf,
+  taskTitleOf,
+  type ScreenCommand,
+  type TihuTask,
+} from './task-ledger.ts'
+import {
+  RECEIPT_SECONDS,
+  askWhichFrame,
+  awaitingFrame,
+  boardFrame,
+  detailFrame,
+  doneAnnouncementOf,
+  doneFrame,
+  folderBase,
+  noticeFrame,
+  receiptFrame,
+} from './task-screens.ts'
+import { ensureAssistantHome } from '../assistant-home.ts'
+import { TihuPreroll, prerollAudioMs } from './preroll.ts'
 
 /** 页面与 WebSocket 的路径（代理侧按这两个前缀放行）。 */
 export const TIHU_PAGE_PATH = '/tihu'
@@ -240,6 +274,17 @@ interface TihuDevice {
   sessionId?: string
   /** 自动跟随模式：每次连上/注入前重新取「最活跃的 CU 会话」，变了就跟随。 */
   autoFollow: boolean
+  /**
+   * 统一指挥模式（2026-11-09 起是默认）：设备只绑指挥会话，说话走派单器，
+   * 屏上是任务棋盘。显式 `?session=` 或 `auto: true` 的老路径把它置 false（逃生口保留）。
+   */
+  unified: boolean
+  /** 屏上正在看哪条任务详情（进度事件据此只刷新这一屏）。 */
+  focusedTask?: string
+  /** 歧义追问待选：用户下一句「一 / 二」就是在答它。 */
+  pendingPick?: { candidates: { id: string; name: string; folder?: string }[]; text: string }
+  /** 派单回执自动回棋盘的计时器（任何交互都取消它）。 */
+  receiptTimer?: ReturnType<typeof setTimeout>
   /** 页面选中的音色（default / 克隆音色名）。 */
   voice: string
   /** edge-tts 兜底音色（在线兜底）。 */
@@ -333,7 +378,7 @@ export interface TihuRuntime {
   dispose: () => void
   /** 测试/诊断用。 */
   /** 控制面：tihu 全局工具用（薄壳转调内部函数，契约见 control.ts）。 */
-  stats: () => { devices: number; activeSessions: string[]; pendingConfirms: number }
+  stats: () => { devices: number; activeSessions: string[]; pendingConfirms: number; tasks: number }
 }
 
 /** 可选服务：cordis 对未 inject 的服务直读会 throw，一律 ctx.get + try。 */
@@ -498,6 +543,26 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const lastAssistant = new Map<string, ProjectReply>()
   /** 会话 id → 屏幕进度状态（步骤计数 / 用时 / 上一步结果）。 */
   const progressStates = new Map<string, TihuProgressState>()
+  /* ---------- 任务登记簿（统一指挥会话的唯一事实源，2026-11-09） ----------
+   *
+   * 之前屏与播报都按「会话 id」投影，所以「完成通知必须点气泡→切会话」写在了数据模型里。
+   * 现在：会话只是任务的一个字段，屏（棋盘/详情/待决策/完成）与播报全部按**任务 id** 取数。
+   */
+  const tasks = new TaskLedger((line) => appendTaskJournal(line))
+  /** 播报队列（P0 插队 / P1·P2 八秒合并 / P3 不播）。 */
+  const notifyBus = new TaskNotifyBus()
+  /** 唯一指挥会话 id（懒建一次；找不到宿主建会话能力时为 undefined，退回老路径）。 */
+  let commanderSessionId: string | undefined
+  /** 播报定时器（每台设备共用一条队，串行念）。 */
+  let announceTimer: ReturnType<typeof setTimeout> | undefined
+  /** 播报预录缓存（`~/.dsh/tihu/preroll/`）：同一句话第二次念不再合成。 */
+  const preroll = new TihuPreroll()
+  /** 正在念播报的设备（避免一条播报被两台设备重复合成）。 */
+  const announcing = new Set<string>()
+  /** 任务 → 挂起的危险动作确认 id（屏上答「确认/取消」要按它回 broker）。 */
+  const confirmOfTask = new Map<string, string>()
+  /** 任务 → 待决策超时定时器（到点按默认项走）。 */
+  const awaitingTimers = new Map<string, ReturnType<typeof setTimeout>>()
   /**
    * 会话 id → 本次 attempt 已经收到的思考文本（agent/assistant-stream 的
    * reasoning-delta 累积；start 重置、end 清空）。宿主 session/event 要等该步
@@ -527,17 +592,44 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   }
   const confirmBroker: ConfirmBroker = options.confirmBroker ?? createConfirmBroker({
     onAsk: (request) => {
+      const confirmPayload: ConfirmAskPayload = {
+        confirmId: request.id,
+        title: request.title,
+        detail: request.detail,
+        options: ['确认', '取消'],
+        timeoutMs: request.timeoutMs,
+        risk: request.risk,
+      }
+      // 统一指挥：危险动作属于某条任务 → 记成待决策（P0 档），屏 5 弹同一个问题。
+      const task = request.sessionId === undefined ? undefined : tasks.ofSession(request.sessionId)
+      if (task !== undefined) {
+        tasks.ask(task.taskId, {
+          question: request.title,
+          options: ['确认', '取消'],
+          // 默认项＝首选项（与托管开着时的自动 approve 同一条规则）。
+          defaultIndex: 0,
+          timeoutMs: request.timeoutMs,
+          ...(request.detail === '' ? {} : { detail: request.detail }),
+        })
+        confirmOfTask.set(task.taskId, request.id)
+        armAwaitingTimer(task.taskId, task.decisionDeadline ?? Date.now() + request.timeoutMs)
+        const frame = awaitingFrameOf(task)
+        for (const device of devices) {
+          if (!device.unified) continue
+          const display = device.sessionId ?? '__unbound__'
+          device.focusedTask = task.taskId
+          unpinHome(display)
+          cancelHomeTimer(display)
+          lastFrames.set(display, frame)
+          device.send('screen.frame', frame)
+        }
+        pushTaskNotify(task, 0, `要你确认：${request.title}`)
+        log(`tihu confirm.ask task=${task.taskId} id=${request.id} title=${JSON.stringify(request.title)}`)
+        return
+      }
       for (const device of devices) {
         if (request.sessionId !== undefined && device.sessionId !== request.sessionId) continue
-        const payload: ConfirmAskPayload = {
-          confirmId: request.id,
-          title: request.title,
-          detail: request.detail,
-          options: ['确认', '取消'],
-          timeoutMs: request.timeoutMs,
-          risk: request.risk,
-        }
-        device.send('confirm.ask', payload)
+        device.send('confirm.ask', confirmPayload)
         // 屏幕也要切到「等待确认」，别让用户只看到上一步的执行画面。
         sendFrame(device, confirmationFrame(request.title, request.detail))
       }
@@ -1250,6 +1342,10 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
         ],
         tone: 'idle',
       } satisfies ScreenFramePayload, sessionId)
+    } else if (device.unified && sessionId === commanderSessionId) {
+      // 指挥会话是 standard 模式，但它本来就不看屏/不点鼠标——不该按「非 CU」告警，
+      // 它的屏是任务棋盘（sendHome 会画）。这里只回一句可用的确认。
+      device.send('event.progress', { stage: '指挥', text: `指挥会话已就绪：${title}` } satisfies ProgressPayload)
     } else {
       // 要求 4：允许绑定（?session= 显式指定时不静默改写用户意图），但必须显著提示。
       device.send('event.alert', {
@@ -1475,23 +1571,27 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
    * 可用 TIHU_PROJECTS_STATE 覆盖文件路径（测试/排障用）。
    */
   let cardCache: { mtimeMs: number; cards: TihuCardRow[] } | undefined
-  function projectCards(): TihuCardRow[] | undefined {
+  /** 跨端状态文件（控制室卡片的真源）：与 assistant-store 的 profile 目录同一处理。 */
+  function projectsStateFile(): string {
     let file = process.env.TIHU_PROJECTS_STATE ?? ''
-    if (file === '') {
-      let dir = ''
+    if (file !== '') return file
+    let dir = ''
+    try {
+      const profile = optionalService(ctx, 'profileContext')
+      if (typeof profile?.dir === 'string' && profile.dir !== '') dir = profile.dir
+    } catch { /* 忽略 */ }
+    if (dir === '') {
       try {
-        const profile = optionalService(ctx, 'profileContext')
-        if (typeof profile?.dir === 'string' && profile.dir !== '') dir = profile.dir
+        const homePaths = optionalService(ctx, 'homePaths')
+        if (typeof homePaths?.home === 'string' && homePaths.home !== '') dir = homePaths.home
       } catch { /* 忽略 */ }
-      if (dir === '') {
-        try {
-          const homePaths = optionalService(ctx, 'homePaths')
-          if (typeof homePaths?.home === 'string' && homePaths.home !== '') dir = homePaths.home
-        } catch { /* 忽略 */ }
-      }
-      if (dir === '') dir = process.env.DSH_HOME ?? process.cwd()
-      file = join(dir, 'dsh-assistant-state.json')
     }
+    if (dir === '') dir = process.env.DSH_HOME ?? process.cwd()
+    return join(dir, 'dsh-assistant-state.json')
+  }
+
+  function projectCards(): TihuCardRow[] | undefined {
+    const file = projectsStateFile()
     try {
       const info = statSync(file)
       if (cardCache !== undefined && cardCache.mtimeMs === info.mtimeMs) return cardCache.cards
@@ -1502,6 +1602,110 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     } catch {
       return undefined
     }
+  }
+
+  /**
+   * 写跨端状态（控制室卡片的真源）：
+   *   - 只动 `projects.layouts / folders / nameOverrides / order`，不碰 hidden/removed/view；
+   *   - 保留文件既有的 `{ projects, view, revision, updatedAt }` 形状，revision 自增
+   *     （控制室 800ms push / 3s poll，靠 revision 收敛，不会被这端盖掉）；
+   *   - 顺手让卡片缓存失效，下一帧主页/棋盘立刻看到新卡。
+   */
+  function writeProjectsState(mutate: (projects: Record<string, any>) => boolean): boolean {
+    const file = projectsStateFile()
+    try {
+      const raw = JSON.parse(readFileSync(file, 'utf8'))
+      const projects = raw?.projects ?? raw
+      if (projects === null || typeof projects !== 'object' || Array.isArray(projects)) return false
+      if (!mutate(projects as Record<string, any>)) return false
+      const next = raw?.projects === undefined
+        ? { projects, view: null, revision: Number(raw?.revision ?? 0) + 1, updatedAt: new Date().toISOString() }
+        : { ...raw, revision: Number(raw?.revision ?? 0) + 1, updatedAt: new Date().toISOString() }
+      writeFileSync(file, JSON.stringify(next, null, 2), 'utf8')
+      cardCache = undefined
+      return true
+    } catch (error) {
+      log(`tihu projects state write failed: ${(error as Error)?.message ?? String(error)}`)
+      return false
+    }
+  }
+
+  /** 布局模板的兜底（'full' 预设的形状，字段与客户端 buildLayout 同名）。 */
+  const LAYOUT_DEFAULTS = {
+    leftWidth: { default: 260, min: 160, max: 480 },
+    chatWidth: { default: 360, min: 240, max: 600 },
+    chatWidthRatio: 0.3,
+    topHeight: { default: 200, min: 120, max: 480 },
+    topHeightRatio: 0.35,
+    chatSide: 'right',
+    chatFullHeight: false,
+    chatHidden: false,
+    chatOnly: false,
+  } as const
+
+  /**
+   * 建卡并双写控制室（设计 §7 第 2 条「新建卡片必须双写」）。
+   *
+   * 为什么克隆一张既有布局而不是自己拼：卡片布局是客户端的 `LayoutSpec`（窗格/宽度/比例
+   * 一堆字段），宿主这边手写一版就等着控制室渲染出半个空壳。克隆现成卡（优先「个人助手」）
+   * 保证结构合法；只有一张卡都没有时才退回 `full` 预设的兜底形状。
+   */
+  function dispatchProjectCard(name: string, folder: string): TihuCardRow | undefined {
+    const title = name.trim()
+    if (title === '' || folder.trim() === '') return undefined
+    const id = `card-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 6)}`
+    let created: TihuCardRow | undefined
+    const ok = writeProjectsState((projects) => {
+      const layouts = Array.isArray(projects.layouts) ? projects.layouts : []
+      const folders = projects.folders !== null && typeof projects.folders === 'object' ? projects.folders : {}
+      const overrides = projects.nameOverrides !== null && typeof projects.nameOverrides === 'object' ? projects.nameOverrides : {}
+      const order = Array.isArray(projects.order) ? projects.order : []
+      const template = layouts.find((layout: any) => layout?.id === ASSISTANT_CARD.id)
+        ?? layouts.find((layout: any) => layout !== null && typeof layout === 'object')
+      const layout = template === undefined || template === null
+        ? { id, title, left: null, top: null, main: [{ id: 'p1', title: '窗口1', min: 200, content: null }], ...LAYOUT_DEFAULTS }
+        : { ...JSON.parse(JSON.stringify(template)), id, title }
+      projects.layouts = [...layouts, layout]
+      projects.folders = { ...folders, [id]: folder }
+      projects.nameOverrides = { ...overrides, [id]: title }
+      projects.order = [id, ...order.filter((item: unknown) => String(item) !== id)]
+      created = { id, name: title, folder }
+      return true
+    })
+    if (!ok || created === undefined) return undefined
+    log(`tihu card created id=${created.id} name=${JSON.stringify(title)} folder=${folder}`)
+    return created
+  }
+
+  /** 按「卡名 / 文件夹关键词」找卡；找不到就建卡（新复杂任务同步控制室）。 */
+  function resolveCardForDispatch(hint: string | undefined, text: string): TihuCardRow | undefined {
+    const cards = projectCards() ?? []
+    const key = String(hint ?? '').trim()
+    if (key !== '') {
+      const lower = key.toLowerCase()
+      const hit = cards.find((card) => card.id === key
+        || card.name === key
+        || card.name.toLowerCase().includes(lower)
+        || String(card.folder ?? '').toLowerCase().includes(lower))
+      if (hit !== undefined) return hit
+    }
+    // 没给 hint（或 hint 不是已知卡）：按原话再嗅一次卡片名
+    const scored = cards
+      .map((card) => ({ card, ...scoreCardAlias(text, card) }))
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score)
+    if (scored.length > 0) return scored[0].card
+    if (key === '') return undefined
+    // 给了一个具体目录：建一张新卡（复杂任务跟项目卡片走）
+    const folder = isAbsolute(key) ? key : join(assistantFolder(), key)
+    return dispatchProjectCard(nameFromFolder(key), folder)
+  }
+
+  /** 路径最后一级当卡名（`D:/proj/青年基金2027` → `青年基金2027`）。 */
+  function nameFromFolder(path: string): string {
+    const parts = String(path ?? '').split(/[\\/]+/).filter(Boolean)
+    const last = parts.length === 0 ? '' : parts[parts.length - 1]
+    return last === '' ? '新项目' : last
   }
 
   /**
@@ -1603,8 +1807,17 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     return best
   }
 
-  /** 主页屏：项目清单优先取宿主 workspace 注册表，取不到才用会话快照按 cwd 分组兜底。 */
+  /** 主页屏：统一指挥设备＝任务棋盘；老路径＝项目清单（workspace 注册表优先，取不到按 cwd 兜底）。 */
   async function sendHome(sessionId: string, device?: TihuDevice): Promise<void> {
+    // 统一指挥：主页就是任务棋盘（有任务＝棋盘、没任务＝同一版式的空态）。
+    const unified = device !== undefined
+      ? device
+      : [...devices].find((item) => item.unified && (item.sessionId ?? '__unbound__') === sessionId)
+    if (unified !== undefined && unified.unified) {
+      browsingHistory.delete(sessionId)
+      sendBoard(unified)
+      return
+    }
     // 已经回主页：浏览状态结束（下次进回复屏重新算）。
     browsingHistory.delete(sessionId)
     let rows: TihuSessionRow[] = []
@@ -2599,6 +2812,9 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
   function deviceOnlineFor(sessionId: string): boolean {
     for (const device of devices) {
       if (device.sessionId === sessionId) return true
+      // 统一指挥：设备绑的是**指挥会话**，但它能替任何一条任务会话确认。
+      // 这一条必须留，否则「危险动作要人拍板」会因为「没绑这条会话」被直接拒掉（设计里的 P0 档就废了）。
+      if (device.unified) return true
     }
     return false
   }
@@ -2790,6 +3006,8 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
   function followRunningTurn(sessionId: string): void {
     for (const device of devices) {
       if (!device.autoFollow) continue
+      // 统一指挥设备不跟随：它的屏由登记簿（任务）投影，才不会被「哪条会话在跑」抢走。
+      if (device.unified) continue
       if (device.commitInFlight) continue
       if (device.sessionId === undefined) continue
       if (device.sessionId === sessionId) continue
@@ -2818,8 +3036,16 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     } satisfies ScreenFramePayload)
   }
 
-  /** 已完成预览/键盘输入的统一提交口；不再重新选择自动目标。 */
+  /** 已完成预览/键盘输入的统一提交口；统一指挥模式下走派单器，老路径仍注当前会话。 */
   async function routeCommittedText(device: TihuDevice, text: string): Promise<void> {
+    // 统一指挥（2026-11-09）：设备只绑指挥会话，一句话先过派单器（快路径 → 慢路径），
+    // 绝不直接注入「设备当前绑的那条会话」——那正是「得先找到是哪条会话」的老毛病。
+    if (device.unified) {
+      await dispatchUtterance(device, text)
+      const key = device.sessionId
+      if (key !== undefined) touchWindow(key)
+      return
+    }
     const sessionId = device.sessionId
     if (sessionId === undefined) throw new Error('还没有选定会话，请先选择')
     if (runningSessions.has(sessionId)) await spawnParallelTask(device, text)
@@ -2912,6 +3138,65 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       if (type === 'turn/start') followRunningTurn(sessionId)
       // 运行中会话一增一减，绑定别的会话的设备底部清单也要跟着变
       if (type === 'turn/start' || type === 'turn/end') setTimeout(() => refreshRunningLists(), 0)
+      // ---------- 任务登记簿：事件归一到任务（放在「设备早退」之前） ----------
+      // 任务会话通常**没有**设备绑着（设备绑的是指挥会话），所以这段必须在早退之前，
+      // 否则「任务跑完了」这件事永远进不了簿，屏上也不会有气泡和播报。
+      const taskOfSession = tasks.ofSession(sessionId)
+      if (taskOfSession !== undefined) {
+        const at = Date.now()
+        const eventData = event?.data ?? {}
+        const stepValue = Number((eventData as any)?.step)
+        if (type === 'turn/start') {
+          tasks.markRunning(taskOfSession.taskId, at)
+          refreshBoards()
+        } else if (type === 'step/start' || type === 'tool/call') {
+          if (Number.isFinite(stepValue)) tasks.noteStep(taskOfSession.taskId, stepValue, at)
+          // 正在看这条任务的详情屏：实时刷新（别的屏不动，免得把人弹走）
+          for (const device of devices) {
+            if (device.focusedTask !== taskOfSession.taskId) continue
+            const frame = taskDetailFrameOf(taskOfSession)
+            if (frame !== undefined) device.send('screen.frame', frame)
+          }
+          refreshBoards()
+        } else if (type === 'tool/result') {
+          refreshBoards()
+        } else if (type === 'turn/end') {
+          const reason = finishReasonOf(eventData)
+          const ok = reason === 'stop' || reason === 'completed'
+          const reply = lastAssistant.get(sessionId)?.text ?? ''
+          const resultLine = firstSentenceOf(reply) || (ok ? '做完了' : `中断（${reason}）`)
+          tasks.complete(taskOfSession.taskId, { resultLine, now: at })
+          // 同一批里其它刚完成的条数：「另有 N 条」收进状态行，不单独占一条气泡带。
+          const others = tasks.list().filter((item) => item.state === 'done'
+            && item.taskId !== taskOfSession.taskId
+            && (item.finishedAt ?? 0) > at - 15_000).length
+          for (const device of devices) {
+            if (!device.unified) continue
+            const display = device.sessionId ?? '__unbound__'
+            const frame = doneFrame({
+              taskId: taskOfSession.taskId,
+              resultLine,
+              bullets: toBullets(reply, 3),
+              others,
+            })
+            device.focusedTask = taskOfSession.taskId
+            unpinHome(display)
+            cancelHomeTimer(display)
+            const state = homeStates.get(display) ?? { mode: 'session' as const, page: 0, done: true }
+            state.mode = 'session'
+            state.done = ok
+            homeStates.set(display, state)
+            lastFrames.set(display, frame)
+            device.send('screen.frame', frame)
+            sendTaskUpdate(device, taskOfSession)
+            scheduleHome(display)
+          }
+          // P1：气泡 ＋ 一句播报（八秒窗口内的多条合并成一句）
+          pushTaskNotify(taskOfSession, 1, doneAnnouncementOf(taskOfSession))
+          refreshBoards()
+          log(`tihu task done task=${taskOfSession.taskId} ok=${String(ok)} line=${JSON.stringify(resultLine)} others=${others}`)
+        }
+      }
       // 没有设备绑定这个会话时也要处 turn/end 的收尾：别的会话跑完了，
       // 当前屏右侧必须冒出「新回复」气泡（2026-11-07 用户实测：新开的 CU 会话完成，鹈鹕屏没通知）。
       if (![...devices].some((device) => device.sessionId === sessionId)) {
@@ -3127,6 +3412,7 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       socket,
       seq: seqOf,
       autoFollow: false,
+      unified: false,
       bindEpoch: 0,
       autoBindEpoch: 0,
       voiceAttempt: 0,
@@ -3245,19 +3531,35 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       const saved = savedDeviceFrame(device)
       const requested = typeof payload.sessionId === 'string' && payload.sessionId !== '' ? payload.sessionId : undefined
       if (requested !== undefined) {
-        // 显式会话（URL）优先：手动绑定，不参与自动跟随。
+        // 显式会话（URL ?session= / 老页面）：手动绑定，逃生口保留。
         device.autoFollow = false
+        device.unified = false
         await bindSession(device, requested)
       } else if (payload.auto === true) {
-        // 默认路径：自动绑定「最近活跃的 Computer Use 会话」，但首次连接屏仍是主页；
-        // 同一 clientId 重连则优先恢复断线前那一屏。
+        // 老页面显式要「自动跟随最活跃 CU 会话」：保留（页面还没升级时不能白屏）。
         device.autoFollow = true
+        device.unified = false
         await autoBindActive(device, 'hello')
       } else {
+        // 默认路径（2026-11-09 起）：设备绑唯一指挥会话，屏上是任务棋盘。
         device.autoFollow = false
-        device.sessionId = undefined
+        const commander = await ensureCommanderSession()
+        if (commander !== undefined) {
+          device.unified = true
+          await bindSession(device, commander)
+          device.send('event.progress', {
+            stage: '指挥',
+            text: '统一指挥已就绪：说一句话就派单，不用挑会话',
+          } satisfies ProgressPayload)
+        } else {
+          // 宿主还没有新建会话的能力（老宿主/命令行桩）：退回「未绑定 + 主页」。
+          device.unified = false
+          device.sessionId = undefined
+          log('tihu unified mode unavailable: no session create service')
+        }
       }
-      const restored = restoreSavedDeviceFrame(device, saved)
+      // 统一指挥设备重连一律回棋盘：它的「家」就是任务棋盘，恢复旧的状态/回复屏反而奇怪。
+      const restored = device.unified ? false : restoreSavedDeviceFrame(device, saved)
       if (!restored) await sendHome(device.sessionId ?? '__unbound__', device)
       device.send('event.progress', { stage: '连接', text: `设备 ${device.id} 已就绪` } satisfies ProgressPayload)
       log(`tihu hello client=${payload.clientId} session=${device.sessionId ?? '?'} caps=${JSON.stringify(caps)}`)
@@ -3278,10 +3580,14 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       const payload = message.payload ?? {}
       if (payload.auto === true) {
         device.autoFollow = true
+        device.unified = false
         await autoBindActive(device, 'hello')
         return
       }
       device.autoFollow = false
+      // 显式选一条会话 = 离开统一指挥（逃生口）：屏回到会话详情、说话直接注这条会话。
+      device.unified = false
+      device.focusedTask = undefined
       await bindSession(device, String(payload.sessionId ?? ''))
       return
     }
@@ -3316,6 +3622,38 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       return
     }
 
+    if (type === 'task.reply') {
+      // 屏上答问句 / 点选项 / 轻命令 → 回指挥会话（不是回任务会话）。
+      const payload = (message.payload ?? {}) as TaskReplyPayload
+      if (payload.command === 'board') { await runScreenCommand(device, { kind: 'board' }); return }
+      if (payload.command === 'stop') { await runScreenCommand(device, { kind: 'stop' }); return }
+      if (payload.command === 'cancel') { await runScreenCommand(device, { kind: 'cancel' }); return }
+      if (payload.command === 'open') {
+        const target = payload.taskId ?? device.focusedTask
+        if (target !== undefined && openTask(device, target)) return
+        await runScreenCommand(device, { kind: 'open' })
+        return
+      }
+      if (payload.optionIndex !== undefined) {
+        const task = payload.taskId !== undefined ? tasks.get(payload.taskId) : undefined
+        const defaultIndex = task?.defaultIndex ?? 0
+        await answerAwaiting(device, payload.optionIndex === defaultIndex, payload.optionIndex)
+        return
+      }
+      if (payload.text !== undefined) {
+        // 自由文本＝等价于手输回答：**不执行**原来那个危险动作（安全侧默认），
+        // 把这句话接着派回那条任务会话，由它按人的意思继续。
+        const awaiting = tasks.list().filter((item) => item.state === 'awaiting').sort((a, b) => b.updatedAt - a.updatedAt)[0]
+        await answerAwaiting(device, false)
+        const sessionId = awaiting?.sessionIds[awaiting.sessionIds.length - 1]
+        if (sessionId !== undefined && payload.text.trim() !== '') {
+          await promptSession(sessionId, [{ type: 'text', text: payload.text }])
+          device.send('event.progress', { stage: '待决策', text: '已把你的回答送回去（原动作没执行）' } satisfies ProgressPayload)
+        }
+        return
+      }
+      return
+    }
     if (type === 'screen.gesture') {
       const payload = message.payload as { action?: string; dy?: number; phase?: string; x?: number; y?: number }
       if (device.sessionId !== undefined) {
@@ -3329,6 +3667,58 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
         if ((payload as any).hit === 'action' && typeof (payload as any).actionId === 'string') {
           const actionId = (payload as any).actionId as string
           const sid = device.sessionId
+          /* ---- 统一指挥：棋盘 / 回执 / 详情 / 待决策 / 追问屏上的按键 ---- */
+          if (actionId === 'taskBoard') {
+            if (sid !== undefined) await sendHome(sid, device)
+            else sendBoard(device)
+            return
+          }
+          if (actionId === 'taskOpen') {
+            const target = device.focusedTask ?? boardOf(tasks.list(), Date.now()).rows[0]?.taskId
+            if (target !== undefined) openTask(device, target)
+            return
+          }
+          if (actionId === 'taskCancel') {
+            const target = device.focusedTask ?? tasks.list().filter((task) => task.state === 'queued').sort((a, b) => b.updatedAt - a.updatedAt)[0]?.taskId
+            if (target !== undefined) await cancelTask(device, target)
+            return
+          }
+          if (actionId === 'taskStop') {
+            try { device.cancelRound?.() } catch { /* 忽略 */ }
+            device.send('event.progress', { stage: '停止', text: '已停止朗读（任务还在跑）' } satisfies ProgressPayload)
+            return
+          }
+          if (actionId === 'taskSession') {
+            const task = device.focusedTask === undefined ? undefined : tasks.get(device.focusedTask)
+            const sessionId = task?.sessionIds[task.sessionIds.length - 1]
+            if (task !== undefined && sessionId !== undefined) {
+              // 逃生口：显式去看这条任务会话（说「回棋盘」或点主页回来）
+              device.unified = false
+              device.focusedTask = undefined
+              await bindSession(device, sessionId)
+              device.send('event.progress', { stage: '会话', text: '已切到这条任务会话；说「回棋盘」可回来' } satisfies ProgressPayload)
+            }
+            return
+          }
+          if (actionId.startsWith('taskOption')) {
+            const index = Number(actionId.slice('taskOption'.length))
+            if (Number.isFinite(index)) await answerAwaiting(device, index === 0, index)
+            return
+          }
+          if (actionId === 'pick1' || actionId === 'pick2') {
+            const index = actionId === 'pick1' ? 1 : 2
+            const pick = device.pendingPick
+            device.pendingPick = undefined
+            const card = pick?.candidates[index - 1]
+            if (pick !== undefined && card !== undefined) await dispatchToCard(device, pick.text, card)
+            return
+          }
+          if (actionId === 'pickNone') {
+            const pick = device.pendingPick
+            device.pendingPick = undefined
+            if (pick !== undefined) await dispatchToCard(device, pick.text, ASSISTANT_CARD)
+            return
+          }
           if (actionId === 'send') {
             const pending = device.pendingVoice
             if (pending !== undefined) await commitPendingVoice(device, pending).catch((error) => showInputError(device, error))
@@ -3449,6 +3839,11 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
             homeStates.set(target, { mode: 'session', page: 0, done: true })
           }
           scheduleHome(target)
+          return
+        }
+        // 任务棋盘上点一行：看这条任务的详情（不换会话绑定）
+        if ((payload as any).hit === 'task' && typeof (payload as any).taskId === 'string') {
+          openTask(device, String((payload as any).taskId))
           return
         }
         if ((payload as any).hit === 'chip' && typeof (payload as any).targetSessionId === 'string') {
@@ -3725,6 +4120,751 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     ;(homeSyncTimer as any).unref?.()
   }
 
+  /* ---------- 统一指挥：派单器（指挥会话唯一的动手方式） ----------
+   *
+   * 三层，从快到慢：
+   *   ① 屏上命令（回棋盘/看任务/停止/撤单/确认…）：零模型，说完即做；
+   *   ② 快路径规则表（点名项目卡 / 接着说 / 日常小事 / 歧义追问）：零模型，命中即派；
+   *   ③ 慢路径：交给指挥会话的模型判项目，再由它调 tihu dispatch（它自己不做正文）。
+   *
+   * 三条铁律落在这里：
+   *   - 设备永远绑指挥会话，不再有会话选择器与「自动跟随最活跃会话」；
+   *   - 屏与播报按**任务**投影（登记簿是唯一事实源），不按会话；
+   *   - 完成＝屏上气泡 ＋ 一句播报，绝不要求先点进某条会话。
+   */
+
+  /** 指挥会话的会话名：重启后按标题找回同一条，不再新建第二条。 */
+  const COMMANDER_TITLE = '鹈鹕指挥台'
+
+  /** 日常任务的固定卡片（id 与客户端 ASSISTANT_PROJECT_ID 一致，落点＝助手 home）。 */
+  const ASSISTANT_CARD = { id: 'wt-assistant', name: '个人助手' } as const
+
+  /** 目标算作「复杂任务」的预设永远是 standard（看屏/点鼠标的活由指挥会话显式指定）。 */
+  const TASK_PRESET = 'standard'
+
+  /** 指挥会话的尾巴：告诉模型「你只派单，不动手」。 */
+  const COMMANDER_TAIL = '【指挥会话 · 铁律】你只负责判断「这件事该派给哪个项目」然后用 tihu 的 dispatch 派单；不要自己动手做正文。派完用一句话回主人（例如「已派给青年基金申请书」）。拿不准就只问一句。'
+
+  function assistantFolder(): string {
+    try { return ensureAssistantHome().dir } catch { return process.env.DSH_ASSISTANT_HOME ?? process.cwd() }
+  }
+
+  /** 在指定文件夹新建一条会话（remote.session.create 优先，退回 sessions.create）。 */
+  async function createSessionAt(folder: string, preset: string): Promise<string | undefined> {
+    const base = folder !== '' ? { cwd: folder } : {}
+    const remote = optionalService(ctx, 'remote') as { session?: { create?: (base: unknown) => Promise<any> } } | undefined
+    if (typeof remote?.session?.create === 'function') {
+      try {
+        const result: any = await remote.session.create({ ...base, agentPreset: preset })
+        if (result?.ok === true && typeof result?.value?.sessionId === 'string' && result.value.sessionId !== '') return result.value.sessionId
+        log(`tihu create session rejected: ${String(JSON.stringify(result?.error ?? null)).slice(0, 140)}`)
+      } catch (error) {
+        log(`tihu create session failed: ${(error as Error)?.message ?? String(error)}`)
+      }
+    }
+    const sessionsSvc = optionalService(ctx, 'sessions') as { create?: (base: unknown) => Promise<string> } | undefined
+    if (typeof sessionsSvc?.create === 'function') {
+      try {
+        const created = await sessionsSvc.create(base)
+        if (typeof created === 'string' && created !== '') return created
+      } catch (error) {
+        log(`tihu sessions.create failed: ${(error as Error)?.message ?? String(error)}`)
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * 往一条会话投一组消息（与用户手打同一条入口）。
+   * 优先 `sessions.using(...).prompt()`（宿主会顺手拉起 agent），
+   * 没有这个服务就退回 `agents.followup`（老宿主/测试桩）。
+   */
+  async function promptSession(sessionId: string, blocks: { type: 'text'; text: string }[]): Promise<boolean> {
+    const sessionsSvc = optionalService(ctx, 'sessions') as { using?: (id: string, opts: unknown, fn: (ref: any) => Promise<void>) => Promise<void> } | undefined
+    if (typeof sessionsSvc?.using === 'function') {
+      try {
+        await sessionsSvc.using(sessionId, { source: 'tihu-dispatch' }, async (reference: any) => {
+          await reference?.binding?.session?.prompt(blocks, 'steer')
+          const messageId = lastUserMessageId(reference?.binding?.session)
+          if (messageId !== undefined) activeSessions.set(sessionId, { until: Date.now() + ACTIVE_WINDOW_MS, messageId })
+        })
+        return true
+      } catch (error) {
+        log(`tihu prompt session=${sessionId} failed: ${(error as Error)?.message ?? String(error)}`)
+        return false
+      }
+    }
+    try {
+      inject(sessionId, String(blocks[0]?.text ?? ''), blocks.slice(1).map((block) => block.text).join('\n'))
+      return true
+    } catch (error) {
+      log(`tihu inject session=${sessionId} failed: ${(error as Error)?.message ?? String(error)}`)
+      return false
+    }
+  }
+
+  /** 指挥会话：按标题找回同一条；找不到才新建（落助手 home，standard 模式）。 */
+  async function ensureCommanderSession(): Promise<string | undefined> {
+    if (commanderSessionId !== undefined) {
+      const found = await findSession(commanderSessionId)
+      if (found.status !== 'missing') return commanderSessionId
+      commanderSessionId = undefined
+    }
+    let rows: TihuSessionRow[] = []
+    try { rows = (await collectSessionRows()).rows } catch { rows = [] }
+    const existing = rows.find((row) => String(row.title ?? '').includes(COMMANDER_TITLE))
+    if (existing !== undefined) {
+      commanderSessionId = existing.sessionId
+      log(`tihu commander reused session=${existing.sessionId}`)
+      return commanderSessionId
+    }
+    const created = await createSessionAt(assistantFolder(), TASK_PRESET)
+    if (created === undefined) return undefined
+    commanderSessionId = created
+    log(`tihu commander created session=${created}`)
+    return created
+  }
+
+  /** 派单落点：卡片文件夹 → 助手 home（兜底）。空串表示让宿主用默认 cwd。 */
+  function resolveTaskFolder(card: { folder?: string }): string {
+    const folder = String(card.folder ?? '').trim()
+    return folder !== '' ? folder : assistantFolder()
+  }
+
+  /** 某项目「正在干什么」（追问屏的候选说明用）。 */
+  function doingOf(projectId: string): string {
+    const active = tasks.list()
+      .filter((task) => task.projectId === projectId && task.state !== 'archived' && task.state !== 'done')
+      .sort((a, b) => b.updatedAt - a.updatedAt)[0]
+    if (active === undefined) return ''
+    if (active.state === 'awaiting') return '在等你答一句'
+    if (active.step > 0) return `在跑第 ${active.step} 步`
+    return '在跑'
+  }
+
+  /** 棋盘一帧（含翻页键）。 */
+  function boardFrameFor(device: TihuDevice): { frame: ScreenFramePayload; board: TaskBoardPayload } {
+    const key = device.sessionId ?? '__unbound__'
+    const state = homeStates.get(key) ?? { mode: 'session' as const, page: 0, done: true }
+    const board = boardOf(tasks.list(), Date.now(), state.page)
+    state.mode = 'home'
+    state.page = board.page.index
+    state.pages = board.page.total
+    state.done = true
+    homeStates.set(key, state)
+    const actions: { id: string; label: string }[] = []
+    if (board.page.total > 1 && board.page.index > 0) actions.push({ id: 'homePrev', label: '‹' })
+    if (board.page.total > 1 && board.page.index < board.page.total - 1) actions.push({ id: 'homeNext', label: '›' })
+    const frame = boardFrame(board)
+    return { frame: actions.length === 0 ? frame : { ...frame, actions }, board }
+  }
+
+  /** 屏 1：任务棋盘（含空态）。同一版式，有任务就是棋盘、没任务就是空盘。 */
+  function sendBoard(device: TihuDevice): void {
+    const key = device.sessionId ?? '__unbound__'
+    const { frame, board } = boardFrameFor(device)
+    device.focusedTask = undefined
+    lastFrames.set(key, frame)
+    if (homePinned.has(key)) pinnedHomeFrames.set(key, frame)
+    device.send('screen.frame', frame)
+    device.send('task.list', { board } satisfies TaskListPayload)
+    log(`tihu board device=${device.id} rows=${board.rows.length} running=${board.counts.running} awaiting=${board.counts.awaiting} queued=${board.counts.queued}`)
+  }
+
+  /** 棋盘变化：还停在棋盘上的设备刷一帧（详情屏/回执屏不动，免得把人弹走）。 */
+  function refreshBoards(): void {
+    for (const device of devices) {
+      if (!device.unified) continue
+      if (device.focusedTask !== undefined) continue
+      const key = device.sessionId ?? '__unbound__'
+      if (homeStates.get(key)?.mode !== 'home') continue
+      sendBoard(device)
+    }
+  }
+
+  /** 单行变更（协议里的 task.update；固件按它只改一行，不重画整屏）。 */
+  function sendTaskUpdate(device: TihuDevice, task: TihuTask): void {
+    if (!device.unified) return
+    const board = boardOf([task], Date.now())
+    const row = board.rows[0]
+    if (row === undefined) return
+    device.send('task.update', {
+      taskId: task.taskId,
+      state: row.state,
+      capsule: row.capsule,
+      sub: row.sub,
+      ring: row.ring,
+      ...(task.summary === '' ? {} : { summary: task.summary }),
+    } satisfies TaskUpdatePayload)
+  }
+
+  /** 通知总线 → 屏与播报（P0 立即、P1/P2 八秒合并、P3 不播）。 */
+  function pushTaskNotify(task: TihuTask | undefined, level: 0 | 1 | 2 | 3, text: string): void {
+    const taskId = task?.taskId ?? ''
+    notifyBus.push(level, taskId, text)
+    for (const device of devices) {
+      if (!device.unified) continue
+      device.send('task.notify', { level, taskId, text, ...(taskId === '' ? {} : { bubbleId: taskId }), spoken: false } satisfies TaskNotifyPayload)
+    }
+    scheduleAnnounce()
+  }
+
+  function scheduleAnnounce(): void {
+    if (disposed) return
+    if (announceTimer !== undefined) {
+      clearTimeout(announceTimer)
+      announceTimer = undefined
+    }
+    const at = notifyBus.nextAt()
+    if (at === undefined) return
+    announceTimer = setTimeout(() => {
+      announceTimer = undefined
+      try {
+        flushAnnounce()
+      } catch (error) {
+        log(`tihu announce failed: ${(error as Error)?.stack ?? String(error)}`)
+      }
+    }, Math.max(0, at - Date.now()))
+    announceTimer.unref?.()
+  }
+
+  function flushAnnounce(): void {
+    const item = notifyBus.take()
+    if (item === undefined) {
+      scheduleAnnounce()
+      return
+    }
+    for (const taskId of item.taskIds) if (taskId !== '') tasks.markSpoken(taskId)
+    for (const device of devices) {
+      if (!device.unified) continue
+      // P0（要人）**打断当前朗读**：漏掉一次确认比多打断一次贵得多（设计 §8.7 的优先级表）。
+      if (item.level === 0) {
+        try { device.cancelRound?.() } catch { /* 忽略 */ }
+      }
+      device.send('task.notify', {
+        level: item.level,
+        taskId: item.taskIds[0] ?? '',
+        text: item.text,
+        spoken: true,
+      } satisfies TaskNotifyPayload)
+      void speakAnnouncement(device, item.text).catch((error) => log(`tihu announce speak failed: ${(error as Error)?.message ?? String(error)}`))
+    }
+    log(`tihu announce level=${item.level} tasks=${item.taskIds.join(',')} text=${JSON.stringify(item.text)}`)
+    scheduleAnnounce()
+  }
+
+  /**
+   * 念一句播报（只念这一句，正文不上耳朵）。
+   *
+   * 为什么不复用 speakLocally：那条链路是「回答屏 ＋ 逐句高亮 ＋ 预取」，播报没有正文可高亮，
+   * 硬塞进去会往屏上推 reply 帧、把棋盘顶掉。这里按句**顺序合成顺序下发**（不做预取：
+   * 播报就一两句，预取省不了多少，还会让两句的顺序在弱网下乱掉）。
+   *
+   * 单句播报先查**预录缓存**（`~/.dsh/tihu/preroll/`）：同一句话第二次念不再合成，
+   * 直接把裸 PCM 发下去——这是「完成 → 3 秒内听到」最省的一刀（设计 §11 P3）。
+   */
+  async function speakAnnouncement(device: TihuDevice, text: string): Promise<void> {
+    const key = device.sessionId ?? '__unbound__'
+    const segments = splitSpeechSegments(text)
+      .map((segment) => ({ ...segment, text: toSpeechText(segment.text) }))
+      .filter((segment) => segment.text !== '')
+    if (segments.length === 0) return
+    if (announcing.has(device.id)) return
+    announcing.add(device.id)
+    let until = Date.now()
+    speakingStart(key)
+    const cacheable = segments.length === 1
+    const sendPcm = (pcm: Buffer, segment: { text: string; index: number; start: number; end: number }, final = true): void => {
+      device.send('tts.audio', {
+        seq: 0,
+        total: 1,
+        sampleRate: 24000,
+        channels: 1,
+        format: 'pcm16',
+        data: pcm.toString('base64'),
+        index: segment.index,
+        text: segment.text,
+        charStart: segment.start,
+        charEnd: segment.end,
+        ...(final ? { final: true } : {}),
+      } satisfies TtsAudioPayload)
+      until = Math.max(until, Date.now()) + Math.max(0, prerollAudioMs(pcm.length))
+      speakingProgress(key, until)
+    }
+    try {
+      if (cacheable) {
+        const cached = preroll.get(device.voice, segments[0].text)
+        if (cached !== undefined) {
+          sendPcm(cached, segments[0])
+          log(`tihu announce preroll hit chars=${[...segments[0].text].length} audio=${prerollAudioMs(cached.length)}ms`)
+          return
+        }
+      }
+      if (!tts.available()) {
+        try { await tts.ensureServer() } catch { /* 合成阶段会给出可读错误 */ }
+      }
+      const status = tts.status()
+      if (!status.available) {
+        device.send('event.alert', { level: 'error', text: `本次无语音：${status.error ?? '本地引擎未就绪'}（任务结果已上屏）` })
+        return
+      }
+      for (const segment of segments) {
+        const startedAt = Date.now()
+        const parts: Buffer[] = []
+        const result = await tts.synthesize(segment.text, {
+          voice: device.voice,
+          sessionId: key,
+          edgeVoice: device.edgeVoice,
+          offlineOnly: device.offlineOnly,
+          onChunk: (chunk) => {
+            if (cacheable) parts.push(chunk.data)
+            device.send('tts.audio', {
+              seq: chunk.seq,
+              total: chunk.total,
+              sampleRate: 24000,
+              channels: 1,
+              format: 'pcm16',
+              data: chunk.data.toString('base64'),
+              index: segment.index,
+              text: segment.text,
+              charStart: segment.start,
+              charEnd: segment.end,
+              ...(chunk.final ? { final: true } : {}),
+            } satisfies TtsAudioPayload)
+          },
+        })
+        if (cacheable && parts.length > 0) {
+          // 存进预录：下一次同一句话直接发，不再合成。
+          preroll.put(device.voice, segment.text, Buffer.concat(parts))
+        }
+        // 播放时间轴＝首块到达时刻 ＋ 累计音频时长（与页面 AudioContext 排程同口径）。
+        until = Math.max(until, startedAt) + Math.max(0, Number(result?.audioMs) || 0)
+        speakingProgress(key, until)
+      }
+    } catch (error) {
+      log(`tihu announce synth failed: ${(error as Error)?.message ?? String(error)}`)
+      device.send('event.alert', { level: 'error', text: `播报没念出来：${(error as Error)?.message ?? String(error)}（任务结果已上屏）` })
+    } finally {
+      announcing.delete(device.id)
+      speakingStop(key, until + SPEAK_TAIL_MARGIN_MS)
+    }
+  }
+
+  /** 屏 4 的数据源：正文口径完全照 progress.ts 的 statusFrame（不翻译、不加标签）。 */
+  function taskDetailFrameOf(task: TihuTask): ScreenFramePayload | undefined {
+    const sessionId = task.sessionIds[task.sessionIds.length - 1]
+    if (sessionId === undefined) return undefined
+    const state = progressStates.get(sessionId)
+    const stats = state?.stats ?? screenMetaOf(sessionId).stats
+    const statsLine = stats === undefined
+      ? '统计中…'
+      : [
+          stats.tokPerSec > 0 ? `${stats.tokPerSec.toFixed(0)} tok/s` : '',
+          stats.totalTokens > 0 ? `${formatTokens(stats.totalTokens)} tok` : '',
+          `上下文 ${stats.contextPercent.toFixed(0)}%`,
+        ].filter((part) => part !== '').join(' · ')
+    return detailFrame({
+      taskId: task.taskId,
+      stageWord: state?.stageWord ?? (task.state === 'done' ? '完成' : '思考'),
+      step: Math.max(task.step, state?.step ?? 0),
+      elapsedMs: Math.max(0, (task.finishedAt ?? Date.now()) - task.startedAt),
+      activity: state?.activity.slice(-2) ?? [],
+      statsLine,
+      projectName: task.projectName,
+      sessionTitle: humanTitle(state?.sessionTitle ?? titleForSession(sessionId)),
+    })
+  }
+
+  /** 屏 5 的数据源。 */
+  function awaitingFrameOf(task: TihuTask): ScreenFramePayload {
+    const sessionId = task.sessionIds[task.sessionIds.length - 1]
+    const deadline = task.decisionDeadline ?? Date.now() + CONFIRM_TIMEOUT_MS
+    const secondsLeft = Math.max(0, Math.round((deadline - Date.now()) / 1000))
+    return awaitingFrame({
+      taskId: task.taskId,
+      question: task.question ?? '要你定一下',
+      options: task.options ?? ['确认', '取消'],
+      defaultIndex: task.defaultIndex ?? 0,
+      projectName: task.projectName,
+      sessionTitle: sessionId === undefined ? '刚派出' : humanTitle(titleForSession(sessionId)),
+      ...(task.detail === undefined ? {} : { detail: task.detail }),
+      secondsLeft: secondsLeft === 0 ? Math.round(CONFIRM_TIMEOUT_MS / 1000) : secondsLeft,
+    })
+  }
+
+  /** 看一条任务：详情（屏 4）或待决策（屏 5）。 */
+  function openTask(device: TihuDevice, taskId: string): boolean {
+    const task = tasks.get(taskId)
+    if (task === undefined) return false
+    if (device.receiptTimer !== undefined) {
+      clearTimeout(device.receiptTimer)
+      device.receiptTimer = undefined
+    }
+    const frame = task.state === 'awaiting' ? awaitingFrameOf(task) : taskDetailFrameOf(task)
+    if (frame === undefined) {
+      sendBoard(device)
+      return false
+    }
+    device.focusedTask = taskId
+    const key = device.sessionId ?? '__unbound__'
+    unpinHome(key)
+    cancelHomeTimer(key)
+    const state = homeStates.get(key) ?? { mode: 'session' as const, page: 0, done: true }
+    state.mode = 'session'
+    // 详情屏**不自动跳走**（设计 §8.2：回退只有一条路——「回棋盘」），所以不排空闲计时。
+    state.done = false
+    homeStates.set(key, state)
+    lastFrames.set(key, frame)
+    device.send('screen.frame', frame)
+    return true
+  }
+
+  /** 派单回执（屏 2）：停 5 秒自动回棋盘；任何交互都会取消这个计时。 */
+  function showReceipt(device: TihuDevice, task: TihuTask): void {
+    const key = device.sessionId ?? '__unbound__'
+    const queuedAhead = tasks.list().filter((item) => item.state === 'queued' && item.taskId !== task.taskId).length
+    const frame = receiptFrame({
+      taskId: task.taskId,
+      projectName: task.projectName,
+      ...(task.folder === undefined ? {} : { folder: task.folder }),
+      queueAhead: queuedAhead,
+      ...(queuedAhead > 0 ? { etaText: `${queuedAhead} 分钟` } : {}),
+    })
+    device.focusedTask = task.taskId
+    unpinHome(key)
+    cancelHomeTimer(key)
+    const state = homeStates.get(key) ?? { mode: 'session' as const, page: 0, done: true }
+    state.mode = 'session'
+    state.done = true
+    homeStates.set(key, state)
+    lastFrames.set(key, frame)
+    device.send('screen.frame', frame)
+    sendTaskUpdate(device, task)
+    // 回执期间棋盘数据也要是最新的：另一台停在棋盘上的设备（或回执结束后这台）拿到的就是这条。
+    device.send('task.list', { board: boardOf(tasks.list(), Date.now()) } satisfies TaskListPayload)
+    if (device.receiptTimer !== undefined) clearTimeout(device.receiptTimer)
+    device.receiptTimer = setTimeout(() => {
+      device.receiptTimer = undefined
+      if (!devices.has(device)) return
+      if (device.focusedTask !== task.taskId) return
+      sendBoard(device)
+    }, RECEIPT_SECONDS * 1000)
+    device.receiptTimer.unref?.()
+  }
+
+  /** 派单：建任务 ＋ 建会话 ＋ 投消息 ＋ 出回执。 */
+  async function dispatchToCard(
+    device: TihuDevice | undefined,
+    text: string,
+    card: { id: string; name: string; folder?: string },
+    title?: string,
+  ): Promise<TihuTask | undefined> {
+    const folder = resolveTaskFolder(card)
+    const task = tasks.add({
+      title: title ?? text,
+      projectId: card.id,
+      projectName: card.name,
+      folder,
+      preset: TASK_PRESET,
+    })
+    const sessionId = await createSessionAt(folder, TASK_PRESET)
+    if (sessionId === undefined) {
+      tasks.drop(task.taskId)
+      const message = '宿主还不能新建会话（remote.session.create / sessions.create 都不可用），这次没派出去'
+      if (device !== undefined) {
+        showInputError(device, new Error(message))
+      }
+      log(`tihu dispatch failed: no session service`)
+      return undefined
+    }
+    const blocks = [
+      { type: 'text' as const, text },
+      {
+        type: 'text' as const,
+        text: `【派单 · 鹈鹕】这是主人对着鹈鹕设备说的一句话，已派到「${card.name}」这个项目的任务会话里（落在 ${folder}）。直接开始做；做完用一两句话说明结果；需要人拍板就按项目规矩问。`,
+      },
+    ]
+    const ok = await promptSession(sessionId, blocks)
+    if (!ok) {
+      tasks.drop(task.taskId)
+      if (device !== undefined) showInputError(device, new Error('任务会话没有接住这条消息，请重说'))
+      return undefined
+    }
+    tasks.attachSession(task.taskId, sessionId)
+    log(`tihu dispatch task=${task.taskId} project=${card.id} session=${sessionId} folder=${folder}`)
+    if (device !== undefined) {
+      showReceipt(device, task)
+      refreshBoards()
+    }
+    return task
+  }
+
+  /** 追加到已有任务：不新建、不乱选文件夹（沿用原任务会话的 cwd）。 */
+  async function appendToTask(device: TihuDevice, task: TihuTask, text: string): Promise<void> {
+    const sessionId = task.sessionIds[task.sessionIds.length - 1]
+    if (sessionId === undefined) {
+      await dispatchToCard(device, text, { id: task.projectId, name: task.projectName, ...(task.folder === undefined ? {} : { folder: task.folder }) })
+      return
+    }
+    const ok = await promptSession(sessionId, [{ type: 'text', text }])
+    if (!ok) {
+      showInputError(device, new Error('那条任务的会话没接住这条话，请重说'))
+      return
+    }
+    tasks.markRunning(task.taskId)
+    tasks.noteMilestone(task.taskId, `追加：${taskTitleOf(text)}`)
+    log(`tihu append task=${task.taskId} session=${sessionId}`)
+    showReceipt(device, task)
+    refreshBoards()
+  }
+
+  /** 歧义追问（屏 7）：只问一次；用户答「一 / 二 / 都不是」。 */
+  function askWhich(device: TihuDevice, candidates: readonly TihuCardRow[], text: string): void {
+    const list = candidates.slice(0, 2).map((card) => ({ id: card.id, name: card.name, ...(card.folder === undefined ? {} : { folder: card.folder }) }))
+    device.pendingPick = { candidates: list, text }
+    const key = device.sessionId ?? '__unbound__'
+    unpinHome(key)
+    cancelHomeTimer(key)
+    const frame = askWhichFrame({ candidates: list.map((card) => ({ projectName: card.name, doing: doingOf(card.id) })) })
+    lastFrames.set(key, frame)
+    device.send('screen.frame', frame)
+    pushTaskNotify(undefined, 0, `这句话派给谁：${list.map((card, index) => `${index + 1} ${card.name}`).join('，')}`)
+    log(`tihu ask-which device=${device.id} candidates=${list.map((card) => card.id).join(',')}`)
+  }
+
+  /** 慢路径：交给指挥会话的模型判项目（它再调 tihu dispatch）。 */
+  async function askCommander(device: TihuDevice, text: string): Promise<void> {
+    const commander = await ensureCommanderSession()
+    if (commander === undefined) {
+      showInputError(device, new Error('指挥会话还没建好：先手动绑一条会话（或让宿主支持新建会话）'))
+      return
+    }
+    if (device.sessionId !== commander) await bindSession(device, commander)
+    device.unified = true
+    const key = device.sessionId ?? '__unbound__'
+    const frame = noticeFrame({ stage: '派单', title: '正在看该派给谁', lines: [taskTitleOf(text, 16)], tone: 'busy' })
+    lastFrames.set(key, frame)
+    device.send('screen.frame', frame)
+    const ok = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: COMMANDER_TAIL }])
+    if (!ok) showInputError(device, new Error('指挥会话没有接住这句话，请重说'))
+  }
+
+  /** 撤一条任务：还没起跑就直接撤；起跑过的要先「停止」再撤（危险动作要确认）。 */
+  async function cancelTask(device: TihuDevice, taskId: string): Promise<boolean> {
+    const task = tasks.get(taskId)
+    if (task === undefined) {
+      device.send('event.progress', { stage: '撤单', text: '没有这条任务' } satisfies ProgressPayload)
+      return false
+    }
+    if (task.state === 'running' || task.state === 'awaiting') {
+      device.send('event.progress', {
+        stage: '撤单',
+        text: `「${task.title}」已经开跑了：要撤得先在电脑端停掉它，停了再撤`,
+      } satisfies ProgressPayload)
+      device.send('screen.frame', noticeFrame({ stage: '撤单', title: '这条已经开跑了', lines: ['在电脑端停掉它，再撤'], tone: 'alert' }))
+      return false
+    }
+    const journal = tasks.archive(task.taskId)
+    if (journal !== undefined) appendTaskJournal(journal)
+    device.focusedTask = undefined
+    device.send('screen.frame', noticeFrame({ stage: '撤单', title: `已撤掉：${task.title}`, lines: ['还没开始跑，直接拿掉了'], tone: 'idle' }))
+    sendTaskUpdate(device, task)
+    refreshBoards()
+    log(`tihu cancel task=${task.taskId}`)
+    return true
+  }
+
+  /** 归档行落 journal（纯文本追加；会话与文件夹原样保留）。 */
+  function appendTaskJournal(line: string): void {
+    try {
+      const home = ensureAssistantHome()
+      const day = new Date().toISOString().slice(0, 10)
+      const file = join(home.journal, `${day}.md`)
+      const header = `## 任务归档\n`
+      let prefix = ''
+      try {
+        const existing = readFileSync(file, 'utf8')
+        if (!existing.includes('## 任务归档')) prefix = existing.endsWith('\n') ? `\n${header}` : `\n\n${header}`
+      } catch {
+        prefix = `# ${day}\n\n${header}`
+      }
+      appendFileSync(file, `${prefix}${line}\n`, 'utf8')
+    } catch (error) {
+      log(`tihu journal failed: ${(error as Error)?.message ?? String(error)}`)
+    }
+  }
+
+  /** 屏上口头命令（零模型）。 */
+  async function runScreenCommand(device: TihuDevice, command: ScreenCommand): Promise<void> {
+    const key = device.sessionId ?? '__unbound__'
+    if (command.kind === 'board') {
+      // 「回棋盘」也是从「看会话」逃生口回来的路：重新绑回指挥会话并恢复统一模式。
+      if (!device.unified) {
+        const commander = await ensureCommanderSession()
+        if (commander !== undefined) {
+          device.unified = true
+          await bindSession(device, commander)
+        }
+      }
+      // 钉住棋盘：指挥会话自己的思考帧不许把它顶掉（完成帧走直发，照常会弹）。
+      pinHome(device.sessionId ?? key)
+      sendBoard(device)
+      return
+    }
+    if (command.kind === 'open') {
+      const rows = boardOf(tasks.list(), Date.now()).rows
+      const target = command.index !== undefined ? rows[command.index - 1] : rows[0]
+      if (target === undefined) {
+        device.send('screen.frame', noticeFrame({ stage: '任务', title: '现在没有可看的任务', lines: ['说一句话就派单'], tone: 'idle' }))
+        return
+      }
+      openTask(device, target.taskId)
+      return
+    }
+    if (command.kind === 'stop') {
+      try { device.cancelRound?.() } catch { /* 忽略 */ }
+      device.send('event.progress', { stage: '停止', text: '已停止朗读' } satisfies ProgressPayload)
+      return
+    }
+    if (command.kind === 'cancel') {
+      const target = device.focusedTask ?? tasks.list().filter((task) => task.state === 'queued' || task.state === 'running').sort((a, b) => b.updatedAt - a.updatedAt)[0]?.taskId
+      if (target === undefined) {
+        device.send('screen.frame', noticeFrame({ stage: '撤单', title: '现在没有可撤的任务', lines: [], tone: 'idle' }))
+        return
+      }
+      await cancelTask(device, target)
+      return
+    }
+    if (command.kind === 'confirm') {
+      await answerAwaiting(device, command.approved)
+      return
+    }
+    if (command.kind === 'pick') {
+      if (device.pendingPick !== undefined) {
+        const pick = device.pendingPick
+        device.pendingPick = undefined
+        const card = pick.candidates[command.index - 1]
+        if (card !== undefined) {
+          await dispatchToCard(device, pick.text, card)
+          return
+        }
+      }
+      const rows = boardOf(tasks.list(), Date.now()).rows
+      const target = rows[command.index - 1]
+      if (target !== undefined) openTask(device, target.taskId)
+    }
+  }
+
+  /** 待决策的回答：点选项 / 口头确认 → 回那条任务（经由登记簿解析出的会话）。 */
+  async function answerAwaiting(device: TihuDevice, approved: boolean, optionIndex?: number): Promise<void> {
+    const task = device.focusedTask !== undefined && tasks.get(device.focusedTask)?.state === 'awaiting'
+      ? tasks.get(device.focusedTask)
+      : tasks.list().filter((item) => item.state === 'awaiting').sort((a, b) => b.updatedAt - a.updatedAt)[0]
+    if (task === undefined) {
+      device.send('screen.frame', noticeFrame({ stage: '待决策', title: '现在没有等你定的问题', lines: [], tone: 'idle' }))
+      return
+    }
+    const options = task.options ?? []
+    const defaultIndex = task.defaultIndex ?? 0
+    // 点选项：给的 index 就是「第几个」（0 起，与屏上按钮同序）；口头确认：「确认」＝默认项。
+    const index = optionIndex !== undefined
+      ? Math.max(0, Math.min(optionIndex, Math.max(0, options.length - 1)))
+      : defaultIndex
+    const chosen = options[index] ?? (approved ? '确认' : '取消')
+    const finalApproved = optionIndex !== undefined ? index === defaultIndex : approved
+    const confirmId = confirmOfTask.get(task.taskId)
+    if (confirmId !== undefined) {
+      confirmOfTask.delete(task.taskId)
+      ;(confirmBroker as any).reply(confirmId, finalApproved)
+    }
+    clearAwaitingTimer(task.taskId)
+    tasks.answer(task.taskId, `设备点选「${chosen}」`)
+    device.focusedTask = task.taskId
+    device.send('event.progress', { stage: '待决策', text: `已答：${chosen}` } satisfies ProgressPayload)
+    const frame = taskDetailFrameOf(task)
+    if (frame !== undefined) device.send('screen.frame', frame)
+    refreshBoards()
+    log(`tihu awaiting answer task=${task.taskId} approved=${String(finalApproved)} option=${JSON.stringify(chosen)}`)
+  }
+
+  /** 待决策超时：按默认项（首选项）走，与托管开着时的自动选择同一条规则。 */
+  function armAwaitingTimer(taskId: string, deadline: number): void {
+    clearAwaitingTimer(taskId)
+    const timer = setTimeout(() => {
+      awaitingTimers.delete(taskId)
+      const task = tasks.get(taskId)
+      if (task === undefined || task.state !== 'awaiting') return
+      const confirmId = confirmOfTask.get(taskId)
+      const defaultIndex = task.defaultIndex ?? 0
+      if (confirmId !== undefined) {
+        confirmOfTask.delete(taskId)
+        ;(confirmBroker as any).reply(confirmId, defaultIndex === 0)
+      }
+      const chosen = (task.options ?? [])[defaultIndex] ?? '默认项'
+      tasks.answer(taskId, `60 秒没答 · 按「${chosen}」走`)
+      log(`tihu awaiting timeout task=${taskId} default=${JSON.stringify(chosen)}`)
+      refreshBoards()
+    }, Math.max(0, deadline - Date.now()))
+    timer.unref?.()
+    awaitingTimers.set(taskId, timer)
+  }
+
+  function clearAwaitingTimer(taskId: string): void {
+    const timer = awaitingTimers.get(taskId)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      awaitingTimers.delete(taskId)
+    }
+  }
+
+  /**
+   * 一句设备输入（统一指挥模式）的完整分流。
+   * 顺序：歧义待选 → 屏上命令 → 快路径规则 → 慢路径（指挥会话的模型）。
+   */
+  async function dispatchUtterance(device: TihuDevice, text: string): Promise<void> {
+    const value = String(text ?? '').trim()
+    if (value === '') return
+    const pick = device.pendingPick
+    if (pick !== undefined) {
+      const index = chineseIndex(value)
+      if (index !== undefined && index <= pick.candidates.length) {
+        device.pendingPick = undefined
+        const card = pick.candidates[index - 1]
+        await dispatchToCard(device, pick.text, card)
+        return
+      }
+      if (/^(都不是|都不对|不对)/.test(value)) {
+        device.pendingPick = undefined
+        await dispatchToCard(device, pick.text, ASSISTANT_CARD)
+        return
+      }
+      device.pendingPick = undefined
+    }
+    const command = parseScreenCommand(value)
+    if (command !== undefined) {
+      await runScreenCommand(device, command)
+      return
+    }
+    const route = routeQuick({ text: value, cards: projectCards() ?? [], tasks: tasks.list() })
+    if (route.kind === 'card') {
+      await dispatchToCard(device, value, route.card)
+      return
+    }
+    if (route.kind === 'append') {
+      await appendToTask(device, route.task, value)
+      return
+    }
+    if (route.kind === 'daily') {
+      await dispatchToCard(device, value, ASSISTANT_CARD)
+      return
+    }
+    if (route.kind === 'ambiguous') {
+      askWhich(device, route.candidates, value)
+      return
+    }
+    await askCommander(device, value)
+  }
+
   /* ---------- 控制面（tihu 全局工具用；全是薄壳转调，见 control.ts） ----------
    *
    * 单测覆盖说明：会话定位是纯函数（control.ts 的 matchSessionRows，已直接单测）；
@@ -3922,6 +5062,46 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
       sendReply(target, list[index].sentences, 0, 0, list[index].includeAll)
       return `已打开「${titleForSession(target)}」的最近回答（要朗读点「重读」）`
     },
+    dispatch: async (input) => {
+      const text = String(input.text ?? '').trim()
+      if (text === '') return '错误：dispatch 需要 text（用户原话，也就是「要做什么」）。'
+      let card: { id: string; name: string; folder?: string } | undefined
+      const folderHint = String(input.folder ?? '').trim()
+      if (folderHint !== '') {
+        const known = (projectCards() ?? []).find((item) => String(item.folder ?? '').toLowerCase() === folderHint.toLowerCase())
+        card = known ?? dispatchProjectCard(nameFromFolder(folderHint), folderHint) ?? undefined
+      } else {
+        card = resolveCardForDispatch(input.project, text)
+      }
+      if (card === undefined) card = ASSISTANT_CARD
+      const device = [...devices].find((item) => item.unified)
+      const task = await dispatchToCard(device, text, card, input.title)
+      if (task === undefined) return '错误：这条任务没派出去（宿主不能新建会话，或任务会话没接住消息）。'
+      return `已派给「${task.projectName}」：${task.title}（任务 ${task.taskId}，落在 ${task.folder ?? '默认目录'}）`
+    },
+    listTasks: () => tasks.list()
+      .filter((task) => task.state !== 'archived')
+      .map((task) => ({ taskId: task.taskId, title: task.title, capsule: capsuleOf(task.state), sub: subLineOf(task) })),
+    cancelTask: async (ref) => {
+      const rows: ControlTaskRow[] = tasks.list()
+        .filter((task) => task.state !== 'archived')
+        .map((task) => ({ taskId: task.taskId, title: task.title, capsule: capsuleOf(task.state), sub: subLineOf(task) }))
+      if (rows.length === 0) return '登记簿里现在没有任务，没有可撤的。'
+      const outcome = matchTaskRows(rows, ref)
+      if (outcome.kind === 'none') return `找不到任务「${ref ?? ''}」：用 list_tasks 看一下任务号。`
+      if (outcome.kind === 'many') return `「${ref ?? ''}」匹配到 ${outcome.rows.length} 条任务，请用任务号再精确一些：\n${outcome.rows.map((row) => `${row.taskId}. ${row.title}（${row.capsule}）`).join('\n')}`
+      const row = outcome.kind === 'one' ? outcome.row : outcome.rows[0]
+      const task = tasks.get(row.taskId)
+      if (task === undefined) return `找不到任务 ${row.taskId}。`
+      const device = [...devices].find((item) => item.unified)
+      if (device !== undefined) {
+        const ok = await cancelTask(device, task.taskId)
+        return ok ? `已撤掉任务 ${task.taskId}「${task.title}」` : `任务 ${task.taskId}「${task.title}」已经开跑了：先让任务停下再撤。`
+      }
+      const journal = tasks.archive(task.taskId)
+      if (journal !== undefined) appendTaskJournal(journal)
+      return `已撤掉任务 ${task.taskId}「${task.title}」`
+    },
   }
 
   return {
@@ -3931,6 +5111,16 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
     dispose: () => {
       disposed = true
       if (homeSyncTimer !== undefined) clearInterval(homeSyncTimer)
+      if (announceTimer !== undefined) clearTimeout(announceTimer)
+      announceTimer = undefined
+      for (const timer of awaitingTimers.values()) clearTimeout(timer)
+      awaitingTimers.clear()
+      confirmOfTask.clear()
+      notifyBus.clear()
+      for (const device of devices) {
+        if (device.receiptTimer !== undefined) clearTimeout(device.receiptTimer)
+        device.receiptTimer = undefined
+      }
       for (const [sessionId, timer] of thinkingTimers) {
         clearTimeout(timer)
         thinkingTimers.delete(sessionId)
@@ -3952,7 +5142,7 @@ function savedDeviceFrame(device: TihuDevice): { sessionId: string; frame: Scree
         try { if (typeof disposer === 'function') disposer() } catch { /* 忽略 */ }
       }
     },
-    stats: () => ({ devices: devices.size, activeSessions: [...activeSessions.keys()], pendingConfirms: (confirmBroker as any).pendingCount?.() ?? 0 }),
+    stats: () => ({ devices: devices.size, activeSessions: [...activeSessions.keys()], pendingConfirms: (confirmBroker as any).pendingCount?.() ?? 0, tasks: tasks.size() }),
   }
 }
 
@@ -3962,8 +5152,29 @@ function safeJson(buffer: Buffer): unknown {
   try { return JSON.parse(buffer.toString('utf8')) } catch { return { type: '<unparsable>' } }
 }
 
-/** 工作区内的绝对路径；越界与否由 guard 的快照逻辑再判一次（这里只拼路径）。 */
-function joinSafe(workspace: string, target: string): string {
+/**
+ * 收尾原因（`reason.kind`）：老事件里可能是字符串也可能是对象，两种都认。
+ * completed / stop 算正常完成，其余（error/aborted/cancelled）算中断。
+ */
+function finishReasonOf(data: unknown): string {
+  const record = data !== null && typeof data === 'object' ? data as Record<string, unknown> : {}
+  const reason = record.reason
+  if (typeof reason === 'string') return reason
+  const kind = (reason !== null && typeof reason === 'object' ? (reason as Record<string, unknown>).kind : undefined)
+    ?? record.kind
+  return typeof kind === 'string' ? kind : 'stop'
+}
+
+/** 回复正文的第一句（屏 6 标题与一句播报都用它；超长的收省略号）。 */
+function firstSentenceOf(text: unknown): string {
+  const clean = String(text ?? '').replace(/\s+/g, ' ').trim()
+  if (clean === '') return ''
+  const first = clean.split(/[。！？!?\n]/).map((part) => part.trim()).filter(Boolean)[0] ?? clean
+  const chars = [...first]
+  return chars.length > 24 ? `${chars.slice(0, 23).join('')}…` : first
+}
+
+/** 工作区内的绝对路径；越界与否由 guard 的快照逻辑再判一次（这里只拼路径）。 */function joinSafe(workspace: string, target: string): string {
   return isAbsolute(target) ? target : join(workspace, target)
 }
 

@@ -148,6 +148,86 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .home-recent { display:block; height:20px; box-sizing:border-box; margin:0 0 2px; padding:0 4px;
     border:1px solid #2a5a54; border-radius:4px; background:rgba(20,44,40,.55);
     font-size:13px; line-height:16px; color:#9fd8cf; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  /* ── 任务棋盘（屏 1，2026-11-09 统一指挥会话）──
+     与首页同一副骨架（顶行 14 + 5 行 + 底部翻页 28），只是行的语义从「项目」变成「任务」：
+     一行 34px（比项目行高 4px，要塞下「胶囊 + 任务名」和「项目 · 第 N 步」两行字）。
+     内容高 224 = 顶行 14 + 间隙 4 + 5×34 + 间隙 4 + 翻页 28 = 220，仍不留半行。 */
+  #screen.board-mode .home-top { display:flex; }
+  #screen.board-mode .stage, #screen.board-mode .title, #screen.board-mode ul,
+  #screen.board-mode .reply-body, #screen.board-mode .bar, #screen.board-mode .action-bar,
+  #screen.board-mode .run-list { display:none; }
+  #screen.board-mode .home-body { display:block; }
+  #screen.board-mode .home-pager { display:flex; }
+  #screen .board-item { height:34px; box-sizing:border-box; padding:1px 0; overflow:hidden; }
+  #screen .board-row1 { display:flex; align-items:center; gap:6px; font-size:15px; font-weight:700; line-height:18px; white-space:nowrap; overflow:hidden; }
+  /* 状态胶囊：文字优先（色盲/强光下也读得出），颜色只做辅助 */
+  #screen .board-capsule { flex:none; font-size:11px; line-height:14px; font-weight:700; letter-spacing:.5px;
+    padding:1px 5px; border-radius:4px; background:#1b2430; color:#9fb0c0; border:1px solid #2b3a4a; }
+  #screen .board-capsule.running { color:#8ef0c4; border-color:#2a6b56; background:#10241e; }
+  #screen .board-capsule.awaiting { color:#f7d98a; border-color:#7a5c1f; background:#241d0f; }
+  #screen .board-capsule.done { color:#a9c8ff; border-color:#2b4a7a; background:#101a2b; }
+  #screen .board-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
+  #screen .board-merged { flex:none; font-size:11px; color:#7c8b99; }
+  #screen .board-row2 { display:flex; align-items:center; gap:6px; font-size:12px; line-height:14px; color:#8b97a5; }
+  #screen .board-sub { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
+  /* 时长环（满圈＝30 分钟）：进行中按已用时长画弧，跑久了转琥珀，完成满环，排队空环。
+     环只做辅助，精确时长在详情屏用文字给。 */
+  #screen .board-ring { position:relative; flex:none; width:14px; height:14px; border-radius:50%;
+    background:conic-gradient(var(--ring, #3fb6a8) calc(var(--p, 0) * 1turn), #26323e 0); }
+  #screen .board-ring i { position:absolute; left:3px; top:3px; width:8px; height:8px; border-radius:50%; background:#05080b; display:block; }
+  #screen .board-ring.warn { --ring: var(--warn); }
+  #screen .board-ring.done { --ring: #4f8ef7; }
+  #screen .board-ring.empty { background:#26323e; }
+  /* 待决策行右侧是琥珀问号徽标（不显示时长：这条在等人，不是「跑得久」） */
+  #screen .board-ask { flex:none; width:14px; height:14px; border-radius:50%; background:var(--warn);
+    color:#241d0f; font-size:11px; line-height:14px; font-weight:700; text-align:center; }
+  /* 空态：没有任务时是同一张棋盘的另一种脸（不是另开一屏） */
+  #screen .board-empty { display:flex; flex-direction:column; align-items:center; justify-content:center;
+    height:100%; gap:5px; text-align:center; }
+  #screen .board-empty .wave { display:flex; align-items:center; gap:3px; height:20px; }
+  #screen .board-empty .wave span { display:block; width:3px; height:20px; border-radius:2px; background:var(--accent);
+    animation:wavePulse 1.1s ease-in-out infinite; transform-origin:center; }
+  #screen .board-empty .wave span:nth-child(2) { animation-delay:.12s; }
+  #screen .board-empty .wave span:nth-child(3) { animation-delay:.24s; }
+  #screen .board-empty .wave span:nth-child(4) { animation-delay:.36s; }
+  #screen .board-empty .wave span:nth-child(5) { animation-delay:.48s; }
+  @keyframes wavePulse { 0%,100% { transform:scaleY(.28); } 50% { transform:scaleY(1); } }
+  #screen .board-empty .l1 { font-size:17px; font-weight:700; line-height:20px; }
+  #screen .board-empty .l2 { font-size:12px; line-height:16px; color:#9fb0c0; }
+  #screen .board-empty .l3 { font-size:12px; line-height:16px; color:#6f7d8b; }
+  /* 派单回执的三拍圆点（已入队 / 排队 N 个 / 开始跑）：只在 steps 帧出现 */
+  #screen .steps { display:none; flex:none; gap:6px; margin-top:4px; }
+  #screen.steps-on .steps { display:flex; }
+  #screen .step { flex:1; min-width:0; font-size:11px; line-height:14px; text-align:center; color:#6b7785; white-space:nowrap; overflow:hidden; }
+  #screen .step::before { content:''; display:block; width:7px; height:7px; border-radius:50%; margin:0 auto 2px; background:#26323e; }
+  #screen .step.done { color:var(--accent); }
+  #screen .step.done::before { background:var(--accent); }
+  #screen .step.active { color:#e6edf3; font-weight:700; }
+  #screen .step.active::before { background:#e6edf3; }
+  /* 倒计时条（派单回执 5 秒回棋盘 / 待决策 60 秒按默认项）：文字给秒数，条只给感觉 */
+  #screen .cd-row { display:none; flex:none; align-items:center; gap:6px; font-size:11px; line-height:14px; color:#9fb0c0; }
+  #screen.cd-on .cd-row { display:flex; }
+  #screen .cd-track { flex:1; height:4px; border-radius:2px; background:#182230; overflow:hidden; }
+  #screen .cd-fill { height:100%; width:100%; background:var(--accent); transition:width .95s linear; }
+  /* 「在听 · 已唤醒」（屏 3）：唤醒词命中后盖在屏上，说完停 3 秒自动发送 */
+  #screen .listen { display:none; position:absolute; inset:0; z-index:6; background:#05080b;
+    padding:8px; box-sizing:border-box; flex-direction:column; align-items:center; justify-content:center; gap:4px; }
+  #screen.listen-on .listen { display:flex; }
+  #screen .listen .l0 { font-size:12px; line-height:14px; letter-spacing:1px; color:var(--accent); }
+  #screen .listen .l1 { font-size:18px; font-weight:700; line-height:22px; }
+  #screen .listen .wave { display:flex; align-items:center; gap:4px; height:34px; margin:2px 0; }
+  #screen .listen .wave span { display:block; width:4px; height:34px; border-radius:2px; background:var(--accent);
+    animation:wavePulse .85s ease-in-out infinite; transform-origin:center; }
+  #screen .listen .wave span:nth-child(2) { animation-delay:.08s; }
+  #screen .listen .wave span:nth-child(3) { animation-delay:.16s; }
+  #screen .listen .wave span:nth-child(4) { animation-delay:.24s; }
+  #screen .listen .wave span:nth-child(5) { animation-delay:.32s; }
+  #screen .listen .wave span:nth-child(6) { animation-delay:.4s; }
+  #screen .listen .wave span:nth-child(7) { animation-delay:.48s; }
+  #screen .listen .l2 { font-size:12px; line-height:16px; color:#9fb0c0; }
+  #screen .listen .l3 { font-size:12px; line-height:16px; color:#6f7d8b; }
+  #screen .listen .heard { font-size:12px; line-height:16px; color:#c3ccd5; max-width:290px; text-align:center;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen .pending-rail { position:absolute; right:0; top:8px; bottom:8px; width:64px; padding:4px; box-sizing:border-box;
     display:none; flex-direction:column; gap:4px; z-index:3; }
   #screen.rail-on .pending-rail { display:flex; }
@@ -175,6 +255,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   .screen-tools { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
   .screen-tools button { padding:6px 10px; font-size:12px; }
   .screen-tools button.on { border-color:var(--accent); background:#132420; }
+  .screen-tools button.unsupported { opacity:.45; }
   .screen-tools .hint { margin-left:auto; }
   select, #voiceName, #voiceNote { font:inherit; color:var(--fg); background:#0d131b; border:1px solid var(--line); border-radius:9px; padding:8px 10px; width:100%; }
   /* 屏下的会话选择器：没有会话时展开、绑定后收起（按钮可再展开） */
@@ -246,6 +327,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         <div id="actionBar" class="action-bar"></div>
         <div id="homeBody" class="home-body"></div>
         <div id="homePager" class="home-pager"></div>
+        <div id="steps" class="steps"></div>
+        <div id="cdRow" class="cd-row"><span id="cdText"></span><div class="cd-track"><div class="cd-fill" id="cdFill"></div></div></div>
+        <div id="listen" class="listen">
+          <div class="l0">在听 · 已唤醒</div>
+          <div class="l1">我在，说吧</div>
+          <div class="wave"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+          <div class="heard" id="listenHeard"></div>
+          <div class="l2">说完停 3 秒再发送</div>
+          <div class="l3">想清楚再说不着急</div>
+          <div class="l3">10 秒没说话就退出 · 长按也能说</div>
+        </div>
         <div id="pendingRail" class="pending-rail"></div>
         <div id="scrollHint" class="scroll-hint"></div>
         <div class="bar"><span id="progress">—</span><div class="track"><div class="fill" id="fill"></div></div></div>
@@ -258,6 +350,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     <button data-scale="1">1×</button>
     <button data-scale="2" class="on">2×</button>
     <button data-scale="actual">实际尺寸</button>
+    <button id="wake" title="免按住：叫「你好，鹈鹕」就能说话（浏览器关键词聆听；真机走固件本地唤醒）">免按住</button>
     <button id="shellToggle">仅屏幕</button>
     <span class="hint" id="scaleHint">640 × 480 显示</span>
   </div>
@@ -386,43 +479,32 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   var state = { ws: null, seq: 0, clientId: '', sessionId: '', sessionTitle: '', sessionSource: '',
     sessions: [], listLoaded: false, querying: false, showList: false,
     sessionBound: false, computerUse: null, sessionPreset: '', cuTotal: 0, total: 0,
-    mode: 'auto', lastAutoId: '',
+    mode: 'unified', bindIntent: '', lastAutoId: '',
     lastTranscript: '', asking: null, recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0,
     connState: 'connecting', clockTimer: 0,
     ttsTurnTexts: [], ttsAudioSeen: {},
     audioCtx: null, pcmSources: [], pcmNextTime: 0, turnPcm: [], droppedAudio: false,
     samplePending: false, sampleTimer: 0,
     voice: 'default', voices: [], voiceEngine: null,
-    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, hostAlert: false, screenMode: 'status', pending: [], boundProject: '', homeProjects: [], screenScale: 2, actions: [], running: [] };
+    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, hostAlert: false, screenMode: 'status', pending: [], boundProject: '', homeProjects: [], screenScale: 2, actions: [], running: [],
+    /* 任务棋盘（屏 1）与派单回执 / 待决策的附加块（2026-11-09 统一指挥会话） */
+    board: null, steps: [], countdown: null, countdownTimer: 0,
+    /* 免按住（唤醒词聆听）：browser 关键词 → 屏 3「在听」→ 停 3 秒发送；10 秒没说话退出 */
+    wake: false, wakeRec: null, wakeRestart: 0, listenOn: false, listenText: '', listenTimer: 0, listenIdle: 0 };
 
   /* ---------- 会话定位 ----------
-     2026-11-07 P0：localStorage **按 origin 隔离**。用户在桌面宿主
-     （http://127.0.0.1:57440）选过会话，打开公网 http://<公网IP>:<端口>/tihu 时
-     那个 key 根本不存在 —— 旧实现直接报「还没有会话」。现在按这个顺序找：
-       1. URL ?session=<id>（最高优先级，绑定后写回）；
-       2. 本 origin 自己的 dsh.tihu.session（页面自己选过的）；
-       3. 宽松读一次 dsh.sessions.current（只在同 origin 打开时才有用）；
-       4. 都没有 → 不报错，显示下面的选择器，点一条即绑定。
+     2026-11-09 统一指挥：开机只认两种意图 ——
+       1. URL ?session=<id> 显式指定 → 手动绑定（老逃生口，一次有效）；
+       2. 其它一切（含本地记住过的旧会话）→ 统一指挥：发**裸 hello**，
+          宿主把它绑到唯一的「鹈鹕指挥台」，屏上直接是任务棋盘。
+     本地键 dsh.tihu.session 仍随手动/自动绑定更新（handleSessionInvalid 靠它判断
+     失效的是不是「我们自己记的那条」），但**不再参与开机**：否则一次手动绑定就会被
+     它按 origin 绑死，默认入口永远回不到棋盘（2026-11-09 实测的旧会话屏就是这样来的）。
    */
   var SESSION_KEY = 'dsh.tihu.session';
-  var LEGACY_SESSION_KEY = 'dsh.sessions.current';
 
   function urlSessionId() {
     try { return new URLSearchParams(location.search).get('session') || ''; } catch (e) { return ''; }
-  }
-  /** 从任意文本里宽松抠一个会话 id（旧 key 可能是 JSON、也可能是裸字符串）。 */
-  function looseSessionId(raw) {
-    if (!raw) return '';
-    var match = String(raw).match(/session-[0-9a-zA-Z-]{8,}/);
-    if (match) return match[0];
-    try {
-      var value = JSON.parse(raw);
-      var fields = [value, value && value.sessionId, value && value.id, value && value.current];
-      for (var i = 0; i < fields.length; i += 1) {
-        if (typeof fields[i] === 'string' && /^[0-9a-zA-Z/_-]{8,}$/.test(fields[i])) return fields[i];
-      }
-    } catch (e) { /* 不是 JSON：忽略 */ }
-    return '';
   }
   function storedSessionId() {
     try { return localStorage.getItem(SESSION_KEY) || ''; } catch (e) { return ''; }
@@ -433,18 +515,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       else localStorage.removeItem(SESSION_KEY);
     } catch (e) { /* 隐私模式忽略 */ }
   }
-  function legacySessionId() {
-    try { return looseSessionId(localStorage.getItem(LEGACY_SESSION_KEY)); } catch (e) { return ''; }
-  }
   function pickInitialSession() {
-    // 自动绑定优先级：URL（显式）> 上次记住的（校验后）> 最近活跃的 CU（宿主自动）> 选择器。
+    // 记住的会话不参与开机：默认（无 ?session=）一律统一指挥。
     var fromUrl = urlSessionId();
     if (fromUrl) return { id: fromUrl, source: 'url', mode: 'manual' };
-    var stored = storedSessionId();
-    if (stored) return { id: stored, source: 'local', mode: 'manual' };
-    var legacy = legacySessionId();
-    if (legacy) return { id: legacy, source: 'legacy', mode: 'manual' };
-    return { id: '', source: '', mode: 'auto' };
+    return { id: '', source: '', mode: 'unified' };
   }
   /** 上次自动绑定到的会话 id（localStorage，用来识别「已自动跟随到」）。 */
   function lastAutoSessionId() {
@@ -667,14 +742,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     if (state.connState === 'offline') return 'conn-offline';
     return 'conn-connecting';
   }
-  /** 首页顶行：时钟 + 信号柱，整行宽度和 stage 同一套可用宽（rail-on 240 / 否则 304）。 */
+  /** 首页顶行：时钟 + 信号柱，整行宽度和 stage 同一套可用宽（rail-on 240 / 否则 304）。
+   *  棋盘模式（屏 1）这一行改成右对齐的三段计数「●2 在跑 ●1 等你 ●1 排队」（设计 §8.3）。 */
   function renderHomeTop() {
     var signal = $('homeSignal');
     if (signal) signal.className = 'signal ' + connClassOf();
     var clock = $('homeClock');
     if (!clock) return;
+    // 棋盘模式这一行是三段计数，其余模式是本地时钟——两者走同一条 fitTextPx 排版。
+    var text = state.screenMode === 'board' ? boardCountsText(state.board && state.board.counts) : clockText();
     var room = Math.max(1, stageWidthPx() - SIGNAL_W - HOME_TOP_GAP_W);
-    clock.textContent = fitTextPx(clockText(), room, SCREEN.stageFontPx || 12);
+    clock.textContent = fitTextPx(text, room, SCREEN.stageFontPx || 12);
   }
   /**
    * 朗读屏 stage 行（方案 B + 本轮绑定信息）：文案不动，末尾追加「· 窗口起始行/总行」，
@@ -723,12 +801,173 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     pager.appendChild(label);
     pager.appendChild(next);
   }
+  /* ---------- 任务棋盘（屏 1）：一行一任务 ----------
+   * 版式照设计：顶行三段计数（●N 在跑 ●N 等你 ●N 排队）→ 5 行任务 → 底部翻页。
+   * 每行只说三件事：状态胶囊（文字）、任务名、副行「项目 · 第 N 步」＋右侧时长环。
+   * 待决策行右侧是琥珀问号（不显示时长）；同一项目连续多条折叠成「+N 条」。
+   * 没有任务时是**同一张棋盘的另一种脸**（空态），不另开一屏。
+   */
+  function boardCountsText(counts) {
+    var c = counts || {};
+    var parts = [];
+    if (Number(c.running) > 0) parts.push('●' + c.running + ' 在跑');
+    if (Number(c.awaiting) > 0) parts.push('●' + c.awaiting + ' 等你');
+    if (Number(c.queued) > 0) parts.push('●' + c.queued + ' 排队');
+    return parts.length === 0 ? '● 0 在跑' : parts.join('　');
+  }
+  function renderBoard(payload) {
+    var screen = $('screen');
+    var board = payload.board || {};
+    state.board = board;
+    state.screenMode = 'board';
+    state.hostAlert = false;
+    state.reply = null;
+    state.highlightLock = false;
+    state.actions = [];
+    state.running = [];
+    renderActions();
+    renderRunning();
+    $('stage').style.display = 'none';
+    $('stage').textContent = '';
+    $('replyBody').innerHTML = '';
+    var clock = $('homeClock');
+    if (clock) clock.textContent = fitTextPx(boardCountsText(board.counts), Math.max(1, stageWidthPx() - SIGNAL_W - HOME_TOP_GAP_W), SCREEN.stageFontPx || 12);
+    renderHomePager({ home: { page: board.page || { index: 0, total: 1 } } });
+    renderSteps([]);
+    renderCountdown(null);
+    var body = $('homeBody');
+    body.innerHTML = '';
+    var rows = Array.isArray(board.rows) ? board.rows : [];
+    if (rows.length === 0) {
+      var empty = document.createElement('div');
+      empty.className = 'board-empty';
+      var wave = document.createElement('div');
+      wave.className = 'wave';
+      for (var wi = 0; wi < 5; wi += 1) wave.appendChild(document.createElement('span'));
+      var l1 = document.createElement('div');
+      l1.className = 'l1';
+      l1.textContent = '还没有任务';
+      var l2 = document.createElement('div');
+      l2.className = 'l2';
+      l2.textContent = fitTextPx('叫「你好，鹈鹕」说一句，或者点屏', 288, 12);
+      var l3 = document.createElement('div');
+      l3.className = 'l3';
+      l3.textContent = '说完这里就变成任务棋盘';
+      empty.appendChild(wave);
+      empty.appendChild(l1);
+      empty.appendChild(l2);
+      empty.appendChild(l3);
+      body.appendChild(empty);
+    }
+    for (var i = 0; i < rows.length; i += 1) {
+      var row = rows[i];
+      var item = document.createElement('div');
+      item.className = 'board-item';
+      item.setAttribute('data-task', row.taskId || '');
+      var row1 = document.createElement('div');
+      row1.className = 'board-row1';
+      var capsule = document.createElement('span');
+      capsule.className = 'board-capsule ' + (row.state || 'queued');
+      capsule.textContent = row.capsule || '';
+      var title = document.createElement('span');
+      title.className = 'board-title';
+      title.textContent = row.title || '';
+      row1.appendChild(capsule);
+      row1.appendChild(title);
+      if (Number(row.merged) > 0) {
+        var merged = document.createElement('span');
+        merged.className = 'board-merged';
+        merged.textContent = '+' + row.merged + ' 条';
+        row1.appendChild(merged);
+      }
+      var row2 = document.createElement('div');
+      row2.className = 'board-row2';
+      var sub = document.createElement('span');
+      sub.className = 'board-sub';
+      sub.textContent = row.sub || '';
+      row2.appendChild(sub);
+      if (row.badge === 'ask') {
+        var ask = document.createElement('span');
+        ask.className = 'board-ask';
+        ask.textContent = '?';
+        row2.appendChild(ask);
+      } else {
+        var ring = document.createElement('span');
+        var tone = (row.ring && row.ring.tone) || 'normal';
+        ring.className = 'board-ring' + (tone === 'normal' ? '' : ' ' + tone);
+        ring.style.setProperty('--p', String(Math.max(0, Math.min(1, Number(row.ring && row.ring.percent) || 0))));
+        ring.appendChild(document.createElement('i'));
+        row2.appendChild(ring);
+      }
+      item.appendChild(row1);
+      item.appendChild(row2);
+      body.appendChild(item);
+    }
+    screen.className = 'board-mode' + (state.pending && state.pending.length ? ' rail-on' : '');
+    updateScrollHint();
+  }
+
+  /* 派单回执的三拍圆点：已入队 / 排队 N 个 / 开始跑（圆点由 CSS 画，文字给状态） */
+  function renderSteps(steps) {
+    var screen = $('screen');
+    var box = $('steps');
+    state.steps = Array.isArray(steps) ? steps : [];
+    box.innerHTML = '';
+    if (!state.steps.length) { screen.classList.remove('steps-on'); return; }
+    for (var i = 0; i < state.steps.length; i += 1) {
+      var step = document.createElement('span');
+      step.className = 'step ' + (state.steps[i].state || 'pending');
+      step.textContent = state.steps[i].label || '';
+      box.appendChild(step);
+    }
+    screen.classList.add('steps-on');
+  }
+
+  /* 倒计时条：文字给秒数（精确），条只给感觉；到 0 就停在 0，由宿主决定下一步 */
+  function renderCountdown(countdown) {
+    var screen = $('screen');
+    var row = $('cdRow');
+    clearInterval(state.countdownTimer);
+    state.countdownTimer = 0;
+    if (!countdown || typeof countdown.seconds !== 'number') {
+      state.countdown = null;
+      screen.classList.remove('cd-on');
+      return;
+    }
+    var total = Number(countdown.totalSeconds);
+    if (!Number.isFinite(total) || total <= 0) total = Number(countdown.seconds) || 1;
+    state.countdown = { left: Math.max(0, Math.round(countdown.seconds)), total: total, text: countdown.text || '' };
+    screen.classList.add('cd-on');
+    var paint = function () {
+      var cd = state.countdown;
+      if (!cd) return;
+      $('cdText').textContent = cd.text !== '' ? cd.text : (cd.left > 0 ? cd.left + ' 秒' : '到点');
+      $('cdFill').style.width = Math.max(0, Math.min(100, Math.round(cd.left / cd.total * 100))) + '%';
+    };
+    paint();
+    state.countdownTimer = setInterval(function () {
+      var cd = state.countdown;
+      if (!cd) return;
+      cd.left = Math.max(0, cd.left - 1);
+      paint();
+      if (cd.left <= 0) { clearInterval(state.countdownTimer); state.countdownTimer = 0; }
+    }, 1000);
+  }
+
   function renderScreen(payload) {
     var screen = $('screen');
     renderPending(payload || {});
     updateScrollHint();
     // 收到任何一帧都顺手重画顶行（时钟本来每秒 tick，这里再补一次保证同一帧里不会花掉）。
     renderHomeTop();
+    // 回执/待决策的附加块每帧先收掉，只有本帧带了才重画（否则上一帧的圆点/倒计时会留在屏上）。
+    renderSteps(payload && payload.steps);
+    renderCountdown(payload && payload.countdown);
+    // 任务棋盘（屏 1，含空态）：mode 也是 home，但走 board 分支（行是任务不是项目）。
+    if (payload && payload.board) {
+      renderBoard(payload);
+      return;
+    }
     if (payload && payload.mode === 'home' && payload.home) {
       state.screenMode = 'home';
       state.hostAlert = false;
@@ -929,7 +1168,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   }
   function renderSessionBar() {
     var label = sessionLabel();
-    var modeText = state.mode === 'auto' ? '（自动）' : '（手动）';
+    var modeText = state.mode === 'auto' ? '（自动）' : state.mode === 'unified' ? '（统一指挥）' : '（手动）';
     if (state.sessionBound) {
       $('sessNow').textContent = '当前会话：' + label + modeText;
       $('sessNow').className = 'sess-now' + (state.computerUse === false ? ' bad' : '');
@@ -943,7 +1182,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     } else {
       $('sessNow').textContent = state.mode === 'auto'
         ? '正在自动绑定最近活跃的 Computer Use 会话…'
-        : '还没有选定会话，点下面选一个';
+        : state.mode === 'unified'
+          ? '正在建立统一指挥（任务棋盘）…'
+          : '还没有选定会话，点下面选一个';
       $('sessNow').className = 'sess-now none';
       $('sessLine').textContent = '当前会话：未选定' + modeText;
       $('sessLine').className = 'device-caption none';
@@ -999,6 +1240,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   }
   function chooseSession(sessionId, title) {
     if (!sessionId) return;
+    // 显式点选 = 离开统一指挥（老逃生口）：之后的绑定都按手动会话算。
+    state.bindIntent = 'manual';
+    state.mode = 'manual';
     state.sessionId = sessionId;
     state.sessionTitle = title || '';
     state.showList = false;
@@ -1049,19 +1293,23 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         return;
       }
       var cu = check.computerUse === true;
-      if (state.sessionSource === 'url') {
-        // ?session= 显式指定 —— 允许绑定非 CU，但必须显著提示（宿主同时下发红色屏帧）。
-        setComputerUseNotice(cu, check.preset);
-      } else if (!cu) {
-        // 上次记住的会话已经不是 CU / 不是 CU：按优先级回落到自动。
-        fallbackToAuto('上次记住的会话不是 Computer Use 模式。');
-        return;
-      } else if (!state.sessionBound) {
-        // 仍是 CU：页面先确认，再让宿主绑定（手动）。
-        chooseSession(state.sessionId, checkedTitle(state.sessionId) || state.sessionTitle);
-        return;
-      } else {
-        setComputerUseNotice(true, check.preset);
+      // 统一指挥：绑的是「鹈鹕指挥台」（standard），它不是 CU，也永远不算失效；
+      // 这里一个分支都不能走，否则一次列表刷新就把屏打回旧会话 / 自动跟随。
+      if (state.mode !== 'unified') {
+        if (state.sessionSource === 'url') {
+          // ?session= 显式指定 —— 允许绑定非 CU，但必须显著提示（宿主同时下发红色屏帧）。
+          setComputerUseNotice(cu, check.preset);
+        } else if (!cu) {
+          // 上次记住的会话已经不是 CU / 不是 CU：按优先级回落到自动。
+          fallbackToAuto('上次记住的会话不是 Computer Use 模式。');
+          return;
+        } else if (!state.sessionBound) {
+          // 仍是 CU：页面先确认，再让宿主绑定（手动）。
+          chooseSession(state.sessionId, checkedTitle(state.sessionId) || state.sessionTitle);
+          return;
+        } else {
+          setComputerUseNotice(true, check.preset);
+        }
       }
     }
 
@@ -1071,7 +1319,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     renderSessionBar();
     renderSessionList();
-    if (!state.sessionBound && state.listLoaded) {
+    if (!state.sessionBound && state.listLoaded && state.mode !== 'unified') {
       $('sessHint').textContent = state.cuTotal === 0
         ? '没有可自动绑定的 CU 会话：先在桌面端新建一个 Computer Use 模式会话，再点「刷新会话列表」。'
         : '列表只显示 Computer Use 模式会话；自动模式会跟随最近活跃的一条，手动选一次就以手动为准。';
@@ -1080,17 +1328,28 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function handleSessionBound(payload) {
     if (!payload || !payload.sessionId) return;
     var auto = payload.auto === true;
+    // 统一指挥：这次绑定是页面主动发裸 hello 换来的（宿主绑的是唯一指挥会话）。
+    // 它既不是「自动跟随」，也不是用户挑的那条会话 —— 重连时必须继续发裸 hello，
+    // 一旦把它当手动会话回传 sessionId，宿主就退回老路径（device.unified=false）。
+    var unified = !auto && state.bindIntent === 'unified';
+    state.bindIntent = '';
     var previousAuto = auto ? state.lastAutoId : '';
-    state.mode = auto ? 'auto' : 'manual';
+    state.mode = auto ? 'auto' : unified ? 'unified' : 'manual';
     state.sessionId = payload.sessionId;
     state.sessionTitle = payload.title || state.sessionTitle || '';
     state.boundProject = payload.project || '';
     state.sessionBound = true;
     state.showList = false;
     var cu = payload.computerUse === true;
-    setComputerUseNotice(cu, payload.preset);
-    // 自动绑定只更新展示，不删除上次手动记忆；显式「恢复自动」才由对应按钮清除。
-    if (!auto && cu) rememberSessionId(payload.sessionId);
+    if (unified) {
+      // 指挥会话是 standard 模式，本来就不看屏/不点鼠标：不按「非 CU」告警，也不记 id
+      //（记了下次开机就会被它按 origin 绑死，默认入口又回不到棋盘）。
+      setComputerUseNotice(null, payload.preset);
+    } else {
+      setComputerUseNotice(cu, payload.preset);
+      // 自动绑定只更新展示，不删除上次手动记忆；显式「恢复自动」才由对应按钮清除。
+      if (!auto && cu) rememberSessionId(payload.sessionId);
+    }
     if (auto) {
       state.lastAutoId = payload.sessionId;
       rememberAutoSessionId(payload.sessionId);
@@ -1102,6 +1361,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       $('sessHint').textContent = '已自动跟随到：' + sessionLabel()
         + '（' + (payload.live ? '桌面正开着' : '未打开') + '）。';
       addEvent('done', '已自动跟随到：' + sessionLabel());
+      return;
+    }
+    if (unified) {
+      $('sessHint').textContent = '统一指挥已就绪：说一句话就派单，屏上是任务棋盘；要看某条会话用下面的「换个会话」。';
+      addEvent('done', '统一指挥已就绪：' + sessionLabel());
       return;
     }
     $('sessHint').textContent = cu
@@ -1121,6 +1385,16 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       state.sessionTitle = '';
       state.sessionBound = false;
       if (storedSessionId() === payload.sessionId) rememberSessionId('');
+    }
+    if (state.mode === 'unified') {
+      // 统一指挥下面没有「退回自动跟随」这条路：指挥会话丢了就再发一次裸 hello，
+      // 宿主会重建/复用「鹈鹕指挥台」，屏还是任务棋盘。
+      state.bindIntent = 'unified';
+      state.showList = false;
+      addEvent('alert', payload.reason || '指挥会话不见了，正在重新建立');
+      if (state.ws && state.ws.readyState === 1) sendHello('', false);
+      renderSessionBar();
+      return;
     }
     addEvent('alert', payload.reason || ('会话 ' + shortId(payload.sessionId) + ' 不存在，已改为自动绑定'));
     fallbackToAuto(payload.reason || ('会话 ' + shortId(payload.sessionId) + ' 不存在。'));
@@ -1454,15 +1728,20 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         }
       }
       state.lastAutoId = state.lastAutoId || lastAutoSessionId();
-      // 自动模式：不带 id 让宿主挑「最近活跃的 CU 会话」；手动模式：URL 直接绑，
-      // 本机记住的会话先让宿主校验「仍存在且仍是 CU」再绑。
+      // 三种握手，只由「这次带什么」决定：
+      //   unified（默认）—— 裸 hello：宿主绑唯一的指挥会话，屏上是任务棋盘；
+      //   manual —— ?session= 显式指定（老逃生口）；
+      //   auto —— 点过「恢复自动」或手动会话失效（老逃生口）。
+      // 统一模式**重连也只发裸 hello**：把上次绑到的指挥会话 id 回传，宿主会当成
+      // 手动绑定（device.unified=false），屏又退回那条会话的旧屏。
       var helloSession = '';
       if (state.mode === 'manual') {
         if (state.sessionBound) helloSession = state.sessionId;
         else if (state.sessionSource === 'url') helloSession = state.sessionId;
       }
+      state.bindIntent = state.mode === 'unified' ? 'unified' : 'manual';
       sendHello(helloSession, state.mode === 'auto');
-      if (!helloSession && state.mode !== 'auto' && !state.sessionId) {
+      if (!helloSession && state.mode === 'manual' && !state.sessionId) {
         // 不报错：提示可操作，并展开屏下的选择器。
         state.showList = true;
         addEvent('progress', '还没有选定会话，点下面选一个');
@@ -1605,6 +1884,18 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       case 'sessions.list': handleSessionList(payload); break;
       case 'session.bound': handleSessionBound(payload); break;
       case 'session.invalid': handleSessionInvalid(payload); break;
+      /* 任务登记簿（2026-11-09 统一指挥）：棋盘数据既随 screen.frame.board 下发，
+         也单独发一条 task.list（固件只认这条也没问题）；播报帧只在事件区记一行。 */
+      case 'task.list':
+        if (payload && payload.board) renderBoard(payload);
+        break;
+      case 'task.update':
+        // 单行变更：棋盘在屏上时按最新一拍重画由 screen.frame 负责，这里只记一行事件。
+        if (payload && payload.taskId) addEvent('progress', '任务 ' + payload.taskId + ' → ' + (payload.capsule || payload.state || ''));
+        break;
+      case 'task.notify':
+        if (payload && payload.text) addEvent(payload.level === 0 ? 'alert' : 'progress', (payload.spoken ? '播报：' : '通知：') + payload.text);
+        break;
       case 'pong': break;
       default: break; /* 未知 type：忽略 */
     }
@@ -1894,6 +2185,150 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   };
   $('voiceRefresh').onclick = function () { send('voice.list', {}); };
 
+  /* ---------- 免按住 ＋ 唤醒词「你好，鹈鹕」（屏 3「在听 · 已唤醒」） ----------
+   * 真机是固件本地关键词判定（不上传音频）；模拟页只能用浏览器 SpeechRecognition 做
+   * 关键词聆听，所以它是个**显式开关**（默认关，点一下才开），不偷偷占麦克风。
+   * 命中关键词 → 屏上盖一层「在听」→ 继续说 → 末字后静音 3 秒自动发送；10 秒没说话退出。
+   * 播报中叫醒：先把本地音频队列掐掉（页面侧 AEC 的软件兜底），再进聆听——念一半也能插话。
+   */
+  var WAKE_RE = /你好[，,、\\s]*鹈鹕/;
+  function listenPreview(text) {
+    var heard = $('listenHeard');
+    if (!heard) return;
+    heard.textContent = text === '' ? '' : fitTextPx(text, 288, 12);
+  }
+  function listenBegin() {
+    state.listenOn = true;
+    state.listenText = '';
+    state.listenSkip = true;
+    $('screen').classList.add('listen-on');
+    listenPreview('');
+    clearTimeout(state.listenIdle);
+    // 10 秒一句都没说：退出聆听（不会一直开着麦）
+    state.listenIdle = setTimeout(function () {
+      if (!state.listenOn) return;
+      if (String(state.listenText || '').trim() !== '') return;
+      addEvent('progress', '免按住：10 秒没说话，已退出聆听');
+      listenEnd();
+    }, 10000);
+  }
+  function listenEnd() {
+    state.listenOn = false;
+    state.listenText = '';
+    state.listenSkip = false;
+    clearTimeout(state.listenTimer);
+    clearTimeout(state.listenIdle);
+    state.listenTimer = 0;
+    state.listenIdle = 0;
+    var screen = $('screen');
+    if (screen) screen.classList.remove('listen-on');
+    listenPreview('');
+  }
+  /** 末字后静音 3 秒 = 「说完了」：留出想措辞的时间，不打断人。
+   *  一句话都还没说时**不**起这个计时——那种情况归「10 秒没说话就退出」管。 */
+  function listenTouch() {
+    clearTimeout(state.listenTimer);
+    var text = String(state.listenText || '').trim();
+    if (text === '') return;
+    clearTimeout(state.listenIdle);
+    state.listenIdle = 0;
+    state.listenTimer = setTimeout(function () {
+      var said = String(state.listenText || '').trim();
+      listenEnd();
+      if (said === '') return;   // 只叫了唤醒词没说话：不算一次唤醒
+      stopPcm();
+      send('text.input', { text: said, source: 'voice' });
+      addEvent('progress', '免按住：' + said);
+    }, 3000);
+  }
+  function wakeOnResult(event) {
+    var finalText = '';
+    var interim = '';
+    for (var i = event.resultIndex; i < event.results.length; i += 1) {
+      var res = event.results[i];
+      var seg = res[0] && res[0].transcript ? res[0].transcript : '';
+      if (res.isFinal) finalText += seg;
+      else interim += seg;
+    }
+    if (!state.listenOn) {
+      var probe = finalText || interim;
+      var hit = probe.match(WAKE_RE);
+      if (!hit) return;
+      stopPcm();
+      listenBegin();
+      var tail = probe.slice(hit.index + hit[0].length).replace(/^[，,、。.\\s]+/, '');
+      if (finalText !== '') {
+        state.listenText = tail;
+        state.listenSkip = false;
+      }
+      listenPreview(state.listenText);
+      listenTouch();
+      return;
+    }
+    if (finalText !== '') {
+      if (state.listenSkip) {
+        // 关键词那一句的 final 迟到：去掉关键词前缀再累加，避免把「你好鹈鹕」念进指令
+        var kw = finalText.match(WAKE_RE);
+        state.listenText += kw ? finalText.slice(kw.index + kw[0].length) : finalText;
+        state.listenSkip = false;
+      } else {
+        state.listenText += finalText;
+      }
+      listenPreview(state.listenText);
+      listenTouch();
+      return;
+    }
+    if (interim !== '') listenPreview(state.listenText + interim);
+  }
+  function wakeStop(silent) {
+    state.wake = false;
+    clearTimeout(state.wakeRestart);
+    var rec = state.wakeRec;
+    state.wakeRec = null;
+    if (rec) {
+      try { rec.onend = null; rec.stop(); } catch (e) { /* 忽略 */ }
+    }
+    var btn = $('wake');
+    if (btn) btn.classList.remove('on');
+    listenEnd();
+    if (!silent) addEvent('progress', '免按住：已关闭');
+  }
+  function wakeStart() {
+    var Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Ctor) {
+      addEvent('alert', '这个浏览器不支持免按住聆听（真机走固件本地唤醒）；长按说话仍可用');
+      return false;
+    }
+    var rec = new Ctor();
+    rec.lang = 'zh-CN';
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.onresult = wakeOnResult;
+    rec.onerror = function (event) {
+      if (event && event.error === 'not-allowed') {
+        wakeStop(true);
+        addEvent('alert', '麦克风权限被拒绝：免按住用不了，长按说话仍可用');
+      }
+    };
+    rec.onend = function () {
+      if (!state.wake) return;
+      clearTimeout(state.wakeRestart);
+      state.wakeRestart = setTimeout(function () { try { rec.start(); } catch (e) { /* 忽略 */ } }, 400);
+    };
+    try { rec.start(); } catch (e) { return false; }
+    state.wakeRec = rec;
+    state.wake = true;
+    $('wake').classList.add('on');
+    addEvent('progress', '免按住：叫「你好，鹈鹕」就能说话');
+    return true;
+  }
+  $('wake').onclick = function () {
+    if (state.wake) wakeStop(false);
+    else wakeStart();
+  };
+  try { if (!(window.SpeechRecognition || window.webkitSpeechRecognition)) $('wake').classList.add('unsupported'); } catch (e) { /* 忽略 */ }
+
+
   /* ---------- 屏幕手势：滚轮 / 拖拽 / 触摸 → screen.gesture（宿主持有滚动位置） ---------- */
   (function bindScreenGestures() {
     var screen = $('screen');
@@ -1991,6 +2426,15 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
               send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'project', project: projectEl.getAttribute('data-project') || '', sessionId: projectSession });
               return;
             }
+          }
+        }
+        // 任务棋盘上点一行：看这条任务的详情（宿主 openTask，不换会话绑定）
+        if (state.screenMode === 'board') {
+          var taskEl = under && under.closest ? under.closest('.board-item') : null;
+          var taskId = taskEl && taskEl.getAttribute ? taskEl.getAttribute('data-task') : '';
+          if (taskId) {
+            send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'task', taskId: taskId });
+            return;
           }
         }
         send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'screen' });
