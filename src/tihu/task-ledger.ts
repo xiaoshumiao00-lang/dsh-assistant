@@ -163,11 +163,22 @@ export function ringOf(task: TihuTask, now: number): TaskBoardRow['ring'] {
   return { percent, tone: elapsed > RING_FULL_MS ? 'warn' : 'normal' }
 }
 
+/** 棋盘标题：去掉原话开头重复的项目名，只留「状态 + 会话名」；项目名保留在副行。 */
+export function boardTitleOf(task: TihuTask): string {
+  const title = String(task.title ?? '').trim()
+  const project = String(task.projectName ?? '').trim()
+  if (title === '' || project === '' || !title.startsWith(project)) return title
+  const rest = title.slice(project.length)
+  if (rest !== '' && !/^[\s·:：\-—]/.test(rest)) return title
+  const clean = rest.replace(/^[\s·:：\-—]+/, '').trim()
+  return clean === '' ? title : clean
+}
+
 /** 任务行（棋盘一行）。待决策行给琥珀问号，不显示时长。 */
 export function rowOf(task: TihuTask, now: number): TaskBoardRow {
   const row: TaskBoardRow = {
     taskId: task.taskId,
-    title: task.title,
+    title: boardTitleOf(task),
     state: task.state === 'archived' ? 'done' : task.state,
     capsule: capsuleOf(task.state),
     sub: subLineOf(task),
