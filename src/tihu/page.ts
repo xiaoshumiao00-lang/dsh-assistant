@@ -68,9 +68,13 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen.warn { border-color:#000; }
   #screen.warn .stage, #screen.warn .title { color:var(--warn); }
   #screen.awaiting-mode .cd-row { display:none !important; }
-  #screen.awaiting-mode .bar, #screen.awaiting-mode #progress { display:none !important; }
-  #screen.ask-mode .cd-row, #screen.ask-mode .bar, #screen.ask-mode #progress { display:none !important; }
-  #screen.detail-mode .cd-row, #screen.detail-mode .bar, #screen.detail-mode #progress { display:none !important; }
+  #screen.awaiting-mode .cd-row, #screen.awaiting-mode .cd-track, #screen.awaiting-mode .cd-fill, #screen.awaiting-mode .bar, #screen.awaiting-mode #progress { display:none !important; }
+  #screen.ask-mode .cd-row, #screen.ask-mode .cd-track, #screen.ask-mode .cd-fill, #screen.ask-mode .bar, #screen.ask-mode #progress { display:none !important; }
+  #screen.detail-mode .cd-row, #screen.detail-mode .cd-track, #screen.detail-mode .cd-fill, #screen.detail-mode .bar, #screen.detail-mode #progress { display:none !important; }
+  /* 追问/详情/待决策是纯状态屏：底部只留黑底，连状态屏残留的 1px 分隔线也不显示。 */
+  #screen.ask-mode::after, #screen.detail-mode::after, #screen.awaiting-mode::after {
+    content:''; position:absolute; left:0; right:0; bottom:0; height:18px; background:#05080b; z-index:20; pointer-events:none;
+  }
   /* 完成播报的朗读波形（CSS 动态，7 根） */
   #screen .done-wave { display:none; position:absolute; top:7px; right:9px; gap:2px; align-items:center; height:12px; }
   #screen.done-mode .done-wave { display:flex; }
@@ -241,9 +245,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   /* 倒计时条（派单回执 5 秒回棋盘 / 待决策 60 秒按默认项）：文字给秒数，条只给感觉 */
   #screen .cd-row { display:none; flex:none; align-items:center; gap:6px; font-size:11px; line-height:14px; color:#9fb0c0; }
   #screen.cd-on .cd-row { display:flex; }
-  #screen .cd-track { flex:1; height:6px; border-radius:3px; background:#182230; overflow:hidden; }
-  #screen .cd-fill { height:100%; width:100%; background:repeating-linear-gradient(90deg,var(--accent) 0 8px,transparent 8px 11px); background-size:11px 100%; transition:width .95s linear; animation:tihu-cd-flow .9s linear infinite; }
-  @keyframes tihu-cd-flow { from { background-position:0 0; } to { background-position:11px 0; } }
+  #screen .cd-row #cdText { flex:none; min-width:28px; color:#9fb0c0; font-size:10px; }
+  #screen .cd-track { flex:1; height:8px; border-radius:3px; background:#182230; overflow:hidden; }
+  #screen .cd-fill { height:100%; width:100%; background-image:linear-gradient(90deg,var(--accent) 0 82%,transparent 82% 100%); background-size:20% 100%; background-repeat:repeat-x; transition:width .95s linear; animation:tihu-cd-flow .9s linear infinite; }
+  @keyframes tihu-cd-flow { from { background-position:0 0; } to { background-position:20px 0; } }
   #screen > .bar { display:none; }
   #screen #progress { display:none; }
   /* 「在听 · 已唤醒」（屏 3）：唤醒词命中后盖在屏上，说完停 3 秒自动发送 */
