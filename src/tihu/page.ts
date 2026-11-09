@@ -98,10 +98,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen.home-mode .stage { display:none; }
   /* 顶行时钟数字加粗（用户 2026-11-08 本轮要求，只加粗这一处）：字号 12px、行高 14px、颜色、位置、
      三格信号柱、底部翻页条、回答屏与状态屏的 stage 行全部照旧。粗体只把字形撑宽约 6%（12px/700 比常规宽），
-     HH:MM 五个字符加粗后实测约 40px，离可用宽还差得远（304 − 行间隙 8 − 信号柱 19 = 277；rail-on 时 240 − 27 = 213），
+     HH:MM 五个字符加粗后实测约 40px，离可用宽还差得远（304 − 行间隙 8 − 信号柱 19 = 277），
      所以这一行不会换行、不会溢出、也不会被 fitTextPx 裁成省略号，顶行那套尺寸常量（柱宽 5、柱间隙 2、行间隙 8）不用动。
-     这条规则只作用在 .clock 上（屏内 .clock 只有 #homeClock 这一个元素）：首页项目名 .home-row1、摘要行 .home-row2、
-     最近回答行 .home-recent 都不在这条规则上，不会被带着一起变粗。 */
+   * 这条规则只作用在 .clock 上（屏内 .clock 只有 #homeClock 这一个元素）。 */
+
   #screen .home-top .clock { font-size:12px; line-height:14px; letter-spacing:1px; color:var(--accent); font-weight:bold;
     font-variant-numeric:tabular-nums; white-space:nowrap; overflow:hidden; flex:none; }
   /* 三格信号柱：3 根 ×5px + 2 个间隙 ×2px = 19px（页面 JS 里 HOME_TOP_* 常量要和这两个数字一致）。 */
@@ -119,22 +119,14 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen ul { margin:0; padding:0; list-style:none; font-size:16px; line-height:20px; color:#c3ccd5; }
   #screen ul li { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  /* 回答屏正文（2026-11-08 第二轮：气泡不压文字、末行不裁）：
-     垂直预算 224 = 顶行 14 + 间隙 4×2 + 正文 170 + 按钮行 32（与 screen-spec 的 REPLY_LAYOUT 同一组数字）。
-     正文固定 7 行 × 20px = 140，末行下面留 30px（其中 20px 是一整行安全高度）：
-     右侧气泡轨（64px，正文在 rail-on 时让到 240px）、进度条（reply-mode 收掉）、顶行都进不了这块；
-     宿主只下发 7 行，页面最多也只画 7 行，绝不把第 8 行裁成半行。 */
-  #screen .reply-body { display:none; flex:1; min-height:0; overflow:hidden; font-size:16px; line-height:20px; color:#d9e2ea; }
-  #screen .reply-line { white-space:nowrap; overflow:hidden; }
-  #screen .reply-line.cur { background:var(--accent); color:#04110f; border-radius:3px; }
+  /* 状态屏正文：标题一行、正文最多 4 行；进度条与顶行都进不了正文区。 */
   #screen .home-body { display:none; flex:1; overflow:hidden; }
   #screen.home-mode .home-body { display:block; }
-  #screen.home-mode .title, #screen.home-mode ul, #screen.home-mode .reply-body, #screen.home-mode .bar,
-  #screen.home-mode .action-bar, #screen.home-mode .run-list { display:none; }
-  /* 首页底部翻页条（用户 2026-11-08 要求）：只在 home-mode 显示，按钮 min-height 28px，flex 布局。
-     这一行占掉底部 28px + 4px 间隙，所以项目行必须收进 30px：224 内容高 = 顶行 14（时钟 + 信号柱）+ 间隙 4
-     + 最近回答 20 + 5×30 + 间隙 4 + 翻页条 28 = 220（不留半行）。顶行的高度与原来那行 stage 一模一样，
-     换行走不会把翻页条顶出屏幕。 */
+  #screen.home-mode .title, #screen.home-mode ul, #screen.home-mode .bar,
+  #screen.home-mode .action-bar { display:none; }
+  /* 棋盘底部翻页条：只在 home-mode 显示，按钮 min-height 28px。
+     这一行占掉底部 28px + 4px 间隙，所以 5 行任务必须收进 170px：
+     224 内容高 = 顶行 14 + 间隙 4 + 5×34 + 间隙 4 + 翻页条 28 = 220（不留半行）。 */
   #screen .home-pager { display:none; flex:none; align-items:center; gap:6px; }
   #screen.home-mode .home-pager { display:flex; }
   #screen .home-pager button { flex:none; width:64px; min-height:28px; padding:0; border-radius:6px;
@@ -143,45 +135,25 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .home-pager button:active { background:#2c3d4e; }
   #screen .home-pager .page { flex:1; min-width:0; text-align:center; font-size:13px; line-height:16px;
     color:#9fb0c0; white-space:nowrap; overflow:hidden; }
-  /* 回复屏底部动作条（停止 / 重读 / 主页） */
+  /* 状态屏/回执/完成屏的底部动作条 */
   #screen .action-bar { display:none; flex:none; gap:6px; padding-top:4px; }
-  #screen.reply-mode .action-bar, #screen.has-actions .action-bar { display:flex; }
   #screen .action-bar button { flex:1; min-width:0; min-height:28px; padding:0 2px; white-space:nowrap;
     border-radius:6px; border:1px solid #33414f; background:#1b2430; color:#d9e2ea; font-size:13px; }
-  /* 有历史可翻时是 5 个按钮（停止/重读/主页/上一条/下一条）：小一号字号，304px 内不换行不溢出 */
+  /* 按钮多于 3 个时收小一号字号：304px 内不换行不溢出 */
   #screen .action-bar.many button { font-size:11px; }
   #screen .action-bar button:active { background:#2c3d4e; }
-  /* 状态屏底部：其他正在运行的会话 */
-  #screen .run-list { display:none; flex:none; margin-top:6px; }
-  #screen.run-on .run-list { display:block; }
-  #screen .run-row { display:flex; align-items:center; gap:6px; height:22px; font-size:13px; color:#9fb0c0;
-    border-top:1px solid #1e2a36; }
-  #screen .run-row .dot { width:6px; height:6px; border-radius:50%; background:#35d07f; flex:none; }
-  #screen .run-row .t { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
-  #screen .run-row .go { color:#4f8ef7; font-size:12px; flex:none; }
+
   #screen .tap-flash { position:absolute; width:28px; height:28px; margin:-14px 0 0 -14px; border-radius:50%;
     background:rgba(255,255,255,.35); pointer-events:none; z-index:5; animation:tapFlash .18s ease-out forwards; }
   @keyframes tapFlash { from { opacity:.8; transform:scale(.4); } to { opacity:0; transform:scale(1.4); } }
-  #screen .home-item { height:30px; box-sizing:border-box; padding:0; overflow:hidden; }
-  #screen .home-row1 { display:flex; align-items:center; gap:6px; font-size:16px; font-weight:700; line-height:18px; white-space:nowrap; }
-  #screen .home-dot { width:8px; height:8px; border-radius:50%; flex:none; background:#6b7785; }
-  #screen .home-row1 .name { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #screen .home-row2 { font-size:12px; line-height:12px; color:#8b97a5; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #screen .home-dot.running { background:#35d07f; }
-  #screen .home-dot.idle { background:#6b7785; }
-  #screen .home-dot.done { background:#4f8ef7; }
-  /* 首页顶部「最近回答 · 会话名」行：单行省略，点它回到那条回答的朗读屏 */
-  #screen .home-recent { display:block; height:20px; box-sizing:border-box; margin:0 0 2px; padding:0 4px;
-    border:1px solid #2a5a54; border-radius:4px; background:rgba(20,44,40,.55);
-    font-size:13px; line-height:16px; color:#9fd8cf; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
   /* ── 任务棋盘（屏 1，2026-11-09 统一指挥会话）──
      与首页同一副骨架（顶行 14 + 5 行 + 底部翻页 28），只是行的语义从「项目」变成「任务」：
      一行 34px（比项目行高 4px，要塞下「胶囊 + 任务名」和「项目 · 第 N 步」两行字）。
      内容高 224 = 顶行 14 + 间隙 4 + 5×34 + 间隙 4 + 翻页 28 = 220，仍不留半行。 */
   #screen.board-mode .home-top { display:flex; }
   #screen.board-mode .stage, #screen.board-mode .title, #screen.board-mode ul,
-  #screen.board-mode .reply-body, #screen.board-mode .bar, #screen.board-mode .action-bar,
-  #screen.board-mode .run-list { display:none; }
+  #screen.board-mode .bar, #screen.board-mode .action-bar { display:none; }
   #screen.board-mode .home-body { display:block; }
   #screen.board-mode .home-pager { display:flex; }
   #screen .board-item { height:34px; box-sizing:border-box; padding:1px 0; overflow:hidden; }
@@ -270,26 +242,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .listen .l3 { font-size:12px; line-height:16px; color:#6f7d8b; }
   #screen .listen .heard { font-size:12px; line-height:16px; color:#c3ccd5; max-width:290px; text-align:center;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #screen .pending-rail { position:absolute; right:0; top:8px; bottom:8px; width:64px; padding:4px; box-sizing:border-box;
-    display:none; flex-direction:column; gap:4px; z-index:3; }
-  #screen.rail-on .pending-rail { display:flex; }
-  #screen.rail-on .title, #screen.rail-on ul, #screen.rail-on .reply-body, #screen.rail-on .home-body,
-  #screen.rail-on .home-pager, #screen.rail-on .home-top { width:240px; }
-  #screen .pending-chip { width:56px; height:34px; box-sizing:border-box; padding:2px 3px; border-radius:5px;
-    background:rgba(20,28,40,.82); border:1px solid rgba(120,180,255,.55); overflow:hidden; }
-  #screen .pending-name { font-size:11px; line-height:15px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #screen .pending-sub { font-size:10px; line-height:13px; color:#9fb0bf; display:flex; align-items:center; gap:3px; }
-  #screen .pending-dot { width:5px; height:5px; border-radius:50%; background:#35d07f; }
-  #screen .pending-more { font-size:10px; color:#9fb0bf; text-align:center; }
   /* 右下角那行「已绑定：xxx」本轮搬进回答屏顶行末尾（用户 2026-11-08 确认）：这块地方整个空出来，
      右下角不再写任何文字、也不显示任何东西（上一轮 ecf48fa 删掉的滚动余量角落提示「还有 N 行」
      继续保持删除，不恢复）。回答屏底部那排按钮（停止/重读/主页/上一条/下一条）位置与样式都不动。 */
-  #screen .scroll-hint { display:none; position:absolute; right:8px; bottom:6px; font-size:11px; line-height:14px;
-    color:#9fb0bf; background:rgba(5,8,11,.82); padding:1px 4px; border-radius:3px; pointer-events:none; }
   /* 主页屏也从来不显示角落提示：那块地方是翻页按钮的（› 在右下角），不能被压住 */
-  #screen.home-mode .scroll-hint { display:none; }
-  #screen.reply-mode .title, #screen.reply-mode ul, #screen.reply-mode .bar { display:none; }
-  #screen.reply-mode .reply-body { display:block; }
   #screen .bar { margin-top:auto; display:flex; align-items:center; gap:6px; font-size:10px; color:var(--dim); }
   #screen .track { flex:1; height:5px; border-radius:3px; background:#182230; overflow:hidden; }
   #screen .fill { height:100%; width:0; background:var(--accent); transition:width .3s; }
@@ -335,11 +291,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #events div { padding:2px 0; border-top:1px dashed #182230; }
   #events div:first-child { border-top:0; }
   #events .alert { color:var(--err); } #events .done { color:var(--accent); } #events .progress { color:#a9b6c3; }
-  #ask { border-color:#b04545; display:none; }
-  #ask.on { display:block; }
-  #ask .detail { font-size:13px; color:#e8c5c5; word-break:break-all; margin:6px 0 8px; }
-  #ask .row button { flex:1; }
-  #ask .yes { background:#1d5f4f; border-color:#2a8f74; }
   textarea { width:100%; min-height:64px; resize:vertical; font:inherit; color:var(--fg); background:#0d131b; border:1px solid var(--line); border-radius:9px; padding:8px 10px; }
   .hint { font-size:11px; color:var(--dim); }
   .hint code { color:#c3ccd5; }
@@ -355,7 +306,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
 
 <div class="device-wrap" id="deviceWrap">
   <div class="device-title">ESP32-S3-BOX-3B · 2.4″ · 320×240 · 触摸屏</div>
-  <div class="device-caption none" id="sessLine">当前会话：未选定</div>
   <div class="device" id="device">
     <div class="bezel">
       <div class="mics"><span></span><span></span></div>
@@ -366,8 +316,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         <div class="title" id="title">正在连接宿主…</div>
         <div id="steps" class="steps"></div>
         <ul id="bullets"></ul>
-        <div id="runList" class="run-list"></div>
-        <div id="replyBody" class="reply-body"></div>
         <div id="actionBar" class="action-bar"></div>
         <div id="homeBody" class="home-body"></div>
         <div id="homePager" class="home-pager"></div>
@@ -381,8 +329,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
           <div class="l3">想清楚再说不着急</div>
           <div class="l3">10 秒没说话就退出 · 长按也能说</div>
         </div>
-        <div id="pendingRail" class="pending-rail"></div>
-        <div id="scrollHint" class="scroll-hint"></div>
         <div class="bar"><span id="progress">—</span><div class="track"><div class="fill" id="fill"></div></div></div>
       </div>
       <div class="grille"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
@@ -399,18 +345,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   </div>
 </div>
 
-<div class="card" id="sessCard">
-  <h4>当前会话（Computer Use 模式）</h4>
-  <div class="cu-warn" id="cuWarn"></div>
-  <div class="sess-now none" id="sessNow">还没有选定会话，点下面选一个</div>
-  <div class="sess-list" id="sessList"></div>
-  <div class="row" style="margin-top:8px">
-    <button id="sessSwitch" style="display:none">换个会话</button>
-    <button id="sessAuto" style="display:none">恢复自动</button>
-    <button id="sessRefresh" style="flex:1">刷新会话列表</button>
-  </div>
-  <div class="hint" id="sessHint">列表只显示 Computer Use 模式会话；默认自动绑定最近活跃的一条，手动选一次后以手动为准。</div>
-</div>
 
 <div class="card" id="voiceCard">
   <h4>音色 · 主引擎 edge-tts（离线兜底：本地 Kokoro）</h4>
@@ -450,20 +384,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   <div id="transcript" class="empty">（还没有内容）</div>
   <div class="row" style="margin-top:8px">
     <button id="retry">撤回重说</button>
-    <button id="speak" title="把本轮回复从头再念一遍">重读一遍</button>
-    <button id="ttsStop" title="立刻停止朗读">停止朗读</button>
   </div>
   <textarea id="text" placeholder="文字兜底：直接输入要交给会话的话"></textarea>
   <div class="row" style="margin-top:8px"><button id="send" style="flex:1">发送到当前会话</button></div>
   <div class="row" style="margin-top:8px"><button id="end" style="flex:1;border-color:#b04545">结束本次语音会话</button></div>
   <div class="hint">「结束」会立刻解除危险动作闸门（不用等 120 秒空闲），之后你自己在会话里的操作完全不受影响。</div>
-</div>
-
-<div class="card" id="ask">
-  <h4>⚠ 危险动作确认</h4>
-  <div class="title" id="askTitle">—</div>
-  <div class="detail" id="askDetail"></div>
-  <div class="row"><button class="yes" id="askYes">确认</button><button id="askNo">取消</button></div>
 </div>
 
 <div class="card">
@@ -519,17 +444,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     return out;
   }
   var $ = function (id) { return document.getElementById(id); };
-  var state = { ws: null, seq: 0, clientId: '', sessionId: '', sessionTitle: '', sessionSource: '',
-    sessions: [], listLoaded: false, querying: false, showList: false,
-    sessionBound: false, computerUse: null, sessionPreset: '', cuTotal: 0, total: 0,
-    mode: 'unified', bindIntent: '', lastAutoId: '',
-    lastTranscript: '', asking: null, recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0,
+  var state = { ws: null, seq: 0, clientId: '', sessionId: '', sessionTitle: '', 
+    showList: false,
+    sessionBound: false, 
+    
+    lastTranscript: '', recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0,
     connState: 'connecting', clockTimer: 0,
-    ttsTurnTexts: [], ttsAudioSeen: {},
-    audioCtx: null, pcmSources: [], pcmNextTime: 0, turnPcm: [], droppedAudio: false,
+    
+    audioCtx: null, pcmSources: [], pcmNextTime: 0, droppedAudio: false,
     samplePending: false, sampleTimer: 0,
     voice: 'default', voices: [], voiceEngine: null,
-    reply: null, replyCharPos: 0, replyTimer: 0, highlightLock: false, audioStarted: false, hostAlert: false, screenMode: 'status', pending: [], boundProject: '', homeProjects: [], screenScale: 2, actions: [], running: [],
+    highlightLock: false, hostAlert: false, screenMode: 'status', boundProject: '', screenScale: 2, actions: [], 
     /* 任务棋盘（屏 1）与派单回执 / 待决策的附加块（2026-11-09 统一指挥会话） */
     board: null, steps: [], countdown: null, countdownTimer: 0,
     /* 免按住（唤醒词聆听）：browser 关键词 → 屏 3「在听」→ 停 3 秒发送；10 秒没说话退出 */
@@ -546,38 +471,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
    */
   var SESSION_KEY = 'dsh.tihu.session';
 
-  function urlSessionId() {
-    try { return new URLSearchParams(location.search).get('session') || ''; } catch (e) { return ''; }
-  }
-  function storedSessionId() {
-    try { return localStorage.getItem(SESSION_KEY) || ''; } catch (e) { return ''; }
-  }
-  function rememberSessionId(sessionId) {
-    try {
-      if (sessionId) localStorage.setItem(SESSION_KEY, sessionId);
-      else localStorage.removeItem(SESSION_KEY);
-    } catch (e) { /* 隐私模式忽略 */ }
-  }
-  function pickInitialSession() {
-    // 记住的会话不参与开机：默认（无 ?session=）一律统一指挥。
-    var fromUrl = urlSessionId();
-    if (fromUrl) return { id: fromUrl, source: 'url', mode: 'manual' };
-    return { id: '', source: '', mode: 'unified' };
-  }
-  /** 上次自动绑定到的会话 id（localStorage，用来识别「已自动跟随到」）。 */
-  function lastAutoSessionId() {
-    try { return localStorage.getItem('dsh.tihu.auto') || ''; } catch (e) { return ''; }
-  }
-  function rememberAutoSessionId(sessionId) {
-    try {
-      if (sessionId) localStorage.setItem('dsh.tihu.auto', sessionId);
-      else localStorage.removeItem('dsh.tihu.auto');
-    } catch (e) { /* 隐私模式忽略 */ }
-  }
-  function shortId(sessionId) {
-    if (!sessionId) return '';
-    return String(sessionId).replace(/^session-/, '').slice(0, 8);
-  }
 
   /* ---------- 屏 ---------- */
   function fitTextPx(text, width, fontPx) {
@@ -594,47 +487,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     return out;
   }
-  function renderPending(payload) {
-    var screen = $('screen');
-    var rail = $('pendingRail');
-    // 统一指挥模式没有「桌面会话未读」语义：所有屏都不弹「新任务完成/新回复」浮泡，
-    // 但宿主侧会话状态照旧保留（这里只清页面通知层，不删任何会话）。
-    if (state.mode === 'unified') {
-      state.pending = [];
-      rail.innerHTML = '';
-      screen.classList.remove('rail-on');
-      return;
-    }
-    var items = Array.isArray(payload.pending) ? payload.pending : [];
-    state.pending = items;
-    rail.innerHTML = '';
-    if (items.length > 0) screen.classList.add('rail-on');
-    else screen.classList.remove('rail-on');
-    for (var i = 0; i < items.length && i < 4; i += 1) {
-      var chip = document.createElement('div');
-      chip.className = 'pending-chip';
-      chip.dataset.sessionId = items[i].sessionId;
-      var name = document.createElement('div');
-      name.className = 'pending-name';
-      name.textContent = fitTextPx(items[i].title || items[i].sessionId, 48, 11);
-      var sub = document.createElement('div');
-      sub.className = 'pending-sub';
-      var dot = document.createElement('span');
-      dot.className = 'pending-dot';
-      sub.appendChild(dot);
-      sub.appendChild(document.createTextNode('新回复'));
-      chip.appendChild(name);
-      chip.appendChild(sub);
-      rail.appendChild(chip);
-    }
-    if ((payload.pendingCount || items.length) > items.length) {
-      var more = document.createElement('div');
-      more.className = 'pending-more';
-      more.textContent = '+' + ((payload.pendingCount || items.length) - items.length);
-      rail.appendChild(more);
-    }
-  }
-
   /**
    * 绑定信息：本轮从右下角搬到回答屏顶行末尾（用户 2026-11-08 确认）。文字内容取的还是本来那一套
    * 状态——state.sessionBound 决定出不出，内容用 state.boundProject（项目名优先）→ state.sessionTitle →
@@ -642,20 +494,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
    * 只用在回答屏（reply 分支，见 replyStageText / bindTailOf）：首页顶行仍是上一轮的加粗时钟 + 三格信号柱，
    * 状态屏顶行也不加绑定信息；右下角那个角落提示什么都不显示（CSS display:none + 不写任何文字）。
    */
-  function bindLabelOf() {
-    return state.sessionBound
-      ? ('已绑定：' + (state.boundProject || state.sessionTitle || '未命名会话'))
-      : '';
-  }
-  function updateScrollHint() {
-    // 角落提示不再显示任何东西（CSS .scroll-hint 也已 display:none）；绑定文字改由回答屏顶行排
-    $('scrollHint').textContent = '';
-  }
   function renderActions() {
     var bar = $('actionBar');
     bar.innerHTML = '';
     var actions = state.actions || [];
-    // 5 个按钮（停止/重读/主页/上一条/下一条）时收小字号，304px 内挤得下、不换行。
+    // 按钮多（>3 个）时收小字号，304px 内挤得下、不换行。
     bar.className = actions.length > 3 ? 'action-bar many' : 'action-bar';
     for (var i = 0; i < actions.length; i += 1) {
       var button = document.createElement('button');
@@ -664,108 +507,19 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       bar.appendChild(button);
     }
   }
-  function renderRunning() {
-    var list = $('runList');
-    var screen = $('screen');
-    list.innerHTML = '';
-    var rows = state.running || [];
-    for (var i = 0; i < rows.length; i += 1) {
-      var row = document.createElement('div');
-      row.className = 'run-row';
-      row.setAttribute('data-session', rows[i].sessionId);
-      var dot = document.createElement('span');
-      dot.className = 'dot';
-      var text = document.createElement('span');
-      text.className = 't';
-      text.textContent = rows[i].title;
-      var go = document.createElement('span');
-      go.className = 'go';
-      go.textContent = '切换';
-      row.appendChild(dot);
-      row.appendChild(text);
-      row.appendChild(go);
-      list.appendChild(row);
-    }
-    if (rows.length) screen.classList.add('run-on'); else screen.classList.remove('run-on');
-  }
-  /* stage 行可用宽：气泡轨占掉屏右侧 64px，stage 那行也得让开（rail-on 时 240，否则 304）。 */
+  /* stage 行可用宽：屏宽减去左右内边距（320 − 2×8 = 304）。 */
   function stageWidthPx() {
     var width = (SCREEN.widthPx || 320) - 2 * (SCREEN.paddingPx || 8);
-    return state.pending && state.pending.length > 0 ? Math.min(width, width - 64) : width;
-  }
-  /** 估算一行文本的渲染宽度（与 fitTextPx 同一套字宽估算）。 */
-  function textWidthPx(text, fontPx) {
-    var chars = Array.from(String(text || ''));
-    var used = 0;
-    for (var i = 0; i < chars.length; i += 1) {
-      var code = chars[i].codePointAt(0) || 0;
-      var wide = (code >= 0x2e80 && code <= 0xa4cf) || (code >= 0xff00 && code <= 0xff60) || (code >= 0x1f300 && code <= 0x1faff);
-      used += (wide ? 1 : 0.47) * fontPx;
-    }
-    return used;
-  }
-  /** stage 行 = 文案 + 尾巴：超宽就裁文案、保住尾巴（方案 B 要求位置一定看得见）。 */
-  function stageWithTail(body, tail, fontPx) {
-    if (tail === '') return fitTextPx(body, stageWidthPx(), fontPx);
-    var room = Math.max(1, stageWidthPx() - textWidthPx(tail, fontPx));
-    var shown = body === '' ? '' : fitTextPx(body, room, fontPx);
-    return shown === '' ? tail : shown + tail;
+    return width;
   }
   /**
    * stage 那一行的 letter-spacing（CSS「#screen .stage { … letter-spacing:1px 」同一个数字）：
-   * 尾巴越接越长（本轮又接了「· 已绑定：…」），只按字宽量会撑过 304/240，所以量这一行要带上它。
-   * （首页顶行那套常量——柱宽 5、柱间隙 2、行间隙 8——本轮没有变，还是和 CSS 一模一样。）
+   * 只按字宽量会撑过 304，所以量这一行要带上它。
    */
   var STAGE_LETTER_SPACING_W = 1;
-  /** 按 stage 行算宽：字宽估算 + 每格 1px 的 letter-spacing。 */
-  function stageTextWidthPx(text, fontPx) {
-    return textWidthPx(text, fontPx) + Array.from(String(text || '')).length * STAGE_LETTER_SPACING_W;
-  }
-  /** stage 行专用的截断：和 fitTextPx 同规则（超宽才省略），但每格带上 letter-spacing，算出来的行宽就是渲染行宽。 */
-  function stageFitPx(text, width, fontPx) {
-    var chars = Array.from(String(text || ''));
-    var out = '';
-    var used = 0;
-    for (var i = 0; i < chars.length; i += 1) {
-      var code = chars[i].codePointAt(0) || 0;
-      var wide = (code >= 0x2e80 && code <= 0xa4cf) || (code >= 0xff00 && code <= 0xff60) || (code >= 0x1f300 && code <= 0x1faff);
-      var w = (wide ? 1 : 0.47) * fontPx + STAGE_LETTER_SPACING_W;
-      if (used + w > width) return out === '' ? '…' : out + '…';
-      out += chars[i];
-      used += w;
-    }
-    return out;
-  }
-  /**
-   * stage 行 = 文案 + 必保尾巴（窗口位置数字）+ 可选尾巴（已绑定信息）。溢出时的优先顺序
-   * （用户 2026-11-08 确认）：先裁文案，「1/5」数字和「已绑定：…」两个尾巴都保住；两个尾巴
-   * 自己就撑满一整行时，才用省略号裁绑定文字（位置数字永不被动）。
-   * 这一行 CSS 是 white-space:nowrap + overflow:hidden，绝不换行；宽度全由这里定量算掉
-   * （letter-spacing 也计入，整行渲染宽保证不超过 304 / rail-on 240）。
-   */
-  function stageWithTails(body, keepTail, optionalTail, fontPx) {
-    var available = stageWidthPx();
-    var optional = optionalTail || '';
-    if (optional === '') return stageWithTail(body, keepTail, fontPx);   /* 未绑定：上一轮方案 B 原样 */
-    var keepW = stageTextWidthPx(keepTail, fontPx);
-    var optW = stageTextWidthPx(optional, fontPx);
-    if (keepW + optW <= available) {
-      // 两个尾巴都保：只裁文案
-      var room = Math.max(1, available - keepW - optW);
-      var shown = body === '' ? '' : stageFitPx(body, room, fontPx);
-      return shown === '' ? keepTail + optional : shown + keepTail + optional;
-    }
-    // 尾巴自己就超宽：先裁文案保住位置数字，剩下的宽度才给绑定文字上省略号
-    var base = body === '' ? '' : stageFitPx(body, Math.max(1, available - keepW), fontPx);
-    base = base === '' ? keepTail : base + keepTail;
-    var room = Math.max(0, available - stageTextWidthPx(base, fontPx));
-    if (room < stageTextWidthPx('…', fontPx)) return base;
-    return base + stageFitPx(optional, room, fontPx);
-  }
   /**
    * 首页顶行的尺寸常量：必须和 CSS「#screen .home-top .signal」那三条规则一模一样
    * （柱宽 5px × 3、柱间隙 2px × 2、时间与图标间隙 8px）。
-   * 可用宽度取 stageWidthPx()：有气泡轨时 240，没有时 304，两种都要排得下。
    */
   var SIGNAL_BAR_W = 5;
   var SIGNAL_GAP_W = 2;
@@ -788,58 +542,35 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.connState = next;
     renderHomeTop();
   }
-  function connClassOf() {
-    if (state.connState === 'online') return 'conn-online';
-    if (state.connState === 'offline') return 'conn-offline';
-    return 'conn-connecting';
-  }
-  /** 首页顶行：时钟 + 信号柱，整行宽度和 stage 同一套可用宽（rail-on 240 / 否则 304）。
-   *  棋盘模式（屏 1）这一行改成右对齐的三段计数「●2 在跑 ●1 等你 ●1 排队」（设计 §8.3）。 */
+  /** 顶行：本地时钟 HH:MM + 棋盘右端三段计数 / 信号柱（页面自己画，不读宿主帧）。 */
   function renderHomeTop() {
-    var signal = $('homeSignal');
-    if (signal) signal.className = 'signal ' + connClassOf();
     var clock = $('homeClock');
-    if (!clock) return;
-    // 左上角始终是本地时钟（HH:MM，随分钟刷新）；棋盘三段计数挪到右端。
-    clock.textContent = fitTextPx(clockText(), Math.max(1, stageWidthPx() - 176 - HOME_TOP_GAP_W), SCREEN.stageFontPx || 12);
+    if (clock) clock.textContent = clockText();
     var counts = $('boardCounts');
     if (counts) {
       counts.textContent = state.screenMode === 'board' ? fitTextPx(boardCountsText(state.board && state.board.counts), 170, 11) : '';
     }
   }
-  /**
-   * 朗读屏 stage 行（方案 B + 本轮绑定信息）：文案不动，末尾追加「· 窗口起始行/总行」，
-   * 再接「· 已绑定：<项目名>」。左边的数字取宿主 scroll.offset（绝对窗口起始行，宿主按
-   * scrollOffset 切好可视窗口），右边的数字取宿主新加的 scroll.total（整段回复折完的总行）。
-   * 绑定文字是页面侧已有的那份状态（bindLabelOf），宿主 lane 不为它新增协议字段或消息类型。
-   * 首页顶行（加粗时钟 + 三格信号柱）与状态屏顶行都不加绑定信息。
-   */
-  function bindTailOf() {
-    var label = bindLabelOf();
-    return label === '' ? '' : ' · ' + label;
-  }
-  function replyStageText(payload) {
-    var reply = payload.reply || {};
-    var scroll = reply.scroll || {};
-    var offset = Number(scroll.offset);
-    if (!Number.isFinite(offset) || offset < 0) offset = 0;
-    var delivered = Array.isArray(reply.lines) ? reply.lines.length : 0;
-    var total = Number(scroll.total);
-    if (!Number.isFinite(total) || total < offset + delivered) total = offset + delivered;
-    // 完成播报不显示「第 x/y 段」位置；改由 stage 右端带「另有 N 条」。
-    var position = reply.noPosition === true ? '' : ' · ' + (offset + 1) + '/' + total;
-    var more = payload.more && payload.more.text ? ' · ' + payload.more.text : '';
-    // 完成屏右上让给朗读波形，不再接「已绑定」尾巴（图 3 的完成 stage 只留位置/另有）。
-    var bindTail = payload.stage === '完成' ? '' : bindTailOf();
-    return stageWithTails(String(payload.stage || '回答中'), position + more, bindTail, SCREEN.stageFontPx || 12);
-  }
   /** 主页底部翻页条：‹ 上一页 / 第 x/y 页 / › 下一页；越界的一侧置灰（点它宿主也不动页码）。 */
+  /* ---------- 任务棋盘（屏 1）：一行一任务 ----------
+   * 版式照设计：顶行三段计数（●N 在跑 ●N 等你 ●N 排队）→ 5 行任务 → 底部翻页。
+   * 每行只说三件事：状态胶囊（文字）、任务名、副行「项目 · 第 N 步」＋右侧时长环。
+   * 待决策行右侧是琥珀问号（不显示时长）；同一项目连续多条折叠成「+N 条」。
+   * 没有任务时是**同一张棋盘的另一种脸**（空态），不另开一屏。
+   */
   function renderHomePager(payload) {
     var pager = $('homePager');
     var home = payload.home || {};
     var page = home.page || { index: 0, total: 1 };
     var total = Number(page.total);
     if (!Number.isFinite(total) || total < 1) total = 1;
+    // 只有一页时不显示翻页条（避免屏底留一排无效箭头/页码）。
+    if (total <= 1) {
+      pager.innerHTML = '';
+      pager.style.display = 'none';
+      return;
+    }
+    pager.style.display = 'flex';
     var index = Number(page.index);
     if (!Number.isFinite(index) || index < 0) index = 0;
     if (index > total - 1) index = total - 1;
@@ -865,6 +596,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
    * 待决策行右侧是琥珀问号（不显示时长）；同一项目连续多条折叠成「+N 条」。
    * 没有任务时是**同一张棋盘的另一种脸**（空态），不另开一屏。
    */
+
   function boardCountsText(counts) {
     var c = counts || {};
     // 三段计数**始终都在**（空盘也要看到三个 0）：设计 §8「顶行三段计数归零」，
@@ -887,15 +619,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.board = board;
     state.screenMode = 'board';
     state.hostAlert = false;
-    state.reply = null;
     state.highlightLock = false;
     state.actions = [];
-    state.running = [];
     renderActions();
-    renderRunning();
     $('stage').style.display = 'none';
     $('stage').textContent = '';
-    $('replyBody').innerHTML = '';
     var clock = $('homeClock');
     if (clock) renderHomeTop();
     renderHomePager({ home: { page: board.page || { index: 0, total: 1 } } });
@@ -981,8 +709,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       item.appendChild(row2);
       body.appendChild(item);
     }
-    applyScreenClass('board-mode' + (state.pending && state.pending.length ? ' rail-on' : ''));
-    updateScrollHint();
+    applyScreenClass('board-mode');
   }
 
   /* 派单回执的三拍圆点：已入队 / 排队 N 个 / 开始跑（圆点由 CSS 画，文字给状态） */
@@ -1040,10 +767,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
 
   function renderScreen(payload) {
     var screen = $('screen');
-    renderPending(payload || {});
-    updateScrollHint();
     // 收到任何一帧都顺手重画顶行（时钟本来每秒 tick，这里再补一次保证同一帧里不会花掉）。
     renderHomeTop();
+    // 2026-11-09：旧主页与旧回答屏整体删除；宿主也不会再发这两种帧。
+    // 宿主不会再发这两种帧；万一收到也直接忽略，屏上只认新七屏。
+    if (payload && (payload.mode === 'home' || payload.mode === 'reply') && !payload.board) return;
     // 回执/待决策的附加块每帧先收掉，只有本帧带了才重画（否则上一帧的圆点/倒计时会留在屏上）。
     renderSteps(payload && payload.steps);
     renderCountdown(payload && payload.countdown);
@@ -1052,88 +780,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       renderBoard(payload);
       return;
     }
-    if (payload && payload.mode === 'home' && payload.home) {
-      state.screenMode = 'home';
-      state.hostAlert = false;
-      state.reply = null;
-      state.highlightLock = false;
-      // 首页最上方那一行现在由页面自己负责：本地时钟 HH:MM + 三格信号柱。
-      // 宿主 home 帧的 stage 已经空着（不再写「项目 N 个 · 第 x/y 页」），那一行在 home-mode 收掉；
-      // 「项目 N 个」总数整段删除、不挪到屏内别的地方；状态屏 / 回答屏的 stage 行保持原样。
-      $('stage').style.display = 'none';
-      $('stage').textContent = '';
-      renderHomeTop();
-      renderHomePager(payload);
-      $('replyBody').innerHTML = '';
-      var homeBody = $('homeBody');
-      homeBody.innerHTML = '';
-      var projects = payload.home.projects || [];
-      // 首页顶部「最近回答 · 会话名」：只有该会话存了回复才显示（点它回到那条回答的朗读屏）。
-      var recent = payload.home.recent;
-      if (recent && recent.sessionId) {
-        var recentRow = document.createElement('div');
-        recentRow.className = 'home-recent';
-        recentRow.id = 'homeRecent';
-        recentRow.setAttribute('data-session', recent.sessionId);
-        var railOn = state.pending && state.pending.length > 0;
-        recentRow.textContent = fitTextPx('最近回答 · ' + (recent.title || '最近会话'), railOn ? 232 : 292, 13);
-        homeBody.appendChild(recentRow);
-      }
-      state.homeProjects = projects;
-      state.actions = [];
-      state.running = [];
-      renderActions();
-      renderRunning();
-      for (var pi = 0; pi < projects.length; pi += 1) {
-        var project = projects[pi];
-        var item = document.createElement('div');
-        item.className = 'home-item';
-        if (project.sessionId) item.setAttribute('data-session', project.sessionId);
-        if (project.name) item.setAttribute('data-project', project.name);
-        var row1 = document.createElement('div');
-        row1.className = 'home-row1';
-        var dot = document.createElement('span');
-        dot.className = 'home-dot ' + (project.status || 'idle');
-        var name = document.createElement('span');
-        name.className = 'name';
-        name.textContent = project.name;
-        row1.appendChild(dot);
-        row1.appendChild(name);
-        var row2 = document.createElement('div');
-        row2.className = 'home-row2';
-        row2.textContent = project.summary || '';
-        item.appendChild(row1);
-        item.appendChild(row2);
-        homeBody.appendChild(item);
-      }
-      // 保留 rail-on：renderPending 刚按本帧 pending 加上的类不能被整串覆盖（气泡轨要一直可见）。
-      applyScreenClass('home-mode' + (state.pending && state.pending.length ? ' rail-on' : ''));
-      updateScrollHint();
-      return;
-    }
-    if (payload && payload.mode === 'reply' && payload.reply) {
-      state.screenMode = 'reply';
-      state.hostAlert = payload.tone === 'alert';
-      var lockedIndex = state.highlightLock && state.reply ? state.reply.currentIndex : null;
-      state.reply = payload.reply;
-      if (lockedIndex !== null && payload.reply.sentences.some(function (s) { return s.index === lockedIndex; })) {
-        state.reply.currentIndex = lockedIndex;
-      }
-      if (typeof payload.reply.charPos === 'number') state.replyCharPos = payload.reply.charPos;
-      // 朗读屏 stage 行末尾追加窗口位置（方案 B）：底部不加指示条，那个挡过主页按钮的角落提示仍保持删掉。
-      $('stage').style.display = '';
-      $('stage').textContent = replyStageText(payload);
-      applyScreenClass((payload.tone || 'ok') + ' reply-mode' + (state.pending && state.pending.length ? ' rail-on' : '') + (payload.stage === '完成' ? ' done-mode' : ''));
-      renderReply();
-      state.running = [];
-      renderRunning();
-      state.actions = payload.actions || [];
-      renderActions();
-      applyAudioRecovery();
-      return;
-    }
     state.screenMode = 'status';
-    state.reply = null;
     state.hostAlert = payload.tone === 'alert';
     // 严格按 320×240 规格排版：stage ≤10、标题 ≤28 且单行、正文最多 3 行 ×18 字。
     // 多出来的内容留在事件区，屏幕上不允许出现半行或滚动条。
@@ -1194,12 +841,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       }
       list.appendChild(li);
     }
-    $('replyBody').innerHTML = '';
     state.actions = Array.isArray(payload.actions) ? payload.actions : [];
-    applyScreenClass((payload.tone || 'idle') + (state.pending && state.pending.length ? ' rail-on' : '') + (state.actions.length ? ' has-actions' : '') + (String(payload.stage || '').indexOf('待决策') === 0 ? ' awaiting-mode' : '') + (payload.stage === '追问' ? ' ask-mode' : '') + (payload.stage === '进度' ? ' detail-mode' : ''));
+    applyScreenClass((payload.tone || 'idle') + (state.actions.length ? ' has-actions' : '') + (String(payload.stage || '').indexOf('待决策') === 0 ? ' awaiting-mode' : '') + (payload.stage === '追问' ? ' ask-mode' : '') + (payload.stage === '进度' ? ' detail-mode' : ''));
     renderActions();
-    state.running = payload.running || [];
-    renderRunning();
     var progress = payload.progress;
     if (progress && typeof progress.done === 'number') {
       $('progress').textContent = progress.total ? (progress.done + '/' + progress.total) : String(progress.done);
@@ -1209,40 +853,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   }
 
   /* reply 模式渲染：句子窗口 → 按 304/240 像素折行 → 可视 7 行（末行下留一整行安全高度），当前句反色。 */
-  function renderReply() {
-    var reply = state.reply;
-    var body = $('replyBody');
-    if (!reply || !Array.isArray(reply.sentences)) return;
-    var lines = [];
-    if (Array.isArray(reply.lines) && reply.lines.length) {
-      for (var li = 0; li < reply.lines.length; li += 1) {
-        lines.push({ text: reply.lines[li].text, index: reply.lines[li].sentenceIndex });
-      }
-    } else {
-      var contentWidth = (SCREEN.widthPx || 320) - 2 * (SCREEN.paddingPx || 8) - 4;
-      for (var i = 0; i < reply.sentences.length; i += 1) {
-        var sentence = reply.sentences[i];
-        var wrapped = wrapPx(sentence.text || '', contentWidth, SCREEN.bodyFontPx || 16);
-        for (var w = 0; w < wrapped.length; w += 1) lines.push({ text: wrapped[w], index: sentence.index });
-      }
-    }
-    var current = typeof reply.currentIndex === 'number' ? reply.currentIndex : 0;
-    var visible = SCREEN.replyVisibleLines;
-    var highlight = state.audioStarted || reply.highlightCurrent === true;
-    var currentLine = 0;
-    for (var j = 0; j < lines.length; j += 1) { if (lines[j].index === current) { currentLine = j; break; } }
-    // 宿主已经按 scrollOffset 切好可视窗口，页面直接渲染，不再自行居中。
-    var start = 0;
-    body.innerHTML = '';
-    for (var k = start; k < Math.min(start + visible, lines.length); k += 1) {
-      var div = document.createElement('div');
-      div.className = 'reply-line' + (highlight && lines[k].index === current ? ' cur' : '');
-      div.textContent = lines[k].text;
-      body.appendChild(div);
-    }
-    // 角落不再显示还剩几行的提示，它挡住了主页按钮（可视窗口由宿主 scrollOffset 决定）
-  }
-
   function addEvent(kind, text) {
     var row = document.createElement('div');
     row.className = kind;
@@ -1255,263 +865,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
    * 模式判定**只认宿主返回的 agentPreset**（投影 agentPreset，回退 header），
    * 不靠标题猜。宿主只下发 CU 会话；非 CU 会话在页面上只能是「当前（不可用）」灰色行。
    */
-  function sessionLabel() {
-    if (state.sessionTitle) return state.sessionTitle;
-    return state.sessionId ? shortId(state.sessionId) : '';
-  }
-  function requestSessions() {
-    if (!state.ws || state.ws.readyState !== 1) return;
-    state.listLoaded = false;
-    state.querying = true;
-    renderSessionList();
-    send('sessions.query', { limit: 20, checkId: state.sessionId || undefined });
-  }
-  function setComputerUseNotice(ok, preset) {
-    state.computerUse = ok;
-    state.sessionPreset = preset || '';
-    var warn = $('cuWarn');
-    if (ok === false) {
-      warn.textContent = '⚠ 这条会话不是 Computer Use 模式'
-        + (state.sessionPreset ? '（' + state.sessionPreset + '）' : '')
-        + '：无法看屏/点按。请从下面换一个 Computer Use 会话。';
-    } else {
-      warn.textContent = '';
-    }
-  }
-  function renderSessionBar() {
-    var label = sessionLabel();
-    var modeText = state.mode === 'auto' ? '（自动）' : state.mode === 'unified' ? '（统一指挥）' : '（手动）';
-    if (state.sessionBound) {
-      $('sessNow').textContent = '当前会话：' + label + modeText;
-      $('sessNow').className = 'sess-now' + (state.computerUse === false ? ' bad' : '');
-      $('sessLine').textContent = '当前会话：' + label + modeText;
-      $('sessLine').className = 'device-caption' + (state.computerUse === false ? ' bad' : '');
-    } else if (state.sessionId) {
-      $('sessNow').textContent = '正在确认会话 ' + shortId(state.sessionId) + '…';
-      $('sessNow').className = 'sess-now';
-      $('sessLine').textContent = '当前会话：确认中' + modeText;
-      $('sessLine').className = 'device-caption none';
-    } else {
-      $('sessNow').textContent = state.mode === 'auto'
-        ? '正在自动绑定最近活跃的 Computer Use 会话…'
-        : state.mode === 'unified'
-          ? '正在建立统一指挥（任务棋盘）…'
-          : '还没有选定会话，点下面选一个';
-      $('sessNow').className = 'sess-now none';
-      $('sessLine').textContent = '当前会话：未选定' + modeText;
-      $('sessLine').className = 'device-caption none';
-    }
-    $('sessSwitch').style.display = state.sessionBound ? '' : 'none';
-    $('sessSwitch').textContent = state.showList ? '收起会话列表' : '换个会话';
-    $('sessAuto').style.display = (state.sessionBound && state.mode === 'manual') ? '' : 'none';
-    $('sessList').style.display = (state.sessionBound && !state.showList && state.computerUse !== false) ? 'none' : 'flex';
-    $('cuWarn').style.display = state.computerUse === false ? 'block' : 'none';
-  }
-  function renderSessionList() {
-    var box = $('sessList');
-    box.innerHTML = '';
-    // 当前绑定的非 CU 会话：置灰保留（用户可能从 ?session= 显式指定），不可点。
-    if (state.sessionBound && state.computerUse === false && state.sessionId) {
-      var current = document.createElement('div');
-      current.className = 'sess-item off';
-      var currentTitle = document.createElement('span');
-      currentTitle.className = 't';
-      currentTitle.textContent = (state.sessionTitle || ('会话 ' + shortId(state.sessionId))) + '（当前）';
-      var currentMeta = document.createElement('span');
-      currentMeta.className = 'm';
-      currentMeta.textContent = '非 Computer Use，语音操作不可用';
-      current.appendChild(currentTitle);
-      current.appendChild(currentMeta);
-      box.appendChild(current);
-    }
-    if (!state.sessions.length) {
-      var note = document.createElement('div');
-      note.className = 'hint';
-      note.textContent = state.listLoaded
-        ? (state.cuTotal === 0
-            ? '还没有 Computer Use 模式会话：先在桌面端新建一个 Computer Use 模式会话，再回来点「刷新会话列表」。'
-            : '最近会话里没有 Computer Use 模式（共 ' + state.total + ' 条）：请刷新，或新建一个 CU 会话。')
-        : '正在读取会话列表…';
-      box.appendChild(note);
-      return;
-    }
-    state.sessions.forEach(function (row) {
-      var item = document.createElement('button');
-      item.className = 'sess-item' + (row.sessionId === state.sessionId ? ' on' : '');
-      var title = document.createElement('span');
-      title.className = 't';
-      title.textContent = row.title || ('会话 ' + shortId(row.sessionId));
-      var meta = document.createElement('span');
-      meta.className = 'm';
-      meta.textContent = 'Computer Use · ' + (row.live ? '桌面打开中' : '未打开') + ' · ' + shortId(row.sessionId);
-      item.appendChild(title);
-      item.appendChild(meta);
-      item.onclick = function () { chooseSession(row.sessionId, row.title || ''); };
-      box.appendChild(item);
-    });
-  }
-  function chooseSession(sessionId, title) {
-    if (!sessionId) return;
-    // 显式点选 = 离开统一指挥（老逃生口）：之后的绑定都按手动会话算。
-    state.bindIntent = 'manual';
-    state.mode = 'manual';
-    state.sessionId = sessionId;
-    state.sessionTitle = title || '';
-    state.showList = false;
-    renderSessionBar();
-    renderSessionList();
-    addEvent('progress', '正在绑定 Computer Use 会话 ' + shortId(sessionId) + '…');
-    send('session.bind', { sessionId: sessionId });
-  }
-  function checkedTitle(sessionId) {
-    for (var i = 0; i < state.sessions.length; i += 1) {
-      if (state.sessions[i].sessionId === sessionId && state.sessions[i].title) return state.sessions[i].title;
-    }
-    return '';
-  }
   /** 手动会话失效 / 不是 CU：按优先级回落到「自动绑定最近活跃 CU」。 */
-  function fallbackToAuto(reason) {
-    state.sessionId = '';
-    state.sessionTitle = '';
-    state.sessionBound = false;
-    state.sessionSource = '';
-    state.computerUse = null;
-    state.sessionPreset = '';
-    state.mode = 'auto';
-    rememberSessionId('');
-    setComputerUseNotice(null, '');
-    state.showList = true;
-    $('sessHint').textContent = reason + '已改为自动绑定最近活跃的 Computer Use 会话。';
-    addEvent('alert', reason + '已改为自动绑定');
-    renderSessionBar();
-    renderSessionList();
-    if (state.ws && state.ws.readyState === 1) send('session.bind', { auto: true });
-  }
-  function handleSessionList(payload) {
-    state.sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
-    state.listLoaded = true;
-    state.querying = false;
-    state.cuTotal = typeof payload.cuTotal === 'number' ? payload.cuTotal : state.sessions.length;
-    state.total = typeof payload.total === 'number' ? payload.total : state.cuTotal;
-
-    var check = payload.check;
-    if (state.sessionId && check && check.sessionId === state.sessionId) {
-      // 不存在：可读提示 + 回落到自动（不白屏）。
-      if (check.found === false) {
-        handleSessionInvalid({
-          sessionId: state.sessionId,
-          reason: '会话 ' + shortId(state.sessionId) + ' 不在宿主会话列表里（可能已归档或删除）。'
-        });
-        return;
-      }
-      var cu = check.computerUse === true;
-      // 统一指挥：绑的是「鹈鹕指挥台」（standard），它不是 CU，也永远不算失效；
-      // 这里一个分支都不能走，否则一次列表刷新就把屏打回旧会话 / 自动跟随。
-      if (state.mode !== 'unified') {
-        if (state.sessionSource === 'url') {
-          // ?session= 显式指定 —— 允许绑定非 CU，但必须显著提示（宿主同时下发红色屏帧）。
-          setComputerUseNotice(cu, check.preset);
-        } else if (!cu) {
-          // 上次记住的会话已经不是 CU / 不是 CU：按优先级回落到自动。
-          fallbackToAuto('上次记住的会话不是 Computer Use 模式。');
-          return;
-        } else if (!state.sessionBound) {
-          // 仍是 CU：页面先确认，再让宿主绑定（手动）。
-          chooseSession(state.sessionId, checkedTitle(state.sessionId) || state.sessionTitle);
-          return;
-        } else {
-          setComputerUseNotice(true, check.preset);
-        }
-      }
-    }
-
-    if (state.sessionId && state.sessionBound) {
-      var title = checkedTitle(state.sessionId);
-      if (title) state.sessionTitle = title;
-    }
-    renderSessionBar();
-    renderSessionList();
-    if (!state.sessionBound && state.listLoaded && state.mode !== 'unified') {
-      $('sessHint').textContent = state.cuTotal === 0
-        ? '没有可自动绑定的 CU 会话：先在桌面端新建一个 Computer Use 模式会话，再点「刷新会话列表」。'
-        : '列表只显示 Computer Use 模式会话；自动模式会跟随最近活跃的一条，手动选一次就以手动为准。';
-    }
-  }
-  function handleSessionBound(payload) {
-    if (!payload || !payload.sessionId) return;
-    var auto = payload.auto === true;
-    // 统一指挥：这次绑定是页面主动发裸 hello 换来的（宿主绑的是唯一指挥会话）。
-    // 它既不是「自动跟随」，也不是用户挑的那条会话 —— 重连时必须继续发裸 hello，
-    // 一旦把它当手动会话回传 sessionId，宿主就退回老路径（device.unified=false）。
-    var unified = !auto && state.bindIntent === 'unified';
-    state.bindIntent = '';
-    var previousAuto = auto ? state.lastAutoId : '';
-    state.mode = auto ? 'auto' : unified ? 'unified' : 'manual';
-    state.sessionId = payload.sessionId;
-    state.sessionTitle = payload.title || state.sessionTitle || '';
-    state.boundProject = payload.project || '';
-    state.sessionBound = true;
-    state.showList = false;
-    var cu = payload.computerUse === true;
-    if (unified) {
-      // 指挥会话是 standard 模式，本来就不看屏/不点鼠标：不按「非 CU」告警，也不记 id
-      //（记了下次开机就会被它按 origin 绑死，默认入口又回不到棋盘）。
-      setComputerUseNotice(null, payload.preset);
-    } else {
-      setComputerUseNotice(cu, payload.preset);
-      // 自动绑定只更新展示，不删除上次手动记忆；显式「恢复自动」才由对应按钮清除。
-      if (!auto && cu) rememberSessionId(payload.sessionId);
-    }
-    if (auto) {
-      state.lastAutoId = payload.sessionId;
-      rememberAutoSessionId(payload.sessionId);
-    }
-    renderSessionBar();
-    renderSessionList();
-    var followed = auto && (payload.followed === true || (previousAuto !== '' && previousAuto !== payload.sessionId));
-    if (followed) {
-      $('sessHint').textContent = '已自动跟随到：' + sessionLabel()
-        + '（' + (payload.live ? '桌面正开着' : '未打开') + '）。';
-      addEvent('done', '已自动跟随到：' + sessionLabel());
-      return;
-    }
-    if (unified) {
-      $('sessHint').textContent = '统一指挥已就绪：说一句话就派单，屏上是任务棋盘；要看某条会话用下面的「换个会话」。';
-      addEvent('done', '统一指挥已就绪：' + sessionLabel());
-      return;
-    }
-    $('sessHint').textContent = cu
-      ? (auto
-          ? '已自动绑定最近活跃的 Computer Use 会话；桌面端切到别的 CU 会话时会自动跟随。'
-          : (payload.live
-              ? '已手动绑定 Computer Use 会话，桌面正开着它。'
-              : '已手动绑定 CU 会话；它当前没在桌面打开，语音注入前先在桌面打开。'))
-      : '已绑定，但这条不是 Computer Use 模式：无法看屏/点按，请换一个 CU 会话。';
-    addEvent(cu ? 'done' : 'alert',
-      (cu ? (auto ? '已自动绑定：' : '已绑定会话：') : '已绑定非 CU 会话：') + sessionLabel());
-  }
-  function handleSessionInvalid(payload) {
-    if (!payload) return;
-    if (state.sessionId === payload.sessionId) {
-      state.sessionId = '';
-      state.sessionTitle = '';
-      state.sessionBound = false;
-      if (storedSessionId() === payload.sessionId) rememberSessionId('');
-    }
-    if (state.mode === 'unified') {
-      // 统一指挥下面没有「退回自动跟随」这条路：指挥会话丢了就再发一次裸 hello，
-      // 宿主会重建/复用「鹈鹕指挥台」，屏还是任务棋盘。
-      state.bindIntent = 'unified';
-      state.showList = false;
-      addEvent('alert', payload.reason || '指挥会话不见了，正在重新建立');
-      if (state.ws && state.ws.readyState === 1) sendHello('', false);
-      renderSessionBar();
-      return;
-    }
-    addEvent('alert', payload.reason || ('会话 ' + shortId(payload.sessionId) + ' 不存在，已改为自动绑定'));
-    fallbackToAuto(payload.reason || ('会话 ' + shortId(payload.sessionId) + ' 不存在。'));
-  }
-
   /* ---------- 本地 TTS（PCM）播放 ----------
      sidecar 以 24kHz/pcm16 流式下发，页面用 WebAudio 无缝排队拼接。
      页面只播放宿主合成的 PCM（edge 云健 / Qwen GPU），不再使用浏览器语音。 */
@@ -1557,11 +911,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function applyAudioRecovery() {
     if (!state.droppedAudio || state.hostAlert) return;
     var message = audioRunning(state.audioCtx) ? '声音已启用 · 点重读' : '点屏启用声音 · 解锁后点重读';
-    if (state.screenMode === 'reply' && state.reply) {
-      $('stage').style.display = '';
-      $('stage').textContent = replyStageText({ stage: message, reply: state.reply });
-      $('screen').className = 'alert reply-mode' + (state.pending && state.pending.length ? ' rail-on' : '');
-    } else if (state.screenMode === 'status') {
+    if (state.screenMode === 'status') {
       $('stage').style.display = '';
       $('stage').textContent = clipScreen(message, SCREEN.stageChars);
       $('screen').classList.add('alert');
@@ -1620,63 +970,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         if (state.audioCtx && state.pcmNextTime <= state.audioCtx.currentTime + 0.05) state.highlightLock = false;
       };
       // 重读缓存（本轮完整 PCM）；试听音频不进缓存（否则下次「重读」会念成试听句）。
-      if (cache !== false) state.turnPcm.push(samples);
       return { startAt: startAt, duration: buffer.duration };
     } catch (e) { markAudioDropped(); /* 解码失败：屏内保留重读恢复 */ }
     return null;
   }
   /** 按真实播放时刻切换当前句：不再用 tts.audio 到达即跳。 */
-  function scheduleHighlight(charStart, startAt) {
-    if (typeof charStart !== 'number' || !state.reply || !Array.isArray(state.reply.sentences)) return;
-    var ctx = state.audioCtx;
-    if (!ctx) return;
-    state.highlightLock = true;
-    var delay = Math.max(0, (startAt - ctx.currentTime) * 1000);
-    setTimeout(function () {
-      state.audioStarted = true;
-      if (!state.reply) return;
-      for (var i = 0; i < state.reply.sentences.length; i += 1) {
-        var sentence = state.reply.sentences[i];
-        if (charStart >= sentence.start && charStart < sentence.end) {
-          state.reply.currentIndex = sentence.index;
-          renderReply();
-          return;
-        }
-      }
-    }, delay);
-  }
-  function resetTurnAudio() {
-    stopPcm();
-    clearInterval(state.replyTimer);
-    state.replyTimer = 0;
-    state.ttsTurnTexts = [];
-    state.ttsAudioSeen = {};
-    state.turnPcm = [];
-    state.highlightLock = false;
-    state.audioStarted = false;
-    state.droppedAudio = false;
-  }
-  function replayPcm() {
-    var chunks = state.turnPcm;
-    if (!chunks.length) return false;
-    stopPcm();
-    var ctx = ensureAudio();
-    if (!ctx) return false;
-    var when = ctx.currentTime + 0.05;
-    for (var i = 0; i < chunks.length; i += 1) {
-      var buffer = ctx.createBuffer(1, chunks[i].length, 24000);
-      buffer.copyToChannel(chunks[i], 0);
-      var source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(ctx.destination);
-      source.start(when);
-      when += buffer.duration;
-      state.pcmSources.push(source);
-      (function (src) { src.onended = function () { var at = state.pcmSources.indexOf(src); if (at >= 0) state.pcmSources.splice(at, 1); }; })(source);
-    }
-    state.pcmNextTime = when;
-    return true;
-  }
   /** 试听提示音：0.6 秒 440Hz 正弦，音量中等（直接证明音频通路可用）。 */
   function playBeep() {
     var ctx = state.audioCtx;
@@ -1714,7 +1012,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var run = function () {
       if (audioRunning(ctx)) hideAudioWarn();
       if (!audioRunning(ctx)) { showAudioWarn(); setHint('无音频（点我先）：浏览器还没解锁，先点一下屏幕'); return; }
-      if (state.turnPcm.length > 0 && replayPcm()) { setHint('已播放本轮缓存音频'); return; }
       state.samplePending = true;
       setHint('正在合成试听语音（edge-tts 云健）…');
       send('tts.sample', {});
@@ -1831,35 +1128,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       $('conn').className = 'on';
       setConnState('online');
       state.clientId = state.clientId || ('web-' + Math.random().toString(36).slice(2, 10));
-      if (!state.sessionId && !state.sessionBound) {
-        var picked = pickInitialSession();
-        state.mode = picked.mode;
-        if (picked.id) {
-          state.sessionId = picked.id;
-          state.sessionSource = picked.source;
-        }
-      }
-      state.lastAutoId = state.lastAutoId || lastAutoSessionId();
-      // 三种握手，只由「这次带什么」决定：
-      //   unified（默认）—— 裸 hello：宿主绑唯一的指挥会话，屏上是任务棋盘；
-      //   manual —— ?session= 显式指定（老逃生口）；
-      //   auto —— 点过「恢复自动」或手动会话失效（老逃生口）。
-      // 统一模式**重连也只发裸 hello**：把上次绑到的指挥会话 id 回传，宿主会当成
-      // 手动绑定（device.unified=false），屏又退回那条会话的旧屏。
-      var helloSession = '';
-      if (state.mode === 'manual') {
-        if (state.sessionBound) helloSession = state.sessionId;
-        else if (state.sessionSource === 'url') helloSession = state.sessionId;
-      }
-      state.bindIntent = state.mode === 'unified' ? 'unified' : 'manual';
-      sendHello(helloSession, state.mode === 'auto');
-      if (!helloSession && state.mode === 'manual' && !state.sessionId) {
-        // 不报错：提示可操作，并展开屏下的选择器。
-        state.showList = true;
-        addEvent('progress', '还没有选定会话，点下面选一个');
-      }
-      renderSessionBar();
-      requestSessions();
+      // 统一指挥是唯一入口：永远裸 hello（宿主绑「鹈鹕指挥台」，屏上是任务棋盘）。
+      sendHello('', false);
       send('voice.list', {});
       try { send('voice.select', { name: state.voice || 'default', edgeVoice: $('edgeVoiceSelect').value, offlineOnly: $('offlineOnly').checked }); } catch (e) { /* 忽略 */ }
       clearInterval(state.retryTimer);
@@ -1921,36 +1191,16 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         state.audioPending = false;
         clearTimeout(state.audioTimer);
         // 用户新一轮输入 = 新一轮朗读，停掉上一轮残留。
-        resetTurnAudio();
         $('transcript').textContent = state.lastTranscript;
         $('transcript').className = '';
         addEvent('progress', '转写：' + state.lastTranscript);
         break;
-      case 'tts.text': {
-        var ttsText = String(payload.text || '').trim();
-        if (payload.index === 0) {
-          state.droppedAudio = false;
-          hideAudioWarn();
-        }
-        if (ttsText) state.ttsTurnTexts.push(ttsText);
-        break;
-      }
       case 'tts.audio': {
         // 试听音频：只播、不推进高亮、不进本轮朗读缓存（试听不算一轮回复）。
         if (payload.sample === true) {
           resumeAudio();
           playSampleAudio(String(payload.data || ''), Number(payload.sampleRate) || 24000);
           break;
-        }
-        var audioIndex = typeof payload.index === 'number' ? payload.index : 0;
-        var isNewSegment = !state.ttsAudioSeen[audioIndex];
-        state.ttsAudioSeen[audioIndex] = true;
-        if (typeof payload.charStart === 'number') state.replyCharPos = payload.charStart;
-        // 每个音频块到达都补一次 resume：浏览器自动播放策略可能在任何时刻把 ctx 挂回 suspended。
-        resumeAudio();
-        var played = playPcm(String(payload.data || ''), Number(payload.sampleRate) || 24000);
-        if (played && isNewSegment && typeof payload.charStart === 'number') {
-          scheduleHighlight(payload.charStart, played.startAt);
         }
         break;
       }
@@ -1991,11 +1241,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         // 本地 TTS 失败：立刻把所有待念文本交给系统语音，别让用户等 4 秒兜底。
         addEvent('alert', (payload.level === 'error' ? '错误：' : '') + (payload.text || ''));
         break;
-      case 'event.done': addEvent('done', payload.text || '完成'); break;
-      case 'confirm.ask': showConfirm(payload); break;
-      case 'sessions.list': handleSessionList(payload); break;
-      case 'session.bound': handleSessionBound(payload); break;
-      case 'session.invalid': handleSessionInvalid(payload); break;
+      case 'session.bound': state.sessionBound = true; state.sessionId = payload.sessionId || ''; state.sessionTitle = payload.title || ''; break;
       /* 任务登记簿（2026-11-09 统一指挥）：棋盘数据既随 screen.frame.board 下发，
          也单独发一条 task.list（固件只认这条也没问题）；播报帧只在事件区记一行。 */
       case 'task.list':
@@ -2014,49 +1260,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   }
 
   /* ---------- 危险动作确认 ---------- */
-  function showConfirm(payload) {
-    state.asking = payload;
-    $('askTitle').textContent = payload.title || '需要确认';
-    $('askDetail').textContent = payload.detail || '';
-    $('ask').classList.add('on');
-    if (payload.timeoutMs) {
-      setTimeout(function () {
-        if (state.asking && state.asking.confirmId === payload.confirmId) { reply(payload.confirmId, false); addEvent('alert', '确认超时，已自动取消'); }
-      }, payload.timeoutMs);
-    }
-  }
-  function reply(confirmId, approved) {
-    state.asking = null;
-    $('ask').classList.remove('on');
-    send('confirm.reply', { confirmId: confirmId, approved: approved });
-  }
-  $('askYes').onclick = function () { if (state.asking) reply(state.asking.confirmId, true); };
-  $('askNo').onclick = function () { if (state.asking) reply(state.asking.confirmId, false); };
-
-  /* ---------- 会话选择器按钮 ---------- */
-  $('sessSwitch').onclick = function () {
-    state.showList = !state.showList;
-    renderSessionBar();
-    renderSessionList();
-  };
-  /* 恢复自动：清掉手动记忆，交回宿主「最近活跃 CU 会话」自动跟随。 */
-  $('sessAuto').onclick = function () {
-    state.sessionId = '';
-    state.sessionTitle = '';
-    state.sessionBound = false;
-    state.sessionSource = '';
-    state.computerUse = null;
-    state.sessionPreset = '';
-    state.mode = 'auto';
-    state.showList = false;
-    rememberSessionId('');
-    setComputerUseNotice(null, '');
-    renderSessionBar();
-    renderSessionList();
-    addEvent('progress', '已切回自动：正在绑定最近活跃的 Computer Use 会话…');
-    send('session.bind', { auto: true });
-  };
-  $('sessRefresh').onclick = function () { requestSessions(); };
 
   /* ---------- 真机屏幕：缩放三档 + 外壳开关（只影响显示，不改 320×240 内容） ---------- */
   var SCALE_MODES = {
@@ -2157,7 +1360,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     if (!state.sessionId) {
       addEvent('alert', '还没有选定会话：点下面的会话列表选一个');
       state.showList = true;
-      renderSessionBar();
       return;
     }
     decodeAndResample(arrayBuffer).then(function (result) {
@@ -2238,7 +1440,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     if (!state.sessionId) {
       addEvent('alert', '还没有选定会话：点下面的会话列表选一个');
       state.showList = true;
-      renderSessionBar();
       return;
     }
     send('text.input', { text: text, source: 'keyboard' });
@@ -2259,14 +1460,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     addEvent('progress', '已取消上一条转写，请重新说');
   };
   /* 重读一遍：把本轮所有 tts 段拼回来的全文**从头重播**（不是只读最后一段）。 */
-  $('speak').onclick = function () {
-    if (state.turnPcm.length === 0) { addEvent('alert', '还没有可重读的本地音频'); return; }
-    if (replayPcm()) addEvent('progress', '重读本轮全文（本地音频）');
-  };
-  $('ttsStop').onclick = function () {
-    stopPcm();
-    addEvent('progress', '已停止朗读');
-  };
   /* 试听：先解锁音频；有本轮缓存重播，否则请宿主念一句示例（嘟声只在合成失败时出现）。 */
   $('audioTest').onclick = function () {
     audioTest();
@@ -2491,16 +1684,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         var y = (event.clientY - rect.top) / scale;
         tapFlash(event.clientX - rect.left, event.clientY - rect.top);
         var hit = null;
-        var chips = document.querySelectorAll('#pendingRail .pending-chip');
-        for (var ci = 0; ci < chips.length; ci += 1) {
-          var chipRect = chips[ci].getBoundingClientRect();
-          if (event.clientX >= chipRect.left - 8 && event.clientX <= chipRect.right + 8 &&
-              event.clientY >= chipRect.top - 8 && event.clientY <= chipRect.bottom + 8) {
-            hit = chips[ci].dataset.sessionId;
-            break;
-          }
-        }
-        if (hit) { send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'chip', targetSessionId: hit }); return; }
         var under = document.elementFromPoint(event.clientX, event.clientY);
         if (under && under.getAttribute) {
           var actionId = under.getAttribute('data-action');
@@ -2516,28 +1699,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
             if (actionId === 'home') tapFlash(event.clientX - rect.left, event.clientY - rect.top);
             send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'action', actionId: actionId });
             return;
-          }
-          var rowEl = under.closest ? under.closest('.run-row') : null;
-          var rowSession = rowEl && rowEl.getAttribute('data-session');
-          if (rowSession) {
-            send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'switch', targetSessionId: rowSession });
-            return;
-          }
-        }
-        var recentEl = under && under.closest ? under.closest('.home-recent') : null;
-        if (recentEl) {
-          var recentSession = recentEl.getAttribute('data-session');
-          if (recentSession) { send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'recent', sessionId: recentSession }); return; }
-        }
-        // 项目行按元素命中：首页顶部多了「最近回答」行，不能再按固定 36px 行高算下标。
-        if (state.screenMode === 'home') {
-          var projectEl = under && under.closest ? under.closest('.home-item') : null;
-          if (projectEl) {
-            var projectSession = projectEl.getAttribute('data-session');
-            if (projectSession) {
-              send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'project', project: projectEl.getAttribute('data-project') || '', sessionId: projectSession });
-              return;
-            }
           }
         }
         // 任务棋盘上点一行：看这条任务的详情（宿主 openTask，不换会话绑定）
@@ -2597,8 +1758,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     $('title').textContent = '已结束本次会话';
   };
 
-  renderSessionBar();
-  renderSessionList();
   /* 首页顶行走表：每秒 tick 一次时钟（时间由页面自己的本地时钟渲染，不等宿主推——
      宿主那 30 秒一次的控制室巡检（TIHU_HOME_SYNC_MS）只刷新项目清单，帧隔 30 秒推一次时钟就会 stale）。
      收到 screen.frame 时 renderScreen 也顺手重画一次，保证同一帧里时钟不会花。 */

@@ -61,8 +61,6 @@ export function receiptFrame(input: {
       { id: 'taskOpen', label: '看任务' },
       { id: 'taskCancel', label: '撤单' },
     ],
-    pending: [],
-    pendingCount: 0,
     taskId: input.taskId,
     tone: 'busy',
     mode: 'status',
@@ -94,15 +92,12 @@ export function detailFrame(input: {
     bullets: fitScreenLines(bullets.filter((line) => line !== ''), SCREEN_SPEC.maxBodyLines),
     statsTail: 1,
     actions: [
-      { id: 'taskSession', label: '看会话' },
       { id: 'taskStop', label: '停止' },
       { id: 'taskBoard', label: '回棋盘' },
     ],
     taskId: input.taskId,
     tone: 'busy',
     mode: 'status',
-    pending: [],
-    pendingCount: 0,
   }
 }
 
@@ -144,8 +139,6 @@ export function awaitingFrame(input: {
     taskId: input.taskId,
     tone: 'warn',
     mode: 'status',
-    pending: [],
-    pendingCount: 0,
   }
 }
 
@@ -156,7 +149,7 @@ export function doneFrame(input: {
   /** 正文行（任务回复的要点；没有就只显示结果行）。 */
   bullets?: readonly string[]
   /** 同一批里其它已完成条数（>0 时右端显示「另有 N 条 ▸」）。 */
-  others: number
+  others?: number
 }): ScreenFramePayload {
   const bullets = (input.bullets ?? []).filter((line) => String(line ?? '').trim() !== '')
   return {
@@ -172,8 +165,6 @@ export function doneFrame(input: {
     taskId: input.taskId,
     tone: 'ok',
     mode: 'status',
-    pending: [],
-    pendingCount: 0,
   }
 }
 
@@ -204,8 +195,6 @@ export function askWhichFrame(input: {
     ...(input.taskId === undefined ? {} : { taskId: input.taskId }),
     tone: 'alert',
     mode: 'status',
-    pending: [],
-    pendingCount: 0,
   }
 }
 
