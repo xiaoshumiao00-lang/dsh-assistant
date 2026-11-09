@@ -344,6 +344,8 @@ export interface ScreenFramePayload {
   countdown?: { seconds: number; totalSeconds?: number; text?: string }
   /** 完成屏右端「另有 N 条 ▸」（其它完成收进状态行，不再单独占一条气泡带）。 */
   more?: { count: number; text: string }
+  /** 屏 7 歧义候选卡（项目名＋来源，序号 1/2）。 */
+  ask?: { candidates?: { index: number; projectName: string; source: string }[] }
   /** 这一帧属于哪条任务（屏上点按/答问句时用它回 task.reply）。 */
   taskId?: string
 }
