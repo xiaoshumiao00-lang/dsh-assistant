@@ -342,9 +342,17 @@ export function detailFrame(input: {
   elapsedMs: number
   /** `82 tok/s · 12.3k tok · 上下文 41%`。 */
   statsLine: string
+  /**
+   * 这一轮已经结束（turn/end / 任务完成）：步数行改「第 N 步 · 已结束」。
+   * 用户 2026-11-10 实机：结束之后「已用 3m28s」还在按 now 长，必须停住并显式标结束。
+   */
+  ended?: boolean
 }): ScreenFramePayload {
-  const liveLine = fitLine(input.liveLine || '思考 · 模型推理中…', CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
-  const stepLine = fitLine(`第 ${input.step} 步 · 已用 ${formatUsedMs(input.elapsedMs)}`, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
+  const ended = input.ended === true
+  const liveLine = fitLine(input.liveLine || (ended ? '已结束 · 本轮没有新状态' : '思考 · 模型推理中…'), CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
+  const stepLine = fitLine(ended
+    ? `第 ${input.step} 步 · 已结束`
+    : `第 ${input.step} 步 · 已用 ${formatUsedMs(input.elapsedMs)}`, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
   const statsLine = fitLine(input.statsLine === '' ? '统计中…' : input.statsLine, CONTENT_WIDTH_PX, SCREEN_SPEC.statsFontPx)
   return {
     stage: '进度',
@@ -356,7 +364,7 @@ export function detailFrame(input: {
       { id: 'taskBoard', label: '主页' },
     ],
     taskId: input.taskId,
-    tone: 'busy',
+    tone: ended ? 'ok' : 'busy',
     mode: 'status',
   }
 }

@@ -158,6 +158,20 @@ export const HOME_AFTER_SPEECH_MS = 60_000
 /** 进度页静置多久自动回棋盘（最新事件刷新会重新计时；用户 2026-11-10：三页都要能超时回棋盘）。 */
 export const DETAIL_AUTO_HOME_MS = 60_000
 /**
+ * 进度页看门狗：这么久没有任何**新的会话帧**（步数/工具/回复/思考都没动）就回棋盘。
+ *
+ * 用户 2026-11-10 实机：电脑端 CU 会话已经回复完、turn/end 也到了，屏还挂在它的进度页
+ * （第 20 步 · 已用 3m28s），而且用户回棋盘后又被拉回去。看门狗保证任何一张进度页
+ * 都不会「无限挂着」：静置到点就回棋盘，卡还在（状态由登记簿说话）。
+ * TIHU_PROGRESS_STALE_MS 仅供测试调小（夹在 1s ～ 10min）。
+ */
+export const PROGRESS_WATCHDOG_MS = 30_000
+export function tihuProgressStaleMs(): number {
+  const raw = Number(process.env.TIHU_PROGRESS_STALE_MS ?? PROGRESS_WATCHDOG_MS)
+  if (!Number.isFinite(raw) || raw <= 0) return PROGRESS_WATCHDOG_MS
+  return clampInt(raw, 1_000, 10 * 60_000)
+}
+/**
  * 回主页守门重试间隔：scheduleHome 的 timer 触发时若还有任何会话的 turn 在跑
  * （runningSessions 非空），不回主页，按这个间隔再查一次。
  * 可用环境变量 TIHU_HOME_RECHECK_MS 覆盖（测试里设小）；非数字/0 一律回落到默认，
@@ -390,8 +404,6 @@ interface TihuDevice {
   onBoard?: boolean
   /** 这台设备现在停在哪一屏（sendFrame 记的；进度页每秒重画与回主页计时都按这份判）。 */
   screenStage?: string
-  /** 刚连上：第一次电脑端同步跑完时，若已有任务在跑就自动切到它的进度页。 */
-  followPending?: boolean
   /** 朗读结束后 60 秒自动回棋盘的计时器（任何交互都取消）。 */
   homeTimer?: ReturnType<typeof setTimeout>
   /** 这个计时器是为哪条任务装的（undefined＝指挥会话的回答屏）。 */
@@ -805,6 +817,19 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
    * （2026-11-10 用户实机反馈）。只有真正的 `turn/start` 才容许换锚点（那才是新一轮）。
    */
   const runAnchorAt = new Map<string, number>()
+  /**
+   * 会话这一轮已经结束（sessionId → turn/end 时刻）。
+   *
+   * 用户 2026-11-10 实机：turn/end 之后列表投影里「最后一次发言时间」还在 15 秒活动窗口里，
+   * 旧轮询把它当成「在跑」→ 已结束的会话又抖回执行中（顺带清掉 finishedAt、把「已用」的
+   * 起点挪走），设备重连还会按这个旧状态自动跳进度页。有这条记录之后，活动再新也不算在跑；
+   * 真来了新一轮（turn/start 或更新的发言时间）才作废。
+   */
+  const turnEndedAt = new Map<string, number>()
+  /** 任务这一轮已经结束（taskId → turn/end 时刻）：「已用」到这里停住，不再跨回合累计。 */
+  const runEndedAt = new Map<string, number>()
+  /** 进度页看门狗：taskId → 最近一次真实进度事件（打开进度页也算一次）。 */
+  const progressEventAt = new Map<string, number>()
 
   /** 定锚点：`reset = true` 只由真实的新一轮调用（其它一律不许把锚点往后挪）。 */
   function noteRunAnchor(taskId: string, at: number, reset = false): void {
@@ -817,7 +842,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     if (known === undefined || known <= 0 || at < known) runAnchorAt.set(taskId, at)
   }
 
-  /** 这条任务已经跑了多久（毫秒）：完成态封顶在完成那一刻；没有锚点就从「现在」起算。 */
+  /** 这条任务已经跑了多久（毫秒）：完成/回合结束后封顶在结束那一刻；没有锚点就从「现在」起算。 */
   function elapsedOfTask(task: TihuTask, sessionId?: string): number {
     let anchor = runAnchorAt.get(task.taskId)
     if (anchor === undefined || anchor <= 0) {
@@ -827,7 +852,13 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
       anchor = candidates.length > 0 ? Math.min(...candidates) : Date.now()
       runAnchorAt.set(task.taskId, anchor)
     }
-    return Math.max(0, (task.finishedAt ?? Date.now()) - anchor)
+    // 用户 2026-11-10：回合结束「已用」立刻停住，不许再长（实机那行「已用 3m28s」就是
+    // 完成之后还在按 now 算、把好几轮累加出来的）。
+    const endedAt = runEndedAt.get(task.taskId) ?? task.finishedAt
+    const end = endedAt !== undefined && Number.isFinite(endedAt) && endedAt > 0
+      ? Math.min(Date.now(), endedAt)
+      : Date.now()
+    return Math.max(0, end - anchor)
   }
 
   /**
@@ -2038,6 +2069,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (sessionPreset !== '') sessionPresets.set(sessionId, sessionPreset)
       if (type === 'turn/start') {
         runningSessions.set(sessionId, at)
+        // 真的开了新一轮：之前那条「这一轮已结束」作废（活动窗口重新有意义）。
+        turnEndedAt.delete(sessionId)
+        const startedTask = tasks.ofSession(sessionId)
+        if (startedTask !== undefined) {
+          runEndedAt.delete(startedTask.taskId)
+          progressEventAt.set(startedTask.taskId, at)
+        }
         stopLiveThinking(sessionId, false)
         // 注意：**不能**在这里点亮 tihu 窗口。用户自己在会话里打字同样会触发 turn/start。
         touchWindow(sessionId)
@@ -2048,6 +2086,23 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         }
       } else if (type === 'turn/end') {
         runningSessions.delete(sessionId)
+        // ---------- 用户 2026-11-10：turn/end 时必须把「在跑」与活动行一起清掉 ----------
+        // 1) 这一轮已结束（列表投影里的「最近发言时间」再新也不算在跑）；
+        // 2) 「本次活动」时刻作废：旧轮询用 15/90 秒活动窗口又把已完成的会话 syncExternal 回
+        //    running，屏上就停在旧进度页（实机就是这么被拉回去的）；
+        // 3) 进度状态里的活动行（最新状态 + 明细栈）清空：旧的第 20 步/旧工具行不许再上屏。
+        turnEndedAt.set(sessionId, at)
+        pcActivityAt.delete(sessionId)
+        const endedTask = tasks.ofSession(sessionId)
+        if (endedTask !== undefined) {
+          runEndedAt.set(endedTask.taskId, at)
+          progressEventAt.set(endedTask.taskId, at)
+          const progress = progressStates.get(sessionId)
+          if (progress !== undefined) {
+            progress.lastEventLine = ''
+            progress.activity = []
+          }
+        }
         setTimeout(pruneStaleTurns, 0)
       }
       // 子代理的起落：沿 parentSession 把「子任务在跑」的状态与挂起任务的完成补上。
@@ -2100,17 +2155,24 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           archivePcTask(taskOfSession.taskId, at, `preset=${livePreset}`)
           return
         }
-        pcActivityAt.set(sessionId, at)
+        // 用户 2026-11-10：turn/end 不算「活动」——旧口径把结束那一刻也记成活动，
+        // 15 秒窗口内轮询就会把这条已完成的会话又算成「执行中」。
+        if (type !== 'turn/end') pcActivityAt.set(sessionId, at)
+        if (type === 'turn/start' || type === 'step/start' || type === 'tool/call' || type === 'assistant/message') {
+          progressEventAt.set(taskOfSession.taskId, at)
+        }
         const progress = progressStates.get(sessionId) ?? createProgressState()
         progressStates.set(sessionId, progress)
         applySessionEvent(progress, event, at, screenMetaOf(sessionId))
         if (type !== 'turn/end') refreshFocusedDetail(taskOfSession)
         if (type === 'turn/start') {
-          // 新一轮真的开始了：锚点挪到这一轮（这才算「新一轮」，轮询不许动它）。
+          // 新一轮真的开始了：锚点与步数都从这一轮重新起算（上一轮的「第 20 步」不许带进来）。
           noteRunAnchor(taskOfSession.taskId, progress.turnStartedAt || at, true)
+          tasks.resetStep(taskOfSession.taskId, at)
           tasks.syncExternal(taskOfSession.taskId, { state: 'running', startedAt: progress.turnStartedAt || at, at })
           refreshBoards()
           // 电脑端有任务在跑 → 设备自动切到这条任务的「进度」页（不是待决策）。
+          // 只有真实的 turn/start 才允许跳屏，而且这条任务必须**此刻仍在 running**。
           followRunningTask(taskOfSession)
         } else if (type === 'step/start' || type === 'tool/call') {
           // 电脑端那侧的步数也进登记簿：第 N 步与棋盘微条都跟着真实事件走。
@@ -2141,7 +2203,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             tasks.holdForChildren(taskOfSession.taskId, { childRunning, resultLine: pcResult, now: at })
             deferredReplies.set(taskOfSession.taskId, { reply: doneReply, resultLine: pcResult })
             refreshBoards()
-            refreshFocusedDetail(taskOfSession)
+            // 这一轮已经结束了：还停在它「进度」页的设备立刻离开（回棋盘），
+            // 不许把旧步数/旧已用继续挂在屏上（用户 2026-11-10 实机）。
+            leaveStaleProgress(taskOfSession, 'pc-turn-end-held')
             log(`tihu pc held for subagents task=${taskOfSession.taskId} children=${childRunning}`)
             return
           }
@@ -2160,16 +2224,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           tasks.markRunning(taskOfSession.taskId, at)
           // 新一轮开始：上一轮「等子代理」的挂起状态作废（这一轮会重新算）。
           tasks.clearChildHold(taskOfSession.taskId, at)
-          // 新一轮真的开始了：锚点挪到这一轮（这才算「新一轮」，轮询不许动它）。
+          // 新一轮真的开始了：锚点与步数都从这一轮重新起算（跨回合的「第 20 步」不许带进来）。
           noteRunAnchor(taskOfSession.taskId, progress.turnStartedAt || at, true)
+          tasks.resetStep(taskOfSession.taskId, at)
           refreshBoards()
           refreshFocusedDetail(taskOfSession)
         } else if (type === 'step/start' || type === 'tool/call') {
+          progressEventAt.set(taskOfSession.taskId, at)
           tasks.noteStep(taskOfSession.taskId, Number.isFinite(stepValue) ? stepValue : progress.step, at)
           noteRunAnchor(taskOfSession.taskId, progress.turnStartedAt || at)
           refreshFocusedDetail(taskOfSession)
           refreshBoards()
         } else if (type !== 'turn/end') {
+          if (type === 'assistant/message' || type === 'tool/result') progressEventAt.set(taskOfSession.taskId, at)
           refreshFocusedDetail(taskOfSession)
         } else if (type === 'turn/end') {
           const reason = finishReasonOf(data)
@@ -2183,7 +2250,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             tasks.holdForChildren(taskOfSession.taskId, { childRunning, resultLine, now: at })
             deferredReplies.set(taskOfSession.taskId, { reply, resultLine })
             refreshBoards()
-            refreshFocusedDetail(taskOfSession)
+            // 这一轮已经结束：还停在旧进度页的设备离开（子代理没跑完，先不假装完成）。
+            leaveStaleProgress(taskOfSession, 'turn-end-held')
             log(`tihu task held for subagents task=${taskOfSession.taskId} children=${childRunning}`)
             return
           }
@@ -2438,9 +2506,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         ensurePcSync()
         // 子代理状态也要跟着收敛：有屏在线时每 2 秒对一次「子任务在跑」计数。
         ensureChildReconcile()
-        // 先挂「连上后要不要跟随正在跑的任务」，再触发同步：同步是异步的，
-        // 等它把电脑端任务写进登记簿后，由 syncExternalSessions 决定跳不跳（只跳一次）。
-        device.followPending = true
+        // 连上就只停在棋盘：**不许**按「同步看到的旧状态」自动跳进度页（用户 2026-11-10）。
+        // 跳屏只有一条合法入口：真的 turn/start（见 session/event 的 pc 分支）。
         void syncExternalSessions().catch((error) => log(`tihu pc sync failed: ${(error as Error)?.message ?? String(error)}`))
         sendBoard(device)
       } else {
@@ -3282,10 +3349,17 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           const dismissed = pcDismissedAt.get(sessionId)
           if (dismissed !== undefined && activity <= dismissed) continue
         }
-        const running = agentRunning || now - activity <= PC_ACTIVE_WINDOW_MS
+        // 用户 2026-11-10：这一轮**已经结束**的会话，列表活动再新也不算在跑。
+        // 旧口径只看「15 秒内有活动」，turn/end 那一刻也被算成活动，于是已完成的会话
+        // 被下一轮 syncExternal 抖回 running（finishedAt 被清、已用从头再长）。
+        // 判「结束在最后一次用户发言之后」：只有新的用户发言（lastPromptAt 变新）才算新一轮；
+        // 迟到的 assistant/step 事件只更新 pcActivityAt，不能把回合重新打开。
+        const endedAt = turnEndedAt.get(sessionId) ?? 0
+        const turnOver = endedAt > 0 && (updatedAt <= 0 || endedAt >= updatedAt)
+        const running = agentRunning || (!turnOver && now - activity <= PC_ACTIVE_WINDOW_MS)
         // 已经显示成「执行中」的那一条不许抖成「完成 → 执行中」：电脑端 CU 会话一步等用户
         // 在这侧点屏幕能空好几十秒，每一次抖动都把「已用」与时长环抹回 0（实机就是这个）。
-        const stillRunning = !running && known !== undefined && known !== ''
+        const stillRunning = !running && !turnOver && known !== undefined && known !== ''
           && tasks.get(known ?? '')?.state === 'running' && now - activity <= PC_RUNNING_STILL_MS
         // 子代理还在跑：主会话看起来完成了，这条任务也算「执行中」（用户 2026-11-10）。
         const childRunning = runningSubagentCountOf(sessionId, agents)
@@ -3344,16 +3418,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (changed) refreshBoards()
       // 子代理可能刚好在这轮轮询前结束：补一次收敛（挂起的任务在这里转完成并补播报）。
       reconcileChildTasks('pc-sync')
-      // 设备刚连上：登记簿里已经有在跑的电脑端任务，就直接切到它的「进度」页（不是待决策）。
-      // 只做一次（followPending）：用户主动回棋盘后，不许下一次轮询又把人拽走。
-      for (const device of devices) {
-        if (!device.unified || device.followPending !== true) continue
-        device.followPending = false
-        const runningTask = tasks.list()
-          .filter((task) => task.source === 'pc' && task.state === 'running')
-          .sort((a, b) => b.updatedAt - a.updatedAt)[0]
-        if (runningTask !== undefined) followRunningTask(runningTask)
-      }
+      // 用户 2026-11-10 实机回归：同步/轮询**不许**跳进度页。
+      // 旧实现按「第一次同步看到的在跑任务」自动跟随，回合结束后列表活动还在窗口里，
+      // 设备一回棋盘就被下一次同步/重连拽回旧进度页（已用 3m28s 就是这么来的）。
+      // 现在自动跳屏只剩一个入口：session/event 的 turn/start（见 followRunningTask）。
     } finally {
       pcSyncing = false
     }
@@ -3391,6 +3459,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     device.pendingPick = undefined
     device.focusedTask = task.taskId
     device.onBoard = false
+    progressEventAt.set(task.taskId, Date.now())
     const frame = taskDetailFrameOf(task)
       ?? noticeFrame({ stage: '电脑端', title: task.title, lines: ['这条会话还没开始跑'], tone: 'idle' })
     sendFrame(device, frame, device.sessionId)
@@ -3483,9 +3552,20 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
   }
 
-  /** 电脑端任务开跑：设备自动切到这条任务的「进度」页（屏 4，不是待决策）。 */
+  /**
+   * 电脑端任务开跑：设备自动切到这条任务的「进度」页（屏 4，不是待决策）。
+   *
+   * **只允许在真正的 turn/start 之后调用**（用户 2026-11-10 实机回归）：
+   * 同步/轮询看到的「15 秒内有活动 / 之前显示成执行中」都是旧状态，不能触发跳屏，
+   * 否则回合结束后设备回棋盘也会被下一次同步拽回旧进度页。调用点只有 session/event 的
+   * turn/start 分支；这里再校验一遍任务此刻确实还在 running（子代理在跑也算）。
+   */
   function followRunningTask(task: TihuTask): void {
     if (task.source !== 'pc') return
+    if (!taskRunningNow(task)) {
+      log(`tihu follow skipped task=${task.taskId} state=${task.state}`)
+      return
+    }
     for (const device of devices) {
       if (!device.unified) continue
       if (device.receiptTimer !== undefined || device.pendingPick !== undefined) continue
@@ -3495,10 +3575,31 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       disarmAutoHome(device)
       device.focusedTask = task.taskId
       device.onBoard = false
+      progressEventAt.set(task.taskId, Date.now())
       sendFrame(device, frame, device.sessionId)
       armScreenHome(device, DETAIL_AUTO_HOME_MS, task.taskId, '进度')
       ensureDetailTicker()
       log(`tihu follow task=${task.taskId} device=${device.id}`)
+    }
+  }
+
+  /** 这条任务此刻是真的在跑吗（turn 还在跑，或还有子代理在跑）。 */
+  function taskRunningNow(task: TihuTask): boolean {
+    if (task.state !== 'running') return false
+    if ((task.childRunning ?? 0) > 0) return true
+    const sessionId = task.sessionIds[task.sessionIds.length - 1]
+    return sessionId !== undefined && runningSessions.has(sessionId)
+  }
+
+  /** 还停在这条任务「进度」页的设备：这一轮结束后立刻回棋盘，不许继续挂旧进度。 */
+  function leaveStaleProgress(task: TihuTask, why: string): void {
+    for (const device of devices) {
+      if (!device.unified) continue
+      if (device.focusedTask !== task.taskId) continue
+      if (device.screenStage !== '进度') continue
+      if (device.receiptTimer !== undefined || device.pendingPick !== undefined) continue
+      log(`tihu progress leave device=${device.id} task=${task.taskId} why=${why}`)
+      sendBoard(device)
     }
   }
 
@@ -3930,15 +4031,20 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           `上下文 ${stats.contextPercent.toFixed(0)}%`,
         ].filter((part) => part !== '').join(' · ')
     const title = task.title
+    // 这一轮已经结束（或者任务已转完成）：进度页不再显示会增长的「已用」，
+    // 改成「第 N 步 · 已结束」——用户 2026-11-10 明确要求不能无限挂着旧进度。
+    const endedAt = runEndedAt.get(task.taskId) ?? task.finishedAt
+    const ended = endedAt !== undefined && Number.isFinite(endedAt) && endedAt > 0
     return detailFrame({
       taskId: task.taskId,
       title,
       liveLine: state?.lastEventLine ?? '',
       step: Math.max(task.step, state?.step ?? 0),
-      // 已用时间按「这条任务这一轮跑起来的锚点」算：锚点先到先记、**永不被轮询推到后面**，
-      // 也没有别的帧能把它冻住（见 runAnchorOf 与 detailTicker 的屏阶段改判）。
+      // 已用时间按「这条任务这一轮跑起来的锚点」算：锚点先到先记、**永不被轮询推到后面**；
+      // 回合结束（runEndedAt / finishedAt）那一刻封顶，不跨回合累计（见 elapsedOfTask）。
       elapsedMs: elapsedOfTask(task, sessionId),
       statsLine,
+      ended,
     })
   }
 
@@ -4073,6 +4179,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     device.pendingPick = undefined
     device.focusedTask = task.taskId
     device.onBoard = false
+    progressEventAt.set(task.taskId, Date.now())
     sendFrame(device, frame, device.sessionId)
     armScreenHome(device, DETAIL_AUTO_HOME_MS, task.taskId, '进度')
     ensureDetailTicker()
@@ -4105,10 +4212,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /** 进度页每秒重画一次：「已用」实时走、tokens 跟着刷新（不新增协议消息，仍是 screen.frame）。 */
   let detailTicker: ReturnType<typeof setInterval> | undefined
+  /** 正在把某台设备从进度页换到完成页（异步读历史期间不重复触发）。 */
+  const leavingProgress = new Set<string>()
   function ensureDetailTicker(): void {
     if (detailTicker !== undefined) return
     detailTicker = setInterval(() => {
       if (disposed) return
+      const now = Date.now()
+      const staleMs = tihuProgressStaleMs()
       for (const device of devices) {
         if (!device.unified) continue
         if (device.onBoard === true) continue
@@ -4121,7 +4232,31 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         const key = device.sessionId ?? device.id
         const task = tasks.get(device.focusedTask)
         if (task === undefined) continue
-        if (task.state === 'done' || task.state === 'announced' || task.state === 'awaiting') continue
+        // 结束态还挂在进度页：换完成页（不朗读），不每秒重画旧进度。
+        if (task.state === 'done' || task.state === 'announced') {
+          if (!leavingProgress.has(device.id)) {
+            leavingProgress.add(device.id)
+            void showDone(device, task, false).finally(() => { leavingProgress.delete(device.id) })
+          }
+          continue
+        }
+        if (task.state === 'awaiting') {
+          showDecision(device, task)
+          continue
+        }
+        if (task.state === 'archived') {
+          sendBoard(device)
+          continue
+        }
+        // ---------- 进度页看门狗（用户 2026-11-10）----------
+        // 超过 N 秒（默认 30 秒）没有任何新的会话帧，就别再把旧进度挂在屏上：
+        // 回棋盘（任务卡还在，状态由登记簿说话），并且**不会**被同步/轮询再拉回来。
+        const lastAt = progressEventAt.get(task.taskId) ?? 0
+        if (lastAt > 0 && now - lastAt >= staleMs) {
+          log(`tihu progress watchdog device=${device.id} task=${task.taskId} idle=${now - lastAt}ms`)
+          sendBoard(device)
+          continue
+        }
         const frame = taskDetailFrameOf(task)
         if (frame === undefined) continue
         lastFrames.set(key, frame)
