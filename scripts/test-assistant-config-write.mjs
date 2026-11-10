@@ -81,6 +81,8 @@ cases.push(['GET 在没有配置文件时下发通用默认（不报错、不建
   assert.equal(r.json.allowAllLocalPaths, false)
   assert.equal(r.json.updateCheckEnabled, false)
   assert.equal(r.json.configSource, '')
+  // 鹈鹕端三项：没配置时必须是「跟随默认」（模型 null、云音色空串）
+  assert.deepEqual(r.json.tihu, { model: { foreground: null, background: null }, voice: { edge: '' } })
   assert.equal(existsSync(configFile), false, '只读 GET 不该创建配置文件')
 }])
 
@@ -164,6 +166,60 @@ cases.push(['词表与目录边界：整表替换、空数组合法', async () =
   const cleared = await call('POST', { asrTerms: [] })
   assert.equal(cleared.status, 200)
   assert.deepEqual(cleared.json.asrTerms, [])
+}])
+
+cases.push(['鹈鹕端三项：写入 → 落盘 → 读回，且按子键合并不互相冲掉', async () => {
+  const fg = { provider: 'stub', model: 'fg-model' }
+  const bg = { provider: 'stub', model: 'bg-model' }
+  const w = await call('POST', { tihu: { model: { foreground: fg, background: bg }, voice: { edge: 'zh-CN-XiaoxiaoNeural' } } })
+  assert.equal(w.status, 200)
+  assert.deepEqual(w.json.tihu.model.foreground, fg)
+  assert.deepEqual(w.json.tihu.model.background, bg)
+  assert.equal(w.json.tihu.voice.edge, 'zh-CN-XiaoxiaoNeural')
+  assert.deepEqual(readFileJson().tihu.model.foreground, fg, '字段要真的落到 config.json 的 tihu 命名空间')
+
+  // 只改音色：两个模型不能被冲成 null（设置页每次只发改过的那一项）
+  const voiceOnly = await call('POST', { tihu: { voice: { edge: 'zh-CN-YunxiNeural' } } })
+  assert.equal(voiceOnly.status, 200)
+  assert.deepEqual(voiceOnly.json.tihu.model.foreground, fg, '改音色把前台模型冲掉了')
+  assert.deepEqual(voiceOnly.json.tihu.model.background, bg, '改音色把后台模型冲掉了')
+  assert.equal(voiceOnly.json.tihu.voice.edge, 'zh-CN-YunxiNeural')
+
+  // 只改前台模型：后台与音色保持原样
+  const fgOnly = await call('POST', { tihu: { model: { foreground: { provider: 'stub', model: 'fg-2' } } } })
+  assert.equal(fgOnly.json.tihu.model.foreground.model, 'fg-2')
+  assert.deepEqual(fgOnly.json.tihu.model.background, bg)
+  assert.equal(fgOnly.json.tihu.voice.edge, 'zh-CN-YunxiNeural')
+
+  // 清空（null / ''）= 跟随默认，不能写坏
+  const cleared = await call('POST', { tihu: { model: { foreground: null }, voice: { edge: '' } } })
+  assert.equal(cleared.status, 200)
+  assert.equal(cleared.json.tihu.model.foreground, null)
+  assert.deepEqual(cleared.json.tihu.model.background, bg, '清前台不该动后台')
+  assert.equal(cleared.json.tihu.voice.edge, '')
+}])
+
+cases.push(['鹈鹕端校验：本地 Kokoro 音色 / 未知子键 / 空模型一律 400，且不改文件', async () => {
+  const before = readFileSync(configFile, 'utf8')
+  const kokoro = await call('POST', { tihu: { voice: { edge: 'zf_060' } } })
+  assert.equal(kokoro.status, 400, '本地 Kokoro 音色不该被当成默认云音色接受')
+  assert.equal(kokoro.json.field, 'tihu')
+  const sid = await call('POST', { tihu: { voice: { edge: '35' } } })
+  assert.equal(sid.status, 400, '数字 sid 也不该被接受')
+
+  const unknownKey = await call('POST', { tihu: { model: { third: { provider: 'a', model: 'b' } } } })
+  assert.equal(unknownKey.status, 400, '未知子键要拒（拼错字段不能静默丢改动）')
+
+  const unknownTop = await call('POST', { tihu: { voice: { volume: 3 } } })
+  assert.equal(unknownTop.status, 400)
+
+  const emptyModel = await call('POST', { tihu: { model: { foreground: { provider: '', model: '' } } } })
+  assert.equal(emptyModel.status, 400, '空 provider/model 不是合法选择')
+
+  const badShape = await call('POST', { tihu: 'yes' })
+  assert.equal(badShape.status, 400)
+
+  assert.equal(readFileSync(configFile, 'utf8'), before, '被拒的请求不该改文件')
 }])
 
 cases.push(['未管理的键原样保留（别人写进 config.json 的东西不能被我们吃掉）', async () => {

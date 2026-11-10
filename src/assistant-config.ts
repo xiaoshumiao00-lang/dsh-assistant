@@ -22,6 +22,7 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { assistantHomeDir, syncPersonaSection } from './assistant-home.ts'
 import { manageWebRoutes } from './web-routes.ts'
+import { isTihuCloudVoice } from './tihu/cloud-voices.ts'
 
 /** 一条语音转写术语规则（JSON 里没有 RegExp，只有源串）。 */
 export interface AsrTermRuleJson {
@@ -38,6 +39,56 @@ export interface AssistantPersonaJson {
   /** 逐行文本，原样写进 AGENTS.md 的受控小节里 */
   lines?: string[]
 }
+
+/* ─────────────────────────── 鹈鹕端（tihu） ───────────────────────────
+ *
+ * 2026-11-10 新增：设置 →「个人助手 → 鹈鹕端」只做三项——默认前台模型 / 默认后台模型 /
+ * 默认云音色。字段放在 `tihu` 命名空间里（`tihu.model.foreground`、
+ * `tihu.model.background`、`tihu.voice.edge`），落同一个 `config.json`，不另起文件、
+ * 也不写 localStorage。
+ *
+ * 前台/后台在鹈鹕代码里的落点（lane.ts 只有这两条建会话路径）：
+ *   - 前台 = 派单任务会话（`DISPATCH_PRESET` = computer-use，设备屏上跑的那条）；
+ *   - 后台 = 指挥台会话（`TASK_PRESET` = standard，判项目/续聊，不占屏）。
+ */
+
+/** 一条模型选择（provider + model，可选推理档）。 */
+export interface TihuModelConfig {
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
+
+/** `tihu` 段（读出来的完整形态；没配置时全是「跟随默认」）。 */
+export interface TihuLocalConfig {
+  model: {
+    /** 默认前台模型：null = 跟随宿主默认（老行为）。 */
+    foreground: TihuModelConfig | null
+    /** 默认后台模型：null = 跟随宿主默认（老行为）。 */
+    background: TihuModelConfig | null
+  }
+  voice: {
+    /** 默认云音色（edge-tts 的 zh-CN-*Neural）；空串 = 跟随 TIHU_EDGE_VOICE / 云健。 */
+    edge: string
+  }
+}
+
+/** 一次写入的 `tihu` 子集（只带改过的子键；未出现的子键保持原值）。 */
+export interface TihuConfigPatch {
+  model?: {
+    foreground?: TihuModelConfig | null
+    background?: TihuModelConfig | null
+  }
+  voice?: {
+    edge?: string
+  }
+}
+
+/** 一份干净的 `tihu` 段（新对象，避免共享引用被就地改）。 */
+export function emptyTihuConfig(): TihuLocalConfig {
+  return { model: { foreground: null, background: null }, voice: { edge: '' } }
+}
+
 
 /** 本地配置文件形态（全部字段可选）。 */
 export interface AssistantLocalConfig {
@@ -59,6 +110,8 @@ export interface AssistantLocalConfig {
   updateSource: string
   /** 是否允许前端检查 GitHub 更新（默认 false：别人的机器不该被作者的仓库牵着升级）。 */
   updateCheckEnabled: boolean
+  /** 鹈鹕端（语音小屏）的默认模型与默认云音色。 */
+  tihu: TihuLocalConfig
   /** 实际读到的文件路径（空 = 没有任何本机配置）。 */
   sourceFile: string
   /** 解析失败时的提示（不阻塞使用）。 */
@@ -79,6 +132,7 @@ export const CLIENT_CONFIG_FIELDS = [
   'termEnvAllow',
   'updateSource',
   'updateCheckEnabled',
+  'tihu',
   'configSource',
 ] as const
 
@@ -93,12 +147,16 @@ export const WRITABLE_CONFIG_FIELDS = [
   'termEnvAllow',
   'updateSource',
   'updateCheckEnabled',
+  'tihu',
 ] as const
 
 export type WritableConfigField = (typeof WRITABLE_CONFIG_FIELDS)[number]
 
 /** 一次写入的可写子集（只带用户真的改过的那几个键）。 */
-export type AssistantConfigPatch = Partial<Pick<AssistantLocalConfig, WritableConfigField>>
+export type AssistantConfigPatch = Partial<Pick<AssistantLocalConfig, Exclude<WritableConfigField, 'tihu'>>> & {
+  /** 鹈鹕端：按子键合并，未出现的子键保持原值。 */
+  tihu?: TihuConfigPatch
+}
 
 const EMPTY: AssistantLocalConfig = {
   newProjectParent: null,
@@ -110,6 +168,7 @@ const EMPTY: AssistantLocalConfig = {
   termEnvAllow: [],
   updateSource: '',
   updateCheckEnabled: false,
+  tihu: { model: { foreground: null, background: null }, voice: { edge: '' } },
   sourceFile: '',
   loadError: '',
 }
@@ -125,9 +184,12 @@ const MAX_LINE_CHARS = 2000
 
 /** 候选配置文件路径（按优先级，首个存在的即本机配置）。 */
 export function assistantConfigCandidates(): string[] {
-  const out: string[] = []
   const env = String(process.env.DSH_ASSISTANT_CONFIG ?? '').trim()
-  if (env) out.push(resolvePath(env.replace(/^~(?=$|[\\/])/, homedir())))
+  // 显式覆盖是**权威**的：给了就只认它，不再回退到本机真实配置。
+  // 否则「指定的文件不存在」时会悄悄读到用户家里的 config.json（2026-11-10 实测：
+  // 设了晓晓的机器上，测试里「没配置就用云健」读到的是晓晓，默认值永远测不出来）。
+  if (env) return [resolvePath(env.replace(/^~(?=$|[\\/])/, homedir()))]
+  const out: string[] = []
   out.push(join(assistantHomeDir(), 'config.json'))
   const home = dshHome()
   out.push(join(home, 'dsh-assistant-config.json'))
@@ -237,6 +299,100 @@ function stripBom(text: string): string {
   return text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text
 }
 
+/** 一条模型选择：provider/model 必须都非空，否则视作「跟随默认」。 */
+function normalizeTihuModel(raw: unknown): TihuModelConfig | null {
+  if (!isPlainObject(raw)) return null
+  const provider = typeof raw.provider === 'string' ? raw.provider.trim() : ''
+  const model = typeof raw.model === 'string' ? raw.model.trim() : ''
+  if (provider === '' || model === '') return null
+  const effort = typeof raw.reasoningEffort === 'string' ? raw.reasoningEffort.trim() : ''
+  return { provider, model, ...(effort === '' ? {} : { reasoningEffort: effort }) }
+}
+
+/**
+ * 读盘时的 `tihu` 段归一：任何形状错误都退成「跟随默认」，绝不因为一个坏字段让整份配置失效。
+ * 云音色只认清单里的名字——本地 Kokoro（zf_/zm_/数字）即使手写进文件也当没配。
+ */
+function normalizeTihu(raw: unknown): TihuLocalConfig {
+  const out = emptyTihuConfig()
+  if (!isPlainObject(raw)) return out
+  const model = isPlainObject(raw.model) ? raw.model : {}
+  out.model.foreground = normalizeTihuModel(model.foreground)
+  out.model.background = normalizeTihuModel(model.background)
+  const voice = isPlainObject(raw.voice) ? raw.voice : {}
+  const edge = typeof voice.edge === 'string' ? voice.edge.trim() : ''
+  out.voice.edge = isTihuCloudVoice(edge) ? edge : ''
+  return out
+}
+
+/** 写盘时的模型子键：允许 null（＝清成跟随默认）/ 合法对象；其它一律 undefined（400）。 */
+function normalizeTihuModelForWrite(raw: unknown): TihuModelConfig | null | undefined {
+  if (raw === null) return null
+  if (!isPlainObject(raw)) return undefined
+  const provider = typeof raw.provider === 'string' ? raw.provider.trim() : ''
+  const model = typeof raw.model === 'string' ? raw.model.trim() : ''
+  if (provider === '' || model === '') return undefined
+  if (provider.length > 200 || model.length > 200) return undefined
+  if (/[\u0000-\u001f]/.test(provider) || /[\u0000-\u001f]/.test(model)) return undefined
+  if (raw.reasoningEffort !== undefined && raw.reasoningEffort !== null && typeof raw.reasoningEffort !== 'string') return undefined
+  const effort = typeof raw.reasoningEffort === 'string' ? raw.reasoningEffort.trim() : ''
+  if (effort.length > 64) return undefined
+  return { provider, model, ...(effort === '' ? {} : { reasoningEffort: effort }) }
+}
+
+/**
+ * 写盘时的 `tihu` 段：只接受 `model.foreground/background` 与 `voice.edge`，其余子键一律拒
+ * （拼错字段名不能静默丢改动）。空对象/没有可写子键 → undefined。
+ */
+function normalizeTihuForWrite(raw: unknown): TihuConfigPatch | undefined {
+  if (!isPlainObject(raw)) return undefined
+  const patch: TihuConfigPatch = {}
+  for (const key of Object.keys(raw)) {
+    if (key !== 'model' && key !== 'voice') return undefined
+  }
+  if ('model' in raw) {
+    const model = raw.model
+    if (!isPlainObject(model)) return undefined
+    const next: NonNullable<TihuConfigPatch['model']> = {}
+    for (const key of Object.keys(model)) {
+      if (key !== 'foreground' && key !== 'background') return undefined
+      const value = normalizeTihuModelForWrite(model[key])
+      if (value === undefined) return undefined
+      next[key as 'foreground' | 'background'] = value
+    }
+    patch.model = next
+  }
+  if ('voice' in raw) {
+    const voice = raw.voice
+    if (!isPlainObject(voice)) return undefined
+    const next: NonNullable<TihuConfigPatch['voice']> = {}
+    for (const key of Object.keys(voice)) {
+      if (key !== 'edge') return undefined
+      const rawEdge = voice.edge
+      if (rawEdge !== null && rawEdge !== undefined && typeof rawEdge !== 'string') return undefined
+      const text = typeof rawEdge === 'string' ? rawEdge.trim() : ''
+      // 只允许云端音色；'' = 清掉配置（回到 TIHU_EDGE_VOICE / 云健）。
+      if (text !== '' && !isTihuCloudVoice(text)) return undefined
+      next.edge = text
+    }
+    patch.voice = next
+  }
+  if (Object.keys(patch).length === 0) return undefined
+  return patch
+}
+
+/** 把一次 `tihu` 补丁合进已落盘的旧值：补丁里没出现的子键原样保留。 */
+function mergeTihuPatch(base: unknown, patch: TihuConfigPatch): TihuLocalConfig {
+  const current = normalizeTihu(base)
+  const next: TihuLocalConfig = { model: { ...current.model }, voice: { ...current.voice } }
+  if (patch.model !== undefined) {
+    if ('foreground' in patch.model) next.model.foreground = patch.model.foreground ?? null
+    if ('background' in patch.model) next.model.background = patch.model.background ?? null
+  }
+  if (patch.voice !== undefined && 'edge' in patch.voice) next.voice.edge = patch.voice.edge ?? ''
+  return next
+}
+
 /** 配置文件缓存（按 mtime 失效）。测试改文件后无需重启进程。 */
 let cache: { file: string; mtimeMs: number; value: AssistantLocalConfig } | null = null
 
@@ -271,6 +427,7 @@ export function loadAssistantConfig(force = false): AssistantLocalConfig {
         : [],
       updateSource: typeof parsed.updateSource === 'string' ? parsed.updateSource.trim() : '',
       updateCheckEnabled: parsed.updateCheckEnabled === true,
+      tihu: normalizeTihu(parsed.tihu),
       sourceFile: file,
       loadError: '',
     }
@@ -306,6 +463,7 @@ export function assistantConfigClientView(): Record<string, unknown> {
     termEnvAllow: cfg.termEnvAllow,
     updateSource: cfg.updateSource,
     updateCheckEnabled: cfg.updateCheckEnabled,
+    tihu: cfg.tihu,
     configSource: cfg.sourceFile,
     configError: cfg.loadError || undefined,
   }
@@ -427,6 +585,11 @@ export function validateAssistantConfigPatch(raw: unknown): ValidateResult {
     if (typeof target.updateCheckEnabled !== 'boolean') return bad('updateCheckEnabled', 'expected-boolean')
     patch.updateCheckEnabled = target.updateCheckEnabled
   }
+  if ('tihu' in target) {
+    const value = normalizeTihuForWrite(target.tihu)
+    if (value === undefined) return bad('tihu', 'bad-tihu')
+    patch.tihu = value
+  }
   if (Object.keys(patch).length === 0) return { ok: false, error: 'nothing-to-change' }
   return { ok: true, patch }
 }
@@ -490,6 +653,11 @@ export function writeAssistantConfig(patch: AssistantConfigPatch): WriteResult {
   const next: Record<string, unknown> = { ...base }
   for (const key of WRITABLE_CONFIG_FIELDS) {
     if (!(key in patch)) continue
+    // tihu 按子键合并：设置页每次只发改过的那一项，不能把另外两项冲掉。
+    if (key === 'tihu') {
+      next.tihu = mergeTihuPatch(base.tihu, patch.tihu ?? {})
+      continue
+    }
     const value = (patch as Record<string, unknown>)[key]
     if (value === null || value === undefined) delete next[key]
     else next[key] = value

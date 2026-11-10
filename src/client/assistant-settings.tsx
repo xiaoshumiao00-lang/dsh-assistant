@@ -25,10 +25,12 @@ import { getAssistantApi, readModelPref, writeModelPref, readBgPref, writeBgPref
 import { DEFAULT_ORB_AVATAR } from './pocket/orb/defaultAvatar.ts'
 import { AssistantMemoryPanel } from './assistant-memory-panel.tsx'
 import { LocalConfigPanel } from './assistant-local-config.tsx'
+import { loadAssistantConfig as loadRemoteConfig, saveAssistantConfig, tihuConfigSync, type AssistantModelChoice, type AssistantTihuConfig } from './assistant-config.ts'
+import { TIHU_CLOUD_VOICE_DEFAULT, TIHU_CLOUD_VOICES, tihuCloudVoiceLabel } from '../tihu/cloud-voices.ts'
 import { showFirstRunGuide } from './firstRunGuide.ts'
 import { downloadText } from './download.ts'
 
-type HubSection = 'phone' | 'memory' | 'cu' | 'tuoguan' | 'local'
+type HubSection = 'phone' | 'memory' | 'cu' | 'tihu' | 'tuoguan' | 'local'
 
 const segWrap: Record<string, any> = {
   display: 'flex', gap: 6, margin: '2px 0 12px', padding: 3,
@@ -139,11 +141,61 @@ function ModelSelect(props: {
   )
 }
 
-function ComputerUsePanel() {
+/**
+ * 宿主模型目录（Computer Use 与鹈鹕端共用一份数据源与选项渲染）。
+ *
+ * 两个分区各存各的选择（CU 存 localStorage、鹈鹕端存 config.json），但「有哪些模型」必须
+ * 是同一份——所以把加载逻辑抽到这里，别在两个 panel 里各写一遍。
+ */
+function useModelCatalog(): {
+  models: { provider: string; model: string; name: string; groupName: string }[]
+  fallback?: { provider: string; model: string }
+  state: 'loading' | 'ready' | 'error'
+  error: string
+  reload: () => void
+} {
   const [models, setModels] = useState<{ provider: string; model: string; name: string; groupName: string }[]>([])
   const [fallback, setFallback] = useState<{ provider: string; model: string } | undefined>(undefined)
   const [state, setState] = useState<'loading' | 'ready' | 'error'>('loading')
   const [error, setError] = useState('')
+  const reload = (): void => {
+    setState('loading')
+    setError('')
+    try {
+      const api = getAssistantApi()
+      if (!api || typeof (api as any).modelCatalog !== 'function') {
+        setState('error')
+        setError('宿主模型目录接口还没就绪（稍等几秒再点重试）')
+        return
+      }
+      void (api as any).modelCatalog().then((catalog: any) => {
+        const list: any[] = Array.isArray(catalog?.models) ? catalog.models : []
+        setModels(list.map((m) => ({
+          provider: String(m?.provider ?? ''),
+          model: String(m?.model ?? ''),
+          name: String(m?.name ?? m?.model ?? ''),
+          groupName: String(m?.groupName ?? m?.provider ?? '模型'),
+        })).filter((m) => m.provider && m.model))
+        const d = catalog?.default
+        setFallback(d && typeof d.provider === 'string' && typeof d.model === 'string' ? { provider: d.provider, model: d.model } : undefined)
+        setState('ready')
+      }).catch((err: unknown) => {
+        setState('error')
+        setError(err instanceof Error ? err.message : String(err))
+      })
+    } catch (err) {
+      setState('error')
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+  useEffect(() => { reload() }, [])
+  return { models, fallback, state, error, reload }
+}
+
+function ComputerUsePanel() {
+  const catalog = useModelCatalog()
+  const { models, fallback, state, error } = catalog
+  const load = catalog.reload
   const [front, setFront] = useState<Choice | null>(() => readModelPref('cu'))
   const [background, setBackground] = useState<Choice | null>(() => readBgPref())
   // 千分比坐标（dsh-orb 迁入）：true = 0–1000 比例，false = 截图像素。
@@ -193,39 +245,6 @@ function ComputerUsePanel() {
       .finally(() => setMilliBusy(false))
   }
   useEffect(() => { loadCoordinateMode() }, [])
-
-  const load = () => {
-    setState('loading')
-    setError('')
-    try {
-      const api = getAssistantApi()
-      if (!api || typeof (api as any).modelCatalog !== 'function') {
-        setState('error')
-        setError('宿主模型目录接口还没就绪（稍等几秒再点重试）')
-        return
-      }
-      void (api as any).modelCatalog().then((catalog: any) => {
-        const list: any[] = Array.isArray(catalog?.models) ? catalog.models : []
-        setModels(list.map((m) => ({
-          provider: String(m?.provider ?? ''),
-          model: String(m?.model ?? ''),
-          name: String(m?.name ?? m?.model ?? ''),
-          groupName: String(m?.groupName ?? m?.provider ?? '模型'),
-        })).filter((m) => m.provider && m.model))
-        const d = catalog?.default
-        setFallback(d && typeof d.provider === 'string' && typeof d.model === 'string' ? { provider: d.provider, model: d.model } : undefined)
-        setState('ready')
-      }).catch((err: unknown) => {
-        setState('error')
-        setError(err instanceof Error ? err.message : String(err))
-      })
-    } catch (err) {
-      setState('error')
-      setError(err instanceof Error ? err.message : String(err))
-    }
-  }
-
-  useEffect(() => { load() }, [])
 
   const ball = useSyncExternalStore(ballConfigStore.subscribe, ballConfigStore.getSnapshot)
   const [avatarError, setAvatarError] = useState('')
@@ -419,6 +438,143 @@ function TuoguanPanel() {
   )
 }
 
+/* ---------------- 鹈鹕端（语音小屏）：默认前台/后台模型 + 默认云音色 ---------------- */
+
+/** 配置里的模型选择 → ModelSelect 的 Choice（name 只用于未知模型时的兜底显示）。 */
+function choiceOfModel(raw: AssistantModelChoice | null): Choice | null {
+  return raw ? { provider: raw.provider, model: raw.model, name: raw.model } : null
+}
+
+/**
+ * 「个人助手 → 鹈鹕端」：三项都落 `~/.dsh/assistant/config.json` 的 `tihu` 段
+ * （`tihu.model.foreground` / `tihu.model.background` / `tihu.voice.edge`），
+ * 走现成的 `POST /api/assistant/config`，**不新增 localStorage 键**。
+ *
+ * 生效范围（与 Computer Use 分区同一种说法）：只影响之后新建的会话 / 之后连上的设备。
+ * 前台 = 派单任务会话（设备屏上跑的那条），后台 = 指挥台会话（判项目/续聊，不占屏）。
+ */
+function TihuPanel() {
+  const catalog = useModelCatalog()
+  const { models, fallback, state, error } = catalog
+  const [tihu, setTihu] = useState<AssistantTihuConfig>(() => tihuConfigSync())
+  const [busy, setBusy] = useState<'' | 'foreground' | 'background' | 'voice'>('')
+  const [note, setNote] = useState('')
+  const [noteError, setNoteError] = useState(false)
+
+  useEffect(() => {
+    void loadRemoteConfig().then((value) => { if (value) setTihu(value.tihu) })
+  }, [])
+
+  const save = async (which: 'foreground' | 'background' | 'voice', patch: Record<string, unknown>, done: string): Promise<void> => {
+    if (busy !== '') return
+    setBusy(which)
+    setNote('')
+    setNoteError(false)
+    const result = await saveAssistantConfig({ tihu: patch })
+    setBusy('')
+    if (!result.ok) {
+      setNoteError(true)
+      setNote(`保存失败：${result.error ?? '未知错误'}${result.field ? `（字段 ${result.field}）` : ''}`)
+      return
+    }
+    if (result.config) setTihu(result.config.tihu)
+    setNote(done)
+  }
+
+  return (
+    <div>
+      <div style={card}>
+        <div style={row}>
+          <div>
+            <div style={title}>默认前台模型</div>
+            <p style={desc}>
+              设备派单新建的任务会话（Computer Use 模式，屏上跑的那条）用它。
+              选择后由宿主在会话建好、第一条消息投进去之前指定；<b>已经开着的会话不变</b>。
+            </p>
+          </div>
+          <ModelSelect
+            label="鹈鹕端默认前台模型"
+            value={choiceOfModel(tihu.model.foreground)}
+            models={models}
+            fallback={fallback}
+            disabled={state !== 'ready' || busy !== ''}
+            onPick={(next) => {
+              void save('foreground', { model: { foreground: next ? { provider: next.provider, model: next.model } : null } },
+                next ? '已保存：下次派单新建的任务会话用它。' : '已保存：前台模型跟随 DSH 默认。')
+            }}
+          />
+        </div>
+      </div>
+
+      <div style={card}>
+        <div style={row}>
+          <div>
+            <div style={title}>默认后台模型</div>
+            <p style={desc}>
+              鹈鹕的指挥台会话（判项目、判续聊，不占屏、你看不到它）用它。
+              同样只对之后新建的指挥台生效；当前那条指挥台会话保持原样。
+            </p>
+          </div>
+          <ModelSelect
+            label="鹈鹕端默认后台模型"
+            value={choiceOfModel(tihu.model.background)}
+            models={models}
+            fallback={fallback}
+            disabled={state !== 'ready' || busy !== ''}
+            onPick={(next) => {
+              void save('background', { model: { background: next ? { provider: next.provider, model: next.model } : null } },
+                next ? '已保存：新建的指挥台会话用它。' : '已保存：后台模型跟随 DSH 默认。')
+            }}
+          />
+        </div>
+      </div>
+
+      <div style={card}>
+        <div style={row}>
+          <div>
+            <div style={title}>默认云音色</div>
+            <p style={desc}>
+              设备说话时的默认声音，只列 edge-tts 云端音色（不列本地 Kokoro：那些是离线兜底）。
+              设备页仍可临时另选，只管这一次连接。
+            </p>
+          </div>
+          <select
+            aria-label="鹈鹕端默认云音色"
+            style={selectStyle}
+            disabled={busy !== ''}
+            value={tihu.voice.edge}
+            onChange={(event) => {
+              const next = String(event.target.value)
+              void save('voice', { voice: { edge: next } },
+                next ? `已保存：${tihuCloudVoiceLabel(next)}。` : '已保存：跟随默认云音色。')
+            }}
+          >
+            <option value="">{`跟随默认（${tihuCloudVoiceLabel(TIHU_CLOUD_VOICE_DEFAULT)}）`}</option>
+            {TIHU_CLOUD_VOICES.map((voice) => (
+              <option key={voice.id} value={voice.id}>{voice.label}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {state === 'loading' ? <p style={desc}>正在读取模型目录…</p> : null}
+      {state === 'error' ? (
+        <p style={errText}>
+          模型目录读取失败：{error}
+          <button type="button" style={{ ...selectStyle, height: 26, minWidth: 0, marginLeft: 8, cursor: 'pointer' }} onClick={() => catalog.reload()}>重试</button>
+        </p>
+      ) : null}
+      {note ? <p style={noteError ? errText : { ...desc, marginTop: 2 }}>{note}</p> : null}
+
+      <p style={{ ...desc, padding: '0 2px' }}>
+        三项都存在本机配置文件（~/.dsh/assistant/config.json）里，手机端与电脑端共用同一份；
+        临时改可以用环境变量 TIHU_MODEL_FOREGROUND / TIHU_MODEL_BACKGROUND（provider/model）与
+        TIHU_EDGE_VOICE，环境变量优先级最高。没配置时一切按原样：模型跟随 DSH 默认，音色云健。
+      </p>
+    </div>
+  )
+}
+
 /** 本机认识的预设 id：布局预设（src/client/index.tsx 的 PRESET_DEFS）+ 会话预设（standard / computer-use）。
  *  导入档案包时按这份名单判「本机没有的预设」，缺了要明确提示，不静默。 */
 const KNOWN_PRESET_IDS = ['chat', '2h', '3h', 'l2', 'grid', 't3', 'l13', 'g4', 'l23', 'full', 'standard', 'computer-use']
@@ -532,6 +688,7 @@ export function AssistantSettingsHub({ rpcCall, t, tl }: { rpcCall?: any; t?: an
         {tab('phone', '📱 手机访问')}
         {tab('memory', '🧠 它记下了什么')}
         {tab('cu', '🔮 Computer Use')}
+        {tab('tihu', '🐦 鹈鹕端')}
         {tab('tuoguan', '🤝 托管')}
         {tab('local', '🧩 本机配置')}
       </div>
@@ -542,6 +699,7 @@ export function AssistantSettingsHub({ rpcCall, t, tl }: { rpcCall?: any; t?: an
       )}
       {section === 'memory' && <AssistantMemoryPanel />}
       {section === 'cu' && <ComputerUsePanel />}
+      {section === 'tihu' && <TihuPanel />}
       {section === 'tuoguan' && <TuoguanPanel />}
       {section === 'local' && <LocalConfigPanel tl={tl} />}
 

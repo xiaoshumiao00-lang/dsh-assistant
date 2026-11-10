@@ -385,6 +385,8 @@ export function doneFrame(input: {
   bullets?: readonly string[]
   /** 同一批里其它已完成条数（>0 时顶栏右端「另有 N 条」）。 */
   others?: number
+  /** 首屏高亮从第几行开始（0 起；重读/跳段时用来定点，缺省 0）。 */
+  current?: number
 }): ScreenFramePayload {
   const body = String(input.replyText ?? '').trim() !== ''
     ? String(input.replyText)
@@ -404,7 +406,7 @@ export function doneFrame(input: {
     bullets: fitScreenLines([stripStatusMarks(input.resultLine || '做完了')], SCREEN_SPEC.maxBodyLines),
     done: {
       lines: shown,
-      current: 0,
+      current: Math.max(0, Math.min(Math.max(0, shown.length - 1), Math.trunc(Number(input.current) || 0))),
       ...(ranges.length === shown.length ? { ranges } : {}),
     },
     ...(input.others !== undefined && input.others > 0 ? { more: { count: input.others, text: `另有 ${input.others} 条` } } : {}),
