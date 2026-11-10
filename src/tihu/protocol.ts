@@ -390,8 +390,8 @@ export interface TaskBoardRow {
   ring: { percent: number; tone: 'normal' | 'warn' | 'done' | 'empty' }
   /** 待决策行的琥珀问号徽标。 */
   badge?: 'ask'
-  /** 同一项目连续多条被折叠时的「+N 条」。 */
-  merged?: number
+  /** 子代理还在跑的数量（>0 时状态图形外侧加一圈缓慢旋转的短弧；不写文字）。 */
+  subagents?: number
   /** 最近 8 步耗时（毫秒）：棋盘微条，只做节奏感，不参与状态。 */
   micro?: number[]
 }

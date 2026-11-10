@@ -152,7 +152,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .ask-name { font-size:13px; font-weight:700; line-height:15px; color:#e6edf3; }
   #screen .ask-source { font-size:10px; line-height:12px; color:#9fb0c0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #screen .board-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
-  #screen .board-merged { flex:none; font-size:11px; color:#7c8b99; }
   #screen .board-row2 { display:flex; align-items:center; gap:6px; font-size:12px; line-height:16px; color:#8b97a5; }
   #screen .board-sub { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
   /* 右侧状态图形（用户 2026-11-10 定案，不再用 10px 实心点）：右对齐、离屏幕外沿正好 10px
@@ -168,6 +167,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-status.awaiting { width:14px; height:14px; border-radius:50%; background:var(--warn);
     color:#1b1305; font-size:11px; font-weight:700; line-height:14px; text-align:center; }
   #screen .board-status.running svg { display:block; width:14px; height:14px; }
+  /* 子代理还在跑（用户 2026-11-10 定案）：不写字，只在状态图形外侧加一圈缓慢旋转的
+     短弧（同一枚 14×14 图形里，蓝色同 #4f9fd8，7 秒一圈；子代理全结束就停）。 */
+  #screen .board-status .board-orbit { transform-box:view-box; transform-origin:7px 7px;
+    animation:boardOrbit 7s linear infinite; }
+  @keyframes boardOrbit { from { transform:rotate(0deg); } to { transform:rotate(360deg); } }
   /* 翻页条：上一页 / 第 N/M 页 / 下一页（只有一页时 JS 不建这条）。
      钉在屏底：flex:none + margin-bottom:2px → 条底边离屏幕外沿 8+1+2 = 11px（用户要求 10–12px），
      不管这一页剩 4 条还是 1 条，它都在同一个位置。 */
@@ -659,12 +663,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       title.textContent = row.title || '';
       row1.appendChild(capsule);
       row1.appendChild(title);
-      if (Number(row.merged) > 0) {
-        var merged = document.createElement('span');
-        merged.className = 'board-merged';
-        merged.textContent = '+' + row.merged + ' 条';
-        row1.appendChild(merged);
-      }
       // 微条放在标题行末尾：副行最右边只留「状态图形」这一枚（用户 2026-11-10 实机反馈：
       // 右侧同时出现波形+圆环，看成两个状态了）。
       if (Array.isArray(row.micro) && row.micro.length > 0) {
@@ -734,11 +732,23 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       var radius = 5;
       var circumference = Math.PI * 2 * radius;
       var arc = Math.max(1, circumference * percent);
+      // 子代理还在跑：不写一个字，只在圆环外侧叠一段缓慢旋转的蓝色短弧（约 63°，7 秒一圈）。
+      var subagents = Number(row.subagents);
+      var orbit = '';
+      if (Number.isFinite(subagents) && subagents > 0) {
+        var orbitRadius = 6.35;
+        var orbitLength = Math.PI * 2 * orbitRadius;
+        var orbitArc = orbitLength * (63 / 360);
+        orbit = '<g class="board-orbit">'
+          + '<circle cx="7" cy="7" r="' + orbitRadius + '" fill="none" stroke="#4f9fd8" stroke-width="0.9"'
+          + ' stroke-linecap="round" stroke-dasharray="' + orbitArc.toFixed(2) + ' ' + (orbitLength + 1).toFixed(2) + '"'
+          + ' transform="rotate(-90 7 7)"></circle></g>';
+      }
       status.innerHTML = '<svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">'
         + '<circle cx="7" cy="7" r="' + radius + '" fill="none" stroke="#2b3a4a" stroke-width="2"></circle>'
         + '<circle cx="7" cy="7" r="' + radius + '" fill="none" stroke="#4f9fd8" stroke-width="2" stroke-linecap="round"'
         + ' stroke-dasharray="' + arc.toFixed(2) + ' ' + (circumference + 1).toFixed(2) + '"'
-        + ' transform="rotate(-90 7 7)"></circle></svg>';
+        + ' transform="rotate(-90 7 7)"></circle>' + orbit + '</svg>';
       return status;
     }
     if (state === 'awaiting') {

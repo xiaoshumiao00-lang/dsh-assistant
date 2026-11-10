@@ -567,6 +567,10 @@ interface TihuSessionRow {
   /** agent preset（Computer Use 判定依据：投影 `agentPreset`，缺省回退 header）。 */
   preset: string
   cwd?: string
+  /** 子代理血缘：父会话 id（header.parentSession；只有 origin=subagent 才有）。 */
+  parentSession?: string
+  /** 子代理来源标记（header.origin，实测取值 'subagent'）。 */
+  origin?: string
   workspaceId?: string
   createdAt?: number
   /** 活跃时间：max(createdAt, 投影 sessionListMetadata.lastPromptAt)。 */
@@ -694,6 +698,13 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
    * 任务（派单/电脑端）的完成判定、棋盘状态都从它读；没有设备的会话也要跟。
    */
   const runningSessions = new Map<string, number>()
+  /**
+   * 主回合已结束、等子代理跑完的任务：存下主回合的结论（完成屏/播报在子代理全结束后才出）。
+   * 不入登记簿持久化：进程重启后最多重算一次（子代理本就不跨进程）。
+   */
+  const deferredReplies = new Map<string, { reply: string; resultLine: string }>()
+  /** 子代理收敛的周期检查（事件漏收时兜底；2 秒一次，只扫有会话的任务）。 */
+  let childReconcileTimer: ReturnType<typeof setInterval> | undefined
   /** 事件里带来的会话模式（preset）：列表缓存有 60s TTL，刚建的会话只能靠它判 CU。 */
   const sessionPresets = new Map<string, string>()
   /** 会话 id → 最近一条 assistant 原文（电脑端会话的完成摘要取自它）。 */
@@ -1005,6 +1016,217 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return preset === TIHU_COMPUTER_USE_PRESET
   }
 
+  /* ---------- 子代理（subagent）血缘与在跑计数 ----------
+   *
+   * 宿主数据（2026-11-10 实测 DSH 4 的 session 存储）：
+   *   - 子会话的 header 带 `parentSession`（父会话 id）、`origin: 'subagent'`、
+   *     `delegationDepth`；`sessionQuery.listSessions()` 原样带回来；
+   *   - 父会话的投影 `subagentCatalog` 是「直接子级清单」，但**不含运行状态**；
+   *   - 在跑状态从 agent 注册表拿：`ctx.agents.list()` 的 `agent.status: 'idle' | 'running'`，
+   *     与宿主 `workspace/session-activity` 判断「running subagent descendants」同一口径
+   *     （沿 parentSession + origin=subagent 走到任意深度，只看 status=running）。
+   * 因此这里优先用 agents 注册表；拿不到时退回「会话行血缘 + session/event 的 runningSessions」。
+   */
+
+  function headerOfSession(source: any): any {
+    return source?.header ?? source
+  }
+
+  /** 一条活 agent 的会话 id（agent.session.header.id / agent.id）。 */
+  function agentSessionIdOf(agent: any): string | undefined {
+    const header = headerOfSession(agent?.session)
+    if (typeof header?.id === 'string' && header.id !== '') return header.id
+    return typeof agent?.id === 'string' && agent.id !== '' ? agent.id : undefined
+  }
+
+  /** 活 agent 列表（拿不到给 undefined，调用方退回会话行 + runningSessions）。 */
+  function liveAgentList(): any[] | undefined {
+    const registry = optionalService(ctx, 'agents') as { list?: () => any[] } | undefined
+    try {
+      if (typeof registry?.list !== 'function') return undefined
+      const listed = registry.list()
+      return Array.isArray(listed) ? listed : undefined
+    } catch { return undefined }
+  }
+
+  /**
+   * 这条会话（含任意深度后代）里正在跑的子代理数量。
+   * 只数 `origin=subagent` + `parentSession` 血缘；fork 出来的会话不算（它是另一段对话）。
+   */
+  function runningSubagentCountOf(sessionId: string, agents: any[] | undefined = liveAgentList()): number {
+    if (sessionId === '') return 0
+    if (agents !== undefined) {
+      const childrenOf = new Map<string, any[]>()
+      for (const agent of agents) {
+        const header = headerOfSession(agent?.session)
+        const parent = header?.parentSession
+        if (typeof parent !== 'string' || parent === '') continue
+        if (header?.origin !== 'subagent') continue
+        const siblings = childrenOf.get(parent) ?? []
+        siblings.push(agent)
+        childrenOf.set(parent, siblings)
+      }
+      let running = 0
+      const pending = [sessionId]
+      const visited = new Set<string>([sessionId])
+      while (pending.length > 0) {
+        const parentId = pending.shift() as string
+        for (const child of childrenOf.get(parentId) ?? []) {
+          const childId = agentSessionIdOf(child)
+          if (childId === undefined || visited.has(childId)) continue
+          visited.add(childId)
+          if (child.status === 'running' || (child.status === undefined && runningSessions.has(childId))) running += 1
+          pending.push(childId)
+        }
+      }
+      return running
+    }
+    // 退化路径：没有 agents 注册表（老宿主/轻量桩）时，用缓存的会话行血缘 + 事件里的在跑集合。
+    const rows = sessionListCache?.rows ?? []
+    const childrenOf = new Map<string, TihuSessionRow[]>()
+    for (const row of rows) {
+      if (row.origin !== 'subagent' || row.parentSession === undefined) continue
+      const siblings = childrenOf.get(row.parentSession) ?? []
+      siblings.push(row)
+      childrenOf.set(row.parentSession, siblings)
+    }
+    let running = 0
+    const pending = [sessionId]
+    const visited = new Set<string>([sessionId])
+    while (pending.length > 0) {
+      const parentId = pending.shift() as string
+      for (const child of childrenOf.get(parentId) ?? []) {
+        if (visited.has(child.sessionId)) continue
+        visited.add(child.sessionId)
+        if (runningSessions.has(child.sessionId)) running += 1
+        pending.push(child.sessionId)
+      }
+    }
+    return running
+  }
+
+  /** 从一条会话沿 parentSession 往上走，返回它自己与全部祖先（用于把子代理事件归到任务）。 */
+  function ancestorSessionIdsOf(session: any, sessionId: string): string[] {
+    const chain: string[] = [sessionId]
+    const seen = new Set<string>([sessionId])
+    let current = session
+    for (let depth = 0; depth < 32; depth += 1) {
+      const header = headerOfSession(current)
+      const parent = header?.parentSession
+      if (typeof parent !== 'string' || parent === '' || seen.has(parent)) break
+      chain.push(parent)
+      seen.add(parent)
+      const live = liveSessionOf(parent)
+      current = live ?? sessionListCache?.rows.find((row) => row.sessionId === parent)
+      if (current === undefined) break
+    }
+    return chain
+  }
+
+  /**
+   * 子代理的 turn 起落：把它所有祖先里的任务重新算一遍「在跑子任务数」；
+   * 挂起的任务在归零时补完成（主回合的结论已经存下，不会丢）。
+   */
+  function reconcileTasksForChild(session: any, childId: string, at: number): void {
+    for (const ancestorId of ancestorSessionIdsOf(session, childId).slice(1)) {
+      const task = tasks.ofSession(ancestorId)
+      if (task === undefined) continue
+      const running = runningSubagentCountOf(ancestorId)
+      if (tasks.setChildRunning(task.taskId, running, at)) refreshBoards()
+      if (running === 0 && task.holdingForChildren === true) finalizeHeldTask(task, at)
+    }
+  }
+
+  /**
+   * 一条任务真的完成了：落完成态 ＋ 完成屏 ＋ 一句播报。
+   *
+   * **主回合结束但子代理还在跑时不许走这里**：先 holdForChildren，等子代理全部结束再补。
+   * 完成屏的「另有 N 条」也不再按同批折叠（本次改版只留单条完成）。
+   */
+  function showCompletedTask(task: TihuTask, input: { reply: string; resultLine: string; at: number }): void {
+    const resultLine = String(input.resultLine ?? '').trim() || '做完了'
+    tasks.complete(task.taskId, { resultLine, now: input.at })
+    task.doneText = input.reply
+    const frame = doneFrame({
+      taskId: task.taskId,
+      title: task.title,
+      resultLine,
+      replyText: input.reply || DONE_NO_REPLY_TEXT,
+      bullets: replyBulletsOf(input.reply),
+    })
+    for (const device of devices) {
+      if (!device.unified) continue
+      // 回执/追问/待决策是「要人先看清」的屏：完成帧不能夺屏（屏 2/5/7 优先）。
+      if (device.receiptTimer !== undefined || device.pendingPick !== undefined) continue
+      const focused = device.focusedTask === undefined ? undefined : tasks.get(device.focusedTask)
+      if (focused?.state === 'awaiting') continue
+      disarmAutoHome(device)
+      device.focusedTask = task.taskId
+      device.onBoard = false
+      sendFrame(device, frame, device.sessionId)
+      sendTaskUpdate(device, task)
+      readDoneScreen(device, task)
+    }
+    pushTaskNotify(task, 1, doneAnnouncementOf(task))
+    refreshBoards()
+  }
+
+  /** 子代理全部结束：把挂起的任务补成「完成」并补发完成屏/播报（用主回合存下的结论）。 */
+  function finalizeHeldTask(task: TihuTask, at = Date.now()): void {
+    const sessionId = task.sessionIds[task.sessionIds.length - 1]
+    const stored = deferredReplies.get(task.taskId)
+    deferredReplies.delete(task.taskId)
+    const reply = stored?.reply ?? (sessionId === undefined ? '' : cachedAssistantText(sessionId))
+    const resultLine = stored?.resultLine ?? task.pendingResultLine ?? (firstSentenceOf(reply) || '做完了')
+    task.childRunning = undefined
+    task.holdingForChildren = undefined
+    task.pendingResultLine = undefined
+    showCompletedTask(task, { reply, resultLine, at })
+    log(`tihu subagents settled task=${task.taskId} children=0`)
+  }
+
+  /**
+   * 扫一遍任务与子代理血缘：更新「子任务在跑」计数；挂起的任务在子代理全结束后补完成。
+   * 由子代理事件即时触发，另有 2 秒周期兜底（事件漏收/进程晚启动）。
+   */
+  function reconcileChildTasks(reason: string): void {
+    if (disposed) return
+    const now = Date.now()
+    const agents = liveAgentList()
+    let changed = false
+    for (const task of tasks.list()) {
+      if (task.state === 'archived' || task.state === 'awaiting') continue
+      if (task.sessionIds.length === 0) continue
+      if (task.state === 'done' || task.state === 'announced') {
+        if ((task.childRunning ?? 0) === 0 && task.holdingForChildren !== true) continue
+      }
+      const sessionId = task.sessionIds[task.sessionIds.length - 1]
+      const running = runningSubagentCountOf(sessionId, agents)
+      if ((task.childRunning ?? 0) !== running) {
+        tasks.setChildRunning(task.taskId, running, now)
+        changed = true
+      }
+      if (running === 0 && task.holdingForChildren === true) {
+        finalizeHeldTask(task, now)
+        changed = true
+      }
+    }
+    if (changed) {
+      refreshBoards()
+      log(`tihu subagent reconcile reason=${reason}`)
+    }
+  }
+
+  /** 有统一设备在线时每 2 秒对一次子代理计数（事件漏收也能收敛）。 */
+  function ensureChildReconcile(): void {
+    if (childReconcileTimer !== undefined) return
+    const timer = setInterval(() => {
+      try { reconcileChildTasks('tick') } catch (error) { log(`tihu subagent reconcile failed: ${(error as Error)?.message ?? String(error)}`) }
+    }, 2_000)
+    timer.unref?.()
+    childReconcileTimer = timer
+  }
+
   /**
    * 活跃时间（毫秒）：与宿主/桌面会话列表同一个口径
    * `updatedAt = max(header.createdAt, 投影 sessionListMetadata.lastPromptAt)`。
@@ -1035,6 +1257,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         preset: presetOf(session),
         updatedAt: activityOf(session),
         ...(typeof session?.header?.cwd === 'string' ? { cwd: session.header.cwd } : {}),
+        ...(typeof session?.header?.parentSession === 'string' ? { parentSession: session.header.parentSession } : {}),
+        ...(session?.header?.origin === 'subagent' ? { origin: 'subagent' as const } : {}),
         ...(workspaceIdOf(session) === undefined ? {} : { workspaceId: workspaceIdOf(session) }),
         ...(Number.isFinite(session?.header?.createdAt) ? { createdAt: Number(session.header.createdAt) } : {}),
         live: true,
@@ -1076,6 +1300,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             preset: presetOf(record?.header),
             updatedAt: activityOf(record?.header),
             ...(typeof record?.header?.cwd === 'string' ? { cwd: record.header.cwd } : {}),
+            ...(typeof record?.header?.parentSession === 'string' ? { parentSession: record.header.parentSession } : {}),
+            ...(record?.header?.origin === 'subagent' ? { origin: 'subagent' as const } : {}),
             ...(workspaceIdOf(record) === undefined ? {} : { workspaceId: workspaceIdOf(record) }),
             ...(Number.isFinite(record?.header?.createdAt) ? { createdAt: Number(record.header.createdAt) } : {}),
             live: record?.live === true,
@@ -1788,6 +2014,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         runningSessions.delete(sessionId)
         setTimeout(pruneStaleTurns, 0)
       }
+      // 子代理的起落：沿 parentSession 把「子任务在跑」的状态与挂起任务的完成补上。
+      // 不看它有没有绑定设备——任务状态必须与真实子代理一致。
+      if (headerOfSession(session)?.origin === 'subagent' && (type === 'turn/start' || type === 'turn/end')) {
+        reconcileTasksForChild(session, sessionId, at)
+      }
       if (type === 'assistant/message') {
         const blocks = Array.isArray((data as any)?.message?.content) ? (data as any).message.content : []
         const text = stripToolNoise(blocks.filter((b: any) => b?.type === 'text').map((b: any) => String(b?.text ?? '')).join('\n')).trim()
@@ -1839,30 +2070,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           // 的完成态可能是列表推出来的，`assistant/message` 不保证都在本进程里。
           const doneReply = lastAssistant.get(sessionId)?.text ?? cachedAssistantText(sessionId)
           const pcResult = plainSummaryOf(doneReply) || (pcOk ? '做完了' : `中断（${pcReason}）`)
-          tasks.syncExternal(taskOfSession.taskId, { state: 'done', summary: pcResult, at })
-          // 完成/回答页：任务完成就上完成屏，并从这里开始朗读（读完 60 秒回棋盘）。
-          const doneTask = tasks.get(taskOfSession.taskId) ?? taskOfSession
-          doneTask.doneText = doneReply
-          const done = doneFrame({
-            taskId: doneTask.taskId,
-            title: doneTask.title,
-            resultLine: firstSentenceOf(doneReply) || pcResult,
-            replyText: doneReply || DONE_NO_REPLY_TEXT,
-            bullets: replyBulletsOf(doneReply),
-          })
-          for (const device of devices) {
-            if (!device.unified) continue
-            if (device.receiptTimer !== undefined || device.pendingPick !== undefined) continue
-            disarmAutoHome(device)
-            device.focusedTask = doneTask.taskId
-            device.onBoard = false
-            sendFrame(device, done, device.sessionId)
-            sendTaskUpdate(device, doneTask)
-            // 完成屏一上屏就念**整段正文**（原来这里只留下面的 P1 播报，屏上正文没进过朗读链路）。
-            readDoneScreen(device, doneTask)
+          // 用户 2026-11-10：主回合结束 ≠ 任务完成——它派出的后台子代理可能还在跑。
+          const childRunning = runningSubagentCountOf(sessionId)
+          tasks.setChildRunning(taskOfSession.taskId, childRunning, at)
+          if (childRunning > 0) {
+            tasks.holdForChildren(taskOfSession.taskId, { childRunning, resultLine: pcResult, now: at })
+            deferredReplies.set(taskOfSession.taskId, { reply: doneReply, resultLine: pcResult })
+            refreshBoards()
+            refreshFocusedDetail(taskOfSession)
+            log(`tihu pc held for subagents task=${taskOfSession.taskId} children=${childRunning}`)
+            return
           }
-          pushTaskNotify(doneTask, 1, doneAnnouncementOf(doneTask))
-          refreshBoards()
+          // 完成屏➕一句播报：等子代理都结束才走到这里。
+          showCompletedTask(taskOfSession, { reply: doneReply, resultLine: firstSentenceOf(doneReply) || pcResult, at })
           log(`tihu pc done task=${taskOfSession.taskId} ok=${String(pcOk)} line=${JSON.stringify(pcResult)}`)
         }
         return
@@ -1874,6 +2094,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         const stepValue = Number((data as any)?.step)
         if (type === 'turn/start') {
           tasks.markRunning(taskOfSession.taskId, at)
+          // 新一轮开始：上一轮「等子代理」的挂起状态作废（这一轮会重新算）。
+          tasks.clearChildHold(taskOfSession.taskId, at)
           // 新一轮真的开始了：锚点挪到这一轮（这才算「新一轮」，轮询不许动它）。
           noteRunAnchor(taskOfSession.taskId, progress.turnStartedAt || at, true)
           refreshBoards()
@@ -1890,36 +2112,20 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           const ok = reason === 'stop' || reason === 'completed'
           const reply = lastAssistant.get(sessionId)?.text ?? cachedAssistantText(sessionId)
           const resultLine = firstSentenceOf(reply) || (ok ? '做完了' : `中断（${reason}）`)
-          tasks.complete(taskOfSession.taskId, { resultLine, now: at })
-          taskOfSession.doneText = reply
-          const others = tasks.list().filter((item) => item.state === 'done'
-            && item.taskId !== taskOfSession.taskId
-            && (item.finishedAt ?? 0) > at - 15_000).length
-          const frame = doneFrame({
-            taskId: taskOfSession.taskId,
-            title: taskOfSession.title,
-            resultLine,
-            replyText: reply || DONE_NO_REPLY_TEXT,
-            bullets: replyBulletsOf(reply),
-            ...(others > 0 ? { others } : {}),
-          })
-          for (const device of devices) {
-            if (!device.unified) continue
-            // 回执/追问/待决策是「要人先看清」的屏：完成帧不能夺屏（屏 2/5/7 优先）。
-            if (device.receiptTimer !== undefined || device.pendingPick !== undefined) continue
-            const focused = device.focusedTask === undefined ? undefined : tasks.get(device.focusedTask)
-            if (focused?.state === 'awaiting') continue
-            device.focusedTask = taskOfSession.taskId
-            device.onBoard = false
-            sendFrame(device, frame, device.sessionId)
-            sendTaskUpdate(device, taskOfSession)
-            // 派出去的活完成时也一样：屏一上屏就念**整段正文**（不是只有「标题——第一句」）。
-            readDoneScreen(device, taskOfSession)
+          // 用户 2026-11-10：主回合结束 ≠ 任务完成——它派出的后台子代理可能还在跑。
+          const childRunning = runningSubagentCountOf(sessionId)
+          tasks.setChildRunning(taskOfSession.taskId, childRunning, at)
+          if (childRunning > 0) {
+            tasks.holdForChildren(taskOfSession.taskId, { childRunning, resultLine, now: at })
+            deferredReplies.set(taskOfSession.taskId, { reply, resultLine })
+            refreshBoards()
+            refreshFocusedDetail(taskOfSession)
+            log(`tihu task held for subagents task=${taskOfSession.taskId} children=${childRunning}`)
+            return
           }
-          // P1：一句播报（八秒窗口内的多条合并成一句）
-          pushTaskNotify(taskOfSession, 1, doneAnnouncementOf(taskOfSession))
-          refreshBoards()
-          log(`tihu task done task=${taskOfSession.taskId} ok=${String(ok)} line=${JSON.stringify(resultLine)} others=${others}`)
+          // 子代理全部结束才转完成、才播报（用户 2026-11-10 的硬要求）。
+          showCompletedTask(taskOfSession, { reply, resultLine, at })
+          log(`tihu task done task=${taskOfSession.taskId} ok=${String(ok)} line=${JSON.stringify(resultLine)}`)
         }
         return
       }
@@ -2166,6 +2372,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         device.send('event.progress', { stage: '指挥', text: '统一指挥已就绪：说一句话就派单，不用挑会话' } satisfies ProgressPayload)
         // 电脑端会话也上棋盘：起一次轮询（列表请求仍由 sessionListTtlMs 节流）并立刻同步一遍。
         ensurePcSync()
+        // 子代理状态也要跟着收敛：有屏在线时每 2 秒对一次「子任务在跑」计数。
+        ensureChildReconcile()
         // 先挂「连上后要不要跟随正在跑的任务」，再触发同步：同步是异步的，
         // 等它把电脑端任务写进登记簿后，由 syncExternalSessions 决定跳不跳（只跳一次）。
         device.followPending = true
@@ -2972,13 +3180,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       }
       if (disposed) return
       const now = Date.now()
+      const agents = liveAgentList()
       // 派单任务占着的会话不再上电脑端卡片：归档过的也算（那条会话已经属于鹈鹕任务）。
       const bound = new Set<string>()
       for (const task of tasks.list()) {
         if (task.source === 'pc') continue
         for (const sessionId of task.sessionIds) bound.add(sessionId)
       }
-      const wanted = new Map<string, { row: TihuSessionRow; state: 'queued' | 'running' | 'done'; activity: number; start: number }>()
+      const wanted = new Map<string, { row: TihuSessionRow; state: 'queued' | 'running' | 'done'; activity: number; start: number; childRunning: number }>()
       for (const row of rows) {
         if (wanted.size >= PC_SESSION_MAX) break
         const sessionId = row.sessionId
@@ -3013,10 +3222,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         // 在这侧点屏幕能空好几十秒，每一次抖动都把「已用」与时长环抹回 0（实机就是这个）。
         const stillRunning = !running && known !== undefined && known !== ''
           && tasks.get(known ?? '')?.state === 'running' && now - activity <= PC_RUNNING_STILL_MS
-        const state: 'queued' | 'running' | 'done' = blank ? 'queued' : (running || stillRunning) ? 'running' : 'done'
+        // 子代理还在跑：主会话看起来完成了，这条任务也算「执行中」（用户 2026-11-10）。
+        const childRunning = runningSubagentCountOf(sessionId, agents)
+        const state: 'queued' | 'running' | 'done' = blank ? 'queued' : (running || stillRunning || childRunning > 0) ? 'running' : 'done'
         // 这一轮的起点：列表投影的 lastPromptAt（真实发言时刻），拿不到才退回活动时刻。
         const start = updatedAt > 0 ? updatedAt : (activity > 0 ? activity : (createdAt || now))
-        wanted.set(sessionId, { row, state, activity: activity > 0 ? activity : (createdAt || now), start })
+        wanted.set(sessionId, { row, state, activity: activity > 0 ? activity : (createdAt || now), start, childRunning })
       }
       let changed = false
       // 先撤掉不该再上屏的：会话被归档/删除、被派单任务接管、被用户撤掉、空了太久、
@@ -3045,11 +3256,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             now,
           })
           pcTaskOfSession.set(sessionId, task.taskId)
+          tasks.setChildRunning(task.taskId, item.childRunning, now)
           if (item.state === 'running') noteRunAnchor(task.taskId, pcStartAnchorOf(sessionId, item.start))
           changed = true
-          log(`tihu pc task add task=${task.taskId} session=${sessionId} state=${item.state} title=${JSON.stringify(task.title)}`)
+          log(`tihu pc task add task=${task.taskId} session=${sessionId} state=${item.state} children=${item.childRunning} title=${JSON.stringify(task.title)}`)
           continue
         }
+        if (tasks.setChildRunning(existingId, item.childRunning, now)) changed = true
         const summary = item.state === 'done' ? plainSummaryOf(lastAssistant.get(sessionId)?.text ?? '') : ''
         if (tasks.syncExternal(existingId, {
           title,
@@ -3064,6 +3277,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         })) changed = true
       }
       if (changed) refreshBoards()
+      // 子代理可能刚好在这轮轮询前结束：补一次收敛（挂起的任务在这里转完成并补播报）。
+      reconcileChildTasks('pc-sync')
       // 设备刚连上：登记簿里已经有在跑的电脑端任务，就直接切到它的「进度」页（不是待决策）。
       // 只做一次（followPending）：用户主动回棋盘后，不许下一次轮询又把人拽走。
       for (const device of devices) {
@@ -3704,13 +3919,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return prepareDoneText(doneReadingTextOf(task) || DONE_NO_REPLY_TEXT)
   }
 
-  /** 同一批里其它已完成条数（「另有 N 条」）。 */
-  function otherDoneCountOf(task: TihuTask, now = Date.now()): number {
-    return tasks.list().filter((item) => item.taskId !== task.taskId
-      && (item.state === 'done' || item.state === 'announced')
-      && (item.finishedAt ?? 0) > now - 15_000).length
-  }
-
   /** 完成页：任务名大标题 + 回答 7 行 + 停止/重读/主页。 */
   function doneScreenOf(task: TihuTask): ScreenFramePayload {
     const body = doneBodyTextOf(task)
@@ -3720,7 +3928,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       title: task.title,
       resultLine,
       replyText: body,
-      others: otherDoneCountOf(task),
     })
   }
 
@@ -4939,6 +5146,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       clearGrayFallback()
       clearClarifyPrompt()
       fallbackDispatch = undefined
+      if (childReconcileTimer !== undefined) clearInterval(childReconcileTimer)
+      childReconcileTimer = undefined
+      deferredReplies.clear()
       stopPcSync()
       if (detailTicker !== undefined) clearInterval(detailTicker)
       detailTicker = undefined

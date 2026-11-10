@@ -5,7 +5,7 @@
  * 这两块是「统一指挥会话」的事实源与投影层，全部是纯函数／可注入时钟，
  * 所以能在这里把边界条件钉死：
  *   - 状态机只允许设计里那几条边（完成的东西不会被一条迟到事件拉回执行中）；
- *   - 棋盘排序固定（要人的永远在最上）、同行只折叠「连续同一项目」；
+ *   - 棋盘排序：待决策 → 执行中（含子代理在跑）→ 其余按时间，一条任务一张卡；
  *   - 时长环满圈 30 分钟、完成后满环、排队空环；
  *   - 播报 P0 插队、P1 八秒合并、P3 永不播；
  *   - 派单快路径：点名卡 / 追加 / 日常 / 歧义追问，各走一条。
@@ -35,6 +35,7 @@ import {
   plainSummaryOf,
   ringOf,
   routeQuick,
+  isFinishedState,
   isPinnedBoardTask,
   bestCardMatchOf,
   continuityAffinityOf,
@@ -203,34 +204,73 @@ test('完成写一行结果；完成后不会被迟到的「开始跑」拉回�
 
 /* ---------- 棋盘投影 ---------- */
 
-test('棋盘排序固定：待决策 → 执行中 → 排队 → 完成', () => {
+test('棋盘排序：待决策 → 所有执行中 → 其余按时间；同项目有待决策时整个项目优先', () => {
   const ledger = new TaskLedger()
-  const done = ledger.add({ title: '完成的', projectId: 'p3', projectName: 'C' })
-  const queued = ledger.add({ title: '排队的', projectId: 'p4', projectName: 'D' })
-  const running = ledger.add({ title: '跑着的', projectId: 'p2', projectName: 'B' })
-  const asking = ledger.add({ title: '等你的', projectId: 'p1', projectName: 'A' })
-  ledger.complete(done.taskId, { resultLine: '好了' })
+  // 故意让「等你的」时间最旧：它仍然排第一。
+  const asking = ledger.add({ title: '等你的', projectId: 'p1', projectName: 'A', now: 500 })
+  const running = ledger.add({ title: '跑着的', projectId: 'p2', projectName: 'B', now: 1000 })
+  const done = ledger.add({ title: '完成的', projectId: 'p3', projectName: 'C', now: 5000 })
+  const queued = ledger.add({ title: '排队的', projectId: 'p4', projectName: 'D', now: 2000 })
+  ledger.complete(done.taskId, { resultLine: '好了', now: 5000 })
   ledger.attachSession(running.taskId, 'session-r')
+  ledger.markRunning(running.taskId, 1000)
   ledger.attachSession(asking.taskId, 'session-a')
-  ledger.ask(asking.taskId, { question: 'q', options: ['a', 'b'], defaultIndex: 0, timeoutMs: 60_000 })
-  assert.deepEqual(boardOf(ledger.list(), 10).rows.map((row) => row.taskId), [asking.taskId, running.taskId, queued.taskId, done.taskId])
+  ledger.ask(asking.taskId, { question: 'q', options: ['a', 'b'], defaultIndex: 0, timeoutMs: 60_000, now: 600 })
+  assert.deepEqual(
+    boardOf(ledger.list(), 10_000).rows.map((row) => row.taskId),
+    [asking.taskId, running.taskId, done.taskId, queued.taskId],
+    '待决策最前；执行中第二；其余按时间倒序（完成比排队新）',
+  )
+
+  // 项目优先：A 项目里有一条在等你，同项目的另一条执行中要排到别的项目的执行中前面。
+  const project = new TaskLedger()
+  const askB = project.add({ title: 'B 等你', projectId: 'pb', projectName: 'B', now: 900 })
+  const runA = project.add({ title: 'A 在跑（旧）', projectId: 'pa', projectName: 'A', now: 100 })
+  const runB = project.add({ title: 'B 在跑（新）', projectId: 'pb', projectName: 'B', now: 800 })
+  project.attachSession(askB.taskId, 's-ask-b')
+  project.attachSession(runA.taskId, 's-run-a')
+  project.attachSession(runB.taskId, 's-run-b')
+  project.markRunning(runA.taskId, 100)
+  project.markRunning(runB.taskId, 800)
+  project.ask(askB.taskId, { question: 'q', options: ['a'], defaultIndex: 0, timeoutMs: 60_000, now: 900 })
+  assert.deepEqual(
+    boardOf(project.list(), 10_000).rows.map((row) => row.taskId),
+    [askB.taskId, runB.taskId, runA.taskId],
+    '同项目（B）有待决策 → 整个 B 项目的任务优先；A 的执行中排在后面',
+  )
 })
 
-test('同一项目「连续」多条只留最新一条并折叠成 +N（中间夹了别的项目就不折叠）', () => {
+test('一条任务一张卡：同项目同状态不再折叠成「+N 条」', () => {
   const ledger = new TaskLedger()
-  const a1 = ledger.add({ title: 'A1', projectId: 'pa', projectName: 'A' })
-  const a2 = ledger.add({ title: 'A2', projectId: 'pa', projectName: 'A' })
-  const b1 = ledger.add({ title: 'B1', projectId: 'pb', projectName: 'B' })
-  ledger.attachSession(a1.taskId, 's1')
-  ledger.attachSession(a2.taskId, 's2')
-  ledger.attachSession(b1.taskId, 's3')
-  ledger.noteStep(a1.taskId, 2)
-  ledger.noteStep(a2.taskId, 5)
+  const a1 = ledger.add({ title: 'A1', projectId: 'pa', projectName: 'A', now: 1000 })
+  const a2 = ledger.add({ title: 'A2', projectId: 'pa', projectName: 'A', now: 2000 })
+  const b1 = ledger.add({ title: 'B1', projectId: 'pb', projectName: 'B', now: 3000 })
+  for (const task of [a1, a2, b1]) ledger.attachSession(task.taskId, `s-${task.taskId}`)
   const board = boardOf(ledger.list(), 10)
-  const sameProject = board.rows.filter((row) => row.sub.startsWith('A'))
-  assert.equal(sameProject.length, 1, 'A 只留一行')
-  assert.equal(sameProject[0].merged, 1, '另一条折叠成 +1')
-  assert.ok(board.rows.some((row) => row.sub.startsWith('B')), '夹着的 B 不被吞掉')
+  assert.equal(board.rows.length, 3, '三条任务就是三张卡')
+  assert.deepEqual(new Set(board.rows.map((row) => row.taskId)), new Set([a1.taskId, a2.taskId, b1.taskId]))
+  for (const row of board.rows) assert.equal('merged' in row, false, '不再出现 +N 条合并字段')
+})
+
+test('子代理还在跑：任务保持执行中并带子任务计数；全部结束才允许完成', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: '主会话', projectId: 'p', projectName: 'P', now: 1000 })
+  ledger.attachSession(task.taskId, 's-main')
+  ledger.markRunning(task.taskId, 1000)
+  ledger.holdForChildren(task.taskId, { childRunning: 2, resultLine: '主回合结论', now: 2000 })
+  assert.equal(task.state, 'running', '子任务在跑 ⇒ 不算完成')
+  assert.equal(isFinishedState(task.state), false)
+  const row = boardOf(ledger.list(), 3000).rows[0]
+  assert.equal(row.subagents, 2, '棋盘行带子任务数（页面画旋转短弧）')
+  assert.equal(row.capsule, '执行中')
+  assert.equal(row.state, 'running')
+
+  ledger.setChildRunning(task.taskId, 0, 4000)
+  ledger.complete(task.taskId, { resultLine: '主回合结论', now: 4500 })
+  const doneRow = boardOf(ledger.list(), 5000).rows[0]
+  assert.equal(doneRow.state, 'done')
+  assert.equal(doneRow.subagents, undefined, '子任务清零后不再画旋转弧')
+  assert.equal(task.holdingForChildren, undefined)
 })
 
 test('顶行三段计数在跑/等你/排队，完成不计数', () => {
@@ -1019,15 +1059,16 @@ test('完成页朗读分段：首段只一行、后续合并整行且不超上�
   assert.deepEqual(doneSpeechSegmentsOf(''), [], '没有正文就没有段（不合成空串）')
 })
 
-test('棋盘排序：鹈鹕派单的任务永远在最前（电脑端卡再新也往后排）；每页 4 条、页码夹在范围内', () => {
+test('棋盘排序按状态而不是来源；一条一张卡；每页 4 条、页码夹在范围内', () => {
   const ledger = new TaskLedger()
   const external = ledger.add({ title: '电脑端那条', projectId: 'pc:s', projectName: 'A', sessionIds: ['s'], source: 'pc', state: 'running', now: 5000 })
   const mine = ledger.add({ title: '派单那条', projectId: 'p', projectName: 'P', now: 1000 })
+  ledger.attachSession(mine.taskId, 's-mine')
   const board = boardOf(ledger.list(), 5000)
-  assert.equal(board.rows[0].taskId, mine.taskId, '派单任务排第一（不按最后活动时间排）')
-  assert.equal(board.rows[1].taskId, external.taskId)
+  assert.equal(board.rows[0].taskId, external.taskId, '执行中的排前面（来源不再抢前排）')
+  assert.equal(board.rows[1].taskId, mine.taskId, '还没开跑的派单任务排在执行中之后')
   assert.equal(isPinnedBoardTask(mine), true)
-  assert.equal(isPinnedBoardTask(external), false, '电脑端镜像是只读卡，不占前排')
+  assert.equal(isPinnedBoardTask(external), false, '电脑端镜像是只读卡')
 
   const many = new TaskLedger()
   for (let i = 1; i <= 6; i += 1) many.add({ title: `任务${i}`, projectId: `proj-${i}`, projectName: `P${i}`, now: 1000 + i })
