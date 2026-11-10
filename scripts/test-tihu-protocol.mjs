@@ -2692,6 +2692,8 @@ function unifiedWorkspace(options = {}) {
    */
   const agentHost = options.agentHost === true
   const resumed = []
+  /** 宿主真实入口的调用记录（2026-11-10 实机核对：公开的是 resolveAgent，不是 resume）。 */
+  const resolved = []
   const liveAgents = new Map()
   const mountAgent = (id, meta = {}) => {
     const agent = {
@@ -2705,6 +2707,10 @@ function unifiedWorkspace(options = {}) {
         },
       },
       followup: (message) => {
+        // 「会话挂回了 agent，但这条消息就是投不进去」——降级投递失败用例要的就是这一跳。
+        if (typeof options.promptThrowsFor === 'function' && options.promptThrowsFor(id)) {
+          throw new Error(`宿主会话 ${id} 拒收这条消息（agent.followup 抛错）`)
+        }
         prompted.push({ id, blocks: Array.isArray(message?.content) ? message.content : [], via: 'agent' })
       },
     }
@@ -2724,10 +2730,22 @@ function unifiedWorkspace(options = {}) {
   if (Array.isArray(options.records)) records.push(...options.records)
   // 会话衔接那组：种子会话要落在临时目录里（fundFolder/home 在函数内才建好）。
   if (typeof options.seedSessions === 'function') records.push(...options.seedSessions({ root, home, fundFolder }))
-  // 宿主真实建会话入口（2026-11-09 修复）：sessionController.create/rename/resume。
+  /**
+   * 宿主真实建会话/恢复入口（2026-11-10 核对 app.asar）：
+   * `sessionController` 公开的是 **resolveAgent(sessionId)**（返回活 Agent 或 `{ error: RemoteError }`），
+   * `resume` 只是它内部的私有步骤。fixture 里两条都留：
+   *   - `noResume: true` → 只给 resolveAgent（＝现在这台宿主的真实形状，钉住「必须走 resolveAgent」）；
+   *   - `noResolveAgent: true` → 只给 resume（老宿主/测试桩兜底仍然可用）。
+   */
+  const mountResolved = (sessionId) => {
+    const record = records.find((item) => item.header.id === sessionId)
+    if (record === undefined) return undefined
+    return mountAgent(sessionId, { cwd: record.header.cwd, agentPreset: record.header.agentPreset })
+  }
   const sessionController = {
     create: async (request) => {
       created.push(request)
+      if (options.createFailsAfter !== undefined && created.length > options.createFailsAfter) return undefined
       const id = 'session-task-' + created.length
       records.push(cuRecord(id, { live: true, preset: request.agentPreset, cwd: request.cwd, title: '任务 ' + created.length }))
       if (agentHost) mountAgent(id, { cwd: request.cwd, agentPreset: request.agentPreset })
@@ -2739,13 +2757,32 @@ function unifiedWorkspace(options = {}) {
       if (record !== undefined) record.projection.title = title
       return { title, seq: 1 }
     },
-    resume: async (sessionId) => {
-      resumed.push(sessionId)
-      if (options.resumeFails === true) throw new Error('会话日志打不开：resume 失败')
-      const record = records.find((item) => item.header.id === sessionId)
-      if (record === undefined) throw new Error(`会话 ${sessionId} 不存在（无法 resume）`)
-      return mountAgent(sessionId, { cwd: record.header.cwd, agentPreset: record.header.agentPreset })
-    },
+    ...(options.noResolveAgent === true ? {} : {
+      resolveAgent: async (sessionId) => {
+        resolved.push(sessionId)
+        if (options.resolveFails === true) {
+          return { error: { code: options.resolveErrorCode ?? 'session/writer-held', message: options.resolveErrorText ?? '会话正被另一个写者持有' } }
+        }
+        if (options.resolveThrows === true) {
+          const error = new Error(options.resolveErrorText ?? 'resume failed for session: persistence closed')
+          error.code = options.resolveErrorCode ?? 'gateway/internal'
+          throw error
+        }
+        const mounted = mountResolved(sessionId)
+        if (mounted === undefined) return { error: { code: 'session/not-found', message: `session "${sessionId}" not found (not attached)` } }
+        // 宿主 `ApiSessionAgentController.resolve` 有两种形状：live agent 本体 / `{ agent }` 包装。
+        return options.resolveWraps === true ? { agent: mounted } : mounted
+      },
+    }),
+    ...(options.noResume === true ? {} : {
+      resume: async (sessionId) => {
+        resumed.push(sessionId)
+        if (options.resumeFails === true) throw new Error('会话日志打不开：resume 失败')
+        const mounted = mountResolved(sessionId)
+        if (mounted === undefined) throw new Error(`会话 ${sessionId} 不存在（无法 resume）`)
+        return mounted
+      },
+    }),
   }
   const remote = {
     session: {
@@ -2790,6 +2827,7 @@ function unifiedWorkspace(options = {}) {
     prompted,
     renamed,
     resumed,
+    resolved,
     liveAgents,
     mountAgent,
     unmountAgent,
@@ -5602,15 +5640,20 @@ await testAsync('派单衔接：语义明显矛盾才新建会话（不硬塞给
  * `sessions.using`**；promptOnce 只能退回 `agents.get()`，agent 不在内存就直接抛。
  * 新会话能成只是因为刚 create、agent 还在内存。
  *
- * 修法（用户要求「承接永不把话丢给用户重说」）：
- *   1. append 投递前先 `sessionController.resume(sessionId)`（宿主真实入口，网页版打开旧会话
- *      同一条路），把会话挂回活动 agent 再投；
- *   2. resume 仍失败 → 在**同一项目**新建一条会话投递，**taskId 不变**、屏上不出红字；
- *   3. 只有项目也判不出时才允许旧「指令未发送 / 请重说」屏。
+ * 修法（用户要求「承接永不把话丢给用户重说」＋ 2026-11-10 12:15 实机的三处修正）：
+ *   1. append 投递前先 `sessionController.resolveAgent(sessionId)`（核对宿主包：公开的是
+ *      resolveAgent，返回活 Agent 或 `{ error: RemoteError }`；`resume` 是它内部私有步骤）；
+ *      拿到 agent 后仍用 `ctx.agents.get()` 复核；老宿主只有 `resume` 时兜底走 resume；
+ *   2. 恢复不了（或恢复了仍投不进去）→ 在**同一项目**新建一条会话投递，这一句自己的
+ *      taskId 不变、屏上不出「请重说」；
+ *   3. 降级也失败**不许静默**：lane.log 必须有 taskId＋目标会话＋错误原文，屏必须出
+ *      不带「请重说」的终态（这条没派出去）；
+ *   4. 新一句话不许复用**已经结束**的任务：上一张卡 done/announced 就另起一张新卡。
  */
 
-await testAsync('承接保活：目标会话 idle、agent 不在内存 → 先 resume 再 append（不新建、不出错误屏）', async () => {
-  const w = unifiedWorkspace({ agentHost: true })
+await testAsync('承接保活：idle 会话（agent 不在内存）→ 先 resolveAgent 挂回再 append（不新建、不出错误屏）', async () => {
+  // 宿主真实形状（核对 app.asar）：公开口里只有 resolveAgent，没有 resume。
+  const w = unifiedWorkspace({ agentHost: true, noResume: true })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   try {
     const socket = openLane(w.runtime)
@@ -5632,8 +5675,9 @@ await testAsync('承接保活：目标会话 idle、agent 不在内存 → 先 r
     socket.emit('data', clientFrame(buildUpstream('text.input', { text: '再读一下后两行', source: 'voice' }, 3)))
     await waitMs(300)
 
-    assert.deepEqual(w.resumed, [firstSession], 'append 前必须让宿主 resume 这条会话：' + JSON.stringify(w.resumed))
-    assert.equal(w.created.length, 1, 'resume 成功就不许新建会话')
+    assert.deepEqual(w.resolved, [firstSession], '承接必须先调宿主公开的 resolveAgent：' + JSON.stringify(w.resolved))
+    assert.deepEqual(w.resumed, [], 'resolveAgent 成了就不许再走 resume 兜底：' + JSON.stringify(w.resumed))
+    assert.equal(w.created.length, 1, 'resolveAgent 成功就不许新建会话')
     assert.equal(w.prompted.length, 2, '第二句只投一次：' + JSON.stringify(w.prompted.map((item) => item.id)))
     assert.equal(w.prompted[1].id, firstSession, '要投回原来那条会话')
     assert.equal(w.prompted[1].blocks[0].text, '再读一下后两行', '用户原话原样投递')
@@ -5645,13 +5689,20 @@ await testAsync('承接保活：目标会话 idle、agent 不在内存 → 先 r
     const receipt = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
     assert.equal(receipt?.payload.title, '已派给 青年基金申请书', '回执照常显示项目')
     const board = frames.filter((frame) => frame.type === 'task.list').pop().payload.board
-    assert.equal(board.rows.length, 1, '棋盘上仍然只有一张卡')
-    assert.equal(board.rows[0].taskId, 't1')
-    assert.ok(String(board.rows[0].sub).includes('青年基金申请书'), '棋盘副行照常显示项目：' + JSON.stringify(board.rows[0]))
+    assert.equal(board.rows.length, 2, '旧卡不摘不盖 ＋ 这句新话另起一张卡：' + JSON.stringify(board.rows.map((row) => [row.taskId, row.state, row.title])))
+    const newCard = board.rows.find((row) => row.taskId !== 't1')
+    assert.equal(newCard.taskId, 't2', '新一句话必须有自己的新 taskId（不许复用已完成的旧任务）')
+    assert.equal(newCard.title, '再读一下后两行', '新卡标题＝这句新话，不是旧话')
+    assert.equal(newCard.state, 'running', '这句已经投进去了 → 执行中')
+    assert.ok(String(newCard.sub).includes('青年基金申请书'), '新卡副行照常显示项目：' + JSON.stringify(newCard))
+    const oldCard = board.rows.find((row) => row.taskId === 't1')
+    assert.ok(['done', 'announced'].includes(oldCard.state), '旧任务保持原样（完成家族）：' + oldCard.state)
+    assert.equal(oldCard.title, '把青年基金申请书的摘要前两行读出来', '旧卡标题一字不动')
 
     const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
-    assert.equal(w.liveAgents.has(firstSession), true, 'resume 后 agent 要挂回内存')
-    assert.ok(log.includes('note=append-resume-ok'), 'resume 成功要落 lane.log（实机排查证据）：' + log)
+    assert.equal(w.liveAgents.has(firstSession), true, 'resolveAgent 后 agent 要挂回内存')
+    assert.ok(log.includes('note=append-resolve-agent-ok'), 'resolveAgent 挂回活动 agent 要落 lane.log：' + log)
+    assert.ok(log.includes('note=append-resume-ok'), '承接投递要有 append-resume-ok（实机排查证据）：' + log)
     assert.ok(log.includes('命中=previous'), '承接命中要落盘：' + log)
     assert.ok(log.includes('衔接=append'), '承接结论是 append：' + log)
   } finally {
@@ -5660,8 +5711,9 @@ await testAsync('承接保活：目标会话 idle、agent 不在内存 → 先 r
   }
 })
 
-await testAsync('承接降级：resume 也失败 → 同项目新建会话派出（同 taskId、不出错误屏、副行仍是项目）', async () => {
-  const w = unifiedWorkspace({ agentHost: true, resumeFails: true })
+await testAsync('承接降级：resolveAgent 也失败 → 同项目新建会话派出（这句的 taskId 不变、不出错误屏、副行仍是项目）', async () => {
+  // 现代宿主：resolveAgent 是唯一公开入口，它内部 resume 也失败 → 返回 { error }，没有 resume 可调。
+  const w = unifiedWorkspace({ agentHost: true, noResume: true, resolveFails: true, resolveErrorCode: 'gateway/internal' })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   try {
     const socket = openLane(w.runtime)
@@ -5679,8 +5731,9 @@ await testAsync('承接降级：resume 也失败 → 同项目新建会话派出
     socket.emit('data', clientFrame(buildUpstream('text.input', { text: '再读一下后两行', source: 'voice' }, 3)))
     await waitMs(350)
 
-    assert.deepEqual(w.resumed, [firstSession], '先尝试 resume 那条会话：' + JSON.stringify(w.resumed))
-    assert.equal(w.created.length, 2, 'resume 失败 → 同项目新建一条会话')
+    assert.deepEqual(w.resolved, [firstSession], '先让宿主 resolveAgent 这条会话：' + JSON.stringify(w.resolved))
+    assert.deepEqual(w.resumed, [], '这条宿主没有公开 resume：不许去调不存在的老入口：' + JSON.stringify(w.resumed))
+    assert.equal(w.created.length, 2, '两条入口都没挂回会话 → 同项目新建一条会话')
     assert.equal(w.created[1].cwd, w.fundFolder, '必须落那条会话所属项目的文件夹：' + w.created[1].cwd)
     assert.equal(w.created[1].agentPreset, 'computer-use', '新建的仍是 CU 会话')
     assert.equal(w.prompted.length, 2, '第二句只投一次')
@@ -5695,20 +5748,201 @@ await testAsync('承接降级：resume 也失败 → 同项目新建会话派出
     assert.equal(receipt?.payload.title, '已派给 青年基金申请书', '回执显示那条会话所属项目')
     assert.ok(receipt.payload.bullets.some((line) => String(line).includes('那条会话没接住，已在同项目新建')), '回执留一句短提示：' + JSON.stringify(receipt.payload.bullets))
     const board = frames.filter((frame) => frame.type === 'task.list').pop().payload.board
-    assert.equal(board.rows.length, 1, '同一句话只留一张卡：' + JSON.stringify(board.rows))
-    assert.equal(board.rows[0].taskId, 't1', 'taskId 不变')
-    assert.ok(String(board.rows[0].sub).includes('青年基金申请书'), '棋盘副行照常显示项目：' + JSON.stringify(board.rows[0]))
+    assert.equal(board.rows.length, 2, '旧卡不摘 ＋ 这句新话一张卡：' + JSON.stringify(board.rows.map((row) => [row.taskId, row.state, row.title])))
+    const newCard = board.rows.find((row) => row.taskId !== 't1')
+    assert.equal(newCard.taskId, 't2', '降级沿用这句新话自己的 taskId（不因为降级换号）')
+    assert.equal(newCard.title, '再读一下后两行', '降级后标题仍是这句新话：' + newCard.title)
+    assert.equal(newCard.state, 'running', '降级派出后这句在跑')
+    assert.ok(String(newCard.sub).includes('青年基金申请书'), '棋盘副行照常显示项目：' + JSON.stringify(newCard))
+    assert.equal(board.rows.find((row) => row.taskId === 't1').title, '把青年基金申请书的摘要前两行读出来', '旧卡一字不动')
     const tasks = await w.runtime.control.listTasks()
-    assert.equal(tasks.length, 1)
-    assert.equal(tasks[0].taskId, 't1')
+    assert.equal(tasks.length, 2)
+    assert.deepEqual(tasks.map((item) => item.taskId), ['t1', 't2'])
 
     const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
     assert.ok(log.includes('append 失败 → 同项目新建'), 'append 失败要落 lane.log 并写清「同项目新建」：' + log)
-    assert.ok(log.includes('note=append-resume-failed'), 'resume 失败的原始原因要留痕：' + log)
+    assert.ok(log.includes('note=append-resume-failed'), 'resolveAgent 失败的原始原因要留痕：' + log)
+    assert.ok(log.includes('gateway/internal'), '失败日志必须带宿主真实错误码：' + log)
     assert.ok(log.includes('note=append-degraded'), '降级成功要留一条结果日志：' + log)
   } finally {
     delete process.env.TIHU_LANE_LOG
     w.cleanup()
+  }
+})
+
+await testAsync('老宿主兜底：sessionController 只公开 resume（没有 resolveAgent）时仍能承接（不新建、不出错误屏）', async () => {
+  const w = unifiedWorkspace({ agentHost: true, noResolveAgent: true })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-append-oldhost', protocol: '0' }, 1)))
+    await waitMs(50)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把青年基金申请书的摘要前两行读出来', source: 'voice' }, 2)))
+    await waitMs(180)
+    const firstSession = w.prompted[0].id
+    emit({ id: firstSession }, { type: 'turn/start', data: { turn: 1 } })
+    emit({ id: firstSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(80)
+    w.unmountAgent(firstSession)
+
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '再读一下后两行', source: 'voice' }, 3)))
+    await waitMs(350)
+
+    assert.deepEqual(w.resolved, [], '这条宿主没有 resolveAgent：不许调它：' + JSON.stringify(w.resolved))
+    assert.deepEqual(w.resumed, [firstSession], '老宿主兜底入口必须是 resume：' + JSON.stringify(w.resumed))
+    assert.equal(w.created.length, 1, 'resume 成功就不新建会话')
+    assert.equal(w.prompted[1]?.id, firstSession, '话投回原来那条会话')
+    const frames = framesOf(socket)
+    assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.title === '指令未发送'), false,
+      '兜底成功也不许出「指令未发送」：' + JSON.stringify(frames.filter((frame) => frame.type === 'screen.frame').map((frame) => frame.payload.title)))
+    const board = frames.filter((frame) => frame.type === 'task.list').pop().payload.board
+    assert.equal(board.rows.length, 2, '旧卡不摘 ＋ 新卡另起一张：' + JSON.stringify(board.rows.map((row) => [row.taskId, row.state])))
+    assert.equal(board.rows.find((row) => row.taskId === 't2')?.title, '再读一下后两行')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('note=append-resume-agent-ok'), '老宿主 resume 成功要落盘：' + log)
+    assert.ok(log.includes('note=append-resume-ok'), '承接投递要有 append-resume-ok：' + log)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('新一句话不复用已结束的任务：上一张卡 done/announced → 新 taskId＋新标题，旧任务原样、不新建会话', async () => {
+  const w = unifiedWorkspace({ agentHost: true, noResume: true })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-append-newcard', protocol: '0' }, 1)))
+    await waitMs(50)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把青年基金申请书的摘要前两行读出来', source: 'voice' }, 2)))
+    await waitMs(180)
+    const firstSession = w.prompted[0].id
+    emit({ id: firstSession }, { type: 'turn/start', data: { turn: 1 } })
+    emit({ id: firstSession }, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '摘要前两行：……' }] } } })
+    emit({ id: firstSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(120)
+    const before = await w.runtime.control.listTasks()
+    assert.equal(before.length, 1, '先只有这一张已经完成的旧卡')
+    assert.equal(before[0].capsule, '完成', '旧卡已经结束：' + before[0].capsule)
+    w.unmountAgent(firstSession)
+
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '帮我把 README 的前两行读出来', source: 'voice' }, 3)))
+    await waitMs(300)
+
+    const after = await w.runtime.control.listTasks()
+    assert.equal(after.length, 2, '新一句话必须另起一张卡：' + JSON.stringify(after.map((item) => [item.taskId, item.capsule, item.title])))
+    const fresh = after.find((item) => item.taskId !== before[0].taskId)
+    assert.equal(fresh.taskId, 't2', '新 taskId（旧任务号不许复用）')
+    assert.ok(fresh.title.includes('README'), '标题＝这句新话：' + fresh.title)
+    assert.equal(fresh.capsule, '执行中', '新卡这句已经投进老会话 → 执行中')
+    const oldTask = after.find((item) => item.taskId === before[0].taskId)
+    assert.equal(oldTask.title, before[0].title, '旧任务标题不被这句新话盖掉')
+    assert.equal(oldTask.capsule, '完成', '旧任务状态保持原样：' + oldTask.capsule)
+    assert.equal(w.prompted[1]?.id, firstSession, '新话仍投进那条老会话（承接不新建）')
+    assert.equal(w.created.length, 1, '绝不因为「承接」新建会话')
+    assert.equal(w.resolved.includes(firstSession), true, '先 resolveAgent 挂回那条会话：' + JSON.stringify(w.resolved))
+
+    const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop().payload.board
+    assert.equal(board.counts.running, 1, '新卡在棋盘上要看得见（实机就是这么要求「执行中」）：' + JSON.stringify(board.counts))
+    assert.ok(board.rows.some((row) => row.taskId === 't2'), '棋盘有新卡：' + JSON.stringify(board.rows.map((row) => row.taskId)))
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('承接降级投递失败：既不静默也不丢句（lane.log 写 taskId＋目标会话＋错误原文，屏给不带「请重说」的终态）', async () => {
+  // 老会话挂不回来（resolveAgent 返回 { error }，且这条宿主没有 resume）；
+  // 同项目新建出来的新会话也拒收这句（followup 抛错）——这正是实机「说完没反应」那条路径。
+  const w = unifiedWorkspace({
+    agentHost: true,
+    noResume: true,
+    resolveFails: true,
+    resolveErrorCode: 'session/writer-held',
+    resolveErrorText: 'writer 在这条会话上被另一个 owner 占着',
+    promptThrowsFor: (id) => id === 'session-task-2',
+  })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-append-stuck', protocol: '0' }, 1)))
+    await waitMs(50)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把青年基金申请书的摘要前两行读出来', source: 'voice' }, 2)))
+    await waitMs(180)
+    const firstSession = w.prompted[0].id
+    emit({ id: firstSession }, { type: 'turn/start', data: { turn: 1 } })
+    emit({ id: firstSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(80)
+    w.unmountAgent(firstSession)
+
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '再读一下后两行', source: 'voice' }, 3)))
+    await waitMs(1_200)
+
+    // 1) 必须有可见结果：不带「请重说」的终态屏
+    const frames = framesOf(socket)
+    const stuck = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.title === '这条没派出去').pop()
+    assert.ok(stuck !== undefined, '降级投递失败必须出错误屏（quietFailure 曾经什么都不出）：'
+      + JSON.stringify(frames.filter((frame) => frame.type === 'screen.frame').map((frame) => frame.payload.title)))
+    assert.equal(frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.title === '这条没派出去').length, 1,
+      '同一跳失败只出一屏，不许重复弹')
+    assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.title === '指令未发送'), false,
+      '错的不是用户那句话，绝不许出「指令未发送 / 请重说」：' + JSON.stringify(stuck.payload.bullets))
+    for (const frame of frames.filter((item) => item.type === 'screen.frame')) {
+      for (const line of [frame.payload.title, ...(frame.payload.bullets ?? [])]) {
+        assert.equal(String(line ?? '').includes('请重说'), false, '绝不把话丢给用户重说：' + String(line))
+      }
+    }
+    // 2) 那句话还在棋盘上（没被摘掉，也没盖住旧卡）
+    const rows = await w.runtime.control.listTasks()
+    assert.equal(rows.length, 2, '这句话必须留在棋盘上（新卡没被摘掉、旧卡没被盖掉）：' + JSON.stringify(rows.map((row) => [row.taskId, row.capsule, row.title])))
+    const newCard = rows.find((row) => row.taskId === 't2')
+    assert.ok(newCard !== undefined, '这句必须留在棋盘上：' + JSON.stringify(rows.map((row) => row.taskId)))
+    assert.equal(newCard.title, '再读一下后两行', '标题仍是这句新话（没被旧话盖掉）')
+    assert.equal(rows.find((row) => row.taskId === 't1').capsule, '完成', '旧任务保持原样')
+    // 3) 日志必须写 taskId＋目标会话＋错误原文
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('note=append-degrade-failed'), '降级这一跳失败必须落 lane.log：' + log)
+    assert.ok(log.includes('降级再失败 任务=t2'), '日志要带 taskId：' + log)
+    assert.ok(log.includes('目标会话=session-task-2'), '日志要带目标会话：' + log)
+    assert.ok(log.includes('拒收这条消息'), '日志要带错误原文：' + log)
+    assert.ok(log.includes('session/writer-held'), 'resolveAgent 的真实错误码也要留痕：' + log)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('resolveAgent 失败要落 append-resume-failed 与真实错误码（{ error } 信封／throw 两种形状都认）', async () => {
+  for (const variant of [{ resolveFails: true, resolveErrorCode: 'session/not-found' }, { resolveThrows: true }]) {
+    const w = unifiedWorkspace({ agentHost: true, noResume: true, ...variant })
+    process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+    try {
+      const socket = openLane(w.runtime)
+      const emit = w.events.find((entry) => entry.name === 'session/event').handler
+      socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-resolve-code-' + (variant.resolveErrorCode ?? 'throw'), protocol: '0' }, 1)))
+      await waitMs(50)
+      socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把青年基金申请书的摘要前两行读出来', source: 'voice' }, 2)))
+      await waitMs(180)
+      const firstSession = w.prompted[0].id
+      emit({ id: firstSession }, { type: 'turn/start', data: { turn: 1 } })
+      emit({ id: firstSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+      await waitMs(80)
+      w.unmountAgent(firstSession)
+      socket.emit('data', clientFrame(buildUpstream('text.input', { text: '再读一下后两行', source: 'voice' }, 3)))
+      await waitMs(350)
+      const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+      assert.ok(log.includes('note=append-resolve-agent-failed'), 'resolveAgent 失败本身要留痕：' + JSON.stringify({ resolved: w.resolved, resumed: w.resumed, firstSession, prompted: w.prompted.map((p) => p.id) }) + log)
+      assert.ok(log.includes('note=append-resume-failed'), '降级前要有 append-resume-failed：' + log)
+      const code = variant.resolveErrorCode ?? 'gateway/internal'
+      assert.ok(log.includes(code), `失败日志必须带上宿主真实错误码 ${code}：` + log)
+      assert.equal(w.created.length, 2, '挂不回来仍然同项目新建，不许把话吞掉')
+    } finally {
+      delete process.env.TIHU_LANE_LOG
+      w.cleanup()
+    }
   }
 })
 
