@@ -168,11 +168,13 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-status.awaiting { width:14px; height:14px; border-radius:50%; background:var(--warn);
     color:#1b1305; font-size:11px; font-weight:700; line-height:14px; text-align:center; }
   #screen .board-status.running svg { display:block; width:14px; height:14px; }
-  /* 子代理还在跑（用户 2026-11-10 定案）：不写字，只在状态图形外侧加一圈缓慢旋转的
-     短弧（同一枚 14×14 图形里，蓝色同 #4f9fd8，7 秒一圈；子代理全结束就停）。 */
-  #screen .board-status .board-orbit { transform-box:view-box; transform-origin:7px 7px;
-    animation:boardOrbit 7s linear infinite; }
-  @keyframes boardOrbit { from { transform:rotate(0deg); } to { transform:rotate(360deg); } }
+  /* 有后台子代理还在跑（用户 2026-11-10 定案）：右侧状态图标换成蓝色实心点，
+     1.2 秒一次透明度呼吸；只改 opacity，不做 transform、不改宽高（不位移、不抖行高），
+     右对齐边距仍由 .board-status 的 margin-right:1px 保证（距屏幕外沿 10px 不变）。
+     子代理全结束后 childRunning 清零，卡片自动回到绿色实心圆「完成」。 */
+  #screen .board-status.subagents { width:12px; height:12px; border-radius:50%; background:#4f9fd8;
+    animation:boardBreath 1.2s ease-in-out infinite; }
+  @keyframes boardBreath { 0%, 100% { opacity:.35; } 50% { opacity:1; } }
   /* 翻页条：上一页 / 第 N/M 页 / 下一页（只有一页时 JS 不建这条）。
      钉在屏底：flex:none + margin-bottom:2px → 条底边离屏幕外沿 8+1+2 = 11px（用户要求 10–12px），
      不管这一页剩 4 条还是 1 条，它都在同一个位置。 */
@@ -725,6 +727,14 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var status = document.createElement('span');
     var state = String(row.state || 'queued');
     status.className = 'board-status ' + state;
+    // 后台子代理还在跑（含 code_agent 起的标准会话）：蓝色实心点 + 1.2 秒呼吸，
+    // 不写一个字、不做位移动画；子代理全停后 blink 消失，自动回到绿色实心圆。
+    var blink = row.blink === true || (Number(row.subagents) > 0 && state !== 'awaiting');
+    if (blink) {
+      status.className = 'board-status subagents';
+      status.setAttribute('aria-label', '后台子代理在跑');
+      return status;
+    }
     if (state === 'running') {
       var percent = Number(row.ring && row.ring.percent);
       percent = Number.isFinite(percent) ? Math.max(0, Math.min(1, percent)) : 0;
@@ -733,23 +743,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       var radius = 5;
       var circumference = Math.PI * 2 * radius;
       var arc = Math.max(1, circumference * percent);
-      // 子代理还在跑：不写一个字，只在圆环外侧叠一段缓慢旋转的蓝色短弧（约 63°，7 秒一圈）。
-      var subagents = Number(row.subagents);
-      var orbit = '';
-      if (Number.isFinite(subagents) && subagents > 0) {
-        var orbitRadius = 6.35;
-        var orbitLength = Math.PI * 2 * orbitRadius;
-        var orbitArc = orbitLength * (63 / 360);
-        orbit = '<g class="board-orbit">'
-          + '<circle cx="7" cy="7" r="' + orbitRadius + '" fill="none" stroke="#4f9fd8" stroke-width="0.9"'
-          + ' stroke-linecap="round" stroke-dasharray="' + orbitArc.toFixed(2) + ' ' + (orbitLength + 1).toFixed(2) + '"'
-          + ' transform="rotate(-90 7 7)"></circle></g>';
-      }
+      // 没有子代理的普通执行中：保持原来的蓝色未闭合弧线环（不闪、不转）。
       status.innerHTML = '<svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">'
         + '<circle cx="7" cy="7" r="' + radius + '" fill="none" stroke="#2b3a4a" stroke-width="2"></circle>'
         + '<circle cx="7" cy="7" r="' + radius + '" fill="none" stroke="#4f9fd8" stroke-width="2" stroke-linecap="round"'
         + ' stroke-dasharray="' + arc.toFixed(2) + ' ' + (circumference + 1).toFixed(2) + '"'
-        + ' transform="rotate(-90 7 7)"></circle>' + orbit + '</svg>';
+        + ' transform="rotate(-90 7 7)"></circle></svg>';
       return status;
     }
     if (state === 'awaiting') {
