@@ -42,8 +42,12 @@ import {
   taskTitleOf,
 } from '../src/tihu/task-ledger.ts'
 import {
+  DONE_BODY_FONT_PX,
+  DONE_BODY_TEXT_WIDTH_PX,
   DONE_NO_REPLY_TEXT,
+  DONE_PATH_MAX_CHARS,
   RECEIPT_SECONDS,
+  abbreviatePath,
   askWhichFrame,
   boardFrame,
   detailFrame,
@@ -55,6 +59,7 @@ import {
   noticeFrame,
   prepareDoneText,
   receiptFrame,
+  stripMarkdownMarks,
 } from '../src/tihu/task-screens.ts'
 import { DONE_TITLE_FONT_PX, CONTENT_WIDTH_PX, fitScreenLines, measureTextPx, SCREEN_SPEC } from '../src/tihu/screen-spec.ts'
 
@@ -610,6 +615,85 @@ test('完成页正文：行首状态勾（✅/✓）要剥掉，只留整行青�
   assert.ok(inline.done.lines[0].includes('✓'), '正文中间的勾不动：' + inline.done.lines[0])
 })
 
+/* ---------- 2026-11-10：完成页正文/朗读的长路径缩写与 markdown 清理 ----------
+ *
+ * 实机现象：一条回复里的 Windows 长路径被原样折成 3 行塞进正文，朗读也整条念出来。
+ * 规则：长路径只留「盘符/首段 + … + 文件名」，文件名本身还超长就只留（并折中）文件名；
+ * 结果一律 ≤ 40 字符。正文和 TTS 共用 prepareDoneText，所以只需在这里钉死。
+ */
+
+const REAL_LONG_PATH = 'D:\\陈潘HBEU\\Desktop\\04：财务报销相关\\2026年11月参加武汉学术会议\\ICACHE2026_GNN_dPINN_ppt169_20261108\\exports\\ICACHE2026_GNN_dPINN_20261108_191807_native_charts_tables.pptx'
+
+test('长路径缩写：盘符 + … + 文件名，结果不超过 40 字符', () => {
+  const path = 'D:\\陈潘HBEU\\Desktop\\04：财务报销相关\\2026年11月参加武汉学术会议\\exports\\native_charts_tables.pptx'
+  const short = abbreviatePath(path)
+  assert.equal(short, 'D:\\…\\native_charts_tables.pptx', '只留盘符/首段 + 省略号 + 文件名：' + short)
+  assert.ok([...short].length <= DONE_PATH_MAX_CHARS, '缩写后不超过 40 字符：' + [...short].length)
+  assert.equal(short.includes('陈潘HBEU'), false, '中间目录不许留下来')
+  // 短路径不动：看起来已经很短，再折反而更难读。
+  assert.equal(abbreviatePath('D:\\dsh-assistant\\a.pptx'), 'D:\\dsh-assistant\\a.pptx', '短路径原样返回')
+})
+
+test('长路径缩写：文件名本身还超长时只留文件名（折中），仍守住 40 字符', () => {
+  const short = abbreviatePath(REAL_LONG_PATH)
+  assert.ok([...short].length <= DONE_PATH_MAX_CHARS, '仍超 40 字符：' + [...short].length + ' ' + short)
+  assert.equal(short.includes('D:'), false, '文件名已经够长时不再带盘符：' + short)
+  assert.equal(short.includes('陈潘HBEU'), false, '中间目录不许留下来')
+  assert.ok(short.startsWith('ICACHE2026_GNN'), '保留可辨认的文件名前缀：' + short)
+  assert.ok(short.endsWith('.pptx'), '扩展名优先保住：' + short)
+  assert.ok(short.includes('…'), '折掉的中间用省略号：' + short)
+  // 40 字符只是硬上限；15px 正文一行放不下时还要再收，否则实机仍会把 .pptx 折到下一行。
+  assert.ok(measureTextPx(short, DONE_BODY_FONT_PX) <= DONE_BODY_TEXT_WIDTH_PX, '缩写后要能一行放下：' + short)
+  // 已经缩写过的文本再跑一遍不变（prepareDoneText 会被正文/TTS 各调一次）。
+  assert.equal(abbreviatePath(short), short, '缩写必须幂等')
+  assert.equal(prepareDoneText(prepareDoneText(REAL_LONG_PATH)), prepareDoneText(REAL_LONG_PATH), '整份文本幂等')
+})
+
+test('长路径缩写：正斜杠 / UNC 各自保留自己的分隔符', () => {
+  const slash = abbreviatePath('D:/proj/very/deep/folder/with/many/segments/native_charts_tables.pptx')
+  assert.ok(slash.startsWith('D:/…/'), '正斜杠路径用 /：' + slash)
+  assert.ok(slash.endsWith('native_charts_tables.pptx'))
+  const unc = abbreviatePath('\\\\server\\share\\very\\deep\\folder\\with\\many\\segments\\native_charts_tables.pptx')
+  assert.ok(unc.startsWith('\\\\server\\…\\'), 'UNC 保留 //server：' + unc)
+})
+
+test('完成页正文清掉 markdown 记号：**、`、#、- 列表符', () => {
+  const raw = '## 结论\n- **报告**已导出：`D:\\proj\\out\\结果.pptx`\n- 第二项\n---\n> 引用一句'
+  const clean = prepareDoneText(raw)
+  assert.equal(clean.includes('**'), false, '粗体星号要清掉：' + clean)
+  assert.equal(clean.includes('`'), false, '反引号要清掉：' + clean)
+  assert.equal(clean.includes('#'), false, '标题 # 要清掉：' + clean)
+  assert.equal(/^\s*[-*+]\s+/m.test(clean), false, '列表符要清掉：' + clean)
+  assert.ok(clean.includes('结论'), '标题文字保留：' + clean)
+  assert.ok(clean.includes('报告已导出'), '粗体文字保留：' + clean)
+  assert.ok(clean.includes('结果.pptx'), '代码段里的文件名保留：' + clean)
+  assert.equal(clean.includes('---'), false, '分隔线整行清掉：' + clean)
+  assert.equal(clean.includes('>'), false, '引用符清掉：' + clean)
+  // 只清行首标记：正文中间的 # 与 - 不能动（比如版本号/负号）。
+  assert.equal(stripMarkdownMarks('温差 -0.12 ℃，Issue #42'), '温差 -0.12 ℃，Issue #42', '行中符号不动')
+})
+
+test('完成页帧：长路径在正文里已被缩写，行/区间/朗读仍是同一份文本', () => {
+  const folderPath = 'D:\\陈潘HBEU\\Desktop\\04：财务报销相关\\2026年11月参加武汉学术会议\\exports\\native_charts_tables.pptx'
+  const reply = '**已导出**：' + REAL_LONG_PATH + '。\n已同步到 ' + folderPath + '。\n请查收。'
+  const frame = doneFrame({ taskId: 't9b', title: '导出 PPT', resultLine: '已导出', replyText: reply })
+  const body = prepareDoneText(reply)
+  assert.equal(body.includes('陈潘HBEU'), false, '正文里不该再出现完整路径')
+  assert.equal(body.includes('**'), false, '正文里不该再出现 markdown')
+  const joined = frame.done.lines.join('')
+  assert.equal(joined.includes('陈潘HBEU'), false, '折行后也不许漏出长路径：' + joined)
+  assert.equal(frame.done.ranges.length, frame.done.lines.length, '区间与行一一对应')
+  const chars = [...body]
+  for (const [start, end] of frame.done.ranges) assert.ok(end <= chars.length, '区间不得越界')
+  // 缩写后的路径 token 本身不超过 40 字符（折行可能把它拆到两行，所以按整份文本量）。
+  const tokens = body.match(/[A-Za-z]:[^\s，。；！？、）]*/g) ?? []
+  assert.ok(tokens.length > 0, '正文里应还剩缩写后的路径')
+  for (const token of tokens) assert.ok([...token].length <= DONE_PATH_MAX_CHARS, '路径 token 超长：' + token)
+  // 文件名本身超长的那条只剩文件名开头，不能再带盘符/中间目录。
+  assert.ok(body.includes('ICACHE2026_GNN'), '长文件名保留可辨认前缀：' + body)
+  assert.ok(body.includes('D:\\…\\native_charts_tables.pptx'), '文件名短的路径保留盘符：' + body)
+})
+
 test('完成页大标题：20px 加粗仍单行省略，不换行不溢出', () => {
   const longTitle = '这个任务标题长得离谱以至于一行根本放不下必须省略号收住才行再长一点'
   const frame = doneFrame({ taskId: 't10', title: longTitle, resultLine: '好了', replyText: '好了。' })
@@ -703,6 +787,12 @@ test('完成播报的一句话：用任务标题，不念会话 id', () => {
   const task = ledger.add({ title: '把磷石膏那组图重画', projectId: 'p', projectName: '磷石膏SCI' })
   ledger.complete(task.taskId, { resultLine: '三张图已更新' })
   assert.equal(doneAnnouncementOf(task), '把磷石膏那组图重画——三张图已更新')
+  // 播报也不能整条念长路径：和完成页共用同一套清理。
+  const withPath = ledger.add({ title: '导出 PPT', projectId: 'p', projectName: 'PPT' })
+  ledger.complete(withPath.taskId, { resultLine: '已导出到 ' + REAL_LONG_PATH })
+  const line = doneAnnouncementOf(withPath)
+  assert.equal(line.includes('陈潘HBEU'), false, '播报里不许出现完整路径：' + line)
+  assert.ok(line.includes('ICACHE2026_GNN'), '缩写后的文件名还在：' + line)
 })
 
 test('提示屏与文件夹取值', () => {
