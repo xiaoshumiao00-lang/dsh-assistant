@@ -219,6 +219,17 @@ export function tihuNoticeHomeMs(): number {
 }
 
 /**
+ * 派单回执在屏上停多久（毫秒）：默认 `RECEIPT_SECONDS × 1000`（5 秒）。
+ * 屏上倒计时数字仍由 {@link RECEIPT_SECONDS} 给，这里只调「到点分流」的时刻；
+ * TIHU_RECEIPT_MS 仅供测试调小（夹在 50ms ~ 30s）。
+ */
+export function tihuReceiptHoldMs(): number {
+  const raw = Number(process.env.TIHU_RECEIPT_MS ?? RECEIPT_SECONDS * 1000)
+  if (!Number.isFinite(raw) || raw <= 0) return RECEIPT_SECONDS * 1000
+  return clampInt(raw, 50, 30_000)
+}
+
+/**
  * 朗读收尾余量：lane 的播放时间轴是「首块到达 + 累计音频时长」的投影，页面实际
  * 起播还差一个 ~30ms 的排程缓冲；留这点余量，回主页才不会被最后半句抢跑。
  */
@@ -3279,8 +3290,27 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         target.receiptTimer = undefined
         if (!devices.has(target)) return
         if (target.focusedTask !== task.taskId) return
+        // 用户 2026-11-10：5 秒后不再一律回棋盘——有正在跑的就把那台的进度页亮出来。
+        //   执行中 → 进度页（屏 4，实时状态行＋第 N 步）
+        //   已完成 → 完成页（屏 6；一句话播报在 turn/end 已进总线，这里不再重念正文）
+        //   待决策 → 决策页（要人拍板，不能只留一颗棋盘状态点）
+        //   仍排队/已派出 → 回棋盘
+        const latest = tasks.get(task.taskId) ?? task
+        if (latest.state === 'running' || latest.state === 'awaiting') {
+          if (openTask(target, latest.taskId)) {
+            log(`tihu receipt hold -> ${latest.state} task=${latest.taskId}`)
+            return
+          }
+        } else if (latest.state === 'done' || latest.state === 'announced') {
+          // 回执期间完成帧被挡在门外（见 session/event 的 receiptTimer 判断），这里把屏补上。
+          // 不再念整段正文：完成播报已由通知总线念过一句，重念等于同一件事说两次。
+          showDone(target, latest, false)
+          log(`tihu receipt hold -> done task=${latest.taskId}`)
+          return
+        }
         sendBoard(target)
-      }, RECEIPT_SECONDS * 1000)
+        log(`tihu receipt hold -> board task=${latest.taskId} state=${latest.state}`)
+      }, tihuReceiptHoldMs())
       target.receiptTimer.unref?.()
     }
   }
