@@ -35,6 +35,7 @@ import {
   plainSummaryOf,
   ringOf,
   routeQuick,
+  bestCardMatchOf,
   scoreCardAlias,
   stripWakeWord,
   subLineOf,
@@ -422,6 +423,16 @@ test('两个卡名都点到 → 追问（屏 7），绝不猜', () => {
 test('什么都不像 → 快路径放弃，交给慢路径', () => {
   const route = routeQuick({ text: '这个事儿你看着办，弄完告诉我', cards: CARDS, tasks: [] })
   assert.equal(route.kind, 'none')
+})
+
+test('超时兜底：取最佳匹配卡（片段也算），一张都不像/两张同分则不猜', () => {
+  assert.equal(bestCardMatchOf('基金那边再改改', CARDS)?.id, 'c-fund', '片段命中也要取出来')
+  assert.equal(bestCardMatchOf('把今天要做的三件事整理成清单', CARDS), undefined, '没有任何卡片相似 → 不猜')
+  const tied = [
+    { id: 'c-a', name: '青椒', folder: '' },
+    { id: 'c-b', name: '辣椒', folder: '' },
+  ]
+  assert.equal(bestCardMatchOf('青椒和辣椒都要买', tied), undefined, '两张卡同分就不猜（宁可说没听清）')
 })
 
 test('别名打分：整名 > 片段；公共片段按字长给分', () => {
