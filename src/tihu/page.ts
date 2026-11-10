@@ -459,7 +459,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     lastTranscript: '', recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0,
     connState: 'connecting', clockTimer: 0,
     
-    audioCtx: null, pcmSources: [], pcmNextTime: 0, droppedAudio: false,
+    audioCtx: null, pcmSources: [], pcmNextTime: 0, pcmLast: null, droppedAudio: false,
     /* 朗读自检：收到多少块 / 最后一块是否已排程 / 被丢掉的块数（页面事件区与 __tihuAudioCheck 可查） */
     ttsChunks: 0, ttsFinalSeen: false, ttsDropped: 0,
     samplePending: false, sampleTimer: 0,
@@ -467,10 +467,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     highlightLock: false, hostAlert: false, screenMode: 'status', screenScale: 2, actions: [], 
     /* 任务棋盘（屏 1）与派单回执 / 待决策的附加块（2026-11-09 统一指挥会话） */
     board: null, steps: [], countdown: null, countdownTimer: 0,
-    /* 完成页：done = { lines, current, ranges }；高亮由真实播放进度驱动（见 trackDoneAudio），
-       doneWatch/doneTimer 只在**完全没有声音**时兜底翻行，不参与正常朗读。 */
-    done: null, doneRanges: null, doneSeg: {}, donePoll: 0, doneWatch: 0, doneAudioSeen: false,
-    doneTimer: 0,
+    /* 完成页：done = { lines, current }；高亮只由每段 PCM 的真实开始/结束事件推进
+       （见 segmentStarted/segmentEnded），没有任何按时间翻行的兜底计时器。 */
+    done: null, doneRanges: null,
     /* 免按住（唤醒词聆听）：browser 关键词 → 屏 3「在听」→ 停 3 秒发送；10 秒没说话退出 */
     wake: false, wakeRec: null, wakeRestart: 0, listenOn: false, listenText: '', listenTimer: 0, listenIdle: 0 };
 
@@ -672,24 +671,20 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   }
 
   /* ---------- 完成页（屏 6，参考图版式） ----------
-   * 顶栏 14 + 标题 22 + 正文按行数（最多 7×20，当前行青底黑字）+ 正文↔按钮 12 + 三键 30，
-   * 320×240 内不溢出；行少时正文贴标题、下方黑底留在屏幕最底部。
+   * 顶栏 14 + 标题 22 + 正文按行数（最多 7×20，当前行青底黑字）+ 三键贴底 30，
+   * 320×240 内不溢出；行少时正文贴标题、空白留在正文与按钮之间。
    * 行文本由宿主按像素折好（done.lines），页面只负责窗口与高亮，不再二次翻译。
    *
-   * 高亮 ≡ 真实播放进度（2026-11-10 用户实机反馈：声音和青底行不同步）：
-   * 宿主每段 PCM 带 charStart/charEnd，页面把它排进 AudioContext 时记住
-   * [source.start(at), at + buffer.duration)；「现在 ctx.currentTime 落在哪一段 →
-   * 换算成字符位置 → 落到哪一行」。**不用固定 1.8 秒，也不按字数估时间。**
+   * 高亮 ≡ 每段 PCM 的真实开始/结束（2026-11-10 用户实机反馈第二版：高亮比声音快）：
+   * **不再**用 ctx.currentTime 在排程区间里按比例推算字符位置（旧 pollDone 已删）。
+   * 每段 PCM（一个 AudioBufferSourceNode）真正开始的那一刻 → 锁定它自己的
+   * charStart/charEnd（一段跨多行时就高亮起始行，行内进度不显示）；
+   * 这段 onended（真实事件）→ 推进到下一段的起始行。浏览器没有 onstart 事件，
+   * 页面用「上一段的 onended」当下一段的开始：两段在同一条 AudioContext 时间轴上
+   * 首尾相接（startAt 严格等于上一段的 end），事件与采样级对齐；中间有空档时
+   * 本段是单独排的（startAt = now+0.03），排程瞬间就视作开始。全程不做时间推算。
    */
   function clearDoneState() {
-    if (state.doneTimer) clearInterval(state.doneTimer);
-    state.doneTimer = 0;
-    if (state.doneWatch) clearTimeout(state.doneWatch);
-    state.doneWatch = 0;
-    if (state.donePoll) clearInterval(state.donePoll);
-    state.donePoll = 0;
-    state.doneSeg = {};
-    state.doneAudioSeen = false;
     state.doneRanges = null;
     state.done = null;
     var body = $('doneBody');
@@ -720,30 +715,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       body.appendChild(line);
     }
   }
-  /** 兜底翻行：只在整整 1.5 秒收不到任何朗读 PCM 时启用（音频没解锁/合成失败）。 */
-  function armDoneFallback() {
-    if (state.doneWatch) clearTimeout(state.doneWatch);
-    state.doneWatch = 0;
-    if (state.doneTimer) clearInterval(state.doneTimer);
-    state.doneTimer = 0;
-    if (!state.done || state.done.lines.length <= 1) return;
-    state.doneWatch = setTimeout(function () {
-      state.doneWatch = 0;
-      if (state.doneAudioSeen || !state.done) return;
-      state.doneTimer = setInterval(function () { advanceDone(); }, 1800);
-    }, 1500);
-  }
-  function advanceDone() {
-    var done = state.done;
-    if (!done) return;
-    if (done.current >= done.lines.length - 1) {
-      clearInterval(state.doneTimer);
-      state.doneTimer = 0;
-      return;
-    }
-    done.current += 1;
-    paintDone();
-  }
   /** 字符位置 → 行（依据宿主的 done.ranges，码点下标）。 */
   function lineAtChar(pos) {
     var ranges = state.doneRanges;
@@ -754,57 +725,54 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     return ranges.length - 1;
   }
-  /** 每 80ms 读一次 AudioContext 的真实时钟：落在哪一段已排程 PCM 就高亮那一行。 */
-  function pollDone() {
-    var done = state.done;
-    var ctx = state.audioCtx;
-    if (!done || !ctx || state.screenMode !== 'done') return;
-    var now = ctx.currentTime;
-    var best = null;
-    for (var key in state.doneSeg) {
-      if (!Object.prototype.hasOwnProperty.call(state.doneSeg, key)) continue;
-      var seg = state.doneSeg[key];
-      if (now >= seg.at && now <= seg.end) { best = seg; break; }
-    }
-    // 还没开始 / 两段之间的空隙 / 已经播完：停在当前行（不做任何估算推进）。
-    if (!best) return;
-    var span = Math.max(0.001, best.end - best.at);
-    var frac = Math.min(1, Math.max(0, (now - best.at) / span));
-    var pos = frac >= 1 ? best.ce - 0.5 : best.cs + (best.ce - best.cs) * frac;
-    var line = lineAtChar(pos);
-    if (line !== done.current) { done.current = line; paintDone(); }
-  }
-  /** 一段朗读 PCM 刚排进时间轴：记下它的真实起止时刻，高亮从此由播放时钟驱动。 */
-  function trackDoneAudio(payload, played) {
-    if (state.screenMode !== 'done' || !state.done || !played) return;
-    if (state.done && state.done.lines.length <= 1) return;
-    var index = Number(payload.index);
+  /**
+   * 朗读段开始/结束写进页面事件区（用户 2026-11-10：按段打印时间，方便和声音对照）。
+   * n = 宿主给的段号（payload.index + 1）。一段 120ms 分块有多个 AudioBufferSourceNode，
+   * 开始只在**第一块开始**时记一次（payload.seq=0），结束只在这一段的最后一块（final）记一次。
+   */
+  function logReadSegment(phase, meta, at) {
+    if (!meta) return;
+    var index = Number(meta.index);
     if (!isFinite(index)) return;
-    var cs = Number(payload.charStart);
-    var ce = Number(payload.charEnd);
-    if (!isFinite(cs) || !isFinite(ce) || ce <= cs) return;
-    if (state.doneWatch) { clearTimeout(state.doneWatch); state.doneWatch = 0; }
-    if (state.doneTimer) { clearInterval(state.doneTimer); state.doneTimer = 0; }
-    state.doneAudioSeen = true;
-    // 新一轮朗读（第一段）：清掉上一轮排程，高亮从第一行重新对齐。
-    if (index === 0 && (state.done.current !== 0 || Object.keys(state.doneSeg).length > 0)) {
-      state.doneSeg = {};
-      state.done.current = 0;
+    if (phase === 'start' ? meta.first !== true : meta.final !== true) return;
+    addEvent('progress', '朗读段 ' + (index + 1) + ' ' + (phase === 'start' ? '开始' : '结束')
+      + ' at=' + Math.max(0, Number(at) || 0).toFixed(2) + 's');
+  }
+  /**
+   * 一段 PCM **真正开始**播放：锁定它的字符区间 → 高亮起始行（一段跨多行只亮当前行，
+   * 行内进度不显示）；同时写「朗读段 n 开始」。浏览器没有 onstart：上一段 onended
+   * 触发时本段正好在时间轴上开始（见 playPcm 的首尾相接判定），所以那里调这里；
+   * 空档后单独排的段在排程瞬间调用（30ms 后响，误差远小于一句，绝不会提前一句）。
+   */
+  function segmentStarted(entry) {
+    if (!entry || entry.started) return;
+    entry.started = true;
+    var meta = entry.meta || {};
+    var ctx = state.audioCtx;
+    logReadSegment('start', meta, ctx ? ctx.currentTime : entry.at);
+    if (meta.read !== 'done') return;
+    var done = state.done;
+    if (!done || state.screenMode !== 'done') return;
+    var cs = Number(meta.cs);
+    if (!isFinite(cs)) return;
+    var line = lineAtChar(cs);
+    if (line !== done.current) {
+      done.current = line;
       paintDone();
     }
-    var seg = state.doneSeg[index];
-    if (!seg) {
-      state.doneSeg[index] = { cs: cs, ce: ce, at: played.startAt, end: played.startAt + played.duration };
-    } else {
-      seg.end = Math.max(seg.end, played.startAt + played.duration);
-    }
-    if (!state.donePoll) state.donePoll = setInterval(pollDone, 80);
-    if (window.__tihuAudioCheck) {
-      window.__tihuAudioCheck.doneLine = state.done.current;
-      window.__tihuAudioCheck.doneSegs = Object.keys(state.doneSeg).length;
-      // 验收用：把「每段 PCM 真正排进 AudioContext 的起止时刻」摊开（重读/停止一眼可查）。
-      window.__tihuAudioCheck.doneSeg = state.doneSeg;
-    }
+    if (window.__tihuAudioCheck) window.__tihuAudioCheck.doneLine = done.current;
+  }
+  /**
+   * 一段 PCM 播完（onended，真实事件）：写「朗读段 n 结束」；如果下一段已经在同一条
+   * 时间轴上排好（entry.next），此刻就是它的开始 → 立刻把高亮推进到它的起始行。
+   * 下一段还没到，就停在当前行等它真的开始（绝不按时间提前跳）。
+   */
+  function segmentEnded(entry) {
+    if (!entry) return;
+    var meta = entry.meta || {};
+    var ctx = state.audioCtx;
+    logReadSegment('end', meta, ctx ? ctx.currentTime : entry.at + entry.duration);
+    if (entry.next) segmentStarted(entry.next);
   }
   function renderDone(payload) {
     var raw = payload.done || {};
@@ -816,9 +784,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.highlightLock = false;
     state.done = { lines: lines, current: current };
     state.doneRanges = Array.isArray(raw.ranges) ? raw.ranges : null;
-    state.doneSeg = {};
-    state.doneAudioSeen = false;
-    if (state.donePoll) { clearInterval(state.donePoll); state.donePoll = 0; }
     state.actions = Array.isArray(payload.actions) ? payload.actions : [];
     state.doneMoreText = payload.more && payload.more.text ? String(payload.more.text) : '';
     $('stage').style.display = 'none';
@@ -829,7 +794,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     renderActions();
     applyScreenClass((payload.tone || 'ok') + ' done-mode' + (state.actions.length ? ' has-actions' : ''));
     paintDone();
-    armDoneFallback();
   }
 
   /* 派单回执的三拍圆点：已入队 / 排队 N 个 / 开始跑（圆点由 CSS 画，文字给状态） */
@@ -1040,14 +1004,23 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function audioRunning(ctx) {
     return ctx !== null && ctx !== undefined && ctx.state === 'running';
   }
+  /**
+   * 停止/重读/换屏：掐掉已排程的 PCM，并**清空每段的开始/结束回调**——
+   * 高亮从此不再被任何后续事件推动（停在实际停住的那一行）。
+   * 2026-11-10：onended 同时承担「朗读段 n 结束」和「下一段开始」两件事，
+   * 必须在这里摘掉，否则停止后队列里的下一段仍会把高亮往前推。
+   */
   function stopPcm() {
     for (var i = 0; i < state.pcmSources.length; i += 1) {
-      try { state.pcmSources[i].stop(); } catch (e) { /* 已结束 */ }
+      var source = state.pcmSources[i];
+      source.onended = null;
+      try { source.stop(); } catch (e) { /* 已结束 */ }
     }
     state.pcmSources = [];
     state.pcmNextTime = 0;
+    state.pcmLast = null;
   }
-  function playPcm(base64, sampleRate, cache) {
+  function playPcm(base64, sampleRate, cache, meta) {
     if (!base64) return null;
     var ctx = ensureAudio();
     if (!ctx) { markAudioDropped(); return null; }
@@ -1057,6 +1030,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       resumeAudio();
       if (!audioRunning(ctx)) {
         state.pcmNextTime = 0;
+        state.pcmLast = null;
         markAudioDropped();
         return null;
       }
@@ -1079,10 +1053,19 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       source.start(startAt);
       state.pcmNextTime = startAt + buffer.duration;
       state.pcmSources.push(source);
+      var entry = { source: source, at: startAt, duration: buffer.duration, meta: meta || null, next: null, started: false };
+      // 上一段正好在 startAt 结束（同一时间轴首尾相接）→ 它的 onended 就是本段的「开始」事件；
+      // 中间有空档时没有可挂的上一段，排程瞬间就视作开始（30ms 后真的响）。
+      var prev = state.pcmLast;
+      var contiguous = prev !== null && Math.abs(startAt - (prev.at + prev.duration)) < 1e-6;
+      if (contiguous) prev.next = entry; else segmentStarted(entry);
+      state.pcmLast = entry;
       source.onended = function () {
         var index = state.pcmSources.indexOf(source);
         if (index >= 0) state.pcmSources.splice(index, 1);
         if (state.audioCtx && state.pcmNextTime <= state.audioCtx.currentTime + 0.05) state.highlightLock = false;
+        // 真实播完：记「朗读段 n 结束」；同一条时间轴上的下一段此刻开始 → 推进高亮。
+        segmentEnded(entry);
         // 朗读结束自检：最后一块播完、队列清空 → 记一行（宿主 60 秒后自动回棋盘）。
         if (state.ttsFinalSeen && state.pcmSources.length === 0) {
           state.ttsFinalSeen = false;
@@ -1092,11 +1075,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         }
       };
       // 重读缓存（本轮完整 PCM）；试听音频不进缓存（否则下次「重读」会念成试听句）。
-      return { startAt: startAt, duration: buffer.duration };
+      return entry;
     } catch (e) { markAudioDropped(); /* 解码失败：屏内保留重读恢复 */ }
     return null;
   }
-  /** 按真实播放时刻切换当前句：不再用 tts.audio 到达即跳。 */
   /** 试听提示音：0.6 秒 440Hz 正弦，音量中等（直接证明音频通路可用）。 */
   function playBeep() {
     var ctx = state.audioCtx;
@@ -1335,14 +1317,22 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
           console.warn('[tihu] 朗读采样率异常', audioRate);
           addEvent('alert', '朗读采样率异常：' + audioRate + '（期望 24000）');
         }
-        var chunkPlayed = playPcm(String(payload.data || ''), audioRate, true);
+        var cs = Number(payload.charStart);
+        var ce = Number(payload.charEnd);
+        var segIndex = Number(payload.index);
+        var chunkPlayed = playPcm(String(payload.data || ''), audioRate, true, {
+          index: isFinite(segIndex) ? segIndex : 0,
+          cs: isFinite(cs) ? cs : -1,
+          ce: isFinite(ce) ? ce : -1,
+          first: Number(payload.seq) === 0,
+          final: payload.final === true,
+          read: payload.read === 'done' ? 'done' : '',
+        });
         if (chunkPlayed) {
           state.ttsChunks += 1;
           window.__tihuAudioCheck = { chunks: state.ttsChunks, lastRate: audioRate, lastAt: Date.now(), playing: state.pcmSources.length };
           if (state.ttsChunks === 1) addEvent('progress', '朗读开始：' + audioRate + 'Hz');
           if (payload.final === true) { state.ttsFinalSeen = true; addEvent('progress', '朗读：最后一块已排入播放队列'); }
-          // 完成页正文朗读：按这段 PCM 真正排进 AudioContext 的时刻对齐高亮（不估算）。
-          if (payload.read === 'done') trackDoneAudio(payload, chunkPlayed);
         } else {
           state.ttsDropped += 1;
         }
@@ -1829,24 +1819,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
               hideAudioWarn();
             }
             if (state.done && actionId === 'replay') {
-              // 重读：清掉旧排程，高亮回到第一行，等宿主重发第一段 PCM 后重新按播放时钟对齐。
+              // 重读：掐掉旧音频 + 清空每段回调，高亮回第一行；宿主重发第一段 PCM 后
+              // 从「朗读段 1 开始」这个事件重新推进（不按时间估算）。
               stopPcm();
-              state.doneSeg = {};
-              state.doneAudioSeen = false;
-              if (state.donePoll) { clearInterval(state.donePoll); state.donePoll = 0; }
               state.done.current = 0;
               paintDone();
-              armDoneFallback();
-            }
-            if (state.done && actionId === 'stop') {
-              // 停止：音频已经掐掉，高亮就停在实际停住的那一行（清掉排程，poll 不再改 current）。
-              if (state.doneTimer) clearInterval(state.doneTimer);
-              state.doneTimer = 0;
-              if (state.doneWatch) clearTimeout(state.doneWatch);
-              state.doneWatch = 0;
-              if (state.donePoll) { clearInterval(state.donePoll); state.donePoll = 0; }
-              state.doneSeg = {};
-              state.doneAudioSeen = true; // 不再启用兜底翻行，屏就停在这一行
             }
             if (actionId === 'taskBoard') clearDoneState();
             if (actionId === 'home') tapFlash(event.clientX - rect.left, event.clientY - rect.top);
