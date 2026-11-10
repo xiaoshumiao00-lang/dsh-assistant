@@ -26,8 +26,9 @@
  *        危险动作的授权只在电脑端，绝不上设备屏。只对「tihu 正在执行的会话」生效。
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { isAbsolute, join } from 'node:path'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, isAbsolute, join } from 'node:path'
 import { WsFrameParser, encodeFrame } from '../pocket-host/ws-deflate.mjs'
 import {
   TIHU_DOWNSTREAM_TYPES,
@@ -496,6 +497,83 @@ export function buildTihuUserMessage(text: string): any {
     content: [{ type: 'text', text: String(text ?? '') }],
     source: { kind: 'user' },
   }
+}
+
+/* ---------- lane 详细日志（投递失败的**真实异常**，不只靠宿主 console） ---------- */
+
+/** 单文件上限：超过就截断重开（重启后排查只需要最近一段）。 */
+export const TIHU_LANE_LOG_MAX_BYTES = 2 * 1024 * 1024
+
+/** 日志路径：`$TIHU_LANE_LOG`（测试/排查用）→ `$DSH_HOME/tihu/lane.log` → `~/.dsh/tihu/lane.log`。 */
+export function tihuLaneLogPath(): string {
+  const override = String(process.env.TIHU_LANE_LOG ?? '').trim()
+  if (override !== '') return override
+  const dshHome = String(process.env.DSH_HOME ?? '').trim()
+  return join(dshHome !== '' ? dshHome : join(homedir(), '.dsh'), 'tihu', 'lane.log')
+}
+
+/** 异常 message（换行压成空格；空 message 给个可检索的占位）。 */
+function compactErrorText(error: unknown): string {
+  const text = String((error as Error)?.message ?? error ?? '').replace(/\s+/g, ' ').trim()
+  return text === '' ? 'unknown error' : text
+}
+
+/**
+ * 追加一条投递失败记录：时间 + sessionId + 真实 message + stack 首行（外加首个 at 帧）。
+ *
+ * 日志写失败（磁盘满/权限）绝不影响投递本身；单文件超过 2MB 先清空再写。
+ */
+export function appendTihuLaneLog(sessionId: string, error: unknown, note = ''): string {
+  const message = compactErrorText(error)
+  const stackLines = String((error as Error)?.stack ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+  const stackHead = stackLines[0] ?? ''
+  const stackFrame = stackLines.find((line) => line.startsWith('at ')) ?? ''
+  const parts = [
+    `[${new Date().toISOString()}]`,
+    `session=${sessionId}`,
+    ...(note === '' ? [] : [`note=${note}`]),
+    `message=${JSON.stringify(message)}`,
+    ...(stackHead === '' ? [] : [`stack=${JSON.stringify(stackHead)}`]),
+    ...(stackFrame === '' || stackFrame === stackHead ? [] : [`frame=${JSON.stringify(stackFrame)}`]),
+  ]
+  const line = `${parts.join(' ')}\n`
+  try {
+    const file = tihuLaneLogPath()
+    mkdirSync(dirname(file), { recursive: true })
+    try {
+      if (statSync(file).size > TIHU_LANE_LOG_MAX_BYTES) writeFileSync(file, '', 'utf8')
+    } catch { /* 文件还不存在 */ }
+    appendFileSync(file, line, 'utf8')
+  } catch { /* 日志失败不影响功能 */ }
+  return line
+}
+
+/** 屏上一行硬截断（中文正文一行约 18 字；英文异常也不许把整屏吃掉）。 */
+function clipScreenBullet(value: unknown, maxChars: number): string {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  const chars = [...text]
+  if (chars.length <= maxChars) return text
+  return `${chars.slice(0, Math.max(1, maxChars - 1)).join('')}…`
+}
+
+/** 设备屏第二行：一句 ≤20 字的真实原因摘要（常见宿主异常翻成中文，其余截原文）。 */
+export function screenReasonOf(error: unknown): string {
+  const message = compactErrorText(error)
+  const rules: Array<[RegExp, string]> = [
+    [/archiv|归档/i, '会话已归档'],
+    [/not loaded|unload|未加载|没加载|加载失败/i, '会话没加载'],
+    [/no such|not found|missing|不存在|找不到/i, '会话不存在'],
+    [/busy|in progress|locked|正忙/i, '会话正忙'],
+    [/timeout|timed out|超时/i, '响应超时'],
+    [/permission|denied|forbidden|没权限|无权限|权限/i, '没有权限'],
+    [/closed|disconnect|断开/i, '连接断了'],
+    [/create|创建|新建|建不/i, '建不出会话'],
+  ]
+  for (const [pattern, reason] of rules) if (pattern.test(message)) return reason
+  return clipScreenBullet(message, 20)
 }
 
 /** WebSocket 握手应答头。 */
@@ -1380,13 +1458,22 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /* ---------- 会话事件 → 屏 ---------- */
 
-  /** 一条指令没发出去：告警一行 + 屏上一句可操作的话。 */
-  function showInputError(device: TihuDevice, error: unknown): void {
-    const message = (error as Error)?.message ?? String(error)
-    device.send('event.alert', { level: 'error', text: message })
+  /**
+   * 一条指令没发出去：告警一行 + 屏上一句可操作的话。
+   *
+   * 屏上只留两行（正文一行约 18 字）：
+   *   1. `friendly`（不传就用异常 message）截到 18 字；
+   *   2. 真实原因摘要 ≤20 字（`screenReasonOf`）。
+   * 完整异常另有 lane.log（见 appendTihuLaneLog），不指望屏上看得全。
+   */
+  function showInputError(device: TihuDevice, error: unknown, friendly?: string): void {
+    const first = clipScreenBullet(friendly ?? compactErrorText(error), 18)
+    const reason = screenReasonOf(error)
+    const bullets = first === reason ? [first] : [first, reason]
+    device.send('event.alert', { level: 'error', text: `${first}（${reason}）` })
     sendFrame(device, {
       stage: '会话', title: '指令未发送',
-      bullets: fitScreenLines([message.slice(0, 100), '请确认当前会话后重说'], 3),
+      bullets: fitScreenLines(bullets, 3),
       tone: 'alert', mode: 'status',
     } satisfies ScreenFramePayload)
   }
@@ -2295,8 +2382,20 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     } catch { return undefined }
   }
 
+  /** 一次投递的结果：失败时把**真实异常**带回去（屏上原因摘要 + lane.log 都靠它）。 */
+  interface PromptResult {
+    ok: boolean
+    /** 失败时的真实异常（成功时没有）。 */
+    error?: unknown
+    /** 失败来自 sessions.using（只有这种失败值得退避重试）。 */
+    fromUsing?: boolean
+  }
+
+  /** 没投进去时的短退避（毫秒）：重启后宿主可能还在恢复旧会话。 */
+  const PROMPT_RETRY_DELAY_MS = [300, 800]
+
   /**
-   * 往一条会话投一组消息（与用户手打同一条入口）。
+   * 投一次（不做重试）。
    * 优先 `sessions.using(...).prompt()`（宿主会顺手拉起 agent），
    * 没有这个服务就退回 `agents.followup`（老宿主/测试桩）。
    *
@@ -2305,25 +2404,32 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 分支更是一条都不记，于是危险动作闸判「不是 tihu 轮」整段放行（2026-11-09 实测
    * `pwsh Remove-Item` 无 confirm、无 audit）。空 messageId 在 tihuTurnOf 里按 tihu 轮算。
    */
-  async function promptSession(sessionId: string, blocks: { type: 'text'; text: string }[]): Promise<boolean> {
+  async function promptOnce(sessionId: string, blocks: { type: 'text'; text: string }[]): Promise<PromptResult> {
     const sessionsSvc = optionalService(ctx, 'sessions') as { using?: (id: string, opts: unknown, fn: (ref: any) => Promise<void>) => Promise<void> } | undefined
     if (typeof sessionsSvc?.using === 'function') {
       armTihuWindow(sessionId)
       let before: string | undefined
+      let delivered = false
       try {
         await sessionsSvc.using(sessionId, { source: 'tihu-dispatch' }, async (reference: any) => {
           const session = reference?.binding?.session
           before = lastUserMessageId(session)
           await session?.prompt(blocks, 'steer')
+          delivered = true
           const after = lastUserMessageId(session)
           if (after !== undefined && after !== before) armTihuWindow(sessionId, after)
         })
-        return true
+        return { ok: true }
       } catch (error) {
+        if (delivered) {
+          // 消息已经进去了：using 收尾抛错不能算投递失败，否则重试会重复投一遍。
+          appendTihuLaneLog(sessionId, error, 'after-delivery')
+          log(`tihu prompt session=${sessionId} delivered, dispose threw: ${(error as Error)?.message ?? String(error)}`)
+          return { ok: true }
+        }
         // 投递失败就别把窗口留着，免得后续用户自己的工具调用被误判成 tihu 轮。
         activeSessions.delete(sessionId)
-        log(`tihu prompt session=${sessionId} failed: ${(error as Error)?.message ?? String(error)}`)
-        return false
+        return { ok: false, error, fromUsing: true }
       }
     }
     armTihuWindow(sessionId)
@@ -2339,28 +2445,121 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       agent.followup(message)
       const after = lastUserMessageId(sessionForMessageId(sessionId))
       if (after !== undefined && after !== before) armTihuWindow(sessionId, after)
-      return true
+      return { ok: true }
     } catch (error) {
       activeSessions.delete(sessionId)
-      log(`tihu inject session=${sessionId} failed: ${(error as Error)?.message ?? String(error)}`)
-      return false
+      return { ok: false, error, fromUsing: false }
     }
   }
 
-  /** 指挥会话：按标题找回同一条；找不到才新建（落助手 home，standard 模式）。 */
-  async function ensureCommanderSession(): Promise<string | undefined> {
-    if (commanderSessionId !== undefined) {
+  /** 指挥会话换了 id：绑着旧会话的屏改绑到新会话（否则新会话的 turn 事件上不了屏）。 */
+  function rebindCommanderSession(previous: string, next: string): void {
+    if (previous === next) return
+    for (const device of devices) {
+      if (device.sessionId !== previous) continue
+      device.sessionId = next
+      device.send('session.bound', {
+        sessionId: next,
+        title: titleForSession(next),
+        project: projectNameOf(liveSessionOf(next)?.header?.cwd),
+        live: true,
+        preset: TASK_PRESET,
+        computerUse: false,
+      } satisfies SessionBoundPayload)
+    }
+  }
+
+  /** 正在重建的指挥会话：两句同时失败时只建一条，避免两条「鹈鹕指挥台」抢绑。 */
+  let commanderRebuilding: Promise<string | undefined> | undefined
+
+  /**
+   * 指挥会话投不进去（重启后归档/没加载/卡在忙）→ 新建一条并重绑设备。
+   *
+   * 这里必须 **fresh**：按标题找回只会拿回同一个死 id，重试还是失败（2026-11-10 线上）。
+   */
+  async function rebuildCommanderSession(failedSessionId: string): Promise<string | undefined> {
+    if (commanderRebuilding !== undefined) return await commanderRebuilding
+    commanderRebuilding = (async () => {
+      commanderSessionId = undefined
+      const rebuilt = await ensureCommanderSession({ fresh: true })
+      if (rebuilt === undefined) return undefined
+      rebindCommanderSession(failedSessionId, rebuilt)
+      log(`tihu commander rebuilt old=${failedSessionId} new=${rebuilt}`)
+      return rebuilt
+    })()
+    try {
+      return await commanderRebuilding
+    } finally {
+      commanderRebuilding = undefined
+    }
+  }
+
+  /**
+   * 往一条会话投一组消息，并对「重启后旧会话用不了」做兜底：
+   *   1. 投递抛错先等 300ms、800ms 各重试一次（重启后宿主可能还在恢复）；
+   *   2. 仍失败且目标是指挥会话 → 清空 commanderSessionId、新建「鹈鹕指挥台」并重绑设备后再投一次；
+   *   3. 每次失败都把真实异常写进 lane.log（不只宿主 console）。
+   *
+   * 返回 `ok`（成功）或 `error`（最后一次真实异常）：调用方据此在设备屏第二行写原因摘要。
+   */
+  async function promptSession(sessionId: string, blocks: { type: 'text'; text: string }[]): Promise<PromptResult> {
+    // 进函数时就记住「这是不是指挥会话」：后面重建会改 commanderSessionId。
+    const isCommander = sessionId === commanderSessionId
+    let last: PromptResult | undefined
+    for (let attempt = 0; attempt <= PROMPT_RETRY_DELAY_MS.length; attempt += 1) {
+      if (attempt > 0) {
+        await new Promise<void>((resolve) => { setTimeout(resolve, PROMPT_RETRY_DELAY_MS[attempt - 1]) })
+        if (disposed) return { ok: false, error: last?.error ?? new Error('鹈鹕已卸载'), fromUsing: false }
+      }
+      const result = await promptOnce(sessionId, blocks)
+      if (result.ok) return result
+      last = result
+      const failure = result.error ?? new Error('投递失败')
+      appendTihuLaneLog(sessionId, failure, `attempt=${attempt + 1}/${PROMPT_RETRY_DELAY_MS.length + 1}`)
+      log(`tihu prompt session=${sessionId} attempt=${attempt + 1} failed: ${(failure as Error)?.message ?? String(failure)}`)
+      // 只有 using 自己抛错才值得退避重试；fallback 没有活动 agent 时重试也一样。
+      if (result.fromUsing !== true) break
+    }
+    if (!isCommander || disposed) {
+      return { ok: false, error: last?.error ?? new Error('投递失败'), fromUsing: false }
+    }
+    const rebuilt = await rebuildCommanderSession(sessionId)
+    if (rebuilt === undefined) {
+      log(`tihu commander rebuild failed old=${sessionId}`)
+      return { ok: false, error: last?.error ?? new Error('指挥会话重建失败'), fromUsing: false }
+    }
+    const retried = await promptOnce(rebuilt, blocks)
+    if (retried.ok) {
+      log(`tihu commander retry ok old=${sessionId} new=${rebuilt}`)
+      return retried
+    }
+    appendTihuLaneLog(rebuilt, retried.error, 'attempt=rebuild')
+    log(`tihu commander retry failed session=${rebuilt}: ${(retried.error as Error)?.message ?? String(retried.error)}`)
+    return { ok: false, error: retried.error, fromUsing: retried.fromUsing }
+  }
+
+  /**
+   * 指挥会话：按标题找回同一条；找不到才新建（落助手 home，standard 模式）。
+   *
+   * `fresh` 只给「投递连续失败后的重建」用：那条会话已经进不去（重启后归档/没加载/
+   * 卡死在忙），再按标题找回来还是同一个死 id，所以直接新建一条并写回标题。
+   */
+  async function ensureCommanderSession(options: { fresh?: boolean } = {}): Promise<string | undefined> {
+    if (options.fresh !== true && commanderSessionId !== undefined) {
       const found = await findSession(commanderSessionId)
       if (found.status !== 'missing') return commanderSessionId
       commanderSessionId = undefined
     }
-    let rows: TihuSessionRow[] = []
-    try { rows = (await collectSessionRows()).rows } catch { rows = [] }
-    const existing = rows.find((row) => String(row.title ?? '').includes(COMMANDER_TITLE))
-    if (existing !== undefined) {
-      commanderSessionId = existing.sessionId
-      log(`tihu commander reused session=${existing.sessionId}`)
-      return commanderSessionId
+    if (options.fresh === true) commanderSessionId = undefined
+    if (options.fresh !== true) {
+      let rows: TihuSessionRow[] = []
+      try { rows = (await collectSessionRows()).rows } catch { rows = [] }
+      const existing = rows.find((row) => String(row.title ?? '').includes(COMMANDER_TITLE))
+      if (existing !== undefined) {
+        commanderSessionId = existing.sessionId
+        log(`tihu commander reused session=${existing.sessionId}`)
+        return commanderSessionId
+      }
     }
     const created = await createSessionAt(assistantFolder(), TASK_PRESET)
     if (created === undefined) return undefined
@@ -3072,7 +3271,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       tasks.drop(task.taskId)
       const message = '宿主还不能新建会话（sessionController.create 不可用，见 tihu 日志），这次没派出去'
       if (device !== undefined) {
-        showInputError(device, new Error(message))
+        showInputError(device, new Error(message), '任务会话没建起来，请重说')
       }
       log(`tihu dispatch failed: no session service`)
       return undefined
@@ -3087,10 +3286,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     // 先挂到任务再投消息：工具调用可能抢在 prompt() 返回前发生，闸门按
     // tasks.ofSession 找任务、待决策屏按任务取问题，晚挂一步就会漏。
     tasks.attachSession(task.taskId, sessionId)
-    const ok = await promptSession(sessionId, blocks)
-    if (!ok) {
+    const sent = await promptSession(sessionId, blocks)
+    if (!sent.ok) {
       tasks.drop(task.taskId)
-      if (device !== undefined) showInputError(device, new Error('任务会话没有接住这条消息，请重说'))
+      if (device !== undefined) showInputError(device, sent.error, '任务会话没有接住这条消息，请重说')
       return undefined
     }
     log(`tihu dispatch task=${task.taskId} project=${card.id} session=${sessionId} folder=${folder}`)
@@ -3108,9 +3307,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       await dispatchToCard(device, text, { id: task.projectId, name: task.projectName, ...(task.folder === undefined ? {} : { folder: task.folder }) })
       return
     }
-    const ok = await promptSession(sessionId, [{ type: 'text', text }])
-    if (!ok) {
-      showInputError(device, new Error('那条任务的会话没接住这条话，请重说'))
+    const sent = await promptSession(sessionId, [{ type: 'text', text }])
+    if (!sent.ok) {
+      showInputError(device, sent.error, '那条任务的会话没接住这条话，请重说')
       return
     }
     tasks.markRunning(task.taskId)
@@ -3155,7 +3354,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   async function answerDirect(device: TihuDevice, text: string): Promise<void> {
     const commander = await ensureCommanderSession()
     if (commander === undefined) {
-      showInputError(device, new Error('指挥会话还没建好：先手动绑一条会话（或让宿主支持新建会话）'))
+      showInputError(device, new Error('会话新建失败：宿主 sessionController 不可用'), '指挥会话还没建好，请重说')
       return
     }
     device.unified = true
@@ -3175,18 +3374,18 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       target.focusedTask = undefined
       target.send('screen.frame', frame)
     }
-    const ok = await promptSession(commander, [
+    const sent = await promptSession(commander, [
       { type: 'text', text },
       { type: 'text', text: '【只读问答 · 鹈鹕】这是记忆/只读问答：直接回答主人；不要调用 tihu dispatch，不要新建任务。' },
     ])
-    if (!ok) showInputError(device, new Error('指挥会话没有接住这句话，请重说'))
+    if (!sent.ok) showInputError(device, sent.error, '指挥会话没有接住这句话，请重说')
   }
 
   /** 慢路径：交给指挥会话的模型判项目（它再调 tihu dispatch）。 */
   async function askCommander(device: TihuDevice, text: string): Promise<void> {
     const commander = await ensureCommanderSession()
     if (commander === undefined) {
-      showInputError(device, new Error('指挥会话还没建好：先手动绑一条会话（或让宿主支持新建会话）'))
+      showInputError(device, new Error('会话新建失败：宿主 sessionController 不可用'), '指挥会话还没建好，请重说')
       return
     }
     device.unified = true
@@ -3205,8 +3404,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       target.focusedTask = undefined
       target.send('screen.frame', frame)
     }
-    const ok = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: COMMANDER_TAIL }])
-    if (!ok) showInputError(device, new Error('指挥会话没有接住这句话，请重说'))
+    const sent = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: COMMANDER_TAIL }])
+    if (!sent.ok) showInputError(device, sent.error, '指挥会话没有接住这句话，请重说')
   }
 
   /** 撤一条任务：还没起跑就直接撤；起跑过的要先「停止」再撤（危险动作要确认）。 */
