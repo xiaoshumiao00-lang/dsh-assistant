@@ -3326,6 +3326,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   function sliceSegmentByLines(pcm: Buffer, segment: DoneSpeechSegment, ranges: readonly [number, number][], chars: readonly string[]): Array<{ line: number; start: number; end: number; pcm: Buffer }> {
     const lines = ranges.slice(segment.firstLine, segment.lastLine + 1)
     if (lines.length === 0 || pcm.length === 0) return []
+    // 16 bit 单声道：切点必须落在**偶数**字节上。之前按比例四舍五入直接切，切到奇数位就等于
+    // 把每对采样错开一个字节 —— 页面按小端 16 bit 解出来的全是满幅噪声（2026-11-10 实机「刺耳杂音」
+    // 就是这么来的：只有按行分段这版会切，所以是它之后才出现）。
+    const even = (value: number): number => Math.max(0, Math.min(pcm.length, Math.round(value / 2) * 2))
     // 占比按「真正送进合成的那份文本」算，不按屏上正文的长度算：`toSpeechText` 会剥掉 markdown、
     // 链接、符号，按屏上正文切会把行边界一点点拖到声音前面去（2026-11-10 实机「高亮还在往前走」）。
     const weights = lines.map(([start, end]) => Math.max(1, [...toSpeechText(chars.slice(start, end).join(''))].length))
@@ -3335,11 +3339,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     for (let i = 0; i < lines.length; i += 1) {
       used += weights[i] ?? 1
       const raw = i === lines.length - 1 ? pcm.length : Math.round(pcm.length * (used / totalWeight))
-      cuts.push(Math.max(0, Math.min(pcm.length, raw)))
+      cuts.push(even(raw))
     }
     // 行边界单调递增、最后一行收干整段尾巴（切不出重叠、也不留空洞）。
     for (let i = 1; i < cuts.length; i += 1) cuts[i] = Math.max(cuts[i], cuts[i - 1])
-    cuts[cuts.length - 1] = pcm.length
+    cuts[cuts.length - 1] = even(pcm.length)
     const out: Array<{ line: number; start: number; end: number; pcm: Buffer }> = []
     let from = 0
     for (let i = 0; i < lines.length; i += 1) {
@@ -3353,10 +3357,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /** 按固定长度切块下发（与 `tts.audio` 原来的 120 ms 分块同口径，页面时间轴不变）。 */
   function chunkLinePcm(pcm: Buffer): Buffer[] {
-    if (pcm.length <= DONE_READ_CHUNK_BYTES) return [pcm]
+    // 每块都必须是整采样（偶数字节）：奇数长度说明尾部多了半个采样，砍掉它。
+    const body = pcm.length % 2 === 0 ? pcm : pcm.subarray(0, Math.max(0, pcm.length - 1))
+    if (body.length === 0) return []
+    if (body.length <= DONE_READ_CHUNK_BYTES) return [body]
     const parts: Buffer[] = []
-    for (let at = 0; at < pcm.length; at += DONE_READ_CHUNK_BYTES) {
-      parts.push(pcm.subarray(at, Math.min(pcm.length, at + DONE_READ_CHUNK_BYTES)))
+    for (let at = 0; at < body.length; at += DONE_READ_CHUNK_BYTES) {
+      parts.push(body.subarray(at, Math.min(body.length, at + DONE_READ_CHUNK_BYTES)))
     }
     return parts
   }
