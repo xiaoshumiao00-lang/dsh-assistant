@@ -11,12 +11,18 @@
  *   - 派单快路径：点名卡 / 追加 / 日常 / 歧义追问，各走一条。
  */
 import assert from 'node:assert/strict'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   ANNOUNCE_SINGLE_DELAY_MS,
   ANNOUNCE_WINDOW_MS,
   BOARD_PAGE_SIZE,
   DONE_KEEP_MS,
+  LEDGER_RESTORE_MAX,
+  LEDGER_SNAPSHOT_VERSION,
+  RESTORED_INTERRUPTED_LINE,
   RING_FULL_MS,
   TaskLedger,
   TaskNotifyBus,
@@ -28,11 +34,13 @@ import {
   firstFolderOf,
   formatUsedMs,
   journalLineOf,
+  ledgerSnapshotOf,
   looksSimpleTask,
   longestCommonRun,
   mergeAnnouncements,
   parseScreenCommand,
   plainSummaryOf,
+  restoreLedgerTasks,
   ringOf,
   routeQuick,
   isFinishedState,
@@ -47,6 +55,12 @@ import {
   subLineOf,
   taskTitleOf,
 } from '../src/tihu/task-ledger.ts'
+import {
+  TaskLedgerStore,
+  parseLedgerSnapshot,
+  readLedgerSnapshot,
+  writeLedgerSnapshot,
+} from '../src/tihu/task-store.ts'
 import {
   DONE_BODY_FONT_PX,
   DONE_BODY_TEXT_WIDTH_PX,
@@ -1122,5 +1136,152 @@ test('棋盘排序按状态而不是来源；一条一张卡；每页 4 条、�
   assert.equal(boardOf(many.list(), 9000, -3).page.index, 0, '负数夹到第 1 页')
   assert.equal(boardOf([], 9000).page.total, 1, '空盘也算 1 页（翻页条不出现）')
 })
+
+/* ---------- 台账落盘（2026-11-10：跨重启记住完成历史） ---------- */
+
+const ledgerDir = mkdtempSync(join(tmpdir(), 'dsh-tihu-ledger-test-'))
+const DAY = 24 * 60 * 60_000
+
+test('台账落盘 → 重启读盘：完成卡、完成计数、分页都对得上', () => {
+  const now = 1_800_000_000_000
+  const file = join(ledgerDir, 'roundtrip.json')
+  const ledger = new TaskLedger()
+  const first = ledger.add({ title: '写基金预算表', projectId: 'fund', projectName: '青年基金', now: now - 600_000 })
+  ledger.complete(first.taskId, { resultLine: '预算表已生成', now: now - 300_000 })
+  const second = ledger.add({ title: '整理桥梁温度场', projectId: 'bridge', projectName: '温度场', now: now - 900_000 })
+  ledger.complete(second.taskId, { resultLine: '温度场图已出', now: now - 500_000 })
+
+  const store = new TaskLedgerStore({ file, snapshot: () => ledgerSnapshotOf(ledger.list(), now), delayMs: 0, onError: () => {} })
+  assert.equal(store.flush(), true, '写盘要成功')
+  assert.ok(existsSync(file))
+  assert.deepEqual(readdirSync(ledgerDir).filter((name) => name.endsWith('.tmp')), [], '原子写不许留 .tmp')
+
+  const snapshot = readLedgerSnapshot(file)
+  assert.ok(snapshot !== undefined)
+  assert.equal(snapshot.v, LEDGER_SNAPSHOT_VERSION)
+  assert.equal(snapshot.tasks.length, 2)
+
+  // 模拟进程重启：新登记簿 + 读盘恢复。
+  const reborn = new TaskLedger()
+  const restored = reborn.restore(snapshot.tasks, now)
+  assert.equal(restored.restored, 2)
+  assert.equal(restored.dropped, 0)
+  assert.equal(restored.ended, 0, '正常完成的不要标成中断')
+  const board = boardOf(reborn.list(), now)
+  assert.deepEqual(board.counts, { running: 0, awaiting: 0, queued: 0, done: 2 })
+  assert.equal(board.total, 2)
+  assert.equal(board.page.total, 1, '分页按恢复出来的条数算')
+  assert.deepEqual(board.rows.map((row) => row.capsule), ['完成', '完成'])
+  assert.ok(board.rows.some((row) => row.taskId === first.taskId), '恢复的完成卡要上棋盘')
+  const restoredFirst = reborn.get(first.taskId)
+  assert.equal(restoredFirst.resultLine, '预算表已生成')
+  assert.equal(restoredFirst.finishedAt, now - 300_000)
+  assert.ok(restoredFirst.spokenAt !== undefined, '恢复的历史不许再播报')
+
+  const next = reborn.add({ title: '重启后新派的一条', projectId: 'fund', projectName: '青年基金', now })
+  assert.equal(next.taskId, 't3', '短号按恢复出来的最大号继续，不许撞号')
+})
+
+test('重启时 running / queued / awaiting 一律按已结束处理（屏上不再算在跑）', () => {
+  const now = 1_800_000_000_000
+  const ledger = new TaskLedger()
+  const running = ledger.add({ title: '跑一半的那条', projectId: 'p', projectName: 'P', now: now - 600_000 })
+  ledger.markRunning(running.taskId, now - 500_000)
+  ledger.add({ title: '还排队的', projectId: 'p', projectName: 'P', now: now - 400_000 })
+  const awaiting = ledger.add({ title: '等你拍板的', projectId: 'p', projectName: 'P', now: now - 300_000 })
+  ledger.ask(awaiting.taskId, { question: '删不删？', options: ['删', '留'], timeoutMs: 60_000, now: now - 200_000 })
+
+  const snapshot = ledgerSnapshotOf(ledger.list(), now)
+  assert.equal(snapshot.tasks.find((task) => task.taskId === running.taskId).state, 'running', '落盘时保留真实状态')
+
+  const reborn = new TaskLedger()
+  const restored = reborn.restore(snapshot.tasks, now)
+  assert.equal(restored.ended, 3, '三条都按结束处理')
+  for (const task of reborn.list()) {
+    assert.equal(task.state, 'done')
+    assert.equal(task.resultLine, RESTORED_INTERRUPTED_LINE)
+    assert.equal(task.question, undefined, '待决策不许跨重启复活')
+    assert.equal(task.options, undefined)
+    assert.ok(task.finishedAt !== undefined)
+  }
+  const board = boardOf(reborn.list(), now)
+  assert.deepEqual(board.counts, { running: 0, awaiting: 0, queued: 0, done: 3 }, '四段计数里没有在跑/待决策/排队')
+  assert.ok(board.rows.every((row) => row.state === 'done' && row.capsule === '完成'))
+})
+
+test('恢复窗口：超 3 天丢弃，完成历史最多 60 条（按时间淘汰）', () => {
+  const now = 1_800_000_000_000
+  const records = []
+  for (let i = 1; i <= 70; i += 1) {
+    const at = now - (70 - i) * 60_000
+    records.push({
+      taskId: `t${i}`, source: 'tihu', title: `任务${i}`, projectId: 'p', projectName: 'P', preset: 'standard',
+      state: 'done', startedAt: at - 1000, updatedAt: at, finishedAt: at, resultLine: '做完了', sessionIds: [],
+    })
+  }
+  records.push({
+    taskId: 't99', source: 'tihu', title: '四天前', projectId: 'p', projectName: 'P', preset: 'standard',
+    state: 'done', startedAt: now - 4 * DAY, updatedAt: now - 4 * DAY, finishedAt: now - 4 * DAY, sessionIds: [],
+  })
+  const restored = restoreLedgerTasks(records, now)
+  assert.equal(restored.restored, LEDGER_RESTORE_MAX, '最多保留 60 条')
+  assert.equal(restored.restored, 60)
+  assert.equal(restored.dropped, 11, '老 1 条 + 超出上限 10 条')
+  assert.equal(restored.tasks.some((task) => task.taskId === 't99'), false, '超过 3 天的不要')
+  assert.equal(restored.tasks[0].taskId, 't70', '最近的排最前')
+  assert.equal(restored.tasks[59].taskId, 't11', '被淘汰的是 60 条之外最老的那些')
+
+  // 边界：正好 3 天留下，多 1 毫秒丢掉。
+  const edge = restoreLedgerTasks([
+    { taskId: 't1', title: '正好三天', projectId: 'p', projectName: 'P', state: 'done', startedAt: now - DONE_KEEP_MS, updatedAt: now - DONE_KEEP_MS, finishedAt: now - DONE_KEEP_MS, sessionIds: [] },
+    { taskId: 't2', title: '多一毫秒', projectId: 'p', projectName: 'P', state: 'done', startedAt: now - DONE_KEEP_MS - 1, updatedAt: now - DONE_KEEP_MS - 1, finishedAt: now - DONE_KEEP_MS - 1, sessionIds: [] },
+  ], now)
+  assert.equal(edge.restored, 1)
+  assert.equal(edge.tasks[0].taskId, 't1')
+})
+
+test('坏文件 / 旧版本一律当没有；落盘记录不含正文大段文本', () => {
+  const now = 1_800_000_000_000
+  const corrupt = join(ledgerDir, 'corrupt.json')
+  writeFileSync(corrupt, '{"v":1,"tasks":[', 'utf8')
+  assert.equal(readLedgerSnapshot(corrupt), undefined, '半截 JSON 不许抛错、按没有处理')
+  writeFileSync(corrupt, JSON.stringify({ v: LEDGER_SNAPSHOT_VERSION + 1, savedAt: now, tasks: [] }), 'utf8')
+  assert.equal(parseLedgerSnapshot(readFileSync(corrupt, 'utf8')), undefined, '版本不对就整份不要')
+  assert.equal(parseLedgerSnapshot(''), undefined)
+  assert.equal(parseLedgerSnapshot('null'), undefined)
+
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: '正文检查', projectId: 'p', projectName: 'P', sessionIds: ['session-abc'], now })
+  ledger.complete(task.taskId, { resultLine: '一句话结果', now })
+  ledger.get(task.taskId).doneText = '这是一大段正文。'.repeat(500)
+  ledger.get(task.taskId).summary = '摘要一行'
+  const snapshot = ledgerSnapshotOf(ledger.list(), now)
+  const record = snapshot.tasks[0]
+  assert.equal('doneText' in record, false, '正文绝不落盘')
+  assert.equal(record.resultLine, '一句话结果')
+  assert.equal(record.summary, '摘要一行')
+  assert.deepEqual(record.sessionIds, ['session-abc'])
+  assert.ok(JSON.stringify(snapshot).length < 1200, '记录要克制：一条不到 1KB')
+
+  const file = join(ledgerDir, 'shape.json')
+  assert.equal(writeLedgerSnapshot(snapshot, file), true)
+  assert.equal(readFileSync(file, 'utf8').includes('这是一大段正文'), false)
+})
+
+test('状态一变就通知落盘（onChange → schedule → flush：完成状态真的写进文件）', () => {
+  const file = join(ledgerDir, 'wired.json')
+  let ledger
+  const store = new TaskLedgerStore({ file, delayMs: 0, snapshot: () => ledgerSnapshotOf(ledger.list()), onError: () => {} })
+  ledger = new TaskLedger(undefined, { onChange: () => store.schedule() })
+  const task = ledger.add({ title: '接线检查', projectId: 'p', projectName: 'P' })
+  ledger.complete(task.taskId, { resultLine: '接上了' })
+  assert.equal(store.flush(), true)
+  const snapshot = readLedgerSnapshot(file)
+  assert.ok(snapshot !== undefined)
+  assert.equal(snapshot.tasks[0].state, 'done')
+  assert.equal(snapshot.tasks[0].resultLine, '接上了')
+})
+
+rmSync(ledgerDir, { recursive: true, force: true })
 
 console.log(`\n${passed} tests passed（task-ledger + task-screens）`)

@@ -39,7 +39,7 @@ import {
   takeSnapshot,
   targetPathOf,
 } from '../src/tihu/guard.ts'
-import { createTihuRuntime, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH, TIHU_LANE_LOG_MAX_BYTES, appendTihuLaneLog, screenReasonOf, tihuLaneLogPath, tihuReceiptHoldMs } from '../src/tihu/lane.ts'
+import { createTihuRuntime as createTihuRuntimeRaw, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH, TIHU_LANE_LOG_MAX_BYTES, appendTihuLaneLog, screenReasonOf, tihuLaneLogPath, tihuReceiptHoldMs } from '../src/tihu/lane.ts'
 import { BOARD_PAGE_SIZE } from '../src/tihu/task-ledger.ts'
 import {
   APPROVAL_OPTIONS,
@@ -86,6 +86,20 @@ import {
   ttsEngine,
 } from '../src/tihu/tts.ts'
 import { WsFrameParser, encodeFrame } from '../src/pocket-host/ws-deflate.mjs'
+
+/**
+ * 每个 runtime 一份独立临时台账（2026-11-10 台账落盘改造）：
+ *   - 测试之间不串历史（否则前一个用例派的任务会以「重启恢复」的方式出现在下一个用例的棋盘上）；
+ *   - 也绝不读/写真实 `~/.dsh/tihu/task-ledger.json`（跑一次测试不能改用户的完成历史）。
+ * 名字刻意与真实入口同名，下面几百处 createTihuRuntime(...) 都不用改。
+ */
+const tihuTestLedgerDir = mkdtempSync(join(tmpdir(), 'dsh-tihu-ledger-'))
+let tihuTestLedgerSeq = 0
+function createTihuRuntime(ctx, options = {}) {
+  tihuTestLedgerSeq += 1
+  const file = options.taskLedgerPath ?? join(tihuTestLedgerDir, `ledger-${tihuTestLedgerSeq}.json`)
+  return createTihuRuntimeRaw(ctx, { ...options, taskLedgerPath: file })
+}
 
 let passed = 0
 let failed = 0
@@ -651,7 +665,7 @@ function agentsFixture(ids) {
   }
 }
 
-function runtimeFor(records, extras = {}, ttsOptions = {}) {
+function runtimeFor(records, extras = {}, ttsOptions = {}, ledgerPath = undefined) {
   const fixture = fakeCtx({
     sessionQuery: sessionQueryFixture(records),
     sessionProjectionCache: projectionCacheFixture(records),
@@ -661,6 +675,7 @@ function runtimeFor(records, extras = {}, ttsOptions = {}) {
     // TIHU_TEST_LANE_LOG=1 时把宿主侧 lane 的日志打到 stderr（测试挂了先看这个，别瞎猜）。
     log: (message) => { if (process.env.TIHU_TEST_LANE_LOG) console.error('[lane] ' + message) },
     tts: { disabled: true, ...ttsOptions },
+    ...(ledgerPath === undefined ? {} : { taskLedgerPath: ledgerPath }),
   }) }
 }
 
@@ -2720,7 +2735,7 @@ function unifiedWorkspace(options = {}) {
     ...(options.sessionEvents === undefined
       ? {}
       : { sessionQuery: sessionQueryFixture(records, options.sessionEvents) }),
-  }, options.tts ?? {})
+  }, options.tts ?? {}, options.ledgerPath)
   return {
     ...fixture,
     root,
@@ -2794,6 +2809,49 @@ await testAsync('统一指挥：没有指挥会话时 hello 自动建「鹈鹕�
   assert.equal(w.created.length, 1, '第二次 hello 要复用，不再新建指挥会话')
   const secondBound = framesOf(second).filter((frame) => frame.type === 'session.bound').pop()
   assert.equal(secondBound.payload.sessionId, 'session-task-1')
+  w.cleanup()
+})
+
+/*
+ * 2026-11-10 用户实机：重启 DSH 后棋盘「完成」计数与历史卡片全归零（任务只活在内存）。
+ * 台账落盘之后，hello 第一帧就要看到历史完成卡；而且**上次没跑完的**只许按完成出现，
+ * 绝不能带着 running 状态回来（那正是「重启后跳到过时进度页」的来源）。
+ */
+await testAsync('台账恢复：重启后棋盘照样有完成卡与完成计数，跑一半的不算在跑', async () => {
+  const now = Date.now()
+  const ledgerPath = join(tihuTestLedgerDir, 'seeded-restore.json')
+  writeFileSync(ledgerPath, JSON.stringify({
+    v: 1,
+    savedAt: now,
+    tasks: [
+      {
+        taskId: 't7', source: 'tihu', title: '写基金预算表', projectId: 'fund', projectName: '青年基金',
+        preset: 'standard', state: 'done', startedAt: now - 600_000, updatedAt: now - 300_000,
+        finishedAt: now - 300_000, resultLine: '预算表已生成', sessionIds: [],
+      },
+      {
+        taskId: 't8', source: 'tihu', title: '重启前在跑的那条', projectId: 'fund', projectName: '青年基金',
+        preset: 'standard', state: 'running', startedAt: now - 900_000, updatedAt: now - 120_000, sessionIds: [],
+      },
+    ],
+  }), 'utf8')
+  const w = unifiedWorkspace({ ledgerPath })
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'r1', protocol: '0' }, 1)))
+  await waitMs(80)
+  const frames = framesOf(socket)
+  const board = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop()
+  assert.ok(board !== undefined, '屏帧要带 board')
+  assert.deepEqual(board.payload.board.counts, { running: 0, awaiting: 0, queued: 0, done: 2 }, '完成计数要包含恢复的历史')
+  assert.equal(board.payload.board.total, 2)
+  assert.equal(board.payload.board.page.total, 1, '分页跟着恢复出来的条数算')
+  const doneRow = board.payload.board.rows.find((row) => row.taskId === 't7')
+  assert.ok(doneRow !== undefined, '恢复的完成卡要上棋盘')
+  assert.equal(doneRow.capsule, '完成')
+  const endedRow = board.payload.board.rows.find((row) => row.taskId === 't8')
+  assert.equal(endedRow.capsule, '完成', '重启前 running 的必须按完成出现')
+  assert.ok(endedRow.sub.includes('已完成'))
+  assert.equal(frames.some((frame) => frame.type === 'task.notify'), false, '恢复历史不重播完成播报')
   w.cleanup()
 })
 
