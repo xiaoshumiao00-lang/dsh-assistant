@@ -479,7 +479,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     lastTranscript: '', recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0,
     connState: 'connecting', clockTimer: 0,
     
-    audioCtx: null, pcmSources: [], pcmNextTime: 0, pcmLast: null, droppedAudio: false,
+    audioCtx: null, pcmSources: [], pcmNextTime: 0, pcmLast: null, droppedAudio: false, readRound: null,
     /* 朗读自检：收到多少块 / 最后一块是否已排程 / 被丢掉的块数（页面事件区与 __tihuAudioCheck 可查） */
     ttsChunks: 0, ttsFinalSeen: false, ttsDropped: 0,
     samplePending: false, sampleTimer: 0,
@@ -1098,6 +1098,74 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.pcmSources = [];
     state.pcmNextTime = 0;
     state.pcmLast = null;
+    // 被停止的这一轮也把诊断行打出来（块数/重叠/采样率照实报，方便对照实机杂音）。
+    flushReadRound();
+  }
+  /**
+   * 每块首尾各 fadeMs 线性淡入淡出（原位改 samples，缺省 5ms）。
+   * 完成页把一条合成音频按行、再按 120ms 切块下发，块边界常落在波形中间：
+   * 直接拼接就是每 120ms 一声「咔哒」；淡入淡出把边界跳变压到听不见。
+   */
+  function shapePcm(samples, rate, fadeMs) {
+    var n = samples.length;
+    var fade = Math.max(0, Math.round((Number(rate) || 24000) * ((Number(fadeMs) || 5) / 1000)));
+    if (samples.length === 0) return 0;
+    if (fade <= 1 || n <= 2) return 0;
+    var span = Math.min(fade, Math.floor(n / 2));
+    for (var i = 0; i < span; i += 1) {
+      var gain = i / span;
+      samples[i] *= gain;
+      samples[n - 1 - i] *= gain;
+    }
+    return span;
+  }
+  /** 峰值限幅：超过 ceiling（默认 -1 dBFS ≈ 0.891）就整块等比压下来，避免削波成刺耳破音。 */
+  function limitPcm(samples, ceiling) {
+    var limit = Number(ceiling);
+    if (!isFinite(limit) || limit <= 0) limit = 0.891;
+    var peak = 0;
+    for (var i = 0; i < samples.length; i += 1) {
+      var abs = samples[i] < 0 ? -samples[i] : samples[i];
+      if (abs > peak) peak = abs;
+    }
+    if (peak <= limit || peak <= 0) return peak;
+    var gain = limit / peak;
+    for (var j = 0; j < samples.length; j += 1) samples[j] *= gain;
+    return peak;
+  }
+  /** 清掉已经播完的 source：同一轮里别让上一块的尾巴和新块挤在同一条时间轴上。 */
+  function recycleSources(nowAt) {
+    var keep = [];
+    for (var i = 0; i < state.pcmSources.length; i += 1) {
+      var source = state.pcmSources[i];
+      var endAt = Number(source.__pcmEnd);
+      if (isFinite(endAt) && endAt > nowAt - 0.002) { keep.push(source); continue; }
+      try { source.onended = null; source.stop(); } catch (e) { /* 已结束 */ }
+    }
+    state.pcmSources = keep;
+  }
+  /**
+   * 朗读诊断（用户 2026-11-10 要求）：每轮记「首块字节数 / 总块数 / 是否发生重叠 / 采样率」，
+   * 这一轮播完（或被停止）时在事件区打一行，实机有杂音时一眼能对上。
+   */
+  function noteReadRound(rate, overlap, bytes, meta) {
+    var first = meta !== null && meta !== undefined && meta.first === true && Number(meta.index) === 0;
+    if (first) flushReadRound(); // 上一轮没播完就来了新一轮：先把上一轮结算掉
+    if (state.readRound === null || state.readRound === undefined) {
+      state.readRound = { blocks: 0, firstBytes: 0, sampleRate: 0, overlaps: 0 };
+    }
+    var round = state.readRound;
+    round.blocks += 1;
+    round.overlaps += overlap ? 1 : 0;
+    if (!round.firstBytes) round.firstBytes = Number(bytes) || 0;
+    round.sampleRate = Number(rate) || round.sampleRate || 24000;
+  }
+  function flushReadRound() {
+    var round = state.readRound;
+    state.readRound = null;
+    if (!round || !round.blocks) return;
+    addEvent('progress', '朗读 · 块 ' + round.blocks + ' · 首块 ' + round.firstBytes + ' B · 采样率 '
+      + (round.sampleRate || 24000) + ' · 重叠 ' + round.overlaps);
   }
   function playPcm(base64, sampleRate, cache, meta) {
     if (!base64) return null;
@@ -1116,23 +1184,45 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     }
     try {
       var binary = atob(base64);
+      // 小端 16 bit 有符号（宿主按 pcm16 发，采样率 24000）：按对解，**不是** float32。
+      // 少见的奇数字节（半个采样）直接丢尾巴，避免整段错位成噪声。
       var count = Math.floor(binary.length / 2);
+      var rate = Number(sampleRate);
+      if (!Number.isFinite(rate) || rate < 8000 || rate > 96000) rate = 24000;
       var samples = new Float32Array(count);
       for (var i = 0; i < count; i += 1) {
         var value = binary.charCodeAt(i * 2) | (binary.charCodeAt(i * 2 + 1) << 8);
         if (value >= 0x8000) value -= 0x10000;
         samples[i] = value / 32768;
       }
-      var buffer = ctx.createBuffer(1, count, sampleRate);
+      // ① 每块首尾各 5ms 线性淡入淡出：PCM 切成 120ms 一块时，块边界常常落在波形中间，
+      //    直接拼接会「咔哒」（段边界同理）。淡入淡出把跳变压到听不出来。
+      shapePcm(samples, rate, 5);
+      // ② 峰值限幅到 -1 dBFS（0.891）：多块首尾相接、或某段增益偏高时不至于削波成刺耳的破音。
+      limitPcm(samples, 0.891);
+      var buffer = ctx.createBuffer(1, count, rate);
       buffer.copyToChannel(samples, 0);
       var source = ctx.createBufferSource();
       source.buffer = buffer;
       source.connect(ctx.destination);
-      var startAt = Math.max(ctx.currentTime + 0.03, state.pcmNextTime || 0);
+      // ③ 排程绝不重叠：起点 = max(现在 + 30ms, 上一块排到哪儿)。上一块已经过期（卡顿/丢帧）
+      //    就清掉它的残留、从 now+30ms 重新对齐 —— 绝不把两块 start 在同一时刻（叠加会爆音）。
+      var nowAt = ctx.currentTime;
+      var prevEnd = Number(state.pcmNextTime) || 0;
+      if (prevEnd > 0 && prevEnd < nowAt - 0.002) recycleSources(nowAt);
+      var startAt = Math.max(nowAt + 0.03, prevEnd);
+      var overlap = 0;
+      for (var s = 0; s < state.pcmSources.length; s += 1) {
+        var liveEnd = Number(state.pcmSources[s].__pcmEnd);
+        if (isFinite(liveEnd) && liveEnd > startAt + 1e-6) overlap += 1;
+      }
       source.start(startAt);
       state.pcmNextTime = startAt + buffer.duration;
+      source.__pcmEnd = state.pcmNextTime;
       state.pcmSources.push(source);
       var entry = { source: source, at: startAt, duration: buffer.duration, meta: meta || null, next: null, started: false };
+      // 朗读诊断（用户要求）：每轮首块/总块数/是否重叠/采样率，这一轮播完写一行到事件区。
+      noteReadRound(rate, overlap > 0, count, meta);
       // 上一段正好在 startAt 结束（同一时间轴首尾相接）→ 它的 onended 就是本段的「开始」事件；
       // 中间有空档时没有可挂的上一段，排程瞬间就视作开始（30ms 后真的响）。
       var prev = state.pcmLast;
@@ -1151,6 +1241,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
           var endedOk = audioRunning(state.audioCtx);
           console.assert(endedOk, '[tihu] 朗读播完时 AudioContext 不是 running：' + (state.audioCtx && state.audioCtx.state));
           addEvent(endedOk ? 'done' : 'alert', endedOk ? '朗读结束：60 秒后自动回棋盘' : '朗读结束时音频仍未解锁（点一下屏幕再点重读）');
+          flushReadRound();
         }
       };
       // 重读缓存（本轮完整 PCM）；试听音频不进缓存（否则下次「重读」会念成试听句）。

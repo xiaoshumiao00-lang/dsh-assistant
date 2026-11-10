@@ -624,6 +624,8 @@ function stubPcmTts(options = {}) {
   const spoken = []
   const chunkDelayMs = Number(options.chunkDelayMs) || 0
   const chunks = Math.max(1, Number(options.chunks) || 0)
+  // 有些引擎最后一块会多塞半个采样（奇数长度）：用来钉住「发给页面的必须是整采样」。
+  const oddTail = options.oddBytes === true
   const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms) })
   return {
     spoken,
@@ -648,7 +650,9 @@ function stubPcmTts(options = {}) {
       }
       for (const block of chunker.finish()) {
         if (chunkDelayMs > 0) await sleep(chunkDelayMs)
-        synthOptions.onChunk({ data: block.data, seq: seq, total: seq + 1, final: block.final })
+        // 最后一块多半个采样（奇数长度）：拼起来就是奇数字节，宿主必须自己砍掉尾巴。
+        const data = oddTail && block.final ? Buffer.concat([block.data, Buffer.alloc(1)]) : block.data
+        synthOptions.onChunk({ data, seq: seq, total: seq + 1, final: block.final })
         seq += 1
       }
       return { sampleRate: 24000, firstChunkMs: 10, audioMs: samples / 24, totalMs: 20, chunks: seq }
@@ -3665,6 +3669,39 @@ test('page：棋盘翻页条钉在屏底（列表区 flex:1，一页 4 条还是
   assert.equal(/body\.appendChild\(item\)/.test(html), false, '任务行不许再直接挂在 home-body 上')
 })
 
+test('page：朗读音频链路（5ms 淡入淡出 / -1dBFS 限幅 / 排程不重叠 / PCM16 不是 float / 诊断行）', () => {
+  const html = pageHtmlOf()
+  // ① 每块首尾 5ms 淡入淡出：块边界落在波形中间也不「咔哒」。
+  const play = /function playPcm\(base64, sampleRate, cache, meta\) \{([\s\S]*?)\n  \}/.exec(html)
+  assert.ok(play !== null, '要能找到 playPcm')
+  assert.ok(play[1].includes('shapePcm(samples, rate, 5)'), '每块首尾 5ms 淡入淡出：' + play[1].slice(0, 80))
+  const shape = /function shapePcm\(samples, rate, fadeMs\) \{([\s\S]*?)\n  \}/.exec(html)?.[1] ?? ''
+  assert.ok(shape.includes('samples[n - 1 - i] *= gain'), '淡出作用在尾部对称位置')
+  assert.ok(shape.includes('Math.min(fade, Math.floor(n / 2))'), '短块不把中间也压平')
+  // ② 峰值限幅到 -1dBFS（0.891），避免削波成刺耳破音。
+  assert.ok(play[1].includes('limitPcm(samples, 0.891)'), '每块过限幅')
+  const limit = /function limitPcm\(samples, ceiling\) \{([\s\S]*?)\n  \}/.exec(html)?.[1] ?? ''
+  assert.ok(limit.includes('limit = 0.891'), '缺省限幅 -1dBFS')
+  assert.ok(limit.includes('samples[j] *= gain'), '超限时整块等比压下去')
+  // ③ 排程绝不重叠：起点 max(now+30ms, 上一块结束)，过期就重新对齐并回收旧 source。
+  assert.ok(play[1].includes('var startAt = Math.max(nowAt + 0.03, prevEnd)'), '起点不早于上一块结束：' + play[1].slice(0, 120))
+  assert.ok(play[1].includes('overlap += 1'), '同时统计「是否发生重叠」')
+  assert.ok(play[1].includes('recycleSources(nowAt)'), '上一块已过期时先回收，别让残留和新块叠在一起')
+  assert.ok(play[1].includes('source.__pcmEnd = state.pcmNextTime'), '记住每块结束时刻')
+  // ④ 16bit 小端解码（不是 float32）；采样率异常时兜底 24000 并提示。
+  assert.ok(play[1].includes('binary.charCodeAt(i * 2) | (binary.charCodeAt(i * 2 + 1) << 8)'), '按小端 16bit 组样本')
+  assert.ok(play[1].includes('value / 32768'), '整数除以 32768 归一化（float 解码会是 /1.0 那种错法）')
+  assert.ok(play[1].includes('rate < 8000 || rate > 96000'), '采样率越界兜底 24000')
+  assert.equal(/getFloat32|DataView/.test(play[1]), false, '不许把 16bit 当 float 读')
+  // ⑤ 每轮诊断行：块数 / 首块字节 / 采样率 / 是否重叠。
+  assert.ok(play[1].includes('noteReadRound(rate, overlap > 0, count, meta)'), '每块记账')
+  const flush = /function flushReadRound\(\) \{([\s\S]*?)\n  \}/.exec(html)?.[1] ?? ''
+  assert.ok(flush.includes("'朗读 · 块 '"), '事件区打诊断行：' + flush.slice(0, 80))
+  assert.ok(flush.includes("' · 首块 '") && flush.includes("' B · 采样率 '") && flush.includes("' · 重叠 '"),
+    '诊断行含首块字节 / 采样率 / 重叠')
+  assert.ok(html.includes('flushReadRound();'), '播完或被停止时结算这一轮')
+})
+
 test('page：完成页三键贴底（离屏幕下沿 12px）＋ 标题/正文贴顶 + 正文区按剩余高度裁剪', () => {
   const html = pageHtmlOf()
   assert.ok(/#screen\.has-actions \.action-bar \{ display:flex; \}/.test(html), '有按钮时动作条必须显示（缺这条 → 完成页三键消失）')
@@ -3851,6 +3888,33 @@ await testAsync('完成页朗读：每段 PCM 带 read=done + 字符区间，覆
   const sentText = readFrames.map((item) => String(item.payload.text ?? '')).join('')
   assert.ok(sentText.includes('温度场结果已经收敛'), '念的就是屏上那份正文：' + sentText)
   assert.equal(sentText.includes('✅'), false, '行首勾不会进朗读文本')
+  w.cleanup()
+})
+
+await testAsync('完成页朗读：合成给回奇数字节时砍掉半采样，每块 PCM 都是整采样（错位就是满幅噪声）', async () => {
+  const ttsStub = stubPcmTts({ oddBytes: true })
+  const w = unifiedWorkspace({ tts: { instance: ttsStub } })
+  const socket = openLane(w.runtime)
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-done-odd', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+  await waitMs(90)
+  // 回执要停 5 秒：先回棋盘，完成帧才会立刻上屏并开始念正文。
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+  await waitMs(60)
+  const taskSession = w.prompted[0].id
+  emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
+  emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '现在是九点三十一分。温度场结果已经收敛，跨中腹板温差 1.1 ℃。' }] } } })
+  emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await waitMs(400)
+  const readFrames = framesOf(socket).filter((item) => item.type === 'tts.audio' && item.payload.read === 'done')
+  assert.ok(readFrames.length > 0, '要有正文 PCM')
+  for (const item of readFrames) {
+    const bytes = Buffer.from(item.payload.data, 'base64')
+    assert.equal(bytes.length % 2, 0, '每块必须是整采样（偶数字节）：' + bytes.length)
+    assert.equal(item.payload.sampleRate, 24000, '采样率与合成一致')
+  }
   w.cleanup()
 })
 
