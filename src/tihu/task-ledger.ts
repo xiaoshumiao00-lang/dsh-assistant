@@ -554,9 +554,24 @@ export class TaskLedger {
     return task
   }
 
-  /** 标记已播报（同一条不重复念）；七态第 6 态「已播报」。 */
-  markSpoken(taskId: string, now = Date.now()): void {
+  /**
+   * 往旧会话再投一句话（衔接追加）：已完成/已播报的任务回到执行中。
+   *
+   * 与 `markRunning` 的区别：`markRunning` 只把排队/派单态推进到执行中；这里要能把
+   * 已经「完成/已播报」的任务重新拉回执行中，否则续聊的回执会显示一条完成的旧任务。
+   */
+  reopenForAppend(taskId: string, now = Date.now()): TihuTask | undefined {
     const task = this.tasks.get(taskId)
+    if (task === undefined) return undefined
+    task.state = 'running'
+    task.finishedAt = undefined
+    task.spokenAt = undefined
+    task.updatedAt = now
+    return task
+  }
+
+  /** 标记已播报（同一条不重复念）；七态第 6 态「已播报」。 */
+  markSpoken(taskId: string, now = Date.now()): void {    const task = this.tasks.get(taskId)
     if (task === undefined) return
     task.spokenAt = now
     if (task.state === 'done') task.state = 'announced'
@@ -737,7 +752,7 @@ export function mergeAnnouncements(items: readonly { text: string; level: TaskNo
 
 /** 路由结果：派给某张卡／追加到已有任务／日常任务／歧义追问。 */
 export type TaskRoute =
-  | { kind: 'card'; card: TihuCardRow; matched: string }
+  | { kind: 'card'; card: TihuCardRow; matched: string; via?: 'name' | 'folder' | 'fragment' }
   | { kind: 'append'; task: TihuTask }
   | { kind: 'daily' }
   | { kind: 'ambiguous'; candidates: TihuCardRow[] }
@@ -979,7 +994,7 @@ export function routeQuick(input: {
   if (decisive.length === 1) {
     const follow = CONTINUATION.test(text) ? activeOf(decisive[0].card.id) : undefined
     if (follow !== undefined) return { kind: 'append', task: follow }
-    return { kind: 'card', card: decisive[0].card, matched: decisive[0].matched }
+    return { kind: 'card', card: decisive[0].card, matched: decisive[0].matched, via: decisive[0].via }
   }
 
   if (CONTINUATION.test(text)) {
@@ -998,14 +1013,202 @@ export function routeQuick(input: {
   if (best !== undefined && best.score >= 30) {
     const close = scored.filter((item) => item.score * 100 >= best.score * 80)
     if (close.length > 1) return { kind: 'ambiguous', candidates: close.slice(0, 2).map((item) => item.card) }
-    return { kind: 'card', card: best.card, matched: best.matched }
+    return { kind: 'card', card: best.card, matched: best.matched, via: best.via }
   }
   if (looksSimpleTask(text)) return { kind: 'daily' }
   if (best === undefined) return { kind: 'none' }
   // 只剩「2 个字撞上」的弱命中：同样先看有没有第二个候选，再落卡。
   const close = scored.filter((item) => item.score * 100 >= best.score * 80)
   if (close.length > 1) return { kind: 'ambiguous', candidates: close.slice(0, 2).map((item) => item.card) }
-  return { kind: 'card', card: best.card, matched: best.matched }
+  return { kind: 'card', card: best.card, matched: best.matched, via: best.via }
+}
+
+/* ---------- 会话衔接（本地语义打分，纯函数；零模型） ---------- */
+
+/**
+ * 派单的第二步判「这句话与该项目下已有 CU 会话有没有衔接」。
+ *
+ * 三个信号，内容为主、时间与指代只做加权（**指代词不是开关**：用户不用
+ * 「接着/刚才/它」，只要内容和上一件事重合得够，同样判成接续）：
+ *   - content：用户这句话的实字有多少出现在会话标题/摘要里（0.65）；
+ *   - cue：指代/续写语义（接着、刚才、那条、再改…）（0.18）；
+ *   - time：会话最后一次活动离现在多近（0.17）。
+ *
+ * 三档结论：高置信 append、明确无关 new、中间灰区 gray（交给指挥台判一次）。
+ */
+
+/** 只看最近这么多条 CU 会话（再早的不该被吸走）。 */
+export const CONTINUITY_MAX_SESSIONS = 8
+/** 只看最近 7 天有动静的会话（更早的属于另一个上下文）。 */
+export const CONTINUITY_WINDOW_MS = 7 * 24 * 60 * 60_000
+/** 高置信直接续的分数线。 */
+export const CONTINUITY_APPEND_SCORE = 0.54
+/** 明确无关（直接新建）的分数线：低于它没有任何证据表明是同一件事。 */
+export const CONTINUITY_NEW_SCORE = 0.32
+/** 两个候选贴得太近（分差小于它）时不猜，进灰区。 */
+export const CONTINUITY_MARGIN = 0.06
+
+/** 一条可衔接的 CU 会话（lane 投影；纯逻辑只读）。 */
+export interface TihuSessionCandidate {
+  sessionId: string
+  title: string
+  /** 会话摘要（登记簿任务 summary / 结果行；没有就只用标题）。 */
+  summary?: string
+  /** 最后一次活动时刻（时间临近度）。 */
+  updatedAt: number
+}
+
+export interface ContinuityInput {
+  text: string
+  sessions: readonly TihuSessionCandidate[]
+  now: number
+  /** 项目名/文件夹短名：两边先剔掉，免得「同一个项目」被误当成「同一件事」。 */
+  projectHints?: readonly string[]
+}
+
+export type SessionContinuity =
+  | { kind: 'append'; confidence: number; sessionId: string; reason: string }
+  | { kind: 'new'; confidence: number; reason: string }
+  | { kind: 'gray'; confidence: number; sessionId?: string; reason: string }
+
+/** 打分权重：内容为主，指代与时间只是加权信号。 */
+const CONTINUITY_WEIGHT = { content: 0.65, cue: 0.18, time: 0.17 } as const
+
+/**
+ * 指代/续写语义（只是加分信号，绝不作为触发开关）。
+ * 每条最多算一次，总权重封顶 1。
+ */
+const CONTINUITY_CUES: ReadonlyArray<{ pattern: RegExp; weight: number }> = [
+  { pattern: /接着|继续|往下说|接着说/, weight: 0.5 },
+  { pattern: /刚才|刚刚|前面|上面|上次|之前|原先|原来|那条|这条|那个|这个|它/, weight: 0.35 },
+  { pattern: /再(?:改|调|修|补|加|删|压|缩|写|做|跑|弄|看|试|算|核|对|导|画|排|润|翻)/, weight: 0.3 },
+  { pattern: /还有|顺便|另外|补充|然后|下一步|后面|最后/, weight: 0.25 },
+  { pattern: /保留|别动|不要动|不动|不变|照旧|沿用|基于|在此基础上/, weight: 0.2 },
+]
+
+/** 内容字里剔掉的高频虚字（留实字，避免「的/了/这」把无关句子算成相似）。 */
+const CONTINUITY_STOP_CHARS = new Set([...'的了着过是在和与及或而并就都也还又把这那哪个些一点上下中里外后前我你他她它们吗呢吧啊呀哦嗯请帮麻烦会能要想从到为以于被给对向'])
+
+/** 送进衔接判定的候选（lane 用）——同一条会话只保留一份。 */
+export function continuityCandidatesOf(sessions: readonly TihuSessionCandidate[]): TihuSessionCandidate[] {
+  const seen = new Set<string>()
+  const out: TihuSessionCandidate[] = []
+  for (const session of sessions) {
+    if (session.sessionId === '' || seen.has(session.sessionId)) continue
+    seen.add(session.sessionId)
+    out.push(session)
+  }
+  return out.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, CONTINUITY_MAX_SESSIONS)
+}
+
+/** 指代/续写语义分（0..1）：多条命中累加封顶，纯信号。 */
+export function continuityCueScore(text: string): number {
+  const value = String(text ?? '')
+  let sum = 0
+  for (const cue of CONTINUITY_CUES) if (cue.pattern.test(value)) sum += cue.weight
+  return Math.min(1, sum)
+}
+
+/** 时间临近度：同一小时≈1、一天 0.5、三天 0.25、一周 0.13。 */
+export function continuityTimeScore(updatedAt: number, now: number): number {
+  const at = Number(updatedAt)
+  if (!Number.isFinite(at) || at <= 0) return 0
+  const hours = Math.max(0, now - at) / 3_600_000
+  return 1 / (1 + hours / 24)
+}
+
+/** 实字序列：去标点/空白/高频虚字，保留中英数字。 */
+function contentSeqOf(text: string): string[] {
+  const out: string[] = []
+  for (const ch of String(text ?? '').toLowerCase()) {
+    if (/\s/.test(ch)) continue
+    if (/[\p{P}\p{S}]/u.test(ch)) continue
+    if (CONTINUITY_STOP_CHARS.has(ch)) continue
+    out.push(ch)
+  }
+  return out
+}
+
+function bigramsOf(chars: readonly string[]): string[] {
+  const out: string[] = []
+  for (let i = 0; i + 1 < chars.length; i += 1) out.push(chars[i] + chars[i + 1])
+  return out
+}
+
+/**
+ * 内容重合度（0..1）：这句话有多少实字/二字组在参考文本里出现过。
+ * 句子越短越可能是巧合，按实字个数（6 个字满权）打折。
+ */
+export function continuityAffinityOf(text: string, reference: string): number {
+  const a = contentSeqOf(text)
+  const b = contentSeqOf(reference)
+  if (a.length < 2 || b.length < 2) return 0
+  const aSet = new Set(a)
+  const bSet = new Set(b)
+  let sharedChars = 0
+  for (const ch of aSet) if (bSet.has(ch)) sharedChars += 1
+  const coverage = sharedChars / aSet.size
+  const aBigrams = new Set(bigramsOf(a))
+  const bBigrams = new Set(bigramsOf(b))
+  let sharedBigrams = 0
+  for (const bigram of aBigrams) if (bBigrams.has(bigram)) sharedBigrams += 1
+  const dice = aBigrams.size === 0 ? 0 : (2 * sharedBigrams) / (aBigrams.size + bBigrams.size)
+  const weight = Math.min(1, a.length / 6)
+  return (0.6 * coverage + 0.4 * dice) * weight
+}
+
+/** 从两边剔掉项目名/文件夹短名（整串出现才剔，不做模糊替换）。 */
+function stripHints(text: string, hints: readonly string[] | undefined): string {
+  let value = String(text ?? '')
+  for (const hint of hints ?? []) {
+    const raw = String(hint ?? '').trim()
+    if ([...raw].length < 2) continue
+    const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    value = value.replace(new RegExp(escaped, 'gi'), ' ')
+  }
+  return value
+}
+
+/**
+ * 会话衔接判定：给一句话与该项目下的 CU 会话候选，产出 append / new / gray。
+ *
+ * 纪律：
+ *   - 只有**内容**能单独把结论推到 append（不用指代词也照样判接续）；
+ *   - 指代词/时间只加分：单独出现「接着」但没有内容重合，最多到灰区，不会硬塞给旧会话；
+ *   - 两个候选分太近就不猜（gray），宁可问一次也不续错。
+ */
+export function continuityOf(input: ContinuityInput): SessionContinuity {
+  const text = String(input.text ?? '').trim()
+  const now = Number.isFinite(input.now) ? Number(input.now) : Date.now()
+  if (text === '') return { kind: 'new', confidence: 0, reason: '空句子' }
+  const sessions = continuityCandidatesOf(input.sessions)
+  if (sessions.length === 0) return { kind: 'new', confidence: 0, reason: '该项目下还没有 CU 会话' }
+  const utterance = stripHints(text, input.projectHints)
+  const cue = continuityCueScore(text)
+  const scored = sessions.map((candidate) => {
+    const title = stripHints(candidate.title, input.projectHints)
+    const summary = stripHints(candidate.summary ?? '', input.projectHints)
+    const content = Math.max(
+      continuityAffinityOf(utterance, title),
+      summary === '' ? 0 : continuityAffinityOf(utterance, summary),
+    )
+    const time = continuityTimeScore(candidate.updatedAt, now)
+    const score = CONTINUITY_WEIGHT.content * content + CONTINUITY_WEIGHT.cue * cue + CONTINUITY_WEIGHT.time * time
+    return { candidate, score, content, cue, time }
+  }).sort((a, b) => (b.score - a.score) || (b.candidate.updatedAt - a.candidate.updatedAt))
+  const best = scored[0]
+  const second = scored[1]
+  const detail = `content=${best.content.toFixed(2)} cue=${best.cue.toFixed(2)} time=${best.time.toFixed(2)} score=${best.score.toFixed(2)}`
+  if (best.score < CONTINUITY_NEW_SCORE) {
+    return { kind: 'new', confidence: best.score, reason: `明确无关：${detail}` }
+  }
+  if (best.score >= CONTINUITY_APPEND_SCORE) {
+    if (second !== undefined && best.score - second.score < CONTINUITY_MARGIN) {
+      return { kind: 'gray', confidence: best.score, sessionId: best.candidate.sessionId, reason: `两条会话分太近：${detail} second=${second.score.toFixed(2)}` }
+    }
+    return { kind: 'append', confidence: best.score, sessionId: best.candidate.sessionId, reason: detail }
+  }
+  return { kind: 'gray', confidence: best.score, sessionId: best.candidate.sessionId, reason: `灰区：${detail}` }
 }
 
 /**
