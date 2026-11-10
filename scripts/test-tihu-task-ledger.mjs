@@ -51,7 +51,7 @@ import {
   noticeFrame,
   receiptFrame,
 } from '../src/tihu/task-screens.ts'
-import { fitScreenLines, SCREEN_SPEC } from '../src/tihu/screen-spec.ts'
+import { CONTENT_WIDTH_PX, fitScreenLines, measureTextPx, SCREEN_SPEC } from '../src/tihu/screen-spec.ts'
 
 let passed = 0
 function test(name, fn) {
@@ -250,7 +250,7 @@ test(`棋盘每页 ${BOARD_PAGE_SIZE} 行，页码越界自动夹住`, () => {
   assert.equal(boardOf(ledger.list(), 1, 0).rows.length, BOARD_PAGE_SIZE)
   assert.equal(boardOf(ledger.list(), 1, 0).page.total, 2)
   assert.equal(boardOf(ledger.list(), 1, 2).page.index, 1, '越界夹到最后一页')
-  assert.equal(boardOf(ledger.list(), 1, 2).rows.length, 2)
+  assert.equal(boardOf(ledger.list(), 1, 2).rows.length, 3)
 })
 
 test('时长环：满圈 30 分钟，超过继续满圈但转琥珀；排队空环', () => {
@@ -532,36 +532,47 @@ test('派单回执：没有排队时第三拍是「开始跑」', () => {
   assert.ok(frame.bullets.includes('马上开始跑'))
 })
 
-test('任务详情（屏 4）：标题只有「第 N 步 · 已用」，正文四行含统计与「项目 · 会话」', () => {
+test('任务详情（屏 4）：大标题是任务名，正文只留最新状态 + 步数/已用 + 统计', () => {
   const frame = detailFrame({
     taskId: 't4',
-    stageWord: '跑命令',
+    title: '改写第 3 段',
+    liveLine: '工具调用 · click · {"position":{"x":40,"y":60}}',
     step: 7,
     elapsedMs: 83_000,
-    activity: [
-      { label: '工具', detail: 'read_image' },
-      { label: '思考', detail: 's05 now shows 项目 · 会话 and …' },
-    ],
     statsLine: '82 tok/s · 12.3k tok · 上下文 41%',
-    projectName: '青年基金申请书',
-    sessionTitle: '改写第 3 段',
   })
   assert.equal(frame.stage, '进度')
-  assert.equal(frame.title, '第 7 步 · 已用 1m23s')
-  assert.equal(frame.bullets.length, SCREEN_SPEC.maxBodyLines)
-  assert.equal(frame.bullets[0], '工具 · read_image')
-  assert.ok(frame.bullets.some((line) => line.includes('82 tok/s')))
-  assert.ok(frame.bullets.some((line) => line === '青年基金申请书 · 改写第 3 段'))
+  assert.equal(frame.title, '改写第 3 段')
+  assert.equal(frame.bullets.length, 3, '最新状态 / 步数用时 / 统计：' + JSON.stringify(frame.bullets))
+  assert.ok(frame.bullets[0].startsWith('工具调用 · click · {"position"'), '最新状态原样保留：' + frame.bullets[0])
+  assert.equal(frame.bullets[1], '第 7 步 · 已用 1m23s')
+  assert.ok(frame.bullets[2].includes('82 tok/s'))
   assert.equal(frame.statsTail, 1)
-  assert.deepEqual(frame.actions.map((item) => item.label), ['停止', '回棋盘'])
+  assert.deepEqual(frame.actions.map((item) => item.label), ['停止', '主页'])
+})
+
+test('任务详情：超长任务名一行省略（不折行挤掉正文）', () => {
+  const frame = detailFrame({
+    taskId: 't4b',
+    title: 'ESP32语音助手“起点版”项目启动'.repeat(2),
+    liveLine: '思考 · 想一下',
+    step: 1,
+    elapsedMs: 1000,
+    statsLine: '',
+  })
+  assert.ok(measureTextPx(frame.title, SCREEN_SPEC.titleFontPx) <= CONTENT_WIDTH_PX, '标题按像素不超 304：' + frame.title)
+  assert.ok(frame.title.endsWith('…'), '超长要省略')
 })
 
 
-test('完成播报（屏 6）：「另有 N 条」收进状态行，不再单独占气泡带', () => {
-  const single = doneFrame({ taskId: 't6', resultLine: '第 3 段改写完成', others: 0 })
+test('完成页（屏 6）：大标题＝任务名，正文 7 行，另有 N 条进顶栏', () => {
+  const single = doneFrame({ taskId: 't6', title: '今天几号', resultLine: '现在十七点三十一分', replyText: '现在十七点三十一分。', others: 0 })
   assert.equal(single.stage, '完成')
+  assert.equal(single.title, '今天几号', '大标题必须是任务名，不是回答第一句')
+  assert.deepEqual(single.actions.map((item) => item.label), ['停止', '重读', '主页'])
+  assert.ok(Array.isArray(single.done.lines) && single.done.lines.length > 0, '正文行要随帧下发')
   assert.equal(single.more, undefined)
-  const multi = doneFrame({ taskId: 't7', resultLine: '设备联调通过', others: 2 })
+  const multi = doneFrame({ taskId: 't7', title: '设备联调', resultLine: '联调通过', replyText: '联调通过。', others: 2 })
   assert.deepEqual(multi.more, { count: 2, text: '另有 2 条' })
   assert.ok(multi.actions.some((item) => item.id === 'taskBoard'))
 })
@@ -592,8 +603,8 @@ test('提示屏与文件夹取值', () => {
 test('所有任务屏的共同契约：不新增必填字段、按钮 id 不重复、超长标题被省略', () => {
   const frames = [
     receiptFrame({ taskId: 't', projectName: '一个非常非常非常长的项目名字用来测试标题省略', folder: 'D:/x', queueAhead: 1 }),
-    detailFrame({ taskId: 't', stageWord: '思考', step: 1, elapsedMs: 0, activity: [], statsLine: '上下文 3%', projectName: 'P', sessionTitle: 'S' }),
-    doneFrame({ taskId: 't', resultLine: '一个非常非常非常长的结果行用来测试标题省略行为是否正确', others: 3 }),
+    detailFrame({ taskId: 't', title: '一个非常非常非常长的任务名用来测试标题省略行为', liveLine: '思考 · 核对', step: 1, elapsedMs: 0, statsLine: '上下文 3%' }),
+    doneFrame({ taskId: 't', title: '一个非常非常非常长的任务标题用来测试标题省略行为是否正确', resultLine: '结果行', replyText: '结果行', others: 3 }),
     askWhichFrame({ candidates: [] }),
   ]
   for (const frame of frames) {

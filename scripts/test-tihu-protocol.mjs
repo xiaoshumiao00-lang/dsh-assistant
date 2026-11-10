@@ -40,6 +40,7 @@ import {
   targetPathOf,
 } from '../src/tihu/guard.ts'
 import { createTihuRuntime, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH } from '../src/tihu/lane.ts'
+import { BOARD_PAGE_SIZE } from '../src/tihu/task-ledger.ts'
 import { TIHU_CONTROL_SECTION_TEXT, createTihuControlRunner, matchSessionRows, tihuActionNames } from '../src/tihu/control.ts'
 import {
   activityEntryOf,
@@ -55,7 +56,7 @@ import {
   sanitizeScreenLine,
   summarizeToolResult,
 } from '../src/tihu/progress.ts'
-import { ACTUAL_SIZE_SCALE, CONTENT_WIDTH_PX, PENDING_RAIL_WIDTH_PX, REPLY_LAYOUT, SCREEN_BORDER_PX, SCREEN_SPEC, TEXT_WRAP_SAFETY_PX, TITLE_BOLD_FACTOR, clipScreenTitle, fitLine, fitScreenLines, measureTextPx, wrapTextPx } from '../src/tihu/screen-spec.ts'
+import { ACTUAL_SIZE_SCALE, CONTENT_WIDTH_PX, DONE_LAYOUT, PENDING_RAIL_WIDTH_PX, REPLY_LAYOUT, SCREEN_BORDER_PX, SCREEN_SPEC, TEXT_WRAP_SAFETY_PX, TITLE_BOLD_FACTOR, clipScreenTitle, fitLine, fitScreenLines, measureTextPx, wrapTextPx } from '../src/tihu/screen-spec.ts'
 import { fitViewport, replyViewport, replyVisibleWindow, replyWindow, splitReplySentences, splitSpeechSegments, wrapReplyLines } from '../src/tihu/reply.ts'
 import { stripToolNoise, toSpeechText } from '../src/tihu/speech-text.ts'
 import { groupProjects, humanTitle, projectNameOf } from '../src/tihu/project-groups.ts'
@@ -2430,16 +2431,18 @@ test('page：连接图标接的是页面已有的那一份连接状态（绿/灰
   assert.equal(/clockText|connState|getHours\(\)/.test(laneSource), false, '时钟与连接归页面侧，lane 不掺和')
 })
 
-test('page：顶行 14px，棋盘不再有旧式翻页条，5 行 ×40px 收进 224 内容高', () => {
+test('page：顶行 14px，棋盘不再有旧式翻页条，4 行 ×48px 收进 222 内容高', () => {
   const html = pageHtmlOf()
   assert.ok(/#screen \.home-top \{[^}]*height:14px/.test(html), '顶行高 14px（与 stage 那一行同高）')
   assert.ok(/#screen \.home-top \.signal \{[^}]*height:13px/.test(html), '信号柱容器高 13px（不越过行高）')
   assert.ok(/#screen \.home-top \.signal \.bar\.b3 \{ height:13px/.test(html), '最长那根柱 13px')
   assert.equal(html.includes('home-pager'), false, '旧式翻页条（上一页/下一页）已整体删除')
   const itemH = Number((html.match(/#screen \.board-item \{[^}]*height:(\d+)px/) || [0, 0])[1])
-  assert.equal(itemH, 40, '棋盘一行 40px（原翻页条那 28px 分给 5 行）')
-  const used = 14 + 4 + 5 * itemH
+  assert.equal(itemH, 48, '棋盘一行 48px（4 行 × 两行字，含上下 6px 内边距）')
+  assert.equal(BOARD_PAGE_SIZE, 4, '棋盘最多 4 条')
+  const used = 14 + 4 + BOARD_PAGE_SIZE * itemH
   assert.ok(used <= SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx, `棋盘内容高 ${used}px 不得超过 ${SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx}px`)
+  assert.ok(SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx - used >= 8, '底部要留白（不贴屏底）')
 })
 
 
@@ -2846,7 +2849,9 @@ await testAsync('统一指挥：任务 turn/end → 屏 6「完成」＋ 一行�
   const frames = framesOf(socket)
   const done = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').pop()
   assert.ok(done !== undefined, '完成要有屏 6（不必点进会话）')
-  assert.equal(done.payload.title, '现在十七点三十一分', '标题是第一句结果（屏上标题不带句号）')
+  assert.equal(done.payload.title, '现在几点了', '大标题是任务名（不是回答第一句）')
+  assert.equal(done.payload.stage, '完成')
+  assert.ok(Array.isArray(done.payload.done?.lines) && done.payload.done.lines.length > 0, '完成页要带回答正文行')
   assert.ok(done.payload.actions.some((item) => item.id === 'taskBoard'), '完成屏要能回棋盘')
   const note = frames.filter((frame) => frame.type === 'task.notify').pop()
   assert.ok(note !== undefined, '完成要进通知总线（屏气泡＋播报）')
@@ -2880,8 +2885,10 @@ await testAsync('统一指挥：完成屏＝回复版式（7 行正文＋当前�
   assert.ok(done !== undefined, '完成要有屏 6')
   assert.equal(done.payload.mode, 'status', '完成屏是状态屏（旧回复版式已删除）')
   assert.equal(done.payload.reply, undefined, '不该再有 reply 正文窗口')
-  assert.equal(done.payload.title, '第 3 段改写完成', '标题＝结果第一句')
+  assert.equal(done.payload.title, '现在几点了', '大标题＝任务名，不是回答第一句')
   assert.ok(done.payload.bullets.length <= 4 && done.payload.bullets.length > 0, '正文最多 3 行：' + JSON.stringify(done.payload.bullets))
+  assert.ok(Array.isArray(done.payload.done?.lines) && done.payload.done.lines.length >= 3, '长回答要按像素折行：' + JSON.stringify(done.payload.done?.lines))
+  assert.equal(done.payload.done.current, 0, '进入完成页从第一行开始高亮')
   assert.equal(done.payload.more, undefined, '同批没有其它完成时不出「另有」')
   assert.deepEqual(done.payload.actions.map((item) => item.label), ['停止', '重读', '主页'])
   w.cleanup()
@@ -2929,7 +2936,7 @@ await testAsync('统一指挥：说「回棋盘」/「看第 1 条」按屏上�
   const detail = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && Array.isArray(frame.payload.actions)
     && frame.payload.actions.some((item) => item.id === 'taskBoard')).pop()
   assert.ok(detail !== undefined, '「看第 1 条」要进任务详情（屏 4）')
-  assert.ok(detail.payload.title.startsWith('第 '), '详情标题是「第 N 步 · 已用 …」：' + detail.payload.title)
+  assert.equal(detail.payload.title, '青年基金申请书第 3 段再改一遍', '详情大标题是任务名：' + detail.payload.title)
   assert.equal(w.created.length, 1, '看任务不新建会话')
   w.cleanup()
 })
@@ -3278,6 +3285,88 @@ await testAsync('电脑端会话：超过 3 天没活动就不上屏；已在屏
   const board = framesOf(second).filter((frame) => frame.type === 'task.list').pop().payload.board
   assert.equal(board.rows.length, 0, '静置超过 3 天的外部任务要下屏：' + JSON.stringify(board.rows))
   assert.equal(board.empty, true)
+  w.cleanup()
+})
+
+/* ---------- 2026-11-10：棋盘 4 条 / 状态点 / 完成页三键 / 进度页实时 ---------- */
+
+test('page：棋盘右侧是小状态点（10px），不再有大圆环/问号徽标', () => {
+  const html = pageHtmlOf()
+  assert.ok(/#screen \.board-dot \{[^}]*width:10px/.test(html), '状态点 10px')
+  assert.ok(/#screen \.board-dot \{[^}]*margin-right:2px/.test(html), '点右缘离屏幕边 10px（8px 内边距 + 2px）')
+  assert.ok(html.includes('.board-dot.running') && html.includes('.board-dot.awaiting') && html.includes('.board-dot.done'), '三种状态都有颜色')
+  assert.equal(html.includes('board-ring'), false, '不再画大圆环')
+  assert.equal(html.includes('board-ask'), false, '不再画问号徽标')
+})
+
+test('page：完成页三键可见（has-actions 有 display:flex 规则）＋ 7 行正文高度预算', () => {
+  const html = pageHtmlOf()
+  assert.ok(/#screen\.has-actions \.action-bar \{ display:flex; \}/.test(html), '有按钮时动作条必须显示（缺这条 → 完成页三键消失）')
+  assert.ok(/#screen\.done-mode \.action-bar \{ display:flex; flex:none; height:30px/.test(html), '完成页三键高 30px')
+  assert.ok(/#screen \.done-title \{[^}]*font-size:22px/.test(html), '任务名大标题 22px')
+  assert.ok(/#screen \.done-line\.cur \{ background:#5FD2C8/.test(html), '当前朗读行青底反白')
+  const used = DONE_LAYOUT.stageHeightPx + DONE_LAYOUT.titleHeightPx + DONE_LAYOUT.bodyHeightPx
+    + DONE_LAYOUT.actionBarHeightPx + DONE_LAYOUT.columnGapPx * 3
+  assert.ok(used <= 240 - 2 * 8 - 2, `完成页总高 ${used}px 不得超过 222px`)
+  assert.equal(DONE_LAYOUT.visibleLines, 7)
+})
+
+await testAsync('统一指挥：点已完成卡片 → 立刻进完成页（三键，不派单）', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-done-open', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+  await waitMs(90)
+  const taskSession = w.prompted[0].id
+  emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
+  emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '现在十七点三十一分。' }] } } })
+  emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await waitMs(80)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+  await waitMs(60)
+  const created = w.created.length
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 60, hit: 'task', taskId: 't1' }, 4)))
+  await waitMs(60)
+  const frame = framesOf(socket).filter((item) => item.type === 'screen.frame').pop()
+  assert.equal(frame.payload.stage, '完成', '完成卡片点开＝完成页：' + JSON.stringify(frame.payload.stage))
+  assert.equal(frame.payload.title, '现在几点了', '大标题是任务名')
+  assert.deepEqual(frame.payload.actions.map((item) => item.label), ['停止', '重读', '主页'])
+  assert.ok(Array.isArray(frame.payload.done?.lines) && frame.payload.done.lines.length > 0)
+  assert.equal(w.created.length, created, '点完成卡不派单')
+  w.cleanup()
+})
+
+await testAsync('统一指挥：进度页实时——工具调用替换最新一行、步数跟着走、已用每秒刷新', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-live', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把第三节的结果补上', source: 'voice' }, 2)))
+  await waitMs(90)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+  await waitMs(60)
+  const taskSession = w.prompted[0].id
+  emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
+  emit({ id: taskSession }, { type: 'step/start', data: { turn: 1, step: 2 } })
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 60, hit: 'task', taskId: 't1' }, 4)))
+  await waitMs(80)
+  emit({ id: taskSession }, { type: 'tool/call', data: { step: 3, name: 'click', arguments: '{"screen_index":0,"position":{"x":40,"y":60}}' } })
+  await waitMs(60)
+  let frame = framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.stage === '进度').pop()
+  assert.ok(frame !== undefined, '要停在进度页')
+  assert.ok(String(frame.payload.bullets[0]).startsWith('工具调用 · click · {"screen_index":0'), '最新状态行原样：' + frame.payload.bullets[0])
+  assert.equal(frame.payload.bullets[1], '第 3 步 · 已用 0s', '步数跟事件递增：' + frame.payload.bullets[1])
+  const elapsedBefore = frame.payload.bullets[1]
+  await waitMs(1150)
+  frame = framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.stage === '进度').pop()
+  assert.notEqual(frame.payload.bullets[1], elapsedBefore, '已用每秒实时走（不能停在 0s）：' + frame.payload.bullets[1])
+  emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'thinking', thinking: 'User: "补结果" lane.ts' }] } } })
+  await waitMs(60)
+  frame = framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.stage === '进度').pop()
+  assert.ok(String(frame.payload.bullets[0]).startsWith('思考 · User: "补结果" lane.ts'), '思考行原样（不过滤英文/路径）：' + frame.payload.bullets[0])
   w.cleanup()
 })
 

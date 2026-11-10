@@ -213,13 +213,15 @@ export interface TihuProgressState {
   sessionTitle: string
   /** 第四行：解码速度 / 总 token / 上下文占比。 */
   stats?: { tokPerSec: number; totalTokens: number; contextPercent: number }
+  /** 进度页顶部那条「最新状态」：思考 / 工具调用 / 回复，按事件原样替换（一行，超宽由页面省略）。 */
+  lastEventLine: string
   stage: TihuStage
   title: string
   tone: 'idle' | 'busy' | 'ok' | 'alert'
 }
 
 export function createProgressState(now = Date.now()): TihuProgressState {
-  return { turn: 0, step: 0, turnStartedAt: now, lastResult: undefined, lastOutput: '', stageWord: '思考', firstLine: '', activity: [], sessionTitle: '', stage: '思考', title: '等待指令', tone: 'idle' }
+  return { turn: 0, step: 0, turnStartedAt: now, lastResult: undefined, lastOutput: '', stageWord: '思考', firstLine: '', activity: [], sessionTitle: '', lastEventLine: '', stage: '思考', title: '等待指令', tone: 'idle' }
 }
 
 export interface ProgressUpdate {
@@ -250,6 +252,26 @@ function firstSentence(value: unknown): string {
   if (text === '') return ''
   const cut = text.split(/[。！？!?\n]/).map((part) => part.trim()).filter(Boolean)[0] ?? text
   return cut
+}
+
+/**
+ * 进度页「最新一条」原文：只取第一行、压空白，**不翻译、不过滤**英文/路径/命令/session 编号。
+ * 与电脑端通知同一份内容，超宽由 detailFrame 的 fitLine 按像素省略。
+ */
+function rawOneLine(value: unknown): string {
+  const text = String(value ?? '')
+  for (const line of text.split(/\r?\n/)) {
+    const clean = line.replace(/\s+/g, ' ').trim()
+    if (clean !== '') return clean
+  }
+  return ''
+}
+
+/** 工具调用参数原样（对象就 JSON.stringify），只压成一行。 */
+function rawArgsLine(value: unknown): string {
+  if (value === undefined || value === null) return ''
+  if (typeof value === 'string') return rawOneLine(value)
+  try { return rawOneLine(JSON.stringify(value)) } catch { return '' }
 }
 
 /** token 数：99800 → 99.8k、99800000 → 99.8M。 */
@@ -443,6 +465,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.lastOutput = ''
     state.activity = []
     pushActivity(state, '思考', THINKING_PLACEHOLDER)
+    state.lastEventLine = '思考 · ' + THINKING_PLACEHOLDER
     state.stage = '思考'
     state.title = '开始新一轮'
     state.stageWord = '思考'
@@ -457,6 +480,7 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
   if (type === 'step/start') {
     state.step = Number.isFinite(data.step) ? Number(data.step) : state.step + 1
     if (state.activity.length === 0) pushActivity(state, '思考', THINKING_PLACEHOLDER)
+    if (state.lastEventLine === '') state.lastEventLine = '思考 · ' + THINKING_PLACEHOLDER
     state.stage = '思考'
     state.title = '思考下一步'
     state.stageWord = '思考'
@@ -477,6 +501,10 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
     state.stageWord = action.stage
     const item = activityEntryOf(name, args)
     pushActivity(state, item.label, item.detail)
+    // 进度页只显示这一条「最新状态」：工具名与参数都原样（电脑端同款），不换成中文短语。
+    const rawName = name === '' ? '工具' : name
+    const rawArgs = rawArgsLine(data.arguments ?? asRecord(data.call).arguments)
+    state.lastEventLine = `工具调用 · ${rawName}${rawArgs === '' ? '' : ' · ' + rawArgs}`
     state.tone = 'busy'
     return {
       screen: statusFrame(state, now, widthPx),
@@ -522,6 +550,8 @@ export function applySessionEvent(state: TihuProgressState, event: unknown, now 
       }
     }
     const text = messageText(data.message)
+    if (text !== '') state.lastEventLine = '回复 · ' + rawOneLine(text)
+    else if (thought !== '') state.lastEventLine = '思考 · ' + rawOneLine(thought)
     if (text === '') return {}
     const lines = text.split(/\r?\n/).map((line) => sanitizeScreenLine(line)).filter(Boolean)
     const firstLine = lines[0] ?? ''
@@ -593,6 +623,7 @@ export function applyEarlyThinking(
 ): ProgressUpdate | undefined {
   const detail = sanitizeDetail(firstSentence(thought))
   if (detail === '') return undefined
+  state.lastEventLine = '思考 · ' + detail
   const last = state.activity[state.activity.length - 1]
   if (last !== undefined && last.label === '思考') {
     if (last.detail === detail) return undefined

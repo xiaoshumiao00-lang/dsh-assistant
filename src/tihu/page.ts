@@ -73,18 +73,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen.ask-mode::after, #screen.detail-mode::after {
     content:''; position:absolute; left:0; right:0; bottom:0; height:18px; background:#05080b; z-index:20; pointer-events:none;
   }
-  /* 完成播报的朗读波形（CSS 动态，7 根） */
-  #screen .done-wave { display:none; position:absolute; top:7px; right:9px; gap:2px; align-items:center; height:12px; }
-  #screen.done-mode .done-wave { display:flex; }
-  #screen.done-mode .stage { padding-right:24px; }
-  #screen .done-wave span { display:block; width:2px; height:4px; border-radius:1px; background:var(--accent); animation:tihu-done-wave .9s ease-in-out infinite; }
-  #screen .done-wave span:nth-child(2) { animation-delay:.1s; }
-  #screen .done-wave span:nth-child(3) { animation-delay:.2s; }
-  #screen .done-wave span:nth-child(4) { animation-delay:.3s; }
-  #screen .done-wave span:nth-child(5) { animation-delay:.4s; }
-  #screen .done-wave span:nth-child(6) { animation-delay:.5s; }
-  #screen .done-wave span:nth-child(7) { animation-delay:.6s; }
-  @keyframes tihu-done-wave { 0%,100% { height:4px; } 50% { height:12px; } }
+  /* 完成播报的朗读波形：新完成页在顶栏里自己画（见 done-view） */
   #screen.alert .title, #screen.alert .stage { color:var(--err); }
   /* 首页最上方那一行（用户 2026-11-08 确认）：原来的「项目 N 个 · 第 x/y 页」整段删掉，
      换成「本地时钟 HH:MM」+「三格信号柱」。这一行占掉 stage 原来那一行的位置（12px/行高 14），
@@ -123,9 +112,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen.home-mode .title, #screen.home-mode ul, #screen.home-mode .bar,
   #screen.home-mode .action-bar { display:none; }
   /* 旧式翻页条已整体删除（用户 2026-11-09：设备屏不要翻页控件）。
-     棋盘固定显示最近 5 条：那 28px 分给 5 行任务（每行 40px），320×240 内不溢出。 */
+     棋盘固定最多 4 条（BOARD_PAGE_SIZE）：顶行 14 + 间隙 4 + 4×48 = 210 ≤ 222，四行都完整。 */
   /* 状态屏/回执/完成屏的底部动作条 */
   #screen .action-bar { display:none; flex:none; gap:6px; padding-top:4px; }
+  #screen.has-actions .action-bar { display:flex; }
   #screen .action-bar button { flex:1; min-width:0; min-height:28px; padding:0 2px; white-space:nowrap;
     border-radius:6px; border:1px solid #33414f; background:#1b2430; color:#d9e2ea; font-size:13px; }
   /* 按钮多于 3 个时收小一号字号：304px 内不换行不溢出 */
@@ -137,13 +127,13 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   @keyframes tapFlash { from { opacity:.8; transform:scale(.4); } to { opacity:0; transform:scale(1.4); } }
 
   /* ── 任务棋盘（屏 1，2026-11-09 统一指挥会话）──
-     只有顶行 14 + 最近 5 行，不再有底部翻页条：
-     内容高 224 = 顶行 14 + 间隙 4 + 5×40 + 余 10，一行 40px 要塞下两行字。 */
+     只有顶行 14 + 最多 4 行任务，不再有底部翻页条：
+     内容高 222 = 顶行 14 + 间隙 4 + 4×48（每行 20px 标题 + 16px 副行 + 上下 6px）+ 余 12。 */
   #screen.board-mode .home-top { display:flex; }
   #screen.board-mode .stage, #screen.board-mode .title, #screen.board-mode ul,
   #screen.board-mode .bar, #screen.board-mode .action-bar { display:none; }
   #screen.board-mode .home-body { display:block; }
-  #screen .board-item { height:40px; box-sizing:border-box; padding:2px 0; overflow:hidden; }
+  #screen .board-item { height:48px; box-sizing:border-box; padding:6px 0; overflow:hidden; }
   #screen .board-row1 { display:flex; align-items:center; gap:6px; font-size:15px; font-weight:700; line-height:20px; white-space:nowrap; overflow:hidden; }
   /* 状态胶囊：文字优先（色盲/强光下也读得出），颜色只做辅助 */
   #screen .board-capsule { flex:none; font-size:11px; line-height:14px; font-weight:700; letter-spacing:.5px;
@@ -163,20 +153,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-merged { flex:none; font-size:11px; color:#7c8b99; }
   #screen .board-row2 { display:flex; align-items:center; gap:6px; font-size:12px; line-height:16px; color:#8b97a5; }
   #screen .board-sub { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
-  /* 时长环（满圈＝30 分钟）：进行中按已用时长画弧，跑久了转琥珀，完成满环，排队空环。
-     环只做辅助，精确时长在详情屏用文字给。 */
-  #screen .board-ring { position:relative; flex:none; width:14px; height:14px; border-radius:50%;
-    background:conic-gradient(var(--ring, #3fb6a8) calc(var(--p, 0) * 1turn), #26323e 0); }
-  #screen .board-ring i { position:absolute; left:3px; top:3px; width:8px; height:8px; border-radius:50%; background:#05080b; display:block; }
-  #screen .board-ring.warn { --ring: var(--warn); }
-  #screen .board-ring.done { --ring: #4f8ef7; }
-  #screen .board-ring.empty { background:#26323e; }
+  /* 右侧状态点（10px，克制）：完成＝暗灰、执行中＝绿、派单＝蓝、排队＝更暗的灰、待决策＝琥珀。
+     不再画大圆环/问号徽标；点右边缘离屏幕边 10px（内容右界 312 − 2px 外边距）。 */
+  #screen .board-dot { flex:none; width:10px; height:10px; border-radius:50%; margin-left:auto; margin-right:2px;
+    background:#3f4a57; }
+  #screen .board-dot.running { background:#35d07f; }
+  #screen .board-dot.dispatched { background:#6fb3e5; }
+  #screen .board-dot.awaiting { background:var(--warn); }
+  #screen .board-dot.done, #screen .board-dot.announced { background:#5b6673; }
   /* 微条：最近 8 步耗时（只给节奏感，不显示数字） */
   #screen .board-micro { display:flex; flex:none; align-items:flex-end; gap:2px; height:10px; margin-left:auto; margin-right:5px; }
   #screen .board-micro span { width:2px; min-height:2px; background:#3fb6a8; border-radius:1px; opacity:.85; }
-  /* 待决策行右侧是琥珀问号徽标（不显示时长：这条在等人，不是「跑得久」） */
-  #screen .board-ask { flex:none; width:14px; height:14px; border-radius:50%; background:var(--warn);
-    color:#241d0f; font-size:11px; line-height:14px; font-weight:700; text-align:center; }
   /* 空态：没有任务时是同一张棋盘的另一种脸（不是另开一屏） */
   #screen .board-empty { display:flex; flex-direction:column; align-items:center; justify-content:center;
     height:100%; gap:5px; text-align:center; }
@@ -191,6 +178,35 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-empty .l1 { font-size:17px; font-weight:700; line-height:20px; }
   #screen .board-empty .l2 { font-size:12px; line-height:16px; color:#9fb0c0; }
   #screen .board-empty .l3 { font-size:12px; line-height:16px; color:#6f7d8b; }
+  /* ── 完成页（参考图）：顶栏 20 + 标题 24 + 正文 7×20 + 三键 30，合计 222 ──
+     顶栏：左「完成」（青、不加粗）／中波形（7 根竖条）／右「另有 N 条」（灰）／最右 ▶（青）。
+     正文：15px/20px，当前朗读行整行铺青底、黑字加粗，左右各留 8px。 */
+  #screen .done-view { display:none; flex:1; min-height:0; overflow:hidden; flex-direction:column; gap:2px; }
+  #screen.done-mode .done-view { display:flex; }
+  #screen.done-mode .home-top, #screen.done-mode .stage, #screen.done-mode .title,
+  #screen.done-mode ul, #screen.done-mode .bar, #screen.done-mode .steps,
+  #screen.done-mode .cd-row, #screen.done-mode .home-body { display:none; }
+  #screen .done-bar { position:relative; flex:none; height:20px; display:flex; align-items:center; gap:6px; }
+  #screen .done-stage { flex:none; font-size:11px; line-height:20px; color:#5FD2C8; font-weight:400; }
+  #screen .done-wave { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); display:flex; align-items:center; gap:2px; height:14px; }
+  #screen .done-wave span { display:block; width:2px; height:5px; border-radius:1px; background:#5FD2C8; animation:doneBarWave .9s ease-in-out infinite; }
+  #screen .done-wave span:nth-child(2), #screen .done-wave span:nth-child(6) { height:8px; animation-delay:.1s; }
+  #screen .done-wave span:nth-child(3), #screen .done-wave span:nth-child(5) { height:11px; animation-delay:.2s; }
+  #screen .done-wave span:nth-child(4) { height:14px; animation-delay:.3s; }
+  @keyframes doneBarWave { 0%,100% { transform:scaleY(.55); } 50% { transform:scaleY(1); } }
+  #screen .done-more { margin-left:auto; flex:none; font-size:11px; line-height:20px; color:#8b98a5; white-space:nowrap; }
+  #screen .done-play { flex:none; font-size:10px; line-height:20px; color:#5FD2C8; margin-left:6px; }
+  #screen .done-title { flex:none; height:24px; font-size:22px; font-weight:700; line-height:24px; color:#ffffff;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #screen .done-body { flex:1; min-height:0; overflow:hidden; }
+  #screen .done-line { height:20px; line-height:20px; box-sizing:border-box; padding:0 8px; font-size:15px; color:#e8edf2;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #screen .done-line.cur { background:#5FD2C8; color:#04110f; font-weight:700; border-radius:4px; }
+  /* 三键：深灰等宽圆角，左右边距各 12px、键间距 8px、高 30px、浅青字 */
+  #screen.done-mode .action-bar { display:flex; flex:none; height:30px; padding:0 4px; gap:8px; }
+  #screen.done-mode .action-bar button { height:30px; min-height:30px; border:0; border-radius:8px;
+    background:#3A3D42; color:#9fe8df; font-size:14px; }
+  #screen.done-mode .action-bar button:active { background:#4a4e54; }
   /* 派单回执的三拍圆点（已入队 / 排队 N 个 / 开始跑）：只在 steps 帧出现 */
   #screen .steps { display:none; flex:none; gap:5px; margin:5px 0 6px; }
   #screen.steps-on .steps { display:flex; }
@@ -286,11 +302,20 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       <div class="mics"><span></span><span></span></div>
       <div id="screen">
         <div class="stage" id="stage">连接</div>
-        <div id="doneWave" class="done-wave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
         <div id="homeTop" class="home-top"><span class="clock" id="homeClock">--:--</span><span class="home-counts" id="boardCounts"></span><span class="signal conn-connecting" id="homeSignal"><span class="bar b1"></span><span class="bar b2"></span><span class="bar b3"></span></span></div>
         <div class="title" id="title">正在连接宿主…</div>
         <div id="steps" class="steps"></div>
         <ul id="bullets"></ul>
+        <div id="doneView" class="done-view">
+          <div class="done-bar">
+            <span class="done-stage" id="doneStage">完成</span>
+            <span class="done-wave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></span>
+            <span class="done-more" id="doneMore"></span>
+            <span class="done-play" aria-hidden="true">▶</span>
+          </div>
+          <div class="done-title" id="doneTitle"></div>
+          <div class="done-body" id="doneBody"></div>
+        </div>
         <div id="actionBar" class="action-bar"></div>
         <div id="homeBody" class="home-body"></div>
         <div id="cdRow" class="cd-row"><span id="cdText"></span><div class="cd-track"><div class="cd-fill" id="cdFill"></div></div></div>
@@ -431,6 +456,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     highlightLock: false, hostAlert: false, screenMode: 'status', screenScale: 2, actions: [], 
     /* 任务棋盘（屏 1）与派单回执 / 待决策的附加块（2026-11-09 统一指挥会话） */
     board: null, steps: [], countdown: null, countdownTimer: 0,
+    /* 完成页：done = { lines, current }；doneTimer 只负责慢慢推进「当前朗读行」 */
+    done: null, doneTimer: 0,
     /* 免按住（唤醒词聆听）：browser 关键词 → 屏 3「在听」→ 停 3 秒发送；10 秒没说话退出 */
     wake: false, wakeRec: null, wakeRestart: 0, listenOn: false, listenText: '', listenTimer: 0, listenIdle: 0 };
 
@@ -620,24 +647,77 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         }
         row2.appendChild(micro);
       }
-      if (row.badge === 'ask') {
-        var ask = document.createElement('span');
-        ask.className = 'board-ask';
-        ask.textContent = '?';
-        row2.appendChild(ask);
-      } else {
-        var ring = document.createElement('span');
-        var tone = (row.ring && row.ring.tone) || 'normal';
-        ring.className = 'board-ring' + (tone === 'normal' ? '' : ' ' + tone);
-        ring.style.setProperty('--p', String(Math.max(0, Math.min(1, Number(row.ring && row.ring.percent) || 0))));
-        ring.appendChild(document.createElement('i'));
-        row2.appendChild(ring);
-      }
+      /* 右侧状态点：只按状态给颜色，不再画大圆环/问号（完成灰、执行中绿、待决策琥珀）。 */
+      var dot = document.createElement('span');
+      dot.className = 'board-dot ' + String(row.state || 'queued');
+      row2.appendChild(dot);
       item.appendChild(row1);
       item.appendChild(row2);
       body.appendChild(item);
     }
     applyScreenClass('board-mode');
+  }
+
+  /* ---------- 完成页（屏 6，参考图版式） ----------
+   * 顶栏 20 + 标题 24 + 正文 7×20（当前行青底黑字）+ 三键 30 = 222，320×240 内不溢出。
+   * 行文本由宿主按像素折好（done.lines），页面只负责窗口与高亮，不再二次翻译。
+   */
+  function clearDoneState() {
+    if (state.doneTimer) clearInterval(state.doneTimer);
+    state.doneTimer = 0;
+    state.done = null;
+    var body = $('doneBody');
+    if (body) body.innerHTML = '';
+  }
+  function paintDone() {
+    var done = state.done;
+    if (!done) return;
+    var total = done.lines.length;
+    var stage = $('doneStage');
+    if (stage) stage.textContent = '完成' + (total > 1 ? ' · ' + (done.current + 1) + '/' + total : '');
+    var body = $('doneBody');
+    if (!body) return;
+    body.innerHTML = '';
+    var visible = 7;
+    var start = Math.max(0, Math.min(done.current - 2, Math.max(0, total - visible)));
+    for (var i = start; i < Math.min(total, start + visible); i += 1) {
+      var line = document.createElement('div');
+      line.className = 'done-line' + (i === done.current ? ' cur' : '');
+      line.textContent = done.lines[i];
+      body.appendChild(line);
+    }
+  }
+  function advanceDone() {
+    var done = state.done;
+    if (!done) return;
+    if (done.current >= done.lines.length - 1) {
+      clearInterval(state.doneTimer);
+      state.doneTimer = 0;
+      return;
+    }
+    done.current += 1;
+    paintDone();
+  }
+  function renderDone(payload) {
+    var raw = payload.done || {};
+    var lines = (Array.isArray(raw.lines) ? raw.lines : []).map(function (line) { return String(line == null ? '' : line); })
+      .filter(function (line) { return line.trim() !== ''; });
+    var current = Math.max(0, Math.min(Math.max(0, lines.length - 1), Number(raw.current) || 0));
+    state.screenMode = 'done';
+    state.hostAlert = false;
+    state.highlightLock = false;
+    state.done = { lines: lines, current: current };
+    state.actions = Array.isArray(payload.actions) ? payload.actions : [];
+    $('stage').style.display = 'none';
+    $('doneTitle').textContent = payload.title || '';
+    $('doneMore').textContent = payload.more && payload.more.text ? String(payload.more.text) : '';
+    paintDone();
+    renderActions();
+    applyScreenClass((payload.tone || 'ok') + ' done-mode' + (state.actions.length ? ' has-actions' : ''));
+    if (state.doneTimer) clearInterval(state.doneTimer);
+    state.doneTimer = lines.length > 1
+      ? setInterval(function () { advanceDone(); }, 1800)
+      : 0;
   }
 
   /* 派单回执的三拍圆点：已入队 / 排队 N 个 / 开始跑（圆点由 CSS 画，文字给状态） */
@@ -697,6 +777,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var screen = $('screen');
     // 收到任何一帧都顺手重画顶行（时钟本来每秒 tick，这里再补一次保证同一帧里不会花掉）。
     renderHomeTop();
+    // 离开完成页就收掉推进计时器（完成页自己的 7 行高亮不能带到别的屏上）。
+    if (!(payload && payload.done)) clearDoneState();
     // 2026-11-09：旧主页与旧回答屏整体删除；宿主也不会再发这两种帧。
     // 宿主不会再发这两种帧；万一收到也直接忽略，屏上只认新七屏。
     if (payload && (payload.mode === 'home' || payload.mode === 'reply') && !payload.board) return;
@@ -706,6 +788,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     // 任务棋盘（屏 1，含空态）：mode 也是 home，但走 board 分支（行是任务不是项目）。
     if (payload && payload.board) {
       renderBoard(payload);
+      return;
+    }
+    // 完成页：顶栏 + 任务名大标题 + 7 行回答摘要 + 三键（不是旧的状态屏）。
+    if (payload && payload.done) {
+      renderDone(payload);
       return;
     }
     state.screenMode = 'status';
@@ -1628,11 +1715,25 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
           if (actionId) {
             // 停止/回主页都算「退出本轮朗读」：和停止一样先把页面音频队列掐掉（宿主也会 cancelRound），
             // 差别只是不回「已停止朗读」提示。
-            if (actionId === 'stop' || actionId === 'home' || actionId === 'prev' || actionId === 'next') stopPcm();
+            if (actionId === 'stop' || actionId === 'home' || actionId === 'prev' || actionId === 'next' || actionId === 'taskBoard') stopPcm();
             if (actionId === 'replay' && audioRunning(state.audioCtx)) {
               state.droppedAudio = false;
               hideAudioWarn();
             }
+            if (state.done && actionId === 'replay') {
+              // 重读从头：高亮回到第一行，计时器重新走。
+              state.done.current = 0;
+              paintDone();
+              if (state.doneTimer) clearInterval(state.doneTimer);
+              state.doneTimer = state.done.lines.length > 1
+                ? setInterval(function () { advanceDone(); }, 1800)
+                : 0;
+            }
+            if (state.done && actionId === 'stop') {
+              if (state.doneTimer) clearInterval(state.doneTimer);
+              state.doneTimer = 0;
+            }
+            if (actionId === 'taskBoard') clearDoneState();
             if (actionId === 'home') tapFlash(event.clientX - rect.left, event.clientY - rect.top);
             send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'action', actionId: actionId });
             return;

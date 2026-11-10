@@ -291,6 +291,11 @@ export interface ScreenFramePayload {
   more?: { count: number; text: string }
   /** 屏 7 歧义候选卡（项目名＋来源，序号 1/2）。 */
   ask?: { candidates?: { index: number; projectName: string; source: string }[] }
+  /**
+   * 完成屏正文（7 行窗口）：按像素折好的回答摘要行 ＋ 当前朗读行。
+   * 状态行写「完成 · N/M」，大标题是任务/会话标题（不是回答第一句）。
+   */
+  done?: { lines: string[]; current?: number }
   /** 这一帧属于哪条任务（屏上点按/答问句时用它回 task.reply）。 */
   taskId?: string
 }

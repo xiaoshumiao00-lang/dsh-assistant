@@ -11,7 +11,8 @@
  * 容量约束全部来自 screen-spec.ts：正文 4 行、每行约 18 字、标题 1 行、按钮行 32px。
  */
 import type { ScreenFramePayload, TaskBoardPayload } from './protocol.ts'
-import { clipScreenTitle, fitScreenLines, SCREEN_SPEC } from './screen-spec.ts'
+import { CONTENT_WIDTH_PX, SCREEN_SPEC, clipScreenTitle, fitLine, fitScreenLines, wrapTextPx } from './screen-spec.ts'
+import { splitReplySentences } from './reply.ts'
 import { capsuleOf, formatUsedMs, type TihuTask } from './task-ledger.ts'
 
 /** 派单回执自动回棋盘的秒数（设计 §8.2：5 秒够看清落点，又不挡下一句）。 */
@@ -65,33 +66,49 @@ export function receiptFrame(input: {
   }
 }
 
-/** 任务详情（屏 4）：正文口径完全照 progress.ts 的 statusFrame，不翻译、不加标签。 */
+/** 完成屏正文：15px、左右各 8px 内边距后的可用宽（288px）。 */
+export const DONE_BODY_FONT_PX = 15
+export const DONE_BODY_TEXT_WIDTH_PX = CONTENT_WIDTH_PX - 16
+
+/** 回答正文 → 完成屏的折行（按像素折，不切半个字；保留原句顺序）。 */
+export function doneLinesOf(text: string): string[] {
+  const clean = String(text ?? '').replace(/\r\n?/g, '\n').trim()
+  if (clean === '') return []
+  const lines: string[] = []
+  for (const sentence of splitReplySentences(clean)) {
+    for (const line of wrapTextPx(sentence.text, DONE_BODY_TEXT_WIDTH_PX, DONE_BODY_FONT_PX)) {
+      if (line.trim() !== '') lines.push(line)
+    }
+  }
+  return lines
+}
+
+/**
+ * 任务进度（屏 4）：**实时**一屏——标题是任务名，正文只有「最新一条状态 + 第 N 步/已用 + tokens」。
+ * 最新状态行由宿主按事件重算（applySessionEvent 的 lastEventLine），页面不做翻译。
+ */
 export function detailFrame(input: {
   taskId: string
-  /** 工具阶段词（`跑命令` / `读文件` …）。 */
-  stageWord: string
+  /** 会话标题／任务标题（一行，超长省略）。 */
+  title: string
+  /** 最新一条状态（思考 · … / 工具调用 · … / 回复 · …，原样）。 */
+  liveLine?: string
   step: number
   elapsedMs: number
-  /** 最近两条「标签 · 明细」（与设备屏同一格式）。 */
-  activity: readonly { label: string; detail: string }[]
   /** `82 tok/s · 12.3k tok · 上下文 41%`。 */
   statsLine: string
-  projectName: string
-  sessionTitle: string
 }): ScreenFramePayload {
-  const recent = input.activity.slice(-2).map((entry) => (entry.detail === '' ? entry.label : `${entry.label} · ${entry.detail}`))
-    // 详情只有 4 行：工具/思考各占一行，不能因为一条长命令换行把底部「项目 · 会话」挤掉。
-    .map((line) => fitScreenLines([line], 1)[0] ?? line)
-  const stepLine = `第 ${input.step} 步 · 已用 ${formatUsedMs(input.elapsedMs)}`
-  const bullets = [...recent, input.statsLine, `${input.projectName} · ${input.sessionTitle}`]
+  const liveLine = fitLine(input.liveLine || '思考 · 模型推理中…', CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
+  const stepLine = fitLine(`第 ${input.step} 步 · 已用 ${formatUsedMs(input.elapsedMs)}`, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
+  const statsLine = fitLine(input.statsLine === '' ? '统计中…' : input.statsLine, CONTENT_WIDTH_PX, SCREEN_SPEC.statsFontPx)
   return {
     stage: '进度',
-    title: clipScreenTitle(stepLine),
-    bullets: fitScreenLines(bullets.filter((line) => line !== ''), SCREEN_SPEC.maxBodyLines),
+    title: clipScreenTitle(input.title === '' ? '任务进度' : input.title),
+    bullets: [liveLine, stepLine, statsLine].filter((line) => line !== ''),
     statsTail: 1,
     actions: [
       { id: 'taskStop', label: '停止' },
-      { id: 'taskBoard', label: '回棋盘' },
+      { id: 'taskBoard', label: '主页' },
     ],
     taskId: input.taskId,
     tone: 'busy',
@@ -99,21 +116,34 @@ export function detailFrame(input: {
   }
 }
 
-/** 完成播报（屏 6）：一行结果 ＋（可选）正文；其它完成收进 `more`（另有 N 条）。 */
+/**
+ * 完成页（屏 6）：**大标题是任务/会话标题**（不是回答第一句），下面是回答摘要
+ * 7 行窗口（当前朗读行反白），状态行给「完成 · N/M」与「另有 N 条」。
+ */
 export function doneFrame(input: {
   taskId: string
+  /** 会话标题／任务标题（一行大字，超长省略）。 */
+  title: string
+  /** 一句话结果（播报与回退正文用，不再是屏上大标题）。 */
   resultLine: string
-  /** 正文行（任务回复的要点；没有就只显示结果行）。 */
+  /** 完整回答正文：完成屏 7 行正文从它折行。 */
+  replyText?: string
+  /** 回退正文（没有完整回答时用 resultLine）。 */
   bullets?: readonly string[]
-  /** 同一批里其它已完成条数（>0 时右端显示「另有 N 条 ▸」）。 */
+  /** 同一批里其它已完成条数（>0 时顶栏右端「另有 N 条」）。 */
   others?: number
 }): ScreenFramePayload {
-  const bullets = (input.bullets ?? []).filter((line) => String(line ?? '').trim() !== '')
+  const body = String(input.replyText ?? '').trim() !== ''
+    ? String(input.replyText)
+    : ((input.bullets ?? []).join(' ').trim() !== '' ? (input.bullets ?? []).join('\n') : input.resultLine)
+  const lines = doneLinesOf(body)
+  const fallback = doneLinesOf(input.resultLine)
   return {
     stage: '完成',
-    title: clipScreenTitle(input.resultLine || '做完了'),
-    bullets: fitScreenLines(bullets.length > 0 ? bullets : [input.resultLine || '做完了'], SCREEN_SPEC.maxBodyLines),
-    ...(input.others > 0 ? { more: { count: input.others, text: `另有 ${input.others} 条` } } : {}),
+    title: clipScreenTitle(input.title === '' ? '任务完成' : input.title),
+    bullets: fitScreenLines([input.resultLine || '做完了'], SCREEN_SPEC.maxBodyLines),
+    done: { lines: lines.length > 0 ? lines : fallback, current: 0 },
+    ...(input.others !== undefined && input.others > 0 ? { more: { count: input.others, text: `另有 ${input.others} 条` } } : {}),
     actions: [
       { id: 'stop', label: '停止' },
       { id: 'replay', label: '重读' },
@@ -121,6 +151,39 @@ export function doneFrame(input: {
     ],
     taskId: input.taskId,
     tone: 'ok',
+    mode: 'status',
+  }
+}
+
+/**
+ * 待决策页（屏 5）：问题一行大字，最多两个选项 + 主页；到点回棋盘（不替用户选）。
+ * 选项 id 与歧义追问（pick1/pick2）分开：这里答的是**已经派出去的那条任务**。
+ */
+export function decisionFrame(input: {
+  taskId: string
+  title?: string
+  question?: string
+  detail?: string
+  options: readonly string[]
+  defaultIndex?: number
+  seconds: number
+}): ScreenFramePayload {
+  const options = input.options.filter((option) => String(option ?? '').trim() !== '')
+  const defaultLabel = options[input.defaultIndex ?? 0] ?? options[0] ?? ''
+  const bullets: string[] = []
+  const detail = String(input.detail ?? '').replace(/\s+/g, ' ').trim()
+  if (detail !== '') bullets.push(detail)
+  if (defaultLabel !== '') bullets.push(`不选就按「${defaultLabel}」`)
+  const actions = options.slice(0, 2).map((label, index) => ({ id: `taskAnswer${index + 1}`, label }))
+  actions.push({ id: 'taskBoard', label: '主页' })
+  return {
+    stage: '待决策',
+    title: clipScreenTitle(input.question || input.title || '要你定一下'),
+    bullets: fitScreenLines(bullets, SCREEN_SPEC.maxBodyLines),
+    countdown: { seconds: Math.max(1, Math.trunc(input.seconds)), totalSeconds: Math.max(1, Math.trunc(input.seconds)), text: '' },
+    actions,
+    taskId: input.taskId,
+    tone: 'warn',
     mode: 'status',
   }
 }

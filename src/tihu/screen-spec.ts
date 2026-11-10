@@ -42,6 +42,29 @@ export const SCREEN_SPEC = {
   stageChars: 10,
   /** reply 模式：可视正文行数（16px/20px 行高；正文区固定预留一行安全高度后 7 行，见 REPLY_LAYOUT）。 */
   replyVisibleLines: 7,
+  /** 棋盘一次显示几行（BOARD_PAGE_SIZE 必须同步；4 行 ×48px 才放得下两行字且不裁切）。 */
+  boardRows: 4,
+  /** 棋盘一行高度（20px 标题行 + 16px 副行 + 上下各 6px 内边距）。 */
+  boardRowHeightPx: 48,
+} as const
+
+/**
+ * 完成屏垂直预算（320×240，四边 8px）：
+ *
+ *   内容高 222 = 240 − 2×1 边框 − 2×8 内边距
+ *   顶行 14 + 间隙 4 + 大标题 22 + 间隙 4 + 正文 7×20=140 + 间隙 4 + 按钮行 32 = 220
+ *   → 余 2px，三键（停止/重读/主页）稳稳放得下，正文 7 行不被裁。
+ */
+export const DONE_LAYOUT = {
+  stageHeightPx: 14,
+  titleHeightPx: 22,
+  visibleLines: 7,
+  lineHeightPx: 20,
+  bodyHeightPx: 140,
+  actionBarHeightPx: 32,
+  columnGapPx: 4,
+  /** 14 + 4 + 22 + 4 + 140 + 4 + 32 = 220（≤ 222）。 */
+  usedHeightPx: 220,
 } as const
 
 /** 物理规格（近似值，仅用于「实际尺寸」显示）。 */
