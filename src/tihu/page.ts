@@ -12,7 +12,7 @@
  *
  * TTS 只播放宿主下发的 PCM（edge 云健 / Qwen GPU）；页面不再使用浏览器语音。
  */
-import { ACTUAL_SIZE_SCALE, DONE_TITLE_FONT_PX, DONE_TITLE_LINE_HEIGHT_PX, SCREEN_SPEC } from './screen-spec.ts'
+import { ACTUAL_SIZE_SCALE, DONE_LAYOUT, DONE_TITLE_FONT_PX, DONE_TITLE_LINE_HEIGHT_PX, SCREEN_SPEC } from './screen-spec.ts'
 import { condition as conditionVoicePcm, trimSilence as trimVoiceSilence } from '../client/pocket/orb/voice.ts'
 export function tihuPageHtml(options: { lanePath: string; protocol: string }): string {
   const lane = JSON.stringify(options.lanePath)
@@ -174,14 +174,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-empty .l1 { font-size:17px; font-weight:700; line-height:20px; }
   #screen .board-empty .l2 { font-size:12px; line-height:16px; color:#9fb0c0; }
   #screen .board-empty .l3 { font-size:12px; line-height:16px; color:#6f7d8b; }
-  /* ── 完成页（参考图）：顶栏 14 + 标题 22 + 正文 7×20 + 间隙 12 + 三键 30，合计 222 ──
+  /* ── 完成页（参考图）：顶栏 14 + 标题 22 + 正文区（剩余高度）+ 三键 30 ──
      顶栏：左「完成」（青、不加粗）／中波形（7 根竖条）／右「另有 N 条」（灰）／最右 ▶（青）。
      正文：15px/20px，当前朗读行整行铺青底、黑字加粗，左右各留 8px，行首不留任何图标。
      大标题 2026-11-10 用户要求减 2 号（22px → 20px，行高 24 → 22）。
-     正文**按行数自适应**（2026-11-10 用户实机要求）：不再用 flex:1 + 垂直居中，
-     行少时正文贴着标题往下排，底部按钮固定留 12px，下方空白留在屏幕最底下。
-     高度预算：14 + 2 + 22 + 2 + 7×20 + 12 + 30 = 222（内容高 240−2×8−2×1）。 */
-  #screen .done-view { display:none; flex:none; min-height:0; overflow:hidden; flex-direction:column; gap:2px; }
+     2026-11-10 第二版用户实机要求：标题/正文**贴顶**，三键**固定贴在屏幕底部**
+     （键底边离屏幕外沿 12px）；正文区吃掉标题与按钮之间的全部剩余高度，
+     空出来的地方留在**正文与按钮之间**，不再堆在按钮下面。行多时正文区按剩余高度
+     裁剪/滚动（7 行 140 ≤ 145 全放得下），正文与按钮永不重叠。
+     高度预算：14 + 2 + 22 + 2 + 145 正文区 + 4 列间隙 + 30 三键 + 3 margin = 222
+     （内容高 240−2×8−2×1）。「12px 底边」= 3px margin + 8px 内边距 + 1px 边框。 */
+  #screen .done-view { display:none; flex:1 1 auto; min-height:0; overflow:hidden; flex-direction:column; gap:2px; }
   #screen.done-mode .done-view { display:flex; }
   #screen.done-mode .home-top, #screen.done-mode .stage, #screen.done-mode .title,
   #screen.done-mode ul, #screen.done-mode .steps,
@@ -199,18 +202,24 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .done-title { flex:none; height:${DONE_TITLE_LINE_HEIGHT_PX}px; font-size:${DONE_TITLE_FONT_PX}px; font-weight:700;
     line-height:${DONE_TITLE_LINE_HEIGHT_PX}px; color:#ffffff;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  /* 正文块按行数撑开（不 flex:1、不垂直居中）：一行就只占 20px，紧贴标题；
-     满 7 行时 140px 正好铺满，按钮下方不留多余黑带。 */
-  #screen .done-body { flex:none; min-height:0; overflow:hidden; display:flex; flex-direction:column; justify-content:flex-start; }
-  #screen .done-line { height:20px; line-height:20px; box-sizing:border-box; padding:0 8px; font-size:15px; color:#e8edf2;
+  /* 正文块吃掉标题与三键之间的剩余高度（flex:1）：一行时下面留白仍在正文区里，
+     所以视觉上是「正文贴顶、空白在正文与按钮之间」，按钮永远贴在屏幕底部。 */
+  #screen .done-body { flex:1 1 auto; min-height:0; overflow:hidden; display:flex; flex-direction:column; justify-content:flex-start; }
+  #screen .done-line { flex:none; height:20px; line-height:20px; box-sizing:border-box; padding:0 8px; font-size:15px; color:#e8edf2;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen .done-line.cur { background:#5FD2C8; color:#04110f; font-weight:700; border-radius:4px; }
   /* 三键：深灰等宽圆角、键间距 8px、高 30px、浅青字。
-     #screen 已有 4px 列间隙，这里再补 8px margin-top = 正文与按钮之间固定 12px。 */
-  #screen.done-mode .action-bar { display:flex; flex:none; height:30px; padding:0 4px; gap:8px; margin-top:8px; }
+     margin-top:auto 把它顶到屏幕底部；margin-bottom:3px 让键底边离屏幕外沿正好 12px
+     （3 + 8 内边距 + 1 边框）。 */
+  #screen.done-mode .action-bar { display:flex; flex:none; height:30px; padding:0 4px; gap:8px;
+    margin-top:auto; margin-bottom:3px; }
   #screen.done-mode .action-bar button { height:30px; min-height:30px; border:0; border-radius:8px;
     background:#3A3D42; color:#9fe8df; font-size:14px; }
   #screen.done-mode .action-bar button:active { background:#4a4e54; }
+  /* 进度页（屏 4，停止/主页）：动作条同样贴底（键底边离屏幕外沿 12px）；
+     正文（最多 3 行）贴顶，剩余空间留在正文与按钮之间，超出按剩余高度裁剪。 */
+  #screen.detail-mode .action-bar { margin-top:auto; margin-bottom:3px; }
+  #screen.detail-mode ul { flex:1 1 auto; min-height:0; overflow:hidden; }
   /* 派单回执的三拍圆点（已入队 / 排队 N 个 / 开始跑）：只在 steps 帧出现 */
   #screen .steps { display:none; flex:none; gap:5px; margin:5px 0 6px; }
   #screen.steps-on .steps { display:flex; }
@@ -408,6 +417,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   var PROTOCOL = ${protocol};
   /* 真机屏幕规格：与 src/tihu/screen-spec.ts 同一份常量（页面只消费，不另写数值）。 */
   var SCREEN = ${JSON.stringify(SCREEN_SPEC)};
+  var DONE = ${JSON.stringify(DONE_LAYOUT)};
   var ACTUAL_SCALE = ${JSON.stringify(ACTUAL_SIZE_SCALE)};
   function clipScreen(value, max) {
     var text = String(value == null ? '' : value).replace(/\\s+/g, ' ').trim();
@@ -697,7 +707,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var body = $('doneBody');
     if (!body) return;
     body.innerHTML = '';
-    var visible = 7;
+    // 正文区高度＝标题与贴底按钮之间的剩余空间（不固定 7×20）：按真实可视高度取整行数，
+    // 放不下的行交给窗口滚动/裁剪，正文永远不会压到按钮上。
+    var visible = DONE.visibleLines;
+    var avail = body.clientHeight;
+    if (avail > 0) visible = Math.max(1, Math.min(DONE.visibleLines, Math.floor(avail / DONE.lineHeightPx)));
     var start = Math.max(0, Math.min(done.current - 2, Math.max(0, total - visible)));
     for (var i = start; i < Math.min(total, start + visible); i += 1) {
       var line = document.createElement('div');
@@ -810,9 +824,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     $('stage').style.display = 'none';
     $('doneTitle').textContent = payload.title || '';
     $('doneMore').textContent = state.doneMoreText;
-    paintDone();
+    // 先挂 done-mode 再画正文：正文区高度要按「按钮贴底后的剩余空间」实测，
+    // 顺序反了会量到 display:none 的 0。三键也先建好，才有同样的布局尺寸。
     renderActions();
     applyScreenClass((payload.tone || 'ok') + ' done-mode' + (state.actions.length ? ' has-actions' : ''));
+    paintDone();
     armDoneFallback();
   }
 

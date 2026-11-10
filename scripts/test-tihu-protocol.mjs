@@ -3602,7 +3602,7 @@ test('page：棋盘右侧是小状态点（10px），不再有大圆环/问号�
   assert.equal(html.includes('board-ask'), false, '不再画问号徽标')
 })
 
-test('page：完成页三键可见（has-actions 有 display:flex 规则）＋ 7 行正文高度预算', () => {
+test('page：完成页三键贴底（离屏幕下沿 12px）＋ 标题/正文贴顶 + 正文区按剩余高度裁剪', () => {
   const html = pageHtmlOf()
   assert.ok(/#screen\.has-actions \.action-bar \{ display:flex; \}/.test(html), '有按钮时动作条必须显示（缺这条 → 完成页三键消失）')
   assert.ok(/#screen\.done-mode \.action-bar \{ display:flex; flex:none; height:30px/.test(html), '完成页三键高 30px')
@@ -3615,22 +3615,56 @@ test('page：完成页三键可见（has-actions 有 display:flex 规则）＋ 7
   const doneTitleRule = /#screen \.done-title \{[^}]*\}/.exec(html)?.[0] ?? ''
   assert.equal(/font-size:22px/.test(doneTitleRule), false, '大标题不许还留 22px：' + doneTitleRule)
   assert.ok(/#screen \.done-line\.cur \{ background:#5FD2C8/.test(html), '当前朗读行青底反白')
-  // 2026-11-10 用户实机要求：正文按行数自适应，不再 flex:1 垂直居中撑出一大片黑带。
+  // 2026-11-10 第二版：标题/正文贴顶，正文区吃掉标题与贴底按钮之间的全部剩余高度。
   const doneBodyRule = /#screen \.done-body \{[^}]*\}/.exec(html)?.[0] ?? ''
-  assert.ok(doneBodyRule.includes('flex:none'), '正文块按行数撑开，不许 flex:1 撑满：' + doneBodyRule)
+  assert.ok(doneBodyRule.includes('flex:1 1 auto'), '正文区要吃掉剩余高度（空白留在正文与按钮之间）：' + doneBodyRule)
+  assert.ok(doneBodyRule.includes('min-height:0'), '正文区必须 min-height:0 才能被压缩：' + doneBodyRule)
+  assert.ok(doneBodyRule.includes('overflow:hidden'), '正文超出按剩余高度裁剪：' + doneBodyRule)
+  assert.equal(/flex:none/.test(doneBodyRule), false, '正文区不许再按内容收缩：' + doneBodyRule)
   assert.ok(doneBodyRule.includes('justify-content:flex-start'), '正文要从标题下方开始排（不许垂直居中）：' + doneBodyRule)
   assert.equal(/justify-content:center/.test(doneBodyRule), false, '正文块不许再垂直居中：' + doneBodyRule)
   const doneViewRule = /#screen \.done-view \{[^}]*\}/.exec(html)?.[0] ?? ''
-  assert.ok(doneViewRule.includes('flex:none'), '完成页容器也要按内容收缩（否则按钮还是被推到底）：' + doneViewRule)
+  assert.ok(doneViewRule.includes('flex:1 1 auto'), '完成页容器吃满剩余高度，三键才能贴底：' + doneViewRule)
   const doneActionRule = /#screen\.done-mode \.action-bar \{[^}]*\}/.exec(html)?.[0] ?? ''
-  assert.ok(doneActionRule.includes('margin-top:8px'), '正文↔按钮固定 12px（4px 列间隙 + 8px margin）：' + doneActionRule)
-  assert.ok(/#screen \.done-bar \{[^}]*height:14px/.test(html), '顶栏收成 14px，给正文↔按钮腾出 12px 预算')
+  assert.ok(doneActionRule.includes('margin-top:auto'), '三键必须被顶到屏幕底部：' + doneActionRule)
+  assert.ok(doneActionRule.includes('margin-bottom:3px'), '键底边离屏幕外沿 12px（3+8 内边距+1 边框）：' + doneActionRule)
+  assert.equal(/margin-top:8px/.test(doneActionRule), false, '不许再把按钮挂在正文下方 8px：' + doneActionRule)
+  assert.ok(/#screen \.done-bar \{[^}]*height:14px/.test(html), '顶栏收成 14px')
+  // 进度页（屏 4，停止/主页）：动作条同样贴底，正文占剩余高度。
+  const detailActionRule = /#screen\.detail-mode \.action-bar \{[^}]*\}/.exec(html)?.[0] ?? ''
+  assert.ok(detailActionRule.includes('margin-top:auto') && detailActionRule.includes('margin-bottom:3px'),
+    '进度页动作条也要贴底 12px：' + detailActionRule)
+  const detailBodyRule = /#screen\.detail-mode ul \{[^}]*\}/.exec(html)?.[0] ?? ''
+  assert.ok(detailBodyRule.includes('flex:1 1 auto') && detailBodyRule.includes('overflow:hidden'),
+    '进度页正文吃剩余高度、超出裁剪：' + detailBodyRule)
   const used = DONE_LAYOUT.stageHeightPx + DONE_LAYOUT.titleHeightPx + DONE_LAYOUT.bodyHeightPx
-    + DONE_LAYOUT.actionBarHeightPx + DONE_LAYOUT.columnGapPx * 2 + DONE_LAYOUT.bodyToActionGapPx
+    + DONE_LAYOUT.actionBarHeightPx + DONE_LAYOUT.columnGapPx * 2
+    + DONE_LAYOUT.screenGapPx + DONE_LAYOUT.actionBarMarginBottomPx
   assert.equal(used, 240 - 2 * 8 - 2, `完成页总高 ${used}px 必须正好 222px`)
+  assert.equal(DONE_LAYOUT.bottomInsetPx, 12, '动作条底边离屏幕外沿 12px')
+  assert.equal(DONE_LAYOUT.actionBarMarginBottomPx + SCREEN_SPEC.paddingPx + SCREEN_BORDER_PX, DONE_LAYOUT.bottomInsetPx)
   assert.equal(DONE_LAYOUT.visibleLines, 7)
+  assert.ok(DONE_LAYOUT.bodyHeightPx >= DONE_LAYOUT.visibleLines * DONE_LAYOUT.lineHeightPx,
+    '正文区必须放得下 7 整行，否则窗口会裁掉半行')
   assert.equal(DONE_LAYOUT.titleFontPx, 20, '版式预算里的标题字号与 CSS 一致')
   assert.ok(DONE_LAYOUT.titleHeightPx >= DONE_LAYOUT.titleLineHeightPx, '标题块高不得小于行高（否则字形被裁）')
+})
+
+/* ---------- 2026-11-10：三键贴底后，正文窗口按真实可视高度取行数 ---------- */
+test('page：完成页正文窗口按正文区真实高度取整行数（贴底按钮不会压字）', () => {
+  const html = pageHtmlOf()
+  const paintDone = /function paintDone\(\) \{([\s\S]*?)\n  \}/.exec(html)
+  assert.ok(paintDone !== null, '要有 paintDone')
+  assert.ok(paintDone[1].includes('body.clientHeight'), '可视行数要按正文区真实高度算（按钮贴底后不再是固定 7×20）：' + paintDone[1])
+  assert.ok(paintDone[1].includes('DONE.lineHeightPx'), '行高取自 DONE_LAYOUT（与 CSS 同一份常量）')
+  assert.equal(/var visible = 7;/.test(paintDone[1]), false, '不许再把 7 行写死')
+  assert.ok(/DONE\.visibleLines/.test(paintDone[1]), '上限仍是 DONE_LAYOUT.visibleLines')
+  const renderDone = /function renderDone\(payload\) \{([\s\S]*?)\n  \}/.exec(html)
+  assert.ok(renderDone !== null)
+  const classAt = renderDone[1].indexOf('applyScreenClass(')
+  const paintAt = renderDone[1].indexOf('paintDone()')
+  assert.ok(classAt >= 0 && paintAt > classAt, '画正文前必须先挂 done-mode（否则量到的正文区高度是 0）')
+  assert.ok(html.includes('var DONE = '), '页面要拿到 DONE_LAYOUT（可视行数/行高不另写数字）')
 })
 
 /* ---------- 2026-11-10：完成页高亮 ≡ 真实播放进度（不是固定 1.8 秒） ---------- */

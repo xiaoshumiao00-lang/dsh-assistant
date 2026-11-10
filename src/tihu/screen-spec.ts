@@ -57,29 +57,37 @@ export const DONE_TITLE_FONT_PX = 20
 export const DONE_TITLE_LINE_HEIGHT_PX = 22
 
 /**
- * 完成屏垂直预算（320×240，四边 8px）——**按行数自适应**（2026-11-10 用户实机要求）：
+ * 完成屏垂直预算（320×240，四边 8px）——**按钮贴底、正文贴顶**（2026-11-10 用户实机要求第二版）：
  *
  *   内容高 222 = 240 − 2×1 边框 − 2×8 内边距
- *   顶栏 14 + 内缝 2 + 大标题 22 + 内缝 2 + 正文 7×20=140 + 正文↔按钮 12 + 按钮行 30 = 222
+ *   顶栏 14 + 内缝 2 + 大标题 22 + 内缝 2 + 正文区 145
+ *   + #screen 列间隙 4 + 三键 30 + 底边 margin 3 = 222
  *
- * 正文不再 `flex:1` 垂直居中：行少时正文贴着标题往下排、按钮固定在其下方 12px，
- * 剩下的黑底留在屏幕最底部（而不是夹在正文和按钮之间）。
- * 满 7 行时正好 222px 铺满，不会溢出。
+ * 正文区不再是固定的 7×20：它吃掉标题与按钮之间的**全部剩余高度**（145），
+ * 7 行 140 放得下；行更多时页面按正文区的真实可视高度裁剪/滚动，正文永远压不到按钮上。
+ * 三键固定贴在屏幕底部，键底边离屏幕**外沿** 12px（3px margin + 8px 内边距 + 1px 边框）；
+ * 行少时空出来的黑底留在正文与按钮之间，而不是按钮下面。
  */
 export const DONE_LAYOUT = {
   stageHeightPx: 14,
   titleHeightPx: 22,
   titleFontPx: DONE_TITLE_FONT_PX,
   titleLineHeightPx: DONE_TITLE_LINE_HEIGHT_PX,
+  /** 字号 15px、行高 20px，正文区 (222−14−2−22−2−4−30−3)=145 内最多 7 整行。 */
   visibleLines: 7,
   lineHeightPx: 20,
-  bodyHeightPx: 140,
+  /** 正文区（标题下沿 → 动作条上沿）的剩余高度。 */
+  bodyHeightPx: 145,
   actionBarHeightPx: 30,
   /** done-view 内部（顶栏↔标题、标题↔正文）的缝。 */
   columnGapPx: 2,
-  /** 正文↔按钮行的固定缝（页面：4px 列间隙 + 8px margin-top）。 */
-  bodyToActionGapPx: 12,
-  /** 14 + 2 + 22 + 2 + 140 + 12 + 30 = 222。 */
+  /** #screen 本身的列间隙（正文区↔动作条）。 */
+  screenGapPx: 4,
+  /** 动作条底边到屏幕外沿的留白（用户要求 12px）。 */
+  bottomInsetPx: 12,
+  /** 动作条 margin-bottom = 12 − 8 内边距 − 1 边框。 */
+  actionBarMarginBottomPx: 3,
+  /** 14 + 2 + 22 + 2 + 145 + 4 + 30 + 3 = 222。 */
   usedHeightPx: 222,
 } as const
 
