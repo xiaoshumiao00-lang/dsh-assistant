@@ -1188,7 +1188,7 @@ const COMMAND_PATTERNS: ReadonlyArray<{ pattern: RegExp; command: ScreenCommand 
   { pattern: /^(?:回|去|看)?(?:任务)?(?:棋盘|主页|首页|看板)$/, command: { kind: 'board' } },
   { pattern: /^(?:回)(?:到)?(?:棋盘|主页|首页)$/, command: { kind: 'board' } },
   { pattern: /^(?:看|打开|进)(?:一下)?(?:任务|这条|第[一二三四五]条)/, command: { kind: 'open' } },
-  { pattern: /^(?:停止|停下|别念了|别读了|停)$/, command: { kind: 'stop' } },
+  { pattern: /^(?:停止|停下|别念了|别读了|别说了|别说话|不要念了|不用念了|停止阅读|停止朗读|停)$/, command: { kind: 'stop' } },
   { pattern: /^(?:撤单|撤销|取消这条|不做了)$/, command: { kind: 'cancel' } },
   { pattern: /^(?:确认|同意|可以|执行|确认删除|删吧|批准)$/, command: { kind: 'confirm', approved: true } },
   { pattern: /^(?:取消|不|别|留|先留|先留着|别删|不要)$/, command: { kind: 'confirm', approved: false } },

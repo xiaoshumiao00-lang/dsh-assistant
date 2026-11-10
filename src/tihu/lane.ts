@@ -2900,6 +2900,17 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           if (message.type === 'audio.frame' || message.type === 'text.input'
             || message.type === 'session.end'
             || (message.type === 'screen.gesture' && actionId !== 'send')) invalidateVoiceInput(device)
+          // 设备回执必须在**进串行队列之前**结算（2026-11-10 线上回归）。
+          // 队列是一条一条处理的，而「等回执」的动作往往就发生在队列里的某条上行李中
+          // （口头「别念了」→ playback.control，设备回 ack）：把 ack 排到它后面 =
+          // 自己等自己，只能等到 1.5 秒超时，然后谎报「设备未回执」。
+          if (message.type === 'device.ack') {
+            const ack = message.payload as DeviceAckPayload
+            device.lastSeenAt = Date.now()
+            settleDeviceAck(ack)
+            if (ack.ok !== true) log(`tihu device ack not-ok device=${device.id} op=${ack.opId} reason=${ack.reason ?? '-'}`)
+            return
+          }
           enqueue(message)
         } catch (error) {
           log(`tihu frame failed: ${(error as Error)?.stack ?? String(error)}`)
@@ -6650,8 +6661,41 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       return
     }
     if (command.kind === 'stop') {
-      try { device.cancelRound?.() } catch { /* 忽略 */ }
-      device.send('event.progress', { stage: '停止', text: '已停止朗读' } satisfies ProgressPayload)
+      /*
+       * 「别念了 / 停止阅读」与 tihu_stop_speaking 必须走同一条路（2026-11-10 线上回归）。
+       *
+       * 旧实现只 `cancelRound()` + 回一句「已停止朗读」：页面早就排进 WebAudio 时间轴的
+       * 1–2 句照念，而这次口头命令不建 turn、不写任务台账、lane.log 一行没有 —— 用户看到
+       * 声音没停、日志全空，判定成「上行被静默丢弃」。停声只有 `stopDevicePlayback`
+       * 这一条路：下发 playback.control 并等回执，设备没回就如实说。
+       */
+      let outcome: StopPlaybackOutcome
+      try {
+        outcome = await stopDevicePlayback(device)
+      } catch (error) {
+        showInputError(device, error, '停止朗读失败')
+        return
+      }
+      if (outcome.kind === 'idle') {
+        device.send('event.progress', { stage: '停止', text: '本来就没在朗读' } satisfies ProgressPayload)
+        return
+      }
+      if (outcome.kind === 'listening') {
+        device.send('event.progress', {
+          stage: '停止',
+          text: outcome.ack === undefined ? '已退出「在听」（设备未回执）' : '已退出「在听」',
+        } satisfies ProgressPayload)
+        return
+      }
+      if (outcome.kind === 'sent') {
+        device.send('event.progress', { stage: '停止', text: '已下发停止（设备未回执）' } satisfies ProgressPayload)
+        return
+      }
+      const echo = ackEcho(outcome.ack)
+      device.send('event.progress', {
+        stage: '停止',
+        text: echo === undefined ? '已停止朗读' : `已停止朗读（停在 ${echo}）`,
+      } satisfies ProgressPayload)
       return
     }
     if (command.kind === 'cancel') {
@@ -6866,10 +6910,54 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     throw new Error(`鹈鹕设备 ${deviceId} 不在线（可能刚断开或换了一块屏）。${onlineDeviceHint()}`)
   }
 
-  /** 这台设备现在是不是真的在出声（页面报了 playback 就信页面，没报过才退回宿主自己的轮次）。 */
+  /**
+   * 这台设备现在是不是真的在出声。
+   *
+   * 页面自报的 `playback.state` 最可信，但**只覆盖完成页正文朗读**（页面只在
+   * `meta.read === 'done'` 的段上报 playing）。一句播报（`speakAnnouncement`）没有
+   * read 元数据，页面不会报 playing —— 宿主自己的 `announcing` 轮次才是唯一事实。
+   * 2026-11-10 线上：只看页面状态时，播报正响着 `tihu_stop_speaking` 也会回
+   * 「本来就没在朗读」——静默成功，用户听到的却是没停。
+   */
   function deviceSpeaking(device: TihuDevice): boolean {
+    if (announcing.has(device.id)) return true
     if (device.playback !== undefined) return device.playback.phase === 'playing'
-    return announcing.has(device.id)
+    return false
+  }
+
+  /** 停声结果（`stopDevicePlayback`）：页面回了什么。 */
+  type StopPlaybackOutcome =
+    | { kind: 'listening'; ack: DeviceAckPayload | undefined }
+    | { kind: 'idle' }
+    | { kind: 'stopped'; ack: DeviceAckPayload }
+    | { kind: 'sent' }
+
+  /**
+   * 让页面真的停声（规格书 §8.4/§8.5）——**唯一**实现，口头命令与工具都走这里。
+   *
+   * 只 `cancelRound()` 是停不掉的：页面早已把接下来 1–2 句排进 WebAudio 时间轴，
+   * 宿主不再发新 PCM 它也照念。必须再下发 `playback.control{action:'stop'}` 并等
+   * `device.ack`：拿到回执才算停；没回执如实说「设备未回执」，绝不回「已停止」。
+   */
+  async function stopDevicePlayback(device: TihuDevice, scope: 'round' | 'all' = 'round'): Promise<StopPlaybackOutcome> {
+    // 在听：停声＝退出在听 + 停声（只掐音频不管麦克风等于没停）。
+    if (device.playback?.phase === 'listening') {
+      const ack = await awaitDeviceAck(device, 'voice.listen', { on: false })
+      device.playback = { phase: 'idle', at: Date.now() }
+      return { kind: 'listening', ack }
+    }
+    // 幂等（§8.1）：本来就没在念 → 一条消息都不发，也不回「已停止」。
+    if (!deviceSpeaking(device)) return { kind: 'idle' }
+    try { device.cancelRound?.() } catch { /* 忽略 */ }
+    device.pausedAt = undefined
+    const ack = await awaitDeviceAck(device, 'playback.control', { action: 'stop', scope })
+    if (ack !== undefined && ack.ok === false) {
+      throw new Error(`设备拒绝停止朗读：${ack.reason ?? '原因未知'}（${device.id}）`)
+    }
+    // 页面随后会补一条 playback.state{phase:'idle'}；先按住旧状态，免得同一秒里的
+    // 第二句「别念了」又按 playing 走一遍（真正的状态仍以页面上报为准）。
+    if (ack !== undefined) device.playback = { phase: 'idle', at: Date.now() }
+    return ack === undefined ? { kind: 'sent' } : { kind: 'stopped', ack }
   }
 
   /** 棋盘那一句（回主页/翻页的返回文案都用它，四段计数每次现算）。 */
@@ -7002,8 +7090,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         device: controlDeviceOf(device),
         display,
         pinned: device.onBoard === true,
-        // 真事实：页面自报的 playback.state（不再写死 false）。
-        speaking: playback?.phase === 'playing',
+        // 真事实：完成页正文读页面自报的 playback；播报没有 read 元数据，回落到宿主轮次。
+        speaking: deviceSpeaking(device),
         ...(device.screenStage === undefined || device.screenStage === '' ? {} : { stage: device.screenStage }),
         ...(playback === undefined ? {} : {
           playback: {
@@ -7075,29 +7163,23 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
     stopSpeaking: async (deviceId, options) => {
       const device = requireControlDevice(deviceId)
-      // 规格书 §8.4：在听 → 停声＝**退出在听** + 停声（只掐音频不管麦克风等于没停）。
-      if (device.playback?.phase === 'listening') {
-        const ack = await awaitDeviceAck(device, 'voice.listen', { on: false })
-        device.playback = { phase: 'idle', at: Date.now() }
+      const outcome = await stopDevicePlayback(device, options.scope ?? 'round')
+      if (outcome.kind === 'listening') {
         return {
           text: '已退出「在听」',
           deviceId: device.id,
-          ...(ack === undefined ? {} : { acked: true }),
+          ...(outcome.ack === undefined ? {} : { acked: true }),
           echo: '麦克风已关',
         }
       }
       // 幂等（规格书 §8.1）：本来就没在念 → 不发消息、不回「已停止」。
       // 待决策/进度/棋盘本来就没声（§8.4），这也**不算失败**。
-      if (!deviceSpeaking(device)) {
+      if (outcome.kind === 'idle') {
         return { text: '本来就没在朗读', deviceId: device.id, already: true, echo: `停在 ${screenEchoOf(device)}` }
       }
-      try { device.cancelRound?.() } catch { /* 忽略 */ }
-      device.pausedAt = undefined
-      const ack = await awaitDeviceAck(device, 'playback.control', { action: 'stop', scope: options.scope ?? 'round' })
-      if (ack !== undefined && ack.ok === false) throw new Error(`设备拒绝停止朗读：${ack.reason ?? '原因未知'}（${device.id}）`)
-      return ack === undefined
-        ? { text: '已下发停止', deviceId: device.id }
-        : { text: '已停止朗读', deviceId: device.id, acked: true, echo: `停在 ${ackEcho(ack) ?? screenEchoOf(device)}` }
+      // 没回执：明确说「已下发」，工具层再补「设备未回执」（绝不假装成功）。
+      if (outcome.kind === 'sent') return { text: '已下发停止', deviceId: device.id }
+      return { text: '已停止朗读', deviceId: device.id, acked: true, echo: `停在 ${ackEcho(outcome.ack) ?? screenEchoOf(device)}` }
     },
 
     pauseSpeaking: async (deviceId) => {

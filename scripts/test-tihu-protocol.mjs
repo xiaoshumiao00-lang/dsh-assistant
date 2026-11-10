@@ -6877,6 +6877,90 @@ await testAsync('鹈鹕端默认前台模型：派单新建的 computer-use 任�
   }
 })
 
+await testAsync('页面重连后 text.input 仍被处理', async () => {
+  const w = unifiedWorkspace()
+  try {
+    const first = openLane(w.runtime)
+    first.emit('data', clientFrame(buildUpstream('hello', { clientId: 'rc-page', protocol: '0' }, 1)))
+    await waitMs(60)
+    first.destroy()
+    await waitMs(20)
+    const second = openLane(w.runtime)
+    second.emit('data', clientFrame(buildUpstream('hello', { clientId: 'rc-page', protocol: '0' }, 2)))
+    await waitMs(80)
+    // 真机页面 onopen 的固定顺序：hello → playback.state(idle) → voice.list → voice.select
+    second.emit('data', clientFrame(buildUpstream('playback.state', { phase: 'idle' }, 3)))
+    second.emit('data', clientFrame(buildUpstream('voice.list', {}, 4)))
+    second.emit('data', clientFrame(buildUpstream('voice.select', { name: 'default' }, 5)))
+    await waitMs(80)
+    second.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'keyboard' }, 6)))
+    await waitMs(200)
+    assert.equal(w.prompted.length, 1, '重连后第一句仍要送到指挥台：' + JSON.stringify(w.prompted.map((item) => item.id)))
+    assert.equal(w.created.length > 0, true, '要建任务会话')
+  } finally {
+    w.cleanup()
+  }
+})
+
+await testAsync('文字说「别念了」＝真的让页面停声（playback.control＋回执），不是静默吞掉', async () => {
+  const w = unifiedWorkspace()
+  process.env.TIHU_ACK_TIMEOUT_MS = '300'
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'rc-stop', protocol: '0' }, 1)))
+    await waitMs(60)
+    // 完成页正在念第 3 段（页面自报）——「别念了」必须让**页面**把已排程的音频停下。
+    socket.emit('data', clientFrame(buildUpstream('playback.state', { phase: 'playing', segment: 3, line: 2, total: 12 }, 2)))
+    await waitMs(30)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '别念了', source: 'keyboard' }, 3)))
+    await waitMs(60)
+    const stop = framesOf(socket).filter((frame) => frame.type === 'playback.control').pop()
+    assert.ok(stop !== undefined, '「别念了」必须下发 playback.control（只 cancelRound 停不掉页面已排程的音频）')
+    assert.equal(stop.payload.action, 'stop')
+    assert.equal(typeof stop.payload.opId, 'string', '要带 opId 等回执，才能证明页面真的停了')
+    assert.equal(w.created.length, 0, '「别念了」是屏上命令，不该建任务会话')
+    assert.equal(w.prompted.length, 0, '也不该往指挥台投 prompt')
+    socket.emit('data', clientFrame(buildUpstream('device.ack', { opId: stop.payload.opId, ok: true, stage: '完成 第 3/12 行' }, 4)))
+    await waitMs(60)
+    const progress = framesOf(socket).filter((frame) => frame.type === 'event.progress' && frame.payload.stage === '停止').pop()
+    assert.ok(progress !== undefined, '停声结果要上屏')
+    assert.ok(String(progress.payload.text).includes('已停止朗读'), '回执到了才能说已停止：' + String(progress.payload.text))
+    assert.ok(String(progress.payload.text).includes('完成 第 3/12 行'), '要带设备自报的停留位置：' + String(progress.payload.text))
+    const stopped = await w.runtime.control.stopSpeaking(w.runtime.control.listDevices()[0].id, { scope: 'round' })
+    assert.equal(stopped.already, true, '停过之后工具要如实回 already-idle，不重复下发')
+  } finally {
+    delete process.env.TIHU_ACK_TIMEOUT_MS
+    w.cleanup()
+  }
+})
+
+await testAsync('「停止阅读」也是停声命令（不是一条新任务）；离线后 tihu_stop_speaking 明确报不在线', async () => {
+  const w = unifiedWorkspace()
+  process.env.TIHU_ACK_TIMEOUT_MS = '300'
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'rc-stop2', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('playback.state', { phase: 'playing', segment: 1 }, 2)))
+    await waitMs(20)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '停止阅读', source: 'keyboard' }, 3)))
+    await waitMs(40)
+    assert.equal(w.created.length, 0, '「停止阅读」不许被派成一条任务（旧版 t39 就是这样白跑一趟）')
+    assert.ok(framesOf(socket).some((frame) => frame.type === 'playback.control'), '也要真的下发停声')
+    const deviceId = w.runtime.control.listDevices()[0].id
+    // 页面断开（重连/断网）：旧设备 id 的动作必须明确失败，绝不能假装成功。
+    socket.destroy()
+    await waitMs(60)
+    const gone = await w.runtime.control.stopSpeaking(deviceId, { scope: 'round' }).then(() => null, (error) => error)
+    assert.ok(gone instanceof Error && gone.message.includes('不在线'), '设备断开后必须报不在线：' + String(gone))
+    const none = await w.runtime.control.stopSpeaking(undefined, { scope: 'round' }).then(() => null, (error) => error)
+    assert.ok(none instanceof Error && none.message.includes('不在线'), '没有设备时也不能静默成功：' + String(none))
+  } finally {
+    delete process.env.TIHU_ACK_TIMEOUT_MS
+    w.cleanup()
+  }
+})
+
 /* ---------- 汇总 ---------- */console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
 if (failed > 0) process.exit(1)
 process.exit(0)
