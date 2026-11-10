@@ -784,10 +784,14 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
    */
   const runningSessions = new Map<string, number>()
   /**
-   * 主回合已结束、等子代理跑完的任务：存下主回合的结论（完成屏/播报在子代理全结束后才出）。
+   * 主回合已结束、等子代理跑完的任务：存下主回合的结论（收尾时落完成态用）。
+   *
+   * 朗读与状态解耦（用户 2026-11-10 实机）：turn/end 一到、只要拿到了这轮的最终回复正文，
+   * 就立刻走既有完成页 + 朗读链路念出来（卡片仍是执行中）；`announcedAt` 记的就是「这轮已经
+   * 念过」——子会话全停收尾时**只静默变绿**，绝不再读第二遍。
    * 不入登记簿持久化：进程重启后最多重算一次（子代理本就不跨进程）。
    */
-  const deferredReplies = new Map<string, { reply: string; resultLine: string }>()
+  const deferredReplies = new Map<string, { reply: string; resultLine: string; announcedAt?: number }>()
   /** 子代理收敛的周期检查（事件漏收时兜底；2 秒一次，只扫有会话的任务）。 */
   let childReconcileTimer: ReturnType<typeof setInterval> | undefined
   /** 事件里带来的会话模式（preset）：列表缓存有 60s TTL，刚建的会话只能靠它判 CU。 */
@@ -1419,15 +1423,23 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /**
-   * 一条任务真的完成了：落完成态 ＋ 完成屏 ＋ 一句播报。
+   * 这一轮的回复上屏 ＋ 整段正文朗读（**不动任务状态**）。
    *
-   * **主回合结束但子代理还在跑时不许走这里**：先 holdForChildren，等子代理全部结束再补。
-   * 完成屏的「另有 N 条」也不再按同批折叠（本次改版只留单条完成）。
+   * 用户 2026-11-10 实机：主回合结束、后台 code_agent 子会话还在跑时，旧实现把完成页与朗读
+   * 一起压进 deferredReplies，等子会话全停才出——后台一跑几分钟，用户一句话都听不到。
+   * 现在朗读与状态解耦，两个调用方各取所需：
+   *   - 没有子代理：`showCompletedTask` 先落完成态，再走这里（绿卡与完成页同帧）；
+   *   - 有子代理：turn/end 到了就由这里**立刻念**，任务状态保持执行中（棋盘蓝色呼吸点），
+   *     子会话全停后只静默变绿（见 `finalizeHeldTask`），绝不再读第二遍。
+   *
+   * 正文、路径缩写、markdown 剥离、逐行折行与高亮区间全部复用既有链路：`doneFrame`
+   * 的正文与 `readDoneBody` 念的是同一份 `task.doneText`（`prepareDoneText` 之后）。
    */
-  function showCompletedTask(task: TihuTask, input: { reply: string; resultLine: string; at: number }): void {
+  function showReplyScreen(task: TihuTask, input: { reply: string; resultLine: string }): void {
     const resultLine = String(input.resultLine ?? '').trim() || '做完了'
-    tasks.complete(task.taskId, { resultLine, now: input.at })
     task.doneText = input.reply
+    // 播报文本（标题——第一句）用同一结果行：子代理在跑时 complete() 还没跑，先落到 resultLine。
+    if (String(task.resultLine ?? '').trim() === '') task.resultLine = resultLine
     const frame = doneFrame({
       taskId: task.taskId,
       title: task.title,
@@ -1448,20 +1460,52 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       sendTaskUpdate(device, task)
       readDoneScreen(device, task)
     }
+    // 正文已经在这台设备上开念了：这条 P1 播报会被 doneReadingTask 跳过（不重复念第一句）。
     pushTaskNotify(task, 1, doneAnnouncementOf(task))
     refreshBoards()
   }
 
-  /** 子代理全部结束：把挂起的任务补成「完成」并补发完成屏/播报（用主回合存下的结论）。 */
+  /**
+   * 一条任务真的完成了：落完成态 ＋ 完成屏 ＋ 一句播报。
+   *
+   * 完成屏的「另有 N 条」不再按同批折叠（本次改版只留单条完成）。
+   */
+  function showCompletedTask(task: TihuTask, input: { reply: string; resultLine: string; at: number }): void {
+    const resultLine = String(input.resultLine ?? '').trim() || '做完了'
+    tasks.complete(task.taskId, { resultLine, now: input.at })
+    showReplyScreen(task, { reply: input.reply, resultLine })
+  }
+
+  /**
+   * 子代理全部结束：把挂起的任务收尾。
+   *
+   * 这轮回复在 turn/end 时已经念过（`announcedAt` 有值）→ **只静默变绿**：落完成态、刷棋盘、
+   * 给还停在完成页的那台发一行 task.update；不出完成屏、不再朗读、也不推完成播报。
+   * 没念过（turn/end 时正文还没到 / 旧挂起）→ 才按主回合结论补一次完成屏 + 朗读（仍是唯一一次）。
+   */
   function finalizeHeldTask(task: TihuTask, at = Date.now()): void {
     const sessionId = task.sessionIds[task.sessionIds.length - 1]
     const stored = deferredReplies.get(task.taskId)
     deferredReplies.delete(task.taskId)
     const reply = stored?.reply ?? (sessionId === undefined ? '' : cachedAssistantText(sessionId))
     const resultLine = stored?.resultLine ?? task.pendingResultLine ?? (firstSentenceOf(reply) || '做完了')
+    const alreadyRead = stored?.announcedAt !== undefined
     task.childRunning = undefined
     task.holdingForChildren = undefined
     task.pendingResultLine = undefined
+    if (alreadyRead) {
+      tasks.complete(task.taskId, { resultLine, now: at })
+      if (String(task.doneText ?? '').trim() === '') task.doneText = reply
+      refreshBoards()
+      for (const device of devices) {
+        if (!device.unified) continue
+        if (device.focusedTask !== task.taskId) continue
+        // 还停在完成页：只更新那一条卡片（绿），屏上正文/高亮不动，也不重读。
+        sendTaskUpdate(device, task)
+      }
+      log(`tihu subagents settled task=${task.taskId} children=0 silent=1`)
+      return
+    }
     showCompletedTask(task, { reply, resultLine, at })
     log(`tihu subagents settled task=${task.taskId} children=0`)
   }
@@ -2176,12 +2220,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     const task = tasks.ofSession(parentId)
     if (task === undefined || task.state === 'archived' || task.state === 'awaiting') return
     let changed = tasks.setChildRunning(task.taskId, running, at)
-    // 迟到的登记（父任务已经完成）：子会话还在跑就把它拉回执行中并挂起完成，等子会话结束再收尾。
+    // 迟到的登记（父任务已经完成）：子会话还在跑就把它拉回执行中并挂起，等子会话结束再收尾。
+    // 这条父任务刚才完成时已经出过完成页、念过这一轮回复了（announcedAt），收尾时只静默变绿。
     if (running > 0 && (task.state === 'done' || task.state === 'announced')) {
       const reply = lastAssistant.get(parentId)?.text ?? ''
       const resultLine = firstSentenceOf(reply) || task.resultLine || '做完了'
       tasks.holdForChildren(task.taskId, { childRunning: running, resultLine, now: at })
-      deferredReplies.set(task.taskId, { reply, resultLine })
+      deferredReplies.set(task.taskId, { reply, resultLine, announcedAt: at })
       changed = true
     }
     if (changed) refreshBoards()
@@ -2508,12 +2553,20 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           tasks.setChildRunning(taskOfSession.taskId, childRunning, at)
           if (childRunning > 0) {
             tasks.holdForChildren(taskOfSession.taskId, { childRunning, resultLine: pcResult, now: at })
-            deferredReplies.set(taskOfSession.taskId, { reply: doneReply, resultLine: pcResult })
+            const deferred = { reply: doneReply, resultLine: pcResult, announcedAt: undefined as number | undefined }
+            deferredReplies.set(taskOfSession.taskId, deferred)
+            // 用户 2026-11-10（实机 bug）：朗读与状态解耦——这一轮回复**立刻**按既有完成页 +
+            // 朗读链路念出来（正文取真正的最后一条 assistant 消息，高亮跟着音频走），
+            // 卡片状态保持执行中（蓝色呼吸点），等子会话全停再静默变绿、不重读。
+            if (String(doneReply ?? '').trim() !== '') {
+              showReplyScreen(taskOfSession, { reply: doneReply, resultLine: pcResult })
+              deferred.announcedAt = at
+            }
             refreshBoards()
-            // 这一轮已经结束了：还停在它「进度」页的设备立刻离开（回棋盘），
+            // 这一轮已经结束了：还停在它「进度」页的设备立刻离开（回棋盘/完成页），
             // 不许把旧步数/旧已用继续挂在屏上（用户 2026-11-10 实机）。
             leaveStaleProgress(taskOfSession, 'pc-turn-end-held')
-            log(`tihu pc held for subagents task=${taskOfSession.taskId} children=${childRunning}`)
+            log(`tihu pc held for subagents task=${taskOfSession.taskId} children=${childRunning} announced=${deferred.announcedAt !== undefined}`)
             return
           }
           // 完成屏➕一句播报：等子代理都结束才走到这里。
@@ -2559,11 +2612,18 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           tasks.setChildRunning(taskOfSession.taskId, childRunning, at)
           if (childRunning > 0) {
             tasks.holdForChildren(taskOfSession.taskId, { childRunning, resultLine, now: at })
-            deferredReplies.set(taskOfSession.taskId, { reply, resultLine })
+            const deferred = { reply, resultLine, announcedAt: undefined as number | undefined }
+            deferredReplies.set(taskOfSession.taskId, deferred)
+            // 朗读与状态解耦（与 pc 分支同一条规则）：turn/end 一到、拿到正文就立刻念这一轮；
+            // 卡片仍是执行中（蓝色呼吸点），子会话全停才静默变绿、不重复朗读。
+            if (String(reply ?? '').trim() !== '') {
+              showReplyScreen(taskOfSession, { reply, resultLine })
+              deferred.announcedAt = at
+            }
             refreshBoards()
             // 这一轮已经结束：还停在旧进度页的设备离开（子代理没跑完，先不假装完成）。
             leaveStaleProgress(taskOfSession, 'turn-end-held')
-            log(`tihu task held for subagents task=${taskOfSession.taskId} children=${childRunning}`)
+            log(`tihu task held for subagents task=${taskOfSession.taskId} children=${childRunning} announced=${deferred.announcedAt !== undefined}`)
             return
           }
           // 子代理全部结束才转完成、才播报（用户 2026-11-10 的硬要求）。

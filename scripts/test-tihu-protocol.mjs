@@ -4374,85 +4374,164 @@ await testAsync('棋盘排序：执行中的电脑端卡片排在「还没开跑
   w.cleanup()
 })
 
-await testAsync('子代理：主回合结束但后台子任务还在跑 → 不算完成、不播报；子任务结束才转完成并播报', async () => {
+await testAsync('子代理在跑：turn/end 立刻出完成页并朗读这一轮且只读一次；子会话停 → 卡片静默变绿、不重读', async () => {
   let children = []
   const agents = { list: () => children, get: () => undefined }
-  const w = unifiedWorkspace({ agents })
+  const ttsStub = stubPcmTts()
+  const w = unifiedWorkspace({ agents, tts: { instance: ttsStub } })
   const socket = openLane(w.runtime)
   const emit = w.events.find((entry) => entry.name === 'session/event').handler
-  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-subagent', protocol: '0' }, 1)))
-  await waitMs(60)
-  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
-  await waitMs(120)
-  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
-  await waitMs(80)
-  const taskSession = w.prompted[0].id
-  const childId = 'session-child-1'
-  children = [{
-    id: childId,
-    status: 'running',
-    session: { header: { id: childId, parentSession: taskSession, origin: 'subagent', delegationDepth: 1 } },
-  }]
+  const frames = () => framesOf(socket)
+  // 一轮正文朗读 = 恰好一条 final 的 read=done PCM（一行一段，最后一段带 final）。
+  const readRounds = () => frames().filter((frame) => frame.type === 'tts.audio'
+    && frame.payload.read === 'done' && frame.payload.final === true).length
+  const doneScreens = () => frames().filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').length
+  const boardNow = () => frames().filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop()?.payload?.board
+  try {
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-subagent', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+    await waitMs(120)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+    await waitMs(80)
+    const taskSession = w.prompted[0].id
+    const childA = 'session-child-1'
+    const childB = 'session-child-2'
+    children = [
+      { id: childA, status: 'running', session: { header: { id: childA, parentSession: taskSession, origin: 'subagent', delegationDepth: 1 } } },
+      { id: childB, status: 'running', session: { header: { id: childB, parentSession: taskSession, origin: 'subagent', delegationDepth: 1 } } },
+    ]
 
-  // 屏上不写「子任务 N 个在跑」：右侧状态图标换成蓝色呼吸点（只改透明度，不位移）。
-  const pageHtml = w.runtime.page()
-  assert.ok(pageHtml.includes('@keyframes boardBreath'), '子代理在跑要有呼吸动画')
-  assert.ok(pageHtml.includes('animation:boardBreath 1.2s ease-in-out infinite'), '1.2 秒一个周期、缓入缓出')
-  const breathStart = pageHtml.indexOf('@keyframes boardBreath')
-  const breathBody = pageHtml.slice(breathStart, pageHtml.indexOf('}', breathStart) + 1)
-  assert.equal(/transform|translate|top:|left:|margin/.test(breathBody), false, '呼吸动画只改透明度：不抖动、不位移')
-  assert.equal(pageHtml.includes('boardOrbit'), false, '旧的旋转短弧已删')
-  assert.equal(pageHtml.includes('board-merged'), false, '「+N 条」的样式彻底删掉')
+    // 屏上不写「子任务 N 个在跑」：右侧状态图标换成蓝色呼吸点（只改透明度，不位移）。
+    const pageHtml = w.runtime.page()
+    assert.ok(pageHtml.includes('@keyframes boardBreath'), '子代理在跑要有呼吸动画')
+    assert.ok(pageHtml.includes('animation:boardBreath 1.2s ease-in-out infinite'), '1.2 秒一个周期、缓入缓出')
+    const breathStart = pageHtml.indexOf('@keyframes boardBreath')
+    const breathBody = pageHtml.slice(breathStart, pageHtml.indexOf('}', breathStart) + 1)
+    assert.equal(/transform|translate|top:|left:|margin/.test(breathBody), false, '呼吸动画只改透明度：不抖动、不位移')
+    assert.equal(pageHtml.includes('boardOrbit'), false, '旧的旋转短弧已删')
+    assert.equal(pageHtml.includes('board-merged'), false, '「+N 条」的样式彻底删掉')
 
-  emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
-  emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '已经交出去了，后台还在跑。' }] } } })
-  emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
-  await waitMs(220)
+    emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
+    emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '已经交出去了，后台还在跑。' }] } } })
+    emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(260)
 
-  let frames = framesOf(socket)
-  assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成'), false, '子任务在跑：不许出完成屏')
-  assert.equal(frames.some((frame) => frame.type === 'task.notify' && frame.payload.level === 1), false, '子任务在跑：不许播报完成')
-  let board = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop().payload.board
-  assert.equal(board.rows[0].state, 'running', '主回合结束但子代理在跑 ⇒ 仍然是执行中')
-  assert.equal(board.rows[0].subagents, 1, '棋盘行带子任务数（页面据此画蓝色呼吸点，不写字）')
-  assert.equal(board.rows[0].blink, true, '子代理在跑 ⇒ 棋盘行 blink=true')
-  assert.equal(board.rows[0].capsule, '执行中')
-  assert.equal('merged' in board.rows[0], false, '不再有「+N 条」')
+    // 1) turn/end 一到就出完成页、就念这一轮——不等子会话（用户 2026-11-10 实机 bug）。
+    const done = frames().filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').pop()
+    assert.ok(done !== undefined, '子任务在跑也必须立刻出完成页（朗读与状态解耦）')
+    assert.equal(done.payload.title, '现在几点了')
+    assert.ok(String(done.payload.done?.lines?.join('') ?? '').includes('后台还在跑'), '完成页正文是这一轮的真实回复')
+    assert.equal(doneScreens(), 1, '完成页只出一次')
+    assert.equal(readRounds(), 1, 'turn/end 立刻朗读整段正文，且只读一次：' + readRounds())
+    assert.ok(frames().some((frame) => frame.type === 'tts.audio' && frame.payload.read === 'done'), '朗读走的是完成页正文链路（read=done）')
+    assert.equal(frames().filter((frame) => frame.type === 'tts.audio' && frame.payload.read === undefined).length, 0,
+      '正文在念时不再补念「标题——第一句」')
 
-  // 子代理结束：状态转完成并补发播报。
-  children = [{ ...children[0], status: 'idle' }]
-  emit(
-    { id: childId, header: { id: childId, parentSession: taskSession, origin: 'subagent' } },
-    { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
-  )
-  await waitMs(260)
-  frames = framesOf(socket)
-  const done = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').pop()
-  assert.ok(done !== undefined, '子代理结束 → 才转完成屏')
-  assert.equal(done.payload.title, '现在几点了')
-  const note = frames.filter((frame) => frame.type === 'task.notify' && frame.payload.level === 1).pop()
-  assert.ok(note !== undefined, '子代理结束 → 才播报完成')
-  assert.ok(String(note.payload.text).includes('现在几点了'), '播报用任务标题：' + note.payload.text)
-  // 完成屏期间棋盘不刷新（屏一上屏就不再发 board）：回棋盘再看这张卡。
-  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 4)))
-  await waitMs(90)
-  board = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop().payload.board
-  assert.equal(board.rows[0].state, 'done')
-  assert.equal(board.rows[0].subagents, undefined, '子任务清零后不再画呼吸点')
-  assert.equal(board.rows[0].blink, undefined, '子任务清零后 blink 消失')
-  w.cleanup()
+    // 2) 卡片仍是执行中：蓝色呼吸点 + 子任务计数（两条并行都在算）。
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 4)))
+    await waitMs(90)
+    let board = boardNow()
+    assert.equal(board.rows[0].state, 'running', '主回合结束但子代理在跑 ⇒ 仍然是执行中')
+    assert.equal(board.rows[0].subagents, 2, '并行两条子会话都要算')
+    assert.equal(board.rows[0].blink, true, '子代理在跑 ⇒ 棋盘行 blink=true（右侧蓝色呼吸点）')
+    assert.equal(board.rows[0].capsule, '执行中')
+    assert.equal('merged' in board.rows[0], false, '不再有「+N 条」')
+
+    // 3) 第一条子会话结束：还在跑 → 不许变绿、不许重读。
+    children = [{ ...children[0], status: 'idle' }, children[1]]
+    emit(
+      { id: childA, header: { id: childA, parentSession: taskSession, origin: 'subagent' } },
+      { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    )
+    await waitMs(200)
+    assert.equal(readRounds(), 1, '子会话中途结束不许再读一遍：' + readRounds())
+    board = boardNow()
+    assert.equal(board.rows[0].state, 'running', '还有一条子会话在跑 ⇒ 仍是执行中')
+    assert.equal(board.rows[0].blink, true)
+
+    // 4) 最后一条子会话结束（中途失败也算结束）：静默变绿——不再出完成页、不再朗读、不再播报。
+    const notifyBefore = frames().filter((frame) => frame.type === 'task.notify' && frame.payload.level === 1).length
+    children = [children[0], { ...children[1], status: 'idle' }]
+    emit(
+      { id: childB, header: { id: childB, parentSession: taskSession, origin: 'subagent' } },
+      { type: 'turn/end', data: { turn: 1, reason: { kind: 'error', message: '子会话中途失败' } } },
+    )
+    await waitMs(260)
+    assert.equal(readRounds(), 1, '子会话全部结束后不许重复朗读（只读一次）：' + readRounds())
+    assert.equal(doneScreens(), 1, '子会话全部结束后不再出完成页（静默变绿）')
+    assert.equal(frames().filter((frame) => frame.type === 'task.notify' && frame.payload.level === 1).length, notifyBefore,
+      '收尾静默：不再推完成播报')
+    board = boardNow()
+    assert.ok(['done', 'announced'].includes(board.rows[0].state), '子任务全停 ⇒ 卡片转完成：' + board.rows[0].state)
+    assert.equal(board.rows[0].subagents, undefined, '子任务清零后不再画呼吸点')
+    assert.equal(board.rows[0].blink, undefined, '子任务清零后 blink 消失（绿色实心圆）')
+  } finally {
+    w.cleanup()
+  }
 })
 
-await testAsync('code_agent 后台会话：登记父→子链接 → 父任务保持执行中并闪烁；子会话停 → 恢复完成', async () => {
+await testAsync('子会话 1 秒内结束：只朗读一次（不会「先读一次、结束再读一次」）', async () => {
+  let children = []
+  const agents = { list: () => children, get: () => undefined }
+  const ttsStub = stubPcmTts()
+  const w = unifiedWorkspace({ agents, tts: { instance: ttsStub } })
+  const socket = openLane(w.runtime)
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  const readRounds = () => framesOf(socket).filter((frame) => frame.type === 'tts.audio'
+    && frame.payload.read === 'done' && frame.payload.final === true).length
+  const doneScreens = () => framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').length
+  try {
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-subagent-fast', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+    await waitMs(120)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+    await waitMs(80)
+    const taskSession = w.prompted[0].id
+    const childId = 'session-child-fast'
+    children = [{
+      id: childId,
+      status: 'running',
+      session: { header: { id: childId, parentSession: taskSession, origin: 'subagent', delegationDepth: 1 } },
+    }]
+    emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
+    emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '已经交出去了，后台还在跑。' }] } } })
+    emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    // 子会话几乎同时结束（实机「1 秒内跑完」）：紧接着就发它的 turn/end。
+    children = [{ ...children[0], status: 'idle' }]
+    emit(
+      { id: childId, header: { id: childId, parentSession: taskSession, origin: 'subagent' } },
+      { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    )
+    await waitMs(420)
+    assert.equal(readRounds(), 1, '1 秒内结束也只有一个朗读轮：' + readRounds())
+    assert.equal(doneScreens(), 1, '完成页只出一次')
+    // 收尾是静默的：设备还停在完成页，只会收到一行 task.update（状态变完成），不再重发完成屏。
+    const lastUpdate = framesOf(socket).filter((frame) => frame.type === 'task.update' && frame.payload.taskId === 't1').pop()
+    assert.equal(lastUpdate?.payload?.state, 'done', '收尾那一行 task.update 把卡片改成完成：' + JSON.stringify(lastUpdate?.payload))
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 4)))
+    await waitMs(100)
+    const board = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop()?.payload?.board
+    assert.ok(['done', 'announced'].includes(board.rows[0].state), '子会话停了 ⇒ 卡片就是完成（不闪）：' + board.rows[0].state)
+    assert.equal(board.rows[0].blink, undefined)
+  } finally {
+    w.cleanup()
+  }
+})
+
+await testAsync('code_agent 后台会话：turn/end 立刻朗读一次、卡片保持执行中闪烁；子会话停 → 静默变绿不重读', async () => {
   // 实机那条就是这种：CU 会话调 code_agent 建出来的标准会话，header 没有 parentSession、
   // origin 不是 subagent、preset=standard，只能靠 tools/post-execute 的登记认出来。
   let children = []
   const agents = { list: () => children, get: () => undefined }
+  const ttsStub = stubPcmTts()
   const now = Date.now()
   const sessionId = 'session-pc-code-agent'
   const childId = 'session-code-child'
   const w = unifiedWorkspace({
     agents,
+    tts: { instance: ttsStub },
     records: [cuRecord(sessionId, {
       live: true, preset: 'computer-use', cwd: '/work/tihu', createdAt: now - 600_000,
       lastPromptAt: now - 600, title: '鹈鹕待决策接入 pendingInteraction',
@@ -4466,6 +4545,9 @@ await testAsync('code_agent 后台会话：登记父→子链接 → 父任务�
     socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pc-code-agent', protocol: '0' }, 1)))
     await waitMs(160)
     const boardOf = () => framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.board).pop()?.payload?.board
+    const readRounds = () => framesOf(socket).filter((frame) => frame.type === 'tts.audio'
+      && frame.payload.read === 'done' && frame.payload.final === true).length
+    const doneScreens = () => framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').length
 
     emit({ id: sessionId }, { type: 'turn/start', data: { turn: 1 } })
     await waitMs(140)
@@ -4498,20 +4580,26 @@ await testAsync('code_agent 后台会话：登记父→子链接 → 父任务�
     assert.equal(row.blink, true, '子代理在跑 ⇒ blink=true（右侧蓝色呼吸点）')
     assert.equal(board.counts.running, 1, '顶行「●N 在跑」要算它')
 
-    // 父回合结束：子会话还在跑，不许出完成屏/播报。
+    // 父回合结束：子会话还在跑 —— 这一轮回复必须**立刻**朗读（实机 bug 就是这里一句都不念）。
+    const answer = '已经把报告交出去了，后台还在写剩下的两节。'
+    emit({ id: sessionId }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: answer }] } } })
     emit({ id: sessionId }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
-    await waitMs(240)
+    await waitMs(260)
     let frames = framesOf(socket)
-    assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成'), false,
-      '子代理没跑完：父回合结束也不许出完成屏')
-    assert.equal(frames.some((frame) => frame.type === 'task.notify' && frame.payload.level === 1), false,
-      '子代理没跑完：不许播报完成')
+    const firstDone = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').pop()
+    assert.ok(firstDone !== undefined, '子代理没跑完也要立刻出完成页')
+    assert.ok(String(firstDone.payload.done?.lines?.join('') ?? '').includes('后台还在写'), '完成页读的是这一轮真实回复')
+    assert.equal(readRounds(), 1, 'turn/end 立刻朗读一次：' + readRounds())
     board = boardOf()
     row = board.rows.find((item) => item.taskId === 'p1')
-    assert.equal(row.state, 'running', '父回合结束后仍是执行中')
-    assert.equal(row.blink, true, '还在跑就继续闪')
+    assert.equal(row.state, 'running', '父回合结束后仍是执行中（不许提前变绿）')
+    assert.equal(row.blink, true, '还在跑就继续闪（蓝色呼吸点）')
 
-    // 子会话停：立刻恢复完成，不再闪。
+    // 子会话停：静默变绿——不再出完成页、不再朗读第二遍。
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+    // 等 P1 播报窗口（400ms）过去再取基线，否则会把「正文念完这一批」误算成收尾又播了一次。
+    await waitMs(520)
+    const notifyBefore = framesOf(socket).filter((frame) => frame.type === 'task.notify' && frame.payload.level === 1).length
     children = [{ ...children[0], status: 'idle' }]
     emit(
       { id: childId, header: { id: childId, agentPreset: 'standard' } },
@@ -4519,15 +4607,13 @@ await testAsync('code_agent 后台会话：登记父→子链接 → 父任务�
     )
     await waitMs(300)
     frames = framesOf(socket)
-    const done = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').pop()
-    assert.ok(done !== undefined, '子会话停 → 补完成屏')
-    assert.ok(frames.some((frame) => frame.type === 'task.notify' && frame.payload.level === 1),
-      '子会话停 → 补完成播报')
-    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
-    await waitMs(100)
+    assert.equal(readRounds(), 1, '子会话停后不许重复朗读：' + readRounds())
+    assert.equal(doneScreens(), 1, '子会话停后不再补完成屏（静默变绿）')
+    assert.equal(frames.filter((frame) => frame.type === 'task.notify' && frame.payload.level === 1).length, notifyBefore,
+      '收尾静默：不再推完成播报')
     board = boardOf()
     row = board.rows.find((item) => item.taskId === 'p1')
-    assert.equal(row.state, 'done', '子会话全停 → 卡片转完成')
+    assert.ok(['done', 'announced'].includes(row.state), '子会话全停 → 卡片转完成：' + row.state)
     assert.equal(row.blink, undefined, '子会话全停 → 不再闪（绿色实心圆）')
     assert.equal(row.subagents, undefined)
   } finally {
