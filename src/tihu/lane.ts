@@ -80,7 +80,6 @@ import {
   DONE_KEEP_MS,
   TaskLedger,
   TaskNotifyBus,
-  bestCardMatchOf,
   boardOf,
   capsuleOf,
   chineseIndex,
@@ -211,15 +210,15 @@ export function tihuThinkingFlushMs(): number {
 }
 
 /**
- * 慢路径（指挥会话）投递成功后的兜底等待（毫秒）。
+ * 灰区（项目知道、接不接不知道）交给指挥台判一次的等待上限（毫秒）。
  *
- * 指挥会话的模型可能几十秒都不回（本机 strata 的 TTFT 实测约 55s），设备屏就一直停在
- * 「派单 / 正在看该派给谁」，任务没建出来也不报错（2026-11-10 线上 40s+ 实测）。
- * 超过这个窗口就按快路径的匹配分自己派单，不再等模型。
- * TIHU_SLOW_PATH_FALLBACK_MS 可覆盖（夹在 50ms ~ 2min；0/负数/非数字回落默认）。
+ * 注意：这**不是**「派给哪个项目」的判断窗口。用户 2026-11-10 拍板：指挥台判项目
+ * 不设超时，一直等到它回；灰区只是「接着哪条会话」的二次确认，到点没结论就按
+ * 屏上澄清一次处理（不答就新建），所以这里保留一个有限窗口。
+ * TIHU_GRAY_FALLBACK_MS 可覆盖（夹在 50ms ~ 2min；0/负数/非数字回落默认）。
  */
-export function tihuSlowPathFallbackMs(): number {
-  const raw = Number(process.env.TIHU_SLOW_PATH_FALLBACK_MS ?? 9_000)
+export function tihuGrayCommanderMs(): number {
+  const raw = Number(process.env.TIHU_GRAY_FALLBACK_MS ?? 9_000)
   if (!Number.isFinite(raw) || raw <= 0) return 9_000
   return clampInt(raw, 50, 120_000)
 }
@@ -234,13 +233,6 @@ export function tihuClarifyMs(): number {
   const raw = Number(process.env.TIHU_CLARIFY_MS ?? 15_000)
   if (!Number.isFinite(raw) || raw <= 0) return 15_000
   return clampInt(raw, 100, 60_000)
-}
-
-/** 「没听清派给谁」短提示在屏上停多久再回棋盘（默认 3 秒；TIHU_NOTICE_HOME_MS 可覆盖）。 */
-export function tihuNoticeHomeMs(): number {
-  const raw = Number(process.env.TIHU_NOTICE_HOME_MS ?? 3_000)
-  if (!Number.isFinite(raw) || raw <= 0) return 3_000
-  return clampInt(raw, 100, 30_000)
 }
 
 /**
@@ -724,10 +716,24 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   /** 唯一指挥会话 id（懒建一次；建不出来就直接上错误屏，不退回旧壳）。 */
   let commanderSessionId: string | undefined
   /**
-   * 慢路径兜底计时：一句已经投进指挥会话、还在等模型判项目的话。
-   * 同一时刻只留一句（设备一次只说一句）；新的慢路径会先清掉旧的。
+   * 正在等指挥台判项目的那句话（用户 2026-11-10：**不设超时**，一直等到它回）。
+   *
+   * 屏上每秒重画「已等 N 秒」；用户按「主页」回棋盘时判断照旧在后台跑，
+   * 只停止往屏上刷这一帧（`device.onBoard` 守门），任务卡仍留在棋盘排队区。
    */
-  let slowPathFallback: { text: string; commander: string; timer: ReturnType<typeof setTimeout> } | undefined
+  let commanderWait: {
+    text: string
+    key: string
+    taskId: string
+    startedAt: number
+    ticker: ReturnType<typeof setInterval>
+  } | undefined
+  /**
+   * 已上棋盘、还在等指挥台判项目的排队卡（字面归一化 key → taskId）。
+   * 指挥台晚到的 dispatch 按这句话认领同一张卡：**taskId 不变**，绝不新建第二张。
+   * 不设过期时间：用户拍板「一直等到判出结果」，卡只在转正 / 彻底失败 / 卸载时摘掉。
+   */
+  const pendingCommanderTask = new Map<string, { taskId: string; at: number }>()
   /**
    * 超时兜底已经派过的一句（按字面归一化后的 key）：指挥会话晚到的同一条 dispatch
    * 不能再建第二条任务。只挡模型这条入口，快路径重复说同一句不受影响。
@@ -737,7 +743,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const FALLBACK_DEDUPE_MS = 5 * 60_000
   /**
    * 灰区（会话衔接判不准）交给指挥台判一次的计时器：到点还没派出就按「一次澄清」处理。
-   * 与 slowPathFallback 分开：一个是「项目都不知道」，一个是「项目知道、接不接不知道」。
+   * 与「等指挥台判项目」分开：那一步不设超时，这里只是「接着哪条」的二次确认。
    */
   let grayFallback: {
     text: string
@@ -3097,7 +3103,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /** 派单决策的上下文（写 lane.log 的四个字段：项目命中方式、会话、置信分、是否澄清）。 */
   interface DispatchMeta {
-    /** 项目命中方式：name / folder / fragment / daily / append / slow-path / commander / clarify。 */
+    /** 项目命中方式：name / folder / fragment / daily / append / commander / clarify。 */
     via: string
     /** 会话衔接结论：append / new / gray。 */
     continuity: string
@@ -3105,6 +3111,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     confidence?: number
     /** 是否经过澄清：no（没问）/ asked（问了没答，按新建）/ yes（用户选了）。 */
     clarify: 'no' | 'asked' | 'yes'
+    /** 复用「等指挥台判断」的排队卡（taskId 不变，绝不新建第二张）。 */
+    reuseTaskId?: string
+    /** 回执屏上多写一句短提示（例如「指挥台没接住，先派给个人助手」）。 */
+    note?: string
   }
 
   /** 决策原因落 ~/.dsh/tihu/lane.log（项目命中方式、会话命中 id、置信分、是否澄清）。 */
@@ -3373,7 +3383,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     lastFrames.set(key, frame)
     pushFrame(device, frame)
     device.send('task.list', { board } satisfies TaskListPayload)
-    log(`tihu board device=${device.id} rows=${board.rows.length} page=${board.page.index + 1}/${board.page.total} running=${board.counts.running} awaiting=${board.counts.awaiting} queued=${board.counts.queued}`)
+    log(`tihu board device=${device.id} rows=${board.rows.length} page=${board.page.index + 1}/${board.page.total} awaiting=${board.counts.awaiting} running=${board.counts.running} queued=${board.counts.queued} done=${board.counts.done}`)
     device.boardHasRunning = board.rows.some((row) => row.state === 'running')
     ensureBoardTicker()
   }
@@ -3404,6 +3414,17 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (device.focusedTask !== undefined) continue
       if (device.onBoard !== true) continue
       sendBoard(device)
+    }
+  }
+
+  /**
+   * 只更新棋盘数据、不换屏：失败撤单时屏还停在错误页/等待页，
+   * 但下一次按「主页」必须看到这张卡已经没了（不能留一张假排队）。
+   */
+  function broadcastBoardSnapshot(): void {
+    const board = boardOf(tasks.list(), Date.now())
+    for (const device of devices) {
+      if (device.unified) device.send('task.list', { board } satisfies TaskListPayload)
     }
   }
 
@@ -4074,13 +4095,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /** 派单回执（屏 2）：停 5 秒自动回棋盘；任何交互都会取消这个计时。 */
-  function showReceipt(device: TihuDevice, task: TihuTask): void {
+  function showReceipt(device: TihuDevice, task: TihuTask, note?: string): void {
     const key = device.sessionId ?? '__unbound__'
-    const queuedAhead = tasks.list().filter((item) => item.state === 'queued' && item.taskId !== task.taskId).length
+    const queuedAhead = tasks.list().filter((item) => (item.state === 'queued' || item.state === 'dispatched') && item.taskId !== task.taskId).length
     const frame = receiptFrame({
       taskId: task.taskId,
       projectName: task.projectName,
       ...(task.folder === undefined ? {} : { folder: task.folder }),
+      ...(note === undefined || note === '' ? {} : { note }),
       queueAhead: queuedAhead,
       ...(queuedAhead > 0 ? { etaText: `${queuedAhead} 分钟` } : { etaText: '1 分钟' }),
     })
@@ -4104,7 +4126,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         //   执行中 → 进度页（屏 4，实时状态行＋第 N 步）
         //   已完成 → 完成页（屏 6；一句话播报在 turn/end 已进总线，这里不再重念正文）
         //   待决策 → 决策页（要人拍板，不能只留一颗棋盘状态点）
-        //   仍排队/已派出 → 回棋盘
+        //   仍排队中 → 回棋盘
         const latest = tasks.get(task.taskId) ?? task
         if (latest.state === 'running' || latest.state === 'awaiting') {
           if (openTask(target, latest.taskId)) {
@@ -4125,7 +4147,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
   }
 
-  /** 派单：建任务 ＋ 建 CU 会话 ＋ 投消息 ＋ 出回执。 */
+  /** 派单：建任务（或把「等指挥台判断」的排队卡转正）＋ 建 CU 会话 ＋ 投消息 ＋ 出回执。 */
   async function dispatchToCard(
     device: TihuDevice | undefined,
     text: string,
@@ -4135,17 +4157,38 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   ): Promise<TihuTask | undefined> {
     const folder = resolveTaskFolder(card)
     const decision: DispatchMeta = meta ?? { via: 'rule', continuity: 'new', clarify: 'no' }
-    const task = tasks.add({
-      title: title ?? text,
-      projectId: card.id,
-      projectName: card.name,
-      folder,
-      // 派单会话必须是 computer-use：设备屏要能看屏/点按，且必须是「项目文件夹」不变。
-      preset: DISPATCH_PRESET,
-    })
+    stopCommanderWait()
+    // 这句话是不是已经在等指挥台判断？是就**复用那张卡**（taskId 不变，绝不新建第二张）。
+    const reuseTaskId = decision.reuseTaskId ?? pendingCommanderTaskIdOf(text)
+    let task: TihuTask | undefined
+    if (reuseTaskId !== undefined) {
+      const existing = tasks.get(reuseTaskId)
+      if (existing !== undefined && existing.state !== 'archived') {
+        task = tasks.adopt(existing.taskId, {
+          title: title ?? text,
+          projectId: card.id,
+          projectName: card.name,
+          folder,
+          preset: DISPATCH_PRESET,
+        })
+      }
+    }
+    if (task === undefined) {
+      task = tasks.add({
+        title: title ?? text,
+        projectId: card.id,
+        projectName: card.name,
+        folder,
+        // 派单会话必须是 computer-use：设备屏要能看屏/点按，且必须是「项目文件夹」不变。
+        preset: DISPATCH_PRESET,
+      })
+    }
     const sessionId = await createSessionAt(folder, DISPATCH_PRESET)
     if (sessionId === undefined) {
       tasks.drop(task.taskId)
+      releasePendingCommanderTask(task.taskId)
+      refreshBoards()
+      broadcastBoardSnapshot()
       const message = '宿主还不能新建会话（sessionController.create 不可用，见 tihu 日志），这次没派出去'
       if (device !== undefined) {
         showInputError(device, new Error(message), '任务会话没建起来，请重说')
@@ -4166,18 +4209,23 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     const sent = await promptSession(sessionId, blocks)
     if (!sent.ok) {
       tasks.drop(task.taskId)
+      releasePendingCommanderTask(task.taskId)
+      refreshBoards()
+      broadcastBoardSnapshot()
       logDispatchDecision(card.name, sessionId, decision)
       if (device !== undefined) showInputError(device, sent.error, '任务会话没有接住这条消息，请重说')
       return undefined
     }
+    // 同一句话晚到的 dispatch 不能再建第二条任务（新建会话这条路同样要立去重牌）。
+    fallbackDispatch = { key: dispatchKeyOf(text), taskId: task.taskId, at: Date.now() }
+    releasePendingCommanderTask(task.taskId)
     log(`tihu dispatch task=${task.taskId} project=${card.id} session=${sessionId} folder=${folder} preset=${DISPATCH_PRESET}`)
-    // 派单已经发生（快路径 / 指挥会话 / 超时兜底 / 澄清）：所有兜底计时立刻撤掉。
-    clearSlowPathFallback()
+    // 派单已经发生（快路径 / 指挥会话 / 澄清）：灰区与澄清计时立刻撤掉。
     clearGrayFallback()
     clearClarifyPrompt()
     logDispatchDecision(card.name, sessionId, decision)
     if (device !== undefined) {
-      showReceipt(device, task)
+      showReceipt(device, task, decision.note)
       refreshBoards()
     }
     return task
@@ -4197,7 +4245,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     meta: DispatchMeta,
   ): Promise<TihuTask | undefined> {
     const folder = resolveTaskFolder(card)
-    clearSlowPathFallback()
+    stopCommanderWait()
     clearGrayFallback()
     clearClarifyPrompt()
     const existing = tasks.ofSession(target.sessionId)
@@ -4205,27 +4253,61 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       // 外部镜像卡不承接：用真正的鹈鹕任务接管这条会话（电脑端卡下一轮轮询会自己下屏）。
       archivePcTask(existing.taskId, Date.now(), 'tihu append')
     }
-    let task = existing !== undefined && existing.source === 'pc' ? undefined : existing
-    const createdTask = task === undefined
-    if (task === undefined) {
-      task = tasks.add({
-        title: text,
-        projectId: card.id,
-        projectName: card.name,
-        folder,
-        preset: DISPATCH_PRESET,
-        sessionIds: [target.sessionId],
-      })
-      tasks.attachSession(task.taskId, target.sessionId)
-    } else {
-      tasks.reopenForAppend(task.taskId)
+    // 这句已经在等指挥台判断：排队卡就是它，taskId 不变；这条会话改挂到这张卡上。
+    const reuseTaskId = meta.reuseTaskId ?? pendingCommanderTaskIdOf(text)
+    let task: TihuTask | undefined
+    if (reuseTaskId !== undefined) {
+      const reused = tasks.get(reuseTaskId)
+      if (reused !== undefined && reused.state !== 'archived') {
+        task = tasks.adopt(reused.taskId, {
+          title: text,
+          projectId: card.id,
+          projectName: card.name,
+          folder,
+          preset: DISPATCH_PRESET,
+        })
+        if (existing !== undefined && existing.taskId !== task.taskId) {
+          // 同一句话只留一张卡：会话从旧任务摘下来；旧任务还在跑就归档（不留一张永远不动的卡）。
+          tasks.detachSession(existing.taskId, target.sessionId)
+          if (existing.state !== 'done' && existing.state !== 'announced' && existing.state !== 'archived') {
+            const removed = tasks.archive(existing.taskId, Date.now())
+            if (removed !== undefined) appendTaskJournal(removed)
+            log(`tihu append replace old task=${existing.taskId} -> ${task.taskId}`)
+          }
+        }
+        tasks.attachSession(task.taskId, target.sessionId)
+      }
     }
+    const adoptedTask = task !== undefined
+    if (task === undefined) {
+      task = existing !== undefined && existing.source === 'pc' ? undefined : existing
+      if (task === undefined) {
+        task = tasks.add({
+          title: text,
+          projectId: card.id,
+          projectName: card.name,
+          folder,
+          preset: DISPATCH_PRESET,
+          sessionIds: [target.sessionId],
+        })
+        tasks.attachSession(task.taskId, target.sessionId)
+      } else {
+        tasks.reopenForAppend(task.taskId)
+      }
+    }
+    const createdTask = adoptedTask || task.state === 'queued' || task.state === 'dispatched'
     const sent = await promptSession(target.sessionId, [
       { type: 'text', text },
       { type: 'text', text: appendTailOf(card, folder) },
     ])
     if (!sent.ok) {
-      if (createdTask) tasks.drop(task.taskId)
+      // 排队卡是我们自己立的（或这条任务是新建的）：失败就撤掉，不能让棋盘上留一张假排队。
+      if (createdTask) {
+        tasks.drop(task.taskId)
+        releasePendingCommanderTask(task.taskId)
+        refreshBoards()
+        broadcastBoardSnapshot()
+      }
       logDispatchDecision(card.name, target.sessionId, meta)
       if (device !== undefined) showInputError(device, sent.error, '那条会话没接住这句话，请重说')
       return undefined
@@ -4234,10 +4316,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     tasks.noteMilestone(task.taskId, `追加：${taskTitleOf(text)}`)
     // 同一句晚到的模型 dispatch 不能再建第二条（这条任务已经派过了）。
     fallbackDispatch = { key: dispatchKeyOf(text), taskId: task.taskId, at: Date.now() }
+    releasePendingCommanderTask(task.taskId)
     logDispatchDecision(card.name, target.sessionId, meta)
     log(`tihu append task=${task.taskId} project=${card.id} session=${target.sessionId} folder=${folder} preset=${DISPATCH_PRESET}`)
     if (device !== undefined) {
-      showReceipt(device, task)
+      showReceipt(device, task, meta.note)
       refreshBoards()
     }
     return task
@@ -4325,6 +4408,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       return false
     }
     device.unified = true
+    // 灰区换屏（「正在看是不是接着做」）：停掉上一步的「已等 N 秒」秒表，排队卡留着。
+    stopCommanderWait()
     const key = device.sessionId ?? device.id
     device.onBoard = false
     const frame = noticeFrame({
@@ -4378,7 +4463,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     via: string,
   ): void {
     clearGrayFallback()
-    const waitMs = tihuSlowPathFallbackMs()
+    const waitMs = tihuGrayCommanderMs()
     const timer = setTimeout(() => {
       grayFallback = undefined
       if (disposed) return
@@ -4445,7 +4530,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       await dispatchToCard(undefined, text, card, undefined, { via, continuity: 'new', confidence: decision.confidence, clarify: 'asked' })
       return
     }
-    clearSlowPathFallback()
+    stopCommanderWait()
     clearGrayFallback()
     const displayKey = device?.sessionId ?? device?.id ?? targets[0].sessionId ?? targets[0].id
     lastFrames.set(displayKey, frame)
@@ -4595,99 +4680,91 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     if (!sent.ok) showInputError(device, sent.error, '指挥会话没有接住这句话，请重说')
   }
 
-  /** 派单字面归一化：去空白与标点、转小写（超时兜底的去重 key）。 */
+  /** 派单字面归一化：去空白与标点、转小写（去重与排队卡认领的 key）。 */
   function dispatchKeyOf(text: string): string {
     return String(text ?? '')
       .toLowerCase()
       .replace(/[\s，,。.!！?？:：、；;"'"'（）()\[\]【】《》\-_/\\]+/g, '')
   }
 
-  /** 清掉慢路径兜底计时（派单成功 / 新一句话 / 卸载时调用）。 */
-  function clearSlowPathFallback(): void {
-    if (slowPathFallback === undefined) return
-    clearTimeout(slowPathFallback.timer)
-    slowPathFallback = undefined
-  }
+  /* ---------- 等指挥台判断（用户 2026-11-10：不设超时，一直等到它判出结果） ---------- */
 
   /**
-   * 慢路径投递成功后开始计时：模型在窗口内没派出，就自己派。
+   * 这句话对应的「等指挥台判断」排队卡。
    *
-   * 这是「任务没建出来也不报错」的兜底：屏会一直停在「正在看该派给谁」等模型，
-   * 本机 strata 的 TTFT 实测 55s，用户等 40s 就是死屏。超时改走快路径的匹配分。
+   * 指挥台晚到的 dispatch 只带原话，不带任务 id；靠字面归一化找回同一张卡，
+   * 转正式任务时 **taskId 不变**，屏上不会凭空多出第二张。
    */
-  function armSlowPathFallback(device: TihuDevice, text: string, commander: string): void {
-    clearSlowPathFallback()
-    const waitMs = tihuSlowPathFallbackMs()
-    const timer = setTimeout(() => {
-      slowPathFallback = undefined
-      void runSlowPathFallback(device, text, commander, waitMs)
-    }, waitMs)
-    timer.unref?.()
-    slowPathFallback = { text, commander, timer }
-    log(`tihu slow-path armed session=${commander} after=${waitMs}ms`)
+  function pendingCommanderTaskIdOf(text: string): string | undefined {
+    const key = dispatchKeyOf(text)
+    const hit = pendingCommanderTask.get(key)
+    if (hit === undefined) return undefined
+    const task = tasks.get(hit.taskId)
+    if (task === undefined || task.state === 'archived') {
+      pendingCommanderTask.delete(key)
+      return undefined
+    }
+    return hit.taskId
+  }
+
+  /** 这张排队卡已经转成正式任务（或彻底失败）：从认领表里摘掉，并停掉秒表。 */
+  function releasePendingCommanderTask(taskId: string): void {
+    for (const [key, hit] of pendingCommanderTask) {
+      if (hit.taskId === taskId) pendingCommanderTask.delete(key)
+    }
+    if (commanderWait?.taskId === taskId) stopCommanderWait()
+  }
+
+  /** 停掉「已等 N 秒」的秒表（派单成功 / 新一句话 / 卸载时调用；排队卡本身不动）。 */
+  function stopCommanderWait(): void {
+    if (commanderWait === undefined) return
+    clearInterval(commanderWait.ticker)
+    commanderWait = undefined
+  }
+
+  /** 等待屏一帧：标题固定，正文第二行是「已等 N 秒」（每秒重画）。 */
+  function commanderWaitFrameOf(text: string, startedAt: number): ScreenFramePayload {
+    const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+    return {
+      ...noticeFrame({ stage: '派单', title: '正在看该派给谁', lines: [taskTitleOf(text, 16), `已等 ${seconds} 秒`], tone: 'busy' }),
+      // 等待不设超时：必须给一个「主页」出口，用户回棋盘后判断仍在后台继续。
+      actions: [{ id: 'taskBoard', label: '主页' }],
+    }
   }
 
   /**
-   * 超时兜底：按快路径的匹配分取最佳卡直接派单（与快路径同一条 dispatchToCard，
-   * 含 5 秒回执与派单尾巴）；一张卡都不像就只留一句「没听清派给谁」，3 秒后回棋盘。
-   * 超时本身写 lane.log，排查时能看到是哪句话、等了多久。
+   * 一句话刚进慢路径：**先**在棋盘上立一张排队卡（计入「●N 排队」），再投给指挥台。
+   * 投递失败也复用这张卡派出去，不会出现「屏上等半天、棋盘上什么都没有」。
    */
-  async function runSlowPathFallback(device: TihuDevice, text: string, commander: string, waitedMs: number): Promise<void> {
-    if (disposed) return
-    const seconds = Math.max(1, Math.round(waitedMs / 1000))
-    try {
-      appendTihuLaneLog(
-        commander,
-        new Error(`慢路径派单超时：${seconds} 秒内指挥会话没有派出「${taskTitleOf(text, 24)}」`),
-        'slow-path-timeout',
-      )
-    } catch { /* 日志失败不影响兜底 */ }
-    log(`tihu slow-path timeout session=${commander} after=${waitedMs}ms text=${JSON.stringify(text)}`)
-    let card: { id: string; name: string; folder?: string } | undefined
-    let via = 'slow-path'
-    try {
-      const cards = projectCards() ?? []
-      const route = routeQuick({ text, cards, tasks: tasks.list() })
-      if (route.kind === 'card') {
-        card = route.card
-        via = `slow-path:${route.via ?? 'card'}`
-      } else if (route.kind === 'daily') {
-        card = ASSISTANT_CARD
-        via = 'slow-path:daily'
-      } else {
-        card = bestCardMatchOf(text, cards)
-        if (card !== undefined) via = 'slow-path:best'
-      }
-    } catch (error) {
-      log(`tihu slow-path route failed: ${(error as Error)?.message ?? String(error)}`)
-    }
-    if (card === undefined) {
-      showSlowPathMiss(device, text)
-      return
-    }
-    // 先立去重牌再 await：指挥会话晚到的同一条 dispatch 不能再建第二条任务。
-    fallbackDispatch = { key: dispatchKeyOf(text), taskId: '', at: Date.now() }
-    // 项目已经兜底出来，接不接着旧会话仍走本地衔接：灰区只澄清一次（指挥台刚刚已经超时）。
-    const outcome = await dispatchWithContinuity(device, text, card, { via }, { allowCommander: false })
-    const task = outcome.task
-    if (task === undefined) {
-      fallbackDispatch = undefined
-      // 灰区只问一次就结束（不把去重牌留着，用户答完还要能派出去）。
-      if (outcome.message.includes('澄清')) log(`tihu slow-path fallback -> clarify project=${card.id}`)
-      return
-    }
-    fallbackDispatch = { key: dispatchKeyOf(text), taskId: task.taskId, at: Date.now() }
-    log(`tihu slow-path fallback task=${task.taskId} project=${card.id} session=${task.sessionIds[task.sessionIds.length - 1] ?? '-'}`)
+  function createCommanderPendingTask(text: string): TihuTask {
+    const task = tasks.add({
+      title: text,
+      projectId: ASSISTANT_CARD.id,
+      projectName: ASSISTANT_CARD.name,
+      preset: DISPATCH_PRESET,
+      waitingCommander: true,
+    })
+    pendingCommanderTask.set(dispatchKeyOf(text), { taskId: task.taskId, at: Date.now() })
+    refreshBoards()
+    log(`tihu commander pending task=${task.taskId} text=${JSON.stringify(text)}`)
+    return task
   }
 
-  /** 超时兜底的一张卡都不像：屏上只留一句短提示，停几秒自动回棋盘（不建任务、不假装派出）。 */
-  function showSlowPathMiss(device: TihuDevice, text: string): void {
+  /**
+   * 进入等待：所有统一设备上「派单 · 正在看该派给谁 / 已等 N 秒」，每 1 秒重画一次。
+   * `onBoard === true` 的设备（用户按了「主页」）不再刷屏——判断在后台继续。
+   */
+  function beginCommanderWait(device: TihuDevice, text: string, taskId: string): void {
+    stopCommanderWait()
+    const startedAt = Date.now()
     const key = device.sessionId ?? device.id
-    const frame = noticeFrame({ stage: '派单', title: '没听清派给谁', lines: [taskTitleOf(text, 16)], tone: 'idle' })
+    const frame = commanderWaitFrameOf(text, startedAt)
     lastFrames.set(key, frame)
     const targets = [...devices].filter((item) => item.unified)
     if (targets.length === 0) targets.push(device)
     for (const target of targets) {
+      // 新一句话要看的屏不能被上一条回执/完成页的计时抢走。
+      disarmAutoHome(target)
       if (target.receiptTimer !== undefined) {
         clearTimeout(target.receiptTimer)
         target.receiptTimer = undefined
@@ -4696,41 +4773,93 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       target.focusedTask = undefined
       target.onBoard = false
       pushFrame(target, frame)
-      armScreenHome(target, tihuNoticeHomeMs(), undefined, '派单')
     }
-    log(`tihu slow-path no card device=${device.id}`)
+    const ticker = setInterval(() => {
+      if (disposed || commanderWait === undefined) return
+      const next = commanderWaitFrameOf(text, startedAt)
+      // 重建指挥会话会改绑 device.sessionId：诊断用的 lastFrames 跟着新 id 走。
+      lastFrames.set(device.sessionId ?? device.id, next)
+      for (const target of devices) {
+        if (!target.unified) continue
+        // 用户回棋盘了：屏幕不再被秒表抢走，判断照旧在后台跑。
+        if (target.onBoard === true) continue
+        pushFrame(target, next)
+      }
+    }, 1_000)
+    ticker.unref?.()
+    commanderWait = { text, key, taskId, startedAt, ticker }
+    log(`tihu commander wait task=${taskId} session=${commanderSessionId ?? '-'} text=${JSON.stringify(text)}`)
   }
 
-  /** 慢路径：交给指挥会话的模型判项目（它再调 tihu dispatch）。 */
-  async function askCommander(device: TihuDevice, text: string): Promise<void> {
-    const commander = await ensureCommanderSession()
-    if (commander === undefined) {
-      showInputError(device, new Error('会话新建失败：宿主 sessionController 不可用'), '指挥会话还没建好，请重说')
-      return
-    }
-    device.unified = true
-    const key = device.sessionId ?? device.id
-    device.onBoard = false
-    const frame = noticeFrame({ stage: '派单', title: '正在看该派给谁', lines: [taskTitleOf(text, 16)], tone: 'busy' })
-    lastFrames.set(key, frame)
-    const targets = [...devices].filter((item) => item.unified)
-    if (targets.length === 0) targets.push(device)
-    for (const target of targets) {
-      // 新一句话要看的屏（慢路径的「正在看该派给谁」）不能被上一条回执的 5 秒计时抢走。
-      if (target.receiptTimer !== undefined) {
-        clearTimeout(target.receiptTimer)
-        target.receiptTimer = undefined
+  /**
+   * 投递本身失败才走这里（指挥会话丢失 / prompt 抛错，含「当前没有活动 agent」）。
+   *
+   * `promptSession` 已经试过退避重试与重建指挥会话；到这里说明指挥台确实接不住这句话，
+   * 立刻在「个人助手」下新建一条会话派出去，并在回执上留一句短提示。
+   * 再失败也必须给终态（撤掉排队卡 + 错误屏），不能停在「等指挥台」。
+   */
+  async function fallbackCommanderDispatch(
+    device: TihuDevice,
+    text: string,
+    pendingTaskId: string,
+    error: unknown,
+    stage: string,
+  ): Promise<void> {
+    stopCommanderWait()
+    const reason = (error as Error)?.message ?? String(error)
+    log(`tihu commander ${stage} failed -> personal assistant fallback: ${reason}`)
+    try {
+      const task = await dispatchToCard(device, text, ASSISTANT_CARD, undefined, {
+        via: 'commander-fallback',
+        continuity: 'new',
+        clarify: 'no',
+        reuseTaskId: pendingTaskId,
+        note: '指挥台没接住，先派给个人助手',
+      })
+      if (task !== undefined) {
+        device.send('event.progress', {
+          stage: '派单',
+          text: '指挥台没接住，已先派给个人助手',
+        } satisfies ProgressPayload)
+        log(`tihu commander fallback task=${task.taskId} session=${task.sessionIds[task.sessionIds.length - 1] ?? '-'}`)
+        return
       }
-      target.focusedTask = undefined
-      pushFrame(target, frame)
+    } catch (failure) {
+      log(`tihu commander fallback dispatch threw: ${(failure as Error)?.message ?? String(failure)}`)
     }
-    const sent = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: COMMANDER_TAIL }])
-    if (!sent.ok) {
-      showInputError(device, sent.error, '指挥会话没有接住这句话，请重说')
-      return
+    // 终态：排队卡撤掉，屏上明确说没派出去（绝不静默停住）。
+    const task = tasks.get(pendingTaskId)
+    if (task !== undefined && task.state !== 'archived') {
+      tasks.drop(pendingTaskId)
+      refreshBoards()
     }
-    // 投递成功才开始倒计时：投递本身就失败的话走上面的错误屏，不假装在等模型。
-    armSlowPathFallback(device, text, commander)
+    broadcastBoardSnapshot()
+    releasePendingCommanderTask(pendingTaskId)
+    showInputError(device, error, '指挥台没接住，个人助手也没派出去，请重说')
+  }
+
+  /** 慢路径：交给指挥会话的模型判项目（它再调 tihu dispatch）；投递后**无限等待**。 */
+  async function askCommander(device: TihuDevice, text: string): Promise<void> {
+    device.unified = true
+    stopCommanderWait()
+    // 先上棋盘：排队卡在投递之前就存在（用户要求：立刻计入「●N 排队」）。
+    const pending = createCommanderPendingTask(text)
+    try {
+      const commander = await ensureCommanderSession()
+      if (commander === undefined) {
+        await fallbackCommanderDispatch(device, text, pending.taskId, new Error('会话新建失败：宿主 sessionController 不可用'), 'ensure')
+        return
+      }
+      beginCommanderWait(device, text, pending.taskId)
+      const sent = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: COMMANDER_TAIL }])
+      if (!sent.ok) {
+        // 只有投递本身出错才兜底；投递成功就等，没有计时器。
+        await fallbackCommanderDispatch(device, text, pending.taskId, sent.error, 'prompt')
+      }
+    } catch (error) {
+      // 任何意外异常也要有终态（排队卡撤掉 + 错误屏），不能让设备静默停在等待。
+      await fallbackCommanderDispatch(device, text, pending.taskId, error, 'exception')
+    }
   }
 
   /** 撤一条任务：还没起跑就直接撤；起跑过的要先「停止」再撤（危险动作要确认）。 */
@@ -5056,14 +5185,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     dispatch: async (input) => {
       const text = String(input.text ?? '').trim()
       if (text === '') return '错误：dispatch 需要 text（用户原话，也就是「要做什么」）。'
-      // 超时兜底已经替这句话派过一次：指挥会话晚到的同一条 dispatch 不能建第二条任务。
+      // 同一句话已经派过一次（含「等指挥台判断」的排队卡转正）：晚到的 dispatch 不能建第二条任务。
       if (fallbackDispatch !== undefined
         && fallbackDispatch.key === dispatchKeyOf(text)
         && Date.now() - fallbackDispatch.at < FALLBACK_DEDUPE_MS) {
-        log(`tihu dispatch skipped duplicate after fallback text=${JSON.stringify(text)} task=${fallbackDispatch.taskId || '-'}`)
-        return fallbackDispatch.taskId === ''
-          ? '这条刚刚已经由超时兜底派出去了（正在建任务），不用再派一次。'
-          : `这条刚刚已经由超时兜底派成任务 ${fallbackDispatch.taskId} 了，不用再派一次。`
+        log(`tihu dispatch skipped duplicate text=${JSON.stringify(text)} task=${fallbackDispatch.taskId || '-'}`)
+        return `这条刚刚已经派成任务 ${fallbackDispatch.taskId} 了，不用再派一次。`
       }
       let card: { id: string; name: string; folder?: string } | undefined
       const folderHint = String(input.folder ?? '').trim()
@@ -5142,7 +5269,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     handleUpgrade,
     dispose: () => {
       disposed = true
-      clearSlowPathFallback()
+      stopCommanderWait()
+      pendingCommanderTask.clear()
       clearGrayFallback()
       clearClarifyPrompt()
       fallbackDispatch = undefined

@@ -106,6 +106,11 @@ export interface TihuTask {
   holdingForChildren?: boolean
   /** 挂起时主回合的那句结论（完成屏/播报用）。 */
   pendingResultLine?: string
+  /**
+   * 这句话还在等指挥台判项目（慢路径刚投出去、还没派）。
+   * 值是 `true` 时棋盘副行写「等指挥台判断」；判出结果后由 `adopt` 清掉。
+   */
+  waitingCommander?: boolean
   /** 归档时刻。 */
   archivedAt?: number
   /** journal 行写过没有（只写一次）。 */
@@ -115,19 +120,17 @@ export interface TihuTask {
 /** 登记簿里的状态；`archived` 是终态（任务移出棋盘，会话与文件夹原样保留）。 */
 export type TihuTaskState = TaskState | 'archived'
 
-/** 状态→屏上胶囊文字（文字优先，颜色只做辅助）。 */
+/** 状态→屏上胶囊文字（**全系统只有这四个词**：排队中 / 执行中 / 待决策 / 完成）。 */
 export function capsuleOf(state: TihuTaskState): string {
   switch (state) {
-    case 'queued': return '排队'
-    case 'dispatched': return '派单'
+    case 'queued':
+    case 'dispatched': return '排队中'
     case 'running': return '执行中'
     case 'awaiting': return '待决策'
-    case 'done': return '完成'
-    // 屏 1 的胶囊与图一致仍写「完成」；`announced` 是登记簿的第七态（已播报），
-    // 用于播报去重与归档，不再多造一个屏上词。
+    case 'done':
     case 'announced': return '完成'
     case 'archived': return '已归档'
-    default: return '排队'
+    default: return '排队中'
   }
 }
 
@@ -160,10 +163,12 @@ export function subLineOf(task: TihuTask, projectName?: string): string {
   const project = String(projectName ?? task.projectName ?? '').trim()
   if (task.source === 'pc') return project === '' ? '电脑端' : `电脑端 · ${project}`
   const head = project === '' ? '' : project
+  // 等指挥台判项目的话已经上棋盘（排队中）：副行必须说清它卡在哪一步。
+  if (task.waitingCommander === true) return head === '' ? '等指挥台判断' : `${head} · 等指挥台判断`
   if (task.state === 'queued') return head === '' ? '排队中' : `${head} · 排队中`
-  if (task.state === 'dispatched') return head === '' ? '已派出' : `${head} · 已派出`
+  if (task.state === 'dispatched') return head === '' ? '排队中' : `${head} · 排队中`
   if (isFinishedState(task.state)) return head === '' ? '已完成' : `${head} · 已完成`
-  if (task.step <= 0) return head === '' ? '已派出' : `${head} · 已派出`
+  if (task.step <= 0) return head === '' ? '执行中' : `${head} · 执行中`
   return head === '' ? `第 ${task.step} 步` : `${head} · 第 ${task.step} 步`
 }
 
@@ -272,17 +277,25 @@ export function boardOf(tasks: readonly TihuTask[], now: number, page = 0): Task
   }
 }
 
-/** 顶行三段计数（在跑 / 等你 / 排队）。 */
+/**
+ * 顶行四段计数（等你 / 在跑 / 排队 / 完成）。
+ *
+ * 口径固定成四个词：`awaiting`＝待决策；`running`＝执行中（含子代理还在跑）；
+ * `queued`＝排队中（真实 queued ＋ 已绑会话还没开跑的 dispatched）；`done`＝完成
+ * （含已播报）。空盘四段也都是 0，不省略任何一段。
+ */
 export function countsOf(tasks: readonly TihuTask[]): TaskBoardPayload['counts'] {
   let running = 0
   let awaiting = 0
   let queued = 0
+  let done = 0
   for (const task of tasks) {
     if (task.state === 'running') running += 1
     else if (task.state === 'awaiting') awaiting += 1
     else if (task.state === 'queued' || task.state === 'dispatched') queued += 1
+    else if (isFinishedState(task.state)) done += 1
   }
-  return { running, awaiting, queued }
+  return { running, awaiting, queued, done }
 }
 
 /** 新派一条任务的入参。 */
@@ -299,6 +312,8 @@ export interface NewTaskInput {
   state?: TihuTaskState
   /** 起跑时刻（时长环从它算）：电脑端会话＝最后一次活动时间。 */
   startedAt?: number
+  /** 还在等指挥台判项目（慢路径刚投出去）：棋盘副行写「等指挥台判断」。 */
+  waitingCommander?: boolean
   now?: number
 }
 
@@ -361,6 +376,7 @@ export class TaskLedger {
       updatedAt: now,
       summary: '',
       ...(input.folder === undefined || input.folder === '' ? {} : { folder: input.folder }),
+      ...(input.waitingCommander === true ? { waitingCommander: true } : {}),
     }
     this.tasks.set(task.taskId, task)
     // 用同一只时钟剪枝：调用方传了 now（单测假时钟）就不能拿真实时间比 3 天窗口。
@@ -415,6 +431,35 @@ export class TaskLedger {
     task.startedAt = task.startedAt === 0 ? now : task.startedAt
     task.updatedAt = now
     return task
+  }
+
+  /**
+   * 把「等指挥台判断」的排队卡转成正式任务：只改项目/文件夹/标题与等待标记，
+   * **taskId 不变**（用户 2026-11-10 要求：不许因为判出结果就冒出第二张卡）。
+   */
+  adopt(taskId: string, input: { title?: string; projectId: string; projectName: string; folder?: string; preset?: string; now?: number }): TihuTask | undefined {
+    const task = this.tasks.get(taskId)
+    if (task === undefined) return undefined
+    const now = input.now ?? Date.now()
+    const title = String(input.title ?? '').trim()
+    if (title !== '') task.title = taskTitleOf(title)
+    task.projectId = input.projectId
+    task.projectName = input.projectName
+    if (input.folder !== undefined && input.folder !== '') task.folder = input.folder
+    if (input.preset !== undefined && input.preset !== '') task.preset = input.preset
+    task.waitingCommander = undefined
+    task.updatedAt = now
+    return task
+  }
+
+  /** 一条会话改挂到另一张任务（同一句话转正式任务时，旧卡不再持有这条会话）。 */
+  detachSession(taskId: string, sessionId: string, now = Date.now()): void {
+    const task = this.tasks.get(taskId)
+    if (task === undefined) return
+    const at = task.sessionIds.indexOf(sessionId)
+    if (at < 0) return
+    task.sessionIds.splice(at, 1)
+    task.updatedAt = now
   }
 
   /** 会话开始跑（turn/start）：排队/派单/回答完 → 执行中。 */

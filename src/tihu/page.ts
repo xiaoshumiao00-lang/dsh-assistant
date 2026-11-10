@@ -141,7 +141,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-capsule { flex:none; font-size:11px; line-height:14px; font-weight:700; letter-spacing:.5px;
     padding:1px 5px; border-radius:4px; background:#1b2430; color:#9fb0c0; border:1px solid #2b3a4a; }
   #screen .board-capsule.running { color:#8ef0c4; border-color:#2a6b56; background:#10241e; }
-  #screen .board-capsule.dispatched { color:#9fd8ff; border-color:#2b5a7a; background:#0f1c26; }
+  /* 「已绑会话、还没开跑」仍属排队中：与 queued 同一套灰，不另造「派单」色 */
+  #screen .board-capsule.dispatched { color:#9fb0c0; border-color:#2b3a4a; background:#1b2430; }
   #screen .board-capsule.awaiting { color:#f7d98a; border-color:#7a5c1f; background:#241d0f; }
   #screen .board-capsule.done { color:#a9c8ff; border-color:#2b4a7a; background:#101a2b; }
   #screen .board-capsule.announced { color:#93a9c4; border-color:#33465c; background:#111820; }
@@ -162,7 +163,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-status { flex:none; width:14px; height:14px; box-sizing:border-box; margin-left:6px; margin-right:1px; }
   #screen .board-status.done, #screen .board-status.announced { width:12px; height:12px; border-radius:50%; background:#35d07f; }
   #screen .board-status.queued { width:12px; height:12px; border-radius:50%; background:none; border:1px solid #6f7d89; }
-  #screen .board-status.dispatched { width:12px; height:12px; border-radius:50%; background:none; border:1px solid #6fb3e5; }
+  #screen .board-status.dispatched { width:12px; height:12px; border-radius:50%; background:none; border:1px solid #6f7d89; }
   #screen .board-status.announced { background:#2fbf6b; }
   #screen .board-status.awaiting { width:14px; height:14px; border-radius:50%; background:var(--warn);
     color:#1b1305; font-size:11px; font-weight:700; line-height:14px; text-align:center; }
@@ -572,18 +573,18 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.connState = next;
     renderHomeTop();
   }
-  /** 顶行：本地时钟 HH:MM + 棋盘右端三段计数 / 信号柱（页面自己画，不读宿主帧）。 */
+  /** 顶行：本地时钟 HH:MM + 棋盘右端四段计数（等你/在跑/排队/完成）/ 信号柱（页面自己画，不读宿主帧）。 */
   function renderHomeTop() {
     var clock = $('homeClock');
     if (clock) clock.textContent = clockText();
     var counts = $('boardCounts');
     if (counts) {
-      counts.textContent = state.screenMode === 'board' ? fitTextPx(boardCountsText(state.board && state.board.counts), 170, 11) : '';
+      counts.textContent = state.screenMode === 'board' ? fitTextPx(boardCountsText(state.board && state.board.counts), 240, 11) : '';
     }
   }
 
   /* ---------- 任务棋盘（屏 1）：一行一任务 ----------
-   * 版式：顶行三段计数（●N 在跑 等你 排队）→ 最近 5 行任务。旧式翻页条已整体删除
+   * 版式：顶行四段计数（等你 在跑 排队 完成）→ 最近 5 行任务。旧式翻页条已整体删除
    * （用户 2026-11-09：设备屏不要上一页/下一页），5 行分掉原来那 28px，320×240 不溢出。
    * 每行只说三件事：状态胶囊（文字）、任务名、副行「项目 · 第 N 步」＋右侧时长环。
    * 没有任务时是**同一张棋盘的另一种脸**（空态），不另开一屏。
@@ -591,10 +592,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
 
   function boardCountsText(counts) {
     var c = counts || {};
-    // 三段计数**始终都在**（空盘也要看到三个 0）：设计 §8「顶行三段计数归零」，
-    // 不能因为某一档是 0 就把它省掉——省掉以后空盘顶行只剩「● 0 在跑」，和文档不一致。
-    // 宽度由 fitTextPx 兜底缩放，320px 放得下「●0 在跑　●0 等你　●0 排队」。
-    return '●' + (Number(c.running) || 0) + ' 在跑　●' + (Number(c.awaiting) || 0) + ' 等你　●' + (Number(c.queued) || 0) + ' 排队';
+    // 四段计数**始终都在**（空盘也要看到四个 0），顺序固定：等你 → 在跑 → 排队 → 完成。
+    // 段间用窄空格（小间距），不换行；宽度由 fitTextPx 兜底缩放。
+    return '●' + (Number(c.awaiting) || 0) + ' 等你' + '\u2009●' + (Number(c.running) || 0) + ' 在跑'
+      + '\u2009●' + (Number(c.queued) || 0) + ' 排队' + '\u2009●' + (Number(c.done) || 0) + ' 完成';
   }
   function applyScreenClass(base) {
     var screen = $('screen');
