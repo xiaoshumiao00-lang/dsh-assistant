@@ -364,10 +364,9 @@ export interface SessionBoundPayload {
  * `task.list` / `task.update` / `task.notify` 给固件与后续页面用同一份数据，不另造形状。
  */
 
-/** 任务状态（屏上胶囊文案就是它的中文映射，见 task-ledger.ts 的 capsuleOf）。 */
 /**
- * 任务七态（设计 §5）：排队 → 派单 → 执行中 → 待决策 → 完成 → 已播报 → 归档。
- * `announced` 是「完成且已播过」；归档在登记簿里用 `archived`（不移入下行屏）。
+ * 任务内部状态：queued/dispatched 都映射成屏上「排队中」；running 执行中、
+ * awaiting 待决策、done/announced 完成。屏上只出现这四个词（见 capsuleOf）。
  */
 export type TaskState = 'queued' | 'dispatched' | 'running' | 'awaiting' | 'done' | 'announced'
 
@@ -379,7 +378,7 @@ export interface TaskBoardRow {
   title: string
   /** 状态（文字胶囊的依据，不只靠颜色）。 */
   state: TaskState
-  /** 胶囊文字：排队 / 执行中 / 待决策 / 完成。 */
+  /** 胶囊文字：排队中 / 执行中 / 待决策 / 完成（全系统只用这四个词）。 */
   capsule: string
   /** 副行：「项目 · 第 N 步」。 */
   sub: string
@@ -399,8 +398,11 @@ export interface TaskBoardRow {
 /** 任务棋盘整屏。 */
 export interface TaskBoardPayload {
   rows: TaskBoardRow[]
-  /** 顶行三段计数（在跑 / 等你 / 排队）。 */
-  counts: { running: number; awaiting: number; queued: number }
+  /**
+   * 顶行四段计数（等你 / 在跑 / 排队 / 完成）。
+   * 顺序由页面决定；四段都始终下发（0 也要有），计数口径见 task-ledger.ts 的 countsOf。
+   */
+  counts: { running: number; awaiting: number; queued: number; done: number }
   page: { index: number; total: number }
   total: number
   /** 一个任务都没有：同一版式的空态（不另开一屏）。 */

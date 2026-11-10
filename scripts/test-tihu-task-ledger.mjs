@@ -94,7 +94,26 @@ test('新任务是排队态：没有步数、没有会话、不编用时', () =>
   assert.deepEqual(task.sessionIds, [])
   assert.equal(subLineOf(task, task.projectName), '青年基金申请书 · 排队中')
   assert.equal(ringOf(task, 1000).tone, 'empty')
-  assert.equal(capsuleOf(task.state), '排队')
+  assert.equal(capsuleOf(task.state), '排队中')
+})
+
+test('等指挥台判断：排队卡副行标等待；判出结果 adopt 同一 taskId 转正（不新建第二张）', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: '把这两个方向拿个主意', projectId: 'wt-assistant', projectName: '个人助手', waitingCommander: true, now: 1000 })
+  assert.equal(task.state, 'queued')
+  assert.equal(subLineOf(task), '个人助手 · 等指挥台判断')
+  const row = boardOf(ledger.list(), 1000).rows[0]
+  assert.equal(row.capsule, '排队中')
+  assert.equal(row.sub, '个人助手 · 等指挥台判断')
+  assert.deepEqual(countsOf(ledger.list()), { running: 0, awaiting: 0, queued: 1, done: 0 })
+  // 判出结果：同一张卡转成正式任务（项目/文件夹改掉，taskId 不变）。
+  ledger.adopt(task.taskId, { title: '把这两个方向拿个主意', projectId: 'card-fund', projectName: '青年基金申请书', folder: 'D:/fund', now: 2000 })
+  assert.equal(task.taskId, 't1', 'taskId 必须保持')
+  assert.equal(task.waitingCommander, undefined)
+  assert.equal(task.projectName, '青年基金申请书')
+  assert.equal(subLineOf(task), '青年基金申请书 · 排队中')
+  ledger.attachSession(task.taskId, 'session-x', 3000)
+  assert.equal(ledger.list().filter((item) => item.state !== 'archived').length, 1, '只有一张卡')
 })
 
 test('自动归档不早于 3 天（用户要求静置超过 3 天才允许）', () => {
@@ -128,7 +147,7 @@ test('绑上会话＝派单态；turn/start 才进执行中；attachSession 不�
   ledger.attachSession(task.taskId, 'session-aaaa', 1100)
   ledger.attachSession(task.taskId, 'session-aaaa', 1200)
   assert.equal(task.state, 'dispatched')
-  assert.equal(capsuleOf(task.state), '派单')
+  assert.equal(capsuleOf(task.state), '排队中')
   ledger.markRunning(task.taskId, 1300)
   assert.equal(task.state, 'running')
   assert.deepEqual(task.sessionIds, ['session-aaaa'])
@@ -273,7 +292,7 @@ test('子代理还在跑：任务保持执行中并带子任务计数；全部�
   assert.equal(task.holdingForChildren, undefined)
 })
 
-test('顶行三段计数在跑/等你/排队，完成不计数', () => {
+test('顶行四段计数：等你/在跑/排队/完成都在（空盘四段归零）', () => {
   const ledger = new TaskLedger()
   const a = ledger.add({ title: 'a', projectId: '1', projectName: '1' })
   const b = ledger.add({ title: 'b', projectId: '2', projectName: '2' })
@@ -284,7 +303,7 @@ test('顶行三段计数在跑/等你/排队，完成不计数', () => {
   ledger.attachSession(b.taskId, 'sb')
   ledger.ask(b.taskId, { question: 'q', options: ['x', 'y'], defaultIndex: 0, timeoutMs: 60_000 })
   ledger.complete(d.taskId, { resultLine: 'ok' })
-  assert.deepEqual(countsOf(ledger.list()), { running: 1, awaiting: 1, queued: 1 })
+  assert.deepEqual(countsOf(ledger.list()), { running: 1, awaiting: 1, queued: 1, done: 1 })
   assert.equal(ledger.list().length, 4)
 })
 
@@ -293,7 +312,7 @@ test('没有任务 = 同一版式的空态（empty=true，不是另一屏）', (
   const board = boardOf(ledger.list(), 1)
   assert.equal(board.empty, true)
   assert.deepEqual(board.rows, [])
-  assert.deepEqual(board.counts, { running: 0, awaiting: 0, queued: 0 })
+  assert.deepEqual(board.counts, { running: 0, awaiting: 0, queued: 0, done: 0 })
   assert.deepEqual(board.page, { index: 0, total: 1 })
   const frame = boardFrame(board)
   assert.equal(frame.mode, 'home')
@@ -964,15 +983,15 @@ test('电脑端外部任务：source=pc / p 前缀短号 / 副行「电脑端 ·
   assert.equal(subLineOf(second), '电脑端', '没有项目名时就直接「电脑端」')
 })
 
-test('电脑端外部任务计入「在跑/排队」，完成不计数；棋盘胶囊与鹈鹕任务同一套文字', () => {
+test('电脑端外部任务计入四段计数；棋盘胶囊与鹈鹕任务同一套四词', () => {
   const ledger = new TaskLedger()
   ledger.add({ title: '跑着的', projectId: 'pc:a', projectName: 'A', sessionIds: ['a'], source: 'pc', state: 'running' })
   ledger.add({ title: '排队的', projectId: 'pc:b', projectName: 'B', sessionIds: ['b'], source: 'pc', state: 'queued' })
   ledger.add({ title: '完成的', projectId: 'pc:c', projectName: 'C', sessionIds: ['c'], source: 'pc', state: 'done' })
-  assert.deepEqual(countsOf(ledger.list()), { running: 1, awaiting: 0, queued: 1 })
+  assert.deepEqual(countsOf(ledger.list()), { running: 1, awaiting: 0, queued: 1, done: 1 })
   const board = boardOf(ledger.list(), 10)
   assert.equal(board.total, 3)
-  assert.deepEqual(board.rows.map((row) => row.capsule), ['执行中', '排队', '完成'])
+  assert.deepEqual(board.rows.map((row) => row.capsule), ['执行中', '排队中', '完成'])
   assert.deepEqual(board.rows.map((row) => row.sub), ['电脑端 · A', '电脑端 · B', '电脑端 · C'])
 })
 

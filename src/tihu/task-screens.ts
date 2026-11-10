@@ -39,10 +39,13 @@ export function receiptFrame(input: {
   queueAhead: number
   /** 人类可读的预计开始时间，如「约 1 分钟」。 */
   etaText?: string
+  /** 额外一句短提示（例如「指挥台没接住，先派给个人助手」）。 */
+  note?: string
 }): ScreenFramePayload {
   const ahead = Math.max(0, Math.trunc(input.queueAhead))
   const folderName = shortFolderPath(input.folder)
   const bullets: string[] = []
+  if (input.note !== undefined && input.note.trim() !== '') bullets.push(input.note.trim())
   if (folderName !== '') bullets.push(`文件夹 ${folderName}`)
   bullets.push(input.etaText !== undefined && input.etaText !== '' ? `约 ${input.etaText}后开始跑` : '马上开始跑')
   bullets.push(`${RECEIPT_SECONDS} 秒后自动回棋盘`)
