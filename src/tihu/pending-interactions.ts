@@ -33,11 +33,19 @@ import {
 export const PENDING_QUESTION_FALLBACK = '电脑端在等你确认'
 /** 取不到真实选项时的单个固定选项。 */
 export const PENDING_OPTION_FALLBACK = '继续'
-/** 审批的两个选项（顺序＝屏上按钮顺序；首项＝默认项，与托管自动答同一个结果）。 */
+/** 审批的两个选项（顺序＝屏上按钮顺序；点选语义不变）。 */
 export const APPROVAL_OPTIONS: readonly string[] = ['允许一次', '拒绝']
 /** 与 {@link APPROVAL_OPTIONS} 一一对应的宿主审批结果（官方闭集）。 */
 export const APPROVAL_OUTCOMES: readonly string[] = ['allowed-once', 'rejected']
-/** 待决策倒计时（用户 2026-11-10：60 秒到点按默认项走）。 */
+/**
+ * 审批到点自动拍板的那一项：**「拒绝」**（用户 2026-11-10 拍板）。
+ *
+ * 只改超时的落点，不改按钮顺序与点选语义：首项仍是「允许一次」，设备点它照旧交回
+ * `allowed-once`；60 秒没人答才走 `rejected`（危险动作绝不自己放行，与「托管」替人答
+ * 首选项是两条不同的规则）。
+ */
+export const APPROVAL_DEFAULT_INDEX = APPROVAL_OPTIONS.indexOf('拒绝')
+/** 待决策倒计时（用户 2026-11-10：60 秒到点按默认项走；审批默认项＝拒绝）。 */
 export const DECISION_TIMEOUT_MS = 60_000
 /** 设备全掉线时多久改交给电脑端一次（毫秒）。 */
 export const PENDING_OFFLINE_CHECK_MS = 2_000
@@ -105,7 +113,8 @@ function displayReasonOf(request: any): string {
  * `approval/request` → 待决策。
  *
  * 真实可取的东西只有 `toolName` 与 `reason` / `displayReason`（审批请求没有选项列表）；
- * 两个选项按官方闭集固定成「允许一次 / 拒绝」，默认项＝允许一次（与托管自动答同一结果）。
+ * 两个选项按官方闭集固定成「允许一次 / 拒绝」；**到点默认「拒绝」**（用户 2026-11-10），
+ * 设备点「允许一次」仍交回 `allowed-once`。
  * @param request - 审批 waterfall 的请求对象。
  * @returns 待决策；没法定位会话时 null（调用方一律放行）。
  */
@@ -123,9 +132,9 @@ export function approvalDecisionOf(request: any): PendingDecision | null {
     question,
     ...(toolName === '' ? {} : { detail: toolName }),
     options: [...APPROVAL_OPTIONS],
-    defaultIndex: 0,
+    defaultIndex: APPROVAL_DEFAULT_INDEX,
     answerOf: (index) => {
-      const at = Number.isFinite(index) ? Math.max(0, Math.min(Math.trunc(index), APPROVAL_OUTCOMES.length - 1)) : 0
+      const at = Number.isFinite(index) ? Math.max(0, Math.min(Math.trunc(index), APPROVAL_OUTCOMES.length - 1)) : APPROVAL_DEFAULT_INDEX
       return APPROVAL_OUTCOMES[at]
     },
   }
