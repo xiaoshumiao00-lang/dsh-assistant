@@ -170,7 +170,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-pager button.off { color:#48525d; }
   #screen .board-pager .page { font-size:11px; line-height:12px; color:#c8d4dd; }
   /* 微条：最近 8 步耗时（只给节奏感，不显示数字） */
-  #screen .board-micro { display:flex; flex:none; align-items:flex-end; gap:2px; height:10px; margin-left:auto; margin-right:5px; }
+  #screen .board-micro { display:flex; flex:none; align-items:flex-end; gap:2px; height:10px; margin-left:2px; }
   #screen .board-micro span { width:2px; min-height:2px; background:#3fb6a8; border-radius:1px; opacity:.85; }
   /* 空态：没有任务时是同一张棋盘的另一种脸（不是另开一屏） */
   #screen .board-empty { display:flex; flex-direction:column; align-items:center; justify-content:center;
@@ -653,12 +653,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         merged.textContent = '+' + row.merged + ' 条';
         row1.appendChild(merged);
       }
-      var row2 = document.createElement('div');
-      row2.className = 'board-row2';
-      var sub = document.createElement('span');
-      sub.className = 'board-sub';
-      sub.textContent = row.sub || '';
-      row2.appendChild(sub);
+      // 微条放在标题行末尾：副行最右边只留「状态图形」这一枚（用户 2026-11-10 实机反馈：
+      // 右侧同时出现波形+圆环，看成两个状态了）。
       if (Array.isArray(row.micro) && row.micro.length > 0) {
         var micro = document.createElement('span');
         micro.className = 'board-micro';
@@ -669,8 +665,14 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
           bar.style.height = Math.max(2, Math.round(2 + ratio * 8)) + 'px';
           micro.appendChild(bar);
         }
-        row2.appendChild(micro);
+        row1.appendChild(micro);
       }
+      var row2 = document.createElement('div');
+      row2.className = 'board-row2';
+      var sub = document.createElement('span');
+      sub.className = 'board-sub';
+      sub.textContent = row.sub || '';
+      row2.appendChild(sub);
       /* 右侧状态图形（用户 2026-11-10 定案）：完成＝绿色实心圆（直径 12px）；
          待决策＝黄色圆形里的问号；排队/派单＝灰色细环；进行中＝蓝色圆环，弧长由宿主的
          ring.percent（已运行时长 ÷ 30 分钟）画出来，满 30 分钟后停在差一点的整圈。 */
