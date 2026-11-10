@@ -37,6 +37,10 @@ import {
   routeQuick,
   isPinnedBoardTask,
   bestCardMatchOf,
+  continuityAffinityOf,
+  continuityCueScore,
+  continuityOf,
+  continuityTimeScore,
   scoreCardAlias,
   stripWakeWord,
   subLineOf,
@@ -481,6 +485,60 @@ test('两个整名 → 屏 7 候选保留 HPG，不被个人助手挤掉', () =>
 test('文件夹兜底按顺序取第一个非空', () => {
   assert.equal(firstFolderOf([undefined, '', 'D:/a']), 'D:/a')
   assert.equal(firstFolderOf([undefined, '']), undefined)
+})
+
+/* ---------- 会话衔接（派单第二步：接着旧会话还是新建） ---------- */
+
+/** 造一条 CU 会话候选；`minutesAgo` 默认 5 分钟前动过。 */
+function cuSession(sessionId, title, options = {}) {
+  const { minutesAgo = 5, summary } = options
+  return {
+    sessionId,
+    title,
+    ...(summary === undefined ? {} : { summary }),
+    updatedAt: Date.now() - minutesAgo * 60_000,
+  }
+}
+
+const CONTEXT_NOW = Date.now()
+
+test('会话衔接：没有指代词、只靠内容重合也判为追加（指代词不是开关）', () => {
+  const text = '引言第三段压缩到八百字，数据核对一遍'
+  const sessions = [cuSession('s-fund', '青年基金申请书引言第三段压缩与数据核对')]
+  const decision = continuityOf({ text, sessions, now: CONTEXT_NOW, projectHints: ['青年基金申请书'] })
+  assert.equal(continuityCueScore(text), 0, '这句话里没有任何指代/续写词')
+  assert.equal(decision.kind, 'append')
+  assert.equal(decision.sessionId, 's-fund')
+  assert.ok(decision.confidence >= 0.54, `内容够像就该直接续：${decision.confidence}`)
+})
+
+test('会话衔接：指代词本身不构成追加（内容无关时最多到灰区）', () => {
+  const sessions = [cuSession('s-fund', '青年基金申请书引言第三段压缩')]
+  const unrelated = continuityOf({ text: '青年基金申请书预算表按新模板重算', sessions, now: CONTEXT_NOW, projectHints: ['青年基金申请书'] })
+  assert.equal(unrelated.kind, 'new', '同一个项目但不是同一件事 → 新建')
+  const pronounOnly = continuityOf({ text: '接着把青年基金申请书那个再改一下', sessions, now: CONTEXT_NOW, projectHints: ['青年基金申请书'] })
+  assert.notEqual(pronounOnly.kind, 'append', '光说「接着那个」不能硬塞给旧会话')
+  assert.equal(pronounOnly.kind, 'gray', '指代只能把结论推到灰区，交给下一步判')
+})
+
+test('会话衔接：完全不相关直接新建；没有 CU 会话也新建', () => {
+  const weather = [cuSession('s-weather', '武汉天气查询')]
+  assert.equal(continuityOf({ text: '帮我订个明天的会议室', sessions: weather, now: CONTEXT_NOW, projectHints: ['个人助手'] }).kind, 'new')
+  assert.equal(continuityOf({ text: '随便说点什么', sessions: [], now: CONTEXT_NOW }).kind, 'new')
+  assert.equal(continuityOf({ text: '', sessions: weather, now: CONTEXT_NOW }).kind, 'new')
+})
+
+test('会话衔接：两个候选分太近不猜（灰区），旧的会话时间分自然下降', () => {
+  const sessions = [
+    cuSession('s-a', '青年基金申请书引言第三段压缩', { minutesAgo: 3 }),
+    cuSession('s-b', '青年基金申请书引言第三段压缩', { minutesAgo: 4 }),
+  ]
+  const decision = continuityOf({ text: '青年基金申请书引言第三段压缩到八百字', sessions, now: CONTEXT_NOW, projectHints: ['青年基金申请书'] })
+  assert.equal(decision.kind, 'gray')
+  assert.ok(decision.sessionId !== undefined, '灰区也要带最像的那条（澄清屏要显示它的名字）')
+  assert.ok(continuityTimeScore(CONTEXT_NOW - 60_000, CONTEXT_NOW) > continuityTimeScore(CONTEXT_NOW - 3 * 86_400_000, CONTEXT_NOW))
+  assert.ok(continuityAffinityOf('引言第三段压缩', '青年基金申请书引言第三段压缩') > 0.5)
+  assert.equal(continuityAffinityOf('帮我订会议室', '青年基金申请书引言修改'), 0)
 })
 
 /* ---------- 口头命令 ---------- */

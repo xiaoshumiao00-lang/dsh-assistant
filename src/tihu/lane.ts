@@ -84,6 +84,8 @@ import {
   boardOf,
   capsuleOf,
   chineseIndex,
+  continuityCandidatesOf,
+  continuityOf,
   parseScreenCommand,
   plainSummaryOf,
   routeQuick,
@@ -91,7 +93,9 @@ import {
   stripWakeWord,
   subLineOf,
   taskTitleOf,
+  CONTINUITY_WINDOW_MS,
   type ScreenCommand,
+  type TihuSessionCandidate,
   type TihuTask,
 } from './task-ledger.ts'
 import {
@@ -99,6 +103,7 @@ import {
   RECEIPT_SECONDS,
   askWhichFrame,
   boardFrame,
+  clarifySessionFrame,
   decisionFrame,
   detailFrame,
   doneAnnouncementOf,
@@ -217,6 +222,18 @@ export function tihuSlowPathFallbackMs(): number {
   const raw = Number(process.env.TIHU_SLOW_PATH_FALLBACK_MS ?? 9_000)
   if (!Number.isFinite(raw) || raw <= 0) return 9_000
   return clampInt(raw, 50, 120_000)
+}
+
+/**
+ * 会话衔接澄清在屏上最多等多久（毫秒，默认 15 秒）。
+ *
+ * 「新建，还是接着刚才那条」只问一次；到点没答就按**新建**派出，不再追问。
+ * TIHU_CLARIFY_MS 可覆盖（夹在 100ms ~ 60s；0/负数/非数字回落默认）。
+ */
+export function tihuClarifyMs(): number {
+  const raw = Number(process.env.TIHU_CLARIFY_MS ?? 15_000)
+  if (!Number.isFinite(raw) || raw <= 0) return 15_000
+  return clampInt(raw, 100, 60_000)
 }
 
 /** 「没听清派给谁」短提示在屏上停多久再回棋盘（默认 3 秒；TIHU_NOTICE_HOME_MS 可覆盖）。 */
@@ -387,6 +404,19 @@ interface TihuDevice {
   homeTask?: string
   /** 歧义追问待选：用户下一句「一 / 二」就是在答它。 */
   pendingPick?: { candidates: { id: string; name: string; folder?: string }[]; text: string }
+  /**
+   * 会话衔接澄清待答（只问一次）：用户下一句「一/二」或在屏上点选。
+   * `sessionId` 空串表示没有可接着的候选（这时不会问，直接新建）。
+   */
+  pendingClarify?: {
+    text: string
+    card: { id: string; name: string; folder?: string }
+    sessionId: string
+    sessionTitle: string
+    confidence: number
+    /** 项目命中方式（写 lane.log 用）。 */
+    via: string
+  }
   /** 派单回执自动回棋盘的计时器（任何交互都取消它）。 */
   receiptTimer?: ReturnType<typeof setTimeout>
   /** 页面选中的音色（default / 克隆音色名）。 */
@@ -694,6 +724,24 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   let fallbackDispatch: { key: string; taskId: string; at: number } | undefined
   /** 兜底去重窗口：模型最晚也就一两分钟才回（实测 TTFT 55s），5 分钟足够。 */
   const FALLBACK_DEDUPE_MS = 5 * 60_000
+  /**
+   * 灰区（会话衔接判不准）交给指挥台判一次的计时器：到点还没派出就按「一次澄清」处理。
+   * 与 slowPathFallback 分开：一个是「项目都不知道」，一个是「项目知道、接不接不知道」。
+   */
+  let grayFallback: {
+    text: string
+    key: string
+    card: { id: string; name: string; folder?: string }
+    confidence: number
+    via: string
+    timer: ReturnType<typeof setTimeout>
+  } | undefined
+  /** 会话衔接澄清的屏上计时器（只问一次；到点按新建）。 */
+  let clarifyTimer: ReturnType<typeof setTimeout> | undefined
+  /** 已经问过澄清的句子（字面归一化 key → 问的时刻）：同一条任务不许重复追问。 */
+  const clarifyAsked = new Map<string, number>()
+  /** 重复追问窗口外的旧记录可以清掉（10 分钟足够覆盖一条任务）。 */
+  const CLARIFY_ONCE_MS = 10 * 60_000
   /* ---------- 电脑端会话镜像（source='pc'）的运行时状态 ---------- */
   /** 电脑端会话 id → 登记簿里的短号（`p1`…）：轮询与事件都按它认领任务。 */
   const pcTaskOfSession = new Map<string, string>()
@@ -2238,16 +2286,25 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           }
           if (actionId === 'pick1' || actionId === 'pick2') {
             const index = actionId === 'pick1' ? 1 : 2
+            if (device.pendingClarify !== undefined) {
+              await resolveClarify(device, index === 1 ? 'new' : 'same')
+              return
+            }
             const pick = device.pendingPick
             device.pendingPick = undefined
             const card = pick?.candidates[index - 1]
-            if (pick !== undefined && card !== undefined) await dispatchToCard(device, pick.text, card)
+            if (pick !== undefined && card !== undefined) await dispatchWithContinuity(device, pick.text, card, { via: 'pick' }, { allowCommander: true })
             return
           }
           if (actionId === 'pickNone') {
+            if (device.pendingClarify !== undefined) {
+              // 澄清屏只有两个选项（没有「都不是」按钮）；留着当「新建」处理，避免卡死。
+              await resolveClarify(device, 'new')
+              return
+            }
             const pick = device.pendingPick
             device.pendingPick = undefined
-            if (pick !== undefined) await dispatchToCard(device, pick.text, ASSISTANT_CARD)
+            if (pick !== undefined) await dispatchWithContinuity(device, pick.text, ASSISTANT_CARD, { via: 'pick-none' }, { allowCommander: true })
             return
           }
           if (actionId === 'send') {
@@ -2473,8 +2530,15 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   /** 日常任务的固定卡片（id 与客户端 ASSISTANT_PROJECT_ID 一致，落点＝助手 home）。 */
   const ASSISTANT_CARD = { id: 'wt-assistant', name: '个人助手' } as const
 
-  /** 目标算作「复杂任务」的预设永远是 standard（看屏/点鼠标的活由指挥会话显式指定）。 */
+  /**
+   * 指挥会话用的预设：standard（它只看单、不看屏）。
+   * 派单建的任务会话一律 {@link DISPATCH_PRESET}（computer-use），否则设备屏上的任务
+   * 不能看屏/点按，而且「非 CU 会话不上屏」的规则会把它们当电脑端会话处理。
+   */
   const TASK_PRESET = 'standard'
+
+  /** 派单会话（含「接着旧会话」复用）必须是 Computer Use 模式。 */
+  const DISPATCH_PRESET = TIHU_COMPUTER_USE_PRESET
 
   /** 指挥会话的尾巴：告诉模型「你只派单，不动手」。 */
   const COMMANDER_TAIL = '【指挥会话 · 铁律】你只负责判断「这件事该派给哪个项目」然后用 tihu 的 dispatch 派单；不要自己动手做正文。派完用一句话回主人（例如「已派给青年基金申请书」）。拿不准就只问一句。'
@@ -2758,6 +2822,94 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   function resolveTaskFolder(card: { folder?: string }): string {
     const folder = String(card.folder ?? '').trim()
     return folder !== '' ? folder : assistantFolder()
+  }
+
+  /* ---------- 会话衔接（同项目 CU 会话 → 追加 or 新建） ---------- */
+
+  /** 路径归一：反斜杠、去尾部分隔符、小写（Windows 大小写不敏感）。 */
+  function folderKeyOf(folder: string | undefined): string {
+    return String(folder ?? '').trim().replace(/[\\/]+$/, '').replace(/\//g, '\\').toLowerCase()
+  }
+
+  /** child 是否在 base 目录里（含 base 本身）。空路径一律不算。 */
+  function sameProjectFolder(base: string, child: string | undefined): boolean {
+    const left = folderKeyOf(base)
+    const right = folderKeyOf(child)
+    if (left === '' || right === '') return false
+    return right === left || right.startsWith(`${left}\\`)
+  }
+
+  /** 项目名/文件夹短名：算内容重合度前先剔掉，避免「同一个项目」被当成「同一件事」。 */
+  function continuityHintsOf(card: { name?: string }, folder: string): string[] {
+    const hints = [String(card.name ?? '').trim(), folderBase(folder)]
+    return hints.filter((hint, index) => [...hint].length >= 2 && hints.indexOf(hint) === index)
+  }
+
+  /**
+   * 该项目下最近的 CU 会话（最多 8 条）：只看 Computer Use 模式、同一项目文件夹、
+   * 7 天内有活动的；标题取会话投影，摘要取登记簿里绑在这条会话上的任务摘要/结果行。
+   *
+   * 列表走 collectSessionRows（60 秒缓存），所以这一步是毫秒级，不为每次派单多打宿主。
+   */
+  async function projectCuSessionsOf(card: { id: string; name: string; folder?: string }): Promise<TihuSessionCandidate[]> {
+    let rows: TihuSessionRow[] = []
+    try { rows = (await collectSessionRows()).rows } catch { rows = [] }
+    const folder = resolveTaskFolder(card)
+    const now = Date.now()
+    const candidates: TihuSessionCandidate[] = []
+    for (const row of rows) {
+      if (row.sessionId === commanderSessionId) continue
+      if (!isComputerUsePreset(row.preset)) continue
+      if (!sameProjectFolder(folder, row.cwd)) continue
+      if (!(row.updatedAt > 0) || now - row.updatedAt > CONTINUITY_WINDOW_MS) continue
+      const task = tasks.ofSession(row.sessionId)
+      const title = humanTitle(String(task?.title ?? row.title ?? ''))
+      const summary = String(task?.summary || task?.resultLine || task?.doneText || '').slice(0, 160)
+      candidates.push({
+        sessionId: row.sessionId,
+        title: title !== '' ? title : String(row.title ?? ''),
+        ...(summary === '' ? {} : { summary }),
+        updatedAt: row.updatedAt,
+      })
+    }
+    return continuityCandidatesOf(candidates)
+  }
+
+  /** 指挥台点名的会话：完整 id / 短号 / 标题（最后才做包含匹配）。 */
+  function findContinuityTarget(candidates: readonly TihuSessionCandidate[], ref: string): TihuSessionCandidate | undefined {
+    const key = String(ref ?? '').trim()
+    if (key === '') return undefined
+    const shortOf = (sessionId: string): string => sessionId.replace(/^session-/, '').slice(0, 8).toLowerCase()
+    const lower = key.toLowerCase()
+    return candidates.find((item) => item.sessionId === key)
+      ?? candidates.find((item) => shortOf(item.sessionId) === shortOf(key) || shortOf(item.sessionId) === lower)
+      ?? candidates.find((item) => item.title === key)
+      ?? candidates.find((item) => item.title.toLowerCase().includes(lower))
+  }
+
+  /** 派单决策的上下文（写 lane.log 的四个字段：项目命中方式、会话、置信分、是否澄清）。 */
+  interface DispatchMeta {
+    /** 项目命中方式：name / folder / fragment / daily / append / slow-path / commander / clarify。 */
+    via: string
+    /** 会话衔接结论：append / new / gray。 */
+    continuity: string
+    /** 本地置信分（0..1；没有就 undefined）。 */
+    confidence?: number
+    /** 是否经过澄清：no（没问）/ asked（问了没答，按新建）/ yes（用户选了）。 */
+    clarify: 'no' | 'asked' | 'yes'
+  }
+
+  /** 决策原因落 ~/.dsh/tihu/lane.log（项目命中方式、会话命中 id、置信分、是否澄清）。 */
+  function logDispatchDecision(projectName: string, sessionId: string | undefined, meta: DispatchMeta): void {
+    const confidence = meta.confidence === undefined ? '-' : meta.confidence.toFixed(2)
+    const message = `派单决策 项目=${projectName} 命中=${meta.via} 会话=${sessionId === undefined || sessionId === '' ? '新建' : sessionId} 衔接=${meta.continuity} 置信=${confidence} 澄清=${meta.clarify}`
+    try { appendTihuLaneLog(sessionId === undefined || sessionId === '' ? '-' : sessionId, new Error(message), 'dispatch-decision') } catch { /* 日志失败不影响派单 */ }
+    log(`tihu ${message}`)
+  }
+
+  /** 续聊尾巴：告诉任务会话「这是接着之前那条做」，别推翻已完成的部分。 */
+  function appendTailOf(card: { name: string }, folder: string): string {
+    return `【续聊 · 鹈鹕】这一句是接着本条会话前面的事继续做（项目「${card.name}」，工作目录 ${folder} 不变）。在已有进展上增量修改，别从头再来，也别动前面已经确认过的部分。做完后用简洁中文说明结果：先给结论，再给关键数字或进展，文字不要太长，适合直接朗读；不要表格、列表、代码块或长路径。`
   }
 
   /** 某项目「正在干什么」（追问屏的候选说明用）。 */
@@ -3766,22 +3918,25 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
   }
 
-  /** 派单：建任务 ＋ 建会话 ＋ 投消息 ＋ 出回执。 */
+  /** 派单：建任务 ＋ 建 CU 会话 ＋ 投消息 ＋ 出回执。 */
   async function dispatchToCard(
     device: TihuDevice | undefined,
     text: string,
     card: { id: string; name: string; folder?: string },
     title?: string,
+    meta?: DispatchMeta,
   ): Promise<TihuTask | undefined> {
     const folder = resolveTaskFolder(card)
+    const decision: DispatchMeta = meta ?? { via: 'rule', continuity: 'new', clarify: 'no' }
     const task = tasks.add({
       title: title ?? text,
       projectId: card.id,
       projectName: card.name,
       folder,
-      preset: TASK_PRESET,
+      // 派单会话必须是 computer-use：设备屏要能看屏/点按，且必须是「项目文件夹」不变。
+      preset: DISPATCH_PRESET,
     })
-    const sessionId = await createSessionAt(folder, TASK_PRESET)
+    const sessionId = await createSessionAt(folder, DISPATCH_PRESET)
     if (sessionId === undefined) {
       tasks.drop(task.taskId)
       const message = '宿主还不能新建会话（sessionController.create 不可用，见 tihu 日志），这次没派出去'
@@ -3804,12 +3959,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     const sent = await promptSession(sessionId, blocks)
     if (!sent.ok) {
       tasks.drop(task.taskId)
+      logDispatchDecision(card.name, sessionId, decision)
       if (device !== undefined) showInputError(device, sent.error, '任务会话没有接住这条消息，请重说')
       return undefined
     }
-    log(`tihu dispatch task=${task.taskId} project=${card.id} session=${sessionId} folder=${folder}`)
-    // 派单已经发生（不管是快路径、指挥会话还是超时兜底）：慢路径的兜底计时立刻撤掉。
+    log(`tihu dispatch task=${task.taskId} project=${card.id} session=${sessionId} folder=${folder} preset=${DISPATCH_PRESET}`)
+    // 派单已经发生（快路径 / 指挥会话 / 超时兜底 / 澄清）：所有兜底计时立刻撤掉。
     clearSlowPathFallback()
+    clearGrayFallback()
+    clearClarifyPrompt()
+    logDispatchDecision(card.name, sessionId, decision)
     if (device !== undefined) {
       showReceipt(device, task)
       refreshBoards()
@@ -3817,23 +3976,354 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return task
   }
 
-  /** 追加到已有任务：不新建、不乱选文件夹（沿用原任务会话的 cwd）。 */
-  async function appendToTask(device: TihuDevice, task: TihuTask, text: string): Promise<void> {
-    const sessionId = task.sessionIds[task.sessionIds.length - 1]
-    if (sessionId === undefined) {
-      await dispatchToCard(device, text, { id: task.projectId, name: task.projectName, ...(task.folder === undefined ? {} : { folder: task.folder }) })
-      return
+  /**
+   * 追加到已有 CU 会话（不新建、不换文件夹）：把用户这句 ＋ 续聊尾巴投进原会话。
+   *
+   * 任务记账：这个会话已经有鹈鹕任务就复用（完成态拉回执行中）；没有就补一条任务挂上，
+   * 但不新建会话。电脑端镜像任务（source='pc'）不当承接对象：那条卡是只读镜像。
+   */
+  async function appendToSession(
+    device: TihuDevice | undefined,
+    text: string,
+    card: { id: string; name: string; folder?: string },
+    target: { sessionId: string; title?: string },
+    meta: DispatchMeta,
+  ): Promise<TihuTask | undefined> {
+    const folder = resolveTaskFolder(card)
+    clearSlowPathFallback()
+    clearGrayFallback()
+    clearClarifyPrompt()
+    const existing = tasks.ofSession(target.sessionId)
+    if (existing !== undefined && existing.source === 'pc') {
+      // 外部镜像卡不承接：用真正的鹈鹕任务接管这条会话（电脑端卡下一轮轮询会自己下屏）。
+      archivePcTask(existing.taskId, Date.now(), 'tihu append')
     }
-    const sent = await promptSession(sessionId, [{ type: 'text', text }])
+    let task = existing !== undefined && existing.source === 'pc' ? undefined : existing
+    const createdTask = task === undefined
+    if (task === undefined) {
+      task = tasks.add({
+        title: text,
+        projectId: card.id,
+        projectName: card.name,
+        folder,
+        preset: DISPATCH_PRESET,
+        sessionIds: [target.sessionId],
+      })
+      tasks.attachSession(task.taskId, target.sessionId)
+    } else {
+      tasks.reopenForAppend(task.taskId)
+    }
+    const sent = await promptSession(target.sessionId, [
+      { type: 'text', text },
+      { type: 'text', text: appendTailOf(card, folder) },
+    ])
     if (!sent.ok) {
-      showInputError(device, sent.error, '那条任务的会话没接住这条话，请重说')
-      return
+      if (createdTask) tasks.drop(task.taskId)
+      logDispatchDecision(card.name, target.sessionId, meta)
+      if (device !== undefined) showInputError(device, sent.error, '那条会话没接住这句话，请重说')
+      return undefined
     }
     tasks.markRunning(task.taskId)
     tasks.noteMilestone(task.taskId, `追加：${taskTitleOf(text)}`)
-    log(`tihu append task=${task.taskId} session=${sessionId}`)
-    showReceipt(device, task)
-    refreshBoards()
+    // 同一句晚到的模型 dispatch 不能再建第二条（这条任务已经派过了）。
+    fallbackDispatch = { key: dispatchKeyOf(text), taskId: task.taskId, at: Date.now() }
+    logDispatchDecision(card.name, target.sessionId, meta)
+    log(`tihu append task=${task.taskId} project=${card.id} session=${target.sessionId} folder=${folder} preset=${DISPATCH_PRESET}`)
+    if (device !== undefined) {
+      showReceipt(device, task)
+      refreshBoards()
+    }
+    return task
+  }
+
+  /** 派单结果（给指挥台回话用）。 */
+  interface DispatchOutcome {
+    task?: TihuTask
+    message: string
+  }
+
+  /**
+   * 派单第二步：项目定了之后判「接着哪条 CU 会话」。
+   *
+   * 高置信 append → 投回原会话；明确无关 new → 同项目新建；
+   * 灰区 → 有人允许就问指挥台判一次（allowCommander），否则只问用户一次（屏上澄清）。
+   */
+  async function dispatchWithContinuity(
+    device: TihuDevice | undefined,
+    text: string,
+    card: { id: string; name: string; folder?: string },
+    meta: { via: string },
+    options: { allowCommander?: boolean } = {},
+  ): Promise<DispatchOutcome> {
+    let candidates: TihuSessionCandidate[] = []
+    try {
+      candidates = await projectCuSessionsOf(card)
+    } catch (error) {
+      log(`tihu continuity list failed: ${(error as Error)?.message ?? String(error)}`)
+    }
+    const folder = resolveTaskFolder(card)
+    const decision = continuityOf({
+      text,
+      sessions: candidates,
+      now: Date.now(),
+      projectHints: continuityHintsOf(card, folder),
+    })
+    const hitSession = decision.kind === 'append' ? decision.sessionId : decision.kind === 'gray' ? decision.sessionId ?? '-' : '-'
+    log(`tihu continuity project=${card.id} via=${meta.via} kind=${decision.kind} score=${decision.confidence.toFixed(2)} session=${hitSession} ${decision.reason}`)
+
+    if (decision.kind === 'append') {
+      const target = candidates.find((item) => item.sessionId === decision.sessionId)
+      const task = await appendToSession(
+        device,
+        text,
+        card,
+        { sessionId: decision.sessionId, ...(target?.title === undefined || target.title === '' ? {} : { title: target.title }) },
+        { via: meta.via, continuity: 'append', confidence: decision.confidence, clarify: 'no' },
+      )
+      if (task === undefined) return { message: '错误：那条会话没接住这句话。' }
+      return { task, message: `已接着「${task.projectName}」原有会话派出：${task.title}（任务 ${task.taskId}）` }
+    }
+
+    if (decision.kind === 'new') {
+      const task = await dispatchToCard(device, text, card, undefined, { via: meta.via, continuity: 'new', confidence: decision.confidence, clarify: 'no' })
+      if (task === undefined) return { message: '错误：这条任务没派出去（宿主不能新建会话，或任务会话没接住消息）。' }
+      return { task, message: `已派给「${task.projectName}」：${task.title}（任务 ${task.taskId}，落在 ${task.folder ?? '默认目录'}）` }
+    }
+
+    // 灰区：先让指挥台判一次（项目已知时也可以直接问用户，见 showSessionClarify）。
+    if (options.allowCommander === true && device !== undefined) {
+      const asked = await askGrayCommander(device, text, card, decision, candidates, meta.via)
+      return {
+        message: asked
+          ? '这句话的衔接在灰区：已请指挥会话判一次（接着哪条 / 还是新建）。'
+          : '这句话的衔接在灰区：设备屏上会问一次「新建，还是接着刚才那条」。',
+      }
+    }
+    await showSessionClarify(device, text, card, decision, candidates, meta.via)
+    return { message: '已在设备屏上问一次：新建，还是接着刚才那条（同一条任务只问一次，不答就按新建派出）。' }
+  }
+
+  /** 灰区交给指挥台判一次：给它候选会话短号，它用 dispatch(session=…) 或 newSession 回话。 */
+  async function askGrayCommander(
+    device: TihuDevice,
+    text: string,
+    card: { id: string; name: string; folder?: string },
+    decision: { confidence: number; sessionId?: string },
+    candidates: readonly TihuSessionCandidate[],
+    via: string,
+  ): Promise<boolean> {
+    const commander = await ensureCommanderSession()
+    if (commander === undefined) {
+      await showSessionClarify(device, text, card, { ...decision }, candidates, via)
+      return false
+    }
+    device.unified = true
+    const key = device.sessionId ?? device.id
+    device.onBoard = false
+    const frame = noticeFrame({
+      stage: '派单',
+      title: '正在看是不是接着做',
+      lines: candidates.length > 0 ? [taskTitleOf(text, 16), `候选 ${candidates.length} 条会话`] : [taskTitleOf(text, 16)],
+      tone: 'busy',
+    })
+    lastFrames.set(key, frame)
+    const targets = [...devices].filter((item) => item.unified)
+    if (targets.length === 0) targets.push(device)
+    for (const target of targets) {
+      if (target.receiptTimer !== undefined) {
+        clearTimeout(target.receiptTimer)
+        target.receiptTimer = undefined
+      }
+      disarmAutoHome(target)
+      target.focusedTask = undefined
+      pushFrame(target, frame)
+    }
+    const list = candidates.map((candidate, index) => {
+      const short = candidate.sessionId.replace(/^session-/, '').slice(0, 8)
+      const at = candidate.updatedAt > 0 ? new Date(candidate.updatedAt).toISOString().slice(5, 16).replace('T', ' ') : '未知时间'
+      return `${index + 1}. ${candidate.title || '未命名会话'}（${short} · ${at}）`
+    })
+    const tail = [
+      `【会话衔接 · 灰区】项目「${card.name}」下最近有这些 Computer Use 会话：`,
+      list.length === 0 ? '（还没有 CU 会话）' : list.join('\n'),
+      `用户这句话：「${text}」`,
+      '判断它是不是接着其中某条在做（内容连续、指代、时间接近都算），然后**只调一次** tihu dispatch：',
+      '· 接着某条 → dispatch 带 session=<那条的短号>（例如 session="98bb83cb"）',
+      '· 确实是一件新事 → dispatch 带 newSession=true',
+      '不要自己动手做正文；拿不准就 newSession=true。',
+    ].join('\n')
+    const sent = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: tail }])
+    if (!sent.ok) {
+      await showSessionClarify(device, text, card, { ...decision }, candidates, via)
+      return false
+    }
+    armGrayFallback(device, text, card, decision, candidates, via)
+    return true
+  }
+
+  /** 灰区计时：指挥台在窗口内没派出 → 屏上澄清一次（不答就新建）。 */
+  function armGrayFallback(
+    device: TihuDevice,
+    text: string,
+    card: { id: string; name: string; folder?: string },
+    decision: { confidence: number; sessionId?: string },
+    candidates: readonly TihuSessionCandidate[],
+    via: string,
+  ): void {
+    clearGrayFallback()
+    const waitMs = tihuSlowPathFallbackMs()
+    const timer = setTimeout(() => {
+      grayFallback = undefined
+      if (disposed) return
+      try {
+        appendTihuLaneLog('-', new Error(`灰区衔接超时：${Math.round(waitMs / 1000)} 秒内指挥台没有派出「${taskTitleOf(text, 24)}」`), 'continuity-gray-timeout')
+      } catch { /* 日志失败不影响兜底 */ }
+      log(`tihu continuity-gray timeout after=${waitMs}ms text=${JSON.stringify(text)}`)
+      void showSessionClarify(device, text, card, decision, candidates, via)
+        .catch((error) => log(`tihu clarify failed: ${(error as Error)?.message ?? String(error)}`))
+    }, waitMs)
+    timer.unref?.()
+    grayFallback = { text, key: dispatchKeyOf(text), card, confidence: decision.confidence, via, timer }
+  }
+
+  function clearGrayFallback(): void {
+    if (grayFallback === undefined) return
+    clearTimeout(grayFallback.timer)
+    grayFallback = undefined
+  }
+
+  /** 清掉屏上澄清（所有设备）与该计时器。 */
+  function clearClarifyPrompt(): void {
+    if (clarifyTimer !== undefined) {
+      clearTimeout(clarifyTimer)
+      clarifyTimer = undefined
+    }
+    for (const item of devices) item.pendingClarify = undefined
+  }
+
+  /**
+   * 灰区且指挥台也没结论：屏上只问一次「新建，还是接着刚才那条」。
+   * 已经问过同一条任务就不再问（直接按新建）；没有候选会话也直接新建。
+   */
+  async function showSessionClarify(
+    device: TihuDevice | undefined,
+    text: string,
+    card: { id: string; name: string; folder?: string },
+    decision: { confidence: number; sessionId?: string },
+    candidates: readonly TihuSessionCandidate[],
+    via: string,
+  ): Promise<void> {
+    const key = dispatchKeyOf(text)
+    const askedAt = clarifyAsked.get(key)
+    if (askedAt !== undefined && Date.now() - askedAt < CLARIFY_ONCE_MS) {
+      await dispatchToCard(device, text, card, undefined, { via, continuity: 'new', confidence: decision.confidence, clarify: 'asked' })
+      return
+    }
+    clarifyAsked.set(key, Date.now())
+    for (const [oldKey, at] of clarifyAsked) {
+      if (Date.now() - at > CLARIFY_ONCE_MS) clarifyAsked.delete(oldKey)
+    }
+    const sessionId = decision.sessionId ?? ''
+    if (sessionId === '') {
+      // 没有可接着的会话：不必问，直接按新建。
+      await dispatchToCard(device, text, card, undefined, { via, continuity: 'new', confidence: decision.confidence, clarify: 'no' })
+      return
+    }
+    const sessionTitle = candidates.find((item) => item.sessionId === sessionId)?.title ?? ''
+    const frame = clarifySessionFrame({ sessionTitle })
+    const targets = [...devices].filter((item) => item.unified)
+    if (targets.length === 0 && device !== undefined) targets.push(device)
+    if (targets.length === 0) {
+      // 没有任何屏可问：按新建（灰区绝不猜旧会话）。
+      await dispatchToCard(undefined, text, card, undefined, { via, continuity: 'new', confidence: decision.confidence, clarify: 'asked' })
+      return
+    }
+    clearSlowPathFallback()
+    clearGrayFallback()
+    const displayKey = device?.sessionId ?? device?.id ?? targets[0].sessionId ?? targets[0].id
+    lastFrames.set(displayKey, frame)
+    for (const target of targets) {
+      disarmAutoHome(target)
+      if (target.receiptTimer !== undefined) {
+        clearTimeout(target.receiptTimer)
+        target.receiptTimer = undefined
+      }
+      target.pendingPick = undefined
+      target.pendingClarify = {
+        text,
+        card,
+        sessionId,
+        sessionTitle,
+        confidence: decision.confidence,
+        via,
+      }
+      target.focusedTask = undefined
+      target.onBoard = false
+      pushFrame(target, frame)
+    }
+    if (clarifyTimer !== undefined) clearTimeout(clarifyTimer)
+    const timer = setTimeout(() => {
+      clarifyTimer = undefined
+      if (disposed) return
+      const waiting = [...devices].find((item) => item.pendingClarify !== undefined)
+      const pending = waiting?.pendingClarify
+      if (pending === undefined) return
+      clearClarifyPrompt()
+      log(`tihu clarify timeout text=${JSON.stringify(pending.text)}`)
+      void dispatchToCard(waiting, pending.text, pending.card, undefined, {
+        via: pending.via,
+        continuity: 'new',
+        confidence: pending.confidence,
+        clarify: 'asked',
+      }).catch((error) => log(`tihu clarify timeout dispatch failed: ${(error as Error)?.message ?? String(error)}`))
+    }, tihuClarifyMs())
+    timer.unref?.()
+    clarifyTimer = timer
+    log(`tihu clarify ask project=${card.id} session=${sessionId} score=${decision.confidence.toFixed(2)} title=${JSON.stringify(sessionTitle)}`)
+  }
+
+  /** 用户在屏上/口头答澄清：一＝新建，二＝接着那条。答完立刻派出，不再追问。 */
+  async function resolveClarify(device: TihuDevice, choice: 'new' | 'same'): Promise<void> {
+    const pending = device.pendingClarify
+    if (pending === undefined) return
+    clearClarifyPrompt()
+    if (choice === 'same' && pending.sessionId !== '') {
+      await appendToSession(
+        device,
+        pending.text,
+        pending.card,
+        { sessionId: pending.sessionId, ...(pending.sessionTitle === '' ? {} : { title: pending.sessionTitle }) },
+        { via: pending.via, continuity: 'append', confidence: pending.confidence, clarify: 'yes' },
+      )
+      return
+    }
+    await dispatchToCard(device, pending.text, pending.card, undefined, {
+      via: pending.via,
+      continuity: 'new',
+      confidence: pending.confidence,
+      clarify: 'yes',
+    })
+  }
+
+  /** 澄清待答的一句话/一次点选：「一/二」「新建/接着」都认。 */
+  function clarifyChoiceOf(text: string): 'new' | 'same' | undefined {
+    const clean = String(text ?? '').replace(/[\s，,。.!！?？:：、；;]+/g, '')
+    if (clean === '') return undefined
+    const index = chineseIndex(clean)
+    if (index === 1) return 'new'
+    if (index === 2) return 'same'
+    if (/^(?:新建|新的|新的一条|新会话|另起|另开|重新开|单开)$/.test(clean)) return 'new'
+    if (/^(?:接着|继续|原来那条|原来的|刚才那条|那条|同一个|同一会话|还那条)$/.test(clean)) return 'same'
+    return undefined
+  }
+
+  /** 追加到已有任务（routeQuick 的 append 出口）：仍要过一遍会话衔接判定。 */
+  async function appendToTask(device: TihuDevice, task: TihuTask, text: string): Promise<void> {
+    const card = { id: task.projectId, name: task.projectName, ...(task.folder === undefined ? {} : { folder: task.folder }) }
+    const outcome = await dispatchWithContinuity(device, text, card, { via: 'append' }, { allowCommander: true })
+    if (outcome.task === undefined && outcome.message.startsWith('错误')) {
+      showInputError(device, new Error(outcome.message), '这条没派出去，请重说')
+    }
   }
 
   /** 歧义追问（屏 7）：只问一次；用户答「一 / 二 / 都不是」。 */
@@ -3947,12 +4437,20 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     } catch { /* 日志失败不影响兜底 */ }
     log(`tihu slow-path timeout session=${commander} after=${waitedMs}ms text=${JSON.stringify(text)}`)
     let card: { id: string; name: string; folder?: string } | undefined
+    let via = 'slow-path'
     try {
       const cards = projectCards() ?? []
       const route = routeQuick({ text, cards, tasks: tasks.list() })
-      if (route.kind === 'card') card = route.card
-      else if (route.kind === 'daily') card = ASSISTANT_CARD
-      else card = bestCardMatchOf(text, cards)
+      if (route.kind === 'card') {
+        card = route.card
+        via = `slow-path:${route.via ?? 'card'}`
+      } else if (route.kind === 'daily') {
+        card = ASSISTANT_CARD
+        via = 'slow-path:daily'
+      } else {
+        card = bestCardMatchOf(text, cards)
+        if (card !== undefined) via = 'slow-path:best'
+      }
     } catch (error) {
       log(`tihu slow-path route failed: ${(error as Error)?.message ?? String(error)}`)
     }
@@ -3962,9 +4460,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
     // 先立去重牌再 await：指挥会话晚到的同一条 dispatch 不能再建第二条任务。
     fallbackDispatch = { key: dispatchKeyOf(text), taskId: '', at: Date.now() }
-    const task = await dispatchToCard(device, text, card)
+    // 项目已经兜底出来，接不接着旧会话仍走本地衔接：灰区只澄清一次（指挥台刚刚已经超时）。
+    const outcome = await dispatchWithContinuity(device, text, card, { via }, { allowCommander: false })
+    const task = outcome.task
     if (task === undefined) {
       fallbackDispatch = undefined
+      // 灰区只问一次就结束（不把去重牌留着，用户答完还要能派出去）。
+      if (outcome.message.includes('澄清')) log(`tihu slow-path fallback -> clarify project=${card.id}`)
       return
     }
     fallbackDispatch = { key: dispatchKeyOf(text), taskId: task.taskId, at: Date.now() }
@@ -4118,12 +4620,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       return
     }
     if (command.kind === 'pick') {
+      if (device.pendingClarify !== undefined) {
+        await resolveClarify(device, command.index === 1 ? 'new' : 'same')
+        return
+      }
       if (device.pendingPick !== undefined) {
         const pick = device.pendingPick
         device.pendingPick = undefined
         const card = pick.candidates[command.index - 1]
         if (card !== undefined) {
-          await dispatchToCard(device, pick.text, card)
+          await dispatchWithContinuity(device, pick.text, card, { via: 'pick' }, { allowCommander: true })
           return
         }
       }
@@ -4135,25 +4641,34 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /**
    * 一句设备输入（统一指挥模式）的完整分流。
-   * 顺序：歧义待选 → 屏上命令 → 快路径规则 → 慢路径（指挥会话的模型）。
+   * 顺序：澄清待答 → 歧义待选 → 屏上命令 → 快路径规则（项目 + 本地会话衔接）→ 慢路径。
    */
   async function dispatchUtterance(device: TihuDevice, text: string): Promise<void> {
     // 唤醒词是设备噪声（「你好，鹈鹕，帮我查一下…」）：进门先剥掉一层，
     // 屏上命令、任务标题、派单文本都不再带「你好，鹈鹕」。
     const value = stripWakeWord(String(text ?? ''))
     if (value === '') return
+    // 会话衔接澄清待答：「一/二」「新建/接着」立刻派；说了别的就先把原来那句按新建派出去。
+    if (device.pendingClarify !== undefined) {
+      const choice = clarifyChoiceOf(value)
+      if (choice !== undefined) {
+        await resolveClarify(device, choice)
+        return
+      }
+      await resolveClarify(device, 'new')
+    }
     const pick = device.pendingPick
     if (pick !== undefined) {
       const index = chineseIndex(value)
       if (index !== undefined && index <= pick.candidates.length) {
         device.pendingPick = undefined
         const card = pick.candidates[index - 1]
-        await dispatchToCard(device, pick.text, card)
+        await dispatchWithContinuity(device, pick.text, card, { via: 'pick' }, { allowCommander: true })
         return
       }
       if (/^(都不是|都不对|不对)/.test(value)) {
         device.pendingPick = undefined
-        await dispatchToCard(device, pick.text, ASSISTANT_CARD)
+        await dispatchWithContinuity(device, pick.text, ASSISTANT_CARD, { via: 'pick' }, { allowCommander: true })
         return
       }
       device.pendingPick = undefined
@@ -4170,7 +4685,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
     const route = routeQuick({ text: value, cards: projectCards() ?? [], tasks: tasks.list() })
     if (route.kind === 'card') {
-      await dispatchToCard(device, value, route.card)
+      await dispatchWithContinuity(device, value, route.card, { via: route.via ?? 'card' }, { allowCommander: true })
       return
     }
     if (route.kind === 'append') {
@@ -4178,7 +4693,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       return
     }
     if (route.kind === 'daily') {
-      await dispatchToCard(device, value, ASSISTANT_CARD)
+      await dispatchWithContinuity(device, value, ASSISTANT_CARD, { via: 'daily' }, { allowCommander: true })
       return
     }
     if (route.kind === 'ambiguous') {
@@ -4353,9 +4868,40 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       }
       if (card === undefined) card = ASSISTANT_CARD
       const device = [...devices].find((item) => item.unified)
-      const task = await dispatchToCard(device, text, card, input.title)
-      if (task === undefined) return '错误：这条任务没派出去（宿主不能新建会话，或任务会话没接住消息）。'
-      return `已派给「${task.projectName}」：${task.title}（任务 ${task.taskId}，落在 ${task.folder ?? '默认目录'}）`
+      const key = dispatchKeyOf(text)
+      // 灰区正在等指挥台这一句结论：它带 session = 接着那条，不带 = 明确新建。
+      const grayResolution = grayFallback !== undefined && grayFallback.key === key
+      const grayConfidence = grayResolution ? grayFallback?.confidence : undefined
+      const sessionHint = String(input.session ?? '').trim()
+      if (sessionHint !== '') {
+        const candidates = await projectCuSessionsOf(card)
+        const target = findContinuityTarget(candidates, sessionHint)
+        if (target === undefined) {
+          return `没找到要接着的会话「${sessionHint}」：它必须是该项目文件夹下的 Computer Use 会话（可以先用 list_sessions 看短号）。`
+        }
+        const task = await appendToSession(
+          device,
+          text,
+          card,
+          { sessionId: target.sessionId, ...(target.title === '' ? {} : { title: target.title }) },
+          { via: 'commander', continuity: 'append', confidence: grayConfidence ?? 1, clarify: 'no' },
+        )
+        if (task === undefined) return '错误：那条会话没接住这条消息（宿主投递失败）。'
+        return `已接着「${task.projectName}」原有会话派出：${task.title}（任务 ${task.taskId}）`
+      }
+      if (input.newSession === true || grayResolution) {
+        const task = await dispatchToCard(device, text, card, input.title, {
+          via: 'commander',
+          continuity: 'new',
+          ...(grayConfidence === undefined ? {} : { confidence: grayConfidence }),
+          clarify: grayResolution ? 'yes' : 'no',
+        })
+        if (task === undefined) return '错误：这条任务没派出去（宿主不能新建会话，或任务会话没接住消息）。'
+        return `已派给「${task.projectName}」：${task.title}（任务 ${task.taskId}，落在 ${task.folder ?? '默认目录'}）`
+      }
+      // 没点名接哪条：本地衔接先判；灰区只问用户一次（指挥台已经在这条链路上，不能再递归问它）。
+      const outcome = await dispatchWithContinuity(device, text, card, { via: 'commander' }, { allowCommander: false })
+      return outcome.message
     },
     listTasks: () => tasks.list()
       .filter((task) => task.state !== 'archived')
@@ -4390,6 +4936,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     dispose: () => {
       disposed = true
       clearSlowPathFallback()
+      clearGrayFallback()
+      clearClarifyPrompt()
       fallbackDispatch = undefined
       stopPcSync()
       if (detailTicker !== undefined) clearInterval(detailTicker)

@@ -471,6 +471,40 @@ export function askWhichFrame(input: {
   }
 }
 
+/**
+ * 会话衔接澄清（只问一次）：灰区且指挥台也给不出结论时，屏上问「新建，还是接着刚才那条」。
+ *
+ * 两个选项固定为「1 新建 / 2 接着<那条会话>」：用户点按钮或说「一/二」都走同一条路。
+ * 超时（lane 的计时器）按「新建」走，所以这里不设倒计时数字，避免屏上读秒与实际动作不一致。
+ */
+export function clarifySessionFrame(input: {
+  /** 候选会话名（没有就写「刚才那条」）。 */
+  sessionTitle?: string
+  taskId?: string
+}): ScreenFramePayload {
+  const title = clipScreenTitle('新建，还是接着刚才那条？')
+  // 会话名截到 8 个字：屏上一行放得下，且不会把「接着「…」」折成两行。
+  const rawLabel = String(input.sessionTitle ?? '').trim() || '刚才那条'
+  const labelChars = [...rawLabel]
+  const sessionLabel = labelChars.length > 8 ? `${labelChars.slice(0, 7).join('')}…` : rawLabel
+  const bullets = ['1 新建一条独立会话', `2 接着「${sessionLabel}」`]
+  return {
+    stage: '澄清',
+    title,
+    bullets: fitScreenLines(bullets, SCREEN_SPEC.maxBodyLines),
+    ask: {
+      candidates: [
+        { index: 1, projectName: '新建会话', source: '' },
+        { index: 2, projectName: `接着「${sessionLabel}」`, source: '' },
+      ],
+    },
+    actions: [{ id: 'pick1', label: '新建' }, { id: 'pick2', label: '接着' }],
+    ...(input.taskId === undefined ? {} : { taskId: input.taskId }),
+    tone: 'alert',
+    mode: 'status',
+  }
+}
+
 /** 一句提示屏（撤单、停止、归档这类轻动作的结果；不占棋盘也不进气泡）。 */
 export function noticeFrame(input: { stage: string; title: string; lines?: readonly string[]; tone?: 'idle' | 'busy' | 'ok' | 'alert'; taskId?: string }): ScreenFramePayload {
   return {

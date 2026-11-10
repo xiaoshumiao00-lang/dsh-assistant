@@ -2621,6 +2621,8 @@ function unifiedWorkspace(options = {}) {
   // 额外种子会话（电脑端外部任务那组用）：必须在 runtimeFor 之前放进去，
   // 投影缓存 fixture 是按数组快照建 Map 的，晚 push 的会话查不到标题。
   if (Array.isArray(options.records)) records.push(...options.records)
+  // 会话衔接那组：种子会话要落在临时目录里（fundFolder/home 在函数内才建好）。
+  if (typeof options.seedSessions === 'function') records.push(...options.seedSessions({ root, home, fundFolder }))
   // 宿主真实建会话入口（2026-11-09 修复）：sessionController.create/rename。
   const sessionController = {
     create: async (request) => {
@@ -2782,7 +2784,7 @@ await testAsync('统一指挥：日常小事派到「个人助手」文件夹，
   await waitMs(90)
   assert.equal(w.created.length, 1, '要新建一条任务会话')
   assert.equal(w.created[0].cwd, w.home, '日常任务落助手 home（与长按悬浮球一致）')
-  assert.equal(w.created[0].agentPreset, 'standard', '日常任务一律 standard')
+  assert.equal(w.created[0].agentPreset, 'computer-use', '派单会话一律 computer-use（设备屏要能看屏/点按）')
   assert.equal(w.prompted.length, 1, '原话要进任务会话')
   assert.equal(w.prompted[0].blocks[0].text, '现在几点了')
   const dispatchTail = String(w.prompted[0].blocks[1].text)
@@ -4317,6 +4319,198 @@ await testAsync('慢路径：投递成功后 turn/start 不抢屏，tihu dispatc
     await waitMs(520)
     assert.equal(w.created.length, 1, '派单成功后兜底必须撤销，不能重复建任务：' + JSON.stringify(w.created))
     assert.equal(framesOf(socket).some((frame) => frame.type === 'screen.frame' && frame.payload.title === '没听清派给谁'), false)
+  } finally {
+    delete process.env.TIHU_SLOW_PATH_FALLBACK_MS
+    w.cleanup()
+  }
+})
+
+/* ---------- 2026-11-10 派单重设计：会话级衔接（项目 → 接着旧 CU 会话 or 新建） ---------- */
+
+/** 会话衔接用例的公共种子：项目文件夹里一条 CU 会话，最近 5 分钟动过。 */
+function seedInFund(folder, id = 'session-cu-fund', title = '青年基金申请书引言第三段压缩与数据核对') {
+  return [cuRecord(id, {
+    live: false,
+    preset: 'computer-use',
+    cwd: folder,
+    title,
+    lastPromptAt: Date.now() - 5 * 60_000,
+  })]
+}
+
+await testAsync('派单衔接：完全无关 → 个人助手下新建一条 computer-use 会话（项目文件夹不变）', async () => {
+  const w = unifiedWorkspace({
+    seedSessions: ({ home }) => [cuRecord('session-cu-weather', {
+      live: false,
+      preset: 'computer-use',
+      cwd: home,
+      title: '武汉天气查询',
+      lastPromptAt: Date.now() - 60_000,
+    })],
+  })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-cont-new', protocol: '0' }, 1)))
+    await waitMs(50)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+    await waitMs(120)
+
+    assert.equal(w.created.length, 1, '无关的新任务要新建会话')
+    assert.equal(w.created[0].cwd, w.home, '落个人助手文件夹')
+    assert.equal(w.created[0].agentPreset, 'computer-use', '派单会话必须是 computer-use')
+    assert.equal(w.prompted[0].id, 'session-task-1', '新任务投进新会话，不塞给天气那条')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('派单决策 项目=个人助手'), 'lane.log 要写项目命中方式：' + log)
+    assert.ok(log.includes('命中=daily'), '日常小事命中方式=daily：' + log)
+    assert.ok(log.includes('衔接=new'), '明确无关 → new')
+    assert.ok(log.includes('澄清=no'), '没进灰区就不该澄清')
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('派单衔接：相关且语义连续（没有指代词）→ 追加到原 CU 会话，不新建、不换文件夹', async () => {
+  const w = unifiedWorkspace({ seedSessions: ({ fundFolder }) => seedInFund(fundFolder) })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-cont-append', protocol: '0' }, 1)))
+    await waitMs(50)
+    const text = '青年基金申请书引言第三段压缩到八百字，数据核对一遍'
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, 2)))
+    await waitMs(150)
+
+    assert.equal(w.created.length, 0, '有衔接就不许新建会话')
+    assert.equal(w.prompted.length, 1, '只投一次：投给原会话')
+    assert.equal(w.prompted[0].id, 'session-cu-fund', '这句要投到原来那条 CU 会话：' + JSON.stringify(w.prompted.map((item) => item.id)))
+    assert.equal(w.prompted[0].blocks[0].text, text, '用户原话原样投递')
+    const tail = String(w.prompted[0].blocks[1].text)
+    assert.ok(tail.includes('【续聊 · 鹈鹕】'), '续聊要带尾巴：' + tail)
+    assert.ok(tail.includes('青年基金申请书'), '尾巴要带项目名')
+    assert.ok(tail.includes(`工作目录 ${w.fundFolder}`), '尾巴要说明文件夹不变')
+    const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
+    assert.equal(receipt?.payload.title, '已派给 青年基金申请书', '追加也出同一张回执')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('命中=name'), '项目命中方式要落盘：' + log)
+    assert.ok(log.includes('会话=session-cu-fund'), '会话命中 id 要落盘')
+    assert.ok(log.includes('衔接=append'), '决策原因要落盘')
+    assert.ok(/置信=0\.\d\d/.test(log), '置信分要落盘：' + log)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('派单衔接：同一项目但明显另一件事 → 同项目文件夹新建独立 CU 会话', async () => {
+  const w = unifiedWorkspace({ seedSessions: ({ fundFolder }) => seedInFund(fundFolder) })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-cont-independent', protocol: '0' }, 1)))
+    await waitMs(50)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '青年基金申请书预算表按新模板重算', source: 'voice' }, 2)))
+    await waitMs(150)
+
+    assert.equal(w.created.length, 1, '不衔接就要新建一条独立会话')
+    assert.equal(w.created[0].cwd, w.fundFolder, '文件夹仍是项目文件夹')
+    assert.equal(w.created[0].agentPreset, 'computer-use')
+    assert.equal(w.prompted[0].id, 'session-task-1', '新任务不塞进旧会话')
+    assert.ok(String(w.prompted[0].blocks[1].text).includes('这句话已派到「青年基金申请书」'), '新会话用派单尾巴')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('衔接=new'), '决策原因要落盘：' + log)
+    assert.ok(log.includes('会话=session-task-1'), '新建时也写会话 id')
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('派单衔接：灰区 → 指挥台超时 → 屏上澄清一次，选「二 接着」立刻追加原会话', async () => {
+  process.env.TIHU_SLOW_PATH_FALLBACK_MS = '120'
+  process.env.TIHU_CLARIFY_MS = '800'
+  const w = unifiedWorkspace({ seedSessions: ({ fundFolder }) => seedInFund(fundFolder, 'session-cu-fund', '青年基金申请书引言第三段压缩') })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-cont-gray', protocol: '0' }, 1)))
+    await waitMs(50)
+    const text = '接着把青年基金申请书那个再改一下'
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, 2)))
+    await waitMs(300)
+
+    const clarify = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '澄清')
+    assert.equal(clarify.length, 1, '灰区且指挥台没结论 → 只问一次：' + JSON.stringify(clarify.map((frame) => frame.payload.title)))
+    assert.equal(clarify[0].payload.title, '新建，还是接着刚才那条？')
+    assert.ok(clarify[0].payload.bullets.some((line) => String(line).includes('接着「青年基金申请书')), '第二个选项要写清接着哪条：' + JSON.stringify(clarify[0].payload.bullets))
+    assert.ok(w.prompted.some((item) => item.id === 'session-cmd'), '灰区要先让指挥台判一次')
+
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '二', source: 'voice' }, 3)))
+    await waitMs(120)
+    assert.equal(w.created.length, 0, '选了「接着」就不新建会话')
+    assert.equal(w.prompted.filter((item) => item.id === 'session-cu-fund').length, 1, '要把这句投到原会话')
+    const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
+    assert.equal(receipt?.payload.title, '已派给 青年基金申请书')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('澄清=yes'), '用户选完要落盘：' + log)
+    assert.ok(log.includes('衔接=append'))
+  } finally {
+    delete process.env.TIHU_SLOW_PATH_FALLBACK_MS
+    delete process.env.TIHU_CLARIFY_MS
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('派单衔接：灰区澄清超时 → 默认新建（同一条只问一次，不重复追问）', async () => {
+  process.env.TIHU_SLOW_PATH_FALLBACK_MS = '100'
+  process.env.TIHU_CLARIFY_MS = '150'
+  const w = unifiedWorkspace({ seedSessions: ({ fundFolder }) => seedInFund(fundFolder, 'session-cu-fund', '青年基金申请书引言第三段压缩') })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-cont-timeout', protocol: '0' }, 1)))
+    await waitMs(50)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '接着把青年基金申请书那个再改一下', source: 'voice' }, 2)))
+    await waitMs(600)
+
+    assert.equal(w.created.length, 1, '澄清超时要按默认新建：' + JSON.stringify(w.created))
+    assert.equal(w.created[0].cwd, w.fundFolder)
+    assert.equal(w.created[0].agentPreset, 'computer-use')
+    assert.equal(w.prompted.filter((item) => item.id === 'session-cu-fund').length, 0, '超时不许续到旧会话')
+    assert.equal(framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '澄清').length, 1, '只问一次')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('澄清=asked'), '超时按新建要落盘：' + log)
+    // 再等一个澄清窗口，确认没有第二次追问、也没有第二条任务。
+    await waitMs(400)
+    assert.equal(w.created.length, 1, '不许重复派单')
+    assert.equal(framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '澄清').length, 1, '同一条任务不重复追问')
+  } finally {
+    delete process.env.TIHU_SLOW_PATH_FALLBACK_MS
+    delete process.env.TIHU_CLARIFY_MS
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('派单衔接：指挥台判出「接着那条」→ dispatch(session=短号) 直接追加，不再澄清', async () => {
+  process.env.TIHU_SLOW_PATH_FALLBACK_MS = '800'
+  const w = unifiedWorkspace({ seedSessions: ({ fundFolder }) => seedInFund(fundFolder, 'session-cu-fund', '青年基金申请书引言第三段压缩') })
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-cont-commander', protocol: '0' }, 1)))
+    await waitMs(50)
+    const text = '接着把青年基金申请书那个再改一下'
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, 2)))
+    await waitMs(120)
+    assert.ok(w.prompted.some((item) => item.id === 'session-cmd'), '灰区先问指挥台')
+    const reply = await w.runtime.control.dispatch({ text, session: 'cu-fund' })
+    await waitMs(100)
+    assert.ok(String(reply).includes('已接着'), '指挥台给出结论：' + reply)
+    assert.equal(w.created.length, 0, '判出接续就不新建')
+    assert.equal(w.prompted.filter((item) => item.id === 'session-cu-fund').length, 1)
+    assert.equal(framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '澄清').length, 0, '指挥台给了结论就不用问用户')
   } finally {
     delete process.env.TIHU_SLOW_PATH_FALLBACK_MS
     w.cleanup()

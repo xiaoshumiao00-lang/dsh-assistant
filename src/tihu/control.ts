@@ -114,6 +114,10 @@ export interface ControlDispatchInput {
   folder?: string
   /** 指定标题（不给就用原话规范化）。 */
   title?: string
+  /** 指定「接着这条 CU 会话」：会话短号或标题关键词（灰区由指挥台判出来的结论）。 */
+  session?: string
+  /** 明确新建一条独立会话（指挥台判「不是接着之前那条」时的结论）。 */
+  newSession?: boolean
 }
 
 /**
@@ -239,6 +243,8 @@ export interface TihuControlArgs {
   target?: string
   /** 派单：自定义标题（可选；不给就按原话规范化）。 */
   title?: string
+  /** 派单：明确新建（灰区由指挥台判「不是接着之前那条」时用）。 */
+  newSession?: boolean
 }
 
 /** handler 可用的上下文。 */
@@ -276,6 +282,7 @@ export function normalizeControlArgs(raw: unknown): TihuControlArgs {
   const target = typeof targetRaw === 'string' && targetRaw.trim() !== '' ? targetRaw.trim() : undefined
   const titleRaw = input.title
   const title = typeof titleRaw === 'string' && titleRaw.trim() !== '' ? titleRaw.trim() : undefined
+  const newSession = input.newSession === true
   return {
     action,
     ...(session === undefined ? {} : { session }),
@@ -284,6 +291,7 @@ export function normalizeControlArgs(raw: unknown): TihuControlArgs {
     ...(text === undefined ? {} : { text }),
     ...(target === undefined ? {} : { target }),
     ...(title === undefined ? {} : { title }),
+    ...(newSession ? { newSession } : {}),
   }
 }
 
@@ -445,7 +453,7 @@ defineAction('open_recent', '点首页「最近回答」行，打开最近有回
  * lane 的派单器按「卡片文件夹 → 模板最新步骤目录 → 绑定会话 cwd → 助手 home」定，
  * 模型指错也不会写错地方。
  */
-defineAction('dispatch', '派单：把用户的一句话派给某个项目文件夹的新任务会话去执行（text 必填＝用户原话；target 可选＝项目卡名或文件夹关键词）。指挥会话自己不要动手做正文，一律走这个 action。', async (args, api) => {
+defineAction('dispatch', '派单：把用户的一句话派给某个项目的 Computer Use 任务会话去执行（text 必填＝用户原话；target 可选＝项目卡名或文件夹关键词；session 可选＝接着那条已有 CU 会话的短号/标题；newSession=true 表示明确新建）。指挥会话自己不要动手做正文，一律走这个 action。', async (args, api) => {
   if (args.text === undefined) {
     throw new Error('dispatch 需要 text 参数（用户原话）。只传项目名不行：要派的是「做什么」。')
   }
@@ -453,6 +461,8 @@ defineAction('dispatch', '派单：把用户的一句话派给某个项目文件
     text: args.text,
     ...(args.target === undefined ? {} : { project: args.target }),
     ...(args.title === undefined ? {} : { title: args.title }),
+    ...(args.session === undefined ? {} : { session: args.session }),
+    ...(args.newSession === true ? { newSession: true } : {}),
   })
 })
 
