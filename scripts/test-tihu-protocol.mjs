@@ -3667,38 +3667,46 @@ test('page：完成页正文窗口按正文区真实高度取整行数（贴底�
   assert.ok(html.includes('var DONE = '), '页面要拿到 DONE_LAYOUT（可视行数/行高不另写数字）')
 })
 
-/* ---------- 2026-11-10：完成页高亮 ≡ 真实播放进度（不是固定 1.8 秒） ---------- */
-test('page：完成页高亮由 AudioContext 的真实排程驱动（source.start + buffer 时长）', () => {
+/* ---------- 2026-11-10：完成页高亮由每段 PCM 的真实开始/结束事件驱动（不按时间推算） ---------- */
+test('page：完成页高亮由每段 PCM 的 onended/开始事件驱动，删掉 currentTime 比例推算', () => {
   const html = pageHtmlOf()
-  assert.ok(html.includes('function trackDoneAudio'), '页面要有「按已排程 PCM 记录区间」的函数')
-  assert.ok(html.includes('function pollDone'), '页面要有按播放时钟取当前行的轮询')
-  assert.ok(html.includes('ctx.currentTime'), '当前行必须读 AudioContext 的真实时钟')
-  assert.ok(html.includes('played.startAt') && html.includes('played.duration'), '区间要用 source.start 的时刻 + buffer 时长')
-  assert.ok(/payload\.read === 'done'/.test(html), '只认完成页正文朗读的 PCM（一句话播报不推进高亮）')
+  assert.ok(html.includes('function segmentStarted'), '每段 PCM 真正开始 → 锁定字符区间、高亮起始行')
+  assert.ok(html.includes('function segmentEnded'), '每段 onended（真实事件）→ 结束并推进下一段')
+  assert.equal(html.includes('function pollDone'), false, '删掉 80ms 读时钟按比例推算的 pollDone')
+  assert.equal(html.includes('function trackDoneAudio'), false, '删掉按排程区间记录的老实现')
+  assert.equal(/state\.doneSeg|state\.donePoll/.test(html), false, '不再保留 doneSeg/轮询状态')
+  const playPcm = /function playPcm\(base64, sampleRate, cache, meta\) \{([\s\S]*?)\n  \}/.exec(html)
+  assert.ok(playPcm !== null, 'playPcm 要收这一段的字符区间（meta）')
+  assert.ok(playPcm[1].includes('source.onended = function'), '每段 AudioBufferSourceNode 都要挂 onended')
+  assert.ok(playPcm[1].includes('prev.next = entry'), '首尾相接时，上一段的 onended 就是下一段的「开始」事件')
+  assert.ok(playPcm[1].includes('segmentEnded(entry)'), '真实播完才记结束/推进')
+  assert.ok(/payload\.read === 'done'/.test(html), '只认完成页正文朗读的 PCM（播报不推进完成页高亮）')
   assert.ok(html.includes('state.doneRanges'), '页面要收下宿主的 done.ranges')
-  assert.ok(html.includes('lineAtChar'), '要有「字符位置 → 行」的换算')
-  // 旧实现：renderDone 里无条件 setInterval(advanceDone, 1800)。现在这台计时只当
-  // 「整轮一个 PCM 都没收到」的兜底，且必须被 doneAudioSeen 挡着。
-  const fallback = /function armDoneFallback\(\) \{([\s\S]*?)\n  \}/.exec(html)
-  assert.ok(fallback !== null, '要有兜底翻行函数')
-  assert.ok(fallback[1].includes('1800'), '兜底仍是 1.8 秒一行')
-  assert.ok(fallback[1].includes('state.doneAudioSeen'), '有声音时兜底必须让路')
+  assert.ok(html.includes('lineAtChar'), '要有「字符位置 → 行」的换算（一段跨多行只亮起始行）')
+  // 事件区可观测性：按段打印开始/结束时间（不新增协议消息，addEvent 只写本地事件区）。
+  assert.ok(html.includes("'朗读段 '"), '事件区要按段打印「朗读段 n」')
+  assert.ok(html.includes("'开始' : '结束'") || /' 开始' : ' 结束'/.test(html), '开始/结束两种文案')
+  assert.ok(/at=' \+ Math\.max\(0, Number\(at\) \|\| 0\)\.toFixed\(2\)/.test(html), '事件区时间精确到 0.01s（at=…s）')
+  assert.ok(/meta\.first !== true/.test(html) && /meta\.final !== true/.test(html), '一段只记一次开始（seq=0）与一次结束（final）')
+  // 高亮推进不再有任何按时间翻行的兜底计时器（用户 2026-11-10：彻底不靠时间推算）。
+  assert.equal(/doneTimer|doneWatch|advanceDone|armDoneFallback/.test(html), false, '不许留按时间翻行的兜底计时器')
   const renderDone = /function renderDone\(payload\) \{([\s\S]*?)\n  \}/.exec(html)
   assert.ok(renderDone !== null)
   assert.equal(renderDone[1].includes('setInterval'), false, '渲染完成屏时不许直接挂固定计时器')
 })
 
-test('page：重读清旧排程、停止停在当前行', () => {
+test('page：重读从第一段重新开始、停止清空回调且高亮停住', () => {
   const html = pageHtmlOf()
   const replay = /actionId === 'replay'\) \{([\s\S]*?)\n            \}/.exec(html)
   assert.ok(replay !== null, '要有重读分支')
-  assert.ok(replay[1].includes('stopPcm()'), '重读先掐掉旧音频')
-  assert.ok(replay[1].includes('state.doneSeg = {}'), '重读清掉旧排程')
+  assert.ok(replay[1].includes('stopPcm()'), '重读先掐掉旧音频并清回调')
   assert.ok(replay[1].includes('state.done.current = 0'), '重读高亮回第一行')
-  const stop = /actionId === 'stop'\) \{([\s\S]*?)\n            \}/.exec(html)
-  assert.ok(stop !== null, '要有停止分支')
-  assert.ok(stop[1].includes('state.doneSeg = {}'), '停止后不再按排程改行（停在实停的那一行）')
-  assert.equal(/state\.done\.current\s*=/.test(stop[1]), false, '停止不许把高亮重置或推进')
+  const stopPcm = /function stopPcm\(\) \{([\s\S]*?)\n  \}/.exec(html)
+  assert.ok(stopPcm !== null)
+  assert.ok(stopPcm[1].includes('source.onended = null'), '停止/重读必须清空每段的开始/结束回调')
+  assert.ok(stopPcm[1].includes('state.pcmLast = null'), '停止后不再和旧时间轴首尾相接')
+  assert.ok(/actionId === 'stop' \|\| actionId === 'home'[^\n]*stopPcm\(\)/.test(html), '停止/回主页统一走 stopPcm：清回调、掐音频')
+  assert.equal(/actionId === 'stop'\) \{/.test(html), false, '停止不再单独挂一个会改高亮的分支')
 })
 
 await testAsync('统一指挥：点已完成卡片 → 立刻进完成页（三键，不派单）', async () => {
