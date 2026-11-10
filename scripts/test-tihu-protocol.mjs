@@ -5321,6 +5321,144 @@ await testAsync('派单衔接：指挥台判出「接着那条」→ dispatch(se
   }
 })
 
+/* ---------- 2026-11-10 实机：承接优先于项目命中 / 低置信命中不许单独定落点 ----------
+ *
+ * 实机日志（lane.log）：
+ *   17:40:13 「帮我把 README 的前两行读出来」→ 片段命中 Advanced Engineering Informatics，
+ *            新建会话；
+ *   17:40:36 「再读一下后两行」→ 命中 daily（个人助手）、衔接=new ← 错：明明接着上一条；
+ *   17:41:08 「这次只读最后一行」→ 同项目 append ← 对，这一条不许改坏。
+ * 修复纪律：承接看「上一条派单任务所属会话」的本地连续性，过线就接过去（跨项目也接），
+ * 屏上显示那条会话所属项目；项目片段/低置信命中只能算线索，不能单独定落点。
+ */
+
+await testAsync('派单衔接：新一句接着上一条派单任务（跨项目）→ 追加那条会话，屏上显示那条会话的项目', async () => {
+  const w = unifiedWorkspace()
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-prev-follow', protocol: '0' }, 1)))
+    await waitMs(50)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把青年基金申请书的摘要前两行读出来', source: 'voice' }, 2)))
+    await waitMs(150)
+    assert.equal(w.created.length, 1, '第一句按项目卡新建一条会话')
+    const firstSession = w.prompted[0].id
+    // 上一句真的跑完了（实机就是完成后才说「再读一下」）：turn/start + turn/end。
+    emit({ id: firstSession }, { type: 'turn/start', data: { turn: 1 } })
+    emit({ id: firstSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(80)
+
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '再读一下后两行', source: 'voice' }, 3)))
+    await waitMs(200)
+
+    assert.equal(w.created.length, 1, '接着上一条会话：不许新建会话（跨项目也一样）')
+    assert.equal(w.prompted.length, 2, '第二句只投一次')
+    assert.equal(w.prompted[1].id, firstSession, '第二句要投回上一条派单会话：' + JSON.stringify(w.prompted.map((item) => item.id)))
+    assert.equal(w.prompted[1].blocks[0].text, '再读一下后两行', '用户原话原样投递')
+    assert.ok(String(w.prompted[1].blocks[1].text).includes('【续聊 · 鹈鹕】'), '接着上一条要带续聊尾巴')
+    assert.ok(String(w.prompted[1].blocks[1].text).includes('青年基金申请书'), '尾巴要写那条会话所属项目')
+    const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
+    assert.equal(receipt?.payload.title, '已派给 青年基金申请书', '屏上显示那条会话所属项目，不是命中项目（个人助手）')
+    const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop().payload.board
+    const row = board.rows.find((item) => item.taskId === 't1')
+    assert.ok(row !== undefined && String(row.sub).includes('青年基金申请书'), '棋盘副行也是那条会话所属项目：' + JSON.stringify(row))
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('命中=previous'), '承接命中要落盘：' + log)
+    assert.ok(log.includes(`会话=${firstSession}`), '要写清接到哪条会话：' + log)
+    assert.ok(log.includes('衔接=append'), '承接结论是 append：' + log)
+    assert.equal(w.prompted.some((item) => item.id === 'session-cmd'), false, '过线直接接，不许再问指挥台')
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('派单：低置信 fragment 命中不许单独定项目 → 交给指挥台判，再按结论派单', async () => {
+  const gypsumFolder = '/work/磷石膏'
+  const w = unifiedWorkspace({
+    cards: [
+      { id: 'card-fund', name: '青年基金申请书' },
+      { id: 'card-gypsum', name: '磷石膏SCI', folder: gypsumFolder },
+    ],
+  })
+  // 第一个卡的文件夹在 unifiedWorkspace 里创建；这里把它的 folder 指回真实临时目录。
+  const cardsWithFolder = w.cards.map((card) => card.id === 'card-fund' ? { ...card, folder: w.fundFolder } : card)
+  writeFileSync(w.stateFile, JSON.stringify({
+    projects: {
+      layouts: cardsWithFolder.map((card) => ({ id: card.id, title: card.name })),
+      folders: Object.fromEntries(cardsWithFolder.map((card) => [card.id, card.folder])),
+      nameOverrides: {},
+      order: cardsWithFolder.map((card) => card.id),
+      hidden: [],
+      removed: [],
+    },
+    view: null,
+    revision: 1,
+    updatedAt: new Date(0).toISOString(),
+  }), 'utf8')
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-weak-hit', protocol: '0' }, 1)))
+    await waitMs(50)
+    // 「石膏」只是 2 字片段（不是点名），旧实现会凭它直接塞进磷石膏SCI。
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把石膏板的吸水率试验数据整理一下', source: 'voice' }, 2)))
+    await waitMs(150)
+
+    assert.equal(w.created.length, 0, '低置信命中不许先建会话')
+    assert.ok(w.prompted.some((item) => item.id === 'session-cmd'), '要先交给指挥台判项目')
+    const waiting = (await w.runtime.control.listTasks())[0]
+    assert.ok(String(waiting.sub).includes('等指挥台判断'), '屏上先立一张「等指挥台判断」的排队卡：' + JSON.stringify(waiting))
+
+    commanderTextReply(w, '{"project":"青年基金申请书","session":"new","append_to":""}')
+    await waitMs(150)
+
+    assert.equal(w.created.length, 1, '指挥台给了结论才建会话')
+    assert.equal(w.created[0].cwd, w.fundFolder, '按指挥台结论落到青年基金，不是那个片段命中的项目：' + w.created[0].cwd)
+    assert.equal(w.prompted[w.prompted.length - 1].id, 'session-task-1')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('低置信项目命中'), '低置信命中要落盘说明走了指挥台：' + log)
+    assert.ok(log.includes('命中=commander'), '指挥台结论命中方式要落盘：' + log)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('派单衔接：语义明显矛盾才新建会话（不硬塞给上一条）', async () => {
+  const w = unifiedWorkspace()
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-contradict', protocol: '0' }, 1)))
+    await waitMs(50)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把青年基金申请书的摘要前两行读出来', source: 'voice' }, 2)))
+    await waitMs(150)
+    const firstSession = w.prompted[0].id
+    emit({ id: firstSession }, { type: 'turn/start', data: { turn: 1 } })
+    emit({ id: firstSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(80)
+
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '帮我订个明天的会议室', source: 'voice' }, 3)))
+    await waitMs(200)
+
+    assert.equal(w.created.length, 2, '明显矛盾 → 新建一条会话')
+    assert.equal(w.created[1].cwd, w.home, '新任务落个人助手文件夹：' + w.created[1].cwd)
+    assert.equal(w.prompted.filter((item) => item.id === firstSession).length, 1, '不许把无关的一句塞回上一条会话')
+    assert.equal(w.prompted[1].id, 'session-task-2')
+    const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
+    assert.equal(receipt?.payload.title, '已派给 个人助手')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('命中=daily'), '无关的一句走日常：' + log)
+    assert.ok(log.includes('衔接=new'), '明显矛盾 → 新建会话：' + log)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
 /* ---------- 待决策（屏 5）：宿主 pendingInteraction → tasks.ask（2026-11-10） ----------
  *
  * 实机要测的是「待决策」三件套：琥珀色问号卡 + 待决策屏 + 顶行「●N 等你」。
