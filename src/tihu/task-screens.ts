@@ -274,6 +274,57 @@ export function doneLineRangesOf(text: string): Array<[number, number]> {
   return ranges
 }
 
+/** 完成页朗读一段的最大字符数（码点）：一段可以合并若干**整行**，但不超过这个长度。 */
+export const DONE_SPEECH_MAX_CHARS = 80
+
+/** 完成页朗读的一段：覆盖一到若干整行，坐标与 {@link doneLineRangesOf} 完全一致。 */
+export interface DoneSpeechSegment {
+  index: number
+  /** 朗读文本里的码点区间起点（= 该段第一行在正文里的起点）。 */
+  start: number
+  /** 码点区间终点（不含）。 */
+  end: number
+  /** 这一段覆盖的第一屏行下标（页面高亮从这里开始）。 */
+  firstLine: number
+  /** 这一段覆盖的最后一屏行下标。 */
+  lastLine: number
+  /** 送 TTS 的文本（正文里的码点切片，含段间空白）。 */
+  text: string
+}
+
+/**
+ * 完成页**朗读分段**：和屏上折行、和 `done.ranges` 共用同一份文本、同一坐标系。
+ *
+ * 为什么按「整行」切：屏上 7 行窗口一行一行地念，高亮也一行一行地走 —— 分段边界就是
+ * 行边界（`charStart/charEnd` 必定落在某条 `done.ranges` 的起点/终点），页面不需要
+ * 再做任何按时间/按比例的行内推算，也就不会出现「念一行、跳四行」。
+ * 首段只装第一行：完成屏出帧后第一段最早就开口（原来 20 字首段是为了抢首包，
+ * 但它把一行正文从中间腰斩，高亮和声音就对不齐）。
+ * 合并上限 `DONE_SPEECH_MAX_CHARS`（80 字）保持原样：一段一次合成，段间不必再等首包。
+ */
+export function doneSpeechSegmentsOf(text: string, maxChars: number = DONE_SPEECH_MAX_CHARS): DoneSpeechSegment[] {
+  const clean = prepareDoneText(text)
+  const ranges = doneLineRangesOf(clean)
+  if (ranges.length === 0) return []
+  const chars = [...clean]
+  const out: DoneSpeechSegment[] = []
+  let index = 0
+  let line = 0
+  while (line < ranges.length) {
+    const start = ranges[line][0]
+    let last = line
+    if (index !== 0) {
+      // 后面的段：能装下几整行就装几整行（首段只装一行，见上面的注释）。
+      while (last + 1 < ranges.length && (ranges[last + 1][1] - start) <= maxChars) last += 1
+    }
+    const end = ranges[last][1]
+    out.push({ index, start, end, firstLine: line, lastLine: last, text: chars.slice(start, end).join('') })
+    index += 1
+    line = last + 1
+  }
+  return out
+}
+
 /**
  * 任务进度（屏 4）：**实时**一屏——标题是任务名，正文只有「最新一条状态 + 第 N 步/已用 + tokens」。
  * 最新状态行由宿主按事件重算（applySessionEvent 的 lastEventLine），页面不做翻译。

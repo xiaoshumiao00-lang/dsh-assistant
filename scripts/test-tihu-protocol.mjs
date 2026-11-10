@@ -603,7 +603,11 @@ function runtimeFor(records, extras = {}, ttsOptions = {}) {
     sessionProjectionCache: projectionCacheFixture(records),
     ...extras,
   })
-  return { ...fixture, runtime: createTihuRuntime(fixture.ctx, { log: () => {}, tts: { disabled: true, ...ttsOptions } }) }
+  return { ...fixture, runtime: createTihuRuntime(fixture.ctx, {
+    // TIHU_TEST_LANE_LOG=1 时把宿主侧 lane 的日志打到 stderr（测试挂了先看这个，别瞎猜）。
+    log: (message) => { if (process.env.TIHU_TEST_LANE_LOG) console.error('[lane] ' + message) },
+    tts: { disabled: true, ...ttsOptions },
+  }) }
 }
 
 function openLane(runtime) {
@@ -2973,8 +2977,9 @@ await testAsync('统一指挥：两个卡名都点到 → 追问屏（只问一�
   w.cleanup()
 })
 
-await testAsync('统一指挥：任务 turn/end → 屏 6「完成」＋ 一行播报（八秒窗口合并）', async () => {
-  const w = unifiedWorkspace()
+await testAsync('统一指挥：任务 turn/end → 屏 6「完成」＋ 整段正文朗读（不再另念「标题——第一句」）', async () => {
+  const ttsStub = stubPcmTts()
+  const w = unifiedWorkspace({ tts: { instance: ttsStub } })
   const socket = openLane(w.runtime)
   const emit = w.events.find((entry) => entry.name === 'session/event').handler
   socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u5', protocol: '0' }, 1)))
@@ -2986,10 +2991,11 @@ await testAsync('统一指挥：任务 turn/end → 屏 6「完成」＋ 一行�
   socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
   await waitMs(60)
   const taskSession = w.prompted[0].id
+  const answer = '现在十七点三十一分。温度场结果已经收敛，跨中腹板温差 1.1 ℃。'
   emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
-  emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '现在十七点三十一分。' }] } } })
+  emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: answer }] } } })
   emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
-  await waitMs(90)
+  await waitMs(300)
   const frames = framesOf(socket)
   const done = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').pop()
   assert.ok(done !== undefined, '完成要有屏 6（不必点进会话）')
@@ -3001,9 +3007,18 @@ await testAsync('统一指挥：任务 turn/end → 屏 6「完成」＋ 一行�
   assert.ok(note !== undefined, '完成要进通知总线（屏气泡＋播报）')
   assert.equal(note.payload.level, 1)
   assert.ok(note.payload.text.includes('现在几点了'), '播报用任务标题，不念会话 id：' + note.payload.text)
-  await waitMs(600)
-  const spoken = framesOf(socket).filter((frame) => frame.type === 'task.notify' && frame.payload.spoken === true).pop()
-  assert.ok(spoken !== undefined, '过了单条延迟要念（八秒窗口下第一条很快念）')
+  // 用户 2026-11-10 的硬要求：完成页念**整段正文**，所以「标题——第一句」这条播报
+  // 不再另开一轮（另开一轮会把正文 PCM 中途掐掉，正是「只念第一句」的来源）。
+  const announced = frames.filter((frame) => frame.type === 'task.notify' && frame.payload.spoken === false
+    && String(frame.payload.text ?? '').includes('现在几点了')).pop()
+  assert.ok(announced !== undefined, '这台设备已经在念正文：播报帧标记 spoken=false（不再重复念标题）')
+  const skipLog = frames.filter((frame) => frame.type === 'task.notify' && frame.payload.spoken === true)
+  assert.equal(skipLog.length, 0, '不许再另念一句「标题——第一句」')
+  const readFrames = frames.filter((frame) => frame.type === 'tts.audio' && frame.payload.read === 'done')
+  assert.ok(readFrames.length > 0, '完成时直接下发 read=done 的正文 PCM')
+  const body = [...prepareDoneText(answer)]
+  assert.equal(Math.min(...readFrames.map((frame) => frame.payload.charStart)), 0, '正文从第 0 字开始念')
+  assert.equal(Math.max(...readFrames.map((frame) => frame.payload.charEnd)), body.length, '念到正文最后一个字（不是第一句就停）')
   w.cleanup()
 })
 
@@ -3593,13 +3608,40 @@ await testAsync('模式过滤：CU 会话切回普通模式 → 自动下屏归�
 
 /* ---------- 2026-11-10：棋盘 4 条 / 状态点 / 完成页三键 / 进度页实时 ---------- */
 
-test('page：棋盘右侧是小状态点（10px），不再有大圆环/问号徽标', () => {
+test('page：棋盘右侧状态图形（完成实心圆／待决策问号／进行中蓝色弧／排队细环）＋ 底部翻页条', () => {
   const html = pageHtmlOf()
-  assert.ok(/#screen \.board-dot \{[^}]*width:10px/.test(html), '状态点 10px')
-  assert.ok(/#screen \.board-dot \{[^}]*margin-right:2px/.test(html), '点右缘离屏幕边 10px（8px 内边距 + 2px）')
-  assert.ok(html.includes('.board-dot.running') && html.includes('.board-dot.awaiting') && html.includes('.board-dot.done'), '三种状态都有颜色')
-  assert.equal(html.includes('board-ring'), false, '不再画大圆环')
-  assert.equal(html.includes('board-ask'), false, '不再画问号徽标')
+  // 用户 2026-11-10 定案：右对齐、离屏幕外沿 10px（内容右界 311 − 1px 外边距 = 310）。
+  assert.ok(/#screen \.board-status \{[^}]*margin-right:1px/.test(html), '状态图形右缘离屏幕外沿 10px')
+  assert.ok(/#screen \.board-status \{[^}]*width:14px/.test(html), '状态图形 14px 见方（不抢行高）')
+  // 完成＝绿色实心圆，直径 12px。
+  const doneRule = /#screen \.board-status\.done[^{]*\{[^}]*\}/.exec(html)?.[0] ?? ''
+  assert.ok(doneRule.includes('width:12px') && doneRule.includes('height:12px'), '完成：直径 12px：' + doneRule)
+  assert.ok(/background:#35d07f/.test(doneRule), '完成：绿色实心圆：' + doneRule)
+  assert.equal(/border:1px/.test(doneRule), false, '完成是实心的，不描边：' + doneRule)
+  // 排队／派单＝细环（描边、无填充）。
+  const queuedRule = /#screen \.board-status\.queued \{[^}]*\}/.exec(html)?.[0] ?? ''
+  assert.ok(queuedRule.includes('background:none'), '排队：空心环：' + queuedRule)
+  assert.ok(queuedRule.includes('border:1px solid'), '排队：细环（1px 描边）：' + queuedRule)
+  // 待决策＝黄色圆形里一个问号。
+  const awaitingRule = /#screen \.board-status\.awaiting \{[^}]*\}/.exec(html)?.[0] ?? ''
+  assert.ok(awaitingRule.includes('background:var(--warn)'), '待决策：黄底圆形：' + awaitingRule)
+  assert.ok(awaitingRule.includes('text-align:center'), '待决策：问号要居中：' + awaitingRule)
+  assert.ok(html.includes("status.textContent = row.badge === 'ask' ? '?' : '·'"), '待决策：圆形里放问号')
+  // 进行中＝蓝色未闭合圆环，弧长按 ring.percent（已运行时长 ÷ 30 分钟）画，跑满停在差一点。
+  assert.ok(html.includes('stroke-dasharray'), '进行中：用 stroke-dasharray 画弧长')
+  assert.ok(html.includes('row.ring && row.ring.percent'), '进行中：弧长来自宿主下发的 ring.percent')
+  assert.ok(html.includes('if (percent >= 1) percent = 0.94'), '进行中：满 30 分钟停在满圈差一点（未闭合）')
+  assert.ok(/#4f9fd8/.test(html), '进行中：蓝色弧')
+  assert.equal(html.includes('board-dot'), false, '旧的 10px 实心点已整体换掉')
+  // 翻页条：每页 4 条＋上一页/下一页＋第 N/M 页；只有一页时 JS 不建。
+  assert.ok(/#screen \.board-pager \{ display:flex/.test(html), '翻页条版式在')
+  assert.ok(html.includes("prevBtn.textContent = '上一页'"), '有「上一页」')
+  assert.ok(html.includes("nextBtn.textContent = '下一页'"), '有「下一页」')
+  assert.ok(html.includes("pageText.textContent = '第 ' + (pageIndex + 1) + '/' + pageTotal + ' 页'"), '有「第 N/M 页」')
+  assert.ok(html.includes("prevBtn.setAttribute('data-action', 'boardPrev')"), '上一页点下去发 boardPrev')
+  assert.ok(html.includes("nextBtn.setAttribute('data-action', 'boardNext')"), '下一页点下去发 boardNext')
+  assert.ok(html.includes('if (rows.length > 0 && pageTotal > 1)'), '只有一页时整条翻页栏不出现')
+  assert.ok(html.includes("pageIndex < pageTotal - 1 ? 'cur' : 'off'"), '当前页方向看得出（可翻=亮、到头=暗）')
 })
 
 test('page：完成页三键贴底（离屏幕下沿 12px）＋ 标题/正文贴顶 + 正文区按剩余高度裁剪', () => {
@@ -3705,7 +3747,10 @@ test('page：重读从第一段重新开始、停止清空回调且高亮停住'
   assert.ok(stopPcm !== null)
   assert.ok(stopPcm[1].includes('source.onended = null'), '停止/重读必须清空每段的开始/结束回调')
   assert.ok(stopPcm[1].includes('state.pcmLast = null'), '停止后不再和旧时间轴首尾相接')
-  assert.ok(/actionId === 'stop' \|\| actionId === 'home'[^\n]*stopPcm\(\)/.test(html), '停止/回主页统一走 stopPcm：清回调、掐音频')
+  // 停止/回主页/翻页统一走 stopPcm：掐音频、清每段回调（翻页也要立刻停口，别让上一屏的正文念到下一屏）。
+  const stopCall = /if \(actionId === 'stop' \|\| actionId === 'home'[\s\S]{0,240}?stopPcm\(\)/.exec(html)?.[0] ?? ''
+  assert.ok(stopCall !== '', '停止/回主页统一走 stopPcm：清回调、掐音频')
+  assert.ok(stopCall.includes("actionId === 'boardPrev'") && stopCall.includes("actionId === 'boardNext'"), '翻页也先停口：' + stopCall)
   assert.equal(/actionId === 'stop'\) \{/.test(html), false, '停止不再单独挂一个会改高亮的分支')
 })
 
@@ -3774,11 +3819,17 @@ await testAsync('完成页朗读：每段 PCM 带 read=done + 字符区间，覆
   const chars = [...body]
   assert.equal(Math.min(...readFrames.map((item) => item.payload.charStart)), 0, '第一段从第 0 字开始')
   assert.equal(Math.max(...readFrames.map((item) => item.payload.charEnd)), chars.length, '最后一段要念到正文末尾')
-  // 一句话播报（通知总线念的那条）不能带 read=done，否则会把完成页高亮带跑偏。
+  // 一句话播报（通知总线念的那条）不再和正文抢：这条任务已经在这台设备上念正文，
+  // 因此**一条裸播报 PCM 都不该有**（有的话就是把正文 PCM 从中间掐掉的那轮）。
   const plain = frames.filter((item) => item.type === 'tts.audio' && item.payload.read === undefined)
-  assert.ok(plain.length > 0, '普通播报帧不带 read 标记')
-  assert.ok(ttsStub.spoken.join('').includes('温度场结果已经收敛'), '念的就是屏上那份正文：' + ttsStub.spoken.join('|'))
-  assert.equal(ttsStub.spoken.join('').includes('✅'), false, '行首勾不会念出来')
+  assert.equal(plain.length, 0, '正文在念时不许再另念一句「标题——第一句」')
+  const skipped = frames.filter((item) => item.type === 'task.notify' && item.payload.spoken === false
+    && String(item.payload.text ?? '').includes('现在几点了')).pop()
+  assert.ok(skipped !== undefined, '播报被标记成 spoken=false（正文已经念过，不重复）')
+  // 下发到页面的文本必须覆盖到最后一句（预录缓存命中时 tts 桩不会再有 synth 调用，所以查帧里的 text）。
+  const sentText = readFrames.map((item) => String(item.payload.text ?? '')).join('')
+  assert.ok(sentText.includes('温度场结果已经收敛'), '念的就是屏上那份正文：' + sentText)
+  assert.equal(sentText.includes('✅'), false, '行首勾不会进朗读文本')
   w.cleanup()
 })
 
@@ -3851,8 +3902,112 @@ await testAsync('统一指挥：进度页实时——工具调用替换最新一
   w.cleanup()
 })
 
-/* ---------- 2026-11-10：重启后旧指挥会话投不进去 → 退避重试 / 重建 ---------- */
+await testAsync('统一指挥：电脑端镜像任务的进度页——步数跟 tool/call、已用按这轮真正的起点走（轮询不回零）', async () => {
+  const now = Date.now()
+  const w = unifiedWorkspace({
+    records: [cuRecord('session-pc2', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 9000, title: '把这组图重画' })],
+  })
+  const socket = openLane(w.runtime)
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pc-live', protocol: '0' }, 1)))
+  await waitMs(140)
+  // 这一轮 9 秒前就开始了：「已用」必须是 ~9s，不是 0s（旧实现把「此刻」当锚点，永远 0s 不动）。
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 60, hit: 'task', taskId: 'p1' }, 2)))
+  await waitMs(90)
+  let frame = framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.stage === '进度').pop()
+  assert.ok(frame !== undefined, '电脑端卡片点开＝进度页（屏 4）')
+  const secondsOf = (line) => Number((String(line).match(/已用 (\d+)s/) ?? [0, 0])[1])
+  assert.ok(secondsOf(frame.payload.bullets[1]) >= 7, '已用按这轮真正的起点算（不是 0s）：' + frame.payload.bullets[1])
+  // 电脑端那侧的 tool/call 也要进登记簿：第 N 步跟着真实事件走。
+  emit({ id: 'session-pc2' }, { type: 'tool/call', data: { step: 2, name: 'click', arguments: '{"position":{"x":10,"y":20}}' } })
+  await waitMs(90)
+  frame = framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.stage === '进度').pop()
+  assert.equal(String(frame.payload.bullets[1]).split(' · ')[0], '第 2 步', '电脑端的步数也进登记簿：' + frame.payload.bullets[1])
+  const before = secondsOf(frame.payload.bullets[1])
+  // 再同步一遍会话列表（第二台设备 hello）：轮询不许把「已用」抹回 0。
+  const second = openLane(w.runtime)
+  second.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pc-live-2', protocol: '0' }, 3)))
+  await waitMs(260)
+  frame = framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.stage === '进度').pop()
+  assert.ok(secondsOf(frame.payload.bullets[1]) >= before, '轮询不许把「已用」回零：' + before + 's → ' + frame.payload.bullets[1])
+  w.cleanup()
+})
 
+await testAsync('统一指挥：棋盘每页 4 条 + 翻页（第 N/M 页、上一页/下一页、到头钳住）', async () => {
+  // 同项目同状态的卡片会折叠成一行（那是登记簿本来的折叠规则），所以这里用 6 张不同的卡，
+  // 每条任务落在不同 projectId 上，才能真正产生 2 页。
+  const root = mkdtempSync(join(tmpdir(), 'tihu-page-cards-'))
+  const cards = Array.from({ length: 6 }, (_, index) => {
+    const folder = join(root, `p${index + 1}`)
+    mkdirSync(folder, { recursive: true })
+    return { id: `card-p${index + 1}`, name: `第${index + 1}卡`, folder }
+  })
+  const w = unifiedWorkspace({ cards })
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-page', protocol: '0' }, 1)))
+    await waitMs(60)
+    for (const card of cards) {
+      const out = await w.runtime.control.dispatch({ text: `把 ${card.name} 的第一段再改一遍`, folder: card.folder })
+      assert.ok(String(out).startsWith('已派给'), '派单要成功：' + out)
+    }
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 30)))
+    await waitMs(120)
+    const boardOf = () => framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.board).pop().payload.board
+    let board = boardOf()
+    assert.equal(board.rows.length, 4, '每页就 4 条：' + board.rows.length)
+    assert.equal(board.page.total, 2, '6 条 → 2 页')
+    assert.equal(board.page.index, 0, '回棋盘回到第 1 页')
+    const firstPage = board.rows.map((row) => row.taskId)
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 60, y: 232, hit: 'action', actionId: 'boardNext' }, 31)))
+    await waitMs(120)
+    board = boardOf()
+    assert.equal(board.page.index, 1, '点「下一页」立刻翻到第 2 页')
+    assert.equal(board.rows.length, 2, '第 2 页剩 2 条')
+    const secondPage = board.rows.map((row) => row.taskId)
+    assert.equal(new Set([...firstPage, ...secondPage]).size, 6, '两页合起来正好 6 条、不重不漏')
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 60, y: 232, hit: 'action', actionId: 'boardNext' }, 32)))
+    await waitMs(90)
+    assert.equal(boardOf().page.index, 1, '最后一页再点「下一页」钳住不动')
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 232, hit: 'action', actionId: 'boardPrev' }, 33)))
+    await waitMs(90)
+    assert.equal(boardOf().page.index, 0, '点「上一页」回第 1 页')
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 232, hit: 'action', actionId: 'boardPrev' }, 34)))
+    await waitMs(90)
+    assert.equal(boardOf().page.index, 0, '第一页再点「上一页」钳住不动')
+    // 只有一页时不该有第二页（用户要求「一页就隐藏」）：清到只剩 1 条再看。
+    for (const task of w.runtime.control.listTasks()) await w.runtime.control.cancelTask(task.taskId)
+    await waitMs(80)
+    board = boardOf()
+    assert.equal(board.page.total, 1, '一条都不剩多页时只留 1 页')
+    assert.equal(board.page.index, 0, '页码夹回第 1 页')
+  } finally {
+    w.cleanup()
+    try { rmSync(root, { recursive: true, force: true }) } catch { /* 忽略 */ }
+  }
+})
+
+await testAsync('棋盘排序：鹈鹕派单的任务永远在最前（电脑端卡片再新也排在后面）', async () => {
+  const now = Date.now()
+  const w = unifiedWorkspace({
+    records: [cuRecord('session-pc3', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 500, title: '把第三节的结果补上' })],
+  })
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-pin', protocol: '0' }, 1)))
+  await waitMs(140)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '青年基金申请书第 3 段再改一遍', source: 'voice' }, 2)))
+  await waitMs(140)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+  await waitMs(90)
+  const board = framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.board).pop().payload.board
+  assert.equal(board.rows.length, 2, '两条都在：' + JSON.stringify(board.rows.map((row) => row.taskId)))
+  assert.equal(board.rows[0].taskId, 't1', '派单任务排第一（不按最后活动时间排）：' + JSON.stringify(board.rows.map((row) => row.taskId)))
+  assert.equal(String(board.rows[1].taskId).startsWith('p'), true, '电脑端卡片排后面')
+  assert.equal(board.rows[0].sub.includes('电脑端'), false, '派单任务的副行不是「电脑端 · …」')
+  w.cleanup()
+})
+
+/* ---------- 2026-11-10：重启后旧指挥会话投不进去 → 退避重试 / 重建 ---------- */
 test('lane.log：路径可覆盖、超过 2MB 截断重开，每行带时间/sessionId/message/stack 首行', () => {
   const beforeLog = process.env.TIHU_LANE_LOG
   const beforeHome = process.env.DSH_HOME

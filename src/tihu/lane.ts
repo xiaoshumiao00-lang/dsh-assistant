@@ -103,10 +103,13 @@ import {
   detailFrame,
   doneAnnouncementOf,
   doneFrame,
+  doneLineRangesOf,
+  doneSpeechSegmentsOf,
   folderBase,
   noticeFrame,
   prepareDoneText,
   receiptFrame,
+  type DoneSpeechSegment,
 } from './task-screens.ts'
 import { ensureAssistantHome } from '../assistant-home.ts'
 import { TihuPreroll, prerollAudioMs } from './preroll.ts'
@@ -114,6 +117,9 @@ import { TihuPreroll, prerollAudioMs } from './preroll.ts'
 /** 页面与 WebSocket 的路径（代理侧按这两个前缀放行）。 */
 export const TIHU_PAGE_PATH = '/tihu'
 export const TIHU_LANE_PATH = '/tihu/lane'
+
+/** 棋盘上有在跑的行时，隔多久重发一帧（让右侧蓝色弧跟着已运行时长往前走）。 */
+export const BOARD_TICK_MS = 5_000
 
 /**
  * 每会话回答历史上限（用户 2026-11-08 要求：最多 8 条，含 sentences/speechSegments/
@@ -265,11 +271,18 @@ const tihuRuntimeEnv = (globalThis as any).process?.env ?? {} as Record<string, 
 
 /** 「在跑」判定窗口：最近 15 秒内有活动，或 agent 的 turn 还在跑。 */
 export const PC_ACTIVE_WINDOW_MS = 15_000
+/**
+ * 已经显示成「执行中的那一条」还被允许算作在跑的更宽窗口（默认 90 秒）。
+ * 电脑端 CU 会话一步要等用户在这侧点屏幕（`computer_use` 就是等 GUI 动作），
+ * 15 秒一过就把卡抖成「完成 → 执行中」：抖一次「已用」与时长环就归零一次，
+ * 屏上看见的就是「已用 0s 永远不动」——所以抖完前先用这个更宽的窗口接着算。
+ */
+export const PC_RUNNING_STILL_MS = 90_000
 /** 电脑端会话上屏窗口：与登记簿自动归档同口径（静置 3 天内还值得看一眼）。 */
 export const PC_SESSION_WINDOW_MS = DONE_KEEP_MS
 /** 刚建好、还没发过一句话的会话最多以「排队」占位多久（再久就不占棋盘了）。 */
 export const PC_QUEUED_WINDOW_MS = 10 * 60_000
-/** 同时上屏的电脑端会话上限：棋盘一页 5 行，得给鹈鹕派单的任务留位置。 */
+/** 同时上屏的电脑端会话上限：每页 4 条，得给鹈鹕派单的任务留位置。 */
 export const PC_SESSION_MAX = 6
 
 /**
@@ -364,6 +377,8 @@ interface TihuDevice {
   focusedTask?: string
   /** 屏停在棋盘上（只有它才跟着登记簿自动重画）。 */
   onBoard?: boolean
+  /** 这台设备现在停在哪一屏（sendFrame 记的；进度页每秒重画与回主页计时都按这份判）。 */
+  screenStage?: string
   /** 刚连上：第一次电脑端同步跑完时，若已有任务在跑就自动切到它的进度页。 */
   followPending?: boolean
   /** 朗读结束后 60 秒自动回棋盘的计时器（任何交互都取消）。 */
@@ -416,6 +431,16 @@ interface TihuDevice {
    * 号变了就立刻停手——「停止/重读」才能真正掐断正在下发的那一轮 PCM。
    */
   speakEpoch?: number
+  /**
+   * 这条设备当前正在念正文的那条完成任务（完成页朗读）。
+   * 有它就说明「屏上这份完整正文已经在这台设备上念过了」，P1 播报不再补念
+   * 一遍「标题——第一句」（那正是朗读只念到第一句的直接原因）。
+   */
+  doneReadingTask?: string
+  /** 棋盘翻页页码（0 起）；每页 4 条，用户点「上一页/下一页」就地改这一条。 */
+  boardPage?: number
+  /** 这台设备的棋盘上有没有「在跑」的行（决定棋盘时长弧需不需要按时钟重发）。 */
+  boardHasRunning?: boolean
 }
 
 /**
@@ -676,6 +701,52 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const pcDismissedAt = new Map<string, number>()
   /** 电脑端会话最近一次事件时刻：列表缓存里的 lastPromptAt 不包含助手回复/工具步骤。 */
   const pcActivityAt = new Map<string, number>()
+  /**
+   * 这一轮跑起来的锚点（taskId → 时刻）。
+   *
+   * 「已用 …」和棋盘上那条时长弧都按它算。**先到先记**：旧实现把「列表里最后活动时间 /
+   * 事件到达的此刻」当锚点反复回填，于是电脑端 CU 会话跑一步等用户在这侧点屏幕能空几十秒 ——
+   * 每一次回填都把「已用」抹成 0s，屏上就是「tok 数在动，第 0 步 · 已用 0s 永远不动」
+   * （2026-11-10 用户实机反馈）。只有真正的 `turn/start` 才容许换锚点（那才是新一轮）。
+   */
+  const runAnchorAt = new Map<string, number>()
+
+  /** 定锚点：`reset = true` 只由真实的新一轮调用（其它一律不许把锚点往后挪）。 */
+  function noteRunAnchor(taskId: string, at: number, reset = false): void {
+    if (!Number.isFinite(at) || at <= 0) return
+    if (reset) {
+      runAnchorAt.set(taskId, at)
+      return
+    }
+    const known = runAnchorAt.get(taskId)
+    if (known === undefined || known <= 0 || at < known) runAnchorAt.set(taskId, at)
+  }
+
+  /** 这条任务已经跑了多久（毫秒）：完成态封顶在完成那一刻；没有锚点就从「现在」起算。 */
+  function elapsedOfTask(task: TihuTask, sessionId?: string): number {
+    let anchor = runAnchorAt.get(task.taskId)
+    if (anchor === undefined || anchor <= 0) {
+      const candidates = [task.startedAt, sessionId === undefined ? undefined : runningSessions.get(sessionId)]
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value) && value > 0)
+      anchor = candidates.length > 0 ? Math.min(...candidates) : Date.now()
+      runAnchorAt.set(task.taskId, anchor)
+    }
+    return Math.max(0, (task.finishedAt ?? Date.now()) - anchor)
+  }
+
+  /**
+   * 电脑端这一轮的起点：优先「本进程看到的 `turn/start`」→ 列表投影的 lastPromptAt →
+   * 兜底此刻。写进登记簿时必须用它，不能用「此刻」（那让「已用」与时长环反复归零）。
+   */
+  function pcStartAnchorOf(sessionId: string, fallback = Date.now()): number {
+    const turn = runningSessions.get(sessionId)
+    if (turn !== undefined && Number.isFinite(turn)) return turn
+    const row = sessionListCache?.rows.find((item) => item.sessionId === sessionId)
+    const prompted = Number(row?.updatedAt ?? 0)
+    if (Number.isFinite(prompted) && prompted > 0) return prompted
+    return fallback
+  }
   /** 电脑端会话轮询定时器（只在有统一指挥设备在线时跑）。 */
   let pcSyncTimer: ReturnType<typeof setInterval> | undefined
   /** 同一时刻只跑一次同步：轮询与 hello 撞车时后到的直接并入这一次。 */
@@ -702,6 +773,8 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   function cancelSpeaking(device: TihuDevice): void {
     device.speakEpoch = (device.speakEpoch ?? 0) + 1
     announcing.delete(device.id)
+    // 正文这一轮被打断了：别再把它记成「已经念过」，否则后面的播报会一起被吞掉。
+    device.doneReadingTask = undefined
   }
   /**
    * 会话 id → 本次 attempt 已经收到的思考文本（agent/assistant-stream 的
@@ -821,10 +894,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 统一指挥之后只有这七屏（棋盘/回执/唤醒/进度详情/待决策/完成/追问）：这里只负责把帧发给设备
    * 并记一份「这台设备最后看到的那屏」（控制面诊断用），不再补旧气泡、不再恢复旧会话屏。
    */
+  /** 屏帧的公共出口：记下这台设备现在停在哪一屏（进度页刷新与回主页计时都按这份判）。 */
+  function pushFrame(device: TihuDevice, frame: ScreenFramePayload): void {
+    device.screenStage = frame.stage
+    device.send('screen.frame', frame)
+  }
+
   function sendFrame(device: TihuDevice, frame: ScreenFramePayload, sessionId?: string): void {
     const outgoing: ScreenFramePayload = { ...frame, bullets: frame.bullets ?? [] }
     lastFrames.set(sessionId ?? device.sessionId ?? device.id, outgoing)
-    device.send('screen.frame', outgoing)
+    pushFrame(device, outgoing)
   }
 
   const sessionListTtlMs = (): number => clampInt(Number(tihuRuntimeEnv.TIHU_SESSION_LIST_TTL_MS ?? 60_000), 100, 600_000)
@@ -1684,16 +1763,26 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         applySessionEvent(progress, event, at, screenMetaOf(sessionId))
         if (type !== 'turn/end') refreshFocusedDetail(taskOfSession)
         if (type === 'turn/start') {
-          tasks.syncExternal(taskOfSession.taskId, { state: 'running', startedAt: at, at })
+          // 新一轮真的开始了：锚点挪到这一轮（这才算「新一轮」，轮询不许动它）。
+          noteRunAnchor(taskOfSession.taskId, progress.turnStartedAt || at, true)
+          tasks.syncExternal(taskOfSession.taskId, { state: 'running', startedAt: progress.turnStartedAt || at, at })
           refreshBoards()
           // 电脑端有任务在跑 → 设备自动切到这条任务的「进度」页（不是待决策）。
           followRunningTask(taskOfSession)
+        } else if (type === 'step/start' || type === 'tool/call') {
+          // 电脑端那侧的步数也进登记簿：第 N 步与棋盘微条都跟着真实事件走。
+          const stepValue = Number((data as any)?.step)
+          tasks.noteStep(taskOfSession.taskId, Number.isFinite(stepValue) ? stepValue : progress.step, at)
+          noteRunAnchor(taskOfSession.taskId, progress.turnStartedAt || at)
+          refreshFocusedDetail(taskOfSession)
+          refreshBoards()
         } else if (type === 'assistant/message') {
           const pcLine = plainSummaryOf(lastAssistant.get(sessionId)?.text ?? '')
           if (pcLine !== '') {
+            noteRunAnchor(taskOfSession.taskId, progress.turnStartedAt || pcStartAnchorOf(sessionId, at))
             tasks.syncExternal(taskOfSession.taskId, taskOfSession.state === 'running'
               ? { state: 'running', summary: pcLine, at }
-              : { state: 'running', startedAt: at, summary: pcLine, at })
+              : { state: 'running', startedAt: pcStartAnchorOf(sessionId, at), summary: pcLine, at })
           }
         } else if (type === 'turn/end') {
           const pcReason = finishReasonOf(data)
@@ -1721,6 +1810,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             device.onBoard = false
             sendFrame(device, done, device.sessionId)
             sendTaskUpdate(device, doneTask)
+            // 完成屏一上屏就念**整段正文**（原来这里只留下面的 P1 播报，屏上正文没进过朗读链路）。
+            readDoneScreen(device, doneTask)
           }
           pushTaskNotify(doneTask, 1, doneAnnouncementOf(doneTask))
           refreshBoards()
@@ -1735,10 +1826,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         const stepValue = Number((data as any)?.step)
         if (type === 'turn/start') {
           tasks.markRunning(taskOfSession.taskId, at)
+          // 新一轮真的开始了：锚点挪到这一轮（这才算「新一轮」，轮询不许动它）。
+          noteRunAnchor(taskOfSession.taskId, progress.turnStartedAt || at, true)
           refreshBoards()
           refreshFocusedDetail(taskOfSession)
         } else if (type === 'step/start' || type === 'tool/call') {
-          if (Number.isFinite(stepValue)) tasks.noteStep(taskOfSession.taskId, stepValue, at)
+          tasks.noteStep(taskOfSession.taskId, Number.isFinite(stepValue) ? stepValue : progress.step, at)
+          noteRunAnchor(taskOfSession.taskId, progress.turnStartedAt || at)
           refreshFocusedDetail(taskOfSession)
           refreshBoards()
         } else if (type !== 'turn/end') {
@@ -1771,6 +1865,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             device.onBoard = false
             sendFrame(device, frame, device.sessionId)
             sendTaskUpdate(device, taskOfSession)
+            // 派出去的活完成时也一样：屏一上屏就念**整段正文**（不是只有「标题——第一句」）。
+            readDoneScreen(device, taskOfSession)
           }
           // P1：一句播报（八秒窗口内的多条合并成一句）
           pushTaskNotify(taskOfSession, 1, doneAnnouncementOf(taskOfSession))
@@ -1788,12 +1884,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           if (!device.unified) continue
           const key = device.sessionId ?? device.id
           // 只有「我在，直接答」那一屏才把答案贴上去；慢路径派单的收尾话不上屏。
-          if (lastFrames.get(key)?.stage !== '回答') continue
+          if (device.screenStage !== '回答') continue
           if (device.receiptTimer !== undefined || device.pendingPick !== undefined) continue
           const lines = replyBulletsOf(reply).slice(0, 2)
           const frame = noticeFrame({ stage: '回答', title: line, lines, tone: 'ok' })
           lastFrames.set(key, frame)
-          device.send('screen.frame', frame)
+          pushFrame(device, frame)
           void speakAnnouncement(device, line)
             .then((spokenMs) => { if (spokenMs >= 0) armAutoHome(device, spokenMs) })
             .catch((error) => log(`tihu answer speak failed: ${(error as Error)?.message ?? String(error)}`))
@@ -2084,6 +2180,17 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             await runScreenCommand(device, { kind: 'board' })
             return
           }
+          if (actionId === 'boardPrev' || actionId === 'boardNext') {
+            // 棋盘翻页：就地换页（不重排任务、不派单）。页码夹到真实范围内。
+            const current = Math.max(0, Math.trunc(device.boardPage ?? 0))
+            const step = actionId === 'boardNext' ? 1 : -1
+            const next = Math.max(0, current + step)
+            if (next === current && step < 0) return
+            device.boardPage = next
+            sendBoard(device)
+            log(`tihu board page device=${device.id} page=${device.boardPage + 1}`)
+            return
+          }
           if (actionId === 'replay') {
             // 重读：从第一段重新念（完成页打开后也能重读）；页面自己把高亮拉回第一行。
             const target = device.focusedTask === undefined
@@ -2096,9 +2203,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
               if (String(target.doneText ?? '').trim() === '') {
                 await showDone(device, target, true)
               } else {
-                void speakAnnouncement(device, doneBodyTextOf(target), 'done')
-                  .then((spokenMs) => { if (spokenMs > 0) armScreenHome(device, spokenMs + HOME_AFTER_SPEECH_MS, target.taskId, '完成') })
-                  .catch((error) => log(`tihu replay speak failed: ${(error as Error)?.message ?? String(error)}`))
+                // 重读一整段（一行一段）：和完成页打开时念的是同一份正文。
+                readDoneScreen(device, target)
               }
             }
             return
@@ -2116,7 +2222,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             return
           }
           if (actionId === 'taskOpen') {
-            const target = device.focusedTask ?? boardOf(tasks.list(), Date.now()).rows[0]?.taskId
+            const target = device.focusedTask ?? boardOf(tasks.list(), Date.now(), Math.max(0, device.boardPage ?? 0)).rows[0]?.taskId
             if (target !== undefined) openTask(device, target)
             return
           }
@@ -2720,7 +2826,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         if (task.source === 'pc') continue
         for (const sessionId of task.sessionIds) bound.add(sessionId)
       }
-      const wanted = new Map<string, { row: TihuSessionRow; state: 'queued' | 'running' | 'done'; activity: number }>()
+      const wanted = new Map<string, { row: TihuSessionRow; state: 'queued' | 'running' | 'done'; activity: number; start: number }>()
       for (const row of rows) {
         if (wanted.size >= PC_SESSION_MAX) break
         const sessionId = row.sessionId
@@ -2751,8 +2857,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           if (dismissed !== undefined && activity <= dismissed) continue
         }
         const running = agentRunning || now - activity <= PC_ACTIVE_WINDOW_MS
-        const state: 'queued' | 'running' | 'done' = blank ? 'queued' : running ? 'running' : 'done'
-        wanted.set(sessionId, { row, state, activity: activity > 0 ? activity : (createdAt || now) })
+        // 已经显示成「执行中」的那一条不许抖成「完成 → 执行中」：电脑端 CU 会话一步等用户
+        // 在这侧点屏幕能空好几十秒，每一次抖动都把「已用」与时长环抹回 0（实机就是这个）。
+        const stillRunning = !running && known !== undefined && known !== ''
+          && tasks.get(known ?? '')?.state === 'running' && now - activity <= PC_RUNNING_STILL_MS
+        const state: 'queued' | 'running' | 'done' = blank ? 'queued' : (running || stillRunning) ? 'running' : 'done'
+        // 这一轮的起点：列表投影的 lastPromptAt（真实发言时刻），拿不到才退回活动时刻。
+        const start = updatedAt > 0 ? updatedAt : (activity > 0 ? activity : (createdAt || now))
+        wanted.set(sessionId, { row, state, activity: activity > 0 ? activity : (createdAt || now), start })
       }
       let changed = false
       // 先撤掉不该再上屏的：会话被归档/删除、被派单任务接管、被用户撤掉、空了太久、
@@ -2777,10 +2889,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             sessionIds: [sessionId],
             source: 'pc',
             state: item.state,
-            startedAt: item.activity,
+            startedAt: item.start,
             now,
           })
           pcTaskOfSession.set(sessionId, task.taskId)
+          if (item.state === 'running') noteRunAnchor(task.taskId, pcStartAnchorOf(sessionId, item.start))
           changed = true
           log(`tihu pc task add task=${task.taskId} session=${sessionId} state=${item.state} title=${JSON.stringify(task.title)}`)
           continue
@@ -2791,7 +2904,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           projectName,
           ...(item.row.cwd === undefined ? {} : { folder: item.row.cwd }),
           state: item.state,
-          startedAt: item.activity,
+          // 锚点＝这轮真正开始的时刻（列表投影里的 lastPromptAt），不是「此刻」：
+          // 用此刻就会让「已用」在每次轮询归零（实机那条「已用 0s 永远不动」）。
+          startedAt: pcStartAnchorOf(sessionId, item.start),
           at: now,
           ...(summary === '' ? {} : { summary }),
         })) changed = true
@@ -2865,16 +2980,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
   }
 
-  /** 棋盘一帧：固定第 0 页（最近 5 条）。旧式翻页控件已删除，320×240 放 5 行。 */
-  function boardFrameFor(): { frame: ScreenFramePayload; board: TaskBoardPayload } {
-    const board = boardOf(tasks.list(), Date.now(), 0)
+  /** 棋盘一帧：每页 4 行，页码从这台设备的 `boardPage` 拿（翻不动就夹回最后一张页）。 */
+  let boardTicker: ReturnType<typeof setInterval> | undefined
+  function boardFrameFor(page: number): { frame: ScreenFramePayload; board: TaskBoardPayload } {
+    const board = boardOf(tasks.list(), Date.now(), page)
     return { frame: boardFrame(board), board }
   }
 
   /** 屏 1：任务棋盘（含空态）。同一版式，有任务就是棋盘、没任务就是空盘。 */
-  function sendBoard(device: TihuDevice): void {
+  function sendBoard(device: TihuDevice, resetPage = false): void {
     const key = device.sessionId ?? device.id
-    const { frame, board } = boardFrameFor()
+    const { frame, board } = boardFrameFor(resetPage ? 0 : Math.max(0, Math.trunc(device.boardPage ?? 0)))
+    // 页码夹到真实范围内（任务少了一条，最后一张页可能已经没了）。
+    device.boardPage = board.page.index
     // 回棋盘＝明确离开回执/追问/详情：旧计时器与待选项一起清掉。
     if (device.receiptTimer !== undefined) {
       clearTimeout(device.receiptTimer)
@@ -2884,10 +3002,32 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     device.pendingPick = undefined
     device.focusedTask = undefined
     device.onBoard = true
+    device.doneReadingTask = undefined
     lastFrames.set(key, frame)
-    device.send('screen.frame', frame)
+    pushFrame(device, frame)
     device.send('task.list', { board } satisfies TaskListPayload)
-    log(`tihu board device=${device.id} rows=${board.rows.length} running=${board.counts.running} awaiting=${board.counts.awaiting} queued=${board.counts.queued}`)
+    log(`tihu board device=${device.id} rows=${board.rows.length} page=${board.page.index + 1}/${board.page.total} running=${board.counts.running} awaiting=${board.counts.awaiting} queued=${board.counts.queued}`)
+    device.boardHasRunning = board.rows.some((row) => row.state === 'running')
+    ensureBoardTicker()
+  }
+
+  /**
+   * 棋盘上有「在跑」的行时按时钟重发帧：右侧那条蓝色弧是按「已运行时长占 30 分钟的百分比」
+   * 画的，不重发就永远停在打开那一刻的比例（原来只有任务事件才刷新）。
+   */
+  function ensureBoardTicker(): void {
+    if (boardTicker !== undefined) return
+    boardTicker = setInterval(() => {
+      const stillRunning = [...devices].some((device) => device.unified && device.onBoard === true
+        && device.focusedTask === undefined && device.boardHasRunning === true)
+      if (!stillRunning) {
+        clearInterval(boardTicker)
+        boardTicker = undefined
+        return
+      }
+      refreshBoards()
+    }, BOARD_TICK_MS)
+    boardTicker.unref?.()
   }
 
   /** 棋盘变化：还停在棋盘上的设备刷一帧（详情屏/回执屏不动，免得把人弹走）。 */
@@ -2942,7 +3082,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (device.onBoard === true) return
       if (device.homeTask !== taskId) return
       if (taskId !== undefined && device.focusedTask !== taskId) return
-      if (expectStage !== undefined && (lastFrames.get(device.sessionId ?? device.id)?.stage ?? '') !== expectStage) return
+      if (expectStage !== undefined && device.screenStage !== expectStage) return
       device.homeTask = undefined
       log(`tihu auto home device=${device.id} task=${taskId ?? '-'} stage=${expectStage ?? '-'}`)
       sendBoard(device)
@@ -3034,12 +3174,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (item.level === 0) {
         try { device.cancelRound?.() } catch { /* 忽略 */ }
       }
+      // 完成页正文已经在这台设备上念过了：这条「标题——第一句」不再另开一轮。
+      // 另开一轮正是实测「只念第一句、后面全哑」的来源（新一轮会把正文的 PCM 中途掐掉）。
+      const alreadyRead = item.taskIds.some((taskId) => taskId !== '' && taskId === device.doneReadingTask)
       device.send('task.notify', {
         level: item.level,
         taskId: item.taskIds[0] ?? '',
         text: item.text,
-        spoken: true,
+        spoken: !alreadyRead,
       } satisfies TaskNotifyPayload)
+      if (alreadyRead) {
+        log(`tihu announce skipped device=${device.id} task=${device.doneReadingTask}（完成页整段正文在念，不重复念标题）`)
+        continue
+      }
       void speakAnnouncement(device, item.text)
         .then((spokenMs) => { if (spokenMs >= 0) armAutoHome(device, spokenMs, item.taskIds[0] || undefined) })
         .catch((error) => log(`tihu announce speak failed: ${(error as Error)?.message ?? String(error)}`))
@@ -3058,15 +3205,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 单句播报先查**预录缓存**（`~/.dsh/tihu/preroll/`）：同一句话第二次念不再合成，
    * 直接把裸 PCM 发下去——这是「完成 → 3 秒内听到」最省的一刀（设计 §11 P3）。
    */
-  async function speakAnnouncement(device: TihuDevice, text: string, purpose?: 'done'): Promise<number> {
+  async function speakAnnouncement(device: TihuDevice, text: string): Promise<number> {
     const key = device.sessionId ?? '__unbound__'
     const segments = splitSpeechSegments(text)
       .map((segment) => ({ ...segment, text: toSpeechText(segment.text) }))
       .filter((segment) => segment.text !== '')
     if (segments.length === 0) return -1
-    // 一句话播报不打断正在进行的朗读；「重读/打开完成页」念的是正文，允许接管（旧的一轮靠
-    // epoch 立刻哑火），否则点了重读却因为 announcing 占着什么都不念。
-    if (purpose === undefined && announcing.has(device.id)) return -1
+    // 一句话播报不打断正在进行的朗读（完成页整段正文、或另一条播报）。
+    if (announcing.has(device.id)) return -1
     const epoch = (device.speakEpoch = (device.speakEpoch ?? 0) + 1)
     announcing.add(device.id)
     const stale = (): boolean => device.speakEpoch !== epoch
@@ -3085,7 +3231,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         text: segment.text,
         charStart: segment.start,
         charEnd: segment.end,
-        ...(purpose === undefined ? {} : { read: purpose }),
         ...(final ? { final: true } : {}),
       } satisfies TtsAudioPayload)
     }
@@ -3131,7 +3276,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
               text: segment.text,
               charStart: segment.start,
               charEnd: segment.end,
-              ...(purpose === undefined ? {} : { read: purpose }),
               ...(chunk.final ? { final: true } : {}),
             } satisfies TtsAudioPayload)
           },
@@ -3153,6 +3297,175 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
   }
 
+  /* ---------- 完成页朗读：整段正文，一行一段（与屏上 done.ranges 同一坐标） ----------
+   *
+   * 2026-11-10 第三版（用户实机反馈）：完成页原来**只念了「标题——第一句」**，
+   * 因为任务完成时只推了一条 P1 播报（`doneAnnouncementOf` = 标题＋结果第一句），
+   * 完成页正文压根没进过朗读链路；而高亮却跟着 PCM 继续往前行 —— 两者读的根本不是
+   * 同一份文本。现在统一成一件事：**完成屏上屏就念屏上那份完整正文，每一行念一遍，
+   * 全部念完**，朗读分段直接来自 `done.ranges`（同一份 `prepareDoneText` 的结果），
+   * 所以每块 PCM 的 `charStart/charEnd` 就是那一行的区间，不需要页面做任何推算。
+   *
+   * 三处必须同时念完的原因（原实现留下的坑）：
+   *   1. 段与段之间没有 `return`/`break` 早退：唯一能中断的是「停止/重读/P0 抢屏」，
+   *      那靠 `speakEpoch` 对号（号变了才停手），不是循环本身的出口；
+   *   2. 播报（P1）不再抢正文这一轮：这条任务已经在该设备上念过正文，
+   *      `flushAnnounce` 直接把这条播报标记成未念（见 `device.doneReadingTask`）；
+   *   3. 合成不再逐段串行等首包：一段在合成时，后面几段已经在跑（`DONE_SYNTH_AHEAD`），
+   *      下发仍按行序，页面时间轴首尾相接 → 高亮跟着真实播放走。
+   */
+
+  /** 完成页朗读把一整行的 PCM 再切成的块大小（120 ms @ 24 kHz 单声道 16 bit）。 */
+  const DONE_READ_CHUNK_MS = 120
+  const DONE_READ_SAMPLE_RATE = 24000
+  const DONE_READ_CHUNK_BYTES = Math.round(DONE_READ_SAMPLE_RATE * DONE_READ_CHUNK_MS / 1000) * 2
+  /** 朗读时往前预合成几段（不改变下发顺序）。 */
+  const DONE_READ_AHEAD = 2
+
+  /** 一段（若干整行）的合成结果 → 按行区间切成「每行自己的 PCM」。 */
+  function sliceSegmentByLines(pcm: Buffer, segment: DoneSpeechSegment, ranges: readonly [number, number][], chars: readonly string[]): Array<{ line: number; start: number; end: number; pcm: Buffer }> {
+    const lines = ranges.slice(segment.firstLine, segment.lastLine + 1)
+    if (lines.length === 0 || pcm.length === 0) return []
+    // 占比按「真正送进合成的那份文本」算，不按屏上正文的长度算：`toSpeechText` 会剥掉 markdown、
+    // 链接、符号，按屏上正文切会把行边界一点点拖到声音前面去（2026-11-10 实机「高亮还在往前走」）。
+    const weights = lines.map(([start, end]) => Math.max(1, [...toSpeechText(chars.slice(start, end).join(''))].length))
+    const totalWeight = weights.reduce((total, value) => total + value, 0) || 1
+    const cuts: number[] = []
+    let used = 0
+    for (let i = 0; i < lines.length; i += 1) {
+      used += weights[i] ?? 1
+      const raw = i === lines.length - 1 ? pcm.length : Math.round(pcm.length * (used / totalWeight))
+      cuts.push(Math.max(0, Math.min(pcm.length, raw)))
+    }
+    // 行边界单调递增、最后一行收干整段尾巴（切不出重叠、也不留空洞）。
+    for (let i = 1; i < cuts.length; i += 1) cuts[i] = Math.max(cuts[i], cuts[i - 1])
+    cuts[cuts.length - 1] = pcm.length
+    const out: Array<{ line: number; start: number; end: number; pcm: Buffer }> = []
+    let from = 0
+    for (let i = 0; i < lines.length; i += 1) {
+      const [start, end] = lines[i]
+      const slice = pcm.subarray(Math.min(from, pcm.length), Math.max(Math.min(from, pcm.length), cuts[i] ?? pcm.length))
+      if (slice.length > 0) out.push({ line: segment.firstLine + i, start, end, pcm: slice })
+      from = cuts[i] ?? pcm.length
+    }
+    return out
+  }
+
+  /** 按固定长度切块下发（与 `tts.audio` 原来的 120 ms 分块同口径，页面时间轴不变）。 */
+  function chunkLinePcm(pcm: Buffer): Buffer[] {
+    if (pcm.length <= DONE_READ_CHUNK_BYTES) return [pcm]
+    const parts: Buffer[] = []
+    for (let at = 0; at < pcm.length; at += DONE_READ_CHUNK_BYTES) {
+      parts.push(pcm.subarray(at, Math.min(pcm.length, at + DONE_READ_CHUNK_BYTES)))
+    }
+    return parts
+  }
+
+  /**
+   * 念完一条完成任务的整段正文。返回下发音频的总时长（毫秒）；一段都没念成就返回 -1。
+   */
+  async function readDoneBody(device: TihuDevice, task: TihuTask): Promise<number> {
+    const key = device.sessionId ?? '__unbound__'
+    const body = doneBodyTextOf(task)
+    const ranges = doneLineRangesOf(body)
+    const plan = doneSpeechSegmentsOf(body)
+    if (plan.length === 0 || ranges.length === 0) return -1
+    if (!tts.available()) {
+      try { await tts.ensureServer() } catch { /* 合成阶段给可读错误 */ }
+    }
+    const status = tts.status()
+    if (!status.available) {
+      device.send('event.alert', { level: 'error', text: `本次无语音：${status.error ?? '本地引擎未就绪'}（任务结果已上屏）` })
+      return 0
+    }
+    const epoch = (device.speakEpoch = (device.speakEpoch ?? 0) + 1)
+    // 这条任务在这台设备上已经（开始）念正文了：flushAnnounce 不再重复念「标题——第一句」。
+    device.doneReadingTask = task.taskId
+    announcing.add(device.id)
+    const stale = (): boolean => device.speakEpoch !== epoch
+    const chars = [...body]
+    let spokenMs = 0
+    let failedLines = 0
+    // 合成窗口：段 i 在合成时，段 i+1 / i+2 也已经在跑；下发严格按段序。
+    const queued: Array<Promise<Buffer> | undefined> = []
+    const launchSegment = (index: number): void => {
+      if (index < 0 || index >= plan.length || queued[index] !== undefined) return
+      const segment = plan[index]
+      const speech = toSpeechText(segment.text)
+      if (speech === '') {
+        queued[index] = Promise.resolve(Buffer.alloc(0))
+        return
+      }
+      const cached = preroll.get(device.voice, speech)
+      if (cached !== undefined) {
+        log(`tihu done read preroll hit line=${segment.firstLine} chars=${[...speech].length}`)
+        queued[index] = Promise.resolve(cached)
+        return
+      }
+      const parts: Buffer[] = []
+      queued[index] = tts.synthesize(speech, {
+        voice: device.voice,
+        sessionId: key,
+        edgeVoice: device.edgeVoice,
+        offlineOnly: device.offlineOnly,
+        // 完成页朗读不在这里直接下发：先攒齐这一段的 PCM，再按行切开按序发（行边界＝区间边界）。
+        onChunk: (chunk) => { if (!stale()) parts.push(chunk.data) },
+      }).then(() => Buffer.concat(parts)).then((pcm) => {
+        if (pcm.length > 0) preroll.put(device.voice, speech, pcm)
+        return pcm
+      }).catch((error) => {
+        // 这一段念不出来不能整个 abort：不发静音占位，继续往后念剩下的行。
+        log(`tihu done read synth failed line=${segment.firstLine}: ${(error as Error)?.message ?? String(error)}`)
+        failedLines += 1
+        return Buffer.alloc(0)
+      })
+    }
+    launchSegment(0)
+    for (let index = 0; index < plan.length; index += 1) {
+      // 唯一的中途出口：被「停止 / 重读 / 回主页 / P0」抢走（号变了就停手），循环本身不 break。
+      if (stale()) return spokenMs
+      for (let ahead = 1; ahead <= DONE_READ_AHEAD; ahead += 1) launchSegment(index + ahead)
+      const pcm = (await queued[index]) ?? Buffer.alloc(0)
+      if (stale()) return spokenMs
+      for (const line of sliceSegmentByLines(pcm, plan[index], ranges, chars)) {
+        const blocks = chunkLinePcm(line.pcm)
+        const lastLine = index === plan.length - 1 && line.line === plan[index].lastLine
+        const lineText = chars.slice(line.start, line.end).join('')
+        for (let seq = 0; seq < blocks.length; seq += 1) {
+          if (stale()) return spokenMs
+          spokenMs += blocks[seq].length / 2 / DONE_READ_SAMPLE_RATE * 1000
+          device.send('tts.audio', {
+            seq,
+            total: blocks.length,
+            sampleRate: DONE_READ_SAMPLE_RATE,
+            channels: 1,
+            format: 'pcm16',
+            data: blocks[seq].toString('base64'),
+            index: line.line,
+            text: lineText,
+            charStart: line.start,
+            charEnd: line.end,
+            read: 'done',
+            ...(lastLine && seq === blocks.length - 1 ? { final: true } : {}),
+          } satisfies TtsAudioPayload)
+        }
+      }
+    }
+    if (failedLines > 0) {
+      device.send('event.alert', { level: 'warn', text: `有几行没念出来（${failedLines} 行，引擎/网络问题），其余照常在念` } satisfies AlertPayload)
+    }
+    return spokenMs
+  }
+
+  /** 完成屏上屏 → 念这条任务的整段正文；念完 + 60 秒回棋盘（期间任何交互都会撤销计时）。 */
+  function readDoneScreen(device: TihuDevice, task: TihuTask): void {
+    void readDoneBody(device, task)
+      .then((spokenMs) => {
+        if (spokenMs > 0) armScreenHome(device, spokenMs + HOME_AFTER_SPEECH_MS, task.taskId, '完成')
+      })
+      .catch((error) => log(`tihu done read failed: ${(error as Error)?.message ?? String(error)}`))
+  }
+
   /** 屏 4 的数据源：标题是任务名；正文只有最新一条状态 + 第 N 步/已用 + tokens（全实时）。 */
   function taskDetailFrameOf(task: TihuTask): ScreenFramePayload | undefined {
     const sessionId = task.sessionIds[task.sessionIds.length - 1]
@@ -3172,7 +3485,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       title,
       liveLine: state?.lastEventLine ?? '',
       step: Math.max(task.step, state?.step ?? 0),
-      elapsedMs: Math.max(0, (task.finishedAt ?? Date.now()) - task.startedAt),
+      // 已用时间按「这条任务这一轮跑起来的锚点」算：锚点先到先记、**永不被轮询推到后面**，
+      // 也没有别的帧能把它冻住（见 runAnchorOf 与 detailTicker 的屏阶段改判）。
+      elapsedMs: elapsedOfTask(task, sessionId),
       statsLine,
     })
   }
@@ -3283,10 +3598,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     sendFrame(device, doneScreenOf(task), device.sessionId)
     armScreenHome(device, HOME_AFTER_SPEECH_MS, task.taskId, '完成')
     if (!speak) return
-    // 念的就是屏上折行用的那一份正文：TTS 的 charStart/charEnd 才能和 done.ranges 对齐。
-    void speakAnnouncement(device, doneBodyTextOf(task), 'done')
-      .then((spokenMs) => { if (spokenMs > 0) armScreenHome(device, spokenMs + HOME_AFTER_SPEECH_MS, task.taskId, '完成') })
-      .catch((error) => log(`tihu done speak failed: ${(error as Error)?.message ?? String(error)}`))
+    // 念屏上这份 7 行正文：分段与 done.ranges 同源，一行一段，全部念完。
+    readDoneScreen(device, task)
   }
 
   /** 看待决策页：两个选项 + 主页；到点回棋盘（不替用户选）。 */
@@ -3359,15 +3672,18 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         if (device.onBoard === true) continue
         if (device.focusedTask === undefined) continue
         if (device.receiptTimer !== undefined || device.pendingPick !== undefined) continue
+        // 判「屏上现在是不是进度页」用设备自己那份（不是 lastFrames 那份共享缓存）：
+        // 完成帧/播报帧把缓存改写成别的屏，旧口径就把这条进度页当成「已经不在看了」，
+        // 于是每秒那一跳再也不发帧 → 已用时间冻在 0s（2026-11-10 实机）。
+        if (device.screenStage !== '进度') continue
         const key = device.sessionId ?? device.id
-        if ((lastFrames.get(key)?.stage ?? '') !== '进度') continue
         const task = tasks.get(device.focusedTask)
         if (task === undefined) continue
         if (task.state === 'done' || task.state === 'announced' || task.state === 'awaiting') continue
         const frame = taskDetailFrameOf(task)
         if (frame === undefined) continue
         lastFrames.set(key, frame)
-        device.send('screen.frame', frame)
+        pushFrame(device, frame)
       }
     }, 1000)
     detailTicker.unref?.()
@@ -3381,12 +3697,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (device.onBoard === true) continue
       if (device.focusedTask !== task.taskId) continue
       if (device.receiptTimer !== undefined || device.pendingPick !== undefined) continue
+      if (device.screenStage !== '进度') continue
       const key = device.sessionId ?? device.id
-      if ((lastFrames.get(key)?.stage ?? '') !== '进度') continue
       const frame = taskDetailFrameOf(task)
       if (frame === undefined) continue
       lastFrames.set(key, frame)
-      device.send('screen.frame', frame)
+      pushFrame(device, frame)
       armScreenHome(device, DETAIL_AUTO_HOME_MS, task.taskId, '进度')
     }
   }
@@ -3410,7 +3726,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     for (const target of targets) {
       disarmAutoHome(target)
       target.focusedTask = task.taskId
-      target.send('screen.frame', frame)
+      pushFrame(target, frame)
       sendTaskUpdate(target, task)
       target.send('task.list', { board: boardOf(tasks.list(), Date.now()) } satisfies TaskListPayload)
       if (target.receiptTimer !== undefined) clearTimeout(target.receiptTimer)
@@ -3538,7 +3854,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         target.receiptTimer = undefined
       }
       target.focusedTask = undefined
-      target.send('screen.frame', frame)
+      pushFrame(target, frame)
     }
     pushTaskNotify(undefined, 0, `这句话派给谁：${list.map((card, index) => `${index + 1} ${card.name}`).join('，')}`)
     log(`tihu ask-which device=${device.id} candidates=${list.map((card) => card.id).join(',')}`)
@@ -3566,7 +3882,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       disarmAutoHome(target)
       target.pendingPick = undefined
       target.focusedTask = undefined
-      target.send('screen.frame', frame)
+      pushFrame(target, frame)
     }
     const sent = await promptSession(commander, [
       { type: 'text', text },
@@ -3663,7 +3979,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       target.pendingPick = undefined
       target.focusedTask = undefined
       target.onBoard = false
-      target.send('screen.frame', frame)
+      pushFrame(target, frame)
       armScreenHome(target, tihuNoticeHomeMs(), undefined, '派单')
     }
     log(`tihu slow-path no card device=${device.id}`)
@@ -3690,7 +4006,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         target.receiptTimer = undefined
       }
       target.focusedTask = undefined
-      target.send('screen.frame', frame)
+      pushFrame(target, frame)
     }
     const sent = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: COMMANDER_TAIL }])
     if (!sent.ok) {
@@ -3714,7 +4030,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (removed !== undefined) appendTaskJournal(removed)
       dismissExternalTask(task)
       device.focusedTask = undefined
-      device.send('screen.frame', noticeFrame({ stage: '撤单', title: `已撤掉：${task.title}`, lines: ['电脑端会话照常，只是不再上屏'], tone: 'idle' }))
+      sendFrame(device, noticeFrame({ stage: '撤单', title: `已撤掉：${task.title}`, lines: ['电脑端会话照常，只是不再上屏'], tone: 'idle' }))
       refreshBoards()
       log(`tihu cancel pc task=${task.taskId}`)
       return true
@@ -3724,13 +4040,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         stage: '撤单',
         text: `「${task.title}」已经开跑了：要撤得先在电脑端停掉它，停了再撤`,
       } satisfies ProgressPayload)
-      device.send('screen.frame', noticeFrame({ stage: '撤单', title: '这条已经开跑了', lines: ['在电脑端停掉它，再撤'], tone: 'alert' }))
+      sendFrame(device, noticeFrame({ stage: '撤单', title: '这条已经开跑了', lines: ['在电脑端停掉它，再撤'], tone: 'alert' }))
       return false
     }
     const journal = tasks.archive(task.taskId)
     if (journal !== undefined) appendTaskJournal(journal)
     device.focusedTask = undefined
-    device.send('screen.frame', noticeFrame({ stage: '撤单', title: `已撤掉：${task.title}`, lines: ['还没开始跑，直接拿掉了'], tone: 'idle' }))
+    sendFrame(device, noticeFrame({ stage: '撤单', title: `已撤掉：${task.title}`, lines: ['还没开始跑，直接拿掉了'], tone: 'idle' }))
     sendTaskUpdate(device, task)
     refreshBoards()
     log(`tihu cancel task=${task.taskId}`)
@@ -3760,14 +4076,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   /** 屏上口头命令（零模型）。 */
   async function runScreenCommand(device: TihuDevice, command: ScreenCommand): Promise<void> {
     if (command.kind === 'board') {
-      sendBoard(device)
+      // 口头命令/主页键明确回棋盘：回到第一张页（最该看的那些排在前面）。
+      sendBoard(device, true)
       return
     }
     if (command.kind === 'open') {
-      const rows = boardOf(tasks.list(), Date.now()).rows
+      // 「开第 N 条」指的是屏上这一页的第 N 行（翻页之后所见即所开）。
+      const rows = boardOf(tasks.list(), Date.now(), Math.max(0, device.boardPage ?? 0)).rows
       const target = command.index !== undefined ? rows[command.index - 1] : rows[0]
       if (target === undefined) {
-        device.send('screen.frame', noticeFrame({ stage: '任务', title: '现在没有可看的任务', lines: ['说一句话就派单'], tone: 'idle' }))
+        sendFrame(device, noticeFrame({ stage: '任务', title: '现在没有可看的任务', lines: ['说一句话就派单'], tone: 'idle' }))
         return
       }
       openTask(device, target.taskId)
@@ -3781,7 +4099,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     if (command.kind === 'cancel') {
       const target = device.focusedTask ?? tasks.list().filter((task) => task.state === 'queued' || task.state === 'running').sort((a, b) => b.updatedAt - a.updatedAt)[0]?.taskId
       if (target === undefined) {
-        device.send('screen.frame', noticeFrame({ stage: '撤单', title: '现在没有可撤的任务', lines: [], tone: 'idle' }))
+        sendFrame(device, noticeFrame({ stage: '撤单', title: '现在没有可撤的任务', lines: [], tone: 'idle' }))
         return
       }
       await cancelTask(device, target)
@@ -3984,10 +4302,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       sendBoard(device)
       return '已回棋盘'
     },
-    browse: async (deviceId) => {
+    browse: async (deviceId, direction) => {
       const device = findControlDevice(deviceId)
       if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
-      return '棋盘固定显示最近 5 条，没有上一页/下一页了'
+      // 棋盘翻页（每页 4 条）：指挥模型的「下一页」和屏上「下一页」按钮走同一条路。
+      device.boardPage = Math.max(0, Math.trunc(device.boardPage ?? 0) + (direction === 'prev' ? -1 : 1))
+      sendBoard(device)
+      const page = Math.max(0, device.boardPage ?? 0)
+      const board = boardOf(tasks.list(), Date.now(), page)
+      const titles = board.rows.map((row, index) => `${index + 1}. ${row.title}（${row.capsule}）`).join('\n')
+      return `棋盘第 ${board.page.index + 1}/${board.page.total} 页（共 ${board.total} 条）：\n${titles === '' ? '（这页没有任务）' : titles}`
     },
     openRecent: async (deviceId) => {
       const device = findControlDevice(deviceId)

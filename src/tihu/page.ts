@@ -123,8 +123,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   @keyframes tapFlash { from { opacity:.8; transform:scale(.4); } to { opacity:0; transform:scale(1.4); } }
 
   /* ── 任务棋盘（屏 1，2026-11-09 统一指挥会话）──
-     只有顶行 14 + 最多 4 行任务，不再有底部翻页条：
-     内容高 222 = 顶行 14 + 间隙 4 + 4×48（每行 20px 标题 + 16px 副行 + 上下 6px）+ 余 12。 */
+     顶行 14 + 间隙 4 + 每页最多 4 行任务 + 底部翻页条 12（2026-11-10 用户明确要回来）：
+     内容高 222 = 顶行 14 + 间隙 4 + 4×48（每行 20px 标题 + 16px 副行 + 上下 6px）+ 翻页条 12。
+     翻页条只有一页时 JS 直接不建，什么都不显示。 */
   #screen.board-mode .home-top { display:flex; }
   #screen.board-mode .stage, #screen.board-mode .title, #screen.board-mode ul,
   #screen.board-mode .action-bar { display:none; }
@@ -149,14 +150,25 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-merged { flex:none; font-size:11px; color:#7c8b99; }
   #screen .board-row2 { display:flex; align-items:center; gap:6px; font-size:12px; line-height:16px; color:#8b97a5; }
   #screen .board-sub { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
-  /* 右侧状态点（10px，克制）：完成＝暗灰、执行中＝绿、派单＝蓝、排队＝更暗的灰、待决策＝琥珀。
-     不再画大圆环/问号徽标；点右边缘离屏幕边 10px（内容右界 312 − 2px 外边距）。 */
-  #screen .board-dot { flex:none; width:10px; height:10px; border-radius:50%; margin-left:auto; margin-right:2px;
-    background:#3f4a57; }
-  #screen .board-dot.running { background:#35d07f; }
-  #screen .board-dot.dispatched { background:#6fb3e5; }
-  #screen .board-dot.awaiting { background:var(--warn); }
-  #screen .board-dot.done, #screen .board-dot.announced { background:#5b6673; }
+  /* 右侧状态图形（用户 2026-11-10 定案，不再用 10px 实心点）：右对齐、离屏幕外沿正好 10px
+     （#screen 内边距 8 + 边框 1 → 内容右界 311；图形外边距 1 → 右界 310 → 距外沿 10px）。
+     完成＝绿色实心圆（直径 12px）；待决策＝黄色圆形里一个问号；
+     进行中＝蓝色未闭合圆环，弧长按「已运行时长 ÷ 30 分钟」画，跑满后停在满圈差一点的那圈；
+     排队／派单＝灰色细环。都不做大圆环（14×14 以内，不抢行高）。 */
+  #screen .board-status { flex:none; width:14px; height:14px; box-sizing:border-box; margin-left:6px; margin-right:1px; }
+  #screen .board-status.done, #screen .board-status.announced { width:12px; height:12px; border-radius:50%; background:#35d07f; }
+  #screen .board-status.queued { width:12px; height:12px; border-radius:50%; background:none; border:1px solid #6f7d89; }
+  #screen .board-status.dispatched { width:12px; height:12px; border-radius:50%; background:none; border:1px solid #6fb3e5; }
+  #screen .board-status.announced { background:#2fbf6b; }
+  #screen .board-status.awaiting { width:14px; height:14px; border-radius:50%; background:var(--warn);
+    color:#1b1305; font-size:11px; font-weight:700; line-height:14px; text-align:center; }
+  #screen .board-status.running svg { display:block; width:14px; height:14px; }
+  /* 翻页条：上一页 / 第 N/M 页 / 下一页（只有一页时 JS 不建这条） */
+  #screen .board-pager { display:flex; align-items:center; justify-content:center; gap:8px; height:12px; }
+  #screen .board-pager button { border:0; background:none; padding:0; color:#9fb0c0; font-size:11px; line-height:12px; }
+  #screen .board-pager button.cur { color:#5FD2C8; font-weight:700; }
+  #screen .board-pager button.off { color:#48525d; }
+  #screen .board-pager .page { font-size:11px; line-height:12px; color:#c8d4dd; }
   /* 微条：最近 8 步耗时（只给节奏感，不显示数字） */
   #screen .board-micro { display:flex; flex:none; align-items:flex-end; gap:2px; height:10px; margin-left:auto; margin-right:5px; }
   #screen .board-micro span { width:2px; min-height:2px; background:#3fb6a8; border-radius:1px; opacity:.85; }
@@ -659,15 +671,68 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         }
         row2.appendChild(micro);
       }
-      /* 右侧状态点：只按状态给颜色，不再画大圆环/问号（完成灰、执行中绿、待决策琥珀）。 */
-      var dot = document.createElement('span');
-      dot.className = 'board-dot ' + String(row.state || 'queued');
-      row2.appendChild(dot);
+      /* 右侧状态图形（用户 2026-11-10 定案）：完成＝绿色实心圆（直径 12px）；
+         待决策＝黄色圆形里的问号；排队/派单＝灰色细环；进行中＝蓝色圆环，弧长由宿主的
+         ring.percent（已运行时长 ÷ 30 分钟）画出来，满 30 分钟后停在差一点的整圈。 */
+      row2.appendChild(boardStatusEl(row));
       item.appendChild(row1);
       item.appendChild(row2);
       body.appendChild(item);
     }
+    // 翻页条：每页 4 条（BOARD_PAGE_SIZE）；只有一页时整条不建（用户 2026-11-10「首页恢复翻页」）。
+    var page = board.page || { index: 0, total: 1 };
+    var pageIndex = Math.max(0, Math.floor(Number(page.index) || 0));
+    var pageTotal = Math.max(1, Number(page.total) || 1);
+    if (rows.length > 0 && pageTotal > 1) {
+      var pager = document.createElement('div');
+      pager.className = 'board-pager';
+      var prevBtn = document.createElement('button');
+      prevBtn.type = 'button';
+      prevBtn.textContent = '上一页';
+      prevBtn.setAttribute('data-action', 'boardPrev');
+      prevBtn.className = pageIndex > 0 ? 'cur' : 'off';
+      var nextBtn = document.createElement('button');
+      nextBtn.type = 'button';
+      nextBtn.textContent = '下一页';
+      nextBtn.setAttribute('data-action', 'boardNext');
+      nextBtn.className = pageIndex < pageTotal - 1 ? 'cur' : 'off';
+      var pageText = document.createElement('span');
+      pageText.className = 'page';
+      pageText.textContent = '第 ' + (pageIndex + 1) + '/' + pageTotal + ' 页';
+      pager.appendChild(prevBtn);
+      pager.appendChild(pageText);
+      pager.appendChild(nextBtn);
+      body.appendChild(pager);
+    }
     applyScreenClass('board-mode');
+  }
+
+  /** 棋盘行右侧那枚状态图形（14×14，右对齐，离屏幕外沿 10px）。 */
+  function boardStatusEl(row) {
+    var status = document.createElement('span');
+    var state = String(row.state || 'queued');
+    status.className = 'board-status ' + state;
+    if (state === 'running') {
+      var percent = Number(row.ring && row.ring.percent);
+      percent = Number.isFinite(percent) ? Math.max(0, Math.min(1, percent)) : 0;
+      // 「跑满就停在满圈附近」：满 30 分钟还留 6% 的空档，让人看得出它转了一圈、但没转满。
+      if (percent >= 1) percent = 0.94;
+      var radius = 5;
+      var circumference = Math.PI * 2 * radius;
+      var arc = Math.max(1, circumference * percent);
+      status.innerHTML = '<svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">'
+        + '<circle cx="7" cy="7" r="' + radius + '" fill="none" stroke="#2b3a4a" stroke-width="2"></circle>'
+        + '<circle cx="7" cy="7" r="' + radius + '" fill="none" stroke="#4f9fd8" stroke-width="2" stroke-linecap="round"'
+        + ' stroke-dasharray="' + arc.toFixed(2) + ' ' + (circumference + 1).toFixed(2) + '"'
+        + ' transform="rotate(-90 7 7)"></circle></svg>';
+      return status;
+    }
+    if (state === 'awaiting') {
+      status.textContent = row.badge === 'ask' ? '?' : '·';
+      return status;
+    }
+    // 完成＝绿色实心圆（直径 12px，由 CSS 给）；排队／派单＝灰色细环（CSS）。
+    return status;
   }
 
   /* ---------- 完成页（屏 6，参考图版式） ----------
@@ -1811,9 +1876,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         if (under && under.getAttribute) {
           var actionId = under.getAttribute('data-action');
           if (actionId) {
-            // 停止/回主页都算「退出本轮朗读」：和停止一样先把页面音频队列掐掉（宿主也会 cancelRound），
+            // 停止/回主页/翻页都算「退出本轮朗读」：和停止一样先把页面音频队列掐掉（宿主也会 cancelRound），
             // 差别只是不回「已停止朗读」提示。
-            if (actionId === 'stop' || actionId === 'home' || actionId === 'prev' || actionId === 'next' || actionId === 'taskBoard') stopPcm();
+            if (actionId === 'stop' || actionId === 'home' || actionId === 'prev' || actionId === 'next'
+              || actionId === 'taskBoard' || actionId === 'boardPrev' || actionId === 'boardNext') stopPcm();
             if (actionId === 'replay' && audioRunning(state.audioCtx)) {
               state.droppedAudio = false;
               hideAudioWarn();

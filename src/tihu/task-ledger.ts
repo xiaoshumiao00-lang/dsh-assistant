@@ -211,7 +211,16 @@ export function rowOf(task: TihuTask, now: number): TaskBoardRow {
 }
 
 /**
- * 棋盘数据：排序固定（待决策 → 执行中 → 排队 → 完成），同一项目连续多条只留最新一条，
+ * 棋盘一行了哪条：鹈鹕自己派出去的任务（`source !== 'pc'`）**永远占最前、永远上屏**。
+ * 用户 2026-11-10：首页看不到派出的任务——电脑端那些 CU 会话最多 6 条，把它们挤到第 2 页
+ * 之后，派出去的活就一条都看不见了（被 CU 过滤误伤或被页大小截掉）。
+ */
+export function isPinnedBoardTask(task: TihuTask): boolean {
+  return task.source !== 'pc'
+}
+
+/**
+ * 棋盘数据：排序固定（鹈鹕派单在前 → 待决策 → 执行中 → 排队 → 完成），同一项目连续多条只留最新一条，
  * 其余折叠成 `merged`（屏上画「+N 条」；点开看的是项目里最新那条）。
  *
  * 为什么按「连续」而不是「全项目」折叠：用户看棋盘是自上而下扫一眼，「刚才那三条基金」
@@ -220,6 +229,9 @@ export function rowOf(task: TihuTask, now: number): TaskBoardRow {
 export function boardOf(tasks: readonly TihuTask[], now: number, page = 0): TaskBoardPayload {
   const live = tasks.filter((task) => task.state !== 'archived')
   const sorted = [...live].sort((a, b) => {
+    // 派出去的任务先占前排（和电脑端会话比状态强弱也值：派完就在跑、跑完也看得见）。
+    const byPin = (isPinnedBoardTask(b) ? 1 : 0) - (isPinnedBoardTask(a) ? 1 : 0)
+    if (byPin !== 0) return byPin
     const byRank = stateRank(a.state) - stateRank(b.state)
     if (byRank !== 0) return byRank
     // 同状态：新动静的在前（完成态用完成时刻，避免「刚完成的反而排后面」）。
