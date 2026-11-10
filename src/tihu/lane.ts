@@ -23,7 +23,12 @@
  *     3. 屏：订阅 `session/event`（turn/start、tool/call、assistant/message、
  *        turn/end）→ screen.frame / event.progress / task.notify / tts.audio；
  *     4. 闸：`tools/pre-execute` / `tools/post-execute` → 快照、审计（见 guard.ts）。
- *        危险动作的授权只在电脑端，绝不上设备屏。只对「tihu 正在执行的会话」生效。
+ *        工具级授权**不**由 lane 自己弹屏（危险动作照旧只在电脑端审批）。只对「tihu 正在执行的会话」生效；
+ *     5. 待决策：宿主的 `approval/request` / `user-questions/request`（pendingInteraction 的真身）
+ *        → 屏 5。**只在**「托管没点亮 + 台上有统一指挥设备 + 该会话已经有任务卡」时接管：
+ *        挂住请求、等设备点选项（60 秒到点按默认项），把答案当 waterfall 返回值交回宿主，
+ *        会话因此真的继续跑（见 pending-interactions.ts）。托管开着时 tuoguan 会替人答，
+ *        这里一律 `next()`，绝不落待决策。
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
@@ -99,6 +104,15 @@ import {
   type TihuTask,
 } from './task-ledger.ts'
 import { commanderReplyTail, parseCommanderReply, type CommanderReply } from './dispatch-protocol.ts'
+import {
+  PENDING_OFFLINE_CHECK_MS,
+  approvalDecisionOf,
+  questionDecisionOf,
+  sessionIdOfPendingRequest,
+  tihuDecisionTimeoutMs,
+  tuoguanOnForSession,
+  type PendingDecision,
+} from './pending-interactions.ts'
 import {
   DONE_NO_REPLY_TEXT,
   RECEIPT_SECONDS,
@@ -480,6 +494,31 @@ interface TihuDevice {
 }
 
 /**
+ * 一条挂起的宿主 pendingInteraction（设备待决策）。
+ *
+ * `settle` 是真答案：把 `answerOf(index)` 当 waterfall 的返回值交回宿主；
+ * `delegate` 是把这道题**还给**电脑端（浏览器卡片），用于设备全掉线。
+ */
+interface PendingDecisionBridge {
+  /** 登记簿里的任务短号。 */
+  taskId: string
+  /** 发起审批/提问的会话。 */
+  sessionId: string
+  /** 这道题的问题原文/选项/默认项。 */
+  decision: PendingDecision
+  settled: boolean
+  timer?: ReturnType<typeof setTimeout>
+  watch?: ReturnType<typeof setInterval>
+  onAbort?: () => void
+  /** 请求的取消信号（abort 时摘监听用）。 */
+  signal?: { removeEventListener?: (name: string, handler: () => void) => void }
+  /** 设备点选 / 超时 / 请求取消 → 交回答案。 */
+  settle: (index: number, by: string) => void
+  /** 设备全掉线 → 还给电脑端。 */
+  delegate: (by: string) => void
+}
+
+/**
  * 定时发一帧（朗读时按音频播放时刻推进屏帧）。
  *
  * 回调必须 try/catch：异常发生在 setTimeout 里，逃出去就是 uncaughtException，
@@ -830,6 +869,16 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const runEndedAt = new Map<string, number>()
   /** 进度页看门狗：taskId → 最近一次真实进度事件（打开进度页也算一次）。 */
   const progressEventAt = new Map<string, number>()
+  /**
+   * 待决策桥：taskId → 挂住的宿主 pendingInteraction。
+   *
+   * 用户 2026-11-10 实机要测「待决策」：登记簿里 `awaiting` 的**唯一合法来源**就是
+   * 「托管没点亮时问题落回人身上」，但 lane 里没有任何地方调 `tasks.ask()`，于是黄色问号
+   * 永远出不来。这里把宿主的 `approval/request` / `user-questions/request` 映射成待决策：
+   * 挂住请求（不调 `next()`）→ 设备点选项或 60 秒到点 → 用 `answerOf(index)` 当返回值交回
+   * 宿主，会话因此**真的**继续跑（不是只把屏标成已答）。
+   */
+  const pendingBridges = new Map<string, PendingDecisionBridge>()
 
   /** 定锚点：`reset = true` 只由真实的新一轮调用（其它一律不许把锚点往后挪）。 */
   function noteRunAnchor(taskId: string, at: number, reset = false): void {
@@ -2192,6 +2241,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         } else if (type === 'turn/end') {
           const pcReason = finishReasonOf(data)
           const pcOk = pcReason === 'stop' || pcReason === 'completed'
+          // 这一轮都结束了：挂着的待决策已经作废（问题等不到答案了），先按默认项了结，
+          // 否则登记簿会永远停在黄色问号，那道 waterfall 也永远悬着。
+          if (taskOfSession.state === 'awaiting' && !settlePendingDecisionDefault(taskOfSession.taskId, '回合结束')) {
+            tasks.answer(taskOfSession.taskId, '回合结束', at)
+          }
           // 内存里没有回复时先从活会话快照补一次（同步，不读盘）；轮询镜像任务
           // 的完成态可能是列表推出来的，`assistant/message` 不保证都在本进程里。
           const doneReply = lastAssistant.get(sessionId)?.text ?? cachedAssistantText(sessionId)
@@ -2241,6 +2295,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         } else if (type === 'turn/end') {
           const reason = finishReasonOf(data)
           const ok = reason === 'stop' || reason === 'completed'
+          // 同上（pc 分支）：回合结束前先把挂着的待决策按默认项了结。
+          if (taskOfSession.state === 'awaiting' && !settlePendingDecisionDefault(taskOfSession.taskId, '回合结束')) {
+            tasks.answer(taskOfSession.taskId, '回合结束', at)
+          }
           const reply = lastAssistant.get(sessionId)?.text ?? cachedAssistantText(sessionId)
           const resultLine = firstSentenceOf(reply) || (ok ? '做完了' : `中断（${reason}）`)
           // 用户 2026-11-10：主回合结束 ≠ 任务完成——它派出的后台子代理可能还在跑。
@@ -2323,6 +2381,17 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       log(`tihu assistant stream failed: ${(error as Error)?.message ?? String(error)}`)
     }
   })
+
+  /* ---------- 待决策：挂住宿主的两道 pendingInteraction waterfall ----------
+   *
+   * 宿主这一侧没有 `sessionStatus`（那是浏览器 uiSession 的投影），pendingInteraction 的真身
+   * 就是这两道 waterfall 的请求：挂住它、把答案当返回值交回去，就是「设备答了真的回到会话」。
+   * 托管开着时 tuoguan 会先答，或者我们判到托管开着直接 `next()`，两条路都不会落待决策。
+   * `installAutoAnswer` 用的是 `{ prepend: true }`（抢在 api-remotes 转发给浏览器之前），
+   * 这里同样 prepend：必须在转发器之前拿到请求，否则浏览器一答 next() 就轮不到我们。
+   */
+  const disposeApprovalRequest = registerPendingWaterfall('approval', 'approval/request')
+  const disposeQuestionRequest = registerPendingWaterfall('question', 'user-questions/request')
 
   /* ---------- WebSocket ---------- */
 
@@ -2553,6 +2622,22 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         await runScreenCommand(device, { kind: 'open' })
         return
       }
+      // 硬件/固件的真正「答选项」入口（与屏上点 taskAnswer1/2 同一条路）：
+      // 有挂着的宿主 pendingInteraction 就把答案交回会话，没有就只改登记簿。
+      if (payload.optionIndex !== undefined) {
+        const target = payload.taskId === undefined
+          ? (device.focusedTask === undefined ? undefined : tasks.get(device.focusedTask))
+          : tasks.get(payload.taskId)
+        if (target !== undefined && target.state === 'awaiting') {
+          const index = Math.max(0, Math.min(Math.trunc(payload.optionIndex), Math.max(0, (target.options ?? []).length - 1)))
+          const label = (target.options ?? [])[index] ?? ''
+          if (!answerPendingDecision(target.taskId, index, '设备点选')) tasks.answer(target.taskId, '设备点选', Date.now())
+          device.send('event.progress', { stage: '待决策', text: `已选：${label}` } satisfies ProgressPayload)
+          leaveDecisionScreens(target.taskId, device.id)
+          sendBoard(device)
+        }
+        return
+      }
       return
     }
     if (type === 'screen.gesture') {
@@ -2598,12 +2683,18 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           }
           if (actionId === 'taskAnswer1' || actionId === 'taskAnswer2') {
             // 待决策页：点选项＝就地答这条任务（不派单、不新建会话），答完立刻回棋盘。
+            // 有挂着的宿主 pendingInteraction 时**必须**走它：那个 settle 才是把答案交回会话的人
+            // （只改登记簿＝设备标记已答、电脑端还得再点一次）。
             const target = device.focusedTask === undefined ? undefined : tasks.get(device.focusedTask)
             if (target !== undefined && target.state === 'awaiting') {
-              const index = actionId === 'taskAnswer1' ? 0 : 1
+              const raw = actionId === 'taskAnswer1' ? 0 : 1
+              const index = Math.max(0, Math.min(raw, Math.max(0, (target.options ?? []).length - 1)))
               const label = (target.options ?? [])[index] ?? ''
-              tasks.answer(target.taskId, '设备点选', Date.now())
+              if (!answerPendingDecision(target.taskId, index, '设备点选')) {
+                tasks.answer(target.taskId, '设备点选', Date.now())
+              }
               device.send('event.progress', { stage: '待决策', text: `已选：${label}` } satisfies ProgressPayload)
+              leaveDecisionScreens(target.taskId, device.id)
               await runScreenCommand(device, { kind: 'board' })
             }
             return
@@ -3402,6 +3493,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           continue
         }
         if (tasks.setChildRunning(existingId, item.childRunning, now)) changed = true
+        // 设备正在答这道题（awaiting）：状态由待决策桥接管，轮询一句话都不许改——
+        // 否则「最近一次活动」的推导会把这张卡抖回完成/执行中，黄色问号活不过一轮。
+        if (tasks.get(existingId)?.state === 'awaiting') continue
         const summary = item.state === 'done' ? plainSummaryOf(lastAssistant.get(sessionId)?.text ?? '') : ''
         if (tasks.syncExternal(existingId, {
           title,
@@ -3589,6 +3683,232 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     if ((task.childRunning ?? 0) > 0) return true
     const sessionId = task.sessionIds[task.sessionIds.length - 1]
     return sessionId !== undefined && runningSessions.has(sessionId)
+  }
+
+  /* ---------- 待决策桥：宿主 pendingInteraction → 屏 5（2026-11-10） ---------- */
+
+  /** 台上还有没有统一指挥设备（没有就不许把电脑端那张卡吞掉）。 */
+  function pendingDeviceOnline(): boolean {
+    for (const device of devices) if (device.unified) return true
+    return false
+  }
+
+  /** 60 秒到点写进 `answeredBy` 的那句话（真 60 秒时与登记簿注释同一口径）。 */
+  function decisionTimeoutLabel(ms: number): string {
+    const seconds = Math.round(ms / 1000)
+    return seconds >= 1 ? `设备 ${seconds} 秒超时` : '设备超时'
+  }
+
+  /**
+   * 屏 5 出现/消失时把还停在这条任务「待决策」页的设备挪走（回棋盘）。
+   * `exceptDeviceId` 给定时跳过那台（点选项的那台自己走 runScreenCommand 回棋盘）。
+   */
+  function leaveDecisionScreens(taskId: string, exceptDeviceId?: string): void {
+    for (const device of devices) {
+      if (!device.unified) continue
+      if (exceptDeviceId !== undefined && device.id === exceptDeviceId) continue
+      if (device.focusedTask !== taskId) continue
+      if (device.screenStage !== '待决策') continue
+      disarmAutoHome(device)
+      sendBoard(device)
+    }
+  }
+
+  /**
+   * 新待决策上屏：棋盘立刻刷一帧（黄色问号 + 顶行「●N 等你」），
+   * 停在棋盘/这条任务上的设备直接切到屏 5；同时发一条**不朗读**的气泡。
+   */
+  function announcePendingDecision(task: TihuTask): void {
+    const question = String(task.question ?? '').trim()
+    const text = `在等你定：${question === '' ? '一条确认' : question}`
+    for (const device of devices) {
+      if (!device.unified) continue
+      device.send('task.notify', { level: 2, taskId: task.taskId, text, spoken: false } satisfies TaskNotifyPayload)
+    }
+    refreshBoards()
+    for (const device of devices) {
+      if (!device.unified) continue
+      if (device.receiptTimer !== undefined || device.pendingPick !== undefined || device.pendingVoice !== undefined) continue
+      if (!(device.onBoard === true || device.focusedTask === task.taskId)) continue
+      showDecision(device, task)
+    }
+    log(`tihu decision ask task=${task.taskId} session=${task.sessionIds[0] ?? '-'} question=${JSON.stringify(task.question ?? '')} options=${JSON.stringify(task.options ?? [])} default=${String(task.defaultIndex ?? 0)}`)
+  }
+
+  /**
+   * 挂住一道宿主 pendingInteraction，等设备拍板。
+   *
+   * 为什么是「挂住 waterfall」而不是「读 sessionStatus」：宿主进程里没有 sessionStatus 那份 Map
+   * （那是浏览器 uiSession 的投影），pendingInteraction 的真身就是这两道 waterfall 的请求；
+   * 谁把它们挂住、把答案当返回值交回去，谁就真的回答了会话。
+   *
+   * 保底（绝不把人卡死）：
+   *   - 60 秒到点 → 按默认项交回（与托管自动答同一条规则，写 `answeredBy＝设备 N 秒超时`）；
+   *   - 设备全掉线 → 立刻 `next()` 还给电脑端（浏览器卡片照旧，这时标「电脑端作答」）；
+   *   - 请求被取消（signal abort）/本插件卸载 → 按默认项了结，返回的 promise 不会永远悬着。
+   */
+  function holdPendingDecision(decision: PendingDecision, task: TihuTask, request: any, next: () => Promise<any>): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const timeoutMs = tihuDecisionTimeoutMs()
+      // 同一任务已经挂着一道题（并行工具调用的极端情况）：旧的按默认项了结，绝不让两条 waterfall 同时挂着。
+      const previous = pendingBridges.get(task.taskId)
+      if (previous !== undefined) previous.settle(previous.decision.defaultIndex, '被新问题顶替')
+      const bridge: PendingDecisionBridge = {
+        taskId: task.taskId,
+        sessionId: decision.sessionId,
+        decision,
+        settled: false,
+        timer: undefined,
+        watch: undefined,
+        onAbort: undefined,
+        settle(index: number, by: string) {
+          if (bridge.settled) return
+          bridge.settled = true
+          clearPendingBridge(bridge)
+          tasks.answer(task.taskId, by, Date.now())
+          leaveDecisionScreens(task.taskId)
+          refreshBoards()
+          log(`tihu decision answer task=${task.taskId} by=${by} index=${String(index)} option=${JSON.stringify(decision.options[index] ?? '')}`)
+          resolve(decision.answerOf(index))
+        },
+        delegate(by: string) {
+          if (bridge.settled) return
+          bridge.settled = true
+          clearPendingBridge(bridge)
+          log(`tihu decision delegate task=${task.taskId} why=${by}`)
+          void Promise.resolve()
+            .then(() => next())
+            .then(
+              (value: unknown) => {
+                tasks.answer(task.taskId, '电脑端作答', Date.now())
+                leaveDecisionScreens(task.taskId)
+                refreshBoards()
+                resolve(value)
+              },
+              (error: unknown) => {
+                tasks.answer(task.taskId, '电脑端作答', Date.now())
+                leaveDecisionScreens(task.taskId)
+                refreshBoards()
+                reject(error)
+              },
+            )
+        },
+      }
+      pendingBridges.set(task.taskId, bridge)
+      tasks.ask(task.taskId, {
+        question: decision.question,
+        options: decision.options,
+        defaultIndex: decision.defaultIndex,
+        ...(decision.detail === undefined ? {} : { detail: decision.detail }),
+        timeoutMs,
+      })
+      announcePendingDecision(task)
+      const timer = setTimeout(() => bridge.settle(decision.defaultIndex, decisionTimeoutLabel(timeoutMs)), timeoutMs)
+      // **不 unref**：这是一道真的挂着的宿主请求（审批/提问），进程闲着也必须到点把它了结，
+      // 否则「60 秒到点按默认项」永远不触发、电脑端那张卡永远等。dispose 会统一清掉它。
+      bridge.timer = timer
+      const watch = setInterval(() => {
+        if (disposed) return
+        if (pendingDeviceOnline()) return
+        bridge.delegate('设备已离线')
+      }, PENDING_OFFLINE_CHECK_MS)
+      watch.unref?.()
+      bridge.watch = watch
+      // 请求被取消（用户停止 turn / 会话被卸载）：题已经作废，按默认项了结，promise 不能悬着。
+      const signal = request?.signal
+      if (signal !== null && typeof signal === 'object' && typeof signal.addEventListener === 'function') {
+        const onAbort = (): void => {
+          if (bridge.settled) return
+          bridge.settled = true
+          clearPendingBridge(bridge)
+          tasks.answer(task.taskId, '请求已取消', Date.now())
+          leaveDecisionScreens(task.taskId)
+          refreshBoards()
+          log(`tihu decision abort task=${task.taskId}`)
+          resolve(decision.answerOf(decision.defaultIndex))
+        }
+        bridge.onAbort = onAbort
+        bridge.signal = signal
+        try { signal.addEventListener('abort', onAbort, { once: true }) } catch { /* 老宿主没有 addEventListener */ }
+      }
+    })
+  }
+
+  /** 摘掉一条待决策桥的计时器/监听（不碰任务状态，调用方自己决定怎么收尾）。 */
+  function clearPendingBridge(bridge: PendingDecisionBridge): void {
+    if (bridge.timer !== undefined) clearTimeout(bridge.timer)
+    bridge.timer = undefined
+    if (bridge.watch !== undefined) clearInterval(bridge.watch)
+    bridge.watch = undefined
+    if (pendingBridges.get(bridge.taskId) === bridge) pendingBridges.delete(bridge.taskId)
+    const signal = bridge.signal
+    if (signal !== undefined && bridge.onAbort !== undefined) {
+      try { signal.removeEventListener('abort', bridge.onAbort) } catch { /* 忽略 */ }
+    }
+    bridge.onAbort = undefined
+  }
+
+  /** 设备点了第 index 项（或口头答）：有挂着的桥就走它，没有就只改登记簿（老路径）。 */
+  function answerPendingDecision(taskId: string, index: number, by: string): boolean {
+    const bridge = pendingBridges.get(taskId)
+    if (bridge === undefined) return false
+    bridge.settle(index, by)
+    return true
+  }
+
+  /**
+   * 这道题已经作废（回合结束 / 会话被撤）：按默认项了结挂着的桥。
+   * 不这么做的话，登记簿会一直停在 awaiting（黄色问号），而宿主那道 waterfall 永远等不到答案。
+   */
+  function settlePendingDecisionDefault(taskId: string, by: string): boolean {
+    const bridge = pendingBridges.get(taskId)
+    if (bridge === undefined) return false
+    bridge.settle(bridge.decision.defaultIndex, by)
+    return true
+  }
+
+  /**
+   * 宿主 pendingInteraction → 待决策的入口（挂在那两道 waterfall 上）。
+   *
+   * 口径（用户 2026-11-10）：
+   *   1. 只对**已存在的任务**生效（pc / tihu 都行），绝不凭空造任务；
+   *   2. 托管开着不落待决策（`tuoguan-autoanswer` 会替人答首选项）；
+   *   3. 台上一台统一指挥设备都没有 → 一句话都不改，原样 `next()` 给电脑端卡片。
+   */
+  async function handlePendingInteraction(kind: 'approval' | 'question', request: any, next: () => Promise<any>): Promise<any> {
+    try {
+      const decision = kind === 'approval' ? approvalDecisionOf(request) : questionDecisionOf(request)
+      if (decision === null) return await next()
+      const task = tasks.ofSession(decision.sessionId)
+      if (task === undefined || task.state === 'archived') {
+        log(`tihu decision skip session=${decision.sessionId} kind=${kind} why=no-task`)
+        return await next()
+      }
+      if (tuoguanOnForSession(decision.sessionId, ctx)) {
+        log(`tihu decision skip task=${task.taskId} kind=${kind} why=tuoguan`)
+        return await next()
+      }
+      if (!pendingDeviceOnline()) {
+        log(`tihu decision skip task=${task.taskId} kind=${kind} why=no-device`)
+        return await next()
+      }
+      return await holdPendingDecision(decision, task, request, next)
+    } catch (error) {
+      // 我们这边出任何岔子都不许影响宿主原有链路：原样 next()，让电脑端卡片照旧接管。
+      log(`tihu decision failed kind=${kind} session=${sessionIdOfPendingRequest(request)}: ${(error as Error)?.stack ?? String(error)}`)
+      return await next()
+    }
+  }
+
+  /** 挂一道 waterfall；宿主没给卸载函数/挂不上都只记日志，不影响原有链路。 */
+  function registerPendingWaterfall(kind: 'approval' | 'question', event: string): (() => void) | undefined {
+    try {
+      const off = ctx.on?.(event, (request: any, next: () => Promise<any>) => handlePendingInteraction(kind, request, next), { prepend: true })
+      return typeof off === 'function' ? off as () => void : undefined
+    } catch (error) {
+      log(`tihu pending waterfall 挂不上 ${event}: ${(error as Error)?.message ?? String(error)}`)
+      return undefined
+    }
   }
 
   /** 还停在这条任务「进度」页的设备：这一轮结束后立刻回棋盘，不许继续挂旧进度。 */
@@ -5704,6 +6024,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     handleUpgrade,
     dispose: () => {
       disposed = true
+      // 卸载时绝不许把宿主的 approval / 提问永远挂住：按默认项了结（与 60 秒到点同一条规则）。
+      for (const bridge of [...pendingBridges.values()]) bridge.settle(bridge.decision.defaultIndex, '插件卸载')
+      pendingBridges.clear()
       stopCommanderWait()
       pendingCommanderTask.clear()
       commanderAsks.length = 0
@@ -5738,7 +6061,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         device.close()
       }
       devices.clear()
-      for (const disposer of [disposePre, disposePost, disposeSession, disposeAssistantStream]) {
+      for (const disposer of [disposePre, disposePost, disposeSession, disposeAssistantStream, disposeApprovalRequest, disposeQuestionRequest]) {
         try { if (typeof disposer === 'function') disposer() } catch { /* 忽略 */ }
       }
     },

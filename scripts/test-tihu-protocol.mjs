@@ -41,6 +41,13 @@ import {
 } from '../src/tihu/guard.ts'
 import { createTihuRuntime, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH, TIHU_LANE_LOG_MAX_BYTES, appendTihuLaneLog, screenReasonOf, tihuLaneLogPath, tihuReceiptHoldMs } from '../src/tihu/lane.ts'
 import { BOARD_PAGE_SIZE } from '../src/tihu/task-ledger.ts'
+import {
+  APPROVAL_OPTIONS,
+  PENDING_OPTION_FALLBACK,
+  PENDING_QUESTION_FALLBACK,
+  approvalDecisionOf,
+  questionDecisionOf,
+} from '../src/tihu/pending-interactions.ts'
 import { DONE_NO_REPLY_TEXT, RECEIPT_SECONDS, prepareDoneText } from '../src/tihu/task-screens.ts'
 import { TIHU_CONTROL_SECTION_TEXT, createTihuControlRunner, matchSessionRows, tihuActionNames } from '../src/tihu/control.ts'
 import { COMMANDER_REPLY_SHAPE, commanderReplyTail, parseCommanderReply } from '../src/tihu/dispatch-protocol.ts'
@@ -5156,6 +5163,246 @@ await testAsync('派单衔接：指挥台判出「接着那条」→ dispatch(se
     delete process.env.TIHU_GRAY_FALLBACK_MS
     w.cleanup()
   }
+})
+
+/* ---------- 待决策（屏 5）：宿主 pendingInteraction → tasks.ask（2026-11-10） ----------
+ *
+ * 实机要测的是「待决策」三件套：琥珀色问号卡 + 待决策屏 + 顶行「●N 等你」。
+ * 登记簿里 `awaiting` 的唯一合法来源是「托管没点亮时问题落回人身上」，而宿主这一侧
+ * pendingInteraction 的真身就是 `approval/request` / `user-questions/request` 两道 waterfall：
+ * 挂住它、把 `answerOf(index)` 当返回值交回去，会话才真的继续跑（不是只把屏标成已答）。
+ */
+
+/** 托管状态真值（lane 按 TIHU_TUOGUAN_STATE 读）：defaultOn=false / off[会话] 才会落待决策。 */
+function useTuoguanState(root, state = {}) {
+  const file = join(root, 'dsh-tuoguan-state.json')
+  writeFileSync(file, JSON.stringify({
+    off: {}, on: {}, defaultOn: true, revision: 1, updatedAt: new Date(0).toISOString(), ...state,
+  }), 'utf8')
+  process.env.TIHU_TUOGUAN_STATE = file
+  return file
+}
+
+/** 取宿主某个 waterfall 的监听（lane 在同一 ctx 上注册）。 */
+function waterfallOf(w, name) {
+  const entry = w.events.find((item) => item.name === name)
+  assert.ok(entry !== undefined, `lane 必须在宿主上挂 ${name} 监听`)
+  return entry.handler
+}
+
+/** 待决策屏的帧（按 stage 认）。 */
+function decisionFramesOf(socket) {
+  return framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '待决策')
+}
+
+await testAsync('待决策：宿主 approval/request → 屏 5（真实正文·黄色问号·●N 等你），点选项真的答回会话', async () => {
+  const now = Date.now()
+  const w = unifiedWorkspace({
+    records: [cuRecord('session-pc-ask', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' })],
+  })
+  // 托管关掉（登记簿注释：出现待决策本来就等于托管没开）。
+  useTuoguanState(w.root, { off: { 'session-pc-ask': true } })
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pending-1', protocol: '0' }, 1)))
+    await waitMs(180)
+    const before = framesOf(socket).filter((frame) => frame.type === 'task.list').pop()
+    assert.equal(before.payload.board.rows[0].taskId, 'p1', '先有电脑端任务卡')
+
+    let delegated = false
+    const approval = waterfallOf(w, 'approval/request')
+    const answered = approval({
+      agent: { session: { id: 'session-pc-ask' } },
+      toolName: 'pwsh',
+      reason: '这条命令会删掉 .tihu 里的快照',
+    }, async () => { delegated = true; return 'rejected' })
+    await waitMs(140)
+
+    const decision = decisionFramesOf(socket).pop()
+    assert.ok(decision !== undefined, '有 pendingInteraction 必须弹待决策屏：'
+      + JSON.stringify(framesOf(socket).filter((frame) => frame.type === 'screen.frame').map((frame) => frame.payload.stage)))
+    assert.equal(decision.payload.title, '这条命令会删掉 .tihu 里的快照', '问题正文来自宿主请求，不许编造')
+    assert.equal(decision.payload.tone, 'warn', '待决策是琥珀色')
+    assert.deepEqual(decision.payload.actions.map((item) => item.id), ['taskAnswer1', 'taskAnswer2', 'taskBoard'])
+    assert.deepEqual(decision.payload.actions.map((item) => item.label), ['允许一次', '拒绝', '主页'])
+    assert.ok(decision.payload.countdown.seconds > 0, '决策页要有倒计时（60 秒到点按默认项）')
+    assert.ok(decision.payload.bullets.some((line) => line.includes('不选就按「允许一次」')),
+      '默认项要写在屏上：' + JSON.stringify(decision.payload.bullets))
+
+    const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop()
+    const row = board.payload.board.rows.find((item) => item.taskId === 'p1')
+    assert.equal(row.state, 'awaiting')
+    assert.equal(row.capsule, '待决策')
+    assert.equal(row.badge, 'ask', '棋盘这一行要黄色问号')
+    assert.deepEqual(row.ring, { percent: 0, tone: 'empty' }, '待决策不显示时长环')
+    assert.equal(String(row.sub).includes('已用'), false, '待决策副行不显示时长')
+    assert.equal(board.payload.board.counts.awaiting, 1, '顶行「●N 等你」要说 1')
+
+    // 点第一个选项 → 真答案交回宿主（点完立刻回棋盘、该行回执行中）
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 150, hit: 'action', actionId: 'taskAnswer1' }, 2)))
+    const value = await answered
+    assert.equal(value, 'allowed-once', '设备点「允许一次」要把 allowed-once 交回宿主')
+    assert.equal(delegated, false, '设备答了就不许再转给电脑端')
+    await waitMs(120)
+    const after = framesOf(socket).filter((frame) => frame.type === 'task.list').pop()
+    const afterRow = after.payload.board.rows.find((item) => item.taskId === 'p1')
+    assert.equal(afterRow.state, 'running', '答完回执行中')
+    assert.equal(after.payload.board.counts.awaiting, 0, '答完「等你」归零')
+    assert.equal(decisionFramesOf(socket).length, 1, '答题后不许再挂一张待决策屏')
+  } finally {
+    delete process.env.TIHU_TUOGUAN_STATE
+    w.cleanup()
+  }
+})
+
+await testAsync('待决策：托管开着不落待决策（照旧交给电脑端浏览器卡片）', async () => {
+  const now = Date.now()
+  const w = unifiedWorkspace({
+    records: [cuRecord('session-pc-ask', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' })],
+  })
+  // defaultOn: true ＝ 托管中（与「没关过就是托管 ON」一致）。
+  useTuoguanState(w.root, {})
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pending-tuoguan', protocol: '0' }, 1)))
+    await waitMs(180)
+    let delegated = false
+    const approval = waterfallOf(w, 'approval/request')
+    const value = await approval({
+      agent: { session: { id: 'session-pc-ask' } },
+      toolName: 'pwsh',
+      reason: '这条命令会删掉 .tihu 里的快照',
+    }, async () => { delegated = true; return 'rejected' })
+    assert.equal(delegated, true, '托管开着：必须原样 next() 交给电脑端')
+    assert.equal(value, 'rejected')
+    await waitMs(80)
+    assert.equal(decisionFramesOf(socket).length, 0, '托管开着绝不落待决策屏')
+    const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop()
+    assert.equal(board.payload.board.counts.awaiting, 0)
+    assert.equal(board.payload.board.rows[0].badge, undefined, '棋盘上不许出现问号')
+  } finally {
+    delete process.env.TIHU_TUOGUAN_STATE
+    w.cleanup()
+  }
+})
+
+await testAsync('待决策：60 秒到点按默认项走（设备没点也回执行中）', async () => {
+  const now = Date.now()
+  process.env.TIHU_DECISION_TIMEOUT_MS = '150'
+  const w = unifiedWorkspace({
+    records: [cuRecord('session-pc-ask', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' })],
+  })
+  useTuoguanState(w.root, { off: { 'session-pc-ask': true } })
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pending-timeout', protocol: '0' }, 1)))
+    await waitMs(180)
+    let delegated = false
+    const approval = waterfallOf(w, 'approval/request')
+    const answered = approval({
+      agent: { session: { id: 'session-pc-ask' } },
+      toolName: 'pwsh',
+      reason: '要不要继续？',
+    }, async () => { delegated = true; return 'rejected' })
+    await waitMs(60)
+    assert.equal(decisionFramesOf(socket).length, 1, '没到点先挂着待决策屏')
+    const value = await answered
+    assert.equal(value, 'allowed-once', '到点按首选项（与托管自动答同一条规则）')
+    assert.equal(delegated, false, '到点也是设备侧了结，不再转电脑端')
+    await waitMs(120)
+    const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop()
+    assert.equal(board.payload.board.rows[0].state, 'running', '到点后回执行中')
+    assert.equal(board.payload.board.counts.awaiting, 0)
+  } finally {
+    delete process.env.TIHU_DECISION_TIMEOUT_MS
+    delete process.env.TIHU_TUOGUAN_STATE
+    w.cleanup()
+  }
+})
+
+await testAsync('待决策：ask_user_question 用真实问题原文与选项，答案按题 id 交回', async () => {
+  const now = Date.now()
+  const w = unifiedWorkspace({
+    records: [cuRecord('session-pc-ask', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' })],
+  })
+  useTuoguanState(w.root, { off: { 'session-pc-ask': true } })
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pending-question', protocol: '0' }, 1)))
+    await waitMs(180)
+    const questions = waterfallOf(w, 'user-questions/request')
+    const answered = questions({
+      agent: { session: { id: 'session-pc-ask' } },
+      questions: [{
+        id: 'q1',
+        question: '这三种图哪种放正文？',
+        header: '出图',
+        options: [{ label: '矢量 PDF' }, { label: '300dpi PNG' }],
+      }],
+    }, async () => ({ answers: [] }))
+    await waitMs(140)
+    const decision = decisionFramesOf(socket).pop()
+    assert.ok(decision !== undefined, '提问也要上待决策屏')
+    assert.equal(decision.payload.title, '这三种图哪种放正文？', '问题原文照搬宿主的')
+    assert.deepEqual(decision.payload.actions.slice(0, 2).map((item) => item.label), ['矢量 PDF', '300dpi PNG'], '选项照搬宿主的')
+    assert.ok(decision.payload.bullets.some((line) => line.includes('出图')), '题目标题进 detail 行')
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 150, hit: 'action', actionId: 'taskAnswer2' }, 2)))
+    const value = await answered
+    assert.deepEqual(value, { answers: [{ id: 'q1', selected: ['300dpi PNG'] }] }, '答案按题 id 交回（选第二项）')
+  } finally {
+    delete process.env.TIHU_TUOGUAN_STATE
+    w.cleanup()
+  }
+})
+
+await testAsync('待决策：会话没有任务就不接管、也不凭空造任务', async () => {
+  const w = unifiedWorkspace({ seedCommander: true })
+  useTuoguanState(w.root, { defaultOn: false })
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pending-notask', protocol: '0' }, 1)))
+    await waitMs(120)
+    const before = w.runtime.control.listTasks().length
+    let delegated = false
+    const approval = waterfallOf(w, 'approval/request')
+    const value = await approval({
+      agent: { session: { id: 'session-nobody' } },
+      toolName: 'pwsh',
+    }, async () => { delegated = true; return 'rejected' })
+    assert.equal(delegated, true, '没有任务就原样交给电脑端')
+    assert.equal(value, 'rejected')
+    assert.equal(w.runtime.control.listTasks().length, before, '绝不许凭空造任务')
+    assert.equal(decisionFramesOf(socket).length, 0)
+  } finally {
+    delete process.env.TIHU_TUOGUAN_STATE
+    w.cleanup()
+  }
+})
+
+await testAsync('待决策：取不到单题原文时用固定文案 +「继续」（不编造问题）', async () => {
+  // 多题批：屏上给不出唯一的「真实问题」，只能固定文案 + 一个「继续」＝每题首选项。
+  const batch = questionDecisionOf({
+    agent: { session: { id: 's' } },
+    questions: [{ id: 'q1', question: '一？' }, { id: 'q2', question: '二？' }],
+  })
+  assert.equal(batch.question, PENDING_QUESTION_FALLBACK)
+  assert.deepEqual(batch.options, [PENDING_OPTION_FALLBACK])
+  // 多题批每题按「首选项 / 无选项就自由文本」作答（与托管自动答同一条规则），题 id 一一对上。
+  const batchAnswer = batch.answerOf(0)
+  assert.deepEqual(batchAnswer.answers.map((answer) => answer.id), ['q1', 'q2'])
+  assert.equal(batchAnswer.answers.every((answer) => answer.selected.length === 0 && typeof answer.custom === 'string'), true,
+    '没有选项的题用自由文本默认，不编选项：' + JSON.stringify(batchAnswer))
+  // 审批：官方闭集只有两个结果，选项固定「允许一次 / 拒绝」，默认项＝首选项。
+  const approval = approvalDecisionOf({ agent: { session: { id: 's' } }, toolName: 'pwsh' })
+  assert.deepEqual(approval.options, APPROVAL_OPTIONS)
+  assert.equal(approval.defaultIndex, 0)
+  assert.equal(approval.question, '允许使用 pwsh？', '取不到 reason 时才用工具名拼一句，且不带正文')
+  assert.equal(approval.answerOf(0), 'allowed-once')
+  assert.equal(approval.answerOf(1), 'rejected')
+  // 缺会话 / 缺题 id 的请求一律不接管（交回电脑端）。
+  assert.equal(approvalDecisionOf({ toolName: 'pwsh' }), null)
+  assert.equal(questionDecisionOf({ agent: { session: { id: 's' } }, questions: [{ question: '没有 id' }] }), null)
+  assert.equal(questionDecisionOf({ agent: { session: { id: 's' } }, questions: [] }), null)
 })
 
 /* ---------- 汇总 ---------- */console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
