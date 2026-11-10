@@ -48,8 +48,11 @@ import {
   detailFrame,
   doneAnnouncementOf,
   doneFrame,
+  doneLineRangesOf,
+  doneLinesOf,
   folderBase,
   noticeFrame,
+  prepareDoneText,
   receiptFrame,
 } from '../src/tihu/task-screens.ts'
 import { DONE_TITLE_FONT_PX, CONTENT_WIDTH_PX, fitScreenLines, measureTextPx, SCREEN_SPEC } from '../src/tihu/screen-spec.ts'
@@ -588,8 +591,7 @@ test('完成页（屏 6）：大标题＝任务名，正文 7 行，另有 N 条
   assert.ok(multi.actions.some((item) => item.id === 'taskBoard'))
 })
 
-test('完成页正文：行首状态勾（✅/✓）要剥掉，只留整行青底黑字', () => {
-  const frame = doneFrame({
+test('完成页正文：行首状态勾（✅/✓）要剥掉，只留整行青底黑字', () => {  const frame = doneFrame({
     taskId: 't8',
     title: '现在几点了',
     resultLine: '✅ 现在是 2026 年 11 月 10 日上午 9 点 31 分',
@@ -620,6 +622,60 @@ test('完成页：两行正文也放得下（正文块垂直居中，不再全�
   assert.ok(frame.done.lines.length >= 1)
   const lineHeight = 20
   assert.ok(frame.done.lines.length * lineHeight <= 7 * lineHeight, '正文行数不超 7 行窗口')
+})
+
+/* ---------- 2026-11-10：完成页高亮严格跟随真实播放（字符区间桥） ---------- */
+
+test('完成页行字符区间：与行一一对应、单调、能按区间还原出整段正文', () => {
+  const text = prepareDoneText('✅ 现在是 2026 年 11 月 10 日（星期一）上午 9 点 31 分。'
+    + '温度场结果已收敛，跨中腹板温差 1.1 ℃，比目标 1.5 ℃ 还好。')
+  const lines = doneLinesOf(text)
+  const ranges = doneLineRangesOf(text)
+  assert.equal(ranges.length, lines.length, '区间数必须等于行数：' + JSON.stringify(ranges))
+  const chars = [...text]
+  let cursor = 0
+  for (let i = 0; i < ranges.length; i += 1) {
+    const [start, end] = ranges[i]
+    assert.ok(Number.isInteger(start) && Number.isInteger(end) && end > start, `第 ${i} 行区间非法：${start}-${end}`)
+    assert.ok(start >= cursor, `第 ${i} 行区间必须单调（不重叠、不倒序）`)
+    cursor = end
+    const sliced = chars.slice(start, end).join('')
+    const line = [...lines[i]].join('')
+    // 折行只在空白处丢字符，所以切片去掉空白后必须等于该行
+    assert.equal(sliced.replace(/\s+/g, ''), line.replace(/\s+/g, ''), `第 ${i} 行切片对不上正文：${sliced} vs ${line}`)
+  }
+})
+
+test('完成页行字符区间：换行/首尾空白/行首勾都不影响（区间基于同一份朗读文本）', () => {
+  const raw = '  \r\n✅ 第一句结束。\r\n第二句来了。\r\n  '
+  const text = prepareDoneText(raw)
+  assert.equal(text.startsWith('✅'), false, '准备阶段就去掉行首勾')
+  assert.equal(text, '第一句结束。\n第二句来了。', '规范化后没有首尾空白与 CRLF：' + JSON.stringify(text))
+  const ranges = doneLineRangesOf(raw)
+  assert.ok(ranges.length >= 2, '两句话至少两行：' + JSON.stringify(ranges))
+  const chars = [...prepareDoneText(raw)]
+  for (const [start, end] of ranges) assert.ok(end <= chars.length, '区间不得越界')
+})
+
+test('完成页帧带 ranges：和 lines 一一对应，可直接驱动高亮', () => {
+  const body = '现在是 2026 年 11 月 10 日上午 9 点 31 分。温度场结果已经收敛，跨中腹板温差 1.1 ℃。'
+  const frame = doneFrame({ taskId: 't12', title: '现在几点了', resultLine: '九点半', replyText: body })
+  const lines = frame.done.lines
+  const ranges = frame.done.ranges
+  assert.ok(Array.isArray(ranges), '完成帧必须带行字符区间')
+  assert.equal(ranges.length, lines.length, '区间与行一一对应')
+  const chars = [...prepareDoneText(body)]
+  for (let i = 0; i < lines.length; i += 1) {
+    const [start, end] = ranges[i]
+    assert.ok(end - start >= [...lines[i]].length - 1, `第 ${i} 行区间太短：${end - start}`)
+    assert.ok(start >= 0 && end <= chars.length, `第 ${i} 行区间越界`)
+  }
+  // 回退到一句话结果时，行和区间同样来自那一句（页面对不上时只是不切换，不会错行）。
+  const fallbackFrame = doneFrame({ taskId: 't13', title: 'x', resultLine: '只有一句话', bullets: [] })
+  assert.ok(fallbackFrame.done.lines.length > 0)
+  if (fallbackFrame.done.ranges !== undefined) {
+    assert.equal(fallbackFrame.done.ranges.length, fallbackFrame.done.lines.length, '回退正文的区间也要对齐')
+  }
 })
 
 test('歧义追问（屏 7）：两个候选 + 「都不是」，序号用数字', () => {
