@@ -3255,9 +3255,9 @@ await testAsync('电脑端会话：外部任务卡上棋盘（p 前缀 / 电脑�
   const now = Date.now()
   const w = unifiedWorkspace({
     records: [
-      cuRecord('session-pc-run', { live: true, preset: 'standard', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' }),
-      cuRecord('session-pc-idle', { live: true, preset: 'standard', cwd: '/work/磷石膏', createdAt: now - 7_200_000, lastPromptAt: now - 120_000, title: '磷石膏出图' }),
-      cuRecord('session-pc-new', { live: true, preset: 'standard', cwd: '/work/新目录', createdAt: now - 5000, title: '新会话' }),
+      cuRecord('session-pc-run', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' }),
+      cuRecord('session-pc-idle', { live: true, preset: 'computer-use', cwd: '/work/磷石膏', createdAt: now - 7_200_000, lastPromptAt: now - 120_000, title: '磷石膏出图' }),
+      cuRecord('session-pc-new', { live: true, preset: 'computer-use', cwd: '/work/新目录', createdAt: now - 5000, title: '新会话' }),
     ],
   })
   const socket = openLane(w.runtime)
@@ -3309,7 +3309,7 @@ await testAsync('电脑端会话：指挥会话与派单会话不重复上屏', 
 await testAsync('电脑端会话：turn/end → 完成卡＋一句播报，不建会话、不投 prompt', async () => {
   const now = Date.now()
   const w = unifiedWorkspace({
-    records: [cuRecord('session-pc', { live: true, preset: 'standard', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' })],
+    records: [cuRecord('session-pc', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' })],
   })
   const socket = openLane(w.runtime)
   const emit = w.events.find((entry) => entry.name === 'session/event').handler
@@ -3345,7 +3345,7 @@ await testAsync('电脑端会话：turn/end → 完成卡＋一句播报，不�
 await testAsync('电脑端会话：点卡片走 session.bind 详情，不发派单、不建会话', async () => {
   const now = Date.now()
   const w = unifiedWorkspace({
-    records: [cuRecord('session-pc', { live: true, preset: 'standard', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' })],
+    records: [cuRecord('session-pc', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' })],
   })
   const socket = openLane(w.runtime)
   socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pc-open', protocol: '0' }, 1)))
@@ -3375,7 +3375,7 @@ await testAsync('电脑端同步：一次 hello 只拉一次会话列表（复�
   const now = Date.now()
   const records = [
     cuRecord('session-cmd', { live: true, preset: 'standard', title: '鹈鹕指挥台' }),
-    cuRecord('session-pc-run', { live: true, preset: 'standard', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' }),
+    cuRecord('session-pc-run', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' }),
   ]
   const base = sessionQueryFixture(records)
   let listCalls = 0
@@ -3396,9 +3396,9 @@ await testAsync('电脑端会话：超过 3 天没活动就不上屏；已在屏
   const w = unifiedWorkspace({
     records: [
       // 刚活跃的：要上屏
-      cuRecord('session-pc-live', { live: true, preset: 'standard', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' }),
+      cuRecord('session-pc-live', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' }),
       // 4 天没活动的：不许进登记簿（活动时间＝max(createdAt, lastPromptAt)）
-      cuRecord('session-pc-stale', { live: true, preset: 'standard', cwd: '/work/旧项目', createdAt: now - 8 * 24 * 3600_000, lastPromptAt: now - 4 * 24 * 3600_000, title: '四天前的会话' }),
+      cuRecord('session-pc-stale', { live: true, preset: 'computer-use', cwd: '/work/旧项目', createdAt: now - 8 * 24 * 3600_000, lastPromptAt: now - 4 * 24 * 3600_000, title: '四天前的会话' }),
     ],
   })
   const socket = openLane(w.runtime)
@@ -3417,6 +3417,103 @@ await testAsync('电脑端会话：超过 3 天没活动就不上屏；已在屏
   delete process.env.TIHU_SESSION_LIST_TTL_MS
   const board = framesOf(second).filter((frame) => frame.type === 'task.list').pop().payload.board
   assert.equal(board.rows.length, 0, '静置超过 3 天的外部任务要下屏：' + JSON.stringify(board.rows))
+  assert.equal(board.empty, true)
+  w.cleanup()
+})
+
+/* ---------- 2026-11-10 用户规则：只有 Computer Use 模式的电脑端会话才上屏 ---------- */
+
+await testAsync('模式过滤：普通（standard）会话完全不上屏，CU 会话照常上屏', async () => {
+  const now = Date.now()
+  const w = unifiedWorkspace({
+    records: [
+      // 普通模式、刚刚还在跑：按老逻辑会占一张「执行中」卡——现在一条都不许上。
+      cuRecord('session-std-run', { live: true, preset: 'standard', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '普通模式会话' }),
+      cuRecord('session-slim', { live: true, preset: 'standard-slim-local', cwd: '/work/笔记', createdAt: now - 600_000, lastPromptAt: now - 2000, title: '轻量模式会话' }),
+      // Computer Use 会话：必须上屏。
+      cuRecord('session-cu-run', { live: true, preset: 'computer-use', cwd: '/work/点按', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '电脑操作会话' }),
+    ],
+  })
+  const socket = openLane(w.runtime)
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'cu-filter', protocol: '0' }, 1)))
+  await waitMs(170)
+  const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop().payload.board
+  assert.equal(board.rows.length, 1, '只有 CU 会话上屏：' + JSON.stringify(board.rows))
+  assert.equal(board.rows[0].title, '电脑操作会话')
+  assert.equal(board.rows[0].sub, '电脑端 · 点按', 'CU 卡照旧带「电脑端 · 项目」副行')
+  assert.deepEqual(board.counts, { running: 1, awaiting: 0, queued: 0 }, '普通会话不计入在跑/等你/排队')
+  assert.equal(board.rows.some((row) => /普通|轻量/.test(row.title)), false, '普通模式会话不许出现在棋盘')
+  // 普通会话跑完一轮：不能进登记簿，也就不能播报。
+  emit({ id: 'session-std-run' }, { type: 'turn/start', data: { turn: 1 } })
+  emit({ id: 'session-std-run' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '普通模式的结果' }] } } })
+  emit({ id: 'session-std-run' }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await waitMs(150)
+  const frames = framesOf(socket)
+  assert.equal(frames.filter((frame) => frame.type === 'task.notify').length, 0, '普通会话不播报')
+  assert.equal(frames.filter((frame) => frame.type === 'task.update' && /普通/.test(JSON.stringify(frame.payload))).length, 0, '普通会话不下发任务更新')
+  const after = frames.filter((frame) => frame.type === 'task.list').pop().payload.board
+  assert.equal(after.rows.length, 1, '普通会话跑完也不许补一张卡')
+  w.cleanup()
+})
+
+await testAsync('模式过滤：派单任务始终上屏（会话是普通模式也不踢）', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'dispatch-keep', protocol: '0' }, 1)))
+  await waitMs(60)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+  await waitMs(120)
+  // 派单建出来的会话故意改成普通模式，并伪装成「电脑端刚活跃」：它仍必须留在棋盘上。
+  const taskRecord = w.records.find((record) => record.header.id === 'session-task-1')
+  assert.ok(taskRecord !== undefined)
+  taskRecord.projection.agentPreset = 'standard'
+  taskRecord.projection.sessionListMetadata.lastPromptAt = Date.now() - 1000
+  taskRecord.header.createdAt = Date.now() - 600_000
+  process.env.TIHU_SESSION_LIST_TTL_MS = '50'
+  const second = openLane(w.runtime)
+  second.emit('data', clientFrame(buildUpstream('hello', { clientId: 'dispatch-keep-2', protocol: '0' }, 1)))
+  await waitMs(220)
+  delete process.env.TIHU_SESSION_LIST_TTL_MS
+  const rows = framesOf(second).filter((frame) => frame.type === 'task.list').pop().payload.board.rows
+  assert.equal(rows.length, 1, '派单任务不许因为模式被踢下屏：' + JSON.stringify(rows))
+  assert.equal(rows[0].taskId, 't1', '留下的就是鹈鹕自己派出去的那条')
+  w.cleanup()
+})
+
+await testAsync('模式过滤：CU 会话切回普通模式 → 自动下屏归档', async () => {
+  const now = Date.now()
+  const w = unifiedWorkspace({
+    records: [
+      cuRecord('session-cu-switch', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '待切换的会话' }),
+      cuRecord('session-cu-event', { live: true, preset: 'computer-use', cwd: '/work/点按', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '运行中被切换的会话' }),
+    ],
+  })
+  const socket = openLane(w.runtime)
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'cu-switch', protocol: '0' }, 1)))
+  await waitMs(170)
+  let rows = framesOf(socket).filter((frame) => frame.type === 'task.list').pop().payload.board.rows
+  assert.equal(rows.length, 2, '两条 CU 会话先上屏：' + JSON.stringify(rows))
+  assert.equal(rows.every((row) => row.taskId.startsWith('p')), true, '外部任务短号 p 前缀：' + JSON.stringify(rows.map((row) => row.taskId)))
+  // ① 运行中被切回普通模式（投影 agentPreset 变 standard）：事件到达就立刻下屏归档，不等下一轮轮询。
+  const eventRecord = w.records.find((item) => item.header.id === 'session-cu-event')
+  eventRecord.projection.agentPreset = 'standard'
+  emit({ id: 'session-cu-event' }, { type: 'turn/start', data: { turn: 1 } })
+  await waitMs(120)
+  const afterEvent = framesOf(socket).filter((frame) => frame.type === 'task.list').pop().payload.board
+  assert.equal(afterEvent.rows.some((row) => row.title === '运行中被切换的会话'), false, '切模式后的会话要立刻下屏：' + JSON.stringify(afterEvent.rows))
+  assert.equal(framesOf(socket).some((frame) => frame.type === 'task.notify'), false, '下屏后的会话不许播报')
+  // ② 另一条也切回普通模式（这次走轮询）：同样要下屏归档。
+  const record = w.records.find((item) => item.header.id === 'session-cu-switch')
+  record.projection.agentPreset = 'standard'
+  process.env.TIHU_SESSION_LIST_TTL_MS = '50'
+  const second = openLane(w.runtime)
+  second.emit('data', clientFrame(buildUpstream('hello', { clientId: 'cu-switch-2', protocol: '0' }, 1)))
+  await waitMs(240)
+  delete process.env.TIHU_SESSION_LIST_TTL_MS
+  const board = framesOf(second).filter((frame) => frame.type === 'task.list').pop().payload.board
+  assert.equal(board.rows.length, 0, '切回普通模式后必须下屏：' + JSON.stringify(board.rows))
   assert.equal(board.empty, true)
   w.cleanup()
 })

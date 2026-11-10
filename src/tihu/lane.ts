@@ -1670,6 +1670,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (taskOfSession !== undefined && taskOfSession.source === 'pc') {
         /* 电脑端（DSH 主 GUI）会话 → 登记簿里的外部任务（`source='pc'`）。
          * 只把会话动静翻译成登记簿状态：不派单、不建会话、不往会话投 prompt、不触发派单尾巴。 */
+        // 用户 2026-11-10 规则：只有 Computer Use 模式才上屏。运行中被切回普通模式时，
+        // 这条卡要立刻下屏归档（下一次轮询也会做，这里只是快一步，别让事件再刷新它）。
+        const livePreset = presetOf(session) || sessionPresets.get(sessionId) || ''
+        if (livePreset !== '' && !isComputerUsePreset(livePreset)) {
+          archivePcTask(taskOfSession.taskId, at, `preset=${livePreset}`)
+          return
+        }
         pcActivityAt.set(sessionId, at)
         const progress = progressStates.get(sessionId) ?? createProgressState()
         progressStates.set(sessionId, progress)
@@ -2659,13 +2666,32 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /**
+   * 让一条电脑端外部任务下屏并归档（用户 2026-11-10：非 CU 会话完全不上屏）。
+   * 屏正停在它的详情页时，顺手把人送回棋盘——否则卡片没了、屏还停在幽灵任务上。
+   */
+  function archivePcTask(taskId: string, now: number, why: string): boolean {
+    pcTaskOfSession.forEach((value, sessionId) => { if (value === taskId) pcTaskOfSession.delete(sessionId) })
+    if (tasks.get(taskId)?.state === 'archived') return false
+    const line = tasks.archive(taskId, now)
+    if (line !== undefined) appendTaskJournal(line)
+    for (const device of devices) {
+      if (device.focusedTask !== taskId) continue
+      sendBoard(device)
+    }
+    refreshBoards()
+    log(`tihu pc task archive task=${taskId} why=${why}`)
+    return true
+  }
+
+  /**
    * 把电脑端会话同步进登记簿（一次轮询）：新建 / 更新 / 归档外部任务。
    *
    * 纪律：
    *   1. 数据源只用现有会话列表（`collectSessionRows()` 自带 `sessionListTtlMs` 节流，
    *      不会因为轮询而额外狂调 `listSessions`）；
    *   2. 指挥会话、以及已被**派单任务**绑定的会话一律跳过（避免同一会话两张卡）；
-   *   3. 只改登记簿：不派单、不建会话、不往任何会话投 prompt（外部任务是只读镜像）。
+   *   3. 只改登记簿：不派单、不建会话、不往任何会话投 prompt（外部任务是只读镜像）；
+   *   4. 只镜像 Computer Use 模式的电脑端会话（用户 2026-11-10 规则，普通模式完全不上屏）。
    */
   async function syncExternalSessions(): Promise<void> {
     if (disposed || pcSyncing) return
@@ -2693,6 +2719,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         if (sessionId === '') continue
         if (sessionId === commanderSessionId) continue
         if (bound.has(sessionId)) continue
+        // 用户 2026-11-10 规则：**只有 Computer Use 模式的电脑端会话才上屏**。
+        // 普通模式（standard / standard-slim-local / cordis…）一律不进登记簿、不上棋盘、
+        // 不播报、不计入在跑/等你/排队。判定读宿主投影 `agentPreset`（缺省回退
+        // header.agentPreset，见 presetOf；实测 projcache 里取值就是 computer-use/standard/…，
+        // `computerUse` 只是绑定回执里的占位布尔，不代表模式）。
+        if (!isComputerUsePreset(row.preset)) continue
         const known = pcTaskOfSession.get(sessionId)
         const createdAt = Number(row.createdAt) || 0
         const updatedAt = Number(row.updatedAt) || 0
@@ -2715,15 +2747,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         wanted.set(sessionId, { row, state, activity: activity > 0 ? activity : (createdAt || now) })
       }
       let changed = false
-      // 先撤掉不该再上屏的：会话被归档/删除、被派单任务接管、被用户撤掉、空了太久。
+      // 先撤掉不该再上屏的：会话被归档/删除、被派单任务接管、被用户撤掉、空了太久、
+      // 或者**模式被切走**（Computer Use → 普通）。
       for (const [sessionId, taskId] of [...pcTaskOfSession]) {
         if (wanted.has(sessionId)) continue
-        pcTaskOfSession.delete(sessionId)
-        if (tasks.get(taskId)?.state === 'archived') continue
-        const line = tasks.archive(taskId, now)
-        if (line !== undefined) appendTaskJournal(line)
-        changed = true
-        log(`tihu pc task archive task=${taskId} session=${sessionId}`)
+        const row = rows.find((item) => item.sessionId === sessionId)
+        const why = row === undefined ? 'session gone' : `preset=${row.preset || '?'}`
+        if (archivePcTask(taskId, now, why)) changed = true
       }
       for (const [sessionId, item] of wanted) {
         const title = externalTitleOf(item.row)
