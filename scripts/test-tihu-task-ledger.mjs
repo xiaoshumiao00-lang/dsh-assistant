@@ -172,6 +172,40 @@ test('绑上会话＝派单态；turn/start 才进执行中；attachSession 不�
   assert.equal(ledger.ofSession('session-aaaa')?.taskId, 't1')
 })
 
+test('同一会话挂着已完成的旧卡＋新一句话的新卡：ofSession 归到新卡，旧卡留在棋盘上', () => {
+  const ledger = new TaskLedger()
+  const old = ledger.add({ title: '再读一下后两行', projectId: 'p1', projectName: '个人助手', now: 1000 })
+  ledger.attachSession(old.taskId, 'session-493ebb6f', 1100)
+  ledger.markRunning(old.taskId, 1200)
+  ledger.complete(old.taskId, { resultLine: '读完了', now: 1300 })
+  ledger.markSpoken(old.taskId, 1400)
+  assert.equal(old.state, 'announced')
+  // 新一句话落到同一条会话：另起一张卡（旧卡不动）。
+  const fresh = ledger.add({ title: '帮我把 README 的前两行读出来', projectId: 'p1', projectName: '个人助手', now: 1500, sessionIds: ['session-493ebb6f'] })
+  ledger.attachSession(fresh.taskId, 'session-493ebb6f', 1500)
+  assert.equal(ledger.ofSession('session-493ebb6f')?.taskId, 't2', '事件归一必须拿最近动过的那张卡（新卡）')
+  assert.equal(ledger.get('t1').state, 'announced', '旧卡状态一字不动')
+  assert.equal(ledger.get('t1').title, '再读一下后两行', '旧卡标题一字不动')
+  const board = boardOf(ledger.list(), 1)
+  assert.equal(board.rows.length, 2, '两张卡都在棋盘上（旧卡不摘）')
+  assert.deepEqual(board.counts, { running: 0, awaiting: 0, queued: 1, done: 1 }, '新卡排队中、旧卡仍算完成')
+  ledger.markRunning(fresh.taskId, 1600)
+  assert.deepEqual(boardOf(ledger.list(), 1).counts, { running: 1, awaiting: 0, queued: 0, done: 1 }, '投进去之后新卡执行中')
+})
+
+test('reopenForAppend 会把完成卡拉回执行中（所以 lane 只允许对还在跑的卡调它——见 test-tihu-protocol 承接回归）', () => {
+  const ledger = new TaskLedger()
+  const task = ledger.add({ title: '旧话', projectId: 'p1', projectName: 'P', now: 1000 })
+  ledger.attachSession(task.taskId, 'session-a', 1100)
+  ledger.markRunning(task.taskId, 1200)
+  ledger.complete(task.taskId, { resultLine: '好了', now: 1300 })
+  // 登记簿本身不判「该不该复用」——复用条件由 lane 的 closedPrevious 判断（见协议回归）。
+  // 这里钉住 reopenForAppend 的行为：它确实会把完成卡改回 running（所以 lane 只允许对还在跑的卡调它）。
+  ledger.reopenForAppend(task.taskId, 1400)
+  assert.equal(task.state, 'running')
+  assert.equal(task.finishedAt, undefined, '回到执行中：完成时刻要清掉')
+})
+
 test('步数只增不减（乱序到达的 tool/call 不能把第 7 步改回第 2 步）', () => {
   const ledger = new TaskLedger()
   const task = ledger.add({ title: 'x', projectId: 'p1', projectName: 'P' })

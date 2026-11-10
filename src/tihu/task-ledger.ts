@@ -618,13 +618,22 @@ export class TaskLedger {
     return this.tasks.get(taskId)
   }
 
-  /** 按会话反查任务（事件归一到任务要靠它）。 */
+  /**
+   * 按会话反查任务（事件归一到任务要靠它）。
+   *
+   * 一条会话可能挂着两张卡（用户 2026-11-10 实机规则：新一句话接到已完成的旧任务那条会话上时
+   * **旧卡留在棋盘上、新卡另起一张**）：归一拿**最近动过**的那张，否则旧的那张（已完成的
+   * 任务）会把 turn/start/turn/end 全抢走，新卡永远停在「排队中」、完成也落不到它身上。
+   * 时刻相同时取后入簿的那张（＝新卡）。
+   */
   ofSession(sessionId: string): TihuTask | undefined {
+    let best: TihuTask | undefined
     for (const task of this.tasks.values()) {
       if (task.state === 'archived') continue
-      if (task.sessionIds.includes(sessionId)) return task
+      if (!task.sessionIds.includes(sessionId)) continue
+      if (best === undefined || task.updatedAt >= best.updatedAt) best = task
     }
-    return undefined
+    return best
   }
 
   /**

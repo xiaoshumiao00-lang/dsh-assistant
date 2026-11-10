@@ -92,6 +92,7 @@ import {
   continuityCandidatesOf,
   continuityOf,
   isConfidentProjectRoute,
+  isFinishedState,
   parseScreenCommand,
   plainSummaryOf,
   previousSessionFollowUpOf,
@@ -138,6 +139,7 @@ import {
 } from './task-screens.ts'
 import { ensureAssistantHome } from '../assistant-home.ts'
 import { TihuPreroll, prerollAudioMs } from './preroll.ts'
+import { tihuFailureError, tihuRemoteFailureOf, tihuResolveAgentFailureOf, type TihuResolveFailure } from './host-resolve.ts'
 
 /** 页面与 WebSocket 的路径（代理侧按这两个前缀放行）。 */
 export const TIHU_PAGE_PATH = '/tihu'
@@ -2303,11 +2305,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 项目**已经确定**、只是宿主建不出会话来：给一屏不带「请重说」的终态。
    *
    * 用户 2026-11-10 要求：只有「项目也无法确定」时才许出现旧「指令未发送 / 请重说」
-   * 错误屏；承接降级（同项目新建）再失败时，错的不是用户那句话，不能让主人重说一遍。
+   * 错误屏；承接降级（同项目新建）再失败时，错的不是用户那句话，不能让主人重说，
+   * 也**不许这一屏干脆不出**（quietFailure 曾经把什么都吞了）。
+   * @param headLine - 屏上第一行（默认「项目已定，宿主没建起会话」）；降级不同跳点文案不同。
    */
-  function showDispatchStuck(device: TihuDevice, error: unknown): void {
+  function showDispatchStuck(device: TihuDevice, error: unknown, headLine?: string): void {
     const reason = screenReasonOf(error)
-    const lines = fitScreenLines(['项目已定，宿主没建起会话', reason], 3)
+    const head = headLine ?? '项目已定，宿主没建起会话'
+    const lines = fitScreenLines([head, reason], 3)
     device.send('event.alert', { level: 'error', text: `这条没派出去（${reason}）` })
     sendFrame(device, {
       stage: '会话', title: '这条没派出去',
@@ -3466,9 +3471,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 「会话 … 当前没有活动 agent」——那是 fallback 分支，三条退避重试也救不回来，
    * 屏上就弹「指令未发送 / 请重说」。新会话（刚 create、agent 还在内存）才碰巧是好的。
    *
-   * 宿主真实入口是 `sessionController.resume(sessionId)`（网页版打开旧会话同一条路）：
-   * 它按持久化 header + 原 agentPreset 把会话重新读出来并 mount 成活动 agent。
-   * 这里先 resume、确认 `agents.get()` 真的能拿到，再交给 promptSession 投递。
+   * 宿主真实入口是 **`sessionController.resolveAgent(sessionId)`**（2026-11-10 核对宿主包
+   * `@deepseek-ai/dsh-api-session-controller/lib/index.js` 第 210 行，`resume` 只是它内部的
+   * 私有步骤、**没有公开出来**）：先看 liveAgent，再 `ctx.sessions.get`，最后走去重的
+   * `resume()`，返回**活 Agent**（或 `{ agent }`）**或** `{ error: RemoteError }`
+   * （错误码 `session/not-found`、`session/writer-held`、`gateway/internal`）。
+   * 旧代码调的 `controller.resume(...)` 在这条宿主上不存在，于是实机每次承接都停在
+   * 「宿主没有 sessionController.resume」→ 新建的会话没接住话 → 句子无声消失。
+   *
+   * 顺序：**resolveAgent → resume（老宿主/测试桩兜底）→ 报真实原因**。
+   * 拿到 agent 后仍用 `ctx.agents.get(sessionId)` 复核一次——promptOnce 的 fallback 只认这个。
    *
    * `sessions.using` 存在时（测试桩 / 老宿主）它自己会拉起 agent，保持原路径不动。
    */
@@ -3498,23 +3510,72 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     if (already !== undefined && already !== null) return { ok: true, resumed: false }
     const sessionsSvc = optionalService(ctx, 'sessions') as { using?: unknown } | undefined
     if (typeof sessionsSvc?.using === 'function') return { ok: true, resumed: false }
-    const controller = optionalService(ctx, 'sessionController') as { resume?: (id: string) => Promise<any> } | undefined
-    if (typeof controller?.resume !== 'function') {
-      return { ok: false, resumed: false, error: new Error('宿主没有 sessionController.resume，无法恢复这条空闲会话') }
+    const controller = optionalService(ctx, 'sessionController') as {
+      resolveAgent?: (id: string) => Promise<any>
+      resume?: (id: string) => Promise<any>
+    } | undefined
+
+    /** 第一条入口失败的原因（留着给兜底入口失败时一起写进日志，绝不吞）。 */
+    let resolveFailure: { code: string; message: string } | undefined
+
+    // ---------- 1) 宿主真实入口：resolveAgent（它内部会走去重的 resume） ----------
+    if (typeof controller?.resolveAgent === 'function') {
+      let returned: any
+      try {
+        returned = await controller.resolveAgent(sessionId)
+      } catch (error) {
+        resolveFailure = tihuRemoteFailureOf(error, 'resolveAgent 抛错')
+      }
+      if (resolveFailure === undefined) {
+        const failure = tihuResolveAgentFailureOf(returned)
+        if (failure !== undefined) {
+          resolveFailure = failure
+        } else {
+          const resolved = liveAgent()
+          if (resolved !== undefined && resolved !== null) {
+            try { appendTihuLaneLog(sessionId, new Error(`承接目标空闲 → resolveAgent 挂回活动 agent（会话 ${sessionId}）`), 'append-resolve-agent-ok') } catch { /* 日志失败不影响承接 */ }
+            return { ok: true, resumed: true }
+          }
+          resolveFailure = { code: 'session/not-live', message: 'resolveAgent 说拿到了 agent，但 ctx.agents 还查不到这条会话' }
+        }
+      }
     }
-    let returned: any
-    try {
-      returned = await controller.resume(sessionId)
-    } catch (error) {
-      return { ok: false, resumed: false, error }
+
+    // ---------- 2) 老宿主 / 测试桩兜底：公开的是 resume(sessionId) ----------
+    if (typeof controller?.resume === 'function') {
+      let resumeFailure: { code: string; message: string } | undefined
+      try {
+        await controller.resume(sessionId)
+      } catch (error) {
+        resumeFailure = tihuRemoteFailureOf(error, 'resume 抛错')
+      }
+      // promptOnce 的 fallback 只认 `agents.get(sessionId)`：返回值不算数，必须真查得到。
+      const mounted = liveAgent()
+      if (mounted !== undefined && mounted !== null) {
+        try { appendTihuLaneLog(sessionId, new Error(`承接目标空闲 → 老宿主 resume 挂回活动 agent（会话 ${sessionId}）`), 'append-resume-agent-ok') } catch { /* 日志失败不影响承接 */ }
+        return { ok: true, resumed: true }
+      }
+      if (resumeFailure === undefined && mounted === undefined) {
+        resumeFailure = { code: 'session/not-live', message: resolveFailure === undefined ? 'resume 之后仍然没有活动 agent' : 'resume 之后仍然没有活动 agent（resolveAgent 先失败）' }
+      }
+      if (resumeFailure !== undefined) {
+        const combined = resolveFailure === undefined ? resumeFailure : { code: resumeFailure.code, message: `${resolveFailure.message}；${resumeFailure.message}` }
+        return { ok: false, resumed: false, error: tihuFailureError(combined, sessionId) }
+      }
+      return { ok: false, resumed: false, error: tihuFailureError({ code: 'session/not-live', message: 'resume 之后 ctx.agents 仍查不到这条会话' }, sessionId) }
     }
-    // promptOnce 的 fallback 只认 `agents.get(sessionId)`：resume 返回值不算数，必须真查得到。
-    const mounted = liveAgent()
-    if (mounted !== undefined && mounted !== null) return { ok: true, resumed: true }
-    if (returned !== undefined && returned !== null) {
-      return { ok: false, resumed: true, error: new Error('resume 返回了 agent，但活动 agent 注册表里还查不到这条会话') }
+
+    // ---------- 3) 两条入口都没能挂回会话：把真实原因点名清楚（实机排查就靠这一行） ----------
+    if (resolveFailure !== undefined) {
+      try {
+        appendTihuLaneLog(sessionId, new Error(`承接目标挂不回来：resolveAgent失败：${resolveFailure.message}`), 'append-resolve-agent-failed')
+      } catch { /* 日志失败不影响承接 */ }
+      return { ok: false, resumed: false, error: tihuFailureError(resolveFailure, sessionId) }
     }
-    return { ok: false, resumed: true, error: new Error('resume 之后仍然没有活动 agent') }
+    if (controller === undefined) {
+      return { ok: false, resumed: false, error: new Error(`宿主没有 sessionController 服务，无法恢复空闲会话 ${sessionId.slice(0, 12)}…（可恢复入口：resolveAgent/resume）`) }
+    }
+    return { ok: false, resumed: false, error: new Error(`宿主 sessionController 没有 resolveAgent 也没有 resume，无法恢复空闲会话 ${sessionId.slice(0, 12)}…`) }
   }
 
   /** 指挥会话换了 id：绑着旧会话的屏改绑到新会话（否则新会话的 turn 事件上不了屏）。 */
@@ -5209,11 +5270,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     const decision: DispatchMeta = meta ?? { via: 'rule', continuity: 'new', clarify: 'no' }
     stopCommanderWait()
     // 这句话是不是已经在等指挥台判断？是就**复用那张卡**（taskId 不变，绝不新建第二张）。
+    // 已经结束的卡（完成/已播报）不许被这句新话盖掉——新一句话一律新建一张卡（用户 2026-11-10 实机规则）。
     const reuseTaskId = decision.reuseTaskId ?? pendingCommanderTaskIdOf(text)
     let task: TihuTask | undefined
     if (reuseTaskId !== undefined) {
       const existing = tasks.get(reuseTaskId)
-      if (existing !== undefined && existing.state !== 'archived') {
+      if (existing !== undefined && existing.state !== 'archived' && !isFinishedState(existing.state)) {
         task = tasks.adopt(existing.taskId, {
           title: title ?? text,
           projectId: card.id,
@@ -5233,6 +5295,23 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         preset: DISPATCH_PRESET,
       })
     }
+    /**
+     * 承接降级的最后一跳也失败时的**唯一允许出口**：既留 lane.log（taskId＋目标会话＋错误原文），
+     * 也给设备一屏不带「请重说」的终态。原来 quietFailure 让这条完全静默——用户实机就是因此
+     * 「说完没反应」。
+     */
+    const noteDegradedFailure = (failedSession: string | undefined, error: unknown, headLine: string): void => {
+      if (decision.keepTaskOnFailure !== true) return
+      const reason = compactErrorText(error)
+      try {
+        appendTihuLaneLog(failedSession ?? '-', new Error(`降级再失败 任务=${task.taskId} 目标会话=${failedSession ?? '没建起来'} 项目=${card.name}：${reason}`), 'append-degrade-failed')
+      } catch { /* 日志失败不影响派单 */ }
+      log(`tihu dispatch degraded failed task=${task.taskId} session=${failedSession ?? '-'} project=${card.id} reason=${reason}`)
+      if (device !== undefined) {
+        showDispatchStuck(device, error, headLine)
+        decision.failureShown = true
+      }
+    }
     const sessionId = await createSessionAt(folder, DISPATCH_PRESET)
     if (sessionId === undefined) {
       const message = '宿主还不能新建会话（sessionController.create 不可用，见 tihu 日志），这次没派出去'
@@ -5247,6 +5326,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         releasePendingCommanderTask(task.taskId)
         refreshBoards()
       }
+      noteDegradedFailure(undefined, new Error(message), '同项目也建不起会话，已留在棋盘')
       if (device !== undefined && decision.quietFailure !== true) {
         showInputError(device, new Error(message), '任务会话没建起来，请重说')
       }
@@ -5276,11 +5356,18 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         refreshBoards()
       }
       logDispatchDecision(card.name, sessionId, decision)
+      noteDegradedFailure(sessionId, sent.error, '这句没投进去，已在同项目新建，稍后重试')
       if (device !== undefined && decision.quietFailure !== true) showInputError(device, sent.error, '任务会话没有接住这条消息，请重说')
       return undefined
     }
     // 承接降级：新会话已经接住这句，原任务（同 taskId）拉回执行中再出回执。
     if (decision.reopenTask === true) tasks.reopenForAppend(task.taskId)
+    if (decision.continuity === 'new' && decision.reuseTaskId !== undefined && decision.keepTaskOnFailure === true) {
+      // 降级成功也要留一条实机可查的投递记录（taskId＋落点会话）：只靠 console 是查不到的。
+      try {
+        appendTihuLaneLog(sessionId, new Error(`降级投递成功 任务=${task.taskId} 会话=${sessionId} 项目=${card.name} 话=${JSON.stringify(taskTitleOf(text, 24))}`), 'append-degrade-delivered')
+      } catch { /* 日志失败不影响派单 */ }
+    }
     // 同一句话晚到的 dispatch 不能再建第二条任务（新建会话这条路同样要立去重牌）。
     fallbackDispatch = { key: dispatchKeyOf(text), taskId: task.taskId, at: Date.now() }
     releasePendingCommanderTask(task.taskId)
@@ -5299,8 +5386,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   /**
    * 追加到已有 CU 会话（不新建、不换文件夹）：把用户这句 ＋ 续聊尾巴投进原会话。
    *
-   * 任务记账：这个会话已经有鹈鹕任务就复用（完成态拉回执行中）；没有就补一条任务挂上，
-   * 但不新建会话。电脑端镜像任务（source='pc'）不当承接对象：那条卡是只读镜像。
+   * 任务记账（用户 2026-11-10 实机规则）：**新一句话不许接进已经结束的任务**——
+   * 会话里那张卡还在跑才复用同 taskId（拉回执行中）；卡已经完成/已播报（或归档、
+   * 电脑端镜像）就新建一张卡（旧卡保持原样）。但不新建会话。
+   * 电脑端镜像任务（source='pc'）不当承接对象：那条卡是只读镜像。
    */
   async function appendToSession(
     device: TihuDevice | undefined,
@@ -5323,7 +5412,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     let task: TihuTask | undefined
     if (reuseTaskId !== undefined) {
       const reused = tasks.get(reuseTaskId)
-      if (reused !== undefined && reused.state !== 'archived') {
+      // 只有「同一句话的排队卡」才许原位转正；已经结束的卡（完成/已播报/归档）不动。
+      if (reused !== undefined && reused.state !== 'archived' && !isFinishedState(reused.state)) {
         task = tasks.adopt(reused.taskId, {
           title: text,
           projectId: card.id,
@@ -5343,9 +5433,15 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         tasks.attachSession(task.taskId, target.sessionId)
       }
     }
+    // 用户 2026-11-10 实机规则（t7 被复用的那条 bug）：
+    //   新一句话**不许**接进已经结束的任务——上一张卡已经「完成/已播报」（或归档、
+    //   电脑端镜像）就新建一张卡：新 taskId、标题＝这句新话、状态先 排队中（attach 后
+    //   变 派单）再 执行中；旧卡保持原样，不摘不盖。
+    // 会话本身仍然复用（承接照旧投进同一条会话），只有「卡」是新的一张。
+    const closedPrevious = existing !== undefined
+      && (existing.source === 'pc' || existing.state === 'archived' || isFinishedState(existing.state))
     if (task === undefined) {
-      task = existing !== undefined && existing.source === 'pc' ? undefined : existing
-      if (task === undefined) {
+      if (existing === undefined || closedPrevious) {
         task = tasks.add({
           title: text,
           projectId: card.id,
@@ -5355,8 +5451,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           sessionIds: [target.sessionId],
         })
         tasks.attachSession(task.taskId, target.sessionId)
+        if (closedPrevious) {
+          log(`tihu append new task=${task.taskId} (previous task=${existing?.taskId} state=${existing?.state} 已结束，不复用)`)
+        }
       } else {
-        tasks.reopenForAppend(task.taskId)
+        // 旧任务还在跑（执行中/待决策/排队）：同一件事继续做，taskId 不变、回到执行中。
+        tasks.reopenForAppend(existing.taskId)
+        task = existing
       }
     }
     // 先确认这条会话现在接得住话：idle 久了 agent 不在内存里，宿主能 resume 就挂回来再投。
@@ -5393,23 +5494,28 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       }
       failure = sent.error ?? new Error('投递失败')
     }
-    // 承接失败（resume 不行，或 resume 了仍投不进去）→ 自动降级：同项目新建，taskId 不变。
+    // 承接失败（resolveAgent/resume 不行，或挂回了 agent 仍投不进去）→ 自动降级：
+    // 同项目新建一条会话，沿用**这一句自己的卡**（fix 3 之后它要么是新卡，要么是还在跑的旧卡）。
     const reason = (failure as Error)?.message ?? String(failure)
-    // 日志：append 失败 → 同项目新建（带真实原因，用户实机排查就看这一行）。
-    try { appendTihuLaneLog(target.sessionId, new Error(`append 失败 → 同项目新建：${failureStage}失败：${reason}`), failureNote) } catch { /* 日志失败不影响兜底 */ }
-    log(`tihu append ${failureStage} failed session=${target.sessionId} project=${card.id} reason=${reason} -> new session in same project`)
-    const degraded = await dispatchToCard(device, text, card, task.title, {
+    // 日志：append 失败 → 同项目新建（带真实原因＋错误码，用户实机排查就看这两行）。
+    try { appendTihuLaneLog(target.sessionId, new Error(`append 失败 → 同项目新建：${failureStage}失败：${reason}（任务 ${task.taskId}）`), failureNote) } catch { /* 日志失败不影响兜底 */ }
+    log(`tihu append ${failureStage} failed session=${target.sessionId} task=${task.taskId} project=${card.id} reason=${reason} -> new session in same project`)
+    const degradeMeta: DispatchMeta = {
       via: meta.via,
       continuity: 'new',
       ...(meta.confidence === undefined ? {} : { confidence: meta.confidence }),
       clarify: meta.clarify,
-      // 同一句话同一张卡：沿用原 taskId，棋盘上不许冒出第二张。
+      // 同一句话同一张卡：沿用这句自己的 taskId，棋盘上不许冒出第二张。
       reuseTaskId: task.taskId,
       note: '那条会话没接住，已在同项目新建',
       reopenTask: true,
       keepTaskOnFailure: true,
       quietFailure: true,
-    })
+    }
+    const degraded = await dispatchToCard(device, text, card, task.title, degradeMeta)
+    // 降级那一跳已经出过「这条没派出去」的终态屏：回填给本函数，别再重复出第二屏。
+    if (degradeMeta.failureShown === true) meta.failureShown = true
+    if (degradeMeta.failure !== undefined) meta.failure = degradeMeta.failure
     if (degraded !== undefined) {
       // 原会话确实没收到这句：任务改挂新会话（taskId 不变，副行仍显示项目）。
       tasks.detachSession(degraded.taskId, target.sessionId)
@@ -5419,9 +5525,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       log(`tihu append degraded task=${degraded.taskId} old=${target.sessionId} new=${fresh} project=${card.id}`)
       return degraded
     }
-    // 同项目新建也没成：项目已定，绝不再让主人重说（旧「指令未发送」只留给项目也判不出的情况）。
+    // 同项目新建也没成：dispatchToCard 已经落 lane.log（taskId＋目标会话＋错误原文）并出过
+    // 不带「请重说」的终态屏。这里只补屏（没有出过才补，绝不静默、也不重复出两屏）。
+    if (device !== undefined && meta.failureShown !== true) showDispatchStuck(device, meta.failure ?? failure)
     meta.failureShown = true
-    if (device !== undefined) showDispatchStuck(device, meta.failure ?? failure)
     return undefined
   }
 
