@@ -91,8 +91,10 @@ import {
   chineseIndex,
   continuityCandidatesOf,
   continuityOf,
+  isConfidentProjectRoute,
   parseScreenCommand,
   plainSummaryOf,
+  previousSessionFollowUpOf,
   routeQuick,
   scoreCardAlias,
   stripWakeWord,
@@ -101,6 +103,7 @@ import {
   CONTINUITY_WINDOW_MS,
   ledgerSnapshotOf,
   type ScreenCommand,
+  type TaskRoute,
   type TihuSessionCandidate,
   type TihuTask,
 } from './task-ledger.ts'
@@ -3523,6 +3526,97 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /**
+   * 上一条派单任务（有会话、不是电脑端镜像、未归档）。
+   *
+   * 用户 2026-11-10：「新一句若与上一条派单任务所属会话的连续性过线，就接到那条会话」。
+   * 取最近动过的那条——appendToSession 会刷新 updatedAt，所以「上一条」永远指真正刚派过的
+   * 那条，不会被更早的任务吸走。
+   */
+  function previousDispatchTask(): TihuTask | undefined {
+    let best: TihuTask | undefined
+    for (const task of tasks.list()) {
+      if (task.source === 'pc') continue
+      if (task.state === 'archived') continue
+      if (task.sessionIds.every((sessionId) => sessionId === '')) continue
+      if (best === undefined || task.updatedAt >= best.updatedAt) best = task
+    }
+    return best
+  }
+
+  /** 上一条派单任务所属会话的候选（标题＋结果摘要＋最近活动）。 */
+  function previousSessionOf(task: TihuTask): TihuSessionCandidate | undefined {
+    const sessionId = [...task.sessionIds].reverse().find((id) => id !== '')
+    if (sessionId === undefined) return undefined
+    const title = humanTitle(task.title)
+    const summary = String(task.resultLine || task.doneText || task.summary || '').slice(0, 160)
+    return {
+      sessionId,
+      title: title !== '' ? title : String(task.title ?? ''),
+      ...(summary === '' ? {} : { summary }),
+      updatedAt: task.updatedAt,
+    }
+  }
+
+  /**
+   * 承接优先于项目命中（用户 2026-11-10 实机规则 A）。
+   *
+   * 新一句与「上一条派单任务所属会话」的本地连续性过线，就直接 append 到那条会话，
+   * **即使项目命中指向另一个项目**；回执/棋盘副行显示的是那条会话所属项目，不是命中项目。
+   * 只有语义明显矛盾（例如上一句在读 README、这句是「把论文图表重画」）才返回 undefined，
+   * 由调用方按本次路由新建会话。
+   *
+   * `skipProjectId` 传本次命中的项目：同一项目内的承接维持现状（仍旧由项目内多候选比分决定）。
+   */
+  async function followPreviousDispatch(
+    device: TihuDevice | undefined,
+    text: string,
+    skipProjectId?: string,
+  ): Promise<DispatchOutcome | undefined> {
+    const previous = previousDispatchTask()
+    if (previous === undefined) return undefined
+    if (skipProjectId !== undefined && previous.projectId === skipProjectId) return undefined
+    const session = previousSessionOf(previous)
+    if (session === undefined) return undefined
+    const card = {
+      id: previous.projectId,
+      name: previous.projectName,
+      ...(previous.folder === undefined || previous.folder === '' ? {} : { folder: previous.folder }),
+    }
+    const folder = resolveTaskFolder(card)
+    const hint = previousSessionFollowUpOf({
+      text,
+      previous: session,
+      now: Date.now(),
+      projectHints: continuityHintsOf(card, folder),
+    })
+    if (hint === undefined || !hint.follow) {
+      if (hint !== undefined) log(`tihu previous-follow skipped project=${card.id} score=${hint.confidence.toFixed(2)} ${hint.detail}`)
+      return undefined
+    }
+    log(`tihu previous-follow append project=${card.id} session=${session.sessionId} score=${hint.confidence.toFixed(2)} ${hint.detail}`)
+    const task = await appendToSession(
+      device,
+      text,
+      card,
+      { sessionId: session.sessionId, ...(session.title === '' ? {} : { title: session.title }) },
+      { via: 'previous', continuity: 'append', confidence: hint.confidence, clarify: 'no' },
+    )
+    if (task === undefined) return { message: '错误：那条会话没接住这句话。' }
+    return { task, message: `已接着「${task.projectName}」原有会话派出：${task.title}（任务 ${task.taskId}）` }
+  }
+
+  /**
+   * 低置信项目命中（用户 2026-11-10 实机规则 B）：只是 fragment、或置信 <0.3 时，
+   * 不许凭这一点单独把任务塞进那个项目。先看是不是接着上一句（规则 A），
+   * 不然就交给指挥台判（慢路径），判不准也只走现有的一次澄清/兜底。
+   */
+  function weakProjectHitOf(route: TaskRoute): { card: { id: string; name: string; folder?: string }; confidence: number; via: string } | undefined {
+    if (route.kind !== 'card') return undefined
+    if (isConfidentProjectRoute(route)) return undefined
+    return { card: route.card, confidence: route.confidence, via: route.via ?? 'fragment' }
+  }
+
+  /**
    * 该项目下最近的 CU 会话（最多 8 条）：只看 Computer Use 模式、同一项目文件夹、
    * 7 天内有活动的；标题取会话投影，摘要取登记簿里绑在这条会话上的任务摘要/结果行。
    *
@@ -3566,7 +3660,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /** 派单决策的上下文（写 lane.log 的四个字段：项目命中方式、会话、置信分、是否澄清）。 */
   interface DispatchMeta {
-    /** 项目命中方式：name / folder / fragment / daily / append / commander / clarify。 */
+    /** 项目命中方式：name / folder / fragment / daily / append / previous / commander / clarify。 */
     via: string
     /** 会话衔接结论：append / new / gray。 */
     continuity: string
@@ -5711,13 +5805,26 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       appendTihuLaneLog('-', new Error(`${reason}（${clipForLog(raw) || '空'}），退回 routeQuick/最佳卡`), 'commander-fallback')
     } catch { /* 日志失败不影响兜底 */ }
     log(`tihu commander ${reason} -> routeQuick/best-card fallback text=${JSON.stringify(ask.text)}`)
+    const device = [...devices].find((item) => item.unified)
+    // 指挥台没给结论时，规则 A 仍然优先：语义还接着上一条派单会话，就接到那条会话去。
+    const followed = await followPreviousDispatch(device, ask.text)
+    if (followed !== undefined) return
     const cards = projectCards() ?? []
     const route = routeQuick({ text: ask.text, cards, tasks: tasks.list() })
     let card: { id: string; name: string; folder?: string } | undefined
     let via = 'commander-fallback'
+    let note = '指挥台没给出结论，先按最佳卡派出'
     if (route.kind === 'card') {
-      card = route.card
-      via = 'fallback-route'
+      // 规则 B：低置信/片段命中不许单独定落点。指挥台又没给结论 → 按最保守的「个人助手」派，
+      // 不凭一个 2 字片段把任务塞进不相干项目。
+      if (!isConfidentProjectRoute(route)) {
+        card = ASSISTANT_CARD
+        via = 'fallback-weak-assistant'
+        note = '判不准项目，先派给个人助手'
+      } else {
+        card = route.card
+        via = 'fallback-route'
+      }
     } else if (route.kind === 'daily') {
       card = ASSISTANT_CARD
       via = 'fallback-daily'
@@ -5730,13 +5837,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
     if (card === undefined) card = bestCardMatchOf(ask.text, cards)
     if (card === undefined) card = ASSISTANT_CARD
-    const device = [...devices].find((item) => item.unified)
     const task = await dispatchToCard(device, ask.text, card, undefined, {
       via,
       continuity: 'new',
       clarify: 'no',
       reuseTaskId: ask.taskId,
-      note: '指挥台没给出结论，先按最佳卡派出',
+      note,
     })
     if (task !== undefined) log(`tihu commander fallback dispatched task=${task.taskId} project=${card.id} via=${via}`)
   }
@@ -6068,6 +6174,28 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
     const route = routeQuick({ text: value, cards: projectCards() ?? [], tasks: tasks.list() })
     if (route.kind === 'card') {
+      // 规则 A：先看是不是接着上一条派单会话（跨项目也接）。同项目仍交给项目内多候选判定。
+      const followed = await followPreviousDispatch(device, value, route.card.id)
+      if (followed !== undefined) {
+        reportFollowFailure(device, followed)
+        return
+      }
+      // 规则 B：低置信/片段命中不许单独定落点。
+      // 唯一例外是「上一条派单就在这个项目里」——这时项目已经被上一句确证过，片段命中
+      // 不是孤证（连打同一项目的句子不会被一句句丢给指挥台）；否则交给指挥台判。
+      const weak = weakProjectHitOf(route)
+      if (weak !== undefined) {
+        const context = previousDispatchTask()
+        const corroborated = context !== undefined && context.projectId === weak.card.id
+        if (!corroborated) {
+          const reason = `低置信项目命中（via=${weak.via} 置信=${weak.confidence.toFixed(2)}）不单独定落点，交给指挥台判`
+          try { appendTihuLaneLog('-', new Error(reason), 'weak-project-hit') } catch { /* 日志失败不影响派单 */ }
+          log(`tihu weak-project hit project=${weak.card.id} via=${weak.via} confidence=${weak.confidence.toFixed(2)} -> commander`)
+          await askCommander(device, value)
+          return
+        }
+        log(`tihu weak-project hit project=${weak.card.id} via=${weak.via} confidence=${weak.confidence.toFixed(2)} corroborated by previous dispatch`)
+      }
       await dispatchWithContinuity(device, value, route.card, { via: route.via ?? 'card' }, { allowCommander: true })
       return
     }
@@ -6076,6 +6204,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       return
     }
     if (route.kind === 'daily') {
+      // 规则 A 同样管「判成日常」这一支：上一句在别的项目里，也先看过线没有。
+      const followed = await followPreviousDispatch(device, value, ASSISTANT_CARD.id)
+      if (followed !== undefined) {
+        reportFollowFailure(device, followed)
+        return
+      }
       await dispatchWithContinuity(device, value, ASSISTANT_CARD, { via: 'daily' }, { allowCommander: true })
       return
     }
@@ -6083,7 +6217,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       askWhich(device, route.candidates, value)
       return
     }
+    // 没有任何项目命中：先接上一条派单会话，接不上才进慢路径。
+    const followed = await followPreviousDispatch(device, value)
+    if (followed !== undefined) {
+      reportFollowFailure(device, followed)
+      return
+    }
     await askCommander(device, value)
+  }
+
+  /** 规则 A 的失败回执：会话没接住时和平时派单失败一样出错误屏，不静默吞掉。 */
+  function reportFollowFailure(device: TihuDevice, outcome: DispatchOutcome): void {
+    if (outcome.task !== undefined || !outcome.message.startsWith('错误')) return
+    showInputError(device, new Error(outcome.message), '这条没派出去，请重说')
   }
 
   /* ---------- 控制面（tihu 全局工具用；全是薄壳转调，见 control.ts） ----------

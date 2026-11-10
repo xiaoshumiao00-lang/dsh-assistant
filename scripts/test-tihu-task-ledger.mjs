@@ -49,7 +49,11 @@ import {
   continuityAffinityOf,
   continuityCueScore,
   continuityOf,
+  continuityScoreOf,
   continuityTimeScore,
+  isConfidentProjectRoute,
+  previousSessionFollowUpOf,
+  projectMatchConfidenceOf,
   scoreCardAlias,
   stripWakeWord,
   subLineOf,
@@ -614,6 +618,61 @@ test('会话衔接：两个候选分太近不猜（灰区），旧的会话时�
   assert.ok(continuityTimeScore(CONTEXT_NOW - 60_000, CONTEXT_NOW) > continuityTimeScore(CONTEXT_NOW - 3 * 86_400_000, CONTEXT_NOW))
   assert.ok(continuityAffinityOf('引言第三段压缩', '青年基金申请书引言第三段压缩') > 0.5)
   assert.equal(continuityAffinityOf('帮我订会议室', '青年基金申请书引言修改'), 0)
+})
+
+/* ---------- 2026-11-10 实机：承接优先于项目命中（跨项目也接） ---------- */
+
+test('上一条派单会话：README 的两句续读都过线（不靠指代词），明显矛盾才新建', () => {
+  const previous = cuSession('s-readme', '帮我把 README 的前两行读出来', { minutesAgo: 1 })
+  const next = previousSessionFollowUpOf({ text: '再读一下后两行', previous, now: CONTEXT_NOW })
+  assert.ok(next !== undefined)
+  assert.equal(next.follow, true, '「再读一下后两行」明显接着上一条 README：' + JSON.stringify(next))
+  assert.equal(next.sessionId, 's-readme')
+  assert.ok(next.confidence >= 0.3 && next.confidence < 0.54, '分数在「上一条」线之上、同项目 append 线之下：' + next.confidence)
+
+  const third = previousSessionFollowUpOf({ text: '这次只读最后一行', previous, now: CONTEXT_NOW })
+  assert.equal(third?.follow, true, '第三句仍接着同一条：' + JSON.stringify(third))
+
+  const unrelated = previousSessionFollowUpOf({ text: '把论文图表重画', previous, now: CONTEXT_NOW })
+  assert.equal(unrelated?.follow, false, '上一句在读 README、这句要重画图表 → 语义明显矛盾，新建：' + JSON.stringify(unrelated))
+  assert.equal(previousSessionFollowUpOf({ text: '帮我订个明天的会议室', previous, now: CONTEXT_NOW })?.follow, false)
+
+  assert.equal(previousSessionFollowUpOf({ text: '再读一下后两行', previous: undefined, now: CONTEXT_NOW }), undefined, '没有上一条就没什么可接')
+  assert.equal(previousSessionFollowUpOf({ text: '', previous, now: CONTEXT_NOW }), undefined)
+})
+
+test('上一条派单会话：项目名先剔掉，不会因为「同一个项目」就算同一件事', () => {
+  const previous = cuSession('s-fund', '青年基金申请书引言第三段压缩', { minutesAgo: 1 })
+  const sameProject = previousSessionFollowUpOf({ text: '青年基金申请书预算表按新模板重算', previous, now: CONTEXT_NOW, projectHints: ['青年基金申请书'] })
+  assert.equal(sameProject?.follow, false, '同项目另一件事不该被吸进上一条会话：' + JSON.stringify(sameProject))
+})
+
+test('低置信项目命中：只是 fragment / 置信 <0.3 不许单独定落点', () => {
+  const cards = [
+    { id: 'c-gypsum', name: '磷石膏SCI' },
+    { id: 'c-fund', name: '青年基金申请书' },
+  ]
+  // 2 字片段「石膏」→ 20 分 → 置信 0.2：只是线索。
+  const weak = routeQuick({ text: '把石膏板的吸水率试验数据整理一下', cards, tasks: [] })
+  assert.equal(weak.kind, 'card')
+  assert.equal(weak.via, 'fragment')
+  assert.ok(weak.confidence < 0.3, `2 字片段置信必须 <0.3：${weak.confidence}`)
+  assert.equal(isConfidentProjectRoute(weak), false)
+  // 4 字片段（0.4）照样不算数：fragment 一律不许单独定项目。
+  const longer = routeQuick({ text: '青年基金预算表按新模板重算', cards, tasks: [] })
+  assert.equal(longer.kind, 'card')
+  assert.equal(longer.via, 'fragment')
+  assert.ok(longer.confidence >= 0.3, `4 字片段置信 0.4：${longer.confidence}`)
+  assert.equal(isConfidentProjectRoute(longer), false)
+  // 整名点名才是确定命中。
+  const strong = routeQuick({ text: '把磷石膏SCI的吸水率试验数据整理一下', cards, tasks: [] })
+  assert.equal(strong.kind, 'card')
+  assert.equal(strong.via, 'name')
+  assert.equal(strong.confidence, 1)
+  assert.equal(isConfidentProjectRoute(strong), true)
+  assert.equal(projectMatchConfidenceOf(20, 'fragment'), 0.2)
+  assert.equal(projectMatchConfidenceOf(30, 'fragment'), 0.3)
+  assert.equal(projectMatchConfidenceOf(120, 'name'), 1)
 })
 
 /* ---------- 口头命令 ---------- */

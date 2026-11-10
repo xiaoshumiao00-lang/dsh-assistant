@@ -1126,11 +1126,45 @@ export function mergeAnnouncements(items: readonly { text: string; level: TaskNo
 
 /** 路由结果：派给某张卡／追加到已有任务／日常任务／歧义追问。 */
 export type TaskRoute =
-  | { kind: 'card'; card: TihuCardRow; matched: string; via?: 'name' | 'folder' | 'fragment' }
+  | {
+    kind: 'card'
+    card: TihuCardRow
+    matched: string
+    via?: 'name' | 'folder' | 'fragment'
+    /**
+     * 项目命中的置信分（0..1）：整名/文件夹命中＝1，片段命中按命中字数折算。
+     * 2026-11-10 实机：2 字片段（0.2）把「再读一下后两行」塞进了不相干项目，
+     * 所以低置信命中只能算线索，不能单独定落点（见 isConfidentProjectRoute）。
+     */
+    confidence: number
+  }
   | { kind: 'append'; task: TihuTask }
   | { kind: 'daily' }
   | { kind: 'ambiguous'; candidates: TihuCardRow[] }
   | { kind: 'none' }
+
+/** 项目命中「够格单独定落点」的置信下限（用户 2026-11-10：低于 0.3 不算数）。 */
+export const PROJECT_MATCH_CONFIDENT = 0.3
+
+/** 打分 → 置信分：整名/文件夹命中视为确定；片段命中按命中字数折算（2 字 0.2、3 字 0.3）。 */
+export function projectMatchConfidenceOf(score: number, via: 'name' | 'folder' | 'fragment'): number {
+  if (via === 'name' || via === 'folder') return 1
+  const value = Number(score)
+  if (!Number.isFinite(value)) return 0
+  return Math.max(0, Math.min(1, value / 100))
+}
+
+/**
+ * 这次项目命中能不能单独定落点。
+ *
+ * 用户 2026-11-10 实机规则：**只是 fragment 命中、或置信低于 0.3** 时，不许凭这一点把
+ * 任务塞进那个项目——要么先看是不是接着上一句（会话衔接），要么交给指挥台判。
+ */
+export function isConfidentProjectRoute(route: TaskRoute): boolean {
+  if (route.kind !== 'card') return false
+  if (route.via === 'fragment') return false
+  return route.confidence >= PROJECT_MATCH_CONFIDENT
+}
 
 /** 设备屏上的轻命令（说一句就能用，不用点屏）。 */
 export type ScreenCommand =
@@ -1368,7 +1402,13 @@ export function routeQuick(input: {
   if (decisive.length === 1) {
     const follow = CONTINUATION.test(text) ? activeOf(decisive[0].card.id) : undefined
     if (follow !== undefined) return { kind: 'append', task: follow }
-    return { kind: 'card', card: decisive[0].card, matched: decisive[0].matched, via: decisive[0].via }
+    return {
+      kind: 'card',
+      card: decisive[0].card,
+      matched: decisive[0].matched,
+      via: decisive[0].via,
+      confidence: projectMatchConfidenceOf(decisive[0].score, decisive[0].via),
+    }
   }
 
   if (CONTINUATION.test(text)) {
@@ -1387,14 +1427,26 @@ export function routeQuick(input: {
   if (best !== undefined && best.score >= 30) {
     const close = scored.filter((item) => item.score * 100 >= best.score * 80)
     if (close.length > 1) return { kind: 'ambiguous', candidates: close.slice(0, 2).map((item) => item.card) }
-    return { kind: 'card', card: best.card, matched: best.matched, via: best.via }
+    return {
+      kind: 'card',
+      card: best.card,
+      matched: best.matched,
+      via: best.via,
+      confidence: projectMatchConfidenceOf(best.score, best.via),
+    }
   }
   if (looksSimpleTask(text)) return { kind: 'daily' }
   if (best === undefined) return { kind: 'none' }
   // 只剩「2 个字撞上」的弱命中：同样先看有没有第二个候选，再落卡。
   const close = scored.filter((item) => item.score * 100 >= best.score * 80)
   if (close.length > 1) return { kind: 'ambiguous', candidates: close.slice(0, 2).map((item) => item.card) }
-  return { kind: 'card', card: best.card, matched: best.matched, via: best.via }
+  return {
+    kind: 'card',
+    card: best.card,
+    matched: best.matched,
+    via: best.via,
+    confidence: projectMatchConfidenceOf(best.score, best.via),
+  }
 }
 
 /* ---------- 会话衔接（本地语义打分，纯函数；零模型） ---------- */
@@ -1542,6 +1594,83 @@ function stripHints(text: string, hints: readonly string[] | undefined): string 
   return value
 }
 
+/** 一条候选的连续性打分结果（0..1；detail 是落日志的那串依据）。 */
+export interface ContinuityScore {
+  content: number
+  cue: number
+  time: number
+  score: number
+  detail: string
+}
+
+/**
+ * 一句话对一条候选会话的连续性打分（纯函数）。
+ *
+ * 与 continuityOf 的关系：continuityOf 在多条候选之间比分、分档（append/new/gray）；
+ * 这里只算「这一条」的分数，供「上一条派单会话」这种只有一个锚点的场景复用同一套语义。
+ */
+export function continuityScoreOf(input: {
+  text: string
+  session: TihuSessionCandidate
+  now: number
+  projectHints?: readonly string[]
+}): ContinuityScore {
+  const text = String(input.text ?? '').trim()
+  const now = Number.isFinite(input.now) ? Number(input.now) : Date.now()
+  const utterance = stripHints(text, input.projectHints)
+  const cue = continuityCueScore(text)
+  const title = stripHints(input.session.title, input.projectHints)
+  const summary = stripHints(input.session.summary ?? '', input.projectHints)
+  const content = Math.max(
+    continuityAffinityOf(utterance, title),
+    summary === '' ? 0 : continuityAffinityOf(utterance, summary),
+  )
+  const time = continuityTimeScore(input.session.updatedAt, now)
+  const score = CONTINUITY_WEIGHT.content * content + CONTINUITY_WEIGHT.cue * cue + CONTINUITY_WEIGHT.time * time
+  return { content, cue, time, score, detail: `content=${content.toFixed(2)} cue=${cue.toFixed(2)} time=${time.toFixed(2)} score=${score.toFixed(2)}` }
+}
+
+/**
+ * 「上一条派单任务所属会话」的承接分数线（0..1）。
+ *
+ * 为什么比同项目 append 线（0.54）低：同项目里有好几条候选要挑，分数必须够高才敢认；
+ * 而「上一句刚刚派给这条会话」本身就是强证据——只要语义还沾着同一件事（内容有重合，
+ * 或明确的「接着/刚才」），就该接着它，而不是因为项目片段命中另起一条。
+ * 纯矛盾（完全无内容重合，只有时间分 0.17）永远过不了这条线。
+ */
+export const CONTINUITY_PREVIOUS_SCORE = 0.3
+
+export interface PreviousFollowUp {
+  follow: boolean
+  confidence: number
+  sessionId: string
+  detail: string
+}
+
+/**
+ * 新一句与「上一条派单任务所属会话」的承接判定（跨项目也成立）。
+ *
+ * 用户 2026-11-10 实机：说「再读一下后两行」，项目片段命中把任务塞进另一个项目并新建会话，
+ * 其实它明显接着上一条 README 任务。这里只看那一句派过的会话：过线就接着它，
+ * 语义明显矛盾（例如上一句在读 README、这句是「把论文图表重画」）才放手去新建。
+ */
+export function previousSessionFollowUpOf(input: {
+  text: string
+  previous?: TihuSessionCandidate
+  now: number
+  projectHints?: readonly string[]
+}): PreviousFollowUp | undefined {
+  const previous = input.previous
+  if (previous === undefined || String(input.text ?? '').trim() === '') return undefined
+  const scored = continuityScoreOf({ text: input.text, session: previous, now: input.now, projectHints: input.projectHints })
+  return {
+    follow: scored.score >= CONTINUITY_PREVIOUS_SCORE,
+    confidence: scored.score,
+    sessionId: previous.sessionId,
+    detail: scored.detail,
+  }
+}
+
 /**
  * 会话衔接判定：给一句话与该项目下的 CU 会话候选，产出 append / new / gray。
  *
@@ -1556,22 +1685,13 @@ export function continuityOf(input: ContinuityInput): SessionContinuity {
   if (text === '') return { kind: 'new', confidence: 0, reason: '空句子' }
   const sessions = continuityCandidatesOf(input.sessions)
   if (sessions.length === 0) return { kind: 'new', confidence: 0, reason: '该项目下还没有 CU 会话' }
-  const utterance = stripHints(text, input.projectHints)
-  const cue = continuityCueScore(text)
-  const scored = sessions.map((candidate) => {
-    const title = stripHints(candidate.title, input.projectHints)
-    const summary = stripHints(candidate.summary ?? '', input.projectHints)
-    const content = Math.max(
-      continuityAffinityOf(utterance, title),
-      summary === '' ? 0 : continuityAffinityOf(utterance, summary),
-    )
-    const time = continuityTimeScore(candidate.updatedAt, now)
-    const score = CONTINUITY_WEIGHT.content * content + CONTINUITY_WEIGHT.cue * cue + CONTINUITY_WEIGHT.time * time
-    return { candidate, score, content, cue, time }
-  }).sort((a, b) => (b.score - a.score) || (b.candidate.updatedAt - a.candidate.updatedAt))
+  const scored = sessions.map((candidate) => ({
+    candidate,
+    ...continuityScoreOf({ text, session: candidate, now, projectHints: input.projectHints }),
+  })).sort((a, b) => (b.score - a.score) || (b.candidate.updatedAt - a.candidate.updatedAt))
   const best = scored[0]
   const second = scored[1]
-  const detail = `content=${best.content.toFixed(2)} cue=${best.cue.toFixed(2)} time=${best.time.toFixed(2)} score=${best.score.toFixed(2)}`
+  const detail = best.detail
   if (best.score < CONTINUITY_NEW_SCORE) {
     return { kind: 'new', confidence: best.score, reason: `明确无关：${detail}` }
   }
