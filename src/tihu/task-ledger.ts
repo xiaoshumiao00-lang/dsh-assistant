@@ -97,6 +97,15 @@ export interface TihuTask {
   decisionDeadline?: number
   /** 谁拍的板（`设备 60 秒超时` / `设备点选` / `口头确认`）。 */
   answeredBy?: string
+  /** 调用链上还有几个子代理（子会话）在跑：主回合结束也不算完成，等它们全部结束。 */
+  childRunning?: number
+  /**
+   * 主回合已经结束、但子代理还在跑：这条任务先挂着「没完成」。
+   * 存下主回合的结论，等子代理结束后再补完成屏与播报。
+   */
+  holdingForChildren?: boolean
+  /** 挂起时主回合的那句结论（完成屏/播报用）。 */
+  pendingResultLine?: string
   /** 归档时刻。 */
   archivedAt?: number
   /** journal 行写过没有（只写一次）。 */
@@ -125,19 +134,6 @@ export function capsuleOf(state: TihuTaskState): string {
 /** 完成家族：棋盘胶囊还分「完成/已播报」，但时长环、排序、归档按同一族处理。 */
 export function isFinishedState(state: TihuTaskState): boolean {
   return state === 'done' || state === 'announced'
-}
-
-/** 排序权重：**要人的永远在最上**，完成沉底。 */
-function stateRank(state: TihuTaskState): number {
-  switch (state) {
-    case 'awaiting': return 0
-    case 'running': return 1
-    case 'dispatched': return 2
-    case 'queued': return 3
-    case 'done': return 4
-    case 'announced': return 5
-    default: return 6
-  }
 }
 
 /** 一句话 → 任务标题：去噪音、压空白、按像素省略（18 字以内）。 */
@@ -206,53 +202,64 @@ export function rowOf(task: TihuTask, now: number): TaskBoardRow {
     row.badge = 'ask'
     row.ring = { percent: 0, tone: 'empty' }
   }
+  // 子代理还在跑：屏上不写字，只给状态图形加一圈缓慢旋转的短弧（page.ts 读这个数）。
+  if ((task.childRunning ?? 0) > 0) row.subagents = task.childRunning
   if (task.stepDurations !== undefined && task.stepDurations.length > 0) row.micro = task.stepDurations.slice(-8)
   return row
 }
 
 /**
- * 棋盘一行了哪条：鹈鹕自己派出去的任务（`source !== 'pc'`）**永远占最前、永远上屏**。
- * 用户 2026-11-10：首页看不到派出的任务——电脑端那些 CU 会话最多 6 条，把它们挤到第 2 页
- * 之后，派出去的活就一条都看不见了（被 CU 过滤误伤或被页大小截掉）。
+ * 棋盘一行了哪条：鹈鹕自己派出去的任务（`source !== 'pc'`）在同状态同时刻时占前排。
+ * 排序的第一优先级已改成「状态」（见 {@link boardOf}），这个只做最后的稳定 tie-break。
  */
 export function isPinnedBoardTask(task: TihuTask): boolean {
   return task.source !== 'pc'
 }
 
 /**
- * 棋盘数据：排序固定（鹈鹕派单在前 → 待决策 → 执行中 → 排队 → 完成），同一项目连续多条只留最新一条，
- * 其余折叠成 `merged`（屏上画「+N 条」；点开看的是项目里最新那条）。
+ * 棋盘排序类别（用户 2026-11-10 改版）：
+ *   0 待决策 → 1 执行中（含「主回合结束但子代理还在跑」）→ 2 其余（排队/派单/完成）。
+ * 不再按「谁派出去的」抢前排：状态就是第一优先级。
+ */
+export function boardRankOf(task: TihuTask): number {
+  if (task.state === 'awaiting') return 0
+  if (task.state === 'running') return 1
+  if (task.state === 'dispatched' && (task.childRunning ?? 0) > 0) return 1
+  return 2
+}
+
+/**
+ * 棋盘数据：一条任务一张卡（不再折叠成「+N 条」）。
  *
- * 为什么按「连续」而不是「全项目」折叠：用户看棋盘是自上而下扫一眼，「刚才那三条基金」
- * 挨着才折叠得有意义；一旦中间夹了别的项目，它就是另一段上下文，不该被吞掉。
+ * 排序（用户 2026-11-10 定案）：
+ *   1. 待决策最前（连同它所属项目优先）；
+ *   2. 其次所有执行中（含子代理还在跑的任务）；
+ *   3. 其余按时间倒序。
+ * 「项目优先」指：同一类别里，若有同项目的任务正在等你拍板，这个项目的其它任务排前面；
+ * 最终 tie-break 仍是时间，再不行才用「鹈鹕派单优先」（保证顺序稳定）。
  */
 export function boardOf(tasks: readonly TihuTask[], now: number, page = 0): TaskBoardPayload {
   const live = tasks.filter((task) => task.state !== 'archived')
+  const awaitingProjects = new Set(
+    live.filter((task) => task.state === 'awaiting').map((task) => task.projectId),
+  )
+  const timeOf = (task: TihuTask): number => isFinishedState(task.state) ? task.finishedAt ?? task.updatedAt : task.updatedAt
   const sorted = [...live].sort((a, b) => {
-    // 派出去的任务先占前排（和电脑端会话比状态强弱也值：派完就在跑、跑完也看得见）。
+    const byRank = boardRankOf(a) - boardRankOf(b)
+    if (byRank !== 0) return byRank
+    // 同类别：所属项目有待决策的任务，整个项目优先。
+    const aProject = awaitingProjects.has(a.projectId) ? 0 : 1
+    const bProject = awaitingProjects.has(b.projectId) ? 0 : 1
+    if (aProject !== bProject) return aProject - bProject
+    // 其余按时间（新动静在前；完成态用完成时刻，避免「刚完成的反而排后面」）。
+    const aAt = timeOf(a)
+    const bAt = timeOf(b)
+    if (aAt !== bAt) return bAt - aAt
     const byPin = (isPinnedBoardTask(b) ? 1 : 0) - (isPinnedBoardTask(a) ? 1 : 0)
     if (byPin !== 0) return byPin
-    const byRank = stateRank(a.state) - stateRank(b.state)
-    if (byRank !== 0) return byRank
-    // 同状态：新动静的在前（完成态用完成时刻，避免「刚完成的反而排后面」）。
-    const aAt = isFinishedState(a.state) ? a.finishedAt ?? a.updatedAt : a.updatedAt
-    const bAt = isFinishedState(b.state) ? b.finishedAt ?? b.updatedAt : b.updatedAt
-    if (aAt !== bAt) return bAt - aAt
     return a.taskId.localeCompare(b.taskId)
   })
-  const rows: TaskBoardRow[] = []
-  const kept = new Map<string, TaskBoardRow>()
-  for (const task of sorted) {
-    const key = `${task.state}|${task.projectId}`
-    const existing = kept.get(key)
-    if (existing !== undefined) {
-      existing.merged = (existing.merged ?? 0) + 1
-      continue
-    }
-    const row = rowOf(task, now)
-    kept.set(key, row)
-    rows.push(row)
-  }
+  const rows: TaskBoardRow[] = sorted.map((task) => rowOf(task, now))
   const totalPages = Math.max(1, Math.ceil(rows.length / BOARD_PAGE_SIZE))
   const index = Math.max(0, Math.min(Math.trunc(page), totalPages - 1))
   const counts = countsOf(tasks)
@@ -551,7 +558,58 @@ export class TaskLedger {
     task.detail = undefined
     task.options = undefined
     task.decisionDeadline = undefined
+    task.holdingForChildren = undefined
+    task.pendingResultLine = undefined
+    task.childRunning = undefined
     return task
+  }
+
+  /**
+   * 子代理计数（调用链上还在跑的子会话数）。
+   * 返回 true 表示屏上该重画（数量变了）。
+   */
+  setChildRunning(taskId: string, count: number, now = Date.now()): boolean {
+    const task = this.tasks.get(taskId)
+    if (task === undefined) return false
+    const next = Number.isFinite(count) && count > 0 ? Math.trunc(count) : 0
+    const previous = task.childRunning ?? 0
+    if (next === previous) return false
+    if (next === 0) task.childRunning = undefined
+    else task.childRunning = next
+    task.updatedAt = now
+    return true
+  }
+
+  /**
+   * 主回合结束了，但子代理还在跑：任务**不能算完成**。
+   * 保持执行中、记下子代理数量与主回合结论，等子代理全部结束后再补完成屏/播报。
+   */
+  holdForChildren(taskId: string, input: { childRunning?: number; resultLine?: string; now?: number } = {}): TihuTask | undefined {
+    const task = this.tasks.get(taskId)
+    if (task === undefined) return undefined
+    const now = input.now ?? Date.now()
+    const running = Number.isFinite(input.childRunning) && (input.childRunning ?? 0) > 0 ? Math.trunc(input.childRunning as number) : 0
+    task.childRunning = running > 0 ? running : undefined
+    task.holdingForChildren = running > 0
+    if (running > 0) {
+      task.state = 'running'
+      task.finishedAt = undefined
+      task.spokenAt = undefined
+      task.updatedAt = now
+    }
+    const line = String(input.resultLine ?? '').trim()
+    if (line !== '') task.pendingResultLine = line
+    return task
+  }
+
+  /** 主会话又开了一轮（或重新派单）：子代理挂起状态清掉。 */
+  clearChildHold(taskId: string, now = Date.now()): void {
+    const task = this.tasks.get(taskId)
+    if (task === undefined) return
+    task.childRunning = undefined
+    task.holdingForChildren = undefined
+    task.pendingResultLine = undefined
+    task.updatedAt = now
   }
 
   /**
@@ -566,6 +624,8 @@ export class TaskLedger {
     task.state = 'running'
     task.finishedAt = undefined
     task.spokenAt = undefined
+    task.holdingForChildren = undefined
+    task.pendingResultLine = undefined
     task.updatedAt = now
     return task
   }
@@ -1057,7 +1117,6 @@ export interface TihuSessionCandidate {
   /** 最后一次活动时刻（时间临近度）。 */
   updatedAt: number
 }
-
 export interface ContinuityInput {
   text: string
   sessions: readonly TihuSessionCandidate[]

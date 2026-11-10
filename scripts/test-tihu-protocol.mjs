@@ -2661,6 +2661,8 @@ function unifiedWorkspace(options = {}) {
   }
   const fixture = runtimeFor(records, {
     ...(options.noCreate === true ? { sessions } : { remote, sessions, sessionController }),
+    // 子代理用例：agents 注册表要能 list()（宿主用它数「在跑的子代理后代」）。
+    ...(options.agents === undefined ? {} : { agents: options.agents }),
     ...(options.sessionEvents === undefined
       ? {}
       : { sessionQuery: sessionQueryFixture(records, options.sessionEvents) }),
@@ -4074,7 +4076,7 @@ await testAsync('统一指挥：棋盘每页 4 条 + 翻页（第 N/M 页、上�
   }
 })
 
-await testAsync('棋盘排序：鹈鹕派单的任务永远在最前（电脑端卡片再新也排在后面）', async () => {
+await testAsync('棋盘排序：执行中的电脑端卡片排在「还没开跑」的派单任务前面（来源不再抢前排）', async () => {
   const now = Date.now()
   const w = unifiedWorkspace({
     records: [cuRecord('session-pc3', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 500, title: '把第三节的结果补上' })],
@@ -4088,9 +4090,76 @@ await testAsync('棋盘排序：鹈鹕派单的任务永远在最前（电脑端
   await waitMs(90)
   const board = framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.board).pop().payload.board
   assert.equal(board.rows.length, 2, '两条都在：' + JSON.stringify(board.rows.map((row) => row.taskId)))
-  assert.equal(board.rows[0].taskId, 't1', '派单任务排第一（不按最后活动时间排）：' + JSON.stringify(board.rows.map((row) => row.taskId)))
-  assert.equal(String(board.rows[1].taskId).startsWith('p'), true, '电脑端卡片排后面')
-  assert.equal(board.rows[0].sub.includes('电脑端'), false, '派单任务的副行不是「电脑端 · …」')
+  assert.equal(board.rows[0].taskId, 'p1', '执行中的排第一：' + JSON.stringify(board.rows.map((row) => row.taskId)))
+  assert.equal(board.rows[0].state, 'running')
+  assert.equal(board.rows[1].taskId, 't1', '派单任务还没开跑 → 排在执行中之后')
+  assert.equal(String(board.rows[1].taskId).startsWith('t'), true, '派单任务仍在屏上（不按来源推后）')
+  assert.equal(board.rows[0].sub.includes('电脑端'), true)
+  assert.equal(board.rows[0].merged, undefined, '不再出现「+N 条」')
+  w.cleanup()
+})
+
+await testAsync('子代理：主回合结束但后台子任务还在跑 → 不算完成、不播报；子任务结束才转完成并播报', async () => {
+  let children = []
+  const agents = { list: () => children, get: () => undefined }
+  const w = unifiedWorkspace({ agents })
+  const socket = openLane(w.runtime)
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-subagent', protocol: '0' }, 1)))
+  await waitMs(60)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+  await waitMs(120)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+  await waitMs(80)
+  const taskSession = w.prompted[0].id
+  const childId = 'session-child-1'
+  children = [{
+    id: childId,
+    status: 'running',
+    session: { header: { id: childId, parentSession: taskSession, origin: 'subagent', delegationDepth: 1 } },
+  }]
+
+  // 屏上不写「子任务 N 个在跑」：只有一圈缓慢旋转的短弧（同 14px 图形，不挤标题/副行）。
+  const pageHtml = w.runtime.page()
+  assert.ok(pageHtml.includes('board-orbit'), '状态图形要有旋转弧标记')
+  assert.ok(pageHtml.includes('@keyframes boardOrbit'), '旋转弧要有动画')
+  assert.ok(pageHtml.includes('animation:boardOrbit 7s linear infinite'), '动效要慢（7 秒一圈）')
+  assert.equal(pageHtml.includes('board-merged'), false, '「+N 条」的样式彻底删掉')
+
+  emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
+  emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '已经交出去了，后台还在跑。' }] } } })
+  emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await waitMs(220)
+
+  let frames = framesOf(socket)
+  assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成'), false, '子任务在跑：不许出完成屏')
+  assert.equal(frames.some((frame) => frame.type === 'task.notify' && frame.payload.level === 1), false, '子任务在跑：不许播报完成')
+  let board = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop().payload.board
+  assert.equal(board.rows[0].state, 'running', '主回合结束但子代理在跑 ⇒ 仍然是执行中')
+  assert.equal(board.rows[0].subagents, 1, '棋盘行带子任务数（页面据此画旋转短弧，不写字）')
+  assert.equal(board.rows[0].capsule, '执行中')
+  assert.equal('merged' in board.rows[0], false, '不再有「+N 条」')
+
+  // 子代理结束：状态转完成并补发播报。
+  children = [{ ...children[0], status: 'idle' }]
+  emit(
+    { id: childId, header: { id: childId, parentSession: taskSession, origin: 'subagent' } },
+    { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+  )
+  await waitMs(260)
+  frames = framesOf(socket)
+  const done = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').pop()
+  assert.ok(done !== undefined, '子代理结束 → 才转完成屏')
+  assert.equal(done.payload.title, '现在几点了')
+  const note = frames.filter((frame) => frame.type === 'task.notify' && frame.payload.level === 1).pop()
+  assert.ok(note !== undefined, '子代理结束 → 才播报完成')
+  assert.ok(String(note.payload.text).includes('现在几点了'), '播报用任务标题：' + note.payload.text)
+  // 完成屏期间棋盘不刷新（屏一上屏就不再发 board）：回棋盘再看这张卡。
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 4)))
+  await waitMs(90)
+  board = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop().payload.board
+  assert.equal(board.rows[0].state, 'done')
+  assert.equal(board.rows[0].subagents, undefined, '子任务清零后旋转弧停掉')
   w.cleanup()
 })
 
