@@ -3644,6 +3644,27 @@ test('page：棋盘右侧状态图形（完成实心圆／待决策问号／进�
   assert.ok(html.includes("pageIndex < pageTotal - 1 ? 'cur' : 'off'"), '当前页方向看得出（可翻=亮、到头=暗）')
 })
 
+test('page：棋盘翻页条钉在屏底（列表区 flex:1，一页 4 条还是 1 条都不动位置）', () => {
+  const html = pageHtmlOf()
+  // 用户 2026-11-10 实机：第 2 页只剩 2 条时翻页栏跟着列表往上跑 → 必须钉死在屏底。
+  const bodyRule = /#screen\.board-mode \.home-body \{[^}]*\}/.exec(html)?.[0] ?? ''
+  assert.ok(bodyRule.includes('display:flex'), '棋盘正文是纵向 flex（列表 + 翻页条两段）：' + bodyRule)
+  assert.ok(bodyRule.includes('flex-direction:column'), '纵向排列：' + bodyRule)
+  assert.ok(bodyRule.includes('min-height:0'), 'min-height:0 才能让列表区被压缩/撑满：' + bodyRule)
+  const listRule = /#screen \.board-list \{[^}]*\}/.exec(html)?.[0] ?? ''
+  assert.ok(listRule.includes('flex:1 1 auto'), '列表区吃掉翻页条上方的全部高度：' + listRule)
+  assert.ok(listRule.includes('min-height:0') && listRule.includes('overflow:hidden'), '列表区超出就裁掉（不挤翻页条）：' + listRule)
+  const pagerRule = /#screen \.board-pager \{[^}]*\}/.exec(html)?.[0] ?? ''
+  assert.ok(pagerRule.includes('flex:none'), '翻页条不许被压缩/拉伸：' + pagerRule)
+  assert.ok(pagerRule.includes('margin-bottom:2px'), '翻页条底边 = 8 内边距 + 1 边框 + 2 = 11px（10–12px 之间）：' + pagerRule)
+  assert.ok(pagerRule.includes('height:12px'), '翻页条固定 12px 高：' + pagerRule)
+  assert.ok(/#screen\.board-mode \{ gap:2px; \}/.test(html), '棋盘间距收到 2px：列表 192 + 翻页条 12 + 底 2 正好放进 222')
+  // 行必须挂进 .board-list（挂回 home-body 就会把翻页条顶上去）。
+  assert.ok(html.includes("list.className = 'board-list'"), '棋盘渲染要建列表容器')
+  assert.ok(html.includes('list.appendChild(item)'), '任务行挂进列表区')
+  assert.equal(/body\.appendChild\(item\)/.test(html), false, '任务行不许再直接挂在 home-body 上')
+})
+
 test('page：完成页三键贴底（离屏幕下沿 12px）＋ 标题/正文贴顶 + 正文区按剩余高度裁剪', () => {
   const html = pageHtmlOf()
   assert.ok(/#screen\.has-actions \.action-bar \{ display:flex; \}/.test(html), '有按钮时动作条必须显示（缺这条 → 完成页三键消失）')
