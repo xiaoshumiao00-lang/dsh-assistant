@@ -41,7 +41,7 @@ import {
 } from '../src/tihu/guard.ts'
 import { createTihuRuntime, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH, TIHU_LANE_LOG_MAX_BYTES, appendTihuLaneLog, screenReasonOf, tihuLaneLogPath, tihuReceiptHoldMs } from '../src/tihu/lane.ts'
 import { BOARD_PAGE_SIZE } from '../src/tihu/task-ledger.ts'
-import { RECEIPT_SECONDS } from '../src/tihu/task-screens.ts'
+import { RECEIPT_SECONDS, prepareDoneText } from '../src/tihu/task-screens.ts'
 import { TIHU_CONTROL_SECTION_TEXT, createTihuControlRunner, matchSessionRows, tihuActionNames } from '../src/tihu/control.ts'
 import {
   activityEntryOf,
@@ -602,6 +602,46 @@ function openLane(runtime) {
   const socket = new FakeSocket()
   runtime.handleUpgrade({ url: '/tihu/lane', headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==' }, socket: {} }, socket, Buffer.alloc(0))
   return socket
+}
+
+/**
+ * 假 TTS：按「每个字 20ms」吐静音 PCM（真实链路也是 120ms 一块），并把念过的文本记下来。
+ * 用它测「完成页正文朗读的 PCM 帧带 read=done + 字符区间」，不必真有声卡/模型。
+ */
+function stubPcmTts(options = {}) {
+  const spoken = []
+  const chunkDelayMs = Number(options.chunkDelayMs) || 0
+  const chunks = Math.max(1, Number(options.chunks) || 0)
+  const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms) })
+  return {
+    spoken,
+    available: () => true,
+    backend: () => 'stub',
+    status: () => ({ available: true, error: undefined, backend: 'stub' }),
+    ensureServer: async () => {},
+    ensureKokoroServer: async () => {},
+    listVoices: async () => [],
+    createVoice: async () => ({ name: 'stub' }),
+    dispose: () => {},
+    synthesize: async (text, synthOptions) => {
+      spoken.push(text)
+      const samples = (chunks > 0 ? chunks : Math.max(1, Math.ceil([...text].length / 5))) * 2880
+      const chunker = new Pcm16Chunker()
+      const pcm = Buffer.alloc(samples * 2)
+      let seq = 0
+      for (const block of chunker.push(pcm)) {
+        if (chunkDelayMs > 0) await sleep(chunkDelayMs)
+        synthOptions.onChunk({ data: block, seq: seq, total: 0, final: false })
+        seq += 1
+      }
+      for (const block of chunker.finish()) {
+        if (chunkDelayMs > 0) await sleep(chunkDelayMs)
+        synthOptions.onChunk({ data: block.data, seq: seq, total: seq + 1, final: block.final })
+        seq += 1
+      }
+      return { sampleRate: 24000, firstChunkMs: 10, audioMs: samples / 24, totalMs: 20, chunks: seq }
+    },
+  }
 }
 
 /* ---------- 2026-11-07 P0：Chrome 大消息分片（FIN=0 + continuation）必须重组 ---------- */
@@ -3416,6 +3456,40 @@ test('page：完成页三键可见（has-actions 有 display:flex 规则）＋ 7
   assert.ok(DONE_LAYOUT.titleHeightPx >= DONE_LAYOUT.titleLineHeightPx, '标题块高不得小于行高（否则字形被裁）')
 })
 
+/* ---------- 2026-11-10：完成页高亮 ≡ 真实播放进度（不是固定 1.8 秒） ---------- */
+test('page：完成页高亮由 AudioContext 的真实排程驱动（source.start + buffer 时长）', () => {
+  const html = pageHtmlOf()
+  assert.ok(html.includes('function trackDoneAudio'), '页面要有「按已排程 PCM 记录区间」的函数')
+  assert.ok(html.includes('function pollDone'), '页面要有按播放时钟取当前行的轮询')
+  assert.ok(html.includes('ctx.currentTime'), '当前行必须读 AudioContext 的真实时钟')
+  assert.ok(html.includes('played.startAt') && html.includes('played.duration'), '区间要用 source.start 的时刻 + buffer 时长')
+  assert.ok(/payload\.read === 'done'/.test(html), '只认完成页正文朗读的 PCM（一句话播报不推进高亮）')
+  assert.ok(html.includes('state.doneRanges'), '页面要收下宿主的 done.ranges')
+  assert.ok(html.includes('lineAtChar'), '要有「字符位置 → 行」的换算')
+  // 旧实现：renderDone 里无条件 setInterval(advanceDone, 1800)。现在这台计时只当
+  // 「整轮一个 PCM 都没收到」的兜底，且必须被 doneAudioSeen 挡着。
+  const fallback = /function armDoneFallback\(\) \{([\s\S]*?)\n  \}/.exec(html)
+  assert.ok(fallback !== null, '要有兜底翻行函数')
+  assert.ok(fallback[1].includes('1800'), '兜底仍是 1.8 秒一行')
+  assert.ok(fallback[1].includes('state.doneAudioSeen'), '有声音时兜底必须让路')
+  const renderDone = /function renderDone\(payload\) \{([\s\S]*?)\n  \}/.exec(html)
+  assert.ok(renderDone !== null)
+  assert.equal(renderDone[1].includes('setInterval'), false, '渲染完成屏时不许直接挂固定计时器')
+})
+
+test('page：重读清旧排程、停止停在当前行', () => {
+  const html = pageHtmlOf()
+  const replay = /actionId === 'replay'\) \{([\s\S]*?)\n            \}/.exec(html)
+  assert.ok(replay !== null, '要有重读分支')
+  assert.ok(replay[1].includes('stopPcm()'), '重读先掐掉旧音频')
+  assert.ok(replay[1].includes('state.doneSeg = {}'), '重读清掉旧排程')
+  assert.ok(replay[1].includes('state.done.current = 0'), '重读高亮回第一行')
+  const stop = /actionId === 'stop'\) \{([\s\S]*?)\n            \}/.exec(html)
+  assert.ok(stop !== null, '要有停止分支')
+  assert.ok(stop[1].includes('state.doneSeg = {}'), '停止后不再按排程改行（停在实停的那一行）')
+  assert.equal(/state\.done\.current\s*=/.test(stop[1]), false, '停止不许把高亮重置或推进')
+})
+
 await testAsync('统一指挥：点已完成卡片 → 立刻进完成页（三键，不派单）', async () => {
   const w = unifiedWorkspace()
   const socket = openLane(w.runtime)
@@ -3440,6 +3514,89 @@ await testAsync('统一指挥：点已完成卡片 → 立刻进完成页（三�
   assert.deepEqual(frame.payload.actions.map((item) => item.label), ['停止', '重读', '主页'])
   assert.ok(Array.isArray(frame.payload.done?.lines) && frame.payload.done.lines.length > 0)
   assert.equal(w.created.length, created, '点完成卡不派单')
+  w.cleanup()
+})
+
+await testAsync('完成页朗读：每段 PCM 带 read=done + 字符区间，覆盖整段正文（高亮按它对齐）', async () => {
+  const ttsStub = stubPcmTts()
+  const w = unifiedWorkspace({ tts: { instance: ttsStub } })
+  const socket = openLane(w.runtime)
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-done-sync', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+  await waitMs(90)
+  const taskSession = w.prompted[0].id
+  const answer = '✅ 现在是 2026 年 11 月 10 日上午 9 点 31 分。温度场结果已经收敛，跨中腹板温差 1.1 ℃，比目标 1.5 ℃ 还好。'
+  emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
+  emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: answer }] } } })
+  emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await waitMs(120)
+  // 回棋盘再点这张完成卡 = 打开完成页并朗读整段正文（showDone 那条路径）
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+  await waitMs(60)
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 60, hit: 'task', taskId: 't1' }, 4)))
+  await waitMs(300)
+  const frames = framesOf(socket)
+  const done = frames.filter((item) => item.type === 'screen.frame' && item.payload.stage === '完成').pop()
+  assert.ok(Array.isArray(done.payload.done?.ranges), '完成帧要带行字符区间：' + JSON.stringify(done.payload.done))
+  assert.equal(done.payload.done.ranges.length, done.payload.done.lines.length, '区间与行一一对应')
+  const readFrames = frames.filter((item) => item.type === 'tts.audio' && item.payload.read === 'done')
+  assert.ok(readFrames.length > 0, '完成页正文朗读的 PCM 帧必须带 read=done')
+  for (const item of readFrames) {
+    assert.equal(typeof item.payload.charStart, 'number', '每段要带 charStart')
+    assert.equal(typeof item.payload.charEnd, 'number', '每段要带 charEnd')
+    assert.ok(item.payload.charEnd > item.payload.charStart, '字符区间必须有效')
+    assert.equal(typeof item.payload.index, 'number', '每段要带段序号（重读从 0 重新对齐）')
+    assert.ok(item.payload.data.length > 0, '要带 PCM')
+  }
+  // 区间必须覆盖整段正文（首段从 0 开始、末段到正文尾），否则最后几行永远高亮不到。
+  const body = prepareDoneText(answer)
+  const chars = [...body]
+  assert.equal(Math.min(...readFrames.map((item) => item.payload.charStart)), 0, '第一段从第 0 字开始')
+  assert.equal(Math.max(...readFrames.map((item) => item.payload.charEnd)), chars.length, '最后一段要念到正文末尾')
+  // 一句话播报（通知总线念的那条）不能带 read=done，否则会把完成页高亮带跑偏。
+  const plain = frames.filter((item) => item.type === 'tts.audio' && item.payload.read === undefined)
+  assert.ok(plain.length > 0, '普通播报帧不带 read 标记')
+  assert.ok(ttsStub.spoken.join('').includes('温度场结果已经收敛'), '念的就是屏上那份正文：' + ttsStub.spoken.join('|'))
+  assert.equal(ttsStub.spoken.join('').includes('✅'), false, '行首勾不会念出来')
+  w.cleanup()
+})
+
+await testAsync('完成页朗读：重读能接管正在念的一轮，停止能真的掐断后续 PCM', async () => {
+  const ttsStub = stubPcmTts({ chunkDelayMs: 25, chunks: 24 })
+  const w = unifiedWorkspace({ tts: { instance: ttsStub } })
+  const socket = openLane(w.runtime)
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-done-stop', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+  await waitMs(90)
+  const taskSession = w.prompted[0].id
+  emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
+  emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '现在是 2026 年 11 月 10 日上午 9 点 31 分。温度场结果已经收敛。' }] } } })
+  emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await waitMs(120)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+  await waitMs(60)
+  const readFrames = () => framesOf(socket).filter((item) => item.type === 'tts.audio' && item.payload.read === 'done')
+  // 打开完成页 = 开始念整段正文
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 60, hit: 'task', taskId: 't1' }, 4)))
+  await waitMs(120)
+  assert.ok(readFrames().length > 0, '打开完成页要开始朗读')
+  const beforeReplay = readFrames().length
+  // 重读：必须能接管（旧实现被 announcing 占住 → 一声不响）
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 150, y: 220, hit: 'action', actionId: 'replay' }, 5)))
+  await waitMs(200)
+  const afterReplay = readFrames()
+  assert.ok(afterReplay.length > beforeReplay, '重读要重新下发 PCM（不能被 announcing 挡住）：' + beforeReplay + ' → ' + afterReplay.length)
+  assert.equal(afterReplay.filter((item) => item.payload.index === 0).length >= 2, true, '重读要从第一段（index 0）重新开始')
+  // 停止：后续 PCM 必须立刻停手（只允许已经在线路上的几块）
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 220, hit: 'action', actionId: 'stop' }, 6)))
+  const atStop = readFrames().length
+  await waitMs(450)
+  const afterStop = readFrames().length
+  assert.ok(afterStop - atStop <= 4, `停止后不该再持续下发 PCM：停时有 ${atStop}，450ms 后 ${afterStop}`)
   w.cleanup()
 })
 

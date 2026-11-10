@@ -85,9 +85,18 @@ export function stripStatusMarks(text: string): string {
     .join('\n')
 }
 
+/**
+ * 完成页朗读用的规范文本：换行统一、去首尾空白、去行首状态勾。
+ * 折行（{@link doneLinesOf}）、字符区间（{@link doneLineRangesOf}）和
+ * 宿主下发 TTS 的 `charStart/charEnd` **必须都基于这一份文本**，否则高亮会和声音错位。
+ */
+export function prepareDoneText(text: unknown): string {
+  return stripStatusMarks(String(text ?? '').replace(/\r\n?/g, '\n')).trim()
+}
+
 /** 回答正文 → 完成屏的折行（按像素折，不切半个字；保留原句顺序）。 */
 export function doneLinesOf(text: string): string[] {
-  const clean = stripStatusMarks(String(text ?? '').replace(/\r\n?/g, '\n')).trim()
+  const clean = prepareDoneText(text)
   if (clean === '') return []
   const lines: string[] = []
   for (const sentence of splitReplySentences(clean)) {
@@ -96,6 +105,33 @@ export function doneLinesOf(text: string): string[] {
     }
   }
   return lines
+}
+
+/**
+ * 每一行正文在朗读文本里的字符区间 `[start, end)`（码点下标）。
+ *
+ * 这是「高亮严格跟随真实播放」的桥：宿主把每段 PCM 的 `charStart/charEnd` 一起下发，
+ * 页面按 AudioContext 里那段 PCM 的实际起止时间（`source.start(at)` + buffer 时长）
+ * 换算成当前字符位置，再落到对应的行——不再用固定 1.8 秒计时推进。
+ * 区间和 {@link doneLinesOf} 的行一一对应、互不重叠、随文本单调递增。
+ */
+export function doneLineRangesOf(text: string): Array<[number, number]> {
+  const clean = prepareDoneText(text)
+  if (clean === '') return []
+  const ranges: Array<[number, number]> = []
+  for (const sentence of splitReplySentences(clean)) {
+    // splitReplySentences 的下标是码点下标，从句子起点开始逐行累加（行文本已被 trim，
+    // 折行只会丢掉空白，因此累加长度就是下一行的起点）。
+    let cursor = sentence.start
+    for (const line of wrapTextPx(sentence.text, DONE_BODY_TEXT_WIDTH_PX, DONE_BODY_FONT_PX)) {
+      const trimmed = line.trim()
+      if (trimmed === '') continue
+      const length = [...trimmed].length
+      ranges.push([cursor, cursor + length])
+      cursor += length
+    }
+  }
+  return ranges
 }
 
 /**
@@ -153,6 +189,10 @@ export function doneFrame(input: {
     : ((input.bullets ?? []).join(' ').trim() !== '' ? (input.bullets ?? []).join('\n') : input.resultLine)
   const lines = doneLinesOf(body)
   const fallback = doneLinesOf(input.resultLine)
+  const shown = lines.length > 0 ? lines : fallback
+  // 行字符区间要和**下发给 TTS 的那段文本**同一坐标系：这里和折行都用 body 走同一份
+  // prepareDoneText，宿主朗读时也念这一份（见 lane 的 doneBodyTextOf）。
+  const ranges = lines.length > 0 ? doneLineRangesOf(body) : []
   const rawTitle = input.title === '' ? '任务完成' : input.title
   return {
     stage: '完成',
@@ -160,7 +200,11 @@ export function doneFrame(input: {
     // 屏幕上的 CSS 省略号只当兜底——宿主先裁，才不会出现「字被浏览器切一半」。
     title: fitLine(rawTitle, CONTENT_WIDTH_PX, DONE_TITLE_FONT_PX * TITLE_BOLD_FACTOR),
     bullets: fitScreenLines([stripStatusMarks(input.resultLine || '做完了')], SCREEN_SPEC.maxBodyLines),
-    done: { lines: lines.length > 0 ? lines : fallback, current: 0 },
+    done: {
+      lines: shown,
+      current: 0,
+      ...(ranges.length === shown.length ? { ranges } : {}),
+    },
     ...(input.others !== undefined && input.others > 0 ? { more: { count: input.others, text: `另有 ${input.others} 条` } } : {}),
     actions: [
       { id: 'stop', label: '停止' },

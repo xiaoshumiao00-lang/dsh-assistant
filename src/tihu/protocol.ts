@@ -184,6 +184,11 @@ export interface TtsAudioPayload {
   /** 本块文本在整段回复里的字符区间（用于正文滚动/高亮）。 */
   charStart?: number
   charEnd?: number
+  /**
+   * 这段音频念的是什么：`done` = 完成页正文朗读（页面据此把「青底行」对齐到真实播放）。
+   * 缺省 = 普通播报（一句话播报 / 试听），不推进完成页高亮。
+   */
+  read?: 'done'
   /** 是否为最后一块。 */
   final?: boolean
   /**
@@ -294,8 +299,10 @@ export interface ScreenFramePayload {
   /**
    * 完成屏正文（7 行窗口）：按像素折好的回答摘要行 ＋ 当前朗读行。
    * 状态行写「完成 · N/M」，大标题是任务/会话标题（不是回答第一句）。
+   * `ranges` 是每一行在朗读文本里的字符区间（码点下标，与 `tts.audio.charStart/charEnd`
+   * 同一坐标系）：页面据此把「正在播的那段 PCM」换算成行，高亮跟着真实播放走。
    */
-  done?: { lines: string[]; current?: number }
+  done?: { lines: string[]; current?: number; ranges?: number[][] }
   /** 这一帧属于哪条任务（屏上点按/答问句时用它回 task.reply）。 */
   taskId?: string
 }

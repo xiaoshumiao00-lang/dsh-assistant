@@ -104,6 +104,7 @@ import {
   doneFrame,
   folderBase,
   noticeFrame,
+  prepareDoneText,
   receiptFrame,
 } from './task-screens.ts'
 import { ensureAssistantHome } from '../assistant-home.ts'
@@ -407,8 +408,13 @@ interface TihuDevice {
   }
   send: (type: string, payload: unknown) => void
   close: () => void
-  /** 中止该设备当前这一轮朗读（换绑/断开时调用）：置 aborted，后续音频不再下发。 */
+  /** 中止该设备当前这一轮朗读（换绑/断开/停止/重读/P0 打断时调用）：后续音频不再下发。 */
   cancelRound?: () => void
+  /**
+   * 朗读轮次号：每次开始念/被打断都 +1。合成循环每发一块前对一次号，
+   * 号变了就立刻停手——「停止/重读」才能真正掐断正在下发的那一轮 PCM。
+   */
+  speakEpoch?: number
 }
 
 /**
@@ -687,6 +693,15 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const preroll = new TihuPreroll()
   /** 正在念播报的设备（避免一条播报被两台设备重复合成）。 */
   const announcing = new Set<string>()
+
+  /**
+   * 打断该设备当前这一轮朗读：轮次号 +1，合成循环每发一块前对号，号变即停。
+   * 「停止」之后不会再冒出新的 PCM（否则页面停了声音还在响、高亮却冻住，就是新的不同步）。
+   */
+  function cancelSpeaking(device: TihuDevice): void {
+    device.speakEpoch = (device.speakEpoch ?? 0) + 1
+    announcing.delete(device.id)
+  }
   /**
    * 会话 id → 本次 attempt 已经收到的思考文本（agent/assistant-stream 的
    * reasoning-delta 累积；start 重置、end 清空）。宿主 session/event 要等该步
@@ -1876,6 +1891,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       close() {
         try { socket.destroy() } catch { /* 忽略 */ }
       },
+      // 停止/重读/回主页/P0 打断都走这里：把轮次号 +1，正在下发的那一轮 PCM 立刻哑火。
+      cancelRound() { cancelSpeaking(device) },
     }
     devices.add(device)
 
@@ -2064,7 +2081,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
               : tasks.get(device.focusedTask)
             if (target !== undefined) {
               try { device.cancelRound?.() } catch { /* 忽略 */ }
-              void speakAnnouncement(device, doneReadingTextOf(target) || doneAnnouncementOf(target))
+              // 重读＝同一份正文再念一遍（页面清掉旧排程，从第一段重新对齐高亮）。
+              void speakAnnouncement(device, doneBodyTextOf(target), 'done')
                 .then((spokenMs) => { if (spokenMs > 0) armScreenHome(device, spokenMs + HOME_AFTER_SPEECH_MS, target.taskId, '完成') })
                 .catch((error) => log(`tihu replay speak failed: ${(error as Error)?.message ?? String(error)}`))
             }
@@ -3002,14 +3020,18 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 单句播报先查**预录缓存**（`~/.dsh/tihu/preroll/`）：同一句话第二次念不再合成，
    * 直接把裸 PCM 发下去——这是「完成 → 3 秒内听到」最省的一刀（设计 §11 P3）。
    */
-  async function speakAnnouncement(device: TihuDevice, text: string): Promise<number> {
+  async function speakAnnouncement(device: TihuDevice, text: string, purpose?: 'done'): Promise<number> {
     const key = device.sessionId ?? '__unbound__'
     const segments = splitSpeechSegments(text)
       .map((segment) => ({ ...segment, text: toSpeechText(segment.text) }))
       .filter((segment) => segment.text !== '')
     if (segments.length === 0) return -1
-    if (announcing.has(device.id)) return -1
+    // 一句话播报不打断正在进行的朗读；「重读/打开完成页」念的是正文，允许接管（旧的一轮靠
+    // epoch 立刻哑火），否则点了重读却因为 announcing 占着什么都不念。
+    if (purpose === undefined && announcing.has(device.id)) return -1
+    const epoch = (device.speakEpoch = (device.speakEpoch ?? 0) + 1)
     announcing.add(device.id)
+    const stale = (): boolean => device.speakEpoch !== epoch
     /** 本次下发的 PCM 总时长（毫秒）：页面按同一时间轴排程，用来算「读完」。 */
     let spokenMs = 0
     const cacheable = segments.length === 1
@@ -3025,6 +3047,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         text: segment.text,
         charStart: segment.start,
         charEnd: segment.end,
+        ...(purpose === undefined ? {} : { read: purpose }),
         ...(final ? { final: true } : {}),
       } satisfies TtsAudioPayload)
     }
@@ -3046,6 +3069,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         return 0
       }
       for (const segment of segments) {
+        // 上一块还没发完就可能被「停止/重读/P0 打断」抢走：号变了就立刻停手。
+        if (stale()) return spokenMs
         const startedAt = Date.now()
         const parts: Buffer[] = []
         const result = await tts.synthesize(segment.text, {
@@ -3054,6 +3079,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           edgeVoice: device.edgeVoice,
           offlineOnly: device.offlineOnly,
           onChunk: (chunk) => {
+            if (stale()) return
             if (cacheable) parts.push(chunk.data)
             spokenMs += chunk.data.length / 2 / 24000 * 1000
             device.send('tts.audio', {
@@ -3067,6 +3093,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
               text: segment.text,
               charStart: segment.start,
               charEnd: segment.end,
+              ...(purpose === undefined ? {} : { read: purpose }),
               ...(chunk.final ? { final: true } : {}),
             } satisfies TtsAudioPayload)
           },
@@ -3083,7 +3110,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       device.send('event.alert', { level: 'error', text: `播报没念出来：${(error as Error)?.message ?? String(error)}（任务结果已上屏）` })
       return spokenMs
     } finally {
-      announcing.delete(device.id)
+      // 只有自己还是当前那一轮才清标记：被重读接管时，新一轮已经把 announcing 重新占上了。
+      if (device.speakEpoch === epoch) announcing.delete(device.id)
     }
   }
 
@@ -3120,6 +3148,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return String(task.summary ?? '').trim()
   }
 
+  /**
+   * 完成页**朗读与折行共用**的一份正文：屏上的 7 行、每行的字符区间、下发给 TTS 的
+   * `charStart/charEnd` 全部基于它，高亮才能跟着真实播放走（少一个字都对不上）。
+   */
+  function doneBodyTextOf(task: TihuTask): string {
+    return prepareDoneText(doneReadingTextOf(task) || task.title)
+  }
+
   /** 同一批里其它已完成条数（「另有 N 条」）。 */
   function otherDoneCountOf(task: TihuTask, now = Date.now()): number {
     return tasks.list().filter((item) => item.taskId !== task.taskId
@@ -3129,7 +3165,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /** 完成页：任务名大标题 + 回答 7 行 + 停止/重读/主页。 */
   function doneScreenOf(task: TihuTask): ScreenFramePayload {
-    const body = doneReadingTextOf(task)
+    const body = doneBodyTextOf(task)
     const resultLine = String(task.resultLine ?? '').trim() || body || '做完了'
     return doneFrame({
       taskId: task.taskId,
@@ -3155,8 +3191,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     sendFrame(device, doneScreenOf(task), device.sessionId)
     armScreenHome(device, HOME_AFTER_SPEECH_MS, task.taskId, '完成')
     if (!speak) return
-    const text = doneReadingTextOf(task) || task.title
-    void speakAnnouncement(device, text)
+    // 念的就是屏上折行用的那一份正文：TTS 的 charStart/charEnd 才能和 done.ranges 对齐。
+    void speakAnnouncement(device, doneBodyTextOf(task), 'done')
       .then((spokenMs) => { if (spokenMs > 0) armScreenHome(device, spokenMs + HOME_AFTER_SPEECH_MS, task.taskId, '完成') })
       .catch((error) => log(`tihu done speak failed: ${(error as Error)?.message ?? String(error)}`))
   }
