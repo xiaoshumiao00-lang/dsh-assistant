@@ -11,7 +11,7 @@
  * 容量约束全部来自 screen-spec.ts：正文 4 行、每行约 18 字、标题 1 行、按钮行 32px。
  */
 import type { ScreenFramePayload, TaskBoardPayload } from './protocol.ts'
-import { CONTENT_WIDTH_PX, SCREEN_SPEC, clipScreenTitle, fitLine, fitScreenLines, wrapTextPx } from './screen-spec.ts'
+import { CONTENT_WIDTH_PX, DONE_TITLE_FONT_PX, SCREEN_SPEC, TITLE_BOLD_FACTOR, clipScreenTitle, fitLine, fitScreenLines, wrapTextPx } from './screen-spec.ts'
 import { splitReplySentences } from './reply.ts'
 import { capsuleOf, formatUsedMs, type TihuTask } from './task-ledger.ts'
 
@@ -70,9 +70,24 @@ export function receiptFrame(input: {
 export const DONE_BODY_FONT_PX = 15
 export const DONE_BODY_TEXT_WIDTH_PX = CONTENT_WIDTH_PX - 16
 
+/**
+ * 回答正文开头的「状态勾」不是屏上内容：模型常把 ✅/✓/✔/☑ 当结论标记写在第一句前面，
+ * 完成页上就成了青底行左边多一个勾形图标（2026-11-10 实机验收，参考图里没有）。
+ * 只剥**行首**的勾＋其后的空白，正文里的勾（表格、清单）原样保留。
+ */
+const LEADING_STATUS_MARK = /^[\s\uFEFF]*(?:[\u2705\u2713\u2714\u2611\u2717\u274c]\uFE0F?\s*)+/u
+
+/** 逐行剥掉行首的状态勾（完成页正文只留整行青底黑字）。 */
+export function stripStatusMarks(text: string): string {
+  return String(text ?? '')
+    .split('\n')
+    .map((line) => line.replace(LEADING_STATUS_MARK, ''))
+    .join('\n')
+}
+
 /** 回答正文 → 完成屏的折行（按像素折，不切半个字；保留原句顺序）。 */
 export function doneLinesOf(text: string): string[] {
-  const clean = String(text ?? '').replace(/\r\n?/g, '\n').trim()
+  const clean = stripStatusMarks(String(text ?? '').replace(/\r\n?/g, '\n')).trim()
   if (clean === '') return []
   const lines: string[] = []
   for (const sentence of splitReplySentences(clean)) {
@@ -138,10 +153,13 @@ export function doneFrame(input: {
     : ((input.bullets ?? []).join(' ').trim() !== '' ? (input.bullets ?? []).join('\n') : input.resultLine)
   const lines = doneLinesOf(body)
   const fallback = doneLinesOf(input.resultLine)
+  const rawTitle = input.title === '' ? '任务完成' : input.title
   return {
     stage: '完成',
-    title: clipScreenTitle(input.title === '' ? '任务完成' : input.title),
-    bullets: fitScreenLines([input.resultLine || '做完了'], SCREEN_SPEC.maxBodyLines),
+    // 大标题是 20px 加粗（比状态屏标题 18px 大）：按 20px×加粗系数量宽裁一次，
+    // 屏幕上的 CSS 省略号只当兜底——宿主先裁，才不会出现「字被浏览器切一半」。
+    title: fitLine(rawTitle, CONTENT_WIDTH_PX, DONE_TITLE_FONT_PX * TITLE_BOLD_FACTOR),
+    bullets: fitScreenLines([stripStatusMarks(input.resultLine || '做完了')], SCREEN_SPEC.maxBodyLines),
     done: { lines: lines.length > 0 ? lines : fallback, current: 0 },
     ...(input.others !== undefined && input.others > 0 ? { more: { count: input.others, text: `另有 ${input.others} 条` } } : {}),
     actions: [

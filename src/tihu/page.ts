@@ -12,7 +12,7 @@
  *
  * TTS 只播放宿主下发的 PCM（edge 云健 / Qwen GPU）；页面不再使用浏览器语音。
  */
-import { ACTUAL_SIZE_SCALE, SCREEN_SPEC } from './screen-spec.ts'
+import { ACTUAL_SIZE_SCALE, DONE_TITLE_FONT_PX, DONE_TITLE_LINE_HEIGHT_PX, SCREEN_SPEC } from './screen-spec.ts'
 import { condition as conditionVoicePcm, trimSilence as trimVoiceSilence } from '../client/pocket/orb/voice.ts'
 export function tihuPageHtml(options: { lanePath: string; protocol: string }): string {
   const lane = JSON.stringify(options.lanePath)
@@ -174,9 +174,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-empty .l1 { font-size:17px; font-weight:700; line-height:20px; }
   #screen .board-empty .l2 { font-size:12px; line-height:16px; color:#9fb0c0; }
   #screen .board-empty .l3 { font-size:12px; line-height:16px; color:#6f7d8b; }
-  /* ── 完成页（参考图）：顶栏 20 + 标题 24 + 正文 7×20 + 三键 30，合计 222 ──
+  /* ── 完成页（参考图）：顶栏 20 + 标题 22 + 正文 7×20 + 三键 30，合计 218 ──
      顶栏：左「完成」（青、不加粗）／中波形（7 根竖条）／右「另有 N 条」（灰）／最右 ▶（青）。
-     正文：15px/20px，当前朗读行整行铺青底、黑字加粗，左右各留 8px。 */
+     正文：15px/20px，当前朗读行整行铺青底、黑字加粗，左右各留 8px，行首不留任何图标。
+     大标题 2026-11-10 用户要求减 2 号（22px → 20px，行高 24 → 22），其余版式不动。 */
   #screen .done-view { display:none; flex:1; min-height:0; overflow:hidden; flex-direction:column; gap:2px; }
   #screen.done-mode .done-view { display:flex; }
   #screen.done-mode .home-top, #screen.done-mode .stage, #screen.done-mode .title,
@@ -192,9 +193,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   @keyframes doneBarWave { 0%,100% { transform:scaleY(.55); } 50% { transform:scaleY(1); } }
   #screen .done-more { margin-left:auto; flex:none; font-size:11px; line-height:20px; color:#8b98a5; white-space:nowrap; }
   #screen .done-play { flex:none; font-size:10px; line-height:20px; color:#5FD2C8; margin-left:6px; }
-  #screen .done-title { flex:none; height:24px; font-size:22px; font-weight:700; line-height:24px; color:#ffffff;
+  #screen .done-title { flex:none; height:${DONE_TITLE_LINE_HEIGHT_PX}px; font-size:${DONE_TITLE_FONT_PX}px; font-weight:700;
+    line-height:${DONE_TITLE_LINE_HEIGHT_PX}px; color:#ffffff;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #screen .done-body { flex:1; min-height:0; overflow:hidden; }
+  /* 正文块在「标题下～按钮上」里垂直居中：两行回答不再全挤在顶部、底下空一大片
+     （2026-11-10 用户要求，像手机通知那样紧凑）；满 7 行时 140px 正好铺满，居中不起作用。 */
+  #screen .done-body { flex:1; min-height:0; overflow:hidden; display:flex; flex-direction:column; justify-content:center; }
   #screen .done-line { height:20px; line-height:20px; box-sizing:border-box; padding:0 8px; font-size:15px; color:#e8edf2;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen .done-line.cur { background:#5FD2C8; color:#04110f; font-weight:700; border-radius:4px; }

@@ -52,7 +52,7 @@ import {
   noticeFrame,
   receiptFrame,
 } from '../src/tihu/task-screens.ts'
-import { CONTENT_WIDTH_PX, fitScreenLines, measureTextPx, SCREEN_SPEC } from '../src/tihu/screen-spec.ts'
+import { DONE_TITLE_FONT_PX, CONTENT_WIDTH_PX, fitScreenLines, measureTextPx, SCREEN_SPEC } from '../src/tihu/screen-spec.ts'
 
 let passed = 0
 function test(name, fn) {
@@ -586,6 +586,40 @@ test('完成页（屏 6）：大标题＝任务名，正文 7 行，另有 N 条
   const multi = doneFrame({ taskId: 't7', title: '设备联调', resultLine: '联调通过', replyText: '联调通过。', others: 2 })
   assert.deepEqual(multi.more, { count: 2, text: '另有 2 条' })
   assert.ok(multi.actions.some((item) => item.id === 'taskBoard'))
+})
+
+test('完成页正文：行首状态勾（✅/✓）要剥掉，只留整行青底黑字', () => {
+  const frame = doneFrame({
+    taskId: 't8',
+    title: '现在几点了',
+    resultLine: '✅ 现在是 2026 年 11 月 10 日上午 9 点 31 分',
+    replyText: '✅ 现在是 2026 年 11 月 10 日（星期一）上午 9 点 31 分。',
+  })
+  assert.ok(frame.done.lines.length > 0)
+  assert.equal(frame.done.lines[0].startsWith('✅'), false, '青底行前面不许留勾：' + frame.done.lines[0])
+  assert.equal(frame.done.lines[0].startsWith('现在是'), true, '正文从「现在是」开始：' + frame.done.lines[0])
+  assert.equal(frame.done.lines.some((line) => /^[\s✅✓✔☑]/.test(line)), false, '每一行行首都不带勾')
+  // 结果行（完成屏隐藏的 bullets）也一起剥，避免换屏时又冒出来。
+  assert.equal(frame.bullets[0].startsWith('✅'), false)
+
+  // 只剥行首：正文中间的勾（清单/表格）原样保留。
+  const inline = doneFrame({ taskId: 't9', title: '清单', resultLine: '三项都通过 ✓', replyText: '三项都通过 ✓ 并已归档。' })
+  assert.ok(inline.done.lines[0].includes('✓'), '正文中间的勾不动：' + inline.done.lines[0])
+})
+
+test('完成页大标题：20px 加粗仍单行省略，不换行不溢出', () => {
+  const longTitle = '这个任务标题长得离谱以至于一行根本放不下必须省略号收住才行再长一点'
+  const frame = doneFrame({ taskId: 't10', title: longTitle, resultLine: '好了', replyText: '好了。' })
+  assert.ok(frame.title.endsWith('…'), '超长标题要省略：' + frame.title)
+  assert.ok(measureTextPx(frame.title, DONE_TITLE_FONT_PX * 1.06) <= CONTENT_WIDTH_PX, '标题宽度不超 304：' + frame.title)
+  assert.equal(frame.title.includes('\n'), false, '标题永远一行')
+})
+
+test('完成页：两行正文也放得下（正文块垂直居中，不再全挤顶部）', () => {
+  const frame = doneFrame({ taskId: 't11', title: '今天几号', resultLine: '十一月十日', replyText: '今天是十一月十日。明天是十一日。' })
+  assert.ok(frame.done.lines.length >= 1)
+  const lineHeight = 20
+  assert.ok(frame.done.lines.length * lineHeight <= 7 * lineHeight, '正文行数不超 7 行窗口')
 })
 
 test('歧义追问（屏 7）：两个候选 + 「都不是」，序号用数字', () => {

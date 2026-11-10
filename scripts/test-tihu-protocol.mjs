@@ -39,8 +39,9 @@ import {
   takeSnapshot,
   targetPathOf,
 } from '../src/tihu/guard.ts'
-import { createTihuRuntime, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH, TIHU_LANE_LOG_MAX_BYTES, appendTihuLaneLog, screenReasonOf, tihuLaneLogPath } from '../src/tihu/lane.ts'
+import { createTihuRuntime, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH, TIHU_LANE_LOG_MAX_BYTES, appendTihuLaneLog, screenReasonOf, tihuLaneLogPath, tihuReceiptHoldMs } from '../src/tihu/lane.ts'
 import { BOARD_PAGE_SIZE } from '../src/tihu/task-ledger.ts'
+import { RECEIPT_SECONDS } from '../src/tihu/task-screens.ts'
 import { TIHU_CONTROL_SECTION_TEXT, createTihuControlRunner, matchSessionRows, tihuActionNames } from '../src/tihu/control.ts'
 import {
   activityEntryOf,
@@ -2815,6 +2816,87 @@ await testAsync('统一指挥：回执/追问期间「回棋盘」可清掉旧�
 })
 
 
+test('回执停留时长默认 5 秒（TIHU_RECEIPT_MS 只给测试调小）', () => {
+  delete process.env.TIHU_RECEIPT_MS
+  assert.equal(RECEIPT_SECONDS, 5)
+  assert.equal(tihuReceiptHoldMs(), 5000, '默认 5 秒')
+  process.env.TIHU_RECEIPT_MS = '200'
+  assert.equal(tihuReceiptHoldMs(), 200)
+  delete process.env.TIHU_RECEIPT_MS
+})
+
+await testAsync('统一指挥：回执 5 秒后任务仍在跑 → 自动切那条任务的进度页（不回棋盘）', async () => {
+  process.env.TIHU_RECEIPT_MS = '200'
+  const w = unifiedWorkspace()
+  try {
+    const socket = openLane(w.runtime)
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-receipt-run', protocol: '0' }, 1)))
+    await waitMs(50)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+    await waitMs(90)
+    assert.ok(framesOf(socket).some((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单'), '先出回执屏')
+    // 任务真的开跑：turn/start → 登记簿 running
+    emit({ id: w.prompted[0].id }, { type: 'turn/start', data: { turn: 1 } })
+    await waitMs(420)
+    const last = framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()
+    assert.equal(last.payload.stage, '进度', '回执到点要切进度页，不是棋盘：' + JSON.stringify(last.payload.stage))
+    assert.equal(last.payload.board, undefined, '不许回棋盘')
+    assert.ok(last.payload.actions.some((item) => item.id === 'taskStop'), '进度页带停止/主页')
+    assert.equal(last.payload.taskId, 't1', '进度页看的是刚派的那条任务')
+  } finally {
+    delete process.env.TIHU_RECEIPT_MS
+    w.cleanup()
+  }
+})
+
+await testAsync('统一指挥：回执 5 秒后任务已完 → 切完成页（回执期间挡住的完成帧补回来）', async () => {
+  process.env.TIHU_RECEIPT_MS = '200'
+  const w = unifiedWorkspace()
+  try {
+    const socket = openLane(w.runtime)
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-receipt-done', protocol: '0' }, 1)))
+    await waitMs(50)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+    await waitMs(90)
+    const taskSession = w.prompted[0].id
+    emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
+    emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '✅ 现在是十七点三十一分。' }] } } })
+    emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(420)
+    const done = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').pop()
+    assert.ok(done !== undefined, '任务已完 → 完成页')
+    assert.equal(done.payload.title, '现在几点了')
+    assert.ok(Array.isArray(done.payload.done?.lines) && done.payload.done.lines.length > 0, '完成页要带回答正文')
+    assert.equal(done.payload.done.lines[0].startsWith('✅'), false, '完成页正文行首不带勾：' + done.payload.done.lines[0])
+    assert.equal(framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop().payload.stage, '完成', '最后停在完成页')
+  } finally {
+    delete process.env.TIHU_RECEIPT_MS
+    w.cleanup()
+  }
+})
+
+await testAsync('统一指挥：回执 5 秒后任务仍排队 → 回棋盘', async () => {
+  process.env.TIHU_RECEIPT_MS = '200'
+  const w = unifiedWorkspace()
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-receipt-queued', protocol: '0' }, 1)))
+    await waitMs(50)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+    await waitMs(90)
+    await waitMs(420)
+    const last = framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()
+    assert.ok(last.payload.board !== undefined, '排队中就到点回棋盘：' + JSON.stringify(last.payload.stage))
+    assert.equal(last.payload.mode, 'home')
+    assert.equal(last.payload.board.rows.length, 1, '棋盘上能看到这条排队任务')
+  } finally {
+    delete process.env.TIHU_RECEIPT_MS
+    w.cleanup()
+  }
+})
+
 await testAsync('统一指挥：两个卡名都点到 → 追问屏（只问一次），答「一」才派', async () => {
   const w = unifiedWorkspace({
     cards: [
@@ -3314,12 +3396,24 @@ test('page：完成页三键可见（has-actions 有 display:flex 规则）＋ 7
   const html = pageHtmlOf()
   assert.ok(/#screen\.has-actions \.action-bar \{ display:flex; \}/.test(html), '有按钮时动作条必须显示（缺这条 → 完成页三键消失）')
   assert.ok(/#screen\.done-mode \.action-bar \{ display:flex; flex:none; height:30px/.test(html), '完成页三键高 30px')
-  assert.ok(/#screen \.done-title \{[^}]*font-size:22px/.test(html), '任务名大标题 22px')
+  // 2026-11-10 用户要求：大标题 22px 太大，减 2 号（20px / 行高 22），其余版式不动。
+  assert.ok(/#screen \.done-title \{[^}]*font-size:20px/.test(html), '任务名大标题 20px（比原 22px 小 2 号）')
+  assert.ok(/#screen \.done-title \{[^}]*height:22px/.test(html), '大标题块高 22px（行高一起收）')
+  assert.ok(/#screen \.done-title \{[^}]*line-height:22px/.test(html), '大标题行高 22px')
+  assert.ok(/#screen \.done-title \{[^}]*white-space:nowrap/.test(html) && /#screen \.done-title \{[^}]*text-overflow:ellipsis/.test(html),
+    '大标题仍单行省略（不许换行/溢出）')
+  const doneTitleRule = /#screen \.done-title \{[^}]*\}/.exec(html)?.[0] ?? ''
+  assert.equal(/font-size:22px/.test(doneTitleRule), false, '大标题不许还留 22px：' + doneTitleRule)
   assert.ok(/#screen \.done-line\.cur \{ background:#5FD2C8/.test(html), '当前朗读行青底反白')
+  // 两行正文不再全挤在顶部：正文块在「标题下～按钮上」之间垂直居中。
+  assert.ok(/#screen \.done-body \{[^}]*display:flex/.test(html) && /#screen \.done-body \{[^}]*justify-content:center/.test(html),
+    '完成页正文块要垂直居中（行数少时上下匀开）')
   const used = DONE_LAYOUT.stageHeightPx + DONE_LAYOUT.titleHeightPx + DONE_LAYOUT.bodyHeightPx
     + DONE_LAYOUT.actionBarHeightPx + DONE_LAYOUT.columnGapPx * 3
   assert.ok(used <= 240 - 2 * 8 - 2, `完成页总高 ${used}px 不得超过 222px`)
   assert.equal(DONE_LAYOUT.visibleLines, 7)
+  assert.equal(DONE_LAYOUT.titleFontPx, 20, '版式预算里的标题字号与 CSS 一致')
+  assert.ok(DONE_LAYOUT.titleHeightPx >= DONE_LAYOUT.titleLineHeightPx, '标题块高不得小于行高（否则字形被裁）')
 })
 
 await testAsync('统一指挥：点已完成卡片 → 立刻进完成页（三键，不派单）', async () => {

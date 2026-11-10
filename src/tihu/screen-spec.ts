@@ -49,15 +49,28 @@ export const SCREEN_SPEC = {
 } as const
 
 /**
+ * 完成页大标题字号（2026-11-10 用户要求：参考图那一行太大，减 2 号）。
+ * 20px 仍单行：`doneFrame` 按 20px×加粗系数裁到 304px，CSS 再兜一层省略号，绝不换行。
+ */
+export const DONE_TITLE_FONT_PX = 20
+/** 完成页大标题行高（字号 20 → 行高 22，与块高一致，上下不飘）。 */
+export const DONE_TITLE_LINE_HEIGHT_PX = 22
+
+/**
  * 完成屏垂直预算（320×240，四边 8px）：
  *
  *   内容高 222 = 240 − 2×1 边框 − 2×8 内边距
  *   顶行 14 + 间隙 4 + 大标题 22 + 间隙 4 + 正文 7×20=140 + 间隙 4 + 按钮行 32 = 220
  *   → 余 2px，三键（停止/重读/主页）稳稳放得下，正文 7 行不被裁。
+ *
+ * 大标题字号从 22 收到 20（行高 24 → 22）后，正文区反而多出 2px：两行回答在
+ * 「标题下～按钮上」之间垂直居中，满 7 行时正好铺满。
  */
 export const DONE_LAYOUT = {
   stageHeightPx: 14,
   titleHeightPx: 22,
+  titleFontPx: DONE_TITLE_FONT_PX,
+  titleLineHeightPx: DONE_TITLE_LINE_HEIGHT_PX,
   visibleLines: 7,
   lineHeightPx: 20,
   bodyHeightPx: 140,
