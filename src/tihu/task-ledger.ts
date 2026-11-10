@@ -30,7 +30,7 @@ export const ANNOUNCE_WINDOW_MS = 8_000
 /** 只有一条时也等这么久再念：留给同一秒内到达的其它完成，凑成一句。 */
 export const ANNOUNCE_SINGLE_DELAY_MS = 400
 /** 棋盘每页行数（与屏幕 320×240 的可读行数一致）。 */
-export const BOARD_PAGE_SIZE = 5
+export const BOARD_PAGE_SIZE = 4
 /** 登记簿内存上限：棋盘只显示最近这些，更早的直接归档。 */
 export const LEDGER_MAX_TASKS = 60
 /** 完成/已播报态在棋盘上留多久后自动归档（毫秒）：用户要求至少 3 天，不能更早。 */
@@ -79,6 +79,8 @@ export interface TihuTask {
   finishedAt?: number
   /** 完成时的一行结果摘要（不是正文）。 */
   resultLine?: string
+  /** 完成时的回答正文（完成页 7 行正文用；没存就退回 resultLine/summary）。 */
+  doneText?: string
   /** 任务行摘要（里程碑更新它）。 */
   summary: string
   /** 已播报时刻（防止重复念）。 */
