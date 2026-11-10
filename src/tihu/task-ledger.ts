@@ -527,6 +527,21 @@ export class TaskLedger {
     return changed
   }
 
+  /**
+   * 新一轮开始：步数从 0 重新数。
+   *
+   * 用户 2026-11-10 实机：进度页上「第 20 步 · 已用 3m28s」把上一轮的步数也累加进来——
+   * 已用已经按本轮 turn/start 算了，步数也必须同口径（否则新一轮一开屏就显示第 20 步）。
+   */
+  resetStep(taskId: string, now = Date.now()): void {
+    const task = this.tasks.get(taskId)
+    if (task === undefined) return
+    task.step = 0
+    task.lastStepAt = undefined
+    task.stepDurations = undefined
+    task.updatedAt = now
+  }
+
   /** 步数推进（tool/call）：只增不减；顺手记最近 8 步耗时给棋盘微条。 */
   noteStep(taskId: string, step: number, now = Date.now()): void {
     const task = this.tasks.get(taskId)

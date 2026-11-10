@@ -4068,6 +4068,169 @@ await testAsync('统一指挥：电脑端镜像任务的进度页——步数跟
   w.cleanup()
 })
 
+/* ---------- 2026-11-10 实机回归：回合结束后屏还挂着旧「进度」页 ----------
+ *
+ * 实机：电脑端那条 CU 会话（ESP32 语音助手「起点版」）已经回复完、turn/end 都到了，
+ * 屏却自己跳到它的「进度」页（第 20 步 · 已用 3m28s / 156 tok/s），用户回棋盘又被拉回去。
+ * 根因：轮询把「15 秒内有活动」当成在跑，turn/end 之后又把已完成的任务 syncExternal 回
+ * running（顺带清掉 finishedAt、把起跑时刻挪走）；设备重连（hello）再按这个旧状态自动跟随。
+ * 这一组钉住：turn/end 之后不抖回执行中、不自动跳屏、已用不跨回合累计、进度页收到 turn/end
+ * 会离开、静置超时回棋盘。
+ */
+
+await testAsync('电脑端 CU 会话：turn/end 后重连/轮询不许抖回执行中、不许自动跳回进度页', async () => {
+  const now = Date.now()
+  const sessionId = 'session-pc-ended'
+  const w = unifiedWorkspace({
+    records: [cuRecord(sessionId, { live: true, preset: 'computer-use', cwd: '/work/ESP32', createdAt: now - 600_000, lastPromptAt: now - 208_000, title: 'ESP32 语音助手起点版' })],
+  })
+  try {
+    const socket = openLane(w.runtime)
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pc-ended', protocol: '0' }, 1)))
+    await waitMs(150)
+    // 这一轮真的开始跑了：只有 turn/start 才允许自动跳进度页。
+    emit({ id: sessionId }, { type: 'turn/start', data: { turn: 1 } })
+    emit({ id: sessionId }, { type: 'tool/call', data: { step: 20, name: 'click', arguments: '{"position":{"x":10,"y":20}}' } })
+    await waitMs(1100)
+    let frame = framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.stage === '进度').pop()
+    assert.ok(frame !== undefined, 'turn/start 该自动进进度页')
+    const usedBefore = Number((String(frame.payload.bullets[1]).match(/已用 (\d+)s/) ?? [0, 0])[1])
+    assert.ok(usedBefore < 60, '已用按本轮 turn/start 算，不是列表里 3m28s 的旧起点：' + frame.payload.bullets[1])
+    emit({ id: sessionId }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '做完了' }] } } })
+    emit({ id: sessionId }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(250)
+    assert.ok(framesOf(socket).some((item) => item.type === 'screen.frame' && item.payload.stage === '完成'), 'turn/end 要进完成页')
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 2)))
+    await waitMs(120)
+    const cut = framesOf(socket).length
+    // 设备重连（同一台再发一次 hello）＝ 实机「回棋盘后又被拉回去」的触发点。
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pc-ended', protocol: '0' }, 3)))
+    await waitMs(420)
+    const after = framesOf(socket).slice(cut)
+    assert.equal(after.some((item) => item.type === 'screen.frame' && item.payload.stage === '进度'), false,
+      '已结束的会话不许再被同步/重连拉回进度页：' + JSON.stringify(after.filter((item) => item.type === 'screen.frame').map((item) => item.payload.stage)))
+    const board = after.filter((item) => item.type === 'task.list').pop()
+    assert.ok(board !== undefined, '重连后应重新下发棋盘')
+    const row = board.payload.board.rows.find((item) => item.taskId === 'p1')
+    assert.equal(row.state, 'done', '回合结束后不许被轮询抖回执行中：' + JSON.stringify(board.payload.board.rows))
+    // 真的开始新一轮才允许跳进度页，且「已用」「步数」都从这一轮重新起算。
+    emit({ id: sessionId }, { type: 'turn/start', data: { turn: 2 } })
+    await waitMs(140)
+    const fresh = framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.stage === '进度').pop()
+    assert.ok(fresh !== undefined, 'turn/start 才允许跳进度页')
+    const usedFresh = Number((String(fresh.payload.bullets[1]).match(/已用 (\d+)s/) ?? [0, 0])[1])
+    assert.ok(usedFresh < 5, '新一轮的「已用」从这一轮开始，不跨回合累计：' + fresh.payload.bullets[1])
+    assert.equal(String(fresh.payload.bullets[1]).startsWith('第 20 步'), false, '上一轮的步数不许带进新一轮：' + fresh.payload.bullets[1])
+  } finally {
+    w.cleanup()
+  }
+})
+
+await testAsync('进度页收到 turn/end：派单任务 → 完成页，不再继续显示旧进度', async () => {
+  process.env.TIHU_RECEIPT_MS = '50'
+  const w = unifiedWorkspace()
+  try {
+    const socket = openLane(w.runtime)
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-progress-end', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
+    // 派单是异步的：等会话真的建出来（最多 2 秒），再让这一轮开跑。
+    for (let i = 0; i < 40 && w.prompted.length === 0; i += 1) await waitMs(50)
+    assert.ok(w.prompted.length > 0, '派单要先建出任务会话')
+    const taskSession = w.prompted[0].id
+    emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
+    emit({ id: taskSession }, { type: 'tool/call', data: { step: 3, name: 'click', arguments: '{"position":{"x":10,"y":20}}' } })
+    await waitMs(120)
+    // 点开这条任务＝实机那一屏进度页。
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 60, hit: 'task', taskId: 't1' }, 3)))
+    await waitMs(120)
+    let screens = framesOf(socket).filter((item) => item.type === 'screen.frame' && /^(进度|完成)$/.test(String(item.payload.stage)))
+    assert.equal(screens.pop().payload.stage, '进度', '先停在进度页')
+    const cut = framesOf(socket).length
+    emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(260)
+    const after = framesOf(socket).slice(cut).filter((item) => item.type === 'screen.frame')
+    assert.equal(after.some((item) => item.payload.stage === '进度'), false, 'turn/end 之后不许再刷旧进度：' + JSON.stringify(after.map((item) => item.payload.stage)))
+    assert.equal(after.pop().payload.stage, '完成', '进度页收到 turn/end 要换完成页')
+  } finally {
+    delete process.env.TIHU_RECEIPT_MS
+    w.cleanup()
+  }
+})
+
+await testAsync('电脑端 CU：turn/end 时子代理还在跑 → 立刻离开进度页；再看时标「已结束」、已用不再增长', async () => {
+  let children = []
+  const agents = { list: () => children, get: () => undefined }
+  const now = Date.now()
+  const sessionId = 'session-pc-held'
+  const w = unifiedWorkspace({
+    agents,
+    records: [cuRecord(sessionId, { live: true, preset: 'computer-use', cwd: '/work/ESP32', createdAt: now - 600_000, lastPromptAt: now - 2000, title: 'ESP32 语音助手起点版' })],
+  })
+  try {
+    const socket = openLane(w.runtime)
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pc-held', protocol: '0' }, 1)))
+    await waitMs(150)
+    children = [{
+      id: 'session-child-held',
+      status: 'running',
+      session: { header: { id: 'session-child-held', parentSession: sessionId, origin: 'subagent', delegationDepth: 1 } },
+    }]
+    emit({ id: sessionId }, { type: 'turn/start', data: { turn: 1 } })
+    await waitMs(150)
+    assert.ok(framesOf(socket).some((item) => item.type === 'screen.frame' && item.payload.stage === '进度'), 'turn/start 先进进度页')
+    emit({ id: sessionId }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(260)
+    const screens = framesOf(socket).filter((item) => item.type === 'screen.frame')
+    assert.equal(screens.some((item) => item.payload.stage === '完成'), false, '子代理在跑：不许假完成')
+    assert.ok(screens.slice(-3).some((item) => item.payload.board !== undefined), 'turn/end 到了就离开进度页（回棋盘），不能继续挂旧进度')
+    // 用户再看这条（还在跑）：屏上标「已结束」，不再显示会一直涨的「已用」。
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 60, hit: 'task', taskId: 'p1' }, 2)))
+    await waitMs(120)
+    const detail = framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.stage === '进度').pop()
+    assert.ok(detail !== undefined, '再点开还是进度页（任务仍在跑）')
+    assert.ok(String(detail.payload.bullets[1]).includes('已结束'), '回合结束后要标「已结束」：' + detail.payload.bullets[1])
+    assert.equal(String(detail.payload.bullets[1]).includes('已用'), false, '回合结束后不再显示会增长的「已用」：' + detail.payload.bullets[1])
+    await waitMs(1200)
+    const later = framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.stage === '进度').pop()
+    assert.equal(String(later.payload.bullets[1]).includes('已用'), false, '回合结束后「已用」不许再增长：' + later.payload.bullets[1])
+    assert.equal(later.payload.bullets[1], detail.payload.bullets[1], '已结束的那一行逐帧不变（不随时间走）')
+  } finally {
+    w.cleanup()
+  }
+})
+
+await testAsync('进度页看门狗：30 秒没有新帧（测试调成 1 秒）自动回棋盘，不无限挂着', async () => {
+  process.env.TIHU_PROGRESS_STALE_MS = '1000'
+  const now = Date.now()
+  const w = unifiedWorkspace({
+    records: [cuRecord('session-pc-watchdog', { live: true, preset: 'computer-use', cwd: '/work/ESP32', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '看门狗' })],
+  })
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pc-watchdog', protocol: '0' }, 1)))
+    await waitMs(150)
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 60, hit: 'task', taskId: 'p1' }, 2)))
+    await waitMs(120)
+    assert.ok(framesOf(socket).some((item) => item.type === 'screen.frame' && item.payload.stage === '进度'), '先停在进度页')
+    await waitMs(1400)
+    assert.ok(framesOf(socket).some((item) => item.type === 'screen.frame' && item.payload.board !== undefined), '静置超时 → 回棋盘')
+    // 回棋盘后轮询/重连不许再把人拉回旧进度页。
+    const cut = framesOf(socket).length
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pc-watchdog', protocol: '0' }, 3)))
+    await waitMs(320)
+    const after = framesOf(socket).slice(cut)
+    assert.equal(after.some((item) => item.type === 'screen.frame' && item.payload.stage === '进度'), false,
+      '看门狗回棋盘后不许再自动跳回进度页')
+  } finally {
+    delete process.env.TIHU_PROGRESS_STALE_MS
+    w.cleanup()
+  }
+})
+
 await testAsync('统一指挥：棋盘每页 4 条 + 翻页（第 N/M 页、上一页/下一页、到头钳住）', async () => {
   // 同项目同状态的卡片会折叠成一行（那是登记簿本来的折叠规则），所以这里用 6 张不同的卡，
   // 每条任务落在不同 projectId 上，才能真正产生 2 页。

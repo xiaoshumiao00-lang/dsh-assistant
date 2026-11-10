@@ -691,6 +691,23 @@ test('任务详情（屏 4）：大标题是任务名，正文只留最新状态
   assert.deepEqual(frame.actions.map((item) => item.label), ['停止', '主页'])
 })
 
+test('任务详情（屏 4）：回合结束后改「第 N 步 · 已结束」，不再显示会增长的「已用」', () => {
+  const frame = detailFrame({
+    taskId: 't4c',
+    title: 'ESP32 语音助手起点版',
+    liveLine: '',
+    step: 20,
+    elapsedMs: 208_000,
+    statsLine: '156 tok/s · 12.3k tok · 上下文 41%',
+    ended: true,
+  })
+  assert.equal(frame.stage, '进度')
+  assert.equal(frame.bullets[1], '第 20 步 · 已结束')
+  assert.equal(frame.bullets.join(' ').includes('已用'), false, '已结束的进度页不许再显示「已用」')
+  assert.ok(frame.bullets[0].includes('已结束'), '最新状态行也标结束：' + frame.bullets[0])
+  assert.equal(frame.tone, 'ok')
+})
+
 test('任务详情：超长任务名一行省略（不折行挤掉正文）', () => {
   const frame = detailFrame({
     taskId: 't4b',
