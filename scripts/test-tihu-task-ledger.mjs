@@ -280,7 +280,8 @@ test('子代理还在跑：任务保持执行中并带子任务计数；全部�
   assert.equal(task.state, 'running', '子任务在跑 ⇒ 不算完成')
   assert.equal(isFinishedState(task.state), false)
   const row = boardOf(ledger.list(), 3000).rows[0]
-  assert.equal(row.subagents, 2, '棋盘行带子任务数（页面画旋转短弧）')
+  assert.equal(row.subagents, 2, '棋盘行带子任务数（页面画蓝色呼吸点）')
+  assert.equal(row.blink, true, '子任务在跑 ⇒ blink=true')
   assert.equal(row.capsule, '执行中')
   assert.equal(row.state, 'running')
 
@@ -288,7 +289,8 @@ test('子代理还在跑：任务保持执行中并带子任务计数；全部�
   ledger.complete(task.taskId, { resultLine: '主回合结论', now: 4500 })
   const doneRow = boardOf(ledger.list(), 5000).rows[0]
   assert.equal(doneRow.state, 'done')
-  assert.equal(doneRow.subagents, undefined, '子任务清零后不再画旋转弧')
+  assert.equal(doneRow.subagents, undefined, '子任务清零后不再画呼吸点')
+  assert.equal(doneRow.blink, undefined, '子任务清零后 blink 消失（绿色实心圆）')
   assert.equal(task.holdingForChildren, undefined)
 })
 

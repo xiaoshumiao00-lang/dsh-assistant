@@ -389,8 +389,13 @@ export interface TaskBoardRow {
   ring: { percent: number; tone: 'normal' | 'warn' | 'done' | 'empty' }
   /** 待决策行的琥珀问号徽标。 */
   badge?: 'ask'
-  /** 子代理还在跑的数量（>0 时状态图形外侧加一圈缓慢旋转的短弧；不写文字）。 */
+  /**
+   * 子代理还在跑的数量（>0 时右侧状态图标换成蓝色呼吸点，不写字、不位移）。
+   * 兼容旧固件：仍按数量下发，`blink` 是同一事实的显式开关。
+   */
   subagents?: number
+  /** 右侧状态图标是否蓝色呼吸闪烁（执行中且还有后台子代理在跑；子代理全停即消失）。 */
+  blink?: boolean
   /** 最近 8 步耗时（毫秒）：棋盘微条，只做节奏感，不参与状态。 */
   micro?: number[]
 }

@@ -534,6 +534,7 @@ function fakeCtx(overrides = {}) {
       if (id === 'sessionQuery') return overrides.sessionQuery
       if (id === 'sessionProjections') return overrides.sessionProjections
       if (id === 'sessionProjectionCache') return overrides.sessionProjectionCache
+      if (id === 'codeAgentRegistry') return overrides.codeAgentRegistry
       if (id === 'workspaceRegistry') return overrides.workspaceRegistry
       return undefined
     },
@@ -4335,11 +4336,14 @@ await testAsync('子代理：主回合结束但后台子任务还在跑 → 不�
     session: { header: { id: childId, parentSession: taskSession, origin: 'subagent', delegationDepth: 1 } },
   }]
 
-  // 屏上不写「子任务 N 个在跑」：只有一圈缓慢旋转的短弧（同 14px 图形，不挤标题/副行）。
+  // 屏上不写「子任务 N 个在跑」：右侧状态图标换成蓝色呼吸点（只改透明度，不位移）。
   const pageHtml = w.runtime.page()
-  assert.ok(pageHtml.includes('board-orbit'), '状态图形要有旋转弧标记')
-  assert.ok(pageHtml.includes('@keyframes boardOrbit'), '旋转弧要有动画')
-  assert.ok(pageHtml.includes('animation:boardOrbit 7s linear infinite'), '动效要慢（7 秒一圈）')
+  assert.ok(pageHtml.includes('@keyframes boardBreath'), '子代理在跑要有呼吸动画')
+  assert.ok(pageHtml.includes('animation:boardBreath 1.2s ease-in-out infinite'), '1.2 秒一个周期、缓入缓出')
+  const breathStart = pageHtml.indexOf('@keyframes boardBreath')
+  const breathBody = pageHtml.slice(breathStart, pageHtml.indexOf('}', breathStart) + 1)
+  assert.equal(/transform|translate|top:|left:|margin/.test(breathBody), false, '呼吸动画只改透明度：不抖动、不位移')
+  assert.equal(pageHtml.includes('boardOrbit'), false, '旧的旋转短弧已删')
   assert.equal(pageHtml.includes('board-merged'), false, '「+N 条」的样式彻底删掉')
 
   emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
@@ -4352,7 +4356,8 @@ await testAsync('子代理：主回合结束但后台子任务还在跑 → 不�
   assert.equal(frames.some((frame) => frame.type === 'task.notify' && frame.payload.level === 1), false, '子任务在跑：不许播报完成')
   let board = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop().payload.board
   assert.equal(board.rows[0].state, 'running', '主回合结束但子代理在跑 ⇒ 仍然是执行中')
-  assert.equal(board.rows[0].subagents, 1, '棋盘行带子任务数（页面据此画旋转短弧，不写字）')
+  assert.equal(board.rows[0].subagents, 1, '棋盘行带子任务数（页面据此画蓝色呼吸点，不写字）')
+  assert.equal(board.rows[0].blink, true, '子代理在跑 ⇒ 棋盘行 blink=true')
   assert.equal(board.rows[0].capsule, '执行中')
   assert.equal('merged' in board.rows[0], false, '不再有「+N 条」')
 
@@ -4375,8 +4380,101 @@ await testAsync('子代理：主回合结束但后台子任务还在跑 → 不�
   await waitMs(90)
   board = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop().payload.board
   assert.equal(board.rows[0].state, 'done')
-  assert.equal(board.rows[0].subagents, undefined, '子任务清零后旋转弧停掉')
+  assert.equal(board.rows[0].subagents, undefined, '子任务清零后不再画呼吸点')
+  assert.equal(board.rows[0].blink, undefined, '子任务清零后 blink 消失')
   w.cleanup()
+})
+
+await testAsync('code_agent 后台会话：登记父→子链接 → 父任务保持执行中并闪烁；子会话停 → 恢复完成', async () => {
+  // 实机那条就是这种：CU 会话调 code_agent 建出来的标准会话，header 没有 parentSession、
+  // origin 不是 subagent、preset=standard，只能靠 tools/post-execute 的登记认出来。
+  let children = []
+  const agents = { list: () => children, get: () => undefined }
+  const now = Date.now()
+  const sessionId = 'session-pc-code-agent'
+  const childId = 'session-code-child'
+  const w = unifiedWorkspace({
+    agents,
+    records: [cuRecord(sessionId, {
+      live: true, preset: 'computer-use', cwd: '/work/tihu', createdAt: now - 600_000,
+      lastPromptAt: now - 600, title: '鹈鹕待决策接入 pendingInteraction',
+    })],
+  })
+  try {
+    const socket = openLane(w.runtime)
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    const post = w.events.find((entry) => entry.name === 'tools/post-execute').handler
+    assert.ok(post !== undefined, 'lane 要挂 tools/post-execute（code_agent 链接登记点）')
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pc-code-agent', protocol: '0' }, 1)))
+    await waitMs(160)
+    const boardOf = () => framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.board).pop()?.payload?.board
+
+    emit({ id: sessionId }, { type: 'turn/start', data: { turn: 1 } })
+    await waitMs(140)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 2)))
+    await waitMs(100)
+    let board = boardOf()
+    assert.ok(board !== undefined, '电脑端 CU 会话要上棋盘')
+    let row = board.rows.find((item) => item.taskId === 'p1')
+    assert.equal(row.state, 'running', '普通执行中')
+    assert.equal(row.blink, undefined, '没有子代理的普通执行中不闪（保持蓝色弧线环）')
+    assert.equal(row.subagents, undefined)
+
+    // code_agent 真正建出的后台会话：标准模式，头里没有任何父会话线索。
+    children = [{ id: childId, status: 'running', session: { header: { id: childId, agentPreset: 'standard' } } }]
+    await post(
+      {
+        callId: 'call-code-1',
+        name: 'code_agent',
+        arguments: { task: '写一份报告' },
+        agent: { session: { header: { id: sessionId } } },
+      },
+      { kind: 'success', value: { accepted: true, created: true, session_id: childId } },
+      async () => undefined,
+    )
+    await waitMs(140)
+    board = boardOf()
+    row = board.rows.find((item) => item.taskId === 'p1')
+    assert.equal(row.state, 'running', 'code_agent 子会话在跑 ⇒ 父任务保持执行中')
+    assert.equal(row.subagents, 1, '子任务数算上 code_agent 起的后台会话')
+    assert.equal(row.blink, true, '子代理在跑 ⇒ blink=true（右侧蓝色呼吸点）')
+    assert.equal(board.counts.running, 1, '顶行「●N 在跑」要算它')
+
+    // 父回合结束：子会话还在跑，不许出完成屏/播报。
+    emit({ id: sessionId }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(240)
+    let frames = framesOf(socket)
+    assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成'), false,
+      '子代理没跑完：父回合结束也不许出完成屏')
+    assert.equal(frames.some((frame) => frame.type === 'task.notify' && frame.payload.level === 1), false,
+      '子代理没跑完：不许播报完成')
+    board = boardOf()
+    row = board.rows.find((item) => item.taskId === 'p1')
+    assert.equal(row.state, 'running', '父回合结束后仍是执行中')
+    assert.equal(row.blink, true, '还在跑就继续闪')
+
+    // 子会话停：立刻恢复完成，不再闪。
+    children = [{ ...children[0], status: 'idle' }]
+    emit(
+      { id: childId, header: { id: childId, agentPreset: 'standard' } },
+      { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    )
+    await waitMs(300)
+    frames = framesOf(socket)
+    const done = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').pop()
+    assert.ok(done !== undefined, '子会话停 → 补完成屏')
+    assert.ok(frames.some((frame) => frame.type === 'task.notify' && frame.payload.level === 1),
+      '子会话停 → 补完成播报')
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 3)))
+    await waitMs(100)
+    board = boardOf()
+    row = board.rows.find((item) => item.taskId === 'p1')
+    assert.equal(row.state, 'done', '子会话全停 → 卡片转完成')
+    assert.equal(row.blink, undefined, '子会话全停 → 不再闪（绿色实心圆）')
+    assert.equal(row.subagents, undefined)
+  } finally {
+    w.cleanup()
+  }
 })
 
 /* ---------- 2026-11-10：重启后旧指挥会话投不进去 → 退避重试 / 重建 ---------- */

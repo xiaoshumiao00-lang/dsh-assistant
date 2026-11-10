@@ -1142,6 +1142,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    *     与宿主 `workspace/session-activity` 判断「running subagent descendants」同一口径
    *     （沿 parentSession + origin=subagent 走到任意深度，只看 status=running）。
    * 因此这里优先用 agents 注册表；拿不到时退回「会话行血缘 + session/event 的 runningSessions」。
+   *
+   * 另有第二种「后台子代理」，会话头里完全认不出来（用户 2026-11-10 实机）：
+   * `code_agent` 工具建出来/续接的标准会话——没有 `parentSession`、`origin` 不是 subagent、
+   * `agentPreset=standard`、`subagent` 行为空。它归哪条会话只能由工具调用现场决定：
+   * `tools/post-execute` 认 `code_agent`，从结果 `session_id` 取子会话、从 exec.agent 取父会话，
+   * 登记成内存里的「父 → 子」链接；插件重载后靠进程内 `codeAgentRegistry` 服务补齐。
+   * 之后一律按子会话**此刻是否在跑**决定父任务是否还在执行中（历史链接不参与计数）。
    */
 
   function headerOfSession(source: any): any {
@@ -1166,56 +1173,114 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /**
+   * `code_agent` 后台子会话链接：子会话 id → 父（CU）会话 id。
+   * 只在内存里：宿主重启后后台会话本来也停了，新的 code_agent 调用会重新登记。
+   */
+  const codeAgentParentOf = new Map<string, string>()
+  /** 链接表上限：正常场景每条 CU 会话只有几条后台会话，防止异常情况无限增长。 */
+  const CODE_AGENT_LINK_MAX = 200
+
+  function rememberCodeAgentChild(parentId: string, childId: string): boolean {
+    if (parentId === '' || childId === '' || parentId === childId) return false
+    if (codeAgentParentOf.get(childId) === parentId) return false
+    codeAgentParentOf.set(childId, parentId)
+    if (codeAgentParentOf.size > CODE_AGENT_LINK_MAX) {
+      const oldest = codeAgentParentOf.keys().next().value
+      if (typeof oldest === 'string') codeAgentParentOf.delete(oldest)
+    }
+    log(`tihu code_agent link child=${childId} parent=${parentId}`)
+    return true
+  }
+
+  /**
+   * 进程内 `codeAgentRegistry` 的链接与状态（拿不到给空表）。
+   * 它是 vendor/computer-use 的 app 级服务，`list()` 会顺手把 idle 的后台会话评成
+   * completed/stopped，所以这里的 state 可以直接当「是否还在跑」用。
+   */
+  function codeAgentRegistryRows(): Map<string, { callerId: string; state: string }> {
+    const rows = new Map<string, { callerId: string; state: string }>()
+    const registry = optionalService(ctx, 'codeAgentRegistry') as { list?: () => any[] } | undefined
+    if (registry === undefined || typeof registry?.list !== 'function') return rows
+    try {
+      const listed = registry.list()
+      for (const row of Array.isArray(listed) ? listed : []) {
+        const sessionId = typeof row?.sessionId === 'string' ? row.sessionId : ''
+        const callerId = typeof row?.callerId === 'string' ? row.callerId : ''
+        if (sessionId === '' || callerId === '') continue
+        rows.set(sessionId, { callerId, state: typeof row?.state === 'string' ? row.state : '' })
+      }
+    } catch { /* registry 不可用：只靠 post-execute 的内存表 */ }
+    return rows
+  }
+
+  /** 把 registry 里的 code_agent 链接并进内存表（插件重载后补历史链接，状态另算）。 */
+  function syncCodeAgentLinks(): Map<string, { callerId: string; state: string }> {
+    const rows = codeAgentRegistryRows()
+    for (const [childId, row] of rows) rememberCodeAgentChild(row.callerId, childId)
+    return rows
+  }
+
+  /**
    * 这条会话（含任意深度后代）里正在跑的子代理数量。
-   * 只数 `origin=subagent` + `parentSession` 血缘；fork 出来的会话不算（它是另一段对话）。
+   *
+   * 两条来源合在一起数：
+   *   - `origin=subagent` + `parentSession` 血缘（fork 出来的会话不算，它是另一段对话）；
+   *   - `code_agent` 工具登记的后台标准会话（header 里没有血缘，只能靠链接表）。
+   * **只看此刻在跑**：agent 注册表 status、codeAgentRegistry state、事件里的 runningSessions；
+   * 子会话 idle/被停后链接仍在，但不再计数，屏上也不会继续闪。
    */
   function runningSubagentCountOf(sessionId: string, agents: any[] | undefined = liveAgentList()): number {
     if (sessionId === '') return 0
+    const registryRows = syncCodeAgentLinks()
+    const childrenOf = new Map<string, Set<string>>()
+    const agentById = new Map<string, any>()
+    const addChild = (parentId: string, childId: string | undefined): void => {
+      if (childId === undefined || childId === '') return
+      const siblings = childrenOf.get(parentId) ?? new Set<string>()
+      siblings.add(childId)
+      childrenOf.set(parentId, siblings)
+    }
     if (agents !== undefined) {
-      const childrenOf = new Map<string, any[]>()
       for (const agent of agents) {
+        const id = agentSessionIdOf(agent)
+        if (id !== undefined) agentById.set(id, agent)
         const header = headerOfSession(agent?.session)
         const parent = header?.parentSession
         if (typeof parent !== 'string' || parent === '') continue
         if (header?.origin !== 'subagent') continue
-        const siblings = childrenOf.get(parent) ?? []
-        siblings.push(agent)
-        childrenOf.set(parent, siblings)
+        addChild(parent, id)
       }
-      let running = 0
-      const pending = [sessionId]
-      const visited = new Set<string>([sessionId])
-      while (pending.length > 0) {
-        const parentId = pending.shift() as string
-        for (const child of childrenOf.get(parentId) ?? []) {
-          const childId = agentSessionIdOf(child)
-          if (childId === undefined || visited.has(childId)) continue
-          visited.add(childId)
-          if (child.status === 'running' || (child.status === undefined && runningSessions.has(childId))) running += 1
-          pending.push(childId)
-        }
+    } else {
+      // 退化路径：没有 agents 注册表（老宿主/轻量桩）时，用缓存的会话行血缘。
+      for (const row of sessionListCache?.rows ?? []) {
+        if (row.origin !== 'subagent' || row.parentSession === undefined) continue
+        addChild(row.parentSession, row.sessionId)
       }
-      return running
     }
-    // 退化路径：没有 agents 注册表（老宿主/轻量桩）时，用缓存的会话行血缘 + 事件里的在跑集合。
-    const rows = sessionListCache?.rows ?? []
-    const childrenOf = new Map<string, TihuSessionRow[]>()
-    for (const row of rows) {
-      if (row.origin !== 'subagent' || row.parentSession === undefined) continue
-      const siblings = childrenOf.get(row.parentSession) ?? []
-      siblings.push(row)
-      childrenOf.set(row.parentSession, siblings)
+    // code_agent 的后台会话：不管有没有 agents 注册表都要算。
+    for (const [childId, parentId] of codeAgentParentOf) addChild(parentId, childId)
+
+    const childRunning = (childId: string): boolean => {
+      const agent = agentById.get(childId)
+      const state = registryRows.get(childId)?.state
+      if (state === 'running') return true
+      if (agent?.status === 'running') return true
+      // 老宿主/轻量桩的 agent 可能没有 status：退回事件里的 turn 跟踪。
+      // registry 已判 completed/stopped 的不再算（子会话 idle/被停立刻停闪）。
+      const statusUnknown = agent === undefined || agent.status === undefined
+      return statusUnknown && runningSessions.has(childId) && state !== 'completed' && state !== 'stopped'
     }
+
     let running = 0
     const pending = [sessionId]
     const visited = new Set<string>([sessionId])
     while (pending.length > 0) {
       const parentId = pending.shift() as string
-      for (const child of childrenOf.get(parentId) ?? []) {
-        if (visited.has(child.sessionId)) continue
-        visited.add(child.sessionId)
-        if (runningSessions.has(child.sessionId)) running += 1
-        pending.push(child.sessionId)
+      for (const childId of childrenOf.get(parentId) ?? []) {
+        if (visited.has(childId)) continue
+        visited.add(childId)
+        if (childRunning(childId)) running += 1
+        pending.push(childId)
       }
     }
     return running
@@ -1250,6 +1315,23 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       const running = runningSubagentCountOf(ancestorId)
       if (tasks.setChildRunning(task.taskId, running, at)) refreshBoards()
       if (running === 0 && task.holdingForChildren === true) finalizeHeldTask(task, at)
+    }
+  }
+
+  /**
+   * `code_agent` 后台会话的 turn 起落：按链接表找回父会话的任务，重算「在跑子任务数」；
+   * 子会话全停后把挂起的父任务补完成（结论在主回合 turn/end 时已存进 deferredReplies）。
+   *
+   * 它们 header 里没有 parentSession（不是 subagent），所以不能用 ancestorSessionIdsOf。
+   */
+  function reconcileTasksForCodeChild(parentId: string, at: number): void {
+    const task = tasks.ofSession(parentId)
+    if (task === undefined) return
+    const running = runningSubagentCountOf(parentId)
+    if (tasks.setChildRunning(task.taskId, running, at)) refreshBoards()
+    if (running === 0 && task.holdingForChildren === true) {
+      finalizeHeldTask(task, at)
+      log(`tihu code_agent settled task=${task.taskId} parent=${parentId}`)
     }
   }
 
@@ -1947,7 +2029,88 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
   })
 
+  /**
+   * `code_agent` 结果里的子会话 id。
+   *
+   * 工具返回值明确是 `{ accepted, created, session_id }`，但 `tools/post-execute` 收到的
+   * result 在不同宿主版本里可能包一层（value/result/output），所以逐层找 `session_id`；
+   * 续接调用（参数带 session_id）拿不到结果时退回参数里的那个 id。
+   */
+  function codeAgentChildIdOf(exec: any, result: any): string | undefined {
+    const args = argsOf(exec) as any
+    const fromArgs = typeof args?.session_id === 'string' && args.session_id.trim() !== ''
+      ? args.session_id.trim()
+      : undefined
+    const seen = new Set<unknown>()
+    const pick = (value: any, depth: number): string | undefined => {
+      if (value === null || typeof value !== 'object' || depth > 4 || seen.has(value)) return undefined
+      seen.add(value)
+      for (const key of ['session_id', 'sessionId', 'childSessionId']) {
+        const found = value[key]
+        if (typeof found === 'string' && found.trim() !== '') return found.trim()
+      }
+      for (const key of ['value', 'result', 'output', 'data', 'payload']) {
+        const found = pick(value[key], depth + 1)
+        if (found !== undefined) return found
+      }
+      return undefined
+    }
+    return pick(result, 0) ?? fromArgs
+  }
+
+  /**
+   * `code_agent` / `code_agent_stop` 的后置处理：把后台标准会话登记成「父 → 子」链接。
+   *
+   * 为什么不能只看会话头：这类会话 header 没有 parentSession、origin 不是 subagent，
+   * 从会话行完全看不出它属于哪条 CU 会话（2026-11-10 实机：卡片提前变绿）。
+   * 登记后立刻重算父任务的子代理数：还在跑就保持执行中（屏上蓝色呼吸），
+   * 已经停了就什么都不改（历史链接不许让卡片一直闪）。
+   */
+  function handleCodeAgentTool(exec: any, result: any): void {
+    const rawTool = String(exec?.name ?? '')
+    // 兼容带命名空间的工具名（`computer-use/code_agent`）。
+    const tool = rawTool.includes('/') ? rawTool.slice(rawTool.lastIndexOf('/') + 1) : rawTool
+    if (tool !== 'code_agent' && tool !== 'code_agent_stop') return
+    const parentId = sessionIdOfAgent(exec?.agent)
+    if (parentId === undefined) return
+    const args = argsOf(exec) as any
+    if (tool === 'code_agent_stop') {
+      const stopped = typeof args?.session_id === 'string' ? args.session_id.trim() : ''
+      if (stopped === '') return
+      syncCodeAgentLinks()
+      reconcileTasksForCodeChild(codeAgentParentOf.get(stopped) ?? parentId, Date.now())
+      return
+    }
+    const childId = codeAgentChildIdOf(exec, result)
+    if (childId === undefined || childId === '') {
+      log('tihu code_agent link skipped: no session_id in result')
+      return
+    }
+    rememberCodeAgentChild(parentId, childId)
+    syncCodeAgentLinks()
+    const at = Date.now()
+    const running = runningSubagentCountOf(parentId)
+    const task = tasks.ofSession(parentId)
+    if (task === undefined || task.state === 'archived' || task.state === 'awaiting') return
+    let changed = tasks.setChildRunning(task.taskId, running, at)
+    // 迟到的登记（父任务已经完成）：子会话还在跑就把它拉回执行中并挂起完成，等子会话结束再收尾。
+    if (running > 0 && (task.state === 'done' || task.state === 'announced')) {
+      const reply = lastAssistant.get(parentId)?.text ?? ''
+      const resultLine = firstSentenceOf(reply) || task.resultLine || '做完了'
+      tasks.holdForChildren(task.taskId, { childRunning: running, resultLine, now: at })
+      deferredReplies.set(task.taskId, { reply, resultLine })
+      changed = true
+    }
+    if (changed) refreshBoards()
+    log(`tihu code_agent child=${childId} parent=${parentId} running=${running}`)
+  }
+
   const disposePost = ctx.on?.('tools/post-execute', async (exec: any, result: any, next: () => Promise<any>) => {
+    // code_agent 起的后台会话必须在**任何**会话里都登记：它可能来自电脑端 CU 任务
+    // （source='pc'，不在 tihu 闸的窗口里），不能只在下面的 pendingCalls 分支处理。
+    try { handleCodeAgentTool(exec, result) } catch (error) {
+      log(`tihu code_agent hook failed: ${(error as Error)?.stack ?? String(error)}`)
+    }
     try {
       const callId = typeof exec?.callId === 'string' ? exec.callId : undefined
       const pending = callId !== undefined ? pendingCalls.get(callId) : undefined
@@ -2158,6 +2321,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       // 不看它有没有绑定设备——任务状态必须与真实子代理一致。
       if (headerOfSession(session)?.origin === 'subagent' && (type === 'turn/start' || type === 'turn/end')) {
         reconcileTasksForChild(session, sessionId, at)
+      }
+      // code_agent 后台会话没有 parentSession：按工具登记的反向链接归到父任务。
+      // 插件刚重载、内存表还空时先从进程内 codeAgentRegistry 补一次。
+      if (type === 'turn/start' || type === 'turn/end') {
+        if (!codeAgentParentOf.has(sessionId)) syncCodeAgentLinks()
+        const codeParent = codeAgentParentOf.get(sessionId)
+        if (codeParent !== undefined) reconcileTasksForCodeChild(codeParent, at)
       }
       if (type === 'assistant/message') {
         const blocks = Array.isArray((data as any)?.message?.content) ? (data as any).message.content : []

@@ -207,8 +207,12 @@ export function rowOf(task: TihuTask, now: number): TaskBoardRow {
     row.badge = 'ask'
     row.ring = { percent: 0, tone: 'empty' }
   }
-  // 子代理还在跑：屏上不写字，只给状态图形加一圈缓慢旋转的短弧（page.ts 读这个数）。
-  if ((task.childRunning ?? 0) > 0) row.subagents = task.childRunning
+  // 子代理还在跑：屏上不写字，右侧状态图标换成蓝色呼吸点（page.ts 读 blink / subagents）。
+  // 只认**此刻**在跑的数量；子代理全停后 childRunning 已经清零，卡片恢复绿色实心圆。
+  if ((task.childRunning ?? 0) > 0) {
+    row.subagents = task.childRunning
+    row.blink = true
+  }
   if (task.stepDurations !== undefined && task.stepDurations.length > 0) row.micro = task.stepDurations.slice(-8)
   return row
 }
