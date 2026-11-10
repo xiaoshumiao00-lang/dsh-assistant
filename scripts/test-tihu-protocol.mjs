@@ -39,7 +39,7 @@ import {
   takeSnapshot,
   targetPathOf,
 } from '../src/tihu/guard.ts'
-import { createTihuRuntime, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH } from '../src/tihu/lane.ts'
+import { createTihuRuntime, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH, TIHU_LANE_LOG_MAX_BYTES, appendTihuLaneLog, screenReasonOf, tihuLaneLogPath } from '../src/tihu/lane.ts'
 import { BOARD_PAGE_SIZE } from '../src/tihu/task-ledger.ts'
 import { TIHU_CONTROL_SECTION_TEXT, createTihuControlRunner, matchSessionRows, tihuActionNames } from '../src/tihu/control.ts'
 import {
@@ -3367,6 +3367,111 @@ await testAsync('统一指挥：进度页实时——工具调用替换最新一
   await waitMs(60)
   frame = framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.stage === '进度').pop()
   assert.ok(String(frame.payload.bullets[0]).startsWith('思考 · User: "补结果" lane.ts'), '思考行原样（不过滤英文/路径）：' + frame.payload.bullets[0])
+  w.cleanup()
+})
+
+/* ---------- 2026-11-10：重启后旧指挥会话投不进去 → 退避重试 / 重建 ---------- */
+
+test('lane.log：路径可覆盖、超过 2MB 截断重开，每行带时间/sessionId/message/stack 首行', () => {
+  const beforeLog = process.env.TIHU_LANE_LOG
+  const beforeHome = process.env.DSH_HOME
+  try {
+    delete process.env.TIHU_LANE_LOG
+    delete process.env.DSH_HOME
+    assert.ok(tihuLaneLogPath().endsWith(join('tihu', 'lane.log')), '默认落 ~/.dsh/tihu/lane.log')
+    assert.ok(tihuLaneLogPath().includes('.dsh'))
+    process.env.DSH_HOME = join(tmpdir(), 'dsh-home')
+    assert.equal(tihuLaneLogPath(), join(tmpdir(), 'dsh-home', 'tihu', 'lane.log'), 'DSH_HOME 优先于 ~/.dsh')
+
+    const root = mkdtempSync(join(tmpdir(), 'tihu-lane-log-'))
+    const file = join(root, 'lane.log')
+    process.env.TIHU_LANE_LOG = file
+    assert.equal(tihuLaneLogPath(), file, 'TIHU_LANE_LOG 最高优先（测试/排查）')
+
+    writeFileSync(file, 'x'.repeat(TIHU_LANE_LOG_MAX_BYTES + 10), 'utf8')
+    const line = appendTihuLaneLog('session-cmd', new Error('目标会话未加载'))
+    const text = readFileSync(file, 'utf8')
+    assert.equal(text, line, '超过 2MB 要先截断重开，只留这一次')
+    assert.ok(line.includes('session=session-cmd'), '每行带 sessionId')
+    assert.ok(line.includes('目标会话未加载'), '每行带真实 message')
+    assert.ok(/\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z\]/.test(line), '每行带 ISO 时间')
+    assert.ok(line.includes('Error: 目标会话未加载'), '每行带 stack 首行')
+    assert.ok(line.includes('frame='), '还带首个 at 帧，方便定位')
+
+    assert.equal(screenReasonOf(new Error('Target session is not loaded')), '会话没加载', '屏上原因摘要翻成中文短句')
+    assert.ok([...screenReasonOf(new Error('x'.repeat(80)))].length <= 20, '原因摘要 ≤20 字')
+    rmSync(root, { recursive: true, force: true })
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    delete process.env.DSH_HOME
+    if (beforeLog !== undefined) process.env.TIHU_LANE_LOG = beforeLog
+    if (beforeHome !== undefined) process.env.DSH_HOME = beforeHome
+  }
+})
+
+await testAsync('重新投递：using 第一次抛错 → 300ms 退避重试后成功（不出「指令未发送」）', async () => {
+  const w = unifiedWorkspace()
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-retry', protocol: '0' }, 1)))
+  await waitMs(50)
+  const sessions = w.ctx.get('sessions')
+  const original = sessions.using
+  let calls = 0
+  sessions.using = async (id, opts, fn) => {
+    calls += 1
+    if (calls === 1) throw new Error('目标会话未加载')
+    return original(id, opts, fn)
+  }
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '这两个方向我实在拿不定主意了', source: 'voice' }, 2)))
+  await waitMs(650)
+  assert.equal(calls, 2, '第一次抛错后要退避重试一次：' + calls)
+  assert.equal(w.prompted.length, 1, '重试成功后要真的投进去')
+  assert.equal(w.prompted[0].id, 'session-cmd', '还是原来的指挥会话，不重建')
+  assert.equal(w.created.length, 0, '一次瞬时失败不许新建指挥会话')
+  const frames = framesOf(socket)
+  assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.title === '指令未发送'), false,
+    '重试成功不许出错误屏：' + JSON.stringify(frames.filter((f) => f.type === 'screen.frame').map((f) => f.payload.title)))
+  const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+  assert.ok(log.includes('session=session-cmd'), '失败要落 lane.log')
+  assert.ok(log.includes('目标会话未加载'), 'lane.log 要写真实异常 message')
+  delete process.env.TIHU_LANE_LOG
+  w.cleanup()
+})
+
+await testAsync('重新投递：指挥会话失效 → 重建「鹈鹕指挥台」、改绑设备后投递成功', async () => {
+  const w = unifiedWorkspace()
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-rebuild', protocol: '0' }, 1)))
+  await waitMs(50)
+  const sessions = w.ctx.get('sessions')
+  const original = sessions.using
+  sessions.using = async (id, opts, fn) => {
+    if (id === 'session-cmd') throw new Error('会话已归档，无法继续')
+    return original(id, opts, fn)
+  }
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '这两个方向我实在拿不定主意了', source: 'voice' }, 2)))
+  await waitMs(2200)
+
+  assert.equal(w.created.length, 1, '旧指挥会话三次都投不进去 → 必须新建一条：' + JSON.stringify(w.created))
+  assert.equal(w.created[0].cwd, w.home, '新指挥会话落助手 home')
+  assert.equal(w.created[0].agentPreset, 'standard')
+  assert.deepEqual(w.renamed[0], { sessionId: 'session-task-1', title: '鹈鹕指挥台' }, '新建后要写标题「鹈鹕指挥台」')
+  assert.equal(w.prompted.length, 1, '重建后要真的投进去一次')
+  assert.equal(w.prompted[0].id, 'session-task-1', '投给新指挥会话：' + JSON.stringify(w.prompted))
+  assert.ok(String(w.prompted[0].blocks[1].text).includes('指挥会话'), '慢路径的指挥尾巴还在')
+
+  const frames = framesOf(socket)
+  assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.title === '指令未发送'), false,
+    '重建投递成功不许出错误屏：' + JSON.stringify(frames.filter((f) => f.type === 'screen.frame').map((f) => f.payload.title)))
+  const bound = frames.filter((frame) => frame.type === 'session.bound').pop()
+  assert.equal(bound.payload.sessionId, 'session-task-1', '设备要改绑到新指挥会话，否则新会话的 turn 事件上不了屏')
+  const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+  assert.ok(log.includes('session=session-cmd'), '旧会话的失败要落 lane.log')
+  assert.ok(log.includes('已归档'), '失败原因要写真实异常')
+  assert.ok(log.includes('note=attempt=1/3') && log.includes('note=attempt=3/3'), '三次退避尝试都要留痕')
+  delete process.env.TIHU_LANE_LOG
   w.cleanup()
 })
 
