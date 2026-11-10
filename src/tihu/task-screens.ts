@@ -11,7 +11,7 @@
  * 容量约束全部来自 screen-spec.ts：正文 4 行、每行约 18 字、标题 1 行、按钮行 32px。
  */
 import type { ScreenFramePayload, TaskBoardPayload } from './protocol.ts'
-import { CONTENT_WIDTH_PX, DONE_TITLE_FONT_PX, SCREEN_SPEC, TITLE_BOLD_FACTOR, clipScreenTitle, fitLine, fitScreenLines, wrapTextPx } from './screen-spec.ts'
+import { CONTENT_WIDTH_PX, DONE_TITLE_FONT_PX, SCREEN_SPEC, TEXT_WRAP_SAFETY_PX, TITLE_BOLD_FACTOR, clipScreenTitle, fitLine, fitScreenLines, measureTextPx, wrapTextPx } from './screen-spec.ts'
 import { splitReplySentences } from './reply.ts'
 import { capsuleOf, formatUsedMs, type TihuTask } from './task-ledger.ts'
 
@@ -94,13 +94,144 @@ export function stripStatusMarks(text: string): string {
     .join('\n')
 }
 
+/** 完成页单条路径的最大字符数（码点）：超过就缩写，缩写结果也不超过它。 */
+export const DONE_PATH_MAX_CHARS = 40
+
+/** 行首无序列表符（`- ` / `* ` / `+ `）；必须带空白，避免误伤 `-0.12`、`a-b`。 */
+const LEADING_LIST_MARK = /^\s{0,3}[-*+]\s+/
+/** 行首标题（`#`～`######`，可无空格）；只剥行首，正文中间的 `#` 不动。 */
+const LEADING_HEADING_MARK = /^\s{0,3}#{1,6}\s*/
+/** 整行分隔线（`---` / `***` / `___`）。 */
+const THEMATIC_BREAK = /^\s*([-*_])\1{2,}\s*$/
+/** 行首引用符 `> `。 */
+const LEADING_QUOTE_MARK = /^\s{0,3}>\s?/
+
 /**
- * 完成页朗读用的规范文本：换行统一、去首尾空白、去行首状态勾。
+ * 逐行清掉残留在完成页正文里的 markdown 记号：`**`、`` ` ``、行首 `#`、
+ * `- `／`* `／`+ ` 列表符，以及分隔线和引用符。保留换行（分句/折行都按它排）。
+ *
+ * 为什么放在宿主：2026-11-10 实机看到正文里还有「**粗体**」「`路径`」「- 项」，
+ * 屏上既不好看、朗读还会把星号/反引号念出来。正文和 TTS 共用这一份文本，清一次就够。
+ */
+export function stripMarkdownMarks(text: string): string {
+  return String(text ?? '')
+    .split('\n')
+    .map((line) => {
+      // 围栏代码块整行（``` / ```json）直接丢掉：语言名不念、也不占正文行。
+      if (/^\s*```/.test(line)) return ''
+      let out = line
+        .replace(LEADING_HEADING_MARK, '')
+        .replace(LEADING_LIST_MARK, '')
+        .replace(LEADING_QUOTE_MARK, '')
+      if (THEMATIC_BREAK.test(out)) return ''
+      // 行内记号：粗体星号与反引号。占位符清掉后正文照常念。
+      out = out.replace(/\*\*/g, '').replace(/`/g, '')
+      return out
+    })
+    .join('\n')
+}
+
+/** 绝对路径（盘符 / UNC / POSIX）；只用来判断代码段里那串东西是不是路径。 */
+function looksLikeAbsolutePath(value: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\/]/.test(value) || /^\/(?:[^/\s]+\/)+/.test(value)
+}
+
+/**
+ * 文件名仍然超过上限时，保留首尾、把中间折成省略号，并优先保住扩展名。
+ * 例：`ICACHE2026_GNN_dPINN_20261108_191807_native_charts_tables.pptx`
+ *   → `ICACHE2026_GNN…_charts_tables.pptx`。
+ */
+function shrinkFileName(name: string, maxChars: number): string {
+  const chars = [...name]
+  if (chars.length <= maxChars) return name
+  const dot = name.lastIndexOf('.')
+  const ext = dot > 0 && name.length - dot <= 9 ? name.slice(dot) : ''
+  const extChars = [...ext]
+  const stem = ext === '' ? chars : chars.slice(0, chars.length - extChars.length)
+  const budget = maxChars - 1 - extChars.length
+  if (budget <= 4) return `${chars.slice(0, Math.max(1, maxChars - 1)).join('')}…`
+  const headLen = Math.max(1, Math.floor(budget / 2))
+  const tailLen = Math.max(1, budget - headLen)
+  const head = stem.slice(0, headLen)
+  while (head.length > 1 && ['_', '-', '.', ' '].includes(head[head.length - 1])) head.pop()
+  // 尾部尽量从分隔符（_ - . 空格）开始：`…e_charts_tables.pptx` 比 `…_charts_tables.pptx`
+  // 多一个半个词的字母，读起来更别扭。
+  let tail = stem.slice(stem.length - tailLen)
+  const cut = tail.findIndex((char) => char === '_' || char === '-' || char === '.' || char === ' ')
+  if (cut > 0 && tail.length - cut >= 6) tail = tail.slice(cut)
+  return `${head.join('')}…${tail.join('')}${ext}`
+}
+
+/** 15px 正文一行能放下的宽度（与 wrapTextPx 一样扣掉安全边距）。 */
+const PATH_LINE_WIDTH_PX = DONE_BODY_TEXT_WIDTH_PX - TEXT_WRAP_SAFETY_PX
+
+/**
+ * 长路径缩写：只留「盘符/首段 + … + 文件名」；文件名本身还超长就再折文件名。
+ *
+ *   D:\陈潘HBEU\Desktop\…\exports\ICACHE2026_GNN_dPINN_…_tables.pptx
+ *     → ICACHE2026_GNN…_charts_tables.pptx
+ *
+ * 上限是**字符**（码点）而不是字节，40 是硬上限；此外再按 15px 正文实测宽度收紧，
+ * 保证整条路径不会被折行切成两段（2026-11-10 实渲染：40 字符的大写文件名宽 328px，
+ * 一折就把 `.pptx` 切到下一行，等于白缩写）。短且一行放得下的路径原样返回。
+ */
+export function abbreviatePath(path: string, maxChars: number = DONE_PATH_MAX_CHARS): string {
+  const raw = String(path ?? '').trim()
+  if (raw === '') return ''
+  const fitsLine = (value: string): boolean => measureTextPx(value, DONE_BODY_FONT_PX) <= PATH_LINE_WIDTH_PX
+  if ([...raw].length <= maxChars && fitsLine(raw)) return raw
+  const sep = raw.includes('\\') ? '\\' : '/'
+  const unc = /^\\\\[^\\/]/.test(raw)
+  const posix = !unc && !/^[A-Za-z]:[\\/]/.test(raw) && raw.startsWith('/')
+  const parts = raw.split(/[\\/]+/).filter((part) => part !== '')
+  if (parts.length < 2) return shrinkFileName(raw, maxChars)
+  const head = unc
+    ? `\\\\${parts[0]}`
+    : (posix ? `${sep}${parts[0]}` : parts[0])
+  const base = parts[parts.length - 1]
+  const withHead = `${head}${sep}…${sep}${base}`
+  // 盘符 + 文件名已经够短就用它；不够短就只留文件名（再不够就折文件名本身）。
+  const candidate = [...withHead].length <= maxChars ? withHead : base
+  if (fitsLine(candidate)) return candidate
+  if (fitsLine(base)) return base
+  // 逐字符收紧到「一行放得下」为止（仍不超过 40 字符硬上限）。
+  for (let limit = Math.min(maxChars, [...base].length) - 1; limit >= 8; limit -= 1) {
+    const shrunk = shrinkFileName(base, limit)
+    if (fitsLine(shrunk)) return shrunk
+  }
+  return shrinkFileName(base, 8)
+}
+
+/** 裸路径 token（不含空白）：Windows 盘符/UNC + POSIX（URL 里的 `/` 由 lookbehind 排除）。 */
+const WINDOWS_PATH_TOKEN = /(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/])[^\s"'`<>|?*，。；！？、）】》」』,;]+/g
+const POSIX_PATH_TOKEN = /(?<![\w:.\/-])\/(?:[^\s/]+\/)+[^\s"'`<>|?*，。；！？、）】》」』,;]+/g
+/** 反引号包着的路径（允许空格），先按代码段边界缩写，再统一清反引号。 */
+const BACKTICKED_PATH = /`([^`\n]+)`/g
+
+/** 文本里的长路径统一缩写（裸 token + 反引号包着的带空格路径）。 */
+export function abbreviateLongPaths(text: string, maxChars: number = DONE_PATH_MAX_CHARS): string {
+  const shorten = (token: string): string => abbreviatePath(token, maxChars)
+  const coded = String(text ?? '').replace(BACKTICKED_PATH, (whole, inner: string) => {
+    const value = inner.trim()
+    return looksLikeAbsolutePath(value) ? abbreviatePath(value, maxChars) : whole
+  })
+  return coded
+    .replace(WINDOWS_PATH_TOKEN, (token: string) => shorten(token))
+    .replace(POSIX_PATH_TOKEN, (token: string) => shorten(token))
+}
+
+/**
+ * 完成页朗读用的规范文本：换行统一、清 markdown 记号、去行首状态勾、长路径缩写、去首尾空白。
  * 折行（{@link doneLinesOf}）、字符区间（{@link doneLineRangesOf}）和
  * 宿主下发 TTS 的 `charStart/charEnd` **必须都基于这一份文本**，否则高亮会和声音错位。
+ *
+ * 顺序有讲究：先缩写路径（反引号里的路径允许带空格，必须在清反引号之前处理），
+ * 再清 markdown（`- ✅ 完成` 要先把列表符拿掉，状态勾才露在行首）。
  */
 export function prepareDoneText(text: unknown): string {
-  return stripStatusMarks(String(text ?? '').replace(/\r\n?/g, '\n')).trim()
+  const normalized = String(text ?? '').replace(/\r\n?/g, '\n')
+  const withoutMarkdown = stripMarkdownMarks(abbreviateLongPaths(normalized))
+  return stripStatusMarks(withoutMarkdown).trim()
 }
 
 /** 回答正文 → 完成屏的折行（按像素折，不切半个字；保留原句顺序）。 */
@@ -307,7 +438,8 @@ export function noticeFrame(input: { stage: string; title: string; lines?: reado
  */
 export function doneAnnouncementOf(task: TihuTask): string {
   const title = task.title || '刚才那件事'
-  const line = String(task.resultLine ?? '').replace(/\s+/g, ' ').trim()
+  // 同一套清理：播报也可能念到第一句里的长路径/markdown，不能因为走的是通知通道就漏掉。
+  const line = prepareDoneText(task.resultLine).replace(/\s+/g, ' ').trim()
   if (line === '') return `${title}，做完了`
   return `${title}——${line}`
 }
