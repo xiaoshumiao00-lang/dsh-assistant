@@ -2684,6 +2684,38 @@ function unifiedWorkspace(options = {}) {
   const created = []
   const prompted = []
   const renamed = []
+  /**
+   * 真宿主形态（2026-11-10 承接 bug 回归用）：`ctx.get('sessions')` 是会话存储，
+   * **没有客户端那份 `sessions.using`**；投递只能走 `agents.get(id).followup()`。
+   * agent 可以「不在内存」（unmountAgent 模拟 idle 后被卸载），宿主 `sessionController.resume`
+   * 负责把它挂回来——正是线上那条路径。
+   */
+  const agentHost = options.agentHost === true
+  const resumed = []
+  const liveAgents = new Map()
+  const mountAgent = (id, meta = {}) => {
+    const agent = {
+      id,
+      status: 'idle',
+      session: {
+        header: {
+          id,
+          ...(meta.cwd === undefined ? {} : { cwd: meta.cwd }),
+          ...(meta.agentPreset === undefined ? {} : { agentPreset: meta.agentPreset }),
+        },
+      },
+      followup: (message) => {
+        prompted.push({ id, blocks: Array.isArray(message?.content) ? message.content : [], via: 'agent' })
+      },
+    }
+    liveAgents.set(id, agent)
+    return agent
+  }
+  const unmountAgent = (id) => { liveAgents.delete(id) }
+  const agentRegistry = {
+    get: (id) => liveAgents.get(id),
+    list: () => [...liveAgents.values()],
+  }
   const records = options.seedCommander === false
     ? []
     : [cuRecord('session-cmd', { live: true, preset: 'standard', title: '鹈鹕指挥台' })]
@@ -2692,12 +2724,13 @@ function unifiedWorkspace(options = {}) {
   if (Array.isArray(options.records)) records.push(...options.records)
   // 会话衔接那组：种子会话要落在临时目录里（fundFolder/home 在函数内才建好）。
   if (typeof options.seedSessions === 'function') records.push(...options.seedSessions({ root, home, fundFolder }))
-  // 宿主真实建会话入口（2026-11-09 修复）：sessionController.create/rename。
+  // 宿主真实建会话入口（2026-11-09 修复）：sessionController.create/rename/resume。
   const sessionController = {
     create: async (request) => {
       created.push(request)
       const id = 'session-task-' + created.length
       records.push(cuRecord(id, { live: true, preset: request.agentPreset, cwd: request.cwd, title: '任务 ' + created.length }))
+      if (agentHost) mountAgent(id, { cwd: request.cwd, agentPreset: request.agentPreset })
       return { sessionId: id }
     },
     rename: async ({ sessionId, title }) => {
@@ -2706,6 +2739,13 @@ function unifiedWorkspace(options = {}) {
       if (record !== undefined) record.projection.title = title
       return { title, seq: 1 }
     },
+    resume: async (sessionId) => {
+      resumed.push(sessionId)
+      if (options.resumeFails === true) throw new Error('会话日志打不开：resume 失败')
+      const record = records.find((item) => item.header.id === sessionId)
+      if (record === undefined) throw new Error(`会话 ${sessionId} 不存在（无法 resume）`)
+      return mountAgent(sessionId, { cwd: record.header.cwd, agentPreset: record.header.agentPreset })
+    },
   }
   const remote = {
     session: {
@@ -2713,25 +2753,28 @@ function unifiedWorkspace(options = {}) {
         created.push(base)
         const id = 'session-task-' + created.length
         records.push(cuRecord(id, { live: true, preset: base.agentPreset, cwd: base.cwd, title: '任务 ' + created.length }))
+        if (agentHost) mountAgent(id, { cwd: base.cwd, agentPreset: base.agentPreset })
         return { ok: true, value: { sessionId: id } }
       },
     },
   }
-  const sessions = {
-    using: async (id, _opts, fn) => fn({
-      binding: {
-        session: {
-          prompt: async (blocks) => prompted.push({ id, blocks }),
-          // 宿主用它给「tihu 语音链路」挂工具闸窗口：派单也算一次 tihu 注入。
-          deriveMessages: () => [{ role: 'user', id: 'msg-' + id }],
+  const sessions = agentHost
+    ? { get: (id) => (liveAgents.has(id) ? { header: liveAgents.get(id).session.header } : undefined) }
+    : {
+      using: async (id, _opts, fn) => fn({
+        binding: {
+          session: {
+            prompt: async (blocks) => prompted.push({ id, blocks }),
+            // 宿主用它给「tihu 语音链路」挂工具闸窗口：派单也算一次 tihu 注入。
+            deriveMessages: () => [{ role: 'user', id: 'msg-' + id }],
+          },
         },
-      },
-    }),
-  }
+      }),
+    }
   const fixture = runtimeFor(records, {
     ...(options.noCreate === true ? { sessions } : { remote, sessions, sessionController }),
     // 子代理用例：agents 注册表要能 list()（宿主用它数「在跑的子代理后代」）。
-    ...(options.agents === undefined ? {} : { agents: options.agents }),
+    ...(agentHost ? { agents: agentRegistry } : options.agents === undefined ? {} : { agents: options.agents }),
     ...(options.sessionEvents === undefined
       ? {}
       : { sessionQuery: sessionQueryFixture(records, options.sessionEvents) }),
@@ -2746,6 +2789,10 @@ function unifiedWorkspace(options = {}) {
     created,
     prompted,
     renamed,
+    resumed,
+    liveAgents,
+    mountAgent,
+    unmountAgent,
     records,
     cleanup: () => {
       fixture.runtime.dispose()
@@ -5539,6 +5586,126 @@ await testAsync('派单衔接：语义明显矛盾才新建会话（不硬塞给
     const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
     assert.ok(log.includes('命中=daily'), '无关的一句走日常：' + log)
     assert.ok(log.includes('衔接=new'), '明显矛盾 → 新建会话：' + log)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+/* ---------- 2026-11-10 实机：承接目标 idle、agent 不在内存 → resume，仍不行才同项目新建 ----------
+ *
+ * 实机（18:29）：设备说「帮我把 README 的前两行读出来」，指挥台判 append 到几十分钟前那条
+ * 会话（早已 idle、没 mount）。`promptSession` 连试三次都抛「会话 … 当前没有活动 agent」，
+ * 屏上弹「指令未发送 / 那条会话没接住这句话，请重说」。
+ *
+ * 根因：真宿主 ctx 上的 `sessions` 是会话存储（dsh-session），**没有客户端那份
+ * `sessions.using`**；promptOnce 只能退回 `agents.get()`，agent 不在内存就直接抛。
+ * 新会话能成只是因为刚 create、agent 还在内存。
+ *
+ * 修法（用户要求「承接永不把话丢给用户重说」）：
+ *   1. append 投递前先 `sessionController.resume(sessionId)`（宿主真实入口，网页版打开旧会话
+ *      同一条路），把会话挂回活动 agent 再投；
+ *   2. resume 仍失败 → 在**同一项目**新建一条会话投递，**taskId 不变**、屏上不出红字；
+ *   3. 只有项目也判不出时才允许旧「指令未发送 / 请重说」屏。
+ */
+
+await testAsync('承接保活：目标会话 idle、agent 不在内存 → 先 resume 再 append（不新建、不出错误屏）', async () => {
+  const w = unifiedWorkspace({ agentHost: true })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-append-resume', protocol: '0' }, 1)))
+    await waitMs(50)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把青年基金申请书的摘要前两行读出来', source: 'voice' }, 2)))
+    await waitMs(180)
+    assert.equal(w.created.length, 1, '第一句按项目卡新建一条会话')
+    const firstSession = w.prompted[0].id
+    assert.equal(w.liveAgents.has(firstSession), true, '刚建的会话 agent 在内存')
+    emit({ id: firstSession }, { type: 'turn/start', data: { turn: 1 } })
+    emit({ id: firstSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(80)
+    // 实机：几十分钟后这条会话 idle，agent 已经不在内存（没 mount）。
+    w.unmountAgent(firstSession)
+    assert.equal(w.liveAgents.has(firstSession), false)
+
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '再读一下后两行', source: 'voice' }, 3)))
+    await waitMs(300)
+
+    assert.deepEqual(w.resumed, [firstSession], 'append 前必须让宿主 resume 这条会话：' + JSON.stringify(w.resumed))
+    assert.equal(w.created.length, 1, 'resume 成功就不许新建会话')
+    assert.equal(w.prompted.length, 2, '第二句只投一次：' + JSON.stringify(w.prompted.map((item) => item.id)))
+    assert.equal(w.prompted[1].id, firstSession, '要投回原来那条会话')
+    assert.equal(w.prompted[1].blocks[0].text, '再读一下后两行', '用户原话原样投递')
+    assert.ok(String(w.prompted[1].blocks[1].text).includes('【续聊 · 鹈鹕】'), '承接要带续聊尾巴')
+
+    const frames = framesOf(socket)
+    assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.title === '指令未发送'), false,
+      'resume 成功不许出错误屏：' + JSON.stringify(frames.filter((frame) => frame.type === 'screen.frame').map((frame) => frame.payload.title)))
+    const receipt = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
+    assert.equal(receipt?.payload.title, '已派给 青年基金申请书', '回执照常显示项目')
+    const board = frames.filter((frame) => frame.type === 'task.list').pop().payload.board
+    assert.equal(board.rows.length, 1, '棋盘上仍然只有一张卡')
+    assert.equal(board.rows[0].taskId, 't1')
+    assert.ok(String(board.rows[0].sub).includes('青年基金申请书'), '棋盘副行照常显示项目：' + JSON.stringify(board.rows[0]))
+
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.equal(w.liveAgents.has(firstSession), true, 'resume 后 agent 要挂回内存')
+    assert.ok(log.includes('note=append-resume-ok'), 'resume 成功要落 lane.log（实机排查证据）：' + log)
+    assert.ok(log.includes('命中=previous'), '承接命中要落盘：' + log)
+    assert.ok(log.includes('衔接=append'), '承接结论是 append：' + log)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('承接降级：resume 也失败 → 同项目新建会话派出（同 taskId、不出错误屏、副行仍是项目）', async () => {
+  const w = unifiedWorkspace({ agentHost: true, resumeFails: true })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-append-degrade', protocol: '0' }, 1)))
+    await waitMs(50)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把青年基金申请书的摘要前两行读出来', source: 'voice' }, 2)))
+    await waitMs(180)
+    const firstSession = w.prompted[0].id
+    emit({ id: firstSession }, { type: 'turn/start', data: { turn: 1 } })
+    emit({ id: firstSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(80)
+    w.unmountAgent(firstSession)
+
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '再读一下后两行', source: 'voice' }, 3)))
+    await waitMs(350)
+
+    assert.deepEqual(w.resumed, [firstSession], '先尝试 resume 那条会话：' + JSON.stringify(w.resumed))
+    assert.equal(w.created.length, 2, 'resume 失败 → 同项目新建一条会话')
+    assert.equal(w.created[1].cwd, w.fundFolder, '必须落那条会话所属项目的文件夹：' + w.created[1].cwd)
+    assert.equal(w.created[1].agentPreset, 'computer-use', '新建的仍是 CU 会话')
+    assert.equal(w.prompted.length, 2, '第二句只投一次')
+    assert.equal(w.prompted[1].id, 'session-task-2', '这句话投进同项目的新会话：' + JSON.stringify(w.prompted.map((item) => item.id)))
+    assert.ok(String(w.prompted[1].blocks[1].text).includes('这句话已派到「青年基金申请书」'), '降级走的是正常派单尾巴')
+
+    const frames = framesOf(socket)
+    assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.title === '指令未发送'), false,
+      '项目已定，不许再出「指令未发送 / 请重说」：' + JSON.stringify(frames.filter((frame) => frame.type === 'screen.frame').map((frame) => frame.payload.title)))
+    assert.equal(frames.some((frame) => frame.payload.title === '这条没派出去'), false, '降级成功也不许出失败屏')
+    const receipt = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
+    assert.equal(receipt?.payload.title, '已派给 青年基金申请书', '回执显示那条会话所属项目')
+    assert.ok(receipt.payload.bullets.some((line) => String(line).includes('那条会话没接住，已在同项目新建')), '回执留一句短提示：' + JSON.stringify(receipt.payload.bullets))
+    const board = frames.filter((frame) => frame.type === 'task.list').pop().payload.board
+    assert.equal(board.rows.length, 1, '同一句话只留一张卡：' + JSON.stringify(board.rows))
+    assert.equal(board.rows[0].taskId, 't1', 'taskId 不变')
+    assert.ok(String(board.rows[0].sub).includes('青年基金申请书'), '棋盘副行照常显示项目：' + JSON.stringify(board.rows[0]))
+    const tasks = await w.runtime.control.listTasks()
+    assert.equal(tasks.length, 1)
+    assert.equal(tasks[0].taskId, 't1')
+
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('append 失败 → 同项目新建'), 'append 失败要落 lane.log 并写清「同项目新建」：' + log)
+    assert.ok(log.includes('note=append-resume-failed'), 'resume 失败的原始原因要留痕：' + log)
+    assert.ok(log.includes('note=append-degraded'), '降级成功要留一条结果日志：' + log)
   } finally {
     delete process.env.TIHU_LANE_LOG
     w.cleanup()
