@@ -2300,6 +2300,23 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /**
+   * 项目**已经确定**、只是宿主建不出会话来：给一屏不带「请重说」的终态。
+   *
+   * 用户 2026-11-10 要求：只有「项目也无法确定」时才许出现旧「指令未发送 / 请重说」
+   * 错误屏；承接降级（同项目新建）再失败时，错的不是用户那句话，不能让主人重说一遍。
+   */
+  function showDispatchStuck(device: TihuDevice, error: unknown): void {
+    const reason = screenReasonOf(error)
+    const lines = fitScreenLines(['项目已定，宿主没建起会话', reason], 3)
+    device.send('event.alert', { level: 'error', text: `这条没派出去（${reason}）` })
+    sendFrame(device, {
+      stage: '会话', title: '这条没派出去',
+      bullets: lines,
+      tone: 'alert', mode: 'status',
+    } satisfies ScreenFramePayload)
+  }
+
+  /**
    * 已完成预览/键盘输入的统一提交口；统一指挥模式下走派单器，老路径仍注当前会话。
    *
    * 返回 true 表示「路由已经自己出了一屏」（回执/追问/棋盘/详情/提示）——调用方
@@ -3440,6 +3457,66 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
   }
 
+  /**
+   * 承接投递前先确认目标会话**现在接得住话**（2026-11-10 实机）。
+   *
+   * 实机现象：目标会话几十分钟前跑过 README，早已 idle、agent 不在内存里。真宿主
+   * `ctx.get('sessions')` 是会话存储（`dsh-session`，只有 get/create/list），并没有客户端
+   * 那份 `sessions.using`，于是 promptOnce 退回 `agents.get()`，直接抛
+   * 「会话 … 当前没有活动 agent」——那是 fallback 分支，三条退避重试也救不回来，
+   * 屏上就弹「指令未发送 / 请重说」。新会话（刚 create、agent 还在内存）才碰巧是好的。
+   *
+   * 宿主真实入口是 `sessionController.resume(sessionId)`（网页版打开旧会话同一条路）：
+   * 它按持久化 header + 原 agentPreset 把会话重新读出来并 mount 成活动 agent。
+   * 这里先 resume、确认 `agents.get()` 真的能拿到，再交给 promptSession 投递。
+   *
+   * `sessions.using` 存在时（测试桩 / 老宿主）它自己会拉起 agent，保持原路径不动。
+   */
+  async function ensureAppendTarget(sessionId: string): Promise<{ ok: boolean; resumed: boolean; error?: unknown }> {
+    // 同一句话/两台设备同时说话时只 resume 一次：重复 resume 会撞「already live」，
+    // 白白把本来能接住的句子降级成新建。
+    const running = appendResumeInFlight.get(sessionId)
+    if (running !== undefined) return await running
+    const work = resumeAppendTargetOnce(sessionId)
+    appendResumeInFlight.set(sessionId, work)
+    try {
+      return await work
+    } finally {
+      if (appendResumeInFlight.get(sessionId) === work) appendResumeInFlight.delete(sessionId)
+    }
+  }
+
+  /** 正在 resume 的会话（见 ensureAppendTarget 的并发说明）。 */
+  const appendResumeInFlight = new Map<string, Promise<{ ok: boolean; resumed: boolean; error?: unknown }>>()
+
+  async function resumeAppendTargetOnce(sessionId: string): Promise<{ ok: boolean; resumed: boolean; error?: unknown }> {
+    const agents = optionalService(ctx, 'agents') as { get?: (id: string) => any } | undefined
+    const liveAgent = (): any => {
+      try { return agents?.get?.(sessionId) } catch { return undefined }
+    }
+    const already = liveAgent()
+    if (already !== undefined && already !== null) return { ok: true, resumed: false }
+    const sessionsSvc = optionalService(ctx, 'sessions') as { using?: unknown } | undefined
+    if (typeof sessionsSvc?.using === 'function') return { ok: true, resumed: false }
+    const controller = optionalService(ctx, 'sessionController') as { resume?: (id: string) => Promise<any> } | undefined
+    if (typeof controller?.resume !== 'function') {
+      return { ok: false, resumed: false, error: new Error('宿主没有 sessionController.resume，无法恢复这条空闲会话') }
+    }
+    let returned: any
+    try {
+      returned = await controller.resume(sessionId)
+    } catch (error) {
+      return { ok: false, resumed: false, error }
+    }
+    // promptOnce 的 fallback 只认 `agents.get(sessionId)`：resume 返回值不算数，必须真查得到。
+    const mounted = liveAgent()
+    if (mounted !== undefined && mounted !== null) return { ok: true, resumed: true }
+    if (returned !== undefined && returned !== null) {
+      return { ok: false, resumed: true, error: new Error('resume 返回了 agent，但活动 agent 注册表里还查不到这条会话') }
+    }
+    return { ok: false, resumed: true, error: new Error('resume 之后仍然没有活动 agent') }
+  }
+
   /** 指挥会话换了 id：绑着旧会话的屏改绑到新会话（否则新会话的 turn 事件上不了屏）。 */
   function rebindCommanderSession(previous: string, next: string): void {
     if (previous === next) return
@@ -3654,14 +3731,21 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       return undefined
     }
     log(`tihu previous-follow append project=${card.id} session=${session.sessionId} score=${hint.confidence.toFixed(2)} ${hint.detail}`)
+    const appendMeta: DispatchMeta = { via: 'previous', continuity: 'append', confidence: hint.confidence, clarify: 'no' }
     const task = await appendToSession(
       device,
       text,
       card,
       { sessionId: session.sessionId, ...(session.title === '' ? {} : { title: session.title }) },
-      { via: 'previous', continuity: 'append', confidence: hint.confidence, clarify: 'no' },
+      appendMeta,
     )
-    if (task === undefined) return { message: '错误：那条会话没接住这句话。' }
+    if (task === undefined) {
+      // 项目已定（就是上一条派单的项目）：宿主连新会话都没建起来时，不许再让主人重说。
+      return { message: appendMeta.failureShown === true ? '已记下：宿主没建起会话（不用重说）。' : '错误：那条会话没接住这句话。' }
+    }
+    if (!task.sessionIds.includes(session.sessionId)) {
+      return { task, message: `那条会话接不住，已在「${task.projectName}」新建会话派出：${task.title}（任务 ${task.taskId}）` }
+    }
     return { task, message: `已接着「${task.projectName}」原有会话派出：${task.title}（任务 ${task.taskId}）` }
   }
 
@@ -3732,6 +3816,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     reuseTaskId?: string
     /** 回执屏上多写一句短提示（例如「指挥台没接住，先派给个人助手」）。 */
     note?: string
+    /** 承接降级：新会话投递成功后把原任务拉回执行中（同 taskId，不新建第二张卡）。 */
+    reopenTask?: boolean
+    /** 承接降级：新会话也没建起来时保留原卡——这句话还在棋盘上，不能悄悄丢。 */
+    keepTaskOnFailure?: boolean
+    /** 承接降级：失败屏由 appendToSession 统一出（这里不弹「指令未发送 / 请重说」）。 */
+    quietFailure?: boolean
+    /** 承接降级：新会话失败的真实异常（给调用方的终态屏写原因）。 */
+    failure?: unknown
+    /** 调用方已经出过终态屏（上层别再补一张「请重说」）。 */
+    failureShown?: boolean
   }
 
   /** 决策原因落 ~/.dsh/tihu/lane.log（项目命中方式、会话命中 id、置信分、是否澄清）。 */
@@ -5141,12 +5235,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
     const sessionId = await createSessionAt(folder, DISPATCH_PRESET)
     if (sessionId === undefined) {
-      tasks.drop(task.taskId)
-      releasePendingCommanderTask(task.taskId)
-      refreshBoards()
-      broadcastBoardSnapshot()
       const message = '宿主还不能新建会话（sessionController.create 不可用，见 tihu 日志），这次没派出去'
-      if (device !== undefined) {
+      decision.failure = new Error(message)
+      // 承接降级：这句话不能悄悄丢——原卡留着、屏由 appendToSession 统一出。
+      if (decision.keepTaskOnFailure !== true) {
+        tasks.drop(task.taskId)
+        releasePendingCommanderTask(task.taskId)
+        refreshBoards()
+        broadcastBoardSnapshot()
+      } else {
+        releasePendingCommanderTask(task.taskId)
+        refreshBoards()
+      }
+      if (device !== undefined && decision.quietFailure !== true) {
         showInputError(device, new Error(message), '任务会话没建起来，请重说')
       }
       log(`tihu dispatch failed: no session service`)
@@ -5164,14 +5265,22 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     tasks.attachSession(task.taskId, sessionId)
     const sent = await promptSession(sessionId, blocks)
     if (!sent.ok) {
-      tasks.drop(task.taskId)
-      releasePendingCommanderTask(task.taskId)
-      refreshBoards()
-      broadcastBoardSnapshot()
+      decision.failure = sent.error
+      if (decision.keepTaskOnFailure !== true) {
+        tasks.drop(task.taskId)
+        releasePendingCommanderTask(task.taskId)
+        refreshBoards()
+        broadcastBoardSnapshot()
+      } else {
+        releasePendingCommanderTask(task.taskId)
+        refreshBoards()
+      }
       logDispatchDecision(card.name, sessionId, decision)
-      if (device !== undefined) showInputError(device, sent.error, '任务会话没有接住这条消息，请重说')
+      if (device !== undefined && decision.quietFailure !== true) showInputError(device, sent.error, '任务会话没有接住这条消息，请重说')
       return undefined
     }
+    // 承接降级：新会话已经接住这句，原任务（同 taskId）拉回执行中再出回执。
+    if (decision.reopenTask === true) tasks.reopenForAppend(task.taskId)
     // 同一句话晚到的 dispatch 不能再建第二条任务（新建会话这条路同样要立去重牌）。
     fallbackDispatch = { key: dispatchKeyOf(text), taskId: task.taskId, at: Date.now() }
     releasePendingCommanderTask(task.taskId)
@@ -5234,7 +5343,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         tasks.attachSession(task.taskId, target.sessionId)
       }
     }
-    const adoptedTask = task !== undefined
     if (task === undefined) {
       task = existing !== undefined && existing.source === 'pc' ? undefined : existing
       if (task === undefined) {
@@ -5251,35 +5359,70 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         tasks.reopenForAppend(task.taskId)
       }
     }
-    const createdTask = adoptedTask || task.state === 'queued' || task.state === 'dispatched'
-    const sent = await promptSession(target.sessionId, [
-      { type: 'text', text },
-      { type: 'text', text: appendTailOf(card, folder) },
-    ])
-    if (!sent.ok) {
-      // 排队卡是我们自己立的（或这条任务是新建的）：失败就撤掉，不能让棋盘上留一张假排队。
-      if (createdTask) {
-        tasks.drop(task.taskId)
-        releasePendingCommanderTask(task.taskId)
-        refreshBoards()
-        broadcastBoardSnapshot()
+    // 先确认这条会话现在接得住话：idle 久了 agent 不在内存里，宿主能 resume 就挂回来再投。
+    const deliverable = await ensureAppendTarget(target.sessionId)
+    let failure: unknown
+    let failureNote = 'append-resume-failed'
+    let failureStage = 'resume'
+    if (!deliverable.ok) {
+      failure = deliverable.error ?? new Error('目标会话没有活动 agent')
+    } else {
+      if (deliverable.resumed) {
+        try { appendTihuLaneLog(target.sessionId, new Error('承接目标空闲 → 已 resume 后投递'), 'append-resume-ok') } catch { /* 日志失败不影响投递 */ }
+        log(`tihu append resume ok session=${target.sessionId} project=${card.id}`)
       }
-      logDispatchDecision(card.name, target.sessionId, meta)
-      if (device !== undefined) showInputError(device, sent.error, '那条会话没接住这句话，请重说')
-      return undefined
+      failureStage = '投递'
+      failureNote = 'append-prompt-failed'
+      const sent = await promptSession(target.sessionId, [
+        { type: 'text', text },
+        { type: 'text', text: appendTailOf(card, folder) },
+      ])
+      if (sent.ok) {
+        tasks.markRunning(task.taskId)
+        tasks.noteMilestone(task.taskId, `追加：${taskTitleOf(text)}`)
+        // 同一句晚到的模型 dispatch 不能再建第二条（这条任务已经派过了）。
+        fallbackDispatch = { key: dispatchKeyOf(text), taskId: task.taskId, at: Date.now() }
+        releasePendingCommanderTask(task.taskId)
+        logDispatchDecision(card.name, target.sessionId, meta)
+        log(`tihu append task=${task.taskId} project=${card.id} session=${target.sessionId} folder=${folder} preset=${DISPATCH_PRESET}`)
+        if (device !== undefined) {
+          showReceipt(device, task, meta.note)
+          refreshBoards()
+        }
+        return task
+      }
+      failure = sent.error ?? new Error('投递失败')
     }
-    tasks.markRunning(task.taskId)
-    tasks.noteMilestone(task.taskId, `追加：${taskTitleOf(text)}`)
-    // 同一句晚到的模型 dispatch 不能再建第二条（这条任务已经派过了）。
-    fallbackDispatch = { key: dispatchKeyOf(text), taskId: task.taskId, at: Date.now() }
-    releasePendingCommanderTask(task.taskId)
-    logDispatchDecision(card.name, target.sessionId, meta)
-    log(`tihu append task=${task.taskId} project=${card.id} session=${target.sessionId} folder=${folder} preset=${DISPATCH_PRESET}`)
-    if (device !== undefined) {
-      showReceipt(device, task, meta.note)
+    // 承接失败（resume 不行，或 resume 了仍投不进去）→ 自动降级：同项目新建，taskId 不变。
+    const reason = (failure as Error)?.message ?? String(failure)
+    // 日志：append 失败 → 同项目新建（带真实原因，用户实机排查就看这一行）。
+    try { appendTihuLaneLog(target.sessionId, new Error(`append 失败 → 同项目新建：${failureStage}失败：${reason}`), failureNote) } catch { /* 日志失败不影响兜底 */ }
+    log(`tihu append ${failureStage} failed session=${target.sessionId} project=${card.id} reason=${reason} -> new session in same project`)
+    const degraded = await dispatchToCard(device, text, card, task.title, {
+      via: meta.via,
+      continuity: 'new',
+      ...(meta.confidence === undefined ? {} : { confidence: meta.confidence }),
+      clarify: meta.clarify,
+      // 同一句话同一张卡：沿用原 taskId，棋盘上不许冒出第二张。
+      reuseTaskId: task.taskId,
+      note: '那条会话没接住，已在同项目新建',
+      reopenTask: true,
+      keepTaskOnFailure: true,
+      quietFailure: true,
+    })
+    if (degraded !== undefined) {
+      // 原会话确实没收到这句：任务改挂新会话（taskId 不变，副行仍显示项目）。
+      tasks.detachSession(degraded.taskId, target.sessionId)
       refreshBoards()
+      const fresh = degraded.sessionIds[degraded.sessionIds.length - 1] ?? ''
+      try { appendTihuLaneLog(fresh || target.sessionId, new Error(`append 失败 → 同项目新建：已派到 ${fresh}（任务 ${degraded.taskId}，项目 ${card.name}）`), 'append-degraded') } catch { /* 日志失败不影响派单 */ }
+      log(`tihu append degraded task=${degraded.taskId} old=${target.sessionId} new=${fresh} project=${card.id}`)
+      return degraded
     }
-    return task
+    // 同项目新建也没成：项目已定，绝不再让主人重说（旧「指令未发送」只留给项目也判不出的情况）。
+    meta.failureShown = true
+    if (device !== undefined) showDispatchStuck(device, meta.failure ?? failure)
+    return undefined
   }
 
   /** 派单结果（给指挥台回话用）。 */
@@ -5319,14 +5462,20 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
     if (decision.kind === 'append') {
       const target = candidates.find((item) => item.sessionId === decision.sessionId)
+      const appendMeta: DispatchMeta = { via: meta.via, continuity: 'append', confidence: decision.confidence, clarify: 'no' }
       const task = await appendToSession(
         device,
         text,
         card,
         { sessionId: decision.sessionId, ...(target?.title === undefined || target.title === '' ? {} : { title: target.title }) },
-        { via: meta.via, continuity: 'append', confidence: decision.confidence, clarify: 'no' },
+        appendMeta,
       )
-      if (task === undefined) return { message: '错误：那条会话没接住这句话。' }
+      if (task === undefined) {
+        return { message: appendMeta.failureShown === true ? '已记下：宿主没建起会话（不用重说）。' : '错误：那条会话没接住这句话。' }
+      }
+      if (!task.sessionIds.includes(decision.sessionId)) {
+        return { task, message: `那条会话接不住，已在「${task.projectName}」新建会话派出：${task.title}（任务 ${task.taskId}）` }
+      }
       return { task, message: `已接着「${task.projectName}」原有会话派出：${task.title}（任务 ${task.taskId}）` }
     }
 
@@ -6466,14 +6615,21 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         if (target === undefined) {
           return `没找到要接着的会话「${sessionHint}」：它必须是该项目文件夹下的 Computer Use 会话（可以先用 list_sessions 看短号）。`
         }
+        const appendMeta: DispatchMeta = { via: 'commander', continuity: 'append', confidence: grayConfidence ?? 1, clarify: 'no' }
         const task = await appendToSession(
           device,
           text,
           card,
           { sessionId: target.sessionId, ...(target.title === '' ? {} : { title: target.title }) },
-          { via: 'commander', continuity: 'append', confidence: grayConfidence ?? 1, clarify: 'no' },
+          appendMeta,
         )
-        if (task === undefined) return '错误：那条会话没接住这条消息（宿主投递失败）。'
+        if (task === undefined) {
+          return appendMeta.failureShown === true ? '已记下：宿主没建起会话（这句话还在棋盘上，不用重说）。' : '错误：那条会话没接住这条消息（宿主投递失败）。'
+        }
+        if (!task.sessionIds.includes(target.sessionId)) {
+          // 承接降级：同项目新建了会话，别把回话说成「已接着原会话」。
+          return `那条会话接不住，已在「${task.projectName}」新建会话派出：${task.title}（任务 ${task.taskId}）`
+        }
         return `已接着「${task.projectName}」原有会话派出：${task.title}（任务 ${task.taskId}）`
       }
       if (input.newSession === true || grayResolution) {
