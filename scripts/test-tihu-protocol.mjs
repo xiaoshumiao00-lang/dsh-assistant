@@ -93,6 +93,8 @@ import { WsFrameParser, encodeFrame } from '../src/pocket-host/ws-deflate.mjs'
  *   - 也绝不读/写真实 `~/.dsh/tihu/task-ledger.json`（跑一次测试不能改用户的完成历史）。
  * 名字刻意与真实入口同名，下面几百处 createTihuRuntime(...) 都不用改。
  */
+/** 续聊尾巴与派单尾巴共用的朗读要求（含「文字不要太长」的例外括注），两处必须一字不差。 */
+const READ_ALOUD_TAIL = '做完后用简洁中文说明结果：先给结论，再给关键数字或进展，文字不要太长，确实需要长文本的情况除外（例如用户明确要求全文朗读、完整清单），适合直接朗读；不要表格、列表、代码块或长路径。'
 const tihuTestLedgerDir = mkdtempSync(join(tmpdir(), 'dsh-tihu-ledger-'))
 let tihuTestLedgerSeq = 0
 function createTihuRuntime(ctx, options = {}) {
@@ -2992,6 +2994,7 @@ await testAsync('统一指挥：日常小事派到「个人助手」文件夹，
   assert.ok(dispatchTail.includes('鹈鹕是主人家里的语音小屏助手'), '新尾巴开场要一致')
   assert.ok(dispatchTail.includes('先给结论，再给关键数字或进展'), '朗读要求要带结论优先')
   assert.ok(dispatchTail.includes('不要表格、列表、代码块或长路径'), '朗读要求要禁长路径/表格')
+  assert.ok(dispatchTail.includes(READ_ALOUD_TAIL), '派单尾巴的朗读要求要逐字一致（含「文字不要太长」例外）')
   assert.equal(dispatchTail.includes('直接开始做'), false, '旧尾巴不能残留')
   assert.equal(dispatchTail.includes('需要人拍板'), false, '旧尾巴不能残留')
   const frames = framesOf(socket)
@@ -5365,6 +5368,7 @@ await testAsync('派单衔接：相关且语义连续（没有指代词）→ �
     assert.ok(tail.includes('【续聊 · 鹈鹕】'), '续聊要带尾巴：' + tail)
     assert.ok(tail.includes('青年基金申请书'), '尾巴要带项目名')
     assert.ok(tail.includes(`工作目录 ${w.fundFolder}`), '尾巴要说明文件夹不变')
+    assert.ok(tail.includes(READ_ALOUD_TAIL), '续聊尾巴的朗读要求要与派单尾巴逐字一致（含「文字不要太长」例外）')
     const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
     assert.equal(receipt?.payload.title, '已派给 青年基金申请书', '追加也出同一张回执')
     const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
