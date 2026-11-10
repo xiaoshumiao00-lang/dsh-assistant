@@ -99,10 +99,12 @@ import {
   subLineOf,
   taskTitleOf,
   CONTINUITY_WINDOW_MS,
+  ledgerSnapshotOf,
   type ScreenCommand,
   type TihuSessionCandidate,
   type TihuTask,
 } from './task-ledger.ts'
+import { TaskLedgerStore } from './task-store.ts'
 import { commanderReplyTail, parseCommanderReply, type CommanderReply } from './dispatch-protocol.ts'
 import {
   PENDING_OFFLINE_CHECK_MS,
@@ -558,6 +560,11 @@ export interface TihuRuntimeOptions {
   homeSyncMs?: number
   /** 语音预览自动发送延迟（默认 2000ms；测试可注入，不属于设备协议）。 */
   previewDelayMs?: number
+  /**
+   * 任务台账落盘文件（缺省 `$TIHU_TASK_LEDGER_FILE` / `$DSH_HOME/tihu/task-ledger.json`）。
+   * 单测传临时文件，绝不碰真实 `~/.dsh/tihu/`。
+   */
+  taskLedgerPath?: string
 }
 
 /** 提供给代理的两个入口 + 卸载函数。 */
@@ -763,7 +770,18 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
    * 2026-11-09 第二轮：旧 session-follow 界面（项目主页/最近回答/翻页/气泡/回答滚动）
    * 已整体删除——设备永远只有新的七屏，绝无回退路径。
    */
-  const tasks = new TaskLedger((line) => appendTaskJournal(line))
+  /* ---------- 台账落盘（2026-11-10：跨重启记住完成历史） ----------
+   *
+   * 用户实机：重启后「完成」计数与历史卡片全归零 —— 任务只活在内存里。
+   * 只存「屏上要看的那点东西」：短号 / 项目 / 标题 / 状态 / 起止时间 / 结果一行。
+   * 写盘防抖 + tmp→rename 原子替换；读不出来就当没有历史（宁缺勿脏）。
+   */
+  const ledgerStore = new TaskLedgerStore({
+    ...(options.taskLedgerPath === undefined || options.taskLedgerPath === '' ? {} : { file: options.taskLedgerPath }),
+    snapshot: () => ledgerSnapshotOf(tasks.list()),
+    onError: (message) => log(`tihu ledger: ${message}`),
+  })
+  const tasks = new TaskLedger((line) => appendTaskJournal(line), { onChange: () => ledgerStore.schedule() })
   /** 播报队列（P0 插队 / P1·P2 八秒合并 / P3 不播）。 */
   const notifyBus = new TaskNotifyBus()
   /** 唯一指挥会话 id（懒建一次；建不出来就直接上错误屏，不退回旧壳）。 */
@@ -879,6 +897,38 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
    * 宿主，会话因此**真的**继续跑（不是只把屏标成已答）。
    */
   const pendingBridges = new Map<string, PendingDecisionBridge>()
+
+  /**
+   * 开机恢复完成历史（用户 2026-11-10：重启后棋盘「完成」计数与卡片全归零）。
+   *
+   * 只恢复最近 3 天内有活动、最多 60 条；**没跑完的一律按「已结束」处理**（状态归完成 +
+   * 写结束原因），绝不把上次的 running 原样带起来——否则屏又会停在一条早已死掉的进度页上。
+   * 恢复出来的是历史，不播报、不自动跳屏、不占「在跑/排队/待决策」计数。
+   *
+   * 电脑端（source='pc'）任务还要把 `sessionId → taskId` 的认领表接回来，
+   * 否则下一次轮询会以为它是新会话、再建一张重复卡。
+   */
+  function restoreTaskLedger(): void {
+    const snapshot = ledgerStore.load()
+    if (snapshot === undefined) return
+    try {
+      const restored = tasks.restore(snapshot.tasks, Date.now())
+      for (const task of restored.tasks) {
+        if (task.source !== 'pc') continue
+        const sessionId = task.sessionIds[0]
+        if (sessionId !== undefined && sessionId !== '') pcTaskOfSession.set(sessionId, task.taskId)
+      }
+      log(`tihu ledger restore tasks=${restored.restored} dropped=${restored.dropped} ended=${restored.ended} file=${ledgerStore.path()}`)
+    } catch (error) {
+      // 恢复失败绝不影响开机：最多是这一轮看不到旧历史。
+      log(`tihu ledger restore failed: ${(error as Error)?.message ?? String(error)}`)
+    }
+  }
+  restoreTaskLedger()
+
+  /** 进程退出兜底：防抖还没到点也要把最新台账写下去（同步、不依赖事件循环）。 */
+  const flushLedgerOnExit = (): void => { ledgerStore.flush() }
+  try { process.once('exit', flushLedgerOnExit) } catch { /* 没有 process（浏览器注入）时忽略 */ }
 
   /** 定锚点：`reset = true` 只由真实的新一轮调用（其它一律不许把锚点往后挪）。 */
   function noteRunAnchor(taskId: string, at: number, reset = false): void {
@@ -3632,8 +3682,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       let changed = false
       // 先撤掉不该再上屏的：会话被归档/删除、被派单任务接管、被用户撤掉、空了太久、
       // 或者**模式被切走**（Computer Use → 普通）。
+      //
+      // 但列表这一次一条都没返回时不下手：宿主刚启动、投影还没就绪都会给出空表，
+      // 拿它把台账里的电脑端卡整批归档，等于重启后把历史完成卡又清一遍（比留着旧卡糟得多）。
+      // 真正被删的会话仍会在下一次有列表时下屏，或按 3 天静置窗口被 prune 收走。
+      const trustList = rows.length > 0
       for (const [sessionId, taskId] of [...pcTaskOfSession]) {
         if (wanted.has(sessionId)) continue
+        if (!trustList) continue
         const row = rows.find((item) => item.sessionId === sessionId)
         const why = row === undefined ? 'session gone' : `preset=${row.preset || '?'}`
         if (archivePcTask(taskId, now, why)) changed = true
@@ -6234,6 +6290,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       for (const disposer of [disposePre, disposePost, disposeSession, disposeAssistantStream, disposeApprovalRequest, disposeQuestionRequest]) {
         try { if (typeof disposer === 'function') disposer() } catch { /* 忽略 */ }
       }
+      // 最后写一次台账（卸载时挂住的待决策可能刚被按默认项了结，状态要跟着落盘）。
+      try { process.off('exit', flushLedgerOnExit) } catch { /* 没有 process 时忽略 */ }
+      ledgerStore.dispose()
     },
     stats: () => ({ devices: devices.size, activeSessions: [...activeSessions.keys()], tasks: tasks.size() }),
   }

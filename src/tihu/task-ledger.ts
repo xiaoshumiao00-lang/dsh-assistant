@@ -35,6 +35,21 @@ export const BOARD_PAGE_SIZE = 4
 export const LEDGER_MAX_TASKS = 60
 /** 完成/已播报态在棋盘上留多久后自动归档（毫秒）：用户要求至少 3 天，不能更早。 */
 export const DONE_KEEP_MS = 3 * 24 * 60 * 60_000
+/**
+ * 台账落盘格式版本：字段一改就 +1，读到别的版本一律当没有。
+ * 宁可丢一次历史，也不把旧格式的脏状态带进棋盘。
+ */
+export const LEDGER_SNAPSHOT_VERSION = 1
+/** 恢复时最多保留的完成历史条数（与内存上限同一口径：超了按最后活动时间淘汰）。 */
+export const LEDGER_RESTORE_MAX = LEDGER_MAX_TASKS
+/**
+ * 重启时**没跑完**的任务统一标这句结束原因。
+ *
+ * 用户 2026-11-10 实机：进程重启后登记簿只剩内存，完成卡全丢；但反过来把上次
+ * `running/queued/awaiting` 原样恢复同样危险——屏会挂在一张早已死掉的进度页上。
+ * 所以恢复时一律按「已结束」落在完成族，并用这一行说明原因。
+ */
+export const RESTORED_INTERRUPTED_LINE = '重启前未跑完，已按结束处理'
 
 /**
  * 任务来源：
@@ -339,6 +354,184 @@ export interface ExternalSyncInput {
   at: number
 }
 
+/* ---------- 落盘格式（跨重启记住完成历史；只存屏上显示要用的字段） ---------- */
+
+/**
+ * 一条任务的落盘记录。
+ *
+ * 纪律（用户 2026-11-10 要求「克制、别把脏状态带起来」）：
+ *   - 只留屏上/恢复要用的字段：短号、来源、标题、项目、文件夹、状态、起止时间、结果一行；
+ *   - **不落正文**（`doneText` 可能有整段回答）、不落待决策题目/选项、不落子代理计数；
+ *   - 字符串一律压空白并截断，避免一条记录变成一整段。
+ */
+export interface LedgerTaskRecord {
+  taskId: string
+  source: TihuTaskSource
+  title: string
+  projectId: string
+  projectName: string
+  folder?: string
+  preset: string
+  state: TihuTaskState
+  startedAt: number
+  updatedAt: number
+  finishedAt?: number
+  /** 完成时的一行结果摘要（不是正文）。 */
+  resultLine?: string
+  /** 任务行摘要（一行）。 */
+  summary?: string
+  /** 承载会话：电脑端任务靠它恢复 `sessionId → taskId` 的认领表，避免重启后重复建卡。 */
+  sessionIds: string[]
+}
+
+/** 落盘文件本体。 */
+export interface LedgerSnapshot {
+  v: number
+  savedAt: number
+  tasks: LedgerTaskRecord[]
+}
+
+/** 恢复结果（日志与测试都用它核对「恢复了多少、丢了多少、多少条按结束处理」）。 */
+export interface LedgerRestoreResult {
+  tasks: TihuTask[]
+  /** 恢复出来的条数。 */
+  restored: number
+  /** 按时间窗口 / 条数上限淘汰掉的条数。 */
+  dropped: number
+  /** 其中从 running/queued/awaiting 归成「完成」的条数。 */
+  ended: number
+}
+
+/** 压空白 + 按字数截断（落盘字段的通用收口）。 */
+function clipRecordText(value: unknown, maxChars: number): string {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  const chars = [...text]
+  return chars.length > maxChars ? `${chars.slice(0, Math.max(1, maxChars - 1)).join('')}…` : text
+}
+
+function recordNumber(value: unknown, fallback: number): number {
+  const number = Number(value)
+  return Number.isFinite(number) && number > 0 ? number : fallback
+}
+
+/** 一条任务 → 落盘记录（归档任务不写：它们已经不在棋盘上）。 */
+export function ledgerRecordOf(task: TihuTask): LedgerTaskRecord | undefined {
+  if (task.state === 'archived') return undefined
+  const record: LedgerTaskRecord = {
+    taskId: task.taskId,
+    source: task.source === 'pc' ? 'pc' : 'tihu',
+    title: clipRecordText(task.title, 40),
+    projectId: clipRecordText(task.projectId, 80),
+    projectName: clipRecordText(task.projectName, 40),
+    preset: clipRecordText(task.preset, 24) || 'standard',
+    state: task.state,
+    startedAt: recordNumber(task.startedAt, 0),
+    updatedAt: recordNumber(task.updatedAt, 0),
+    sessionIds: task.sessionIds.filter((id) => typeof id === 'string' && id !== '').slice(0, 4),
+  }
+  const folder = clipRecordText(task.folder, 260)
+  if (folder !== '') record.folder = folder
+  const finishedAt = recordNumber(task.finishedAt, 0)
+  if (finishedAt > 0) record.finishedAt = finishedAt
+  const resultLine = clipRecordText(task.resultLine, 120)
+  if (resultLine !== '') record.resultLine = resultLine
+  const summary = clipRecordText(task.summary, 120)
+  if (summary !== '') record.summary = summary
+  return record
+}
+
+/** 整本登记簿 → 落盘快照（只含未归档任务；顺序即入簿顺序）。 */
+export function ledgerSnapshotOf(tasks: readonly TihuTask[], now = Date.now()): LedgerSnapshot {
+  const records: LedgerTaskRecord[] = []
+  for (const task of tasks) {
+    const record = ledgerRecordOf(task)
+    if (record !== undefined) records.push(record)
+  }
+  return { v: LEDGER_SNAPSHOT_VERSION, savedAt: now, tasks: records }
+}
+
+/** 任务最后活动的时刻（3 天窗口按它判；完成态优先用完成时刻）。 */
+function recordActivityOf(record: Record<string, unknown>): number {
+  return Math.max(
+    recordNumber(record.finishedAt, 0),
+    recordNumber(record.updatedAt, 0),
+    recordNumber(record.startedAt, 0),
+  )
+}
+
+/**
+ * 落盘记录 → 可入簿的任务（**纯函数**，不碰文件、不认识时钟）。
+ *
+ * 三条硬规则：
+ *   1. 只恢复最近 {@link DONE_KEEP_MS}（3 天）内有活动的任务，且最多 {@link LEDGER_RESTORE_MAX} 条；
+ *   2. `running / queued / dispatched / awaiting` 一律归成「完成」，并写上结束原因
+ *      （恢复出来的任务绝不可能「还在执行中」——那正是「重启后跳回过时进度页」的来源）；
+ *   3. 认不出的记录直接丢（宁缺勿脏）。
+ */
+export function restoreLedgerTasks(records: unknown, now = Date.now()): LedgerRestoreResult {
+  const rows = Array.isArray(records) ? records : []
+  const seen = new Set<string>()
+  const normalized: { task: TihuTask; activity: number }[] = []
+  let dropped = 0
+  let ended = 0
+  for (const raw of rows) {
+    if (raw === null || typeof raw !== 'object') {
+      dropped += 1
+      continue
+    }
+    const record = raw as Record<string, unknown>
+    const taskId = String(record.taskId ?? '').trim()
+    const idMatch = /^([tp])(\d+)$/.exec(taskId)
+    const savedState = String(record.state ?? '')
+    if (idMatch === null || savedState === 'archived' || seen.has(taskId)) {
+      dropped += 1
+      continue
+    }
+    const activity = recordActivityOf(record)
+    if (activity <= 0 || now - activity > DONE_KEEP_MS) {
+      dropped += 1
+      continue
+    }
+    // 没跑完的一律按「已结束」处理：状态归完成、写结束原因；已完成的保持完成。
+    const interrupted = savedState !== 'done' && savedState !== 'announced'
+    if (interrupted) ended += 1
+    const finishedAt = recordNumber(record.finishedAt, 0) || activity
+    const resultLine = interrupted
+      ? RESTORED_INTERRUPTED_LINE
+      : clipRecordText(record.resultLine, 120)
+    const task: TihuTask = {
+      taskId,
+      source: idMatch[1] === 'p' || record.source === 'pc' ? 'pc' : 'tihu',
+      title: taskTitleOf(record.title),
+      projectId: clipRecordText(record.projectId, 80),
+      projectName: clipRecordText(record.projectName, 40),
+      sessionIds: Array.isArray(record.sessionIds)
+        ? record.sessionIds.filter((id): id is string => typeof id === 'string' && id !== '').slice(0, 4)
+        : [],
+      preset: clipRecordText(record.preset, 24) || 'standard',
+      state: 'done',
+      step: 0,
+      turn: 0,
+      startedAt: recordNumber(record.startedAt, 0) || finishedAt,
+      updatedAt: Math.max(finishedAt, recordNumber(record.updatedAt, 0)),
+      finishedAt,
+      resultLine,
+      summary: clipRecordText(record.summary, 120),
+      // 恢复出来的历史**不再播报**：重启后念一堆旧完成会吵死人。
+      spokenAt: finishedAt,
+    }
+    const folder = clipRecordText(record.folder, 260)
+    if (folder !== '') task.folder = folder
+    seen.add(taskId)
+    normalized.push({ task, activity })
+  }
+  // 超上限按最后活动时间淘汰：保住最近的 60 条完成历史。
+  normalized.sort((a, b) => (b.activity - a.activity) || b.task.taskId.localeCompare(a.task.taskId))
+  const kept = normalized.slice(0, LEDGER_RESTORE_MAX)
+  dropped += normalized.length - kept.length
+  return { tasks: kept.map((item) => item.task), restored: kept.length, dropped, ended }
+}
+
 /**
  * 登记簿本体。所有方法同步、无 IO；lane 只做「把事件翻译成这些调用」。
  */
@@ -354,9 +547,22 @@ export class TaskLedger {
    * 所以这里显式声明字段 ＋ 赋值。
    */
   private readonly journal?: (line: string) => void
+  /**
+   * 状态变化回调（lane 用来把台账落盘，做跨重启记忆）。
+   * 只通知「该存一次」，不做 IO；写盘节奏由调用方防抖。
+   */
+  private readonly onChange?: () => void
 
-  constructor(journal?: (line: string) => void) {
+  constructor(journal?: (line: string) => void, options: { onChange?: () => void } = {}) {
     this.journal = journal
+    this.onChange = options.onChange
+  }
+
+  /** 状态变了：通知落盘口（回调抛错绝不影响登记簿本身）。 */
+  private notifyChange(): void {
+    try {
+      this.onChange?.()
+    } catch { /* 落盘失败不影响棋盘 */ }
   }
 
   /** 新派（或追加）一条任务。返回登记簿里的这一条（同一对象，后续原地更新）。 */
@@ -385,7 +591,27 @@ export class TaskLedger {
     this.tasks.set(task.taskId, task)
     // 用同一只时钟剪枝：调用方传了 now（单测假时钟）就不能拿真实时间比 3 天窗口。
     this.prune(now)
+    this.notifyChange()
     return task
+  }
+
+  /**
+   * 从落盘记录恢复（跨重启记住完成历史）。
+   *
+   * 只入簿、不改盘：写盘由调用方的 onChange 防抖决定。短号计数器按恢复出来
+   * 的最大号回填，重启后新派的任务不会撞上 `t1`/`p1`。
+   */
+  restore(records: unknown, now = Date.now()): LedgerRestoreResult {
+    const result = restoreLedgerTasks(records, now)
+    for (const task of result.tasks) {
+      if (this.tasks.has(task.taskId)) continue
+      this.tasks.set(task.taskId, task)
+      const seq = Number(task.taskId.slice(1))
+      if (!Number.isFinite(seq) || seq <= 0) continue
+      if (task.taskId.startsWith('p')) this.pcSeq = Math.max(this.pcSeq, seq)
+      else this.seq = Math.max(this.seq, seq)
+    }
+    return result
   }
 
   get(taskId: string): TihuTask | undefined {
@@ -434,6 +660,7 @@ export class TaskLedger {
     if (task.state === 'queued') task.state = 'dispatched'
     task.startedAt = task.startedAt === 0 ? now : task.startedAt
     task.updatedAt = now
+    this.notifyChange()
     return task
   }
 
@@ -453,6 +680,7 @@ export class TaskLedger {
     if (input.preset !== undefined && input.preset !== '') task.preset = input.preset
     task.waitingCommander = undefined
     task.updatedAt = now
+    this.notifyChange()
     return task
   }
 
@@ -464,6 +692,7 @@ export class TaskLedger {
     if (at < 0) return
     task.sessionIds.splice(at, 1)
     task.updatedAt = now
+    this.notifyChange()
   }
 
   /** 会话开始跑（turn/start）：排队/派单/回答完 → 执行中。 */
@@ -473,6 +702,7 @@ export class TaskLedger {
     if (task.state === 'queued' || task.state === 'dispatched' || task.state === 'awaiting') {
       task.state = 'running'
       task.updatedAt = now
+      this.notifyChange()
     }
     return task
   }
@@ -506,7 +736,11 @@ export class TaskLedger {
     const folder = String(input.folder ?? '').trim()
     if (folder !== '' && task.folder !== folder) task.folder = folder
     const summary = String(input.summary ?? '').trim()
-    if (summary !== '') task.resultLine = summary
+    let summaryChanged = false
+    if (summary !== '' && task.resultLine !== summary) {
+      task.resultLine = summary
+      summaryChanged = true
+    }
     // 会话标题变了/摘要变了：summary 不上棋盘，但结果行要跟着最新一条回复走。
     if (task.state !== input.state) {
       task.state = input.state
@@ -528,6 +762,7 @@ export class TaskLedger {
     } else if (changed) {
       task.updatedAt = at
     }
+    if (changed || summaryChanged) this.notifyChange()
     return changed
   }
 
@@ -544,6 +779,7 @@ export class TaskLedger {
     task.lastStepAt = undefined
     task.stepDurations = undefined
     task.updatedAt = now
+    this.notifyChange()
   }
 
   /** 步数推进（tool/call）：只增不减；顺手记最近 8 步耗时给棋盘微条。 */
@@ -559,6 +795,7 @@ export class TaskLedger {
       task.step = next
     }
     task.updatedAt = now
+    this.notifyChange()
   }
 
   /** 里程碑：任务行摘要更新（P2，可播但低优先）。 */
@@ -569,6 +806,7 @@ export class TaskLedger {
     if (text === '') return
     task.summary = text
     task.updatedAt = now
+    this.notifyChange()
   }
 
   /**
@@ -587,6 +825,7 @@ export class TaskLedger {
     task.defaultIndex = Math.max(0, Math.min(input.defaultIndex ?? 0, task.options.length - 1))
     task.decisionDeadline = now + Math.max(0, input.timeoutMs)
     task.updatedAt = now
+    this.notifyChange()
     return task
   }
 
@@ -603,6 +842,7 @@ export class TaskLedger {
     task.defaultIndex = undefined
     task.decisionDeadline = undefined
     task.updatedAt = now
+    this.notifyChange()
     return task
   }
 
@@ -625,6 +865,7 @@ export class TaskLedger {
     task.holdingForChildren = undefined
     task.pendingResultLine = undefined
     task.childRunning = undefined
+    this.notifyChange()
     return task
   }
 
@@ -641,6 +882,7 @@ export class TaskLedger {
     if (next === 0) task.childRunning = undefined
     else task.childRunning = next
     task.updatedAt = now
+    this.notifyChange()
     return true
   }
 
@@ -663,6 +905,7 @@ export class TaskLedger {
     }
     const line = String(input.resultLine ?? '').trim()
     if (line !== '') task.pendingResultLine = line
+    this.notifyChange()
     return task
   }
 
@@ -674,6 +917,7 @@ export class TaskLedger {
     task.holdingForChildren = undefined
     task.pendingResultLine = undefined
     task.updatedAt = now
+    this.notifyChange()
   }
 
   /**
@@ -691,6 +935,7 @@ export class TaskLedger {
     task.holdingForChildren = undefined
     task.pendingResultLine = undefined
     task.updatedAt = now
+    this.notifyChange()
     return task
   }
 
@@ -699,6 +944,7 @@ export class TaskLedger {
     if (task === undefined) return
     task.spokenAt = now
     if (task.state === 'done') task.state = 'announced'
+    this.notifyChange()
   }
 
   /** 撤单：还没起跑的排队任务直接从棋盘拿掉（起跑过的要先停再撤，那是危险动作）。 */
@@ -707,6 +953,7 @@ export class TaskLedger {
     if (task === undefined) return undefined
     task.state = 'archived'
     task.archivedAt = now
+    this.notifyChange()
     return task
   }
 
@@ -719,6 +966,7 @@ export class TaskLedger {
     if (task === undefined) return undefined
     task.state = 'archived'
     task.archivedAt = task.archivedAt ?? now
+    this.notifyChange()
     if (task.journaled === true) return undefined
     task.journaled = true
     return journalLineOf(task)
@@ -750,6 +998,8 @@ export class TaskLedger {
   clear(): void {
     this.tasks.clear()
     this.seq = 0
+    this.pcSeq = 0
+    this.notifyChange()
   }
 }
 
