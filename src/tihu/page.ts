@@ -129,7 +129,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen.board-mode .home-top { display:flex; }
   #screen.board-mode .stage, #screen.board-mode .title, #screen.board-mode ul,
   #screen.board-mode .action-bar { display:none; }
-  #screen.board-mode .home-body { display:block; }
+  /* 棋盘：列表区吃掉翻页条上方的全部高度，翻页条**钉在屏底**（用户 2026-11-10 实机：
+     第 2 页只有 2 条时，翻页栏跟着列表往上跑，位置和第 1 页不一样）。
+     高度预算 222 = 顶行 14 + 间隙 2 + 列表区（4×48 = 192）+ 翻页条 12 + 底边距 2。 */
+  #screen.board-mode { gap:2px; }
+  #screen.board-mode .home-body { display:flex; flex-direction:column; min-height:0; }
+  #screen .board-list { flex:1 1 auto; min-height:0; overflow:hidden; }
   #screen .board-item { height:48px; box-sizing:border-box; padding:6px 0; overflow:hidden; }
   #screen .board-row1 { display:flex; align-items:center; gap:6px; font-size:15px; font-weight:700; line-height:20px; white-space:nowrap; overflow:hidden; }
   /* 状态胶囊：文字优先（色盲/强光下也读得出），颜色只做辅助 */
@@ -163,8 +168,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-status.awaiting { width:14px; height:14px; border-radius:50%; background:var(--warn);
     color:#1b1305; font-size:11px; font-weight:700; line-height:14px; text-align:center; }
   #screen .board-status.running svg { display:block; width:14px; height:14px; }
-  /* 翻页条：上一页 / 第 N/M 页 / 下一页（只有一页时 JS 不建这条） */
-  #screen .board-pager { display:flex; align-items:center; justify-content:center; gap:8px; height:12px; }
+  /* 翻页条：上一页 / 第 N/M 页 / 下一页（只有一页时 JS 不建这条）。
+     钉在屏底：flex:none + margin-bottom:2px → 条底边离屏幕外沿 8+1+2 = 11px（用户要求 10–12px），
+     不管这一页剩 4 条还是 1 条，它都在同一个位置。 */
+  #screen .board-pager { display:flex; flex:none; align-items:center; justify-content:center; gap:8px;
+    height:12px; margin-bottom:2px; }
   #screen .board-pager button { border:0; background:none; padding:0; color:#9fb0c0; font-size:11px; line-height:12px; }
   #screen .board-pager button.cur { color:#5FD2C8; font-weight:700; }
   #screen .board-pager button.off { color:#48525d; }
@@ -610,6 +618,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     renderCountdown(null);
     var body = $('homeBody');
     body.innerHTML = '';
+    // 列表区单独一层（flex:1）：翻页条在它下面，钉在屏底 —— 一条还是四条都不影响翻页条的位置。
+    var list = document.createElement('div');
+    list.className = 'board-list';
+    body.appendChild(list);
     var rows = Array.isArray(board.rows) ? board.rows : [];
     if (rows.length === 0) {
       var empty = document.createElement('div');
@@ -630,7 +642,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       empty.appendChild(l1);
       empty.appendChild(l2);
       empty.appendChild(l3);
-      body.appendChild(empty);
+      list.appendChild(empty);
     }
     for (var i = 0; i < rows.length; i += 1) {
       var row = rows[i];
@@ -679,7 +691,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       row2.appendChild(boardStatusEl(row));
       item.appendChild(row1);
       item.appendChild(row2);
-      body.appendChild(item);
+      list.appendChild(item);
     }
     // 翻页条：每页 4 条（BOARD_PAGE_SIZE）；只有一页时整条不建（用户 2026-11-10「首页恢复翻页」）。
     var page = board.page || { index: 0, total: 1 };
