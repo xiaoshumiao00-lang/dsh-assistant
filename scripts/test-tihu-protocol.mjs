@@ -43,6 +43,7 @@ import { createTihuRuntime, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE
 import { BOARD_PAGE_SIZE } from '../src/tihu/task-ledger.ts'
 import { DONE_NO_REPLY_TEXT, RECEIPT_SECONDS, prepareDoneText } from '../src/tihu/task-screens.ts'
 import { TIHU_CONTROL_SECTION_TEXT, createTihuControlRunner, matchSessionRows, tihuActionNames } from '../src/tihu/control.ts'
+import { COMMANDER_REPLY_SHAPE, commanderReplyTail, parseCommanderReply } from '../src/tihu/dispatch-protocol.ts'
 import {
   activityEntryOf,
   applyEarlyThinking,
@@ -295,6 +296,51 @@ test('toTtsSegments：无标点超长单句仍硬切，不丢字', () => {
   assert.equal(segments.length, 4, '300 / 80 → 80+80+80+60')
   assert.deepEqual(segments.map((s) => s.length), [80, 80, 80, 60])
   assert.equal(segments.join(''), text)
+})
+
+/* ---------- 指挥台纯文本派单协议（2026-11-10：不依赖工具挂载） ---------- */
+
+console.log('[tihu] 指挥台 JSON 结论解析')
+
+test('指挥台回复：纯 JSON / ```json 包裹 / 前后多余说明 / 中文引号 / 裸键 / 坏 JSON / 空', () => {
+  const expected = { project: '青年基金申请书', session: 'append', appendTo: 'cu-fund' }
+  // 1) 纯 JSON
+  assert.deepEqual(parseCommanderReply('{"project":"青年基金申请书","session":"append","append_to":"cu-fund"}'), expected)
+  // 2) ```json 代码块包裹（带语言标记）
+  assert.deepEqual(parseCommanderReply('```json\n{"project":"青年基金申请书","session":"append","append_to":"cu-fund"}\n```'), expected)
+  // 3) 前后多余说明：只抠中间那行
+  assert.deepEqual(parseCommanderReply('判断如下，应该接着原来那条做：\n{"project":"青年基金申请书","session":"append","append_to":"cu-fund"}\n以上。'), expected)
+  // 4) 中文引号 + 全角冒号/逗号
+  const halfWidth = parseCommanderReply('{"project"："青年基金申请书"，"session"："append"，"append_to"："cu-fund"}')
+  assert.ok(halfWidth !== undefined)
+  assert.equal(halfWidth.session, 'append')
+  assert.deepEqual(parseCommanderReply('{“project”：“青年基金申请书”，“session”：“append”，“append_to”：“cu-fund”}'), expected)
+  // 5) 裸键名 + 尾逗号
+  assert.deepEqual(parseCommanderReply('{project:"青年基金申请书",session:"new",append_to:"",}'), { project: '青年基金申请书', session: 'new', appendTo: '' })
+  // 6) session 写中文也认
+  const appendCn = parseCommanderReply('{"project":"青年基金申请书","session":"接着","append_to":"cu-fund"}')
+  const newCn = parseCommanderReply('{"project":"青年基金申请书","session":"新建","append_to":""}')
+  assert.ok(appendCn !== undefined && newCn !== undefined)
+  assert.equal(appendCn.session, 'append')
+  assert.equal(newCn.session, 'new')
+  // 7) 不可用：没有 JSON / 空 / 说 append 却没给 append_to / 别的形状的 JSON
+  assert.equal(parseCommanderReply(''), undefined)
+  assert.equal(parseCommanderReply('   '), undefined)
+  assert.equal(parseCommanderReply('我觉得应该派给青年基金申请书'), undefined)
+  assert.equal(parseCommanderReply('{"project":"青年基金申请书","session":"append","append_to":""}'), undefined)
+  assert.equal(parseCommanderReply('{"count":3,"items":["a"]}'), undefined)
+  assert.equal(parseCommanderReply(null), undefined)
+})
+
+test('指挥台提示词：只回一行 JSON、不做正文、不调工具、附最近会话短号', () => {
+  const tail = commanderReplyTail(['- 青年基金申请书: cu-fund 引言第三段压缩'])
+  assert.ok(tail.includes(COMMANDER_REPLY_SHAPE), '提示词要给出结论形状：' + tail)
+  assert.ok(tail.includes('只输出一行 JSON'), '必须强调只回一行 JSON')
+  assert.ok(tail.includes('不做正文'), '必须禁止做正文')
+  assert.ok(tail.includes('不解释'), '必须禁止解释')
+  assert.ok(tail.includes('不调用任何工具'), '不能依赖任何工具挂载')
+  assert.ok(tail.includes('cu-fund'), '要带最近会话短号，append_to 才有据可依')
+  assert.equal(commanderReplyTail().includes('最近的项目会话'), false, '没有候选就不写空清单')
 })
 
 /* ---------- 三道闸 ---------- */
@@ -4463,6 +4509,257 @@ await testAsync('慢路径：投递成功后 turn/start 不抢等待屏，tihu d
     await waitMs(1_200)
     assert.equal(w.created.length, 1, '派单成功后不能重复建任务：' + JSON.stringify(w.created))
     assert.equal(framesOf(socket).some((frame) => frame.type === 'screen.frame' && frame.payload.title === '没听清派给谁'), false)
+  } finally {
+    w.cleanup()
+  }
+})
+
+/* ---------- 2026-11-10：指挥台纯文本结论（不依赖工具挂载） ---------- */
+
+/**
+ * 指挥台只回纯文本：assistant/message + turn/end，**不调用任何工具**。
+ * `text === undefined` 表示这一轮没有 assistant/message（空回复）。
+ */
+function commanderTextReply(w, text, options = {}) {
+  const handler = w.events.find((entry) => entry.name === 'session/event').handler
+  const session = { id: 'session-cmd', header: { id: 'session-cmd' } }
+  const turn = options.turn
+  if (options.start === true) {
+    handler(session, { type: 'turn/start', time: Date.now(), data: turn === undefined ? { turn: 1 } : { turn } })
+  }
+  if (text !== undefined) {
+    handler(session, {
+      type: 'assistant/message',
+      time: Date.now(),
+      data: { ...(turn === undefined ? {} : { turn }), message: { content: text === '' ? [] : [{ type: 'text', text }] } },
+    })
+  }
+  if (options.end !== false) {
+    handler(session, { type: 'turn/end', time: Date.now(), data: { turn: turn ?? 1, reason: { kind: 'completed' } } })
+  }
+}
+
+/** 轮询到排队卡转正（同一 taskId、棋盘副行不再是「等指挥台判断」），返回耗时毫秒；超时 -1。 */
+async function promotionMs(w, predicate, startedAt, socket, timeoutMs = 2000) {
+  const deadline = startedAt + timeoutMs
+  while (Date.now() < deadline) {
+    const rows = await w.runtime.control.listTasks()
+    const promoted = rows.length === 1 && rows[0].taskId === 't1' && !String(rows[0].sub).includes('等指挥台判断')
+    // 屏上也要真的换掉：showReceipt 的 task.list 是最后一个信号（回执帧在它之前已推）。
+    const boardRow = socket === undefined
+      ? undefined
+      : framesOf(socket).filter((frame) => frame.type === 'task.list').pop()?.payload?.board?.rows?.[0]
+    const boardSettled = boardRow !== undefined && boardRow.taskId === 't1' && !String(boardRow.sub).includes('等指挥台判断')
+    if (promoted && boardSettled && await predicate(rows)) return Date.now() - startedAt
+    await waitMs(10)
+  }
+  return -1
+}
+
+/** 慢路径开场：hello + 一句话，等排队卡出现。 */
+async function openSlowPath(w, clientId) {
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId, protocol: '0' }, 1)))
+  await waitMs(50)
+  const text = '这两个方向我实在拿不定主意了'
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, 2)))
+  await waitMs(120)
+  return { socket, text }
+}
+
+await testAsync('慢路径 JSON：只回一行 JSON → 排队卡 ≤2 秒同 taskId 转正到项目文件夹（不调工具）', async () => {
+  const w = unifiedWorkspace()
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const { socket, text } = await openSlowPath(w, 'u-json-normal')
+    const commanderPrompt = w.prompted.find((item) => item.id === 'session-cmd')
+    assert.ok(commanderPrompt !== undefined, '慢路径要投给指挥台')
+    const tail = String(commanderPrompt.blocks[1].text)
+    assert.ok(tail.includes('只输出一行 JSON'), '提示词要明确只回一行 JSON：' + tail)
+    assert.ok(tail.includes('不做正文'), '提示词禁止做正文')
+    assert.ok(tail.includes('不解释'), '提示词禁止解释')
+    assert.ok(tail.includes('不调用任何工具'), '指挥会话不需要任何额外工具')
+    assert.ok(tail.includes('append_to'), '提示词要给出结论字段')
+    assert.equal(tail.includes('调 tihu dispatch'), false, '不能再要求指挥台调用 dispatch 工具')
+
+    const waiting = (await w.runtime.control.listTasks())[0]
+    assert.equal(waiting.taskId, 't1')
+    assert.equal(waiting.sub, '个人助手 · 等指挥台判断')
+    assert.equal(w.created.length, 0, '判项目阶段不许先建任务会话')
+
+    const startedAt = Date.now()
+    commanderTextReply(w, '{"project":"青年基金申请书","session":"new","append_to":""}')
+    const took = await promotionMs(w, async () => w.created.length === 1, startedAt, socket)
+    assert.ok(took >= 0, '2 秒内必须转正（不能继续排队）')
+    assert.ok(took < 2000, `转正耗时 ${took}ms 超过 2 秒`)
+
+    assert.equal(w.created[0].cwd, w.fundFolder, 'JSON 点的项目 → 落项目文件夹')
+    assert.equal(w.created[0].agentPreset, 'computer-use')
+    assert.equal(w.prompted.find((item) => item.id === 'session-task-1').blocks[0].text, text, '原话原样投给任务会话')
+    const tasks = await w.runtime.control.listTasks()
+    assert.equal(tasks.length, 1, '排队卡转正，不新建第二张')
+    assert.equal(tasks[0].taskId, 't1', 'taskId 必须保持不变')
+    assert.equal(tasks[0].sub, '青年基金申请书 · 排队中', '副行不再是「等指挥台判断」')
+    const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop().payload.board
+    assert.equal(board.rows.length, 1)
+    assert.equal(board.rows[0].taskId, 't1')
+    assert.equal(board.rows[0].capsule, '排队中')
+    const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
+    assert.equal(receipt?.payload.title, '已派给 青年基金申请书')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('指挥台 JSON 结论'), 'JSON 结论要落 lane.log：' + log)
+    assert.ok(log.includes('项目=青年基金申请书'))
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('慢路径 JSON：```json 包裹 + 中文引号 → 续到 append_to 指定的原会话（不新建）', async () => {
+  const w = unifiedWorkspace({ seedSessions: ({ fundFolder }) => seedInFund(fundFolder) })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const { socket } = await openSlowPath(w, 'u-json-fence')
+    const startedAt = Date.now()
+    commanderTextReply(w, '```json\n{“project”：“青年基金申请书”，“session”：“append”，“append_to”：“cu-fund”}\n```')
+    const took = await promotionMs(w, async () => w.prompted.some((item) => item.id === 'session-cu-fund'), startedAt, socket)
+    assert.ok(took >= 0 && took < 2000, `续会话也要 ≤2 秒转正，实际 ${took}ms`)
+
+    assert.equal(w.created.length, 0, '续到原会话不许新建')
+    assert.equal(w.prompted.filter((item) => item.id === 'session-cu-fund').length, 1, '只投一次')
+    assert.equal(w.prompted.find((item) => item.id === 'session-cu-fund').blocks[0].text, '这两个方向我实在拿不定主意了')
+    const tasks = await w.runtime.control.listTasks()
+    assert.equal(tasks.length, 1)
+    assert.equal(tasks[0].taskId, 't1')
+    assert.ok(tasks[0].sub.includes('青年基金申请书'), '副行要写项目：' + tasks[0].sub)
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('会话=append'), 'append 结论要落盘：' + log)
+    assert.ok(log.includes('续=cu-fund'))
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('慢路径 JSON：前后带多余说明 → 仍能抠出结论并派单', async () => {
+  const w = unifiedWorkspace()
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const { socket } = await openSlowPath(w, 'u-json-extra')
+    const startedAt = Date.now()
+    commanderTextReply(w, '判断如下，这件事该落在青年基金申请书：\n{"project":"青年基金申请书","session":"new","append_to":""}\n以上，请主人确认。')
+    const took = await promotionMs(w, async () => w.created.length === 1, startedAt, socket)
+    assert.ok(took >= 0 && took < 2000, `带说明也要 ≤2 秒转正，实际 ${took}ms`)
+    assert.equal(w.created[0].cwd, w.fundFolder)
+    const tasks = await w.runtime.control.listTasks()
+    assert.equal(tasks.length, 1)
+    assert.equal(tasks[0].taskId, 't1')
+    assert.ok(tasks[0].sub.includes('青年基金申请书'))
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('慢路径 JSON：解析失败 → 按 routeQuick/最佳卡兜底，排队卡 2 秒内给终态并写 lane.log', async () => {
+  const w = unifiedWorkspace()
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const { socket } = await openSlowPath(w, 'u-json-bad')
+    const startedAt = Date.now()
+    commanderTextReply(w, '这两个方向都像青年基金，但我也说不准，主人再想想？')
+    const took = await promotionMs(w, async () => w.created.length === 1, startedAt, socket)
+    assert.ok(took >= 0 && took < 2000, `解析失败也要 ≤2 秒给终态，实际 ${took}ms`)
+
+    // 这句话 routeQuick / 最佳卡都指不到卡片 → 个人助手兜底；关键是不能再停在排队。
+    assert.equal(w.created[0].cwd, w.home, '兜底落个人助手文件夹：' + w.created[0].cwd)
+    const tasks = await w.runtime.control.listTasks()
+    assert.equal(tasks.length, 1, '不许留一张假排队卡')
+    assert.equal(tasks[0].taskId, 't1')
+    assert.equal(tasks[0].sub, '个人助手 · 排队中')
+    const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop().payload.board
+    assert.deepEqual(board.counts, { running: 0, awaiting: 0, queued: 1, done: 0 })
+    assert.equal(board.rows[0].sub, '个人助手 · 排队中', '等指挥台判断的副行必须消失')
+    const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
+    assert.ok(receipt?.payload.bullets.some((line) => String(line).includes('按最佳卡派出')), '回执要说明是指挥台没给结论：' + JSON.stringify(receipt?.payload.bullets))
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('退回 routeQuick/最佳卡'), '解析失败要落 lane.log：' + log)
+    assert.ok(log.includes('commander-fallback'), '要标出兜底来源')
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('慢路径 JSON：reply 为空 → 不拿上一轮 JSON 冒充结论，2 秒内按兜底给终态', async () => {
+  const w = unifiedWorkspace()
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-json-empty', protocol: '0' }, 1)))
+    await waitMs(50)
+    // 上一轮指挥台确实回过一行合法 JSON（但没有对应的等待）：这一轮空回复不能复用它。
+    commanderTextReply(w, '{"project":"青年基金申请书","session":"new","append_to":""}')
+    await waitMs(60)
+    assert.equal(w.created.length, 0, '没有等待中的问题时，指挥台自说自话不许派单')
+
+    const text = '这两个方向我实在拿不定主意了'
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, 2)))
+    await waitMs(120)
+    const startedAt = Date.now()
+    commanderTextReply(w, undefined) // 只有 turn/end，没有任何 assistant/message
+    const took = await promotionMs(w, async () => w.created.length === 1, startedAt, socket)
+    assert.ok(took >= 0 && took < 2000, `空回复也要 ≤2 秒给终态，实际 ${took}ms`)
+    assert.equal(w.created[0].cwd, w.home, '空回复不能拿上一轮 JSON 派到项目：' + w.created[0].cwd)
+    const tasks = await w.runtime.control.listTasks()
+    assert.equal(tasks.length, 1)
+    assert.equal(tasks[0].taskId, 't1')
+    assert.equal(tasks[0].sub, '个人助手 · 排队中')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('回复为空'), '空回复要落 lane.log：' + log)
+    assert.ok(log.includes('退回 routeQuick/最佳卡'))
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('慢路径 JSON：两句话同时排队 → 按 turn 各认领各的回复，不串台', async () => {
+  const w = unifiedWorkspace()
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-json-two', protocol: '0' }, 1)))
+    await waitMs(50)
+    const first = '这两个方向我实在拿不定主意了'
+    const second = '你帮我看看这件事到底该怎么安排'
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: first, source: 'voice' }, 2)))
+    await waitMs(100)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: second, source: 'voice' }, 3)))
+    await waitMs(140)
+    let tasks = await w.runtime.control.listTasks()
+    assert.equal(tasks.length, 2, '两句话各一张排队卡：' + JSON.stringify(tasks))
+    assert.ok(tasks.every((task) => String(task.sub).includes('等指挥台判断')))
+
+    // 第一轮只认领第一句。
+    commanderTextReply(w, '{"project":"青年基金申请书","session":"new","append_to":""}', { start: true, turn: 1 })
+    const firstDeadline = Date.now() + 2000
+    while (Date.now() < firstDeadline && w.created.length < 1) await waitMs(10)
+    assert.equal(w.created.length, 1, '第一轮只派第一句')
+    tasks = await w.runtime.control.listTasks()
+    const firstTask = tasks.find((task) => task.taskId === 't1')
+    const secondTask = tasks.find((task) => task.taskId === 't2')
+    assert.ok(firstTask.sub.includes('青年基金申请书'), 't1 已转正：' + JSON.stringify(firstTask))
+    assert.equal(secondTask.sub, '个人助手 · 等指挥台判断', 't2 还在等它的那一轮，绝不能被 t1 的回复顶掉')
+
+    // 第二轮认领第二句。
+    commanderTextReply(w, '{"project":"个人助手","session":"new","append_to":""}', { start: true, turn: 2 })
+    const secondDeadline = Date.now() + 2000
+    while (Date.now() < secondDeadline && w.created.length < 2) await waitMs(10)
+    assert.equal(w.created.length, 2, '第二句也要派出')
+    tasks = await w.runtime.control.listTasks()
+    assert.equal(tasks.length, 2, '两句两张卡，不合并、不重复')
+    assert.equal(tasks.find((task) => task.taskId === 't2').sub, '个人助手 · 排队中')
+    assert.deepEqual(w.created.map((item) => item.cwd), [w.fundFolder, w.home])
   } finally {
     w.cleanup()
   }

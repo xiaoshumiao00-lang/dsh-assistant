@@ -453,7 +453,7 @@ defineAction('open_recent', '点首页「最近回答」行，打开最近有回
  * lane 的派单器按「卡片文件夹 → 模板最新步骤目录 → 绑定会话 cwd → 助手 home」定，
  * 模型指错也不会写错地方。
  */
-defineAction('dispatch', '派单：把用户的一句话派给某个项目的 Computer Use 任务会话去执行（text 必填＝用户原话；target 可选＝项目卡名或文件夹关键词；session 可选＝接着那条已有 CU 会话的短号/标题；newSession=true 表示明确新建）。指挥会话自己不要动手做正文，一律走这个 action。', async (args, api) => {
+defineAction('dispatch', '派单：把用户的一句话派给某个项目的 Computer Use 任务会话去执行（text 必填＝用户原话；target 可选＝项目卡名或文件夹关键词；session 可选＝接着那条已有 CU 会话的短号/标题；newSession=true 表示明确新建）。设备语音派单已改由指挥台一行 JSON 结论完成，指挥会话不需要调用本工具。', async (args, api) => {
   if (args.text === undefined) {
     throw new Error('dispatch 需要 text 参数（用户原话）。只传项目名不行：要派的是「做什么」。')
   }
@@ -495,7 +495,7 @@ export function createTihuControlRunner(surface: TihuControlSurface) {
 
 export const TIHU_CONTROL_SECTION_NAME = 'tihu:control'
 
-export const TIHU_CONTROL_SECTION_TEXT = '鹈鹕设备上听到的任务一律用 tihu 的 dispatch 派单（别自己动手做正文），看任务用 list_tasks。删除会话前必须先让用户口头确认，再以 confirm=true 调用。'
+export const TIHU_CONTROL_SECTION_TEXT = '鹈鹕设备上的任务由指挥台一行 JSON 决定落点，别自己动手做正文。删除会话前必须先让用户口头确认，再以 confirm=true 调用。'
 
 /** 挂系统提示段落（失败只记日志，绝不影响插件启动）。 */
 function registerControlSection(ctx: any, log: (line: string) => void): (() => void) | undefined {
