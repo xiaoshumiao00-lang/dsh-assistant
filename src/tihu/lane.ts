@@ -80,6 +80,7 @@ import {
   DONE_KEEP_MS,
   TaskLedger,
   TaskNotifyBus,
+  bestCardMatchOf,
   boardOf,
   capsuleOf,
   chineseIndex,
@@ -194,6 +195,27 @@ export function tihuThinkingFlushMs(): number {
   const raw = Number(process.env.TIHU_THINKING_FLUSH_MS ?? 300)
   if (!Number.isFinite(raw)) return 300
   return clampInt(raw, 20, 5_000)
+}
+
+/**
+ * 慢路径（指挥会话）投递成功后的兜底等待（毫秒）。
+ *
+ * 指挥会话的模型可能几十秒都不回（本机 strata 的 TTFT 实测约 55s），设备屏就一直停在
+ * 「派单 / 正在看该派给谁」，任务没建出来也不报错（2026-11-10 线上 40s+ 实测）。
+ * 超过这个窗口就按快路径的匹配分自己派单，不再等模型。
+ * TIHU_SLOW_PATH_FALLBACK_MS 可覆盖（夹在 50ms ~ 2min；0/负数/非数字回落默认）。
+ */
+export function tihuSlowPathFallbackMs(): number {
+  const raw = Number(process.env.TIHU_SLOW_PATH_FALLBACK_MS ?? 9_000)
+  if (!Number.isFinite(raw) || raw <= 0) return 9_000
+  return clampInt(raw, 50, 120_000)
+}
+
+/** 「没听清派给谁」短提示在屏上停多久再回棋盘（默认 3 秒；TIHU_NOTICE_HOME_MS 可覆盖）。 */
+export function tihuNoticeHomeMs(): number {
+  const raw = Number(process.env.TIHU_NOTICE_HOME_MS ?? 3_000)
+  if (!Number.isFinite(raw) || raw <= 0) return 3_000
+  return clampInt(raw, 100, 30_000)
 }
 
 /**
@@ -617,6 +639,18 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const notifyBus = new TaskNotifyBus()
   /** 唯一指挥会话 id（懒建一次；建不出来就直接上错误屏，不退回旧壳）。 */
   let commanderSessionId: string | undefined
+  /**
+   * 慢路径兜底计时：一句已经投进指挥会话、还在等模型判项目的话。
+   * 同一时刻只留一句（设备一次只说一句）；新的慢路径会先清掉旧的。
+   */
+  let slowPathFallback: { text: string; commander: string; timer: ReturnType<typeof setTimeout> } | undefined
+  /**
+   * 超时兜底已经派过的一句（按字面归一化后的 key）：指挥会话晚到的同一条 dispatch
+   * 不能再建第二条任务。只挡模型这条入口，快路径重复说同一句不受影响。
+   */
+  let fallbackDispatch: { key: string; taskId: string; at: number } | undefined
+  /** 兜底去重窗口：模型最晚也就一两分钟才回（实测 TTFT 55s），5 分钟足够。 */
+  const FALLBACK_DEDUPE_MS = 5 * 60_000
   /* ---------- 电脑端会话镜像（source='pc'）的运行时状态 ---------- */
   /** 电脑端会话 id → 登记簿里的短号（`p1`…）：轮询与事件都按它认领任务。 */
   const pcTaskOfSession = new Map<string, string>()
@@ -3293,6 +3327,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       return undefined
     }
     log(`tihu dispatch task=${task.taskId} project=${card.id} session=${sessionId} folder=${folder}`)
+    // 派单已经发生（不管是快路径、指挥会话还是超时兜底）：慢路径的兜底计时立刻撤掉。
+    clearSlowPathFallback()
     if (device !== undefined) {
       showReceipt(device, task)
       refreshBoards()
@@ -3381,6 +3417,100 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     if (!sent.ok) showInputError(device, sent.error, '指挥会话没有接住这句话，请重说')
   }
 
+  /** 派单字面归一化：去空白与标点、转小写（超时兜底的去重 key）。 */
+  function dispatchKeyOf(text: string): string {
+    return String(text ?? '')
+      .toLowerCase()
+      .replace(/[\s，,。.!！?？:：、；;"'"'（）()\[\]【】《》\-_/\\]+/g, '')
+  }
+
+  /** 清掉慢路径兜底计时（派单成功 / 新一句话 / 卸载时调用）。 */
+  function clearSlowPathFallback(): void {
+    if (slowPathFallback === undefined) return
+    clearTimeout(slowPathFallback.timer)
+    slowPathFallback = undefined
+  }
+
+  /**
+   * 慢路径投递成功后开始计时：模型在窗口内没派出，就自己派。
+   *
+   * 这是「任务没建出来也不报错」的兜底：屏会一直停在「正在看该派给谁」等模型，
+   * 本机 strata 的 TTFT 实测 55s，用户等 40s 就是死屏。超时改走快路径的匹配分。
+   */
+  function armSlowPathFallback(device: TihuDevice, text: string, commander: string): void {
+    clearSlowPathFallback()
+    const waitMs = tihuSlowPathFallbackMs()
+    const timer = setTimeout(() => {
+      slowPathFallback = undefined
+      void runSlowPathFallback(device, text, commander, waitMs)
+    }, waitMs)
+    timer.unref?.()
+    slowPathFallback = { text, commander, timer }
+    log(`tihu slow-path armed session=${commander} after=${waitMs}ms`)
+  }
+
+  /**
+   * 超时兜底：按快路径的匹配分取最佳卡直接派单（与快路径同一条 dispatchToCard，
+   * 含 5 秒回执与派单尾巴）；一张卡都不像就只留一句「没听清派给谁」，3 秒后回棋盘。
+   * 超时本身写 lane.log，排查时能看到是哪句话、等了多久。
+   */
+  async function runSlowPathFallback(device: TihuDevice, text: string, commander: string, waitedMs: number): Promise<void> {
+    if (disposed) return
+    const seconds = Math.max(1, Math.round(waitedMs / 1000))
+    try {
+      appendTihuLaneLog(
+        commander,
+        new Error(`慢路径派单超时：${seconds} 秒内指挥会话没有派出「${taskTitleOf(text, 24)}」`),
+        'slow-path-timeout',
+      )
+    } catch { /* 日志失败不影响兜底 */ }
+    log(`tihu slow-path timeout session=${commander} after=${waitedMs}ms text=${JSON.stringify(text)}`)
+    let card: { id: string; name: string; folder?: string } | undefined
+    try {
+      const cards = projectCards() ?? []
+      const route = routeQuick({ text, cards, tasks: tasks.list() })
+      if (route.kind === 'card') card = route.card
+      else if (route.kind === 'daily') card = ASSISTANT_CARD
+      else card = bestCardMatchOf(text, cards)
+    } catch (error) {
+      log(`tihu slow-path route failed: ${(error as Error)?.message ?? String(error)}`)
+    }
+    if (card === undefined) {
+      showSlowPathMiss(device, text)
+      return
+    }
+    // 先立去重牌再 await：指挥会话晚到的同一条 dispatch 不能再建第二条任务。
+    fallbackDispatch = { key: dispatchKeyOf(text), taskId: '', at: Date.now() }
+    const task = await dispatchToCard(device, text, card)
+    if (task === undefined) {
+      fallbackDispatch = undefined
+      return
+    }
+    fallbackDispatch = { key: dispatchKeyOf(text), taskId: task.taskId, at: Date.now() }
+    log(`tihu slow-path fallback task=${task.taskId} project=${card.id} session=${task.sessionIds[task.sessionIds.length - 1] ?? '-'}`)
+  }
+
+  /** 超时兜底的一张卡都不像：屏上只留一句短提示，停几秒自动回棋盘（不建任务、不假装派出）。 */
+  function showSlowPathMiss(device: TihuDevice, text: string): void {
+    const key = device.sessionId ?? device.id
+    const frame = noticeFrame({ stage: '派单', title: '没听清派给谁', lines: [taskTitleOf(text, 16)], tone: 'idle' })
+    lastFrames.set(key, frame)
+    const targets = [...devices].filter((item) => item.unified)
+    if (targets.length === 0) targets.push(device)
+    for (const target of targets) {
+      if (target.receiptTimer !== undefined) {
+        clearTimeout(target.receiptTimer)
+        target.receiptTimer = undefined
+      }
+      target.pendingPick = undefined
+      target.focusedTask = undefined
+      target.onBoard = false
+      target.send('screen.frame', frame)
+      armScreenHome(target, tihuNoticeHomeMs(), undefined, '派单')
+    }
+    log(`tihu slow-path no card device=${device.id}`)
+  }
+
   /** 慢路径：交给指挥会话的模型判项目（它再调 tihu dispatch）。 */
   async function askCommander(device: TihuDevice, text: string): Promise<void> {
     const commander = await ensureCommanderSession()
@@ -3405,7 +3535,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       target.send('screen.frame', frame)
     }
     const sent = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: COMMANDER_TAIL }])
-    if (!sent.ok) showInputError(device, sent.error, '指挥会话没有接住这句话，请重说')
+    if (!sent.ok) {
+      showInputError(device, sent.error, '指挥会话没有接住这句话，请重说')
+      return
+    }
+    // 投递成功才开始倒计时：投递本身就失败的话走上面的错误屏，不假装在等模型。
+    armSlowPathFallback(device, text, commander)
   }
 
   /** 撤一条任务：还没起跑就直接撤；起跑过的要先「停止」再撤（危险动作要确认）。 */
@@ -3710,6 +3845,15 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     dispatch: async (input) => {
       const text = String(input.text ?? '').trim()
       if (text === '') return '错误：dispatch 需要 text（用户原话，也就是「要做什么」）。'
+      // 超时兜底已经替这句话派过一次：指挥会话晚到的同一条 dispatch 不能建第二条任务。
+      if (fallbackDispatch !== undefined
+        && fallbackDispatch.key === dispatchKeyOf(text)
+        && Date.now() - fallbackDispatch.at < FALLBACK_DEDUPE_MS) {
+        log(`tihu dispatch skipped duplicate after fallback text=${JSON.stringify(text)} task=${fallbackDispatch.taskId || '-'}`)
+        return fallbackDispatch.taskId === ''
+          ? '这条刚刚已经由超时兜底派出去了（正在建任务），不用再派一次。'
+          : `这条刚刚已经由超时兜底派成任务 ${fallbackDispatch.taskId} 了，不用再派一次。`
+      }
       let card: { id: string; name: string; folder?: string } | undefined
       const folderHint = String(input.folder ?? '').trim()
       if (folderHint !== '') {
@@ -3756,6 +3900,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     handleUpgrade,
     dispose: () => {
       disposed = true
+      clearSlowPathFallback()
+      fallbackDispatch = undefined
       stopPcSync()
       if (detailTicker !== undefined) clearInterval(detailTicker)
       detailTicker = undefined

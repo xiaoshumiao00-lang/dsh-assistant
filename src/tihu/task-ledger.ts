@@ -906,6 +906,24 @@ export function longestCommonRun(a: string, b: string): number {
 }
 
 /**
+ * 慢路径超时兜底：在全部项目卡里取「最像」的那一张（与快路径同一套 scoreCardAlias）。
+ *
+ * 与 routeQuick 的区别：routeQuick 判断含糊时「宁可多问一句」，只认 ≥2 字（≥20 分）的
+ * 片段命中；超时兜底已经没有再想的余地，只要有一丝相似就取分数最高的那张。
+ * 但**两张卡同分就不猜**（返回 undefined）：猜错项目比说一句「没听清派给谁」贵得多。
+ */
+export function bestCardMatchOf(text: string, cards: readonly TihuCardRow[]): TihuCardRow | undefined {
+  const scored = cards
+    .map((card) => ({ card, ...scoreCardAlias(text, card) }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score)
+  const best = scored[0]
+  if (best === undefined) return undefined
+  if (scored.length > 1 && scored[1].score === best.score) return undefined
+  return best.card
+}
+
+/**
  * 快路径派单（零模型）：命中就用，不命中得 `{ kind: 'none' }`，由慢路径（指挥会话的模型）接手。
  *
  * 顺序即优先级，与设计 §6 一致：

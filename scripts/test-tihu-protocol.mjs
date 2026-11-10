@@ -2431,6 +2431,17 @@ test('page：连接图标接的是页面已有的那一份连接状态（绿/灰
   assert.equal(/clockText|connState|getHours\(\)/.test(laneSource), false, '时钟与连接归页面侧，lane 不掺和')
 })
 
+test('page：状态屏底部贯穿长横线已整条删除（旧 .bar / #progress 元素与 CSS 一起没了）', () => {
+  const html = pageHtmlOf()
+  assert.equal(html.includes('class="bar"'), false, '屏内不再有旧底部进度条元素')
+  assert.equal(html.includes('id="progress"'), false, '旧的 #progress 计数也已删除')
+  assert.equal(/id="fill"|class="fill"|class="track"/.test(html), false, '旧进度轨/填充一起删除')
+  assert.equal(/#screen\s*>\s*\.bar|#screen \.bar \{|#screen \.track \{|#screen \.fill \{/.test(html), false,
+    '旧底部横线的 CSS 规则全部删除（同权重覆盖曾让 5px 长横线漏出来）')
+  assert.equal(/#screen\.ask-mode::after|#screen\.detail-mode::after/.test(html), false,
+    '不再用 18px 黑条盖底部：那会把追问/进度屏底部内容裁掉')
+})
+
 test('page：顶行 14px，棋盘不再有旧式翻页条，4 行 ×48px 收进 222 内容高', () => {
   const html = pageHtmlOf()
   assert.ok(/#screen \.home-top \{[^}]*height:14px/.test(html), '顶行高 14px（与 stage 那一行同高）')
@@ -3473,6 +3484,133 @@ await testAsync('重新投递：指挥会话失效 → 重建「鹈鹕指挥台�
   assert.ok(log.includes('note=attempt=1/3') && log.includes('note=attempt=3/3'), '三次退避尝试都要留痕')
   delete process.env.TIHU_LANE_LOG
   w.cleanup()
+})
+
+/* ---------- 2026-11-10：慢路径（指挥会话）超时兜底 ---------- */
+
+await testAsync('慢路径超时兜底：等不到指挥会话 → 按最佳匹配卡自己派单（回执＋尾巴＋lane.log），晚到的重复 dispatch 不建第二条', async () => {
+  process.env.TIHU_SLOW_PATH_FALLBACK_MS = '120'
+  const w = unifiedWorkspace({ cards: [] })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-timeout-card', protocol: '0' }, 1)))
+    await waitMs(60)
+    const text = '把青年基金申请书第 3 段再改一遍，要有数据支撑'
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, 2)))
+    await waitMs(20)
+    // 投递之后卡片才出现（模拟控制室这时写入/刷新卡片表）：兜底读的是最新卡片。
+    writeFileSync(w.stateFile, JSON.stringify({
+      projects: {
+        layouts: [{ id: 'card-fund', title: '青年基金申请书' }],
+        folders: { 'card-fund': w.fundFolder },
+        nameOverrides: {},
+        order: ['card-fund'],
+        hidden: [],
+        removed: [],
+      },
+      view: null,
+      revision: 2,
+      updatedAt: new Date(0).toISOString(),
+    }), 'utf8')
+    await waitMs(320)
+
+    assert.equal(w.created.length, 1, '超时后要真的建任务会话：' + JSON.stringify(w.created))
+    assert.equal(w.created[0].cwd, w.fundFolder, '落最佳匹配卡的文件夹')
+    const taskPrompt = w.prompted.find((item) => item.id !== 'session-cmd')
+    assert.ok(taskPrompt !== undefined, '派单要投进任务会话：' + JSON.stringify(w.prompted.map((item) => item.id)))
+    assert.ok(String(taskPrompt.blocks[1].text).includes('这句话已派到「青年基金申请书」'), '与快路径同一条派单尾巴')
+    const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
+    assert.ok(receipt !== undefined, '超时兜底也要出 5 秒回执屏')
+    assert.equal(receipt.payload.title, '已派给 青年基金申请书')
+    assert.equal(receipt.payload.countdown.seconds, 5, '回执 5 秒计时照旧')
+    assert.deepEqual(receipt.payload.steps.map((step) => step.state), ['done', 'done', 'active'], '三拍圆点照旧')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('note=slow-path-timeout'), '超时要写 lane.log：' + log)
+    assert.ok(log.includes('慢路径派单超时'), 'lane.log 要写清是哪句话超时')
+
+    const again = await w.runtime.control.dispatch({ text })
+    assert.ok(String(again).includes('不用再派一次'), '指挥会话晚到的同一条 dispatch 要被挡住：' + again)
+    assert.equal(w.created.length, 1, '晚到的重复 dispatch 不许建第二条任务')
+  } finally {
+    delete process.env.TIHU_SLOW_PATH_FALLBACK_MS
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('慢路径超时兜底：一张卡都不像 → 只留「没听清派给谁」短提示，随后自动回棋盘', async () => {
+  process.env.TIHU_SLOW_PATH_FALLBACK_MS = '100'
+  process.env.TIHU_NOTICE_HOME_MS = '120'
+  const w = unifiedWorkspace()
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-timeout-miss', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把今天要做的三件事整理成清单', source: 'voice' }, 2)))
+    await waitMs(420)
+
+    assert.equal(w.created.length, 0, '匹配不到就不许乱建任务')
+    const frames = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+    const noticeIndex = frames.findIndex((frame) => frame.payload.title === '没听清派给谁')
+    assert.ok(noticeIndex >= 0, '要出一句短提示：' + JSON.stringify(frames.map((frame) => frame.payload.title)))
+    assert.equal(frames[noticeIndex].payload.stage, '派单')
+    assert.ok(frames.slice(noticeIndex + 1).some((frame) => frame.payload.board !== undefined), '短提示之后要自动回棋盘')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('note=slow-path-timeout') && log.includes('慢路径派单超时'), '没匹配也要把超时写进 lane.log')
+  } finally {
+    delete process.env.TIHU_SLOW_PATH_FALLBACK_MS
+    delete process.env.TIHU_NOTICE_HOME_MS
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('慢路径：投递成功后 turn/start 不抢屏，tihu dispatch 回执立刻盖掉「正在看该派给谁」，且不再触发兜底', async () => {
+  process.env.TIHU_SLOW_PATH_FALLBACK_MS = '400'
+  const w = unifiedWorkspace()
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-timeout-cover', protocol: '0' }, 1)))
+    await waitMs(60)
+    const text = '这两个方向我实在拿不定主意了'
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, 2)))
+    await waitMs(90)
+    let last = framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()
+    assert.equal(last.payload.stage, '派单')
+    assert.equal(last.payload.title, '正在看该派给谁', '投递成功后先停在派单提示屏')
+
+    const onSessionEvent = w.events.find((entry) => entry.name === 'session/event').handler
+    onSessionEvent({ id: 'session-cmd', header: { id: 'session-cmd' } }, { type: 'turn/start', data: { turn: 1 } })
+    await waitMs(30)
+    last = framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()
+    assert.equal(last.payload.title, '正在看该派给谁', 'turn/start 不许把派单提示屏抢成别的屏')
+
+    const reply = await w.runtime.control.dispatch({ text, project: '青年基金申请书' })
+    await waitMs(60)
+    assert.ok(String(reply).includes('已派给「青年基金申请书」'), 'dispatch 正常派出：' + reply)
+    last = framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()
+    assert.equal(last.payload.stage, '派单')
+    assert.equal(last.payload.title, '已派给 青年基金申请书', 'tihu dispatch 的回执要立刻盖掉提示屏')
+
+    // 指挥会话收尾的一句「已派给…」不能把回执屏改成回答屏。
+    onSessionEvent({ id: 'session-cmd', header: { id: 'session-cmd' } }, {
+      type: 'turn/end',
+      data: { turn: 1, reason: { kind: 'completed' } },
+    })
+    await waitMs(30)
+    last = framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()
+    assert.equal(last.payload.stage, '派单', '指挥会话 turn/end 不许抢回执屏')
+
+    // 兜底计时已被这次派单撤掉：等过原定超时也不会有第二条任务/「没听清」。
+    await waitMs(520)
+    assert.equal(w.created.length, 1, '派单成功后兜底必须撤销，不能重复建任务：' + JSON.stringify(w.created))
+    assert.equal(framesOf(socket).some((frame) => frame.type === 'screen.frame' && frame.payload.title === '没听清派给谁'), false)
+  } finally {
+    delete process.env.TIHU_SLOW_PATH_FALLBACK_MS
+    w.cleanup()
+  }
 })
 
 /* ---------- 汇总 ---------- */console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)

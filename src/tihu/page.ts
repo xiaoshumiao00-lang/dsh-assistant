@@ -67,12 +67,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen.alert { border-color:#000; }
   #screen.warn { border-color:#000; }
   #screen.warn .stage, #screen.warn .title { color:var(--warn); }
-  #screen.ask-mode .cd-row, #screen.ask-mode .cd-track, #screen.ask-mode .cd-fill, #screen.ask-mode .bar, #screen.ask-mode #progress { display:none !important; }
-  #screen.detail-mode .cd-row, #screen.detail-mode .cd-track, #screen.detail-mode .cd-fill, #screen.detail-mode .bar, #screen.detail-mode #progress { display:none !important; }
-  /* 追问/详情是纯状态屏：底部只留黑底，连状态屏残留的 1px 分隔线也不显示。 */
-  #screen.ask-mode::after, #screen.detail-mode::after {
-    content:''; position:absolute; left:0; right:0; bottom:0; height:18px; background:#05080b; z-index:20; pointer-events:none;
-  }
+  #screen.ask-mode .cd-row, #screen.ask-mode .cd-track, #screen.ask-mode .cd-fill { display:none !important; }
+  #screen.detail-mode .cd-row, #screen.detail-mode .cd-track, #screen.detail-mode .cd-fill { display:none !important; }
   /* 完成播报的朗读波形：新完成页在顶栏里自己画（见 done-view） */
   #screen.alert .title, #screen.alert .stage { color:var(--err); }
   /* 首页最上方那一行（用户 2026-11-08 确认）：原来的「项目 N 个 · 第 x/y 页」整段删掉，
@@ -109,7 +105,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   /* 状态屏正文：标题一行、正文最多 4 行；进度条与顶行都进不了正文区。 */
   #screen .home-body { display:none; flex:1; overflow:hidden; }
   #screen.home-mode .home-body { display:block; }
-  #screen.home-mode .title, #screen.home-mode ul, #screen.home-mode .bar,
+  #screen.home-mode .title, #screen.home-mode ul,
   #screen.home-mode .action-bar { display:none; }
   /* 旧式翻页条已整体删除（用户 2026-11-09：设备屏不要翻页控件）。
      棋盘固定最多 4 条（BOARD_PAGE_SIZE）：顶行 14 + 间隙 4 + 4×48 = 210 ≤ 222，四行都完整。 */
@@ -131,7 +127,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
      内容高 222 = 顶行 14 + 间隙 4 + 4×48（每行 20px 标题 + 16px 副行 + 上下 6px）+ 余 12。 */
   #screen.board-mode .home-top { display:flex; }
   #screen.board-mode .stage, #screen.board-mode .title, #screen.board-mode ul,
-  #screen.board-mode .bar, #screen.board-mode .action-bar { display:none; }
+  #screen.board-mode .action-bar { display:none; }
   #screen.board-mode .home-body { display:block; }
   #screen .board-item { height:48px; box-sizing:border-box; padding:6px 0; overflow:hidden; }
   #screen .board-row1 { display:flex; align-items:center; gap:6px; font-size:15px; font-weight:700; line-height:20px; white-space:nowrap; overflow:hidden; }
@@ -184,7 +180,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .done-view { display:none; flex:1; min-height:0; overflow:hidden; flex-direction:column; gap:2px; }
   #screen.done-mode .done-view { display:flex; }
   #screen.done-mode .home-top, #screen.done-mode .stage, #screen.done-mode .title,
-  #screen.done-mode ul, #screen.done-mode .bar, #screen.done-mode .steps,
+  #screen.done-mode ul, #screen.done-mode .steps,
   #screen.done-mode .cd-row, #screen.done-mode .home-body { display:none; }
   #screen .done-bar { position:relative; flex:none; height:20px; display:flex; align-items:center; gap:6px; }
   #screen .done-stage { flex:none; font-size:11px; line-height:20px; color:#5FD2C8; font-weight:400; }
@@ -224,8 +220,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .cd-track { flex:1; height:8px; border-radius:3px; background:#182230; overflow:hidden; }
   #screen .cd-fill { height:100%; width:100%; background-image:linear-gradient(90deg,var(--accent) 0 82%,transparent 82% 100%); background-size:20% 100%; background-repeat:repeat-x; transition:width .95s linear; animation:tihu-cd-flow .9s linear infinite; }
   @keyframes tihu-cd-flow { from { background-position:0 0; } to { background-position:20px 0; } }
-  #screen > .bar { display:none; }
-  #screen #progress { display:none; }
   /* 「在听 · 已唤醒」（屏 3）：唤醒词命中后盖在屏上，说完停 3 秒自动发送 */
   #screen .listen { display:none; position:absolute; inset:0; z-index:6; background:#05080b;
     padding:8px; box-sizing:border-box; flex-direction:column; align-items:center; justify-content:center; gap:4px; }
@@ -249,9 +243,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
      右下角不再写任何文字、也不显示任何东西（上一轮 ecf48fa 删掉的滚动余量角落提示「还有 N 行」
      继续保持删除，不恢复）。回答屏底部那排按钮（停止/重读/主页/上一条/下一条）位置与样式都不动。 */
   /* 主页屏也从来不显示角落提示：那块地方是翻页按钮的（› 在右下角），不能被压住 */
-  #screen .bar { margin-top:auto; display:flex; align-items:center; gap:6px; font-size:10px; color:var(--dim); }
-  #screen .track { flex:1; height:5px; border-radius:3px; background:#182230; overflow:hidden; }
-  #screen .fill { height:100%; width:0; background:var(--accent); transition:width .3s; }
+  /* 旧版底部进度条/贯穿横线已整体删除（用户 2026-11-10：notice/派单类屏底部不许留装饰线）。
+     曾经「> .bar 隐藏」被后面的「#screen .bar 显示」同权重覆盖，
+     320×240 状态屏底部就多出一条 5px 的整屏长横线——现在连元素一起删掉。 */
   #screen.busy .stage { color:var(--warn); } #screen.alert .stage { color:var(--err); } #screen.ok .stage { color:var(--accent); }
   .screen-tools { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
   .screen-tools button { padding:6px 10px; font-size:12px; }
@@ -328,7 +322,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
           <div class="l3">想清楚再说不着急</div>
           <div class="l3">10 秒没说话就退出 · 长按也能说</div>
         </div>
-        <div class="bar"><span id="progress">—</span><div class="track"><div class="fill" id="fill"></div></div></div>
       </div>
       <div class="grille"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
     </div>
@@ -859,11 +852,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.actions = Array.isArray(payload.actions) ? payload.actions : [];
     applyScreenClass((payload.tone || 'idle') + (state.actions.length ? ' has-actions' : '') + (payload.stage === '追问' ? ' ask-mode' : '') + (payload.stage === '进度' ? ' detail-mode' : ''));
     renderActions();
-    var progress = payload.progress;
-    if (progress && typeof progress.done === 'number') {
-      $('progress').textContent = progress.total ? (progress.done + '/' + progress.total) : String(progress.done);
-      $('fill').style.width = progress.total ? Math.min(100, Math.round(progress.done / progress.total * 100)) + '%' : '0%';
-    }
     applyAudioRecovery();
   }
 
@@ -1257,7 +1245,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       }
       case 'event.progress':
         addEvent('progress', (payload.stage ? '[' + payload.stage + '] ' : '') + (payload.text || ''));
-        if (typeof payload.done === 'number') { $('progress').textContent = payload.total ? payload.done + '/' + payload.total : String(payload.done); }
         break;
       case 'event.alert':
         if (payload.level === 'error') {
