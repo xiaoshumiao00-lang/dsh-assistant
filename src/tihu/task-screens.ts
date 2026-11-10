@@ -71,6 +71,15 @@ export const DONE_BODY_FONT_PX = 15
 export const DONE_BODY_TEXT_WIDTH_PX = CONTENT_WIDTH_PX - 16
 
 /**
+ * 取不到助手回复时的完成页正文。
+ *
+ * 为什么不是任务标题：2026-11-10 实机核对发现，电脑端 CU 会话的 `doneText` 为空时
+ * 旧实现拿 `task.title` 兜底，屏上就成了「大标题 + 同一条标题的截断版」——等于用标题
+ * 冒充正文。宁可明确写「没有文字回复」，也不能把人骗过去。
+ */
+export const DONE_NO_REPLY_TEXT = '（没有文字回复）'
+
+/**
  * 回答正文开头的「状态勾」不是屏上内容：模型常把 ✅/✓/✔/☑ 当结论标记写在第一句前面，
  * 完成页上就成了青底行左边多一个勾形图标（2026-11-10 实机验收，参考图里没有）。
  * 只剥**行首**的勾＋其后的空白，正文里的勾（表格、清单）原样保留。
@@ -186,7 +195,7 @@ export function doneFrame(input: {
 }): ScreenFramePayload {
   const body = String(input.replyText ?? '').trim() !== ''
     ? String(input.replyText)
-    : ((input.bullets ?? []).join(' ').trim() !== '' ? (input.bullets ?? []).join('\n') : input.resultLine)
+    : ((input.bullets ?? []).join(' ').trim() !== '' ? (input.bullets ?? []).join('\n') : (input.resultLine || DONE_NO_REPLY_TEXT))
   const lines = doneLinesOf(body)
   const fallback = doneLinesOf(input.resultLine)
   const shown = lines.length > 0 ? lines : fallback
