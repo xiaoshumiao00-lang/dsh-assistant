@@ -497,6 +497,13 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     /* 完成页：done = { lines, current }；高亮只由每段 PCM 的真实开始/结束事件推进
        （见 segmentStarted/segmentEnded），没有任何按时间翻行的兜底计时器。 */
     done: null, doneRanges: null,
+    /* 完成页当前这条任务（playback.state 与暂停点都要带 taskId） */
+    doneTaskId: '',
+    /* 段级续播：暂停时记下第几段（1 起），继续时宿主从该段第一个字重发 PCM。
+       采样级暂停不可靠（WebAudio 时间轴 + suspended 时丢块），所以只做段级。 */
+    pausedAt: null,
+    /* 已处理的设备级 opId（宿主 tool 的幂等键，保留最近 32 个）：重复到达只回 ack 不重复执行。 */
+    opIds: [],
     /* 免按住（唤醒词聆听）：browser 关键词 → 屏 3「在听」→ 停 3 秒发送；10 秒没说话退出 */
     wake: false, wakeRec: null, wakeRestart: 0, listenOn: false, listenText: '', listenTimer: 0, listenIdle: 0 };
 
@@ -776,6 +783,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function clearDoneState() {
     state.doneRanges = null;
     state.done = null;
+    state.doneTaskId = '';
     var body = $('doneBody');
     if (body) body.innerHTML = '';
   }
@@ -839,6 +847,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var meta = entry.meta || {};
     var ctx = state.audioCtx;
     logReadSegment('start', meta, ctx ? ctx.currentTime : entry.at);
+    // 每段真的开始响 → 上报一次（宿主 tihu_status 的「朗读中 · 第 N 段」读它，不靠猜）。
+    if (meta.read === 'done') reportPlayback('playing');
     if (meta.read !== 'done') return;
     var done = state.done;
     if (!done || state.screenMode !== 'done') return;
@@ -868,11 +878,16 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var lines = (Array.isArray(raw.lines) ? raw.lines : []).map(function (line) { return String(line == null ? '' : line); })
       .filter(function (line) { return line.trim() !== ''; });
     var current = Math.max(0, Math.min(Math.max(0, lines.length - 1), Number(raw.current) || 0));
+    // 新的一屏完成页（重读/跳段/新任务）＝旧排程一律作废：不清的话重读会和上一轮 PCM
+    // 排在同一条时间轴上，听起来就是「两遍叠在一起」。
+    stopPcm();
+    state.pausedAt = null;
     state.screenMode = 'done';
     state.hostAlert = false;
     state.highlightLock = false;
     state.done = { lines: lines, current: current };
     state.doneRanges = Array.isArray(raw.ranges) ? raw.ranges : null;
+    state.doneTaskId = payload.taskId ? String(payload.taskId) : '';
     state.actions = Array.isArray(payload.actions) ? payload.actions : [];
     state.doneMoreText = payload.more && payload.more.text ? String(payload.more.text) : '';
     $('stage').style.display = 'none';
@@ -1252,12 +1267,55 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
           console.assert(endedOk, '[tihu] 朗读播完时 AudioContext 不是 running：' + (state.audioCtx && state.audioCtx.state));
           addEvent(endedOk ? 'done' : 'alert', endedOk ? '朗读结束：60 秒后自动回棋盘' : '朗读结束时音频仍未解锁（点一下屏幕再点重读）');
           flushReadRound();
+          reportPlayback('idle');
         }
       };
       // 重读缓存（本轮完整 PCM）；试听音频不进缓存（否则下次「重读」会念成试听句）。
       return entry;
     } catch (e) { markAudioDropped(); /* 解码失败：屏内保留重读恢复 */ }
     return null;
+  }
+  /**
+   * 播放控制（规格书 §7 第 2 处）：从「手指点屏」的 stop/replay/taskBoard/prev/next 分支里
+   * 抽出来，让页面按钮与宿主 playback.control 走**同一套**动作。
+   *
+   * 粒度（§8.5，重要限制）：暂停/继续是**段级**的 —— 暂停＝清空已排程队列并记住「第 N 段」，
+   * 继续＝宿主从该段第一个字重发 PCM，本行会重念 1–3 秒。绝不跳字、不错位。
+   */
+  function applyPlayback(action, meta) {
+    var info = meta || {};
+    if (action === 'stop') {
+      stopPcm();
+      state.pausedAt = null;
+      reportPlayback('idle');
+      return { ok: true };
+    }
+    if (action === 'pause') {
+      var hasAudio = state.pcmSources.length > 0;
+      if (!hasAudio && !state.done) return { ok: false, reason: 'nothing-playing' };
+      var segment = state.done ? state.done.current + 1 : 1;
+      stopPcm();
+      state.pausedAt = { segment: segment, line: segment - 1, taskId: state.doneTaskId };
+      reportPlayback('paused');
+      return { ok: true, segment: segment };
+    }
+    if (action === 'resume' || action === 'seek') {
+      var from = info.from || {};
+      var wanted = Number(from.segment);
+      if (!isFinite(wanted) || wanted < 1) wanted = state.pausedAt ? state.pausedAt.segment : 1;
+      if (!state.done) {
+        state.pausedAt = null;
+        return { ok: false, reason: 'no-done-screen' };
+      }
+      stopPcm();
+      var index = Math.max(0, Math.min(state.done.lines.length - 1, Math.round(wanted) - 1));
+      state.done.current = index;
+      paintDone();
+      state.pausedAt = null;
+      reportPlayback('playing');
+      return { ok: true, segment: index + 1 };
+    }
+    return { ok: false, reason: 'unknown-action' };
   }
   /** 试听提示音：0.6 秒 440Hz 正弦，音量中等（直接证明音频通路可用）。 */
   function playBeep() {
@@ -1416,8 +1474,21 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       state.clientId = state.clientId || ('web-' + Math.random().toString(36).slice(2, 10));
       // 统一指挥是唯一入口：永远裸 hello（宿主绑「鹈鹕指挥台」，屏上是任务棋盘）。
       sendHello('', false);
+      // 规格书 §6.3：连上就补一条「空闲」，宿主丢掉上一轮连接留下的朗读/暂停假设
+      // （否则断线重连后 tihu_status 会报旧的「朗读中」）。
+      reportPlayback('idle');
       send('voice.list', {});
-      try { send('voice.select', { name: state.voice || 'default', edgeVoice: $('edgeVoiceSelect').value, offlineOnly: $('offlineOnly').checked }); } catch (e) { /* 忽略 */ }
+      // 云端音色只在本页手工改过（localStorage 有值）时才上行；没改过就不发，
+      // 让宿主用「设置 → 个人助手 → 鹈鹕端 → 默认云音色」（或 TIHU_EDGE_VOICE）——
+      // 以前每次连上都把本页写死的云健推上去，等于把宿主的默认值压掉。
+      (function () {
+        var override = '';
+        try { override = localStorage.getItem('tihu.edgeVoice') || ''; } catch (e) { /* 忽略 */ }
+        var select = $('edgeVoiceSelect');
+        var payload = { name: state.voice || 'default', offlineOnly: $('offlineOnly').checked };
+        if (override && select && select.querySelector('option[value="' + override + '"]')) { payload.edgeVoice = override; }
+        try { send('voice.select', payload); } catch (e) { /* 忽略 */ }
+      })();
       clearInterval(state.retryTimer);
       state.retryTimer = setInterval(function () { send('ping', { nonce: String(Date.now()) }); }, 25000);
     };
@@ -1449,6 +1520,54 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.ws.send(JSON.stringify({
       v: PROTOCOL, type: type, id: 'dev-' + Date.now().toString(36) + '-' + state.seq, seq: state.seq, ts: Date.now(), payload: payload
     }));
+  }
+  /* ---------- 设备回执 / 播放状态（2026-11-10，规格书 §6.2） ----------
+     宿主下发带 opId 的下行（playback.control / voice.listen / session.ended / device.config）
+     必须回一条 device.ack，否则工具只能等 1.5 秒超时、给用户一句「设备未回执」。
+     opId 保留最近 32 个：同一个 opId 第二次到达只回 duplicate，不重复执行。 */
+  /** 设备自报的「现在在哪一屏」（直接进工具返回的第二段，比宿主猜的可信）。 */
+  function stageEcho() {
+    if (state.listenOn) return '在听';
+    if (state.screenMode === 'board') {
+      var board = state.board || {};
+      var page = board.page || {};
+      var index = Number(page.index) || 0;
+      var total = Math.max(1, Number(page.total) || 1);
+      return '棋盘第 ' + (index + 1) + '/' + total + ' 页';
+    }
+    if (state.screenMode === 'done' && state.done) {
+      var lines = state.done.lines.length;
+      return '完成 第 ' + (state.done.current + 1) + '/' + lines + ' 行';
+    }
+    var stage = $('stage') ? String($('stage').textContent || '') : '';
+    return stage !== '' ? stage : '状态屏';
+  }
+  /** 回一条 device.ack：ok / duplicate / stage 都由页面自己说。 */
+  function ackDown(payload, extra) {
+    if (!payload || typeof payload.opId !== 'string' || payload.opId === '') return false;
+    var duplicated = state.opIds.indexOf(payload.opId) >= 0;
+    if (!duplicated) {
+      state.opIds.push(payload.opId);
+      if (state.opIds.length > 32) state.opIds.shift();
+    }
+    var body = { opId: payload.opId, ok: true, duplicate: duplicated, stage: stageEcho() };
+    if (extra) for (var key in extra) { if (Object.prototype.hasOwnProperty.call(extra, key)) body[key] = extra[key]; }
+    send('device.ack', body);
+    return duplicated;
+  }
+  /** 上报播放状态（页面是唯一写者）：每段开始/结束、暂停/继续/停止、进出聆听。 */
+  function reportPlayback(phase, extra) {
+    var body = { phase: phase, at: Date.now() };
+    if (state.doneTaskId) body.taskId = state.doneTaskId;
+    if (state.done && state.done.lines && state.done.lines.length) {
+      body.segment = state.done.current + 1;
+      body.line = state.done.current;
+      body.total = state.done.lines.length;
+      var range = state.doneRanges && state.doneRanges[state.done.current];
+      if (range && typeof range[0] === 'number') body.charStart = range[0];
+    }
+    if (extra) for (var key in extra) { if (Object.prototype.hasOwnProperty.call(extra, key)) body[key] = extra[key]; }
+    try { send('playback.state', body); } catch (e) { /* 连接断了就丢掉 */ }
   }
   /** 发 hello；sessionId 为空串表示「不指定会话」（自动模式下由宿主挑最活跃 CU）。 */
   function sendHello(sessionId, auto) {
@@ -1523,6 +1642,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         state.voiceEngine = payload.engine || null;
         if (typeof payload.selected === 'string' && payload.selected !== '') state.voice = payload.selected;
         renderVoiceSelect();
+        // 云端音色回显：本页没手工改过（localStorage 无值）时，显示宿主实际在用的那个
+        // （来自「设置 → 个人助手 → 鹈鹕端 → 默认云音色」或 TIHU_EDGE_VOICE），避免两边名字对不上。
+        (function () {
+          var override = '';
+          try { override = localStorage.getItem('tihu.edgeVoice') || ''; } catch (e) { /* 忽略 */ }
+          if (override) return;
+          var host = typeof payload.edgeVoice === 'string' ? payload.edgeVoice : '';
+          var select = $('edgeVoiceSelect');
+          if (!host || !select) return;
+          if (select.querySelector('option[value="' + host + '"]')) select.value = host;
+        })();
         break;
       }
       case 'voice.created': {
@@ -1567,6 +1697,71 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       case 'task.notify':
         if (payload && payload.text) addEvent(payload.level === 0 ? 'alert' : 'progress', (payload.spoken ? '播报：' : '通知：') + payload.text);
         break;
+      /* ---- 2026-11-10（规格书 §6.1）：四类反向控制 ----
+         这四类以前到了页面**没有任何反应**，于是「停止朗读 / 暂停 / 强制在听 / 结束会话」
+         只能靠宿主单方面不发 PCM——页面已经排进 WebAudio 时间轴的块照念。 */
+      case 'playback.control': {
+        var control = payload || {};
+        var applied = applyPlayback(String(control.action || ''), control);
+        if (applied.ok !== true) {
+          addEvent('progress', '播放控制被忽略：' + (applied.reason || 'unknown'));
+          ackDown(control, { ok: false, reason: applied.reason || 'failed' });
+          break;
+        }
+        ackDown(control);
+        break;
+      }
+      case 'voice.listen': {
+        var wantListen = payload && payload.on === true;
+        if (wantListen) {
+          var listenOptions = {};
+          if (payload.prompt !== undefined) listenOptions.prompt = String(payload.prompt);
+          if (payload.timeoutMs !== undefined) listenOptions.timeoutMs = Number(payload.timeoutMs);
+          listenEnter(listenOptions);
+        } else {
+          listenExit();
+        }
+        ackDown(payload, { listening: state.listenOn === true });
+        addEvent('progress', wantListen ? '宿主让进入「在听」' : '宿主让退出「在听」');
+        break;
+      }
+      case 'session.ended': {
+        renderIdle(payload && payload.reason ? String(payload.reason) : '电脑端指令');
+        ackDown(payload);
+        break;
+      }
+      case 'device.config': {
+        var configKey = payload && payload.key ? String(payload.key) : '';
+        if (configKey === 'voice') {
+          var voiceValue = String(payload.value || '');
+          var edgeSelect = $('edgeVoiceSelect');
+          // 真正生效在宿主合成侧（下一条播报就用新音色），页面只把下拉显示对齐。
+          if (edgeSelect && edgeSelect.querySelector('option[value="' + voiceValue + '"]')) edgeSelect.value = voiceValue;
+          addEvent('progress', '宿主把云音色切到：' + voiceValue);
+          ackDown(payload);
+          break;
+        }
+        if (configKey === 'handsfree') {
+          var wantHandsfree = payload.value === true;
+          if (wantHandsfree && !state.wake) {
+            var started = wakeStart();
+            ackDown(payload, started === false ? { ok: false, reason: 'unsupported' } : {});
+          } else if (!wantHandsfree && state.wake) {
+            wakeStop(true);
+            ackDown(payload);
+          } else {
+            ackDown(payload);
+          }
+          break;
+        }
+        if (configKey === 'scale') {
+          applyScale(String(payload.value || '2'));
+          ackDown(payload);
+          break;
+        }
+        ackDown(payload, { ok: false, reason: 'unsupported' });
+        break;
+      }
       case 'pong': break;
       default: break; /* 未知 type：忽略 */
     }
@@ -1805,22 +2000,55 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     if (!heard) return;
     heard.textContent = text === '' ? '' : fitTextPx(text, 288, 12);
   }
-  function listenBegin() {
+  /** 屏上「在听」那几行字：默认「我在，说吧」+「10 秒没说话就退出 · 长按也能说」。 */
+  var LISTEN_DEFAULT_PROMPT = '我在，说吧';
+  function listenHintOf(prompt, timeoutMs) {
+    var box = $('listen');
+    if (!box) return;
+    var l1 = box.querySelector('.l1');
+    if (l1) l1.textContent = prompt !== '' ? fitTextPx(prompt, 288, 15) : LISTEN_DEFAULT_PROMPT;
+    var hints = box.querySelectorAll('.l3');
+    if (hints && hints.length > 0) {
+      hints[hints.length - 1].textContent = Math.round(timeoutMs / 1000) + ' 秒没说话就退出 · 长按也能说';
+    }
+  }
+  /**
+   * 进入「在听 · 已唤醒」（规格书 §7 第 5 处）：唤醒词、页面 #wake 开关、宿主
+   * voice.listen 三处共用这一个入口。options = { prompt, timeoutMs }。
+   */
+  function listenBegin(options) {
+    var opts = options || {};
+    var prompt = typeof opts.prompt === 'string' ? opts.prompt.replace(/\s+/g, ' ').trim() : '';
+    var timeoutMs = Number(opts.timeoutMs);
+    if (!isFinite(timeoutMs) || timeoutMs < 3000) timeoutMs = 10000;
+    if (timeoutMs > 60000) timeoutMs = 60000;
     state.listenOn = true;
     state.listenText = '';
     state.listenSkip = true;
     $('screen').classList.add('listen-on');
     listenPreview('');
+    listenHintOf(prompt, timeoutMs);
     clearTimeout(state.listenIdle);
-    // 10 秒一句都没说：退出聆听（不会一直开着麦）
+    // 一句都没说就退出（不会一直开着麦）
     state.listenIdle = setTimeout(function () {
       if (!state.listenOn) return;
       if (String(state.listenText || '').trim() !== '') return;
-      addEvent('progress', '免按住：10 秒没说话，已退出聆听');
+      addEvent('progress', '免按住：' + Math.round(timeoutMs / 1000) + ' 秒没说话，已退出聆听');
       listenEnd();
-    }, 10000);
+    }, timeoutMs);
+    reportPlayback('listening');
+  }
+  /** 宿主下发 voice.listen{on:true} 的入口：屏上写了「在听」就必须真的开麦。 */
+  function listenEnter(options) {
+    if (!state.wake) wakeStart();
+    listenBegin(options);
+    return true;
+  }
+  function listenExit() {
+    listenEnd();
   }
   function listenEnd() {
+    var wasOn = state.listenOn === true;
     state.listenOn = false;
     state.listenText = '';
     state.listenSkip = false;
@@ -1831,6 +2059,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     var screen = $('screen');
     if (screen) screen.classList.remove('listen-on');
     listenPreview('');
+    if (wasOn) reportPlayback(state.done && state.screenMode === 'done' ? 'playing' : 'idle');
   }
   /** 末字后静音 3 秒 = 「说完了」：留出想措辞的时间，不打断人。
    *  一句话都还没说时**不**起这个计时——那种情况归「10 秒没说话就退出」管。 */
@@ -1991,20 +2220,26 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         if (under && under.getAttribute) {
           var actionId = under.getAttribute('data-action');
           if (actionId) {
-            // 停止/回主页/翻页都算「退出本轮朗读」：和停止一样先把页面音频队列掐掉（宿主也会 cancelRound），
-            // 差别只是不回「已停止朗读」提示。
+            // 停止/重读/回主页/翻页统一走 applyPlayback（2026-11-10）：与宿主 playback.control
+            // 完全同一条路，手指点和嘴上说效果一致；差别只是不回「已停止朗读」提示。
             if (actionId === 'stop' || actionId === 'home' || actionId === 'prev' || actionId === 'next'
-              || actionId === 'taskBoard' || actionId === 'boardPrev' || actionId === 'boardNext') stopPcm();
-            if (actionId === 'replay' && audioRunning(state.audioCtx)) {
-              state.droppedAudio = false;
-              hideAudioWarn();
+              || actionId === 'taskBoard' || actionId === 'boardPrev' || actionId === 'boardNext') {
+              applyPlayback('stop');
             }
-            if (state.done && actionId === 'replay') {
-              // 重读：掐掉旧音频 + 清空每段回调，高亮回第一行；宿主重发第一段 PCM 后
+            if (actionId === 'pause') applyPlayback('pause');
+            if (actionId === 'resume') applyPlayback('resume', {});
+            if (actionId === 'replay') {
+              if (audioRunning(state.audioCtx)) {
+                state.droppedAudio = false;
+                hideAudioWarn();
+              }
+              // 重读：掐掉旧音频 + 高亮回第一行；宿主重发第一段 PCM 后
               // 从「朗读段 1 开始」这个事件重新推进（不按时间估算）。
-              stopPcm();
-              state.done.current = 0;
-              paintDone();
+              if (state.done) {
+                applyPlayback('seek', { from: { segment: 1 } });
+              } else {
+                stopPcm();
+              }
             }
             if (actionId === 'taskBoard') clearDoneState();
             if (actionId === 'home') tapFlash(event.clientX - rect.left, event.clientY - rect.top);
@@ -2060,13 +2295,31 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   });
 
   /* 「结束本次语音会话」：宿主侧立刻关掉危险动作闸门（session.end），
-     不等 120 秒空闲窗口过期——用户说完就可以放心自己干活。 */
+     不等 120 秒空闲窗口过期——用户说完就可以放心自己干活。
+     2026-11-10：屏上那套「空闲」抽成 renderIdle()，宿主 session.ended 下发时走同一份
+     （否则工具结束了会话，屏还停在完成页、旧正文还能被续播）。 */
+  function renderIdle(reason) {
+    stopPcm();
+    clearDoneState();
+    state.pausedAt = null;
+    state.listenOn = false;
+    state.screenMode = 'status';
+    state.actions = [];
+    renderActions();
+    var screen = $('screen');
+    if (screen) screen.className = 'idle';
+    var stage = $('stage');
+    if (stage) { stage.style.display = ''; stage.textContent = '空闲'; }
+    var title = $('title');
+    if (title) title.textContent = '已结束本次会话';
+    var list = $('bullets');
+    if (list) list.innerHTML = '';
+    addEvent('progress', '已结束本次语音会话（' + (reason || 'button') + '）');
+    reportPlayback('idle');
+  }
   $('end').onclick = function () {
     send('session.end', { reason: 'button', sessionId: state.sessionId || undefined });
-    addEvent('progress', '已结束本次语音会话（闸门关闭）');
-    $('screen').className = 'idle';
-    $('stage').textContent = '空闲';
-    $('title').textContent = '已结束本次会话';
+    renderIdle('button');
   };
 
   /* 首页顶行走表：每秒 tick 一次时钟（时间由页面自己的本地时钟渲染，不等宿主推——

@@ -8,9 +8,10 @@
  *   - **未知 type 必须忽略**：`parseUpstream()` 对不认识的 type、坏 JSON、超长的
  *     文本一律返回 `null`，绝不抛错——设备端以后加消息类型时，老宿主不能崩。
  *   - 上行：hello / audio.frame / text.input / session.end / screen.gesture /
- *     voice.* / tts.sample / task.reply / ping。
+ *     voice.* / tts.sample / task.reply / device.ack / playback.state / ping。
  *   - 下行：transcript / tts.audio / screen.frame / event.progress / event.alert /
- *     session.bound / voice.* / task.* / pong。设备屏上不存在任何「授权请求」消息。
+ *     session.bound / voice.* / task.* / playback.control / voice.listen /
+ *     session.ended / device.config / pong。设备屏上不存在任何「授权请求」消息。
  *
  * 2026-11-09 统一指挥：页面开机发裸 hello，宿主绑到唯一的指挥会话；设备只认任务七屏，
  * 没有会话选择器、没有授权屏。协议仍遵守「字段只增不删、未知 type 忽略」。
@@ -30,7 +31,13 @@ function clampCoord(value: number, max: number): number {
   return Math.max(0, Math.min(max, Math.round(value)))
 }
 
-/** 上行消息类型（设备 → 宿主）。 */
+/**
+ * 上行消息类型（设备 → 宿主）。
+ *
+ * 2026-11-10（设备控制工具规格书 §6.2）新增两条：
+ *   - `device.ack`：工具级回执（`opId` 原样带回），让「停止朗读」这类动作可验证；
+ *   - `playback.state`：页面自报「在读哪屏哪段 / 暂停在哪 / 是否在听」，页面是唯一写者。
+ */
 export const TIHU_UPSTREAM_TYPES = [
   'hello',
   'audio.frame',
@@ -42,9 +49,16 @@ export const TIHU_UPSTREAM_TYPES = [
   'voice.select',
   'tts.sample',
   'task.reply',
+  'device.ack',
+  'playback.state',
   'ping',
 ] as const
-/** 下行消息类型（宿主 → 设备）。 */
+/**
+ * 下行消息类型（宿主 → 设备）。
+ *
+ * 2026-11-10（规格书 §6.1）新增四条反向控制通道：播放控制、强制在听、结束会话、设备设置。
+ * 旧的四类（转写/音频/屏帧/事件）一条都不动，仍守「字段只增不删、未知 type 忽略」。
+ */
 export const TIHU_DOWNSTREAM_TYPES = [
   'transcript',
   'tts.audio',
@@ -57,6 +71,10 @@ export const TIHU_DOWNSTREAM_TYPES = [
   'task.list',
   'task.update',
   'task.notify',
+  'playback.control',
+  'voice.listen',
+  'session.ended',
+  'device.config',
   'pong',
 ] as const
 
@@ -198,6 +216,86 @@ export interface TtsAudioPayload {
   sample?: true
 }
 
+/* ---------- 设备反向控制（2026-11-10，规格书 §6） ----------
+ *
+ * 为什么必须新增这一组：屏幕一直由宿主 `screen.frame` 单向决定，声音由页面自己排程，
+ * 两者之间没有反向通道 —— 于是「停声 / 暂停 / 继续 / 跳段 / 强制在听 / 结束会话 / 改设置」
+ * 这七件事模型一件也做不到（`stop_speaking` 以前只是「以后不再发 PCM」，页面已排进
+ * WebAudio 时间轴的那 1~2 句照念）。
+ */
+
+/** 下行：播放控制（停 / 暂停 / 继续 / 跳到第 N 段）。 */
+export interface PlaybackControlPayload {
+  /** 工具级幂等键：页面保留最近 32 个，重复到达只回 ack 不再执行。 */
+  opId?: string
+  action: 'stop' | 'pause' | 'resume' | 'seek'
+  /** stop 用：round = 只停本轮正文/播报；all = 连排队中的播报一起清。 */
+  scope?: 'round' | 'all'
+  /** resume/seek 用：从哪一段（1 起）接着念。段级续播，不是采样级。 */
+  from?: { taskId?: string; segment?: number; line?: number }
+  /** 宿主朗读轮次号（与 tts.audio 同一代际，便于页面丢掉上一轮的晚到块）。 */
+  epoch?: number
+}
+
+/** 下行：强制进入/退出「在听 · 已唤醒」。 */
+export interface VoiceListenPayload {
+  opId?: string
+  on: boolean
+  /** 屏上那行小字（如「我在，说吧」）。 */
+  prompt?: string
+  /** 多久没人说话自动退出（毫秒，宿主已夹 3000–60000）。 */
+  timeoutMs?: number
+}
+
+/** 下行：结束语音会话后让页面自己画「空闲」并清本地完成态。 */
+export interface SessionEndedPayload {
+  sessionId?: string
+  reason?: string
+  /** 毫秒时间戳。 */
+  at?: number
+}
+
+/** 下行：设备设置（音色 / 免按住 / 缩放）。 */
+export interface DeviceConfigPayload {
+  opId?: string
+  key: 'voice' | 'handsfree' | 'scale'
+  value: string | boolean
+}
+
+/** 上行：工具级回执 —— 「回执可验证」的唯一手段。 */
+export interface DeviceAckPayload {
+  /** 原样带回下行的 opId。 */
+  opId: string
+  ok: boolean
+  /** ok=false 时的原因（`mic-denied` / `no-paused` / `unsupported`…）。 */
+  reason?: string
+  /** 同一 opId 重复到达：页面没再执行一次。 */
+  duplicate?: boolean
+  /** 设备自报的当前屏（人话，直接进工具返回，如「完成 第 3/12 行」）。 */
+  stage?: string
+  /** 屏帧版本号（宿主每次下发 +1，页面回声，便于发现漏帧）。 */
+  screenVersion?: number
+  /** 是否正在听（voice.listen 的回执带它）。 */
+  listening?: boolean
+}
+
+/** 上行：页面自报的播放状态（页面是唯一写者；宿主只读）。 */
+export interface PlaybackStatePayload {
+  phase: 'idle' | 'playing' | 'paused' | 'listening'
+  /** 正在念/暂停在哪条任务。 */
+  taskId?: string
+  /** 第几段（1 起；与完成页 done.ranges 同一坐标系）。 */
+  segment?: number
+  /** 第几行（0 起，屏上那一行）。 */
+  line?: number
+  /** 共几段。 */
+  total?: number
+  /** 这一段的起始字符（码点下标，与 tts.audio.charStart 同坐标系）。 */
+  charStart?: number
+  /** 毫秒时间戳。 */
+  at?: number
+}
+
 /** 可选音色（默认音色 + 克隆音色）。 */
 export interface VoiceInfo {
   /** 页面用的名字（默认音色固定 `default`）。 */
@@ -219,6 +317,12 @@ export interface VoiceListPayload {
   voices: VoiceInfo[]
   /** 当前选中的音色（页面本地选择，宿主不强制）。 */
   selected?: string
+  /**
+   * 宿主这台设备实际在用的云端音色（edge-tts 的 zh-CN-*Neural）。
+   * 页面用它回显下拉：没有用户手工覆盖（localStorage `tihu.edgeVoice`）时按它显示，
+   * 免得宿主默认已经是「晓晓」、页面还写着「云健」。
+   */
+  edgeVoice?: string
   /** 本地 TTS 引擎状态；不可用时页面直接走系统语音。 */
   engine: { available: boolean; model?: string; error?: string }
 }
@@ -305,6 +409,16 @@ export interface ScreenFramePayload {
   done?: { lines: string[]; current?: number; ranges?: number[][] }
   /** 这一帧属于哪条任务（屏上点按/答问句时用它回 task.reply）。 */
   taskId?: string
+  /**
+   * 工具级幂等键（规格书 §6.1）：由工具下发时带上，页面渲染后回 `device.ack{opId}`。
+   * 旧固件不认就忽略，不破坏兼容。
+   */
+  opId?: string
+  /**
+   * 屏帧版本号：宿主每下发一帧 +1，页面在 ack 里回声。
+   * 用来发现「宿主以为发了、设备没收到」这类漏帧（现在只有超时兜底）。
+   */
+  frameSeq?: number
 }
 
 export interface ProgressPayload {
@@ -451,6 +565,8 @@ export interface TaskReplyPayload {
   taskId?: string
   /** 点了第几个选项（0 起，与 confirm.ask 的 options 同序）。 */
   optionIndex?: number
+  /** 选项文本（真机按文本答；精确 > 包含，命中多个由宿主退回给模型追问）。 */
+  optionText?: string
   /** 自由文本回答（等价于手输）。 */
   text?: string
   /** 轻命令：看任务／回棋盘／撤单／停止。 */
@@ -471,6 +587,8 @@ export type TihuUpstreamMessage =
   | TihuEnvelope<'voice.select', VoiceSelectPayload>
   | TihuEnvelope<'tts.sample', TtsSamplePayload>
   | TihuEnvelope<'task.reply', TaskReplyPayload>
+  | TihuEnvelope<'device.ack', DeviceAckPayload>
+  | TihuEnvelope<'playback.state', PlaybackStatePayload>
   | TihuEnvelope<'ping', PingPayload>
 
 export type TihuDownstreamMessage =
@@ -485,6 +603,10 @@ export type TihuDownstreamMessage =
   | TihuEnvelope<'task.list', TaskListPayload>
   | TihuEnvelope<'task.update', TaskUpdatePayload>
   | TihuEnvelope<'task.notify', TaskNotifyPayload>
+  | TihuEnvelope<'playback.control', PlaybackControlPayload>
+  | TihuEnvelope<'voice.listen', VoiceListenPayload>
+  | TihuEnvelope<'session.ended', SessionEndedPayload>
+  | TihuEnvelope<'device.config', DeviceConfigPayload>
   | TihuEnvelope<'pong', PingPayload>
 
 /* ---------- 解析与构造 ---------- */
@@ -622,8 +744,30 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
           if (payload.optionIndex < 0 || payload.optionIndex > 8) return null
         }
         if (payload.text !== undefined && (typeof payload.text !== 'string' || payload.text.length > TIHU_MAX_TEXT_CHARS)) return null
+        if (payload.optionText !== undefined && (typeof payload.optionText !== 'string' || payload.optionText.length > 200)) return null
         if (payload.command !== undefined && payload.command !== 'open' && payload.command !== 'board' && payload.command !== 'cancel' && payload.command !== 'stop') return null
-        if (payload.optionIndex === undefined && payload.text === undefined && payload.command === undefined) return null
+        if (payload.optionIndex === undefined && payload.optionText === undefined && payload.text === undefined && payload.command === undefined) return null
+        return value as TihuUpstreamMessage
+      }
+      case 'device.ack': {
+        // 工具级回执：opId 必须原样带回来，否则宿主那边那条 Promise 只能等超时。
+        if (typeof payload.opId !== 'string' || payload.opId === '' || payload.opId.length > 200) return null
+        if (typeof payload.ok !== 'boolean') return null
+        if (payload.reason !== undefined && (typeof payload.reason !== 'string' || payload.reason.length > 200)) return null
+        if (payload.duplicate !== undefined && typeof payload.duplicate !== 'boolean') return null
+        if (payload.stage !== undefined && (typeof payload.stage !== 'string' || payload.stage.length > 120)) return null
+        if (payload.screenVersion !== undefined && (typeof payload.screenVersion !== 'number' || !Number.isFinite(payload.screenVersion))) return null
+        if (payload.listening !== undefined && typeof payload.listening !== 'boolean') return null
+        return value as TihuUpstreamMessage
+      }
+      case 'playback.state': {
+        // 页面自报播放状态：phase 四选一，其余字段都是「有就校验」。
+        if (payload.phase !== 'idle' && payload.phase !== 'playing' && payload.phase !== 'paused' && payload.phase !== 'listening') return null
+        if (payload.taskId !== undefined && (typeof payload.taskId !== 'string' || payload.taskId.length > 64)) return null
+        for (const key of ['segment', 'line', 'total', 'charStart', 'at']) {
+          const field = (payload as Record<string, unknown>)[key]
+          if (field !== undefined && (typeof field !== 'number' || !Number.isFinite(field))) return null
+        }
         return value as TihuUpstreamMessage
       }
       case 'ping': return value as TihuUpstreamMessage

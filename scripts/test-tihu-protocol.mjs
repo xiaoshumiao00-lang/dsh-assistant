@@ -49,7 +49,7 @@ import {
   questionDecisionOf,
 } from '../src/tihu/pending-interactions.ts'
 import { DONE_NO_REPLY_TEXT, RECEIPT_SECONDS, prepareDoneText } from '../src/tihu/task-screens.ts'
-import { TIHU_CONTROL_SECTION_TEXT, createTihuControlRunner, matchSessionRows, tihuActionNames } from '../src/tihu/control.ts'
+import { TIHU_CONTROL_SECTION_TEXT, TIHU_DEVICE_TOOL_NAMES, TIHU_TOOLS, createTihuControlRunner, createTihuToolRunner, formatDeviceResult, matchSessionRows, mostActiveDevice, resolveControlDevice, tihuActionNames, tihuToolNames, tihuToolSpec } from '../src/tihu/control.ts'
 import { COMMANDER_REPLY_SHAPE, commanderReplyTail, parseCommanderReply } from '../src/tihu/dispatch-protocol.ts'
 import {
   activityEntryOf,
@@ -181,9 +181,11 @@ test('screen.gesture 校验：swipe/tap 字段合法才收', () => {
 
 test('版本号与类型清单固定', () => {
   assert.equal(TIHU_PROTOCOL_VERSION, '0')
-  assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'session.end', 'screen.gesture', 'voice.list', 'voice.create', 'voice.select', 'tts.sample', 'task.reply', 'ping'])
-  // 2026-11-09 统一指挥会话：下行 +3（task.list / task.update / task.notify），协议版本仍是 '0'。
-  assert.equal(TIHU_DOWNSTREAM_TYPES.length, 12, '旧界面消息（tts.text/event.done/confirm.ask/sessions.list/session.invalid）已随界面删除')
+  // 2026-11-10（设备控制工具规格书 §6.2）：上行 +2（device.ack / playback.state），版本仍是 '0'。
+  assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'session.end', 'screen.gesture', 'voice.list', 'voice.create', 'voice.select', 'tts.sample', 'task.reply', 'device.ack', 'playback.state', 'ping'])
+  // 2026-11-09 统一指挥会话：下行 +3（task.list / task.update / task.notify）；
+  // 2026-11-10 设备控制：下行 +4（playback.control / voice.listen / session.ended / device.config）。
+  assert.equal(TIHU_DOWNSTREAM_TYPES.length, 16, '旧界面消息（tts.text/event.done/confirm.ask/sessions.list/session.invalid）已随界面删除')
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('tts.audio'))
   assert.equal(TIHU_DOWNSTREAM_TYPES.includes('sessions.list'), false)
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('session.bound'))
@@ -193,8 +195,40 @@ test('版本号与类型清单固定', () => {
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('task.list'))
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('task.update'))
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('task.notify'))
+  // 四类反向控制：没有它们，「停声/暂停/在听/结束会话」只能是假动作。
+  for (const type of ['playback.control', 'voice.listen', 'session.ended', 'device.config']) {
+    assert.ok(TIHU_DOWNSTREAM_TYPES.includes(type), `下行必须含 ${type}`)
+  }
   assert.equal(TIHU_PAGE_PATH, '/tihu')
   assert.equal(TIHU_LANE_PATH, '/tihu/lane')
+})
+
+test('device.ack / playback.state：新上行字段校验（坏帧一律 null，不抛错）', () => {
+  // 回执：opId 必须原样带回来，ok 必须是布尔。
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('device.ack', { opId: 'op-1', ok: true }, 70))) !== null)
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('device.ack', { opId: 'op-1', ok: false, reason: 'mic-denied', stage: '完成 第 3/12 行', duplicate: true }, 71))) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('device.ack', { opId: '', ok: true }, 72))), null, 'opId 空串是坏帧')
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('device.ack', { ok: true }, 73))), null, 'opId 缺失是坏帧')
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('device.ack', { opId: 'op-1', ok: 'yes' }, 74))), null, 'ok 不是布尔是坏帧')
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('device.ack', { opId: 'op-1', ok: true, stage: 123 }, 75))), null)
+  // 播放状态：phase 四选一，数字字段只认有限数。
+  for (const phase of ['idle', 'playing', 'paused', 'listening']) {
+    assert.ok(parseUpstream(JSON.stringify(buildUpstream('playback.state', { phase }, 76))) !== null, `phase=${phase} 必须合法`)
+  }
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('playback.state', { phase: 'paused', taskId: 't3', segment: 3, line: 4, total: 7, charStart: 18 }, 77))) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('playback.state', { phase: 'stopped' }, 78))), null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('playback.state', { phase: 'playing', segment: 'x' }, 79))), null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('playback.state', { phase: 'playing', taskId: 5 }, 80))), null)
+})
+
+test('task.reply 支持 optionText（真机按文本答），空内容仍是坏帧', () => {
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('task.reply', { optionText: '拒绝' }, 81))) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('task.reply', { optionText: 'x'.repeat(201) }, 82))), null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('task.reply', {}, 83))), null)
+  // 四种轻命令不变
+  for (const command of ['open', 'board', 'cancel', 'stop']) {
+    assert.ok(parseUpstream(JSON.stringify(buildUpstream('task.reply', { command }, 84))) !== null)
+  }
 })
 
 test('voice.list / voice.create / voice.select 字段校验', () => {
@@ -2242,8 +2276,87 @@ test('进度屏：assistant/message 的思考与早期流式同一句时不重�
 
 console.log('[tihu] 控制工具')
 
-test('控制工具：action 全集固定，未知 action 报错列出全部合法值', () => {
-  assert.deepEqual(tihuActionNames(), ['status', 'list_devices', 'bind', 'open_bubble', 'progress', 'list_sessions', 'archive', 'stop_speaking', 'replay', 'go_home', 'browse', 'open_recent', 'dispatch', 'list_tasks', 'cancel'])
+test('控制工具：15 个设备工具 + tihu_admin 的名字与顺序固定（旧单 tihu 多 action 形态已删）', () => {
+  assert.deepEqual([...TIHU_DEVICE_TOOL_NAMES], [
+    'tihu_stop_speaking', 'tihu_pause_speaking', 'tihu_resume_speaking', 'tihu_replay',
+    'tihu_go_home', 'tihu_board_page', 'tihu_open_task', 'tihu_follow_task',
+    'tihu_end_voice_session', 'tihu_wake',
+    'tihu_answer_decision', 'tihu_dismiss_decision',
+    'tihu_status', 'tihu_list_devices', 'tihu_device_settings',
+  ])
+  assert.equal(TIHU_DEVICE_TOOL_NAMES.length, 15)
+  assert.deepEqual(tihuToolNames(), [...TIHU_DEVICE_TOOL_NAMES, 'tihu_admin'])
+  // 不并存：旧的单工具 tihu 形态必须彻底消失
+  assert.equal(tihuToolNames().includes('tihu'), false)
+  assert.equal(tihuToolNames().includes('tihu_stop_speaking'), true)
+  // 非设备杂项只剩 6 条（dispatch/list_tasks/cancel_task/task_progress/list_sessions/archive_session）
+  assert.deepEqual(tihuActionNames(), ['dispatch', 'list_tasks', 'cancel_task', 'task_progress', 'list_sessions', 'archive_session'])
+  // 旧 action 名一个都不许再当工具名出现
+  for (const legacy of ['bind', 'open_bubble', 'open_recent', 'status', 'replay', 'go_home', 'browse', 'stop_speaking']) {
+    assert.equal(tihuToolNames().includes(legacy), false, `旧 action「${legacy}」不能还是工具名`)
+  }
+})
+
+test('控制工具：16 个工具的 schema 完整，设备工具都带可选 deviceId，描述能看出「什么时候用」', () => {
+  assert.equal(TIHU_TOOLS.length, 16)
+  for (const spec of TIHU_TOOLS) {
+    assert.ok(spec.name.startsWith('tihu_'), `${spec.name} 必须在 tihu_ 命名空间`)
+    assert.ok(spec.description.length >= 12, `${spec.name} 的描述太短，模型看不出什么时候用：` + spec.description)
+    assert.ok(Object.keys(spec.parameters).length > 0, `${spec.name} 必须有参数表`)
+    for (const [key, param] of Object.entries(spec.parameters)) {
+      assert.ok(['string', 'number', 'boolean'].includes(param.type), `${spec.name}.${key} 类型只能是三种之一`)
+      assert.equal(typeof param.required, 'boolean')
+      assert.ok(param.description.length > 0, `${spec.name}.${key} 必须有描述`)
+    }
+    if (spec.name !== 'tihu_admin' && spec.name !== 'tihu_list_devices') {
+      assert.ok(Object.prototype.hasOwnProperty.call(spec.parameters, 'deviceId'), `${spec.name} 要能指定 deviceId`)
+      assert.equal(spec.parameters.deviceId.required, false, 'deviceId 缺省＝最近活跃的那台')
+    }
+  }
+  // 触发词要写进描述（用户嘴里的说法 → 工具）
+  assert.ok(tihuToolSpec('tihu_stop_speaking').description.includes('停止阅读'))
+  assert.ok(tihuToolSpec('tihu_go_home').description.includes('回主页'))
+  assert.ok(tihuToolSpec('tihu_replay').description.includes('重读'))
+  // 段级续播的限制必须如实写进描述（规格书 §8.5）
+  assert.ok(tihuToolSpec('tihu_pause_speaking').description.includes('本行开头'))
+  assert.ok(tihuToolSpec('tihu_resume_speaking').description.includes('本行开头'))
+})
+
+await testAsync('控制工具：未知工具名报错列出全部 16 个合法工具名', async () => {
+  const { surface } = controlSurfaceFixture()
+  const run = createTihuToolRunner(surface)
+  const failure = await run('tihu_teleport').then(() => null, (error) => error)
+  assert.ok(failure instanceof Error, '未知工具必须报错')
+  assert.ok(failure.message.includes('没有这个鹈鹕工具「tihu_teleport」'), failure.message)
+  for (const name of tihuToolNames()) assert.ok(failure.message.includes(name), `报错要含 ${name}：` + failure.message)
+})
+
+await testAsync('控制工具：每个工具的必填参数与枚举都真的校验（坏参数给可读报错，不静默）', async () => {
+  const { surface } = controlSurfaceFixture()
+  const run = createTihuToolRunner(surface)
+  // ① 必填参数缺失 → 报错里点名参数
+  const missingKey = await run('tihu_device_settings', { deviceId: 'dev-1', value: 'zh-CN-XiaoxiaoNeural' }).then(() => null, (error) => error)
+  assert.ok(missingKey instanceof Error && missingKey.message.includes('缺少必填参数 key'), String(missingKey))
+  const missingAction = await run('tihu_admin', { session: 'x' }).then(() => null, (error) => error)
+  assert.ok(missingAction instanceof Error && missingAction.message.includes('缺少必填参数 action'), String(missingAction))
+  // ② 枚举越界 → 报错里列出全部合法值
+  const badAction = await run('tihu_admin', { action: 'teleport' }).then(() => null, (error) => error)
+  assert.ok(badAction instanceof Error && badAction.message.includes('dispatch'), String(badAction))
+  assert.ok(badAction.message.includes('archive_session'), String(badAction))
+  const badScope = await run('tihu_stop_speaking', { scope: 'everything' }).then(() => null, (error) => error)
+  assert.ok(badScope instanceof Error && badScope.message.includes('round'), String(badScope))
+  const badMode = await run('tihu_dismiss_decision', { mode: 'maybe' }).then(() => null, (error) => error)
+  assert.ok(badMode instanceof Error && badMode.message.includes('default'), String(badMode))
+  // ③ 数字参数坏值 → 报错
+  const badSegment = await run('tihu_replay', { segment: 'third' }).then(() => null, (error) => error)
+  assert.ok(badSegment instanceof Error && badSegment.message.includes('必须是数字'), String(badSegment))
+  // ④ 设备设置只认云端音色清单
+  const badVoice = await run('tihu_device_settings', { key: 'voice', value: 'zf_xiaobei' }).then(() => null, (error) => error)
+  assert.ok(badVoice instanceof Error && badVoice.message.includes('zh-CN-XiaoxiaoNeural'), String(badVoice))
+  const badHandsfree = await run('tihu_device_settings', { key: 'handsfree', value: 'maybe' }).then(() => null, (error) => error)
+  assert.ok(badHandsfree instanceof Error && badHandsfree.message.includes('on / off'), String(badHandsfree))
+  // 以上全部坏参数都不许碰控制面
+  assert.equal(surface.callsCanary(), 0)
 })
 
 test('控制工具：提示段落 ≤120 字，含「口头确认」红线', () => {
@@ -2276,20 +2389,37 @@ test('控制工具：标题模糊匹配 精确/前缀/包含/多候选/无结果
   assert.equal(all.rows.length, 3)
 })
 
-/** 假控制面：记录调用，供 execute 级用例注入。 */
+/**
+ * 假控制面：记录调用，供工具级用例注入。
+ * 15 个设备动作各自返回一条 `DeviceActionOutcome`（文案由 lane 组织，这里只管记录与回话）。
+ */
 function controlSurfaceFixture(options = {}) {
   const calls = []
   const archived = []
-  const devices = options.devices ?? [{ id: 'dev-1', sessionId: 'session-98bb83cb-aaaa-1111', autoFollow: false, voice: 'default', edgeVoice: 'zh-CN-YunjianNeural', offlineOnly: false }]
+  const makeDevice = (overrides) => ({ autoFollow: false, voice: 'default', edgeVoice: 'zh-CN-YunjianNeural', offlineOnly: false, ...overrides })
+  const devices = options.devices ?? [
+    makeDevice({ id: 'dev-1', sessionId: 'session-98bb83cb-aaaa-1111', lastSeenAt: 900, connectedAt: 100 }),
+  ]
   const rows = options.rows ?? [
     { sessionId: 'session-98bb83cb-aaaa-1111', title: '鹈鹕语音调试', preset: 'computer-use', live: true, updatedAt: 100 },
     { sessionId: 'session-11cc22dd-bbbb-2222', title: '鹈鹕实验记录', preset: 'standard', live: false, updatedAt: 200 },
   ]
+  let touched = 0
+  const record = (name, deviceId, extra) => {
+    touched += 1
+    calls.push(extra === undefined ? [name, deviceId] : [name, deviceId, extra])
+    return deviceId
+  }
+  const outcome = (text, deviceId, extra = {}) => ({ text, deviceId, acked: true, echo: '完成 第 3/12 行', ...extra })
   return {
     calls,
     archived,
     surface: {
-      listDevices: () => devices.map((device) => ({ ...device })),
+      /** 坏参数用例专用：证明校验失败时一次控制面都没被调用。 */
+      callsCanary: () => touched,
+      listDevices: (includeOffline = false) => devices
+        .filter((device) => includeOffline === true || device.offline !== true)
+        .map((device) => ({ ...device })),
       deviceOfSession: (sessionId) => {
         const hit = devices.find((device) => device.sessionId === sessionId)
         return hit === undefined ? undefined : { ...hit }
@@ -2299,23 +2429,74 @@ function controlSurfaceFixture(options = {}) {
         if (hit === undefined) return undefined
         return {
           device: { ...hit },
-          display: hit.sessionId ?? '__unbound__',
-          speaking: false,
-          pinned: false,
-          pending: options.pending ?? [],
+          display: hit.sessionId ?? hit.id,
+          pinned: hit.onBoard !== false,
+          speaking: options.playback !== undefined && options.playback.phase === 'playing',
+          ...(hit.screenStage === undefined ? {} : { stage: hit.screenStage }),
+          ...(options.playback === undefined ? {} : { playback: options.playback }),
+          board: options.board ?? { page: 0, total: 1, counts: { running: 0, awaiting: 0, queued: 0, done: 0 }, totalTasks: 0 },
+          ...(options.decision === undefined ? {} : { decision: options.decision }),
           ...(options.screen === undefined ? {} : { screen: options.screen }),
         }
       },
       listSessions: async (fragment) => matchSessionRows(rows, fragment),
-      bind: async (deviceId, sessionId) => { calls.push(['bind', deviceId, sessionId]); return `已绑定 ${sessionId}` },
-      openBubble: async (deviceId, pick) => { calls.push(['openBubble', deviceId, JSON.stringify(pick)]); return '已点开气泡' },
       progress: async (sessionId) => { calls.push(['progress', sessionId]); return { sessionId, title: '进度标题', running: true, speaking: false } },
       archiveSession: async (sessionId) => { calls.push(['archive', sessionId]); archived.push(sessionId); return `已删除（归档）会话「${sessionId}」` },
-      stopSpeaking: async (deviceId) => { calls.push(['stopSpeaking', deviceId]); return '已停止朗读' },
-      replay: async (deviceId) => { calls.push(['replay', deviceId]); return '正在重读当前回答' },
-      goHome: async (deviceId) => { calls.push(['goHome', deviceId]); return '已回主页并钉住' },
-      browse: async (deviceId, direction) => { calls.push(['browse', deviceId, direction]); return `已翻到${direction === 'prev' ? '上' : '下'}一条` },
-      openRecent: async (deviceId) => { calls.push(['openRecent', deviceId]); return '已打开最近回答' },
+      dispatch: async (input) => { calls.push(['dispatch', input.text]); return `已派给「青年基金申请书」：${input.text}（任务 t9）` },
+      listTasks: () => (options.tasks ?? []).map((task) => ({ ...task })),
+      cancelTask: async (ref) => { calls.push(['cancelTask', String(ref)]); return `已撤掉任务 ${ref}` },
+
+      stopSpeaking: async (deviceId, actionOptions) => {
+        record('stopSpeaking', deviceId, JSON.stringify(actionOptions))
+        if (options.stopAlready === true) return outcome('本来就没在朗读', deviceId, { already: true })
+        return outcome('已停止朗读', deviceId)
+      },
+      pauseSpeaking: async (deviceId) => { record('pauseSpeaking', deviceId); return outcome('已暂停', deviceId, { echo: '停在第 3 段（继续时从本行开头念）' }) },
+      resumeSpeaking: async (deviceId) => { record('resumeSpeaking', deviceId); return outcome('已继续', deviceId, { echo: '从第 3 行继续（本行开头重念）' }) },
+      replay: async (deviceId, actionOptions) => {
+        record('replay', deviceId, JSON.stringify(actionOptions))
+        const segment = actionOptions.segment ?? 1
+        return outcome(`正在重读「改写第 3 段」第 ${segment} 段（共 7 段）`, deviceId, { echo: `完成 第 ${segment}/7 行` })
+      },
+      goHome: async (deviceId, actionOptions) => {
+        record('goHome', deviceId, JSON.stringify(actionOptions))
+        if (options.homeAlready === true) return outcome('本来就在主页', deviceId, { already: true, echo: '棋盘第 1/2 页（等你 1 · 在跑 2 · 排队 0 · 完成 3）' })
+        return outcome('已回主页', deviceId, { echo: '棋盘第 1/2 页（等你 1 · 在跑 2 · 排队 0 · 完成 3）' })
+      },
+      boardPage: async (deviceId, actionOptions) => {
+        record('boardPage', deviceId, JSON.stringify(actionOptions))
+        return outcome('已翻到第 2/3 页', deviceId, { echo: '第 2/3 页：1. 改写第 3 段（执行中）' })
+      },
+      openTaskCard: async (deviceId, actionOptions) => {
+        record('openTaskCard', deviceId, JSON.stringify(actionOptions))
+        return outcome('已打开 t3「改写第 3 段」（完成）', deviceId, { echo: '完成页' })
+      },
+      followTask: async (deviceId, actionOptions) => {
+        record('followTask', deviceId, JSON.stringify(actionOptions))
+        return outcome('已跟随 t3「改写第 3 段」', deviceId, { echo: '当前 第 7 步 · 已用 1m23s' })
+      },
+      endVoiceSession: async (deviceId, actionOptions) => {
+        record('endVoiceSession', deviceId, JSON.stringify(actionOptions))
+        return outcome('已结束本次语音会话（闸门关闭）', deviceId, { echo: '屏停在 空闲' })
+      },
+      wake: async (deviceId, actionOptions) => {
+        record('wake', deviceId, JSON.stringify(actionOptions))
+        return outcome('已进入在听（10 秒无人说话自动退出）', deviceId, { echo: '在听' })
+      },
+      answerDecision: async (deviceId, actionOptions) => {
+        record('answerDecision', deviceId, JSON.stringify(actionOptions))
+        return outcome('已选「确认删除」（第 1 项）', deviceId, { echo: 't5' })
+      },
+      dismissDecision: async (deviceId, actionOptions) => {
+        record('dismissDecision', deviceId, JSON.stringify(actionOptions))
+        return outcome('已按默认项「取消」了结（等同 60 秒超时）', deviceId, { echo: 't5' })
+      },
+      deviceSettings: async (deviceId, actionOptions) => {
+        record('deviceSettings', deviceId, JSON.stringify(actionOptions))
+        return actionOptions.key === 'voice'
+          ? outcome('音色已切到 晓晓（zh-CN-XiaoxiaoNeural）', deviceId, { echo: '完成 第 3/12 行' })
+          : outcome('已开免按住', deviceId, { echo: undefined })
+      },
     },
   }
 }
@@ -2329,102 +2510,382 @@ await testAsync('控制工具：未知 action 报错信息完整（列出全部�
   for (const name of tihuActionNames()) assert.ok(failure.message.includes(name), `报错要含 ${name}：` + failure.message)
 })
 
-await testAsync('控制工具：archive 未 confirm 直接拒绝，不碰控制面', async () => {
+await testAsync('控制工具：archive_session 未 confirm 直接拒绝，不碰控制面', async () => {
   const { surface, calls } = controlSurfaceFixture()
   const run = createTihuControlRunner(surface)
-  const failure = await run({ action: 'archive', session: '实验' }).then(() => null, (error) => error)
+  const failure = await run({ action: 'archive_session', session: '实验' }).then(() => null, (error) => error)
   assert.ok(failure instanceof Error && failure.message.includes('口头确认'), String(failure))
   assert.equal(calls.length, 0, '未确认不得触发任何控制面调用')
 })
 
-await testAsync('控制工具：archive 拒绝删除在线设备绑定中的会话', async () => {
+await testAsync('控制工具：archive_session 拒绝删除在线设备绑定中的会话', async () => {
   const { surface, calls } = controlSurfaceFixture()
   const run = createTihuControlRunner(surface)
-  const failure = await run({ action: 'archive', session: '鹈鹕语音调试', confirm: true }).then(() => null, (error) => error)
+  const failure = await run({ action: 'archive_session', session: '鹈鹕语音调试', confirm: true }).then(() => null, (error) => error)
   assert.ok(failure instanceof Error && failure.message.includes('拒绝删除'), String(failure))
   assert.ok(failure.message.includes('dev-1'), '错误要指出是哪台设备：' + failure.message)
   assert.equal(calls.length, 0, '守卫触发后不得调用 archiveSession')
 })
 
-await testAsync('控制工具：archive 确认后且无人绑定 → 真正归档', async () => {
+await testAsync('控制工具：archive_session 确认后且无人绑定 → 真正归档', async () => {
   const { surface, calls, archived } = controlSurfaceFixture({ devices: [] })
   const run = createTihuControlRunner(surface)
-  const text = await run({ action: 'archive', session: '实验', confirm: true })
+  const text = await run({ action: 'archive_session', session: '实验', confirm: true })
   assert.ok(text.includes('已删除（归档）'), text)
   assert.deepEqual(archived, ['session-11cc22dd-bbbb-2222'])
   assert.deepEqual(calls, [['archive', 'session-11cc22dd-bbbb-2222']])
 })
 
-await testAsync('控制工具：会话定位 多候选给清单追问 / 无结果建议 list_sessions / 缺 session 报错', async () => {
+await testAsync('控制工具：会话定位 多候选给清单追问 / 无结果建议 task_progress / 缺 session 报错', async () => {
   const { surface, calls } = controlSurfaceFixture()
   const run = createTihuControlRunner(surface)
-  const many = await run({ action: 'progress', session: '鹈鹕' }).then(() => null, (error) => error)
+  const many = await run({ action: 'task_progress', session: '鹈鹕' }).then(() => null, (error) => error)
   assert.ok(many instanceof Error && many.message.includes('匹配到 2 条'), String(many))
   assert.ok(many.message.includes('鹈鹕语音调试') && many.message.includes('鹈鹕实验记录'), '候选清单要列全：' + many.message)
-  const none = await run({ action: 'progress', session: '不存在的词' }).then(() => null, (error) => error)
+  const none = await run({ action: 'task_progress', session: '不存在的词' }).then(() => null, (error) => error)
   assert.ok(none instanceof Error && none.message.includes('list_sessions'), String(none))
-  const missingRef = await run({ action: 'bind' }).then(() => null, (error) => error)
+  const missingRef = await run({ action: 'task_progress' }).then(() => null, (error) => error)
   assert.ok(missingRef instanceof Error && missingRef.message.includes('需要 session'), String(missingRef))
-  const ok = await run({ action: 'progress', session: '实验' })
+  const ok = await run({ action: 'task_progress', session: '实验' })
   assert.deepEqual(calls, [['progress', 'session-11cc22dd-bbbb-2222']])
   assert.ok(ok.includes('进度标题'), ok)
 })
 
-await testAsync('控制工具：设备缺省取调用会话绑定的设备；单台兜底；多台无绑定与零台报错', async () => {
-  // ① 绑定到调用会话的那台优先
-  const a = controlSurfaceFixture({ devices: [
-    { id: 'dev-9', sessionId: 'session-x', autoFollow: false, voice: 'default', edgeVoice: 'e', offlineOnly: false },
-    { id: 'dev-8', sessionId: 'session-y', autoFollow: false, voice: 'default', edgeVoice: 'e', offlineOnly: false },
+await testAsync('设备选取（§8.2 五级）：显式 deviceId > 会话绑定 > 最近活跃 > 报错', async () => {
+  const two = () => controlSurfaceFixture({ devices: [
+    { id: 'dev-old', clientId: 'client-old', sessionId: 'session-x', autoFollow: false, voice: 'default', edgeVoice: 'e', offlineOnly: false, lastSeenAt: 1000 },
+    { id: 'dev-new', clientId: 'client-new', sessionId: 'session-y', autoFollow: false, voice: 'default', edgeVoice: 'e', offlineOnly: false, lastSeenAt: 9000 },
   ] })
-  const runA = createTihuControlRunner(a.surface)
-  await runA({ action: 'stop_speaking' }, { sessionId: 'session-y' })
-  assert.deepEqual(a.calls, [['stopSpeaking', 'dev-8']])
-  // ② 调用会话没绑设备、只有一台在线 → 缺省用它
-  const b = controlSurfaceFixture({ devices: [{ id: 'dev-only', sessionId: 'other', autoFollow: false, voice: 'default', edgeVoice: 'e', offlineOnly: false }] })
-  const runB = createTihuControlRunner(b.surface)
-  await runB({ action: 'go_home' }, { sessionId: 'session-nobound' })
-  assert.deepEqual(b.calls, [['goHome', 'dev-only']])
-  // ③ 多台在线且没有绑定到调用会话的 → 明确报错
-  const c = controlSurfaceFixture({ devices: [
-    { id: 'dev-1', sessionId: 's1', autoFollow: false, voice: 'default', edgeVoice: 'e', offlineOnly: false },
-    { id: 'dev-2', sessionId: 's2', autoFollow: false, voice: 'default', edgeVoice: 'e', offlineOnly: false },
-  ] })
-  const runC = createTihuControlRunner(c.surface)
-  const ambiguous = await runC({ action: 'replay' }, { sessionId: 'session-nobound' }).then(() => null, (error) => error)
-  assert.ok(ambiguous instanceof Error && ambiguous.message.includes('无法确定'), String(ambiguous))
-  // ④ 零台在线 → 明确报错
+  // ① 显式 deviceId 优先（也认页面 clientId）
+  const a = two()
+  const runA = createTihuToolRunner(a.surface)
+  await runA('tihu_stop_speaking', { deviceId: 'dev-old', scope: 'all' })
+  assert.deepEqual(a.calls, [['stopSpeaking', 'dev-old', '{"scope":"all"}']])
+  await runA('tihu_stop_speaking', { deviceId: 'client-old' })
+  assert.equal(a.calls.length, 2)
+  assert.equal(a.calls[1][1], 'dev-old', '页面 clientId 也要能定位到同一台')
+  // ② 没显式指定 → 最近活跃的那台（dev-new）
+  const b = two()
+  const runB = createTihuToolRunner(b.surface)
+  const out = await runB('tihu_stop_speaking', {})
+  assert.equal(b.calls[0][1], 'dev-new', '默认取最近活跃的那台')
+  assert.ok(out.includes('dev-new'), '返回里要写清实际生效的设备：' + out)
+  // ③ 会话绑定优先于「最近活跃」
+  const c = two()
+  const runC = createTihuToolRunner(c.surface)
+  await runC('tihu_stop_speaking', {}, { sessionId: 'session-x' })
+  assert.equal(c.calls[0][1], 'dev-old', '绑定到调用方会话的那台优先')
+  // ④ 零在线 → 报错并给 /tihu 指引
   const d = controlSurfaceFixture({ devices: [] })
-  const runD = createTihuControlRunner(d.surface)
-  const empty = await runD({ action: 'replay' }).then(() => null, (error) => error)
+  const runD = createTihuToolRunner(d.surface)
+  const empty = await runD('tihu_stop_speaking', {}).then(() => null, (error) => error)
   assert.ok(empty instanceof Error && empty.message.includes('没有鹈鹕设备在线'), String(empty))
+  // ⑤ 不存在的 deviceId → 报错并列出在线设备（绝不悄悄换一台）
+  const failed = await runA('tihu_stop_speaking', { deviceId: 'dev-gone' }).then(() => null, (error) => error)
+  assert.ok(failed instanceof Error && failed.message.includes('不在线'), String(failed))
+  assert.ok(failed.message.includes('dev-old') && failed.message.includes('dev-new'), '要列出在线设备：' + failed.message)
+  // ⑥ 纯函数口径
+  assert.equal(mostActiveDevice(c.surface.listDevices()).id, 'dev-new')
+  assert.equal(resolveControlDevice({ surface: a.surface }, 'dev-old').id, 'dev-old')
 })
 
-await testAsync('控制工具：browse 用 session 参数传方向；open_bubble 缺 index 与标题报错', async () => {
+await testAsync('设备离线：报文与文案都不假装成功（§8.3）', async () => {
+  const { surface } = controlSurfaceFixture()
+  const run = createTihuToolRunner(surface)
+  const failure = await run('tihu_go_home', { deviceId: 'dev-9f21' }).then(() => null, (error) => error)
+  assert.ok(failure instanceof Error, '离线必须是 throw（不再是「错误：…」字符串结果）')
+  assert.ok(failure.message.includes('鹈鹕设备 dev-9f21 不在线'), String(failure))
+  assert.ok(failure.message.includes('在线设备'), '要给出下一步：' + failure.message)
+  // 一个工具都没办法在零设备时「成功」
+  const empty = controlSurfaceFixture({ devices: [] })
+  const runEmpty = createTihuToolRunner(empty.surface)
+  for (const tool of ['tihu_status', 'tihu_list_devices']) {
+    const failed = await runEmpty(tool, {}).then(() => null, (error) => error)
+    assert.ok(failed instanceof Error && failed.message.includes('没有鹈鹕设备在线'), `${tool} 零设备必须报错`)
+  }
+})
+
+await testAsync('设备工具：15 个工具逐个走通，返回文案都带「实际生效的设备」（可直接念给用户）', async () => {
   const { surface, calls } = controlSurfaceFixture()
-  const run = createTihuControlRunner(surface)
-  const prev = await run({ action: 'browse', session: 'prev' })
-  assert.ok(prev.includes('上一条'), prev)
-  const next = await run({ action: 'browse' })
-  assert.ok(next.includes('下一条'), next)
-  const bubbleMissing = await run({ action: 'open_bubble' }).then(() => null, (error) => error)
-  assert.ok(bubbleMissing instanceof Error && bubbleMissing.message.includes('index'), String(bubbleMissing))
-  await run({ action: 'open_bubble', index: 1 })
-  assert.deepEqual(calls.filter((call) => call[0] === 'openBubble'), [['openBubble', 'dev-1', '{"index":1}']])
+  const run = createTihuToolRunner(surface)
+  const cases = [
+    ['tihu_stop_speaking', {}, 'stopSpeaking', '已停止朗读'],
+    ['tihu_pause_speaking', {}, 'pauseSpeaking', '已暂停'],
+    ['tihu_resume_speaking', {}, 'resumeSpeaking', '已继续'],
+    ['tihu_replay', { segment: 1 }, 'replay', '正在重读'],
+    ['tihu_go_home', {}, 'goHome', '已回主页'],
+    ['tihu_board_page', { direction: 'next' }, 'boardPage', '已翻到第 2/3 页'],
+    ['tihu_open_task', { taskId: 't3' }, 'openTaskCard', '已打开 t3'],
+    ['tihu_follow_task', { taskId: 't3' }, 'followTask', '已跟随 t3'],
+    ['tihu_end_voice_session', {}, 'endVoiceSession', '已结束本次语音会话'],
+    ['tihu_wake', {}, 'wake', '已进入在听'],
+    ['tihu_answer_decision', { index: 1 }, 'answerDecision', '已选「确认删除」'],
+    ['tihu_dismiss_decision', { mode: 'default' }, 'dismissDecision', '已按默认项'],
+    ['tihu_device_settings', { key: 'voice', value: 'zh-CN-XiaoxiaoNeural' }, 'deviceSettings', '音色已切到 晓晓'],
+  ]
+  for (const [tool, args, expectedCall, expectedText] of cases) {
+    const text = await run(tool, args)
+    assert.ok(text.includes(expectedText), `${tool} 返回：` + text)
+    assert.ok(text.includes('dev-1'), `${tool} 返回必须写清实际生效的设备：` + text)
+    assert.ok(text.split(' · ').length >= 2, `${tool} 要按「结果 · 设备号 · 回执」给：` + text)
+    assert.equal(calls[calls.length - 1][0], expectedCall, `${tool} 应转调 ${expectedCall}`)
+  }
+  // 状态类（不返回 DeviceActionOutcome，按行读）
+  const status = await run('tihu_status', {})
+  assert.ok(status.includes('设备 dev-1'), status)
+  assert.ok(status.includes('棋盘：等你 0 · 在跑 0 · 排队 0 · 完成 0'), status)
+  assert.ok(status.includes('音色：default'), status)
+  const listed = await run('tihu_list_devices', {})
+  assert.ok(listed.includes('dev-1') && listed.includes('默认控制'), listed)
 })
 
-await testAsync('控制工具：status 汇总屏幕/气泡/朗读/音色；list_devices 列在线设备', async () => {
-  const { surface } = controlSurfaceFixture({
-    pending: [{ sessionId: 'session-11cc22dd-bbbb-2222', title: '鹈鹕实验记录', at: 1 }],
-    screen: { stage: '回答', title: '结论先行', mode: 'reply', bullets: ['第一句', '第二句'] },
+await testAsync('设备工具：幂等 —— 已达成时返回「本来…」，不再下第二次', async () => {
+  const stopped = controlSurfaceFixture({ stopAlready: true })
+  const runStop = createTihuToolRunner(stopped.surface)
+  const stopText = await runStop('tihu_stop_speaking', {})
+  assert.ok(stopText.includes('本来就没在朗读'), stopText)
+  const homed = controlSurfaceFixture({ homeAlready: true })
+  const runHome = createTihuToolRunner(homed.surface)
+  const homeText = await runHome('tihu_go_home', {})
+  assert.ok(homeText.includes('本来就在主页'), homeText)
+  // 幂等的结果也必须带设备号与当前屏（用户要能确认「真的没动」）
+  assert.ok(homeText.includes('dev-1') && homeText.includes('棋盘第'), homeText)
+  // 回执格式化：没回执就写「设备未回执」，绝不静默成功
+  assert.equal(formatDeviceResult({ text: '已下发停止', deviceId: 'dev-1' }), '已下发停止 · dev-1 · 设备未回执')
+  assert.equal(formatDeviceResult({ text: '已停止朗读', deviceId: 'dev-1', acked: true, echo: '停在 完成 第 3/12 行' }), '已停止朗读 · dev-1 · 停在 完成 第 3/12 行')
+  assert.equal(formatDeviceResult({ text: '本来就没在朗读', deviceId: 'dev-1', already: true }), '本来就没在朗读 · dev-1')
+})
+
+await testAsync('设备工具：重播（replay）参数透传，段号由宿主夹范围', async () => {
+  const { surface, calls } = controlSurfaceFixture()
+  const run = createTihuToolRunner(surface)
+  await run('tihu_replay', { taskId: 't3', segment: 4, force: true })
+  const call = calls.find((entry) => entry[0] === 'replay')
+  assert.equal(call[1], 'dev-1')
+  assert.deepEqual(JSON.parse(call[2]), { taskId: 't3', segment: 4, force: true })
+  // line 与 segment 都能传（工具层只做类型校验，语义在 lane）
+  await run('tihu_replay', { line: 2 })
+  assert.deepEqual(JSON.parse(calls[calls.length - 1][2]), { line: 2, force: false })
+  const text = await run('tihu_replay', { segment: 3 })
+  assert.ok(text.includes('第 3 段（共 7 段）'), text)
+})
+
+await testAsync('tihu_admin：6 条杂项都还在，dispatch 缺 text 报错', async () => {
+  const { surface, calls, archived } = controlSurfaceFixture({
+    devices: [],
+    tasks: [{ taskId: 't3', title: '改写第 3 段', capsule: '完成', sub: '青年基金 · 第 4 步' }],
   })
-  const run = createTihuControlRunner(surface)
-  const status = await run({ action: 'status' }, { sessionId: 'session-98bb83cb-aaaa-1111' })
-  assert.ok(status.includes('模式=reply'), status)
-  assert.ok(status.includes('鹈鹕实验记录'), '气泡要列出：' + status)
-  assert.ok(status.includes('朗读中：否'), status)
-  assert.ok(status.includes('zh-CN-YunjianNeural'), status)
-  const listed = await run({ action: 'list_devices' })
-  assert.ok(listed.includes('dev-1'), listed)
+  const run = createTihuToolRunner(surface)
+  const noText = await run('tihu_admin', { action: 'dispatch' }).then(() => null, (error) => error)
+  assert.ok(noText instanceof Error && noText.message.includes('需要 text'), String(noText))
+  const dispatched = await run('tihu_admin', { action: 'dispatch', text: '把预算表补上' })
+  assert.ok(dispatched.includes('已派给'), dispatched)
+  const tasks = await run('tihu_admin', { action: 'list_tasks' })
+  assert.ok(tasks.includes('t3. 改写第 3 段'), tasks)
+  const cancelled = await run('tihu_admin', { action: 'cancel_task', session: 't3' })
+  assert.ok(cancelled.includes('已撤掉'), cancelled)
+  const loud = await run('tihu_admin', { action: 'list_sessions' })
+  assert.ok(loud.includes('鹈鹕语音调试'), loud)
+  const archivedText = await run('tihu_admin', { action: 'archive_session', session: '实验', confirm: true })
+  assert.ok(archivedText.includes('已删除（归档）'), archivedText)
+  assert.deepEqual(archived, ['session-11cc22dd-bbbb-2222'])
+  assert.deepEqual(calls, [['dispatch', '把预算表补上'], ['cancelTask', 't3'], ['archive', 'session-11cc22dd-bbbb-2222']])
+})
+
+/* ---------- 2026-11-10：设备控制工具的 lane 落地（回执 / 幂等 / 单台 / 状态一致） ---------- */
+
+await testAsync('设备控制（lane）：停止朗读真的下发 playback.control，回执进返回；第二次是 already-idle', async () => {
+  const w = unifiedWorkspace()
+  process.env.TIHU_ACK_TIMEOUT_MS = '400'
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'ctl-stop', protocol: '0' }, 1)))
+  await waitMs(60)
+  const device = w.runtime.control.listDevices()[0]
+  assert.ok(device !== undefined, 'hello 之后要有一台在线设备')
+
+  // 页面自报「正在念第 3 段」——宿主从此信页面，不再写死 speaking:false
+  socket.emit('data', clientFrame(buildUpstream('playback.state', { phase: 'playing', taskId: 't1', segment: 3, line: 2, total: 12 }, 2)))
+  await waitMs(20)
+  assert.equal(w.runtime.control.deviceStatus(device.id).speaking, true)
+
+  const pending = w.runtime.control.stopSpeaking(device.id, { scope: 'round' })
+  await waitMs(40)
+  const control = framesOf(socket).filter((frame) => frame.type === 'playback.control').pop()
+  assert.ok(control !== undefined, '必须真的下发 playback.control（以前只掐合成）')
+  assert.equal(control.payload.action, 'stop')
+  assert.equal(typeof control.payload.opId, 'string')
+  socket.emit('data', clientFrame(buildUpstream('device.ack', { opId: control.payload.opId, ok: true, stage: '完成 第 3/12 行' }, 3)))
+  const first = await pending
+  assert.equal(first.text, '已停止朗读', JSON.stringify(first))
+  assert.equal(first.acked, true)
+  assert.ok(String(first.echo).includes('完成 第 3/12 行'), '返回要带设备自报的当前屏：' + String(first.echo))
+
+  // 页面报告已 idle → 再调一次不得再发消息（幂等，§8.1）
+  socket.emit('data', clientFrame(buildUpstream('playback.state', { phase: 'idle' }, 4)))
+  await waitMs(20)
+  const before = framesOf(socket).filter((frame) => frame.type === 'playback.control').length
+  const second = await w.runtime.control.stopSpeaking(device.id, { scope: 'round' })
+  assert.equal(second.already, true, '第二次必须是 already-idle')
+  assert.ok(second.text.includes('本来就没在朗读'), second.text)
+  assert.equal(framesOf(socket).filter((frame) => frame.type === 'playback.control').length, before, '幂等：不得再下发一条')
+  w.cleanup()
+  delete process.env.TIHU_ACK_TIMEOUT_MS
+})
+
+await testAsync('设备控制（lane）：没回执时如实说「设备未回执」，不静默成功', async () => {
+  const w = unifiedWorkspace()
+  process.env.TIHU_ACK_TIMEOUT_MS = '60'
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'ctl-noack', protocol: '0' }, 1)))
+  await waitMs(60)
+  const device = w.runtime.control.listDevices()[0]
+  socket.emit('data', clientFrame(buildUpstream('playback.state', { phase: 'playing', segment: 1 }, 2)))
+  await waitMs(20)
+  const outcome = await w.runtime.control.stopSpeaking(device.id, { scope: 'round' })
+  assert.equal(outcome.acked, undefined, '设备没回执就不能标成已确认')
+  assert.ok(outcome.text.includes('已下发停止'), outcome.text)
+  // 工具层拼出来的是「已下发停止 · dev-… · 设备未回执」
+  const line = formatDeviceResult(outcome)
+  assert.ok(line.includes('设备未回执'), line)
+  w.cleanup()
+  delete process.env.TIHU_ACK_TIMEOUT_MS
+})
+
+await testAsync('设备控制（lane）：回主页之后状态查询一致（屏=棋盘、页码与计数同源）', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'ctl-home', protocol: '0' }, 1)))
+  await waitMs(60)
+  const device = w.runtime.control.listDevices()[0]
+
+  // 派一条任务 → 屏被回执抢走（不在棋盘），这样「回主页」才真的有动作可做
+  await w.runtime.control.dispatch({ text: '把青年基金申请书的预算表补上' })
+  await waitMs(40)
+  const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
+  assert.ok(receipt !== undefined, '派单要出回执屏')
+
+  const home = await w.runtime.control.goHome(device.id, { stopSpeaking: true })
+  assert.equal(home.text, '已回主页', JSON.stringify(home))
+  assert.ok(String(home.echo).includes('棋盘第 1/1 页'), String(home.echo))
+
+  const status = w.runtime.control.deviceStatus(device.id)
+  assert.equal(status.pinned, true, '回主页后必须真的停在棋盘上')
+  assert.equal(status.stage, undefined, '棋盘的 stage 是空串（不再残留「派单」）')
+  assert.equal(status.board.counts.queued + status.board.counts.running + status.board.counts.awaiting + status.board.counts.done, 1, '棋盘计数与登记簿同源')
+  const board = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop()
+  assert.ok(board !== undefined, '回主页必须推一帧棋盘')
+
+  // 再回一次：already-home，不再推帧
+  const framesBefore = framesOf(socket).length
+  const again = await w.runtime.control.goHome(device.id, { stopSpeaking: true })
+  assert.equal(again.already, true, '已在主页就该是 already-home')
+  assert.equal(framesOf(socket).length, framesBefore, 'already-home 不许再推一帧')
+  w.cleanup()
+})
+
+await testAsync('设备控制（lane）：离线设备报错并列出在线设备（不假装成功）', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'ctl-offline', protocol: '0' }, 1)))
+  await waitMs(60)
+  const device = w.runtime.control.listDevices()[0]
+  const failure = await w.runtime.control.stopSpeaking('dev-gone', { scope: 'round' }).then(() => null, (error) => error)
+  assert.ok(failure instanceof Error, '离线必须 throw（§8.3）')
+  assert.ok(failure.message.includes('不在线'), failure.message)
+  assert.ok(failure.message.includes(device.id), '要列出在线设备：' + failure.message)
+  w.cleanup()
+})
+
+await testAsync('多设备（lane）：派单回执只发给最近活跃的那台，第二块屏留在棋盘不黑屏', async () => {
+  const w = unifiedWorkspace()
+  const first = openLane(w.runtime)
+  first.emit('data', clientFrame(buildUpstream('hello', { clientId: 'mt-first', protocol: '0' }, 1)))
+  await waitMs(60)
+  const second = openLane(w.runtime)
+  second.emit('data', clientFrame(buildUpstream('hello', { clientId: 'mt-second', protocol: '0' }, 1)))
+  await waitMs(60)
+  const devices = w.runtime.control.listDevices()
+  assert.equal(devices.length, 2, '两台设备都要在线')
+  const active = devices[0].lastSeenAt >= devices[1].lastSeenAt ? devices[0] : devices[1]
+
+  await w.runtime.control.dispatch({ text: '把青年基金申请书的预算表补上' })
+  await waitMs(60)
+  const receiptOn = (socket) => framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').length
+  assert.equal(receiptOn(second) >= 1 || receiptOn(first) >= 1, true, '至少要有一台收到回执')
+  const totalReceipts = receiptOn(first) + receiptOn(second)
+  assert.equal(totalReceipts, 1, '回执必须只发一台（旧实现广播给所有设备）')
+  // 没收到回执的那台仍停在棋盘上（它的 hello 自己拉过状态，不会黑屏）
+  const boardOn = (socket) => framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).length
+  assert.ok(boardOn(first) >= 1 && boardOn(second) >= 1, '两台都通过自己的 hello 拿到过棋盘帧')
+  assert.ok(active.id.length > 0)
+  w.cleanup()
+})
+
+await testAsync('tihu_list_devices：includeOffline 才列最近断开的设备，且离线设备永不被选中执行动作', async () => {
+  const { surface } = controlSurfaceFixture({ devices: [
+    { id: 'dev-on', sessionId: 'session-a', autoFollow: false, voice: 'default', edgeVoice: 'e', offlineOnly: false, lastSeenAt: 5000 },
+    { id: 'dev-off', sessionId: 'session-b', autoFollow: false, voice: 'default', edgeVoice: 'e', offlineOnly: false, lastSeenAt: 100, offline: true },
+  ] })
+  const run = createTihuToolRunner(surface)
+  const online = await run('tihu_list_devices', {})
+  assert.ok(online.includes('dev-on'), online)
+  assert.equal(online.includes('dev-off'), false, '默认不列离线设备')
+  const all = await run('tihu_list_devices', { includeOffline: true })
+  assert.ok(all.includes('dev-off') && all.includes('已离线'), all)
+  assert.ok(all.includes('1 台鹈鹕设备在线'), '计数只算在线：' + all)
+  // 离线设备永不被选来执行动作（默认落到最近活跃的在线那台；显式点名则报不在线）
+  const stop = await run('tihu_stop_speaking', {})
+  assert.ok(stop.includes('dev-on'), stop)
+  const failed = await run('tihu_stop_speaking', { deviceId: 'dev-off' }).then(() => null, (error) => error)
+  assert.ok(failed instanceof Error && failed.message.includes('不在线'), String(failed))
+})
+
+await testAsync('设备控制（lane）：在听时停止朗读＝退出在听（不只是掐音频）；重读从第 1 段、越界夹回', async () => {
+  const w = unifiedWorkspace()
+  process.env.TIHU_ACK_TIMEOUT_MS = '300'
+  const socket = openLane(w.runtime)
+  const emit = w.events.find((entry) => entry.name === 'session/event').handler
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'ctl-listen', protocol: '0' }, 1)))
+  await waitMs(60)
+  const device = w.runtime.control.listDevices()[0]
+
+  // 在听 → 停声必须退出在听（规格书 §8.4）
+  socket.emit('data', clientFrame(buildUpstream('playback.state', { phase: 'listening' }, 2)))
+  await waitMs(20)
+  const stopping = w.runtime.control.stopSpeaking(device.id, { scope: 'round' })
+  await waitMs(30)
+  const listenOff = framesOf(socket).filter((frame) => frame.type === 'voice.listen').pop()
+  assert.ok(listenOff !== undefined, '在听时必须下发 voice.listen')
+  assert.equal(listenOff.payload.on, false, '停声＝关麦')
+  socket.emit('data', clientFrame(buildUpstream('device.ack', { opId: listenOff.payload.opId, ok: true, stage: '麦克风已关' }, 3)))
+  const stopped = await stopping
+  assert.ok(stopped.text.includes('已退出「在听」'), JSON.stringify(stopped))
+  socket.emit('data', clientFrame(buildUpstream('playback.state', { phase: 'idle' }, 4)))
+  await waitMs(20)
+
+  // 跑一条任务 → 跑着时重读必须被拒绝
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 5)))
+  await waitMs(90)
+  const taskSession = w.prompted[0].id
+  emit({ id: taskSession }, { type: 'turn/start', data: { turn: 1 } })
+  emit({ id: taskSession }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '现在十七点三十一分。' }] } } })
+  await waitMs(60)
+  const running = await w.runtime.control.replay(device.id, {}).then(() => null, (error) => error)
+  assert.ok(running instanceof Error && running.message.includes('还在跑'), String(running))
+
+  // 完成后重读：重发完成帧（current=0）＋从第 1 段起
+  emit({ id: taskSession }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  await waitMs(120)
+  const replayed = await w.runtime.control.replay(device.id, {})
+  assert.ok(replayed.text.includes('正在重读'), JSON.stringify(replayed))
+  assert.ok(String(replayed.echo).includes('完成 第 1/'), String(replayed.echo))
+  const doneFrame = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.done).pop()
+  assert.equal(doneFrame.payload.done.current, 0, '重读要把高亮定到第 1 段（不是加 N）')
+  const clamped = await w.runtime.control.replay(device.id, { segment: 9 })
+  assert.ok(clamped.text.includes('第 1 段'), '越界段号夹回范围：' + clamped.text)
+  assert.ok(clamped.text.includes('已夹到范围内'), '夹了就要说清楚：' + clamped.text)
+  w.cleanup()
+  delete process.env.TIHU_ACK_TIMEOUT_MS
 })
 
 await testAsync('lane.control 薄壳：archiveSession 转调 workspaceRegistry（stopActivity=true），不存在给可读错误', async () => {
@@ -2686,6 +3147,8 @@ function unifiedWorkspace(options = {}) {
   const created = []
   const prompted = []
   const renamed = []
+  /** 鹈鹕端默认模型：selectModel 的调用记录（见本函数里 sessionController.selectModel）。 */
+  const selectedModels = []
   /**
    * 真宿主形态（2026-11-10 承接 bug 回归用）：`ctx.get('sessions')` 是会话存储，
    * **没有客户端那份 `sessions.using`**；投递只能走 `agents.get(id).followup()`。
@@ -2752,6 +3215,14 @@ function unifiedWorkspace(options = {}) {
       records.push(cuRecord(id, { live: true, preset: request.agentPreset, cwd: request.cwd, title: '任务 ' + created.length }))
       if (agentHost) mountAgent(id, { cwd: request.cwd, agentPreset: request.agentPreset })
       return { sessionId: id }
+    },
+    /** 鹈鹕端默认模型走这里（宿主真实通路）。记下「选的时候这条会话投过消息没有」＝顺序证据。 */
+    selectModel: async (request) => {
+      selectedModels.push({
+        ...request,
+        promptedBefore: prompted.some((item) => item.id === request.sessionId),
+      })
+      return { selected: { provider: request.provider, model: request.model } }
     },
     rename: async ({ sessionId, title }) => {
       renamed.push({ sessionId, title })
@@ -2828,6 +3299,7 @@ function unifiedWorkspace(options = {}) {
     created,
     prompted,
     renamed,
+    selectedModels,
     resumed,
     resolved,
     liveAgents,
@@ -4001,17 +4473,24 @@ test('page：完成页高亮由每段 PCM 的 onended/开始事件驱动，删�
 
 test('page：重读从第一段重新开始、停止清空回调且高亮停住', () => {
   const html = pageHtmlOf()
+  // 2026-11-10（规格书 §7 第 2 处）：重读/停止不再各写一份 stopPcm，统一走 applyPlayback
+  // （手指点屏与宿主 playback.control 同一条路）。
   const replay = /actionId === 'replay'\) \{([\s\S]*?)\n            \}/.exec(html)
   assert.ok(replay !== null, '要有重读分支')
-  assert.ok(replay[1].includes('stopPcm()'), '重读先掐掉旧音频并清回调')
-  assert.ok(replay[1].includes('state.done.current = 0'), '重读高亮回第一行')
+  assert.ok(replay[1].includes("applyPlayback('seek'"), '重读＝seek 到第 1 段（与宿主 playback.control 同一条路）')
+  assert.ok(replay[1].includes('segment: 1'), '重读从第一段开始')
+  const applyPlayback = /function applyPlayback\(action, meta\) \{([\s\S]*?)\n  \}\n/.exec(html)
+  assert.ok(applyPlayback !== null, '要有 applyPlayback（播放控制的唯一入口）')
+  assert.ok(applyPlayback[1].includes('stopPcm()'), '暂停/继续/跳段都先掐掉旧音频并清回调')
+  assert.ok(applyPlayback[1].includes('state.done.current = index'), 'seek 把高亮定点到第 N 段（不是加 N）')
+  assert.ok(applyPlayback[1].includes("state.pausedAt = { segment: segment"), '暂停要记住段号（段级续播）')
   const stopPcm = /function stopPcm\(\) \{([\s\S]*?)\n  \}/.exec(html)
   assert.ok(stopPcm !== null)
   assert.ok(stopPcm[1].includes('source.onended = null'), '停止/重读必须清空每段的开始/结束回调')
   assert.ok(stopPcm[1].includes('state.pcmLast = null'), '停止后不再和旧时间轴首尾相接')
-  // 停止/回主页/翻页统一走 stopPcm：掐音频、清每段回调（翻页也要立刻停口，别让上一屏的正文念到下一屏）。
-  const stopCall = /if \(actionId === 'stop' \|\| actionId === 'home'[\s\S]{0,240}?stopPcm\(\)/.exec(html)?.[0] ?? ''
-  assert.ok(stopCall !== '', '停止/回主页统一走 stopPcm：清回调、掐音频')
+  // 停止/回主页/翻页统一走 applyPlayback('stop')：掐音频、清每段回调（翻页也要立刻停口）。
+  const stopCall = /if \(actionId === 'stop' \|\| actionId === 'home'[\s\S]{0,320}?applyPlayback\('stop'\)/.exec(html)?.[0] ?? ''
+  assert.ok(stopCall !== '', '停止/回主页统一走 applyPlayback(stop)：清回调、掐音频')
   assert.ok(stopCall.includes("actionId === 'boardPrev'") && stopCall.includes("actionId === 'boardNext'"), '翻页也先停口：' + stopCall)
   assert.equal(/actionId === 'stop'\) \{/.test(html), false, '停止不再单独挂一个会改高亮的分支')
 })
@@ -6300,6 +6779,100 @@ await testAsync('待决策抢屏：设备看着别的任务、不在棋盘，屏
   } finally {
     delete process.env.TIHU_LANE_LOG
     delete process.env.TIHU_TUOGUAN_STATE
+    w.cleanup()
+  }
+})
+
+/* ---------- 鹈鹕端默认模型（设置 → 个人助手 → 鹈鹕端 → config.json → 会话） ----------
+ *
+ * 宿主 `session.create` 没有 model 字段，所以「指定模型」只能发生在建完会话之后：
+ * `sessionController.selectModel`。下面两条用例钉住真实的接线位置——
+ *   - 后台（指挥台，standard）：hello 触发新建指挥台 → 建完立刻 selectModel；
+ *   - 前台（派单，computer-use）：派单新建任务会话 → 建完立刻 selectModel，且**在 prompt 之前**。
+ * 没配置时一条都不许调（否则等于悄悄改了用户所有会话的模型）。
+ */
+const writeTihuConfig = async (home, tihu) => {
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ tihu }), 'utf8')
+  const config = await import('../src/assistant-config.ts')
+  config.resetAssistantConfigCacheForTests()
+}
+const clearTihuConfig = async (home) => {
+  try { rmSync(join(home, 'config.json'), { force: true }) } catch { /* 忽略 */ }
+  const config = await import('../src/assistant-config.ts')
+  config.resetAssistantConfigCacheForTests()
+}
+
+await testAsync('鹈鹕端默认后台模型：新建指挥台会话后立刻 selectModel，且不配置时一次都不调', async () => {
+  const clean = unifiedWorkspace({ seedCommander: false })
+  try {
+    const socket = openLane(clean.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-none', protocol: '0' }, 1)))
+    await waitMs(80)
+    assert.equal(clean.created.length, 1, '没指挥台时仍要新建一条')
+    assert.deepEqual(clean.selectedModels, [], '没配置模型时绝不能调 selectModel（老行为）')
+  } finally {
+    clean.cleanup()
+  }
+
+  const w = unifiedWorkspace({ seedCommander: false })
+  try {
+    await writeTihuConfig(w.home, { model: { background: { provider: 'stub', model: 'bg-model' } } })
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-bg', protocol: '0' }, 1)))
+    await waitMs(120)
+    assert.equal(w.created.length, 1, '指挥台要建出来')
+    assert.equal(w.created[0].agentPreset, 'standard', '指挥台仍是 standard 预设（模型是选出来的，不是换预设）')
+    assert.equal(w.selectedModels.length, 1, '配置了后台模型就要在建完后选一次：' + JSON.stringify(w.selectedModels))
+    assert.equal(w.selectedModels[0].sessionId, 'session-task-1', '要选在刚建好的那条指挥台上')
+    assert.equal(w.selectedModels[0].provider, 'stub')
+    assert.equal(w.selectedModels[0].model, 'bg-model')
+    assert.equal(w.selectedModels[0].promptedBefore, false, '必须在投第一条消息之前选好模型')
+  } finally {
+    await clearTihuConfig(w.home)
+    w.cleanup()
+  }
+})
+
+await testAsync('鹈鹕端默认后台模型：复用回来的旧指挥台也要补上（它几乎永远不新建）', async () => {
+  const w = unifiedWorkspace()
+  try {
+    await writeTihuConfig(w.home, { model: { background: { provider: 'stub', model: 'bg-reuse' } } })
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-reuse', protocol: '0' }, 1)))
+    await waitMs(120)
+    assert.equal(w.created.length, 0, '已有指挥台就不该新建')
+    const applied = w.selectedModels.filter((item) => item.model === 'bg-reuse')
+    assert.equal(applied.length, 1, '复用回来的指挥台也要把默认后台模型装上：' + JSON.stringify(w.selectedModels))
+    assert.equal(applied[0].sessionId, 'session-cmd', '装在按标题找回的那条指挥台上')
+    // 第二次 hello 不许重复写 model/selection（同一进程内每条只补一次）
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-reuse', protocol: '0' }, 2)))
+    await waitMs(80)
+    assert.equal(w.selectedModels.filter((item) => item.model === 'bg-reuse').length, 1, '同一条指挥台不许每轮重复选模型')
+  } finally {
+    await clearTihuConfig(w.home)
+    w.cleanup()
+  }
+})
+
+await testAsync('鹈鹕端默认前台模型：派单新建的 computer-use 任务会话在 prompt 之前 selectModel', async () => {
+  const w = unifiedWorkspace()
+  try {
+    await writeTihuConfig(w.home, { model: { foreground: { provider: 'stub', model: 'fg-model', reasoningEffort: 'high' } } })
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-fg', protocol: '0' }, 1)))
+    await waitMs(60)
+    const card = w.cards[0]
+    const out = await w.runtime.control.dispatch({ text: `把 ${card.name} 的第一段再改一遍`, folder: card.folder })
+    assert.ok(String(out).startsWith('已派给'), '派单要成功：' + out)
+    await waitMs(80)
+    const fg = w.selectedModels.filter((item) => item.model === 'fg-model')
+    assert.equal(fg.length, 1, '派单建完会话要选一次前台模型：' + JSON.stringify(w.selectedModels))
+    assert.equal(fg[0].provider, 'stub')
+    assert.equal(fg[0].reasoningEffort, 'high', 'reasoningEffort 要一起带过去')
+    assert.equal(fg[0].promptedBefore, false, '必须在 promptSession 之前选模型，否则第一轮还是旧模型')
+    assert.ok(w.prompted.length >= 1, '任务消息仍要正常投进去（选模型不能挡住派单）')
+  } finally {
+    await clearTihuConfig(w.home)
     w.cleanup()
   }
 })

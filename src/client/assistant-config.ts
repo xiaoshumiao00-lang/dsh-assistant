@@ -25,6 +25,26 @@ export interface AsrTermRule {
   flags?: string
 }
 
+/** 一条模型选择（鹈鹕端默认前台/后台模型用）。 */
+export interface AssistantModelChoice {
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
+
+/** 鹈鹕端（语音小屏）的三项：默认前台模型 / 默认后台模型 / 默认云音色。 */
+export interface AssistantTihuConfig {
+  model: {
+    /** null = 跟随宿主默认模型（老行为）。 */
+    foreground: AssistantModelChoice | null
+    background: AssistantModelChoice | null
+  }
+  voice: {
+    /** 云端音色 id（edge-tts 的 zh-CN-*Neural）；'' = 跟随 TIHU_EDGE_VOICE / 云健。 */
+    edge: string
+  }
+}
+
 export interface AssistantClientConfig {
   newProjectParent: string
   newProjectParentSource: 'config' | 'desktop' | 'assistant'
@@ -43,6 +63,8 @@ export interface AssistantClientConfig {
   updateSource: string
   /** 是否允许检查 GitHub 更新（默认 false） */
   updateCheckEnabled: boolean
+  /** 鹈鹕端默认模型与默认云音色（没配置时全走老默认值） */
+  tihu: AssistantTihuConfig
   /** 当前实际生效的配置文件路径（空 = 没有任何本机配置） */
   configSource: string
 }
@@ -100,7 +122,31 @@ function normalize(raw: any): AssistantClientConfig | null {
     termEnvAllow: asStringList(raw.termEnvAllow),
     updateSource: asString(raw.updateSource).trim(),
     updateCheckEnabled: raw.updateCheckEnabled === true,
+    tihu: normalizeTihu(raw.tihu),
     configSource: asString(raw.configSource).trim(),
+  }
+}
+
+/** 一条模型选择的归一（provider/model 都非空才算配了）。 */
+function normalizeModelChoice(raw: any): AssistantModelChoice | null {
+  if (!raw || typeof raw !== 'object') return null
+  const provider = asString(raw.provider).trim()
+  const model = asString(raw.model).trim()
+  if (!provider || !model) return null
+  const effort = asString(raw.reasoningEffort).trim()
+  return { provider, model, ...(effort ? { reasoningEffort: effort } : {}) }
+}
+
+/** 鹈鹕端配置的归一：缺字段就退成「跟随默认」，绝不因为坏值让整份配置读不出来。 */
+function normalizeTihu(raw: any): AssistantTihuConfig {
+  const model = raw && typeof raw === 'object' && raw.model && typeof raw.model === 'object' ? raw.model : {}
+  const voice = raw && typeof raw === 'object' && raw.voice && typeof raw.voice === 'object' ? raw.voice : {}
+  return {
+    model: {
+      foreground: normalizeModelChoice(model.foreground),
+      background: normalizeModelChoice(model.background),
+    },
+    voice: { edge: asString(voice.edge).trim() },
   }
 }
 
@@ -243,6 +289,14 @@ export function allowAllLocalPathsSync(): boolean {
 export function updateSettingsSync(): { source: string; enabled: boolean } {
   const cfg = readCached()
   return { source: cfg?.updateSource ?? '', enabled: cfg?.updateCheckEnabled === true }
+}
+
+/** 鹈鹕端默认模型与默认云音色（宿主还没答过时给「跟随默认」的空形态）。 */
+export function tihuConfigSync(): AssistantTihuConfig {
+  return readCached()?.tihu ?? {
+    model: { foreground: null, background: null },
+    voice: { edge: '' },
+  }
 }
 
 /** 当前生效的配置文件路径（空 = 没有任何本机配置，全部走通用默认）。 */

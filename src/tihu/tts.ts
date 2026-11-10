@@ -33,6 +33,7 @@ import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { Pcm16Chunker, TTS_CHUNK_MS, TTS_SAMPLE_RATE, validateReferenceWav } from './audio.ts'
+import { TIHU_CLOUD_VOICE_DEFAULT, isTihuCloudVoice, tihuCloudVoiceShortName } from './cloud-voices.ts'
 import { toTtsSegments } from './protocol.ts'
 import type { VoiceInfo } from './protocol.ts'
 
@@ -1031,7 +1032,7 @@ export class TihuTts {
     const started = Date.now()
     const deps = this.edgeDependencies()
     if (!deps.ok) throw new Error(`edge 依赖不可用：${deps.error}`)
-    const voice = options.edgeVoice || process.env.TIHU_EDGE_VOICE || 'zh-CN-YunjianNeural'
+    const voice = options.edgeVoice || process.env.TIHU_EDGE_VOICE || TIHU_CLOUD_VOICE_DEFAULT
     const py = spawn(deps.python, ['-u', deps.script, '--text', text, '--voice', voice], {
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -1470,13 +1471,18 @@ export class TihuTts {
     return voiceDirOf(workspace)
   }
 
-  /** 列出音色：默认（edge）+ Kokoro 中文音色（离线兜底/手切）+ 工作区克隆音色。 */
-  async listVoices(sessionId?: string): Promise<VoiceInfo[]> {
+  /** 列出音色：默认（edge）+ Kokoro 中文音色（离线兜底/手切）+ 工作区克隆音色。
+   *  `edgeVoice` 是这台设备实际在用的云端音色（宿主配置/TIHU_EDGE_VOICE/云健），
+   *  只用来把这句说明写对——别让用户设了「晓晓」、屏上还写着「云健」。 */
+  async listVoices(sessionId?: string, edgeVoice?: string): Promise<VoiceInfo[]> {
     const primaryKokoro = this.engineFor() === 'kokoro'
+    const cloudVoice = String(edgeVoice ?? '').trim()
     const voices: VoiceInfo[] = [{
       name: 'default',
       kind: 'default',
-      note: primaryKokoro ? `默认 Kokoro ${kokoroVoiceName(kokoroSid())}` : '默认：edge-tts 云健(Yunjian)',
+      note: primaryKokoro
+        ? `默认 Kokoro ${kokoroVoiceName(kokoroSid())}`
+        : `默认：edge-tts ${tihuCloudVoiceShortName(cloudVoice)}(${isTihuCloudVoice(cloudVoice) ? cloudVoice : TIHU_CLOUD_VOICE_DEFAULT})`,
     }]
     // Kokoro 音色一直列出来（模型齐全时）：选中它就是**手动切到 Kokoro**，切过去的音色设置保留。
     if (this.kokoroReady()) {

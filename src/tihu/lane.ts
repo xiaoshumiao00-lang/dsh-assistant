@@ -55,6 +55,13 @@ import {
   type TaskNotifyPayload,
   type TaskReplyPayload,
   type TaskUpdatePayload,
+  type DeviceAckPayload,
+  type PlaybackStatePayload,
+  type DeviceConfigPayload,
+  type PlaybackControlPayload,
+  type SessionEndedPayload,
+  type TihuDownstreamType,
+  type VoiceListenPayload,
 } from './protocol.ts'
 import {
   appendAudit,
@@ -71,6 +78,8 @@ import {
 import { tihuPageHtml } from './page.ts'
 import { applyEarlyThinking, applySessionEvent, createProgressState, decodeRateOf, formatTokens, pushDecodeSample, type TihuDecodeSample, type TihuProgressState } from './progress.ts'
 import { TihuTts, isKokoroVoice, type TihuTtsPaths } from './tts.ts'
+import { TIHU_CLOUD_VOICE_DEFAULT, isTihuCloudVoice, tihuCloudVoiceShortName } from './cloud-voices.ts'
+import { resolveTihuModel, selectModelKeepingDefault, type TihuModelKind } from './model-select.ts'
 import { replyVisibleWindow, replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
 import { stripToolNoise, toSpeechText } from './speech-text.ts'
 import { CONTENT_WIDTH_PX, fitScreenLines, PENDING_RAIL_WIDTH_PX, REPLY_LAYOUT, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
@@ -78,7 +87,7 @@ import { parseWav } from './audio.ts'
 import { applyPersonalTerms, cleanFillers, fixTerms } from '../client/pocket/orb/asr-terms.ts'
 import { loadAssistantConfig } from '../assistant-config.ts'
 import { cardsFromState, groupCardProjects, groupProjects, groupWorkspaceProjects, humanTitle, projectCardsSignature, projectNameOf, type ProjectReply, type TihuCardRow, type TihuWorkspaceRow } from './project-groups.ts'
-import { matchSessionRows, matchTaskRows, type ControlSessionRow, type ControlTaskRow, type DeviceStatusView, type SessionProgressView, type TihuControlDevice, type TihuControlSurface } from './control.ts'
+import { matchSessionRows, matchTaskRows, type ControlSessionRow, type ControlTaskRow, type DeviceActionOutcome, type DeviceStatusView, type SessionProgressView, type TihuControlDevice, type TihuControlSurface, type TihuDeviceActionOptions } from './control.ts'
 import type { AlertPayload, TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
 import {
   ANNOUNCE_WINDOW_MS,
@@ -129,6 +138,7 @@ import {
   detailFrame,
   doneAnnouncementOf,
   doneFrame,
+  doneLinesOf,
   doneLineRangesOf,
   doneSpeechSegmentsOf,
   folderBase,
@@ -160,6 +170,14 @@ export const REPLY_HISTORY_LIMIT = 8
  */
 const TIHU_SAMPLE_TEXT = '试听：我是云健，声音正常吗？'
 
+/**
+ * 试听句跟着**当前云端音色**走：设置里选了「晓晓」就别再念「我是云健」
+ * （否则用户会以为默认音色没生效）。没配置时与 {@link TIHU_SAMPLE_TEXT} 逐字一致。
+ */
+export function tihuSampleTextOf(edgeVoice?: string): string {
+  const short = tihuCloudVoiceShortName(edgeVoice)
+  return short === '云健' ? TIHU_SAMPLE_TEXT : `试听：我是${short}，声音正常吗？`
+}
 /** 单条 WS 文本帧上限（协议层还有更细的限制）。 */
 const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024
 /** 转写超时。 */
@@ -303,6 +321,23 @@ function clampInt(value: number, min: number, max: number): number {
 
 /** 只用于新增配置读取；避免把新的 process 全局引用计入既有 TS2591 基线。 */
 const tihuRuntimeEnv = (globalThis as any).process?.env ?? {} as Record<string, string | undefined>
+
+/**
+ * 鹈鹕端默认云音色：`TIHU_EDGE_VOICE`（临时覆盖，最高优先）→ 本机配置
+ * `tihu.voice.edge` → 云健（历史默认值，与 2026-11-10 之前完全一致）。
+ *
+ * 只认清单里的云端音色：本地 Kokoro（zf_/zm_/数字）即使被手写进配置文件也当没配——
+ * 设置项语义是「默认云音色」，不是「默认引擎」。
+ */
+export function tihuEdgeVoiceDefault(): string {
+  const env = String(tihuRuntimeEnv.TIHU_EDGE_VOICE ?? '').trim()
+  if (env !== '') return env
+  try {
+    const configured = String((loadAssistantConfig().tihu as any)?.voice?.edge ?? '').trim()
+    if (isTihuCloudVoice(configured)) return configured
+  } catch { /* 读盘失败按「没配置」处理 */ }
+  return TIHU_CLOUD_VOICE_DEFAULT
+}
 
 /* ---------- 电脑端（DSH 主 GUI）会话 → 屏幕上的「外部任务」（2026-11-09） ----------
  *
@@ -498,6 +533,30 @@ interface TihuDevice {
   boardPage?: number
   /** 这台设备的棋盘上有没有「在跑」的行（决定棋盘时长弧需不需要按时钟重发）。 */
   boardHasRunning?: boolean
+  /**
+   * 连上的时刻（控制工具「最近活跃的那台」的第一级比较值）。
+   * 多台设备时默认只控它 —— 不再「有第二块屏就直接报错」。
+   */
+  connectedAt: number
+  /** 最后一次收到**实质**上行（hello / 输入 / 手势 / 回执…）的时刻；ping 不刷新。 */
+  lastSeenAt?: number
+  /**
+   * 页面自报的播放状态（`playback.state`）：页面是唯一写者，宿主只读。
+   * `tihu_status` 的「朗读中 / 暂停在第 3 段 / 在听」全部读它，不再靠猜。
+   */
+  playback?: PlaybackStatePayload
+  /**
+   * 段级续播的暂停点（规格书 §8.5）：暂停＝清空队列并记住第 N 段；
+   * 继续＝宿主从该段第一个字重发 PCM（本行会重念 1–3 秒，绝不跳字）。
+   */
+  pausedAt?: { segment: number; line: number; taskId?: string }
+  /** 免按住（唤醒词聆听）开着吗（`device.config{key:'handsfree'}` 回写）。 */
+  handsfree?: boolean
+  /**
+   * 跟随的终点：`turn` = 本轮 turn 结束就回棋盘；`done` = 跟到任务真的完成（默认）。
+   * 由 tihu_follow_task 的 `until` 决定，回棋盘时清掉。
+   */
+  followUntil?: 'done' | 'turn'
 }
 
 /**
@@ -2775,8 +2834,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       autoBindEpoch: 0,
       voiceAttempt: 0,
       commitInFlight: false,
+      connectedAt: Date.now(),
       voice: 'default',
-      edgeVoice: process.env.TIHU_EDGE_VOICE ?? 'zh-CN-YunjianNeural',
+      edgeVoice: tihuEdgeVoiceDefault(),
       offlineOnly: process.env.TIHU_OFFLINE_ONLY === '1',
       send(type: string, payload: unknown) {
         try {
@@ -2854,6 +2914,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     socket.on('error', () => { /* 断开由 close 处理 */ })
     socket.on('close', () => {
       invalidateVoiceInput(device)
+      rememberRecentDevice(device)
       devices.delete(device)
       // 断开的设备不再有屏：把还挂着的这一轮朗读掐掉，别继续烧合成额度。
       try { device.cancelRound?.() } catch { /* 忽略 */ }
@@ -2873,11 +2934,81 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     for (const device of devices) device.send(type, payload)
   }
 
+  /* ---------- 设备回执（device.ack）：工具级动作「可验证」的唯一手段 ----------
+   *
+   * 规格书 §4.3：所有会改变设备状态的工具下发时带 `opId`，等设备 `device.ack{opId,ok,stage}`，
+   * **1.5 秒**没回执就降级返回「设备未回执」。没有这一层，「停止朗读」永远只是
+   * 「宿主以为发了」——用户在设备前看到的是「停了但还在说」。
+   */
+
+  /** 回执超时（默认 1.5 秒；测试用 TIHU_ACK_TIMEOUT_MS 压到几十毫秒，不拖慢用例）。 */
+  function tihuAckTimeoutMs(): number {
+    return clampInt(Number(tihuRuntimeEnv.TIHU_ACK_TIMEOUT_MS ?? 1500), 40, 10_000)
+  }
+
+  interface PendingAck {
+    resolve: (ack: DeviceAckPayload | undefined) => void
+    timer: ReturnType<typeof setTimeout>
+  }
+  /** 未结算的回执：opId → Promise 结算器（超时即弃，页面迟到的 ack 直接忽略）。 */
+  const pendingAcks = new Map<string, PendingAck>()
+
+  /**
+   * 下发一条「需要回执」的下行：自动生成 opId、挂 1.5 秒超时。
+   * 返回值：ack 对象（成功/失败/重复都算回执）或 `undefined`（超时，设备没回）。
+   */
+  function awaitDeviceAck(device: TihuDevice, type: TihuDownstreamType, payload: Record<string, unknown>): Promise<DeviceAckPayload | undefined> {
+    const opId = randomId('op')
+    return new Promise<DeviceAckPayload | undefined>((resolve) => {
+      const timer = setTimeout(() => {
+        pendingAcks.delete(opId)
+        log(`tihu ack timeout device=${device.id} type=${type} op=${opId}`)
+        resolve(undefined)
+      }, tihuAckTimeoutMs())
+      // **不 unref**：这是一次真的在等设备的动作，进程闲着也必须到点把它了结成
+      // 「设备未回执」，否则工具调用会永远悬着（dispose 会统一 clearPendingAcks）。
+      pendingAcks.set(opId, { resolve, timer })
+      device.send(type, { ...payload, opId })
+    })
+  }
+
+  function settleDeviceAck(ack: DeviceAckPayload): void {
+    const pending = pendingAcks.get(ack.opId)
+    if (pending === undefined) return
+    pendingAcks.delete(ack.opId)
+    clearTimeout(pending.timer)
+    pending.resolve(ack)
+  }
+
+  /** 卸载/重连时把所有挂着的回执等成 undefined（绝不让工具永远悬着）。 */
+  function clearPendingAcks(): void {
+    for (const pending of pendingAcks.values()) {
+      clearTimeout(pending.timer)
+      pending.resolve(undefined)
+    }
+    pendingAcks.clear()
+  }
+
   /** 处理一条合法上行。 */
   async function handleUpstream(device: TihuDevice, message: any): Promise<void> {
     const type = String(message.type)
     if (type === 'ping') {
       device.send('pong', { nonce: message?.payload?.nonce })
+      return
+    }
+    // 任何实质上行都刷新「最近活跃」：控制工具按它挑默认设备（规格书 §8.2 第 3 级）。
+    device.lastSeenAt = Date.now()
+    if (type === 'device.ack') {
+      const ack = message.payload as DeviceAckPayload
+      settleDeviceAck(ack)
+      if (ack.ok !== true) log(`tihu device ack not-ok device=${device.id} op=${ack.opId} reason=${ack.reason ?? '-'}`)
+      return
+    }
+    if (type === 'playback.state') {
+      const payload = message.payload as PlaybackStatePayload
+      const changed = device.playback?.phase !== payload.phase
+      device.playback = payload
+      if (changed) log(`tihu playback device=${device.id} phase=${payload.phase} seg=${payload.segment ?? '-'} line=${payload.line ?? '-'}`)
       return
     }
     if (type === 'hello') {
@@ -2894,6 +3025,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       device.unified = true
       device.focusedTask = undefined
       device.onBoard = true
+      // 断线重连必须丢掉上一轮连接留下的朗读/暂停假设（规格书 §6.3）：
+      // 页面会补一条 playback.state{phase:'idle'}，在那之前一律当「没在念」。
+      device.playback = undefined
+      device.pausedAt = undefined
       const commander = await ensureCommanderSession()
       if (commander !== undefined) {
         device.sessionId = commander
@@ -2955,6 +3090,28 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         const target = payload.taskId ?? device.focusedTask
         if (target !== undefined && openTask(device, target)) return
         await runScreenCommand(device, { kind: 'open' })
+        return
+      }
+      // 真机按文本答（固件没有按钮序号，只有语音/文本）：在挂着的待决策里按文本找选项。
+      if (typeof payload.optionText === 'string' && payload.optionText.trim() !== '') {
+        const target = payload.taskId === undefined
+          ? (device.focusedTask === undefined ? undefined : tasks.get(device.focusedTask))
+          : tasks.get(payload.taskId)
+        if (target !== undefined && target.state === 'awaiting') {
+          const list = (target.options ?? []).filter((option) => String(option ?? '').trim() !== '')
+          const key = payload.optionText.trim()
+          const exact = list.findIndex((label) => label.trim() === key)
+          const index = exact >= 0 ? exact : list.findIndex((label) => label.includes(key) || key.includes(label))
+          // 命中不了就**不猜**：留给模型用 tihu_answer_decision 追问（这里只记一行事件）。
+          if (index >= 0) {
+            if (!answerPendingDecision(target.taskId, index, '设备语音')) tasks.answer(target.taskId, '设备语音', Date.now())
+            device.send('event.progress', { stage: '待决策', text: `已选：${list[index]}` } satisfies ProgressPayload)
+            leaveDecisionScreens(target.taskId, device.id)
+            sendBoard(device)
+          } else {
+            device.send('event.progress', { stage: '待决策', text: `没对上选项「${key}」：${list.join(' / ')}` } satisfies ProgressPayload)
+          }
+        }
         return
       }
       // 硬件/固件的真正「答选项」入口（与屏上点 taskAnswer1/2 同一条路）：
@@ -3104,8 +3261,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       return
     }
     if (type === 'voice.list') {
-      const voices = await tts.listVoices(device.sessionId)
-      device.send('voice.list', { voices, selected: device.voice, engine: tts.status() } satisfies VoiceListPayload)
+      const voices = await tts.listVoices(device.sessionId, device.edgeVoice)
+      device.send('voice.list', { voices, selected: device.voice, edgeVoice: device.edgeVoice, engine: tts.status() } satisfies VoiceListPayload)
       return
     }
     if (type === 'voice.select') {
@@ -3132,7 +3289,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
        * 合成彻底失败：红告警 + 明确告诉页面可以退到提示音（绝不静默）。
        */
       const requested = typeof message.payload?.text === 'string' ? message.payload.text.trim() : ''
-      const sampleText = requested === '' ? TIHU_SAMPLE_TEXT : [...requested].slice(0, 60).join('')
+      const sampleText = requested === '' ? tihuSampleTextOf(device.edgeVoice) : [...requested].slice(0, 60).join('')
       if (!tts.available()) {
         device.send('event.alert', {
           level: 'error',
@@ -3190,8 +3347,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           text: created.cached ? `音色 ${created.voice.name} 已存在（命中缓存）` : `已创建音色 ${created.voice.name}`,
         } satisfies ProgressPayload)
         device.send('voice.list', {
-          voices: await tts.listVoices(device.sessionId),
+          voices: await tts.listVoices(device.sessionId, device.edgeVoice),
           selected: device.voice,
+          edgeVoice: device.edgeVoice,
           engine: tts.status(),
         } satisfies VoiceListPayload)
       } catch (error) {
@@ -3363,6 +3521,36 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       .map((id) => `${id}=${optionalService(ctx, id) === undefined ? 'missing' : 'ok'}`)
       .join(' ')}`)
     return undefined
+  }
+
+  /**
+   * 给**刚建好**的会话装「鹈鹕端默认模型」（设置 → 个人助手 → 鹈鹕端）。
+   *
+   * 为什么是建完再装、而不是 create 时带上：宿主 `session.create` 的请求体只有
+   * `workspaceId / cwd / sessionId / agentPreset`（没有 model 字段），`agent-preset` 里也没有；
+   * 唯一官方通路是 `sessionController.selectModel`——详见 `model-select.ts` 顶部说明。
+   *
+   * 失败只记日志、绝不抛：模型没切上就用宿主默认模型继续跑，不能因为一个配置项把这句话丢掉。
+   * 没配置（环境变量与本机配置都没有）时**什么都不做**，行为与 2026-11-10 之前完全一致。
+   *
+   * @param sessionId 刚建好的会话。
+   * @param kind 前台（派单任务会话）/ 后台（指挥台会话）。
+   * @param note 日志里标明是哪条路径。
+   */
+  async function applyTihuModel(sessionId: string, kind: TihuModelKind, note: string): Promise<void> {
+    let tihu: unknown
+    try { tihu = loadAssistantConfig().tihu } catch { tihu = undefined }
+    const selection = resolveTihuModel(kind, tihu)
+    if (selection === null) return
+    const label = kind === 'foreground' ? '前台' : '后台'
+    const result = await selectModelKeepingDefault(ctx, { sessionId, selection }, log)
+    if (result.ok) {
+      log(`tihu model ${kind} applied session=${sessionId} ${selection.provider}/${selection.model}（${note}）`)
+      try { appendTihuLaneNote('tihu-model', `已指定${label}模型 session=${sessionId} ${selection.provider}/${selection.model}`) } catch { /* 日志失败不影响派单 */ }
+      return
+    }
+    log(`tihu model ${kind} NOT applied session=${sessionId}: ${result.error}`)
+    try { appendTihuLaneNote('tihu-model', `指定${label}模型失败 session=${sessionId}：${result.error}`) } catch { /* 日志失败不影响派单 */ }
   }
 
   /** 给会话写标题：指挥会话靠标题被下次 hello 找回（宿主 sessionTitle 服务，经 sessionController 暴露）。 */
@@ -3665,6 +3853,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /**
+   * 指挥台是**按标题长期复用**的（正常情况永远不新建），所以「只影响新建会话」那条说法
+   * 对它等于永远不生效。这里改成「每进程每条指挥台补一次」：复用回来的那条也把默认后台
+   * 模型装上，装过就记下来、下次不再重复（同一会话不会每轮都写一次 model/selection）。
+   * 用户自己不会去改指挥台的模型（它不占屏、看不到），覆盖它是安全的。
+   */
+  const commanderModelApplied = new Set<string>()
+  async function ensureCommanderModel(sessionId: string): Promise<void> {
+    if (commanderModelApplied.has(sessionId)) return
+    commanderModelApplied.add(sessionId)
+    await applyTihuModel(sessionId, 'background', '指挥台')
+  }
+
+  /**
    * 指挥会话：按标题找回同一条；找不到才新建（落助手 home，standard 模式）。
    *
    * `fresh` 只给「投递连续失败后的重建」用：那条会话已经进不去（重启后归档/没加载/
@@ -3673,7 +3874,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   async function ensureCommanderSession(options: { fresh?: boolean } = {}): Promise<string | undefined> {
     if (options.fresh !== true && commanderSessionId !== undefined) {
       const found = await findSession(commanderSessionId)
-      if (found.status !== 'missing') return commanderSessionId
+      if (found.status !== 'missing') {
+        await ensureCommanderModel(commanderSessionId)
+        return commanderSessionId
+      }
       commanderSessionId = undefined
     }
     if (options.fresh === true) commanderSessionId = undefined
@@ -3684,11 +3888,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (existing !== undefined) {
         commanderSessionId = existing.sessionId
         log(`tihu commander reused session=${existing.sessionId}`)
+        await ensureCommanderModel(commanderSessionId)
         return commanderSessionId
       }
     }
     const created = await createSessionAt(assistantFolder(), TASK_PRESET)
     if (created === undefined) return undefined
+    // 默认后台模型（设置 → 个人助手 → 鹈鹕端）：建完立刻指定，赶在第一条消息之前。
+    await ensureCommanderModel(created)
     commanderSessionId = created
     // 标题必须落库：下次 hello 靠「标题含 鹈鹕指挥台」找回同一条；不写就会每次新建一条。
     const titled = await titleSession(created, COMMANDER_TITLE)
@@ -4162,6 +4369,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     device.pendingPick = undefined
     device.focusedTask = undefined
     device.onBoard = true
+    device.followUntil = undefined
     device.doneReadingTask = undefined
     lastFrames.set(key, frame)
     pushFrame(device, frame)
@@ -4256,6 +4464,27 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   function pendingDeviceOnline(): boolean {
     for (const device of devices) if (device.unified) return true
     return false
+  }
+
+  /**
+   * 最近活跃的统一指挥设备（规格书 §8.2）。
+   *
+   * 2026-11-10 用户拍板：多台设备时**默认只控这一台**，派单回执/完成帧也只发给它，
+   * 不再广播给所有设备（两块屏同时说话比不同步更糟）。第二块屏靠自己的 hello
+   * 主动拉一次棋盘状态，不会黑屏。
+   */
+  function activeUnifiedDevice(): TihuDevice | undefined {
+    let best: TihuDevice | undefined
+    let bestAt = -1
+    for (const device of devices) {
+      if (!device.unified) continue
+      const at = device.lastSeenAt ?? device.connectedAt ?? 0
+      if (at > bestAt) {
+        best = device
+        bestAt = at
+      }
+    }
+    return best
   }
 
   /** 60 秒到点写进 `answeredBy` 的那句话（真 60 秒时与登记簿注释同一口径）。 */
@@ -4519,6 +4748,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (device.focusedTask !== task.taskId) continue
       if (device.screenStage !== '进度') continue
       if (device.receiptTimer !== undefined || device.pendingPick !== undefined) continue
+      // tihu_follow_task{until:'done'}：本轮结束但任务还在跑 → 继续留在进度页。
+      if (device.followUntil === 'done' && task.state === 'running') continue
       log(`tihu progress leave device=${device.id} task=${task.taskId} why=${why}`)
       sendBoard(device)
     }
@@ -4835,8 +5066,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /**
    * 念完一条完成任务的整段正文。返回下发音频的总时长（毫秒）；一段都没念成就返回 -1。
+   *
+   * `fromLine`：从完成页第几行（0 起）开始念——重读/跳段/段级续播都用它。
+   * 段是「按行打包」的（`doneSpeechSegmentsOf`），所以起点取「第一段覆盖到 fromLine 的那段」，
+   * 也就是**从这一行的开头**开始念（绝不从半句中间截）。
    */
-  async function readDoneBody(device: TihuDevice, task: TihuTask): Promise<number> {
+  async function readDoneBody(device: TihuDevice, task: TihuTask, fromLine = 0): Promise<number> {
     const key = device.sessionId ?? '__unbound__'
     const body = doneBodyTextOf(task)
     const ranges = doneLineRangesOf(body)
@@ -4893,7 +5128,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       })
     }
     launchSegment(0)
-    for (let index = 0; index < plan.length; index += 1) {
+    // 段级起点：第一段「最后一行 ≥ fromLine」的那段（＝这一行的开头）。越界就退到第 0 段。
+    const startIndex = (() => {
+      if (fromLine <= 0) return 0
+      const found = plan.findIndex((segment) => segment.lastLine >= fromLine)
+      return found < 0 ? 0 : found
+    })()
+    for (let index = startIndex; index < plan.length; index += 1) {
       // 唯一的中途出口：被「停止 / 重读 / 回主页 / P0」抢走（号变了就停手），循环本身不 break。
       if (stale()) return spokenMs
       for (let ahead = 1; ahead <= DONE_READ_AHEAD; ahead += 1) launchSegment(index + ahead)
@@ -4929,9 +5170,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return spokenMs
   }
 
-  /** 完成屏上屏 → 念这条任务的整段正文；念完 + 60 秒回棋盘（期间任何交互都会撤销计时）。 */
-  function readDoneScreen(device: TihuDevice, task: TihuTask): void {
-    void readDoneBody(device, task)
+  /** 完成屏上屏 → 念这条任务的整段正文（可从第 N 行起）；念完 + 60 秒回棋盘（期间任何交互都会撤销计时）。 */
+  function readDoneScreen(device: TihuDevice, task: TihuTask, fromLine = 0): void {
+    void readDoneBody(device, task, fromLine)
       .then((spokenMs) => {
         if (spokenMs > 0) armScreenHome(device, spokenMs + HOME_AFTER_SPEECH_MS, task.taskId, '完成')
       })
@@ -5022,8 +5263,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return prepareDoneText(doneReadingTextOf(task) || DONE_NO_REPLY_TEXT)
   }
 
-  /** 完成页：任务名大标题 + 回答 7 行 + 停止/重读/主页。 */
-  function doneScreenOf(task: TihuTask): ScreenFramePayload {
+  /** 完成页：任务名大标题 + 回答 7 行 + 停止/重读/主页。`current` ＝首屏高亮从第几行开始。 */
+  function doneScreenOf(task: TihuTask, current = 0): ScreenFramePayload {
     const body = doneBodyTextOf(task)
     const resultLine = String(task.resultLine ?? '').trim() || body || DONE_NO_REPLY_TEXT
     return doneFrame({
@@ -5031,6 +5272,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       title: task.title,
       resultLine,
       replyText: body,
+      current,
     })
   }
 
@@ -5218,10 +5460,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       ...(queuedAhead > 0 ? { etaText: `${queuedAhead} 分钟` } : { etaText: '1 分钟' }),
     })
     lastFrames.set(key, frame)
-    // 统一指挥是「一台设备一张屏」：回执必须发给**所有**统一设备，而不是只发
-    // 派单的那台。否则第二台停在棋盘上，任务完成时它会先弹完成屏（实测两设备分叉）。
-    const targets = [...devices].filter((item) => item.unified)
-    if (targets.length === 0) targets.push(device)
+    // 2026-11-10（规格书 §8.2 + 用户拍板）：动作类帧一律**单台**下发 —— 派单回执与它 5 秒后
+    // 分流的完成/进度/决策帧只发给「最近活跃的那台」，不再广播给所有统一设备。
+    // 第二块屏留在棋盘上，它自己的 hello 会主动拉一次棋盘状态（不会黑屏）。
+    const targets = [activeUnifiedDevice() ?? device]
     for (const target of targets) {
       disarmAutoHome(target)
       target.focusedTask = task.taskId
@@ -5333,6 +5575,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       log(`tihu dispatch failed: no session service`)
       return undefined
     }
+    // 默认前台模型（设置 → 个人助手 → 鹈鹕端）：建完立刻指定，赶在 promptSession 之前。
+    await applyTihuModel(sessionId, 'foreground', '派单')
     const blocks = [
       { type: 'text' as const, text },
       {
@@ -6548,11 +6792,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     showInputError(device, new Error(outcome.message), '这条没派出去，请重说')
   }
 
-  /* ---------- 控制面（tihu 全局工具用；全是薄壳转调，见 control.ts） ----------
+  /* ---------- 控制面（15 个具名设备工具 + tihu_admin 用；全是薄壳转调，见 control.ts） ----------
    *
-   * 单测覆盖说明：会话定位是纯函数（control.ts 的 matchSessionRows，已直接单测）；
-   * bind/openBubble/replay/goHome/browse/openRecent 逐行复刻 screen.gesture 里
-   * 手指点屏的分支，行为以 lane 端到端测试为准，薄壳本身不再重复设断言。
+   * 2026-11-10 重写（规格书 §5/§8）：设备动作一律**单台**、**带 opId 等回执**、**冲突按矩阵处理**。
+   * 单测覆盖说明：会话/任务定位是纯函数（control.ts 的 matchSessionRows/matchTaskRows，已直接单测）；
+   * 设备动作逐条复刻 screen.gesture 里手指点屏的分支（openTask / sendBoard / answerPendingDecision /
+   * readDoneBody），行为以 lane 端到端测试为准（见 scripts/test-tihu-protocol.mjs 的「设备控制（lane）」）。
    * archiveSession 转调宿主 workspaceRegistry（stopActivity=true），
    * 「绑定中的会话拒绝删除」的守卫在 control.ts（可注入假控制面单测）。
    */
@@ -6567,6 +6812,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       voice: device.voice,
       edgeVoice: device.edgeVoice,
       offlineOnly: device.offlineOnly,
+      connectedAt: device.connectedAt,
+      ...(device.lastSeenAt === undefined ? {} : { lastSeenAt: device.lastSeenAt }),
+      ...(device.screenStage === undefined ? {} : { screenStage: device.screenStage }),
+      ...(device.handsfree === undefined ? {} : { handsfree: device.handsfree }),
     }
   }
 
@@ -6575,12 +6824,164 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return [...devices].find((device) => device.id === deviceId || device.hello?.clientId === deviceId)
   }
 
+  /* ---------- 最近断开的设备（tihu_list_devices{includeOffline} 用） ----------
+   * 只留 10 分钟内见过的：给用户「刚才那块屏是不是掉线了」一个可见答案，
+   * 但**永不被选来执行动作**（control.ts 里 resolveControlDevice 会过滤 offline）。 */
+  const RECENT_DEVICE_TTL_MS = 10 * 60_000
+  const recentDevices = new Map<string, { at: number; view: TihuControlDevice }>()
+  function rememberRecentDevice(device: TihuDevice): void {
+    try {
+      const now = Date.now()
+      const snapshot = controlDeviceOf(device)
+      recentDevices.set(device.id, {
+        at: now,
+        view: { ...snapshot, offline: true, lastSeenAt: device.lastSeenAt ?? now },
+      })
+      for (const [id, entry] of recentDevices) {
+        if (now - entry.at > RECENT_DEVICE_TTL_MS) recentDevices.delete(id)
+      }
+      if (recentDevices.size > 20) {
+        const oldest = [...recentDevices.entries()].sort((a, b) => a[1].at - b[1].at)[0]
+        if (oldest !== undefined) recentDevices.delete(oldest[0])
+      }
+    } catch { /* 忽略 */ }
+  }
+
   function controlRowOf(row: TihuSessionRow): ControlSessionRow {
     return { sessionId: row.sessionId, title: humanTitle(row.title), preset: row.preset, live: row.live, updatedAt: row.updatedAt }
   }
 
+  /* ---------- 设备动作的公共零件（15 个具名工具的落地实现都走这里） ---------- */
+
+  /** 在线设备清单（报错时给可操作的下一步，规格书 §8.3）。 */
+  function onlineDeviceHint(): string {
+    const ids = [...devices].map((device) => device.id)
+    return ids.length === 0 ? '当前没有鹈鹕设备在线：先在手机/浏览器打开 /tihu。' : `在线设备：${ids.join('、')}`
+  }
+
+  /** 按 id/clientId 取在线设备；拿不到直接 throw（不再返回「错误：…」字符串假装是结果）。 */
+  function requireControlDevice(deviceId: string): TihuDevice {
+    const device = findControlDevice(deviceId)
+    if (device !== undefined) return device
+    throw new Error(`鹈鹕设备 ${deviceId} 不在线（可能刚断开或换了一块屏）。${onlineDeviceHint()}`)
+  }
+
+  /** 这台设备现在是不是真的在出声（页面报了 playback 就信页面，没报过才退回宿主自己的轮次）。 */
+  function deviceSpeaking(device: TihuDevice): boolean {
+    if (device.playback !== undefined) return device.playback.phase === 'playing'
+    return announcing.has(device.id)
+  }
+
+  /** 棋盘那一句（回主页/翻页的返回文案都用它，四段计数每次现算）。 */
+  function boardEchoOf(device: TihuDevice): string {
+    const board = boardOf(tasks.list(), Date.now(), Math.max(0, Math.trunc(device.boardPage ?? 0)))
+    const counts = board.counts
+    return `棋盘第 ${board.page.index + 1}/${board.page.total} 页（等你 ${counts.awaiting} · 在跑 ${counts.running} · 排队 ${counts.queued} · 完成 ${counts.done}）`
+  }
+
+  /** 设备当前屏的人话（进 ack 的 stage / 工具返回的第三段）。 */
+  function screenEchoOf(device: TihuDevice): string {
+    const stage = device.screenStage ?? ''
+    const playback = device.playback
+    if (stage === '完成') {
+      const total = Number(playback?.total)
+      const line = Number(playback?.line)
+      if (Number.isFinite(total) && total > 0 && Number.isFinite(line)) return `完成 第 ${line + 1}/${total} 行`
+      return '完成'
+    }
+    if (stage !== '') return stage
+    if (device.onBoard === true) return boardEchoOf(device)
+    return '屏未上报'
+  }
+
+  /** 设备回执里的 stage（页面自己算的人话）优先，没有就返回 undefined。 */
+  function ackEcho(ack: DeviceAckPayload | undefined): string | undefined {
+    const stage = String(ack?.stage ?? '').trim()
+    return stage === '' ? undefined : stage
+  }
+
+  /** 登记簿 → 控制面瘦行（任务定位用）。 */
+  function controlTaskRows(): ControlTaskRow[] {
+    return tasks.list()
+      .filter((task) => task.state !== 'archived')
+      .map((task) => ({ taskId: task.taskId, title: task.title, capsule: capsuleOf(task.state), sub: subLineOf(task) }))
+  }
+
+  /** 任务状态 → 屏名（返回文案用）。 */
+  function stageWordOf(task: TihuTask): string {
+    if (task.state === 'done' || task.state === 'announced') return '完成页'
+    if (task.state === 'awaiting') return '待决策页'
+    if (task.state === 'running') return '进度页'
+    return '排队卡'
+  }
+
+  /**
+   * 任务定位：显式号/标题 > 最近完成 > 当前屏上那条 > 第一条。
+   * 多条命中给候选清单让模型追问，**绝不瞎挑**（规格书 §5.7）。
+   */
+  function resolveControlTask(device: TihuDevice, options: { taskId?: string; title?: string; recent?: boolean }): TihuTask {
+    const pool = tasks.list().filter((task) => task.state !== 'archived')
+    const latestFinished = (): TihuTask | undefined => [...pool]
+      .filter((task) => task.state === 'done' || task.state === 'announced')
+      .sort((a, b) => (b.finishedAt ?? b.updatedAt) - (a.finishedAt ?? a.updatedAt))[0]
+    if (options.recent === true) {
+      const latest = latestFinished()
+      if (latest === undefined) throw new Error('现在没有已完成的任务。')
+      return latest
+    }
+    const ref = options.taskId ?? options.title
+    if (ref !== undefined) {
+      const outcome = matchTaskRows(controlTaskRows(), ref)
+      if (outcome.kind === 'one') {
+        const hit = tasks.get(outcome.row.taskId)
+        if (hit !== undefined) return hit
+      }
+      if (outcome.kind === 'many') {
+        throw new Error(`「${ref}」匹配到 ${outcome.rows.length} 条任务，用任务号再精确一些：\n${outcome.rows.map((row) => `${row.taskId}. ${row.title}（${row.capsule}）`).join('\n')}`)
+      }
+      const hints = pool.slice(0, 5).map((task) => `${task.taskId}. ${task.title}（${capsuleOf(task.state)}）`)
+      throw new Error(`找不到任务「${ref}」。棋盘上最多这几条：\n${hints.length === 0 ? '（一条都没有）' : hints.join('\n')}`)
+    }
+    if (device.focusedTask !== undefined) {
+      const focused = tasks.get(device.focusedTask)
+      if (focused !== undefined) return focused
+    }
+    const latest = latestFinished()
+    if (latest !== undefined) return latest
+    const first = pool[0]
+    if (first !== undefined) return first
+    throw new Error('现在没有任何任务：先派一条（tihu_admin action=dispatch）。')
+  }
+
+  /** 当前屏上的待决策（没有就按 taskId 找；还找不到 throw 并列出所有 awaiting）。 */
+  function resolveDecisionTask(device: TihuDevice | undefined, taskId?: string): TihuTask {
+    const awaiting = tasks.list().filter((task) => task.state === 'awaiting')
+    const suffix = awaiting.length === 0
+      ? '。'
+      : `：还有 ${awaiting.length} 条在等你：${awaiting.map((task) => `${task.taskId}「${task.question ?? ''}」`).join('、')}`
+    if (taskId !== undefined) {
+      const got = tasks.get(taskId)
+      if (got !== undefined && got.state === 'awaiting') return got
+      throw new Error(`任务 ${taskId} 现在没有待决策${suffix}`)
+    }
+    const focused = device?.focusedTask === undefined ? undefined : tasks.get(device.focusedTask)
+    if (focused !== undefined && focused.state === 'awaiting') return focused
+    const only = awaiting.length === 1 ? awaiting[0] : undefined
+    if (only !== undefined) return only
+    if (awaiting.length === 0) throw new Error('当前没有待决策：没有人在等你拍板。')
+    throw new Error(`有 ${awaiting.length} 条待决策，请用 taskId 指定：\n${awaiting.map((task) => `${task.taskId}「${task.question ?? ''}」`).join('\n')}`)
+  }
+
   const control: TihuControlSurface = {
-    listDevices: () => [...devices].map(controlDeviceOf),
+    listDevices: (includeOffline = false) => {
+      const online = [...devices].map(controlDeviceOf)
+      if (includeOffline !== true) return online
+      const now = Date.now()
+      const offline = [...recentDevices.values()]
+        .filter((entry) => now - entry.at <= RECENT_DEVICE_TTL_MS && !online.some((item) => item.id === entry.view.id))
+        .map((entry) => ({ ...entry.view }))
+      return [...online, ...offline]
+    },
     deviceOfSession: (sessionId) => {
       const device = [...devices].find((item) => item.sessionId === sessionId)
       return device === undefined ? undefined : controlDeviceOf(device)
@@ -6588,14 +6989,50 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     deviceStatus: (deviceId) => {
       const device = findControlDevice(deviceId)
       if (device === undefined) return undefined
-      const display = device.sessionId ?? '__unbound__'
+      // 写入端是 `sessionId ?? device.id`（sendFrame/pushFrame），读也必须是同一个 key，
+      // 否则未绑定时永远读不到帧（旧实现用 '__unbound__'，2026-11-10 修）。
+      const display = device.sessionId ?? device.id
       const frame = lastFrames.get(display)
+      const board = boardOf(tasks.list(), Date.now(), Math.max(0, Math.trunc(device.boardPage ?? 0)))
+      const focused = device.focusedTask === undefined ? undefined : tasks.get(device.focusedTask)
+      const bridge = focused === undefined ? undefined : pendingBridges.get(focused.taskId)
+      const playback = device.playback
+      const deadline = focused?.decisionDeadline
       return {
         device: controlDeviceOf(device),
         display,
         pinned: device.onBoard === true,
-        speaking: false,
-        pending: [],
+        // 真事实：页面自报的 playback.state（不再写死 false）。
+        speaking: playback?.phase === 'playing',
+        ...(device.screenStage === undefined || device.screenStage === '' ? {} : { stage: device.screenStage }),
+        ...(playback === undefined ? {} : {
+          playback: {
+            phase: playback.phase,
+            ...(playback.taskId === undefined ? {} : { taskId: playback.taskId }),
+            ...(playback.segment === undefined ? {} : { segment: playback.segment }),
+            ...(playback.line === undefined ? {} : { line: playback.line }),
+            ...(playback.total === undefined ? {} : { total: playback.total }),
+            ...(playback.charStart === undefined ? {} : { charStart: playback.charStart }),
+          },
+        }),
+        ...(focused === undefined ? {} : { taskId: focused.taskId, taskTitle: focused.title }),
+        board: {
+          page: board.page.index,
+          total: Math.max(1, board.page.total),
+          counts: board.counts,
+          totalTasks: board.total,
+        },
+        ...(focused === undefined || focused.state !== 'awaiting' || bridge === undefined
+          ? {}
+          : {
+            decision: {
+              taskId: focused.taskId,
+              question: String(focused.question ?? '').trim(),
+              options: focused.options ?? [],
+              secondsLeft: deadline === undefined ? 0 : Math.max(0, Math.round((deadline - Date.now()) / 1000)),
+              ...(focused.defaultIndex === undefined ? {} : { defaultIndex: focused.defaultIndex }),
+            },
+          }),
         ...(frame === undefined ? {} : { screen: { stage: frame.stage ?? '', title: frame.title ?? '', mode: frame.mode ?? 'status', bullets: frame.bullets ?? [] } }),
       }
     },
@@ -6607,15 +7044,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         return { kind: 'none' }
       }
     },
-    bind: async (deviceId, sessionId) => {
-      const device = findControlDevice(deviceId)
-      if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
-      const task = tasks.ofSession(sessionId)
-      if (task === undefined) return `「${titleForSession(sessionId)}」不在棋盘上：统一指挥只有任务详情，没有单独的会话屏`
-      openTask(device, task.taskId)
-      return `已打开任务 ${task.taskId}「${task.title}」的详情`
-    },
-    openBubble: async () => '旧的待读气泡已删除：任务完成直接进棋盘、结果进一句播报',
     progress: async (sessionId) => {
       const found = await findSession(sessionId)
       const title = found.row?.title !== undefined && found.row.title !== '' ? humanTitle(found.row.title) : titleForSession(sessionId)
@@ -6643,53 +7071,474 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       sessionListCache = undefined
       return `已删除（归档）会话「${found.row?.title !== undefined && found.row.title !== '' ? humanTitle(found.row.title) : shortSessionId(sessionId)}」`
     },
-    stopSpeaking: async (deviceId) => {
-      const device = findControlDevice(deviceId)
-      if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
+    /* ---- 15 个具名设备工具的落地实现（control.ts 只做参数校验与文案，这里才是真动作） ---- */
+
+    stopSpeaking: async (deviceId, options) => {
+      const device = requireControlDevice(deviceId)
+      // 规格书 §8.4：在听 → 停声＝**退出在听** + 停声（只掐音频不管麦克风等于没停）。
+      if (device.playback?.phase === 'listening') {
+        const ack = await awaitDeviceAck(device, 'voice.listen', { on: false })
+        device.playback = { phase: 'idle', at: Date.now() }
+        return {
+          text: '已退出「在听」',
+          deviceId: device.id,
+          ...(ack === undefined ? {} : { acked: true }),
+          echo: '麦克风已关',
+        }
+      }
+      // 幂等（规格书 §8.1）：本来就没在念 → 不发消息、不回「已停止」。
+      // 待决策/进度/棋盘本来就没声（§8.4），这也**不算失败**。
+      if (!deviceSpeaking(device)) {
+        return { text: '本来就没在朗读', deviceId: device.id, already: true, echo: `停在 ${screenEchoOf(device)}` }
+      }
       try { device.cancelRound?.() } catch { /* 忽略 */ }
-      return '已停止播报'
+      device.pausedAt = undefined
+      const ack = await awaitDeviceAck(device, 'playback.control', { action: 'stop', scope: options.scope ?? 'round' })
+      if (ack !== undefined && ack.ok === false) throw new Error(`设备拒绝停止朗读：${ack.reason ?? '原因未知'}（${device.id}）`)
+      return ack === undefined
+        ? { text: '已下发停止', deviceId: device.id }
+        : { text: '已停止朗读', deviceId: device.id, acked: true, echo: `停在 ${ackEcho(ack) ?? screenEchoOf(device)}` }
     },
-    replay: async (deviceId) => {
-      const device = findControlDevice(deviceId)
-      if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
-      // 新界面没有「回答屏」可重读：重读＝把最近一条完成任务的结果再念一遍。
-      const latest = tasks.list()
-        .filter((task) => task.state === 'done' || task.state === 'announced')
-        .sort((a, b) => (b.finishedAt ?? b.updatedAt) - (a.finishedAt ?? a.updatedAt))[0]
-      if (latest === undefined) return '现在没有可重读的完成结果'
-      void speakAnnouncement(device, doneAnnouncementOf(latest))
-        .then((spokenMs) => { if (spokenMs >= 0) armAutoHome(device, spokenMs, latest.taskId) })
-        .catch((error) => log(`tihu control replay failed: ${(error as Error)?.message ?? String(error)}`))
-      return `正在重读：${latest.title}`
-    },
-    goHome: async (deviceId) => {
-      const device = findControlDevice(deviceId)
-      if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
+
+    pauseSpeaking: async (deviceId) => {
+      const device = requireControlDevice(deviceId)
+      if (device.playback?.phase === 'paused') {
+        const paused = device.pausedAt
+        return {
+          text: '本来就已经暂停',
+          deviceId: device.id,
+          already: true,
+          echo: paused === undefined ? screenEchoOf(device) : `停在第 ${paused.segment} 段（继续时从本行开头念）`,
+        }
+      }
+      if (!deviceSpeaking(device)) {
+        return { text: '本来就没在朗读，无需暂停', deviceId: device.id, already: true, echo: screenEchoOf(device) }
+      }
+      const segment = Math.max(1, Math.trunc(Number(device.playback?.segment ?? 1)) || 1)
+      const line = Number.isFinite(Number(device.playback?.line))
+        ? Math.max(0, Math.trunc(Number(device.playback?.line)))
+        : segment - 1
+      const taskId = device.playback?.taskId ?? device.focusedTask
       try { device.cancelRound?.() } catch { /* 忽略 */ }
-      sendBoard(device)
-      return '已回棋盘'
+      const ack = await awaitDeviceAck(device, 'playback.control', { action: 'pause' })
+      if (ack !== undefined && ack.ok === false) throw new Error(`设备拒绝暂停：${ack.reason ?? '原因未知'}（${device.id}）`)
+      // 段级续播（规格书 §8.5）：记住段号即可，页面下次从这一行第一个字重念。
+      device.pausedAt = { segment, line, ...(taskId === undefined ? {} : { taskId }) }
+      device.playback = { phase: 'paused', segment, line, ...(taskId === undefined ? {} : { taskId }), at: Date.now() }
+      return {
+        text: '已暂停',
+        deviceId: device.id,
+        ...(ack === undefined ? {} : { acked: true }),
+        echo: `停在第 ${segment} 段（继续时从本行开头念）`,
+      }
     },
-    browse: async (deviceId, direction) => {
-      const device = findControlDevice(deviceId)
-      if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
-      // 棋盘翻页（每页 4 条）：指挥模型的「下一页」和屏上「下一页」按钮走同一条路。
-      device.boardPage = Math.max(0, Math.trunc(device.boardPage ?? 0) + (direction === 'prev' ? -1 : 1))
-      sendBoard(device)
-      const page = Math.max(0, device.boardPage ?? 0)
-      const board = boardOf(tasks.list(), Date.now(), page)
-      const titles = board.rows.map((row, index) => `${index + 1}. ${row.title}（${row.capsule}）`).join('\n')
-      return `棋盘第 ${board.page.index + 1}/${board.page.total} 页（共 ${board.total} 条）：\n${titles === '' ? '（这页没有任务）' : titles}`
+
+    resumeSpeaking: async (deviceId) => {
+      const device = requireControlDevice(deviceId)
+      const paused = device.pausedAt
+      if (paused === undefined && device.playback?.phase !== 'paused') {
+        if (deviceSpeaking(device)) return { text: '本来就在念，不用继续', deviceId: device.id, already: true }
+        throw new Error('没有可继续的朗读：这台设备上没有暂停点（宿主重启/设备重连后位置会丢）。用 tihu_replay 从头重读。')
+      }
+      const segment = Math.max(1, Math.trunc(Number(paused?.segment ?? device.playback?.segment ?? 1)) || 1)
+      const taskId = paused?.taskId ?? device.playback?.taskId ?? device.focusedTask
+      const task = taskId === undefined ? undefined : tasks.get(taskId)
+      if (task === undefined || (task.state !== 'done' && task.state !== 'announced')) {
+        throw new Error('没有可继续的朗读：那条任务已经不在完成页了（归档或换屏）。用 tihu_replay 从头重读。')
+      }
+      const ack = await awaitDeviceAck(device, 'playback.control', { action: 'resume', from: { taskId: task.taskId, segment } })
+      if (ack !== undefined && ack.ok === false) throw new Error(`设备拒绝继续：${ack.reason ?? '原因未知'}（${device.id}）`)
+      device.pausedAt = undefined
+      device.focusedTask = task.taskId
+      device.onBoard = false
+      // 段级续播：重发完成帧（高亮对齐到这一行）+ 从本行开头重发 PCM（会重念 1–3 秒）。
+      pushFrame(device, doneScreenOf(task, segment - 1))
+      readDoneScreen(device, task, segment - 1)
+      return {
+        text: '已继续',
+        deviceId: device.id,
+        ...(ack === undefined ? {} : { acked: true }),
+        echo: `从第 ${segment} 行继续（本行开头重念）`,
+      }
     },
-    openRecent: async (deviceId) => {
+
+    replay: async (deviceId, options) => {
+      const device = requireControlDevice(deviceId)
+      const task = resolveControlTask(device, {
+        ...(options.taskId === undefined ? {} : { taskId: options.taskId }),
+      })
+      if (task.state === 'running' || task.state === 'queued' || task.state === 'dispatched') {
+        throw new Error(`「${task.title}」还在跑，只有完成页能重读（等它完成）。`)
+      }
+      if (task.state === 'awaiting') {
+        throw new Error(`「${task.title}」正在等你拍板，没有可重读的正文：先用 tihu_answer_decision 答掉它。`)
+      }
+      if (String(task.doneText ?? '').trim() === '') {
+        const sessionId = task.sessionIds[task.sessionIds.length - 1]
+        if (sessionId !== undefined) {
+          const text = await readAssistantText(sessionId)
+          if (text !== '') {
+            task.doneText = text
+            if (String(task.resultLine ?? '').trim() === '') task.resultLine = firstSentenceOf(text)
+          }
+        }
+      }
+      const body = doneBodyTextOf(task)
+      const lines = doneLinesOf(body)
+      const total = Math.max(1, lines.length)
+      const wanted = options.line !== undefined ? Math.trunc(options.line) + 1 : Math.max(1, Math.trunc(Number(options.segment ?? 1)) || 1)
+      const from = Math.max(1, Math.min(total, wanted))
+      const clamped = from !== wanted
+      // 重读＝新一轮：先掐掉正在念的那一轮（speakEpoch+1），再从第 from 段重发。
+      try { device.cancelRound?.() } catch { /* 忽略 */ }
+      device.doneReadingTask = undefined
+      device.focusedTask = task.taskId
+      device.onBoard = false
+      device.pausedAt = undefined
+      pushFrame(device, doneScreenOf(task, from - 1))
+      readDoneScreen(device, task, from - 1)
+      return {
+        text: `正在重读「${task.title}」第 ${from} 段（共 ${total} 段）${clamped ? `（原请求第 ${wanted} 段已夹到范围内）` : ''}`,
+        deviceId: device.id,
+        acked: true,
+        echo: `完成 第 ${from}/${total} 行`,
+      }
+    },
+
+    goHome: async (deviceId, options) => {
+      const device = requireControlDevice(deviceId)
+      const stop = options.stopSpeaking !== false
+      // `all: true` 是唯一允许「多发」的动作（规格书 §8.2 的显式例外）。
+      const targets = options.all === true ? [...devices].filter((item) => item.unified) : [device]
+      const page = Math.max(0, Math.trunc(Number(options.page ?? 0)) || 0)
+      let already = 0
+      let wasSpeaking = false
+      for (const target of targets) {
+        // 规格书 §8.4：在听 → 回主页＝先退出在听，别让麦克风在后台继续开着。
+        if (target.playback?.phase === 'listening') {
+          target.send('voice.listen', { on: false } satisfies VoiceListenPayload)
+          target.playback = { phase: 'idle', at: Date.now() }
+        }
+        if (stop) {
+          if (deviceSpeaking(target)) wasSpeaking = true
+          try { target.cancelRound?.() } catch { /* 忽略 */ }
+          target.pausedAt = undefined
+        }
+        const alreadyHome = target.onBoard === true
+          && target.focusedTask === undefined
+          && target.receiptTimer === undefined
+          && target.screenStage === ''
+          && Math.max(0, Math.trunc(target.boardPage ?? 0)) === page
+        if (alreadyHome) {
+          already += 1
+          continue
+        }
+        target.boardPage = page
+        sendBoard(target, false)
+      }
+      const primary = targets[0] ?? device
+      if (stop && wasSpeaking) await awaitDeviceAck(primary, 'playback.control', { action: 'stop', scope: 'round' })
+      const awaiting = tasks.list().filter((task) => task.state === 'awaiting').length
+      return {
+        text: already === targets.length ? '本来就在主页' : '已回主页',
+        deviceId: primary.id,
+        ...(already === targets.length ? { already: true } : { acked: true }),
+        echo: boardEchoOf(primary),
+        ...(awaiting > 0 ? { note: `还有 ${awaiting} 条待决策在等你（没替你答）` } : {}),
+      }
+    },
+
+    boardPage: async (deviceId, options) => {
+      const device = requireControlDevice(deviceId)
+      const current = Math.max(0, Math.trunc(device.boardPage ?? 0))
+      const board = boardOf(tasks.list(), Date.now(), current)
+      const total = Math.max(1, board.page.total)
+      if (total <= 1) {
+        return { text: '棋盘只有 1 页', deviceId: device.id, already: true, echo: boardEchoOf(device) }
+      }
+      const wanted = options.page !== undefined
+        ? Math.trunc(Number(options.page))
+        : current + (options.direction === 'prev' ? -1 : 1)
+      const target = Math.max(0, Math.min(total - 1, wanted))
+      if (target === current) {
+        const edge = options.page !== undefined
+          ? '已经是这一页'
+          : (options.direction === 'prev' ? '已经是第一页' : '已经是最后一页')
+        return { text: edge, deviceId: device.id, already: true, echo: boardEchoOf(device) }
+      }
+      device.boardPage = target
+      sendBoard(device, false)
+      const pageBoard = boardOf(tasks.list(), Date.now(), target)
+      const rows = pageBoard.rows.map((row, index) => `${index + 1}. ${row.title}（${row.capsule}）`)
+      return {
+        text: `已翻到第 ${target + 1}/${total} 页`,
+        deviceId: device.id,
+        acked: true,
+        echo: `第 ${target + 1}/${total} 页${rows.length === 0 ? '（这页没有任务）' : `：${rows.join(' / ')}`}`,
+      }
+    },
+
+    openTaskCard: async (deviceId, options) => {
+      const device = requireControlDevice(deviceId)
+      let task: TihuTask
+      if (options.index !== undefined) {
+        const pageBoard = boardOf(tasks.list(), Date.now(), Math.max(0, Math.trunc(device.boardPage ?? 0)))
+        const row = pageBoard.rows[Math.trunc(options.index) - 1]
+        if (row === undefined) {
+          throw new Error(`第 ${options.index} 行没有任务：这页只有 ${pageBoard.rows.length} 条（第 ${pageBoard.page.index + 1}/${pageBoard.page.total} 页）。`)
+        }
+        const hit = tasks.get(row.taskId)
+        if (hit === undefined) throw new Error(`第 ${options.index} 行（${row.taskId}）刚从棋盘上消失，请重新看一眼棋盘。`)
+        task = hit
+      } else {
+        task = resolveControlTask(device, {
+          ...(options.taskId === undefined ? {} : { taskId: options.taskId }),
+          ...(options.title === undefined ? {} : { title: options.title }),
+          recent: options.recent === true,
+        })
+      }
+      openTask(device, task.taskId)
+      return {
+        text: `已打开 ${task.taskId}「${task.title}」（${capsuleOf(task.state)}）`,
+        deviceId: device.id,
+        acked: true,
+        echo: stageWordOf(task),
+      }
+    },
+
+    followTask: async (deviceId, options) => {
+      const device = requireControlDevice(deviceId)
+      const task = resolveControlTask(device, {
+        ...(options.taskId === undefined ? {} : { taskId: options.taskId }),
+      })
+      if (!taskRunningNow(task)) {
+        // 不在跑：按状态改开对应屏（规格书 §5.8），不假装「已跟随」。
+        openTask(device, task.taskId)
+        return {
+          text: `「${task.title}」没在跑（${capsuleOf(task.state)}），给你看${stageWordOf(task)}`,
+          deviceId: device.id,
+          acked: true,
+          echo: stageWordOf(task),
+        }
+      }
+      if (device.screenStage === '进度' && device.focusedTask !== undefined && device.focusedTask !== task.taskId) {
+        return { text: '用户已经切走，未跟随', deviceId: device.id, already: true, echo: screenEchoOf(device) }
+      }
+      const frame = taskDetailFrameOf(task)
+      if (frame === undefined) throw new Error(`「${task.title}」还没建起会话，暂时没有进度可看。`)
+      disarmAutoHome(device)
+      device.focusedTask = task.taskId
+      device.onBoard = false
+      device.followUntil = options.until === 'turn' ? 'turn' : 'done'
+      progressEventAt.set(task.taskId, Date.now())
+      sendFrame(device, frame, device.sessionId)
+      armScreenHome(device, DETAIL_AUTO_HOME_MS, task.taskId, '进度')
+      ensureDetailTicker()
+      const sessionId = task.sessionIds[task.sessionIds.length - 1]
+      const elapsed = sessionId === undefined ? '' : ` · 已用 ${formatElapsed(elapsedOfTask(task, sessionId))}`
+      return {
+        text: `已跟随 ${task.taskId}「${task.title}」`,
+        deviceId: device.id,
+        acked: true,
+        echo: `当前 第 ${Math.max(task.step, 0)} 步${elapsed}`,
+      }
+    },
+
+    endVoiceSession: async (deviceId, options) => {
+      const device = requireControlDevice(deviceId)
+      // 「结束会话」隐含安静（规格书 §5.9）。
+      if (deviceSpeaking(device)) {
+        try { device.cancelRound?.() } catch { /* 忽略 */ }
+      }
+      const sessionId = device.sessionId
+      const ended = sessionId === undefined ? false : endSession(sessionId)
+      const ack = await awaitDeviceAck(device, 'session.ended', {
+        ...(sessionId === undefined ? {} : { sessionId }),
+        reason: options.reason ?? '电脑端指令',
+        at: Date.now(),
+      })
+      device.pausedAt = undefined
+      device.playback = { phase: 'idle', at: Date.now() }
+      return {
+        text: ended ? '已结束本次语音会话（闸门关闭）' : '当前没有进行中的语音会话',
+        deviceId: device.id,
+        ...(ack === undefined ? {} : { acked: true }),
+        ...(ended ? {} : { already: true }),
+        echo: '屏停在 空闲',
+      }
+    },
+
+    wake: async (deviceId, options) => {
+      const device = requireControlDevice(deviceId)
+      const timeoutMs = clampInt(Number(options.timeoutMs ?? 10_000), 3000, 60_000)
+      const prompt = String(options.prompt ?? '').trim()
+      if (options.stopSpeaking !== false && deviceSpeaking(device)) {
+        try { device.cancelRound?.() } catch { /* 忽略 */ }
+        await awaitDeviceAck(device, 'playback.control', { action: 'stop', scope: 'round' })
+        device.pausedAt = undefined
+      }
+      if (device.playback?.phase === 'listening') {
+        // 幂等（§8.1）：已在听 → 不重开麦，只更新提示与超时。
+        device.send('voice.listen', { on: true, ...(prompt === '' ? {} : { prompt }), timeoutMs } satisfies VoiceListenPayload)
+        return { text: '本来就在「在听」，已更新提示', deviceId: device.id, already: true, echo: '在听' }
+      }
+      const ack = await awaitDeviceAck(device, 'voice.listen', {
+        on: true,
+        ...(prompt === '' ? {} : { prompt }),
+        timeoutMs,
+      })
+      if (ack !== undefined && ack.ok === false) {
+        throw new Error(ack.reason === 'mic-denied'
+          ? '设备没有麦克风权限：在浏览器里允许麦克风后再说一次。'
+          : `设备没能进入在听：${ack.reason ?? '原因未知'}（${device.id}）`)
+      }
+      device.playback = { phase: 'listening', at: Date.now() }
+      return {
+        text: `已进入在听（${Math.round(timeoutMs / 1000)} 秒无人说话自动退出）`,
+        deviceId: device.id,
+        ...(ack === undefined ? {} : { acked: true }),
+        echo: '在听',
+        note: '真机需固件支持 voice.listen，否则只在模拟页生效',
+      }
+    },
+
+    answerDecision: async (deviceId, options) => {
+      // 规格书 §8.3：答决策是唯一「设备离线也能做」的动作 —— 题目挂在宿主会话上。
       const device = findControlDevice(deviceId)
-      if (device === undefined) return `错误：鹈鹕设备 ${deviceId} 不在线（先用 list_devices 看在线设备）`
-      // 「最近回答」行已删除：这里打开最近一条完成任务的详情。
-      const latest = tasks.list()
-        .filter((task) => task.state === 'done' || task.state === 'announced')
-        .sort((a, b) => (b.finishedAt ?? b.updatedAt) - (a.finishedAt ?? a.updatedAt))[0]
-      if (latest === undefined) return '现在没有已完成的任务'
-      openTask(device, latest.taskId)
-      return `已打开最近完成的任务：${latest.title}`
+      if (options.taskId !== undefined) {
+        const known = tasks.get(options.taskId)
+        if (known !== undefined && known.state !== 'awaiting') {
+          return {
+            text: `这条已经答过了（${known.answeredBy ?? '别处'}），不再改口`,
+            deviceId: device?.id ?? '电脑端',
+            already: true,
+            echo: known.taskId,
+          }
+        }
+      }
+      const task = resolveDecisionTask(device, options.taskId)
+      const list = (task.options ?? []).filter((option) => String(option ?? '').trim() !== '')
+      if (list.length === 0) throw new Error(`任务 ${task.taskId} 的待决策没有选项可答。`)
+      let index = -1
+      if (options.index !== undefined) {
+        const wanted = Math.trunc(Number(options.index))
+        if (!Number.isFinite(wanted) || wanted < 1 || wanted > list.length) {
+          throw new Error(`第 ${String(options.index)} 项不存在：这条只有 ${list.length} 个选项：${list.map((label, i) => `${i + 1}. ${label}`).join(' / ')}（不替你猜）`)
+        }
+        index = wanted - 1
+      } else if (options.text !== undefined && options.text.trim() !== '') {
+        const key = options.text.trim()
+        const pairs = list.map((label, i) => [label, i] as const)
+        const exact = pairs.filter(([label]) => label === key)
+        const fuzzy = exact.length > 0 ? exact : pairs.filter(([label]) => label.includes(key) || key.includes(label))
+        if (fuzzy.length === 0) throw new Error(`没有「${key}」这个选项：${list.map((label, i) => `${i + 1}. ${label}`).join(' / ')}`)
+        if (fuzzy.length > 1) throw new Error(`「${key}」命中多个选项：${fuzzy.map(([label, i]) => `${i + 1}. ${label}`).join(' / ')}。请说第几项。`)
+        index = fuzzy[0][1]
+      } else {
+        throw new Error('给 index（第几项，1 起）或 text（选项文本），否则等于替你瞎选。')
+      }
+      const by = String(options.by ?? '电脑端指令')
+      const label = list[index]
+      if (!answerPendingDecision(task.taskId, index, by)) tasks.answer(task.taskId, by, Date.now())
+      if (device !== undefined) {
+        leaveDecisionScreens(task.taskId, device.id)
+        sendBoard(device)
+      } else {
+        refreshBoards()
+      }
+      return {
+        text: `已选「${label}」（第 ${index + 1} 项）`,
+        deviceId: device?.id ?? '电脑端',
+        acked: true,
+        echo: `${task.taskId}${device === undefined ? ' · 已在电脑端作答' : ''}`,
+      }
+    },
+
+    dismissDecision: async (deviceId, options) => {
+      const device = findControlDevice(deviceId)
+      const task = resolveDecisionTask(device, options.taskId)
+      const list = (task.options ?? []).filter((option) => String(option ?? '').trim() !== '')
+      const mode = options.mode ?? 'default'
+      if (mode === 'delegate') {
+        const bridge = pendingBridges.get(task.taskId)
+        if (bridge === undefined) {
+          if (device === undefined) {
+            return { text: '设备本来就不在线，电脑端卡片一直在等', deviceId: '电脑端', already: true, echo: `${task.taskId} · 电脑端` }
+          }
+          throw new Error(`任务 ${task.taskId} 没有挂着的待决策（可能已经交给电脑端了）。`)
+        }
+        if (device !== undefined) leaveDecisionScreens(task.taskId, device.id)
+        bridge.delegate('电脑端交回')
+        return {
+          text: '已把决策交回电脑端',
+          deviceId: device?.id ?? '电脑端',
+          acked: true,
+          echo: `${task.taskId} · 电脑端卡片继续等`,
+        }
+      }
+      let index: number
+      if (mode === 'reject') {
+        const pairs = list.map((label, i) => [label, i] as const)
+        const found = pairs.filter(([label]) => /^(拒绝|取消|否|不同意|不要|不用|no|cancel|reject)$/i.test(label.trim()))
+        if (found.length === 0) {
+          throw new Error(`选项里没有「拒绝/取消」这类否定项：${list.map((label, i) => `${i + 1}. ${label}`).join(' / ')}。绝不猜，请用 tihu_answer_decision 指定第几项。`)
+        }
+        index = found[0][1]
+      } else {
+        index = Math.max(0, Math.min(Math.max(0, list.length - 1), Math.trunc(Number(task.defaultIndex ?? 0))))
+      }
+      const label = list[index] ?? '默认项'
+      const by = mode === 'reject' ? '电脑端拒绝' : '电脑端按默认项'
+      if (!answerPendingDecision(task.taskId, index, by)) tasks.answer(task.taskId, by, Date.now())
+      if (device !== undefined) {
+        leaveDecisionScreens(task.taskId, device.id)
+        sendBoard(device)
+      } else {
+        refreshBoards()
+      }
+      return {
+        text: mode === 'reject'
+          ? `已按拒绝处理：「${label}」（第 ${index + 1} 项）`
+          : `已按默认项「${label}」了结（等同 60 秒超时）`,
+        deviceId: device?.id ?? '电脑端',
+        acked: true,
+        echo: task.taskId,
+      }
+    },
+
+    deviceSettings: async (deviceId, options) => {
+      const device = requireControlDevice(deviceId)
+      if (options.key === 'voice') {
+        const value = String(options.value ?? '')
+        if (!isTihuCloudVoice(value)) throw new Error(`不是合法的云端音色：${value}`)
+        const ack = await awaitDeviceAck(device, 'device.config', { key: 'voice', value })
+        // 真正生效在宿主合成侧（下一条播报就用新音色）；页面只更新下拉显示。
+        device.edgeVoice = value
+        return ack === undefined
+          ? { text: `音色已切到 ${tihuCloudVoiceShortName(value)}（${value}）`, deviceId: device.id }
+          : { text: `音色已切到 ${tihuCloudVoiceShortName(value)}（${value}）`, deviceId: device.id, acked: true, echo: ackEcho(ack) }
+      }
+      if (options.key === 'handsfree') {
+        const on = options.value === true
+        const ack = await awaitDeviceAck(device, 'device.config', { key: 'handsfree', value: on })
+        if (ack !== undefined && ack.ok === false) {
+          return {
+            text: '这台设备不支持免按住（真机走固件本地唤醒）',
+            deviceId: device.id,
+            already: true,
+            acked: true,
+            echo: '免按住未生效',
+          }
+        }
+        device.handsfree = on
+        return {
+          text: on ? '已开免按住' : '已关免按住',
+          deviceId: device.id,
+          ...(ack === undefined ? {} : { acked: true }),
+          note: '只在模拟页/浏览器生效；真机是固件本地唤醒',
+        }
+      }
+      throw new Error(`deviceSettings 只支持 voice / handsfree，收到「${String(options.key)}」。`)
     },
     dispatch: async (input) => {
       const text = String(input.text ?? '').trim()
@@ -6821,6 +7670,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         if (device.voiceUi?.timer !== undefined) clearTimeout(device.voiceUi.timer)
         device.close()
       }
+      // 挂着的设备回执一律结算成「没回执」：工具不能因为插件卸载而永远悬着。
+      clearPendingAcks()
       devices.clear()
       for (const disposer of [disposePre, disposePost, disposeSession, disposeAssistantStream, disposeApprovalRequest, disposeQuestionRequest]) {
         try { if (typeof disposer === 'function') disposer() } catch { /* 忽略 */ }
