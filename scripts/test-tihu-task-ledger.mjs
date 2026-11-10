@@ -35,6 +35,7 @@ import {
   plainSummaryOf,
   ringOf,
   routeQuick,
+  isPinnedBoardTask,
   bestCardMatchOf,
   scoreCardAlias,
   stripWakeWord,
@@ -55,6 +56,8 @@ import {
   doneFrame,
   doneLineRangesOf,
   doneLinesOf,
+  doneSpeechSegmentsOf,
+  DONE_SPEECH_MAX_CHARS,
   folderBase,
   noticeFrame,
   prepareDoneText,
@@ -930,6 +933,57 @@ test('plainSummaryOf：去 markdown / 去长路径 / 只取第一句 / 超长省
   assert.equal(plainSummaryOf('一二三四五六七八九十', 5), '一二三四…')
   assert.equal(plainSummaryOf(''), '')
   assert.equal(plainSummaryOf('```\ncode only\n```'), '')
+})
+
+test('完成页朗读分段：首段只一行、后续合并整行且不超上限，段界与 done.ranges 完全对齐', () => {
+  const body = prepareDoneText('第一句比较短。第二句也不长。第三句稍微长一点，但是仍然没有超过八十字的上限。第四句继续凑一点字数。第五句收尾。')
+  const ranges = doneLineRangesOf(body)
+  const chars = [...body]
+  const segments = doneSpeechSegmentsOf(body)
+  assert.ok(segments.length >= 2, '要分成多段（不能一段念到底，首包等太久）')
+  assert.equal(segments[0].firstLine, 0)
+  assert.equal(segments[0].lastLine, 0, '首段只装第一行（尽快开口）')
+  for (const segment of segments) {
+    assert.equal(segment.start, ranges[segment.firstLine][0], '段起点＝那一行的起点')
+    assert.equal(segment.end, ranges[segment.lastLine][1], '段终点＝那一行的终点')
+    assert.ok(segment.lastLine >= segment.firstLine, '段的行范围必须有效')
+    assert.equal(segment.text, chars.slice(segment.start, segment.end).join(''), '段文本＝同一坐标系里的码点切片')
+  }
+  for (let i = 1; i < segments.length; i += 1) {
+    assert.ok(segments[i].start >= segments[i - 1].end, '段与段不重叠')
+    assert.equal(segments[i].firstLine, segments[i - 1].lastLine + 1, '行是连续的，不跳行')
+  }
+  assert.equal(segments[segments.length - 1].end, chars.length, '最后一段念到正文末尾（不是第一句就停）')
+  for (const segment of segments.slice(1)) {
+    assert.ok(segment.end - segment.start <= DONE_SPEECH_MAX_CHARS, '合并上限：' + (segment.end - segment.start))
+  }
+  assert.deepEqual(segments.map((segment) => segment.index), segments.map((_, index) => index), '段序号从 0 连续')
+  assert.deepEqual(doneSpeechSegmentsOf(''), [], '没有正文就没有段（不合成空串）')
+})
+
+test('棋盘排序：鹈鹕派单的任务永远在最前（电脑端卡再新也往后排）；每页 4 条、页码夹在范围内', () => {
+  const ledger = new TaskLedger()
+  const external = ledger.add({ title: '电脑端那条', projectId: 'pc:s', projectName: 'A', sessionIds: ['s'], source: 'pc', state: 'running', now: 5000 })
+  const mine = ledger.add({ title: '派单那条', projectId: 'p', projectName: 'P', now: 1000 })
+  const board = boardOf(ledger.list(), 5000)
+  assert.equal(board.rows[0].taskId, mine.taskId, '派单任务排第一（不按最后活动时间排）')
+  assert.equal(board.rows[1].taskId, external.taskId)
+  assert.equal(isPinnedBoardTask(mine), true)
+  assert.equal(isPinnedBoardTask(external), false, '电脑端镜像是只读卡，不占前排')
+
+  const many = new TaskLedger()
+  for (let i = 1; i <= 6; i += 1) many.add({ title: `任务${i}`, projectId: `proj-${i}`, projectName: `P${i}`, now: 1000 + i })
+  const page0 = boardOf(many.list(), 9000, 0)
+  assert.equal(page0.page.total, 2, '6 条 → 2 页')
+  assert.equal(page0.page.index, 0)
+  assert.equal(page0.rows.length, BOARD_PAGE_SIZE, '每页 4 条')
+  const page1 = boardOf(many.list(), 9000, 1)
+  assert.equal(page1.page.index, 1)
+  assert.equal(page1.rows.length, 2, '第 2 页剩 2 条')
+  assert.equal(new Set([...page0.rows, ...page1.rows].map((row) => row.taskId)).size, 6, '两页不重不漏')
+  assert.equal(boardOf(many.list(), 9000, 9).page.index, 1, '页码越界夹到最后一张页')
+  assert.equal(boardOf(many.list(), 9000, -3).page.index, 0, '负数夹到第 1 页')
+  assert.equal(boardOf([], 9000).page.total, 1, '空盘也算 1 页（翻页条不出现）')
 })
 
 console.log(`\n${passed} tests passed（task-ledger + task-screens）`)
