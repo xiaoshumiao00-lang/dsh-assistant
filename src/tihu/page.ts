@@ -174,36 +174,40 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-empty .l1 { font-size:17px; font-weight:700; line-height:20px; }
   #screen .board-empty .l2 { font-size:12px; line-height:16px; color:#9fb0c0; }
   #screen .board-empty .l3 { font-size:12px; line-height:16px; color:#6f7d8b; }
-  /* ── 完成页（参考图）：顶栏 20 + 标题 22 + 正文 7×20 + 三键 30，合计 218 ──
+  /* ── 完成页（参考图）：顶栏 14 + 标题 22 + 正文 7×20 + 间隙 12 + 三键 30，合计 222 ──
      顶栏：左「完成」（青、不加粗）／中波形（7 根竖条）／右「另有 N 条」（灰）／最右 ▶（青）。
      正文：15px/20px，当前朗读行整行铺青底、黑字加粗，左右各留 8px，行首不留任何图标。
-     大标题 2026-11-10 用户要求减 2 号（22px → 20px，行高 24 → 22），其余版式不动。 */
-  #screen .done-view { display:none; flex:1; min-height:0; overflow:hidden; flex-direction:column; gap:2px; }
+     大标题 2026-11-10 用户要求减 2 号（22px → 20px，行高 24 → 22）。
+     正文**按行数自适应**（2026-11-10 用户实机要求）：不再用 flex:1 + 垂直居中，
+     行少时正文贴着标题往下排，底部按钮固定留 12px，下方空白留在屏幕最底下。
+     高度预算：14 + 2 + 22 + 2 + 7×20 + 12 + 30 = 222（内容高 240−2×8−2×1）。 */
+  #screen .done-view { display:none; flex:none; min-height:0; overflow:hidden; flex-direction:column; gap:2px; }
   #screen.done-mode .done-view { display:flex; }
   #screen.done-mode .home-top, #screen.done-mode .stage, #screen.done-mode .title,
   #screen.done-mode ul, #screen.done-mode .steps,
   #screen.done-mode .cd-row, #screen.done-mode .home-body { display:none; }
-  #screen .done-bar { position:relative; flex:none; height:20px; display:flex; align-items:center; gap:6px; }
-  #screen .done-stage { flex:none; font-size:11px; line-height:20px; color:#5FD2C8; font-weight:400; }
+  #screen .done-bar { position:relative; flex:none; height:14px; display:flex; align-items:center; gap:6px; }
+  #screen .done-stage { flex:none; font-size:11px; line-height:14px; color:#5FD2C8; font-weight:400; }
   #screen .done-wave { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); display:flex; align-items:center; gap:2px; height:14px; }
   #screen .done-wave span { display:block; width:2px; height:5px; border-radius:1px; background:#5FD2C8; animation:doneBarWave .9s ease-in-out infinite; }
   #screen .done-wave span:nth-child(2), #screen .done-wave span:nth-child(6) { height:8px; animation-delay:.1s; }
   #screen .done-wave span:nth-child(3), #screen .done-wave span:nth-child(5) { height:11px; animation-delay:.2s; }
   #screen .done-wave span:nth-child(4) { height:14px; animation-delay:.3s; }
   @keyframes doneBarWave { 0%,100% { transform:scaleY(.55); } 50% { transform:scaleY(1); } }
-  #screen .done-more { margin-left:auto; flex:none; font-size:11px; line-height:20px; color:#8b98a5; white-space:nowrap; }
-  #screen .done-play { flex:none; font-size:10px; line-height:20px; color:#5FD2C8; margin-left:6px; }
+  #screen .done-more { margin-left:auto; flex:none; font-size:11px; line-height:14px; color:#8b98a5; white-space:nowrap; }
+  #screen .done-play { flex:none; font-size:10px; line-height:14px; color:#5FD2C8; margin-left:6px; }
   #screen .done-title { flex:none; height:${DONE_TITLE_LINE_HEIGHT_PX}px; font-size:${DONE_TITLE_FONT_PX}px; font-weight:700;
     line-height:${DONE_TITLE_LINE_HEIGHT_PX}px; color:#ffffff;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  /* 正文块在「标题下～按钮上」里垂直居中：两行回答不再全挤在顶部、底下空一大片
-     （2026-11-10 用户要求，像手机通知那样紧凑）；满 7 行时 140px 正好铺满，居中不起作用。 */
-  #screen .done-body { flex:1; min-height:0; overflow:hidden; display:flex; flex-direction:column; justify-content:center; }
+  /* 正文块按行数撑开（不 flex:1、不垂直居中）：一行就只占 20px，紧贴标题；
+     满 7 行时 140px 正好铺满，按钮下方不留多余黑带。 */
+  #screen .done-body { flex:none; min-height:0; overflow:hidden; display:flex; flex-direction:column; justify-content:flex-start; }
   #screen .done-line { height:20px; line-height:20px; box-sizing:border-box; padding:0 8px; font-size:15px; color:#e8edf2;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen .done-line.cur { background:#5FD2C8; color:#04110f; font-weight:700; border-radius:4px; }
-  /* 三键：深灰等宽圆角，左右边距各 12px、键间距 8px、高 30px、浅青字 */
-  #screen.done-mode .action-bar { display:flex; flex:none; height:30px; padding:0 4px; gap:8px; }
+  /* 三键：深灰等宽圆角、键间距 8px、高 30px、浅青字。
+     #screen 已有 4px 列间隙，这里再补 8px margin-top = 正文与按钮之间固定 12px。 */
+  #screen.done-mode .action-bar { display:flex; flex:none; height:30px; padding:0 4px; gap:8px; margin-top:8px; }
   #screen.done-mode .action-bar button { height:30px; min-height:30px; border:0; border-radius:8px;
     background:#3A3D42; color:#9fe8df; font-size:14px; }
   #screen.done-mode .action-bar button:active { background:#4a4e54; }
@@ -658,7 +662,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   }
 
   /* ---------- 完成页（屏 6，参考图版式） ----------
-   * 顶栏 20 + 标题 22 + 正文 7×20（当前行青底黑字）+ 三键 30，320×240 内不溢出。
+   * 顶栏 14 + 标题 22 + 正文按行数（最多 7×20，当前行青底黑字）+ 正文↔按钮 12 + 三键 30，
+   * 320×240 内不溢出；行少时正文贴标题、下方黑底留在屏幕最底部。
    * 行文本由宿主按像素折好（done.lines），页面只负责窗口与高亮，不再二次翻译。
    *
    * 高亮 ≡ 真实播放进度（2026-11-10 用户实机反馈：声音和青底行不同步）：

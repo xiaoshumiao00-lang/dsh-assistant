@@ -57,14 +57,14 @@ export const DONE_TITLE_FONT_PX = 20
 export const DONE_TITLE_LINE_HEIGHT_PX = 22
 
 /**
- * 完成屏垂直预算（320×240，四边 8px）：
+ * 完成屏垂直预算（320×240，四边 8px）——**按行数自适应**（2026-11-10 用户实机要求）：
  *
  *   内容高 222 = 240 − 2×1 边框 − 2×8 内边距
- *   顶行 14 + 间隙 4 + 大标题 22 + 间隙 4 + 正文 7×20=140 + 间隙 4 + 按钮行 32 = 220
- *   → 余 2px，三键（停止/重读/主页）稳稳放得下，正文 7 行不被裁。
+ *   顶栏 14 + 内缝 2 + 大标题 22 + 内缝 2 + 正文 7×20=140 + 正文↔按钮 12 + 按钮行 30 = 222
  *
- * 大标题字号从 22 收到 20（行高 24 → 22）后，正文区反而多出 2px：两行回答在
- * 「标题下～按钮上」之间垂直居中，满 7 行时正好铺满。
+ * 正文不再 `flex:1` 垂直居中：行少时正文贴着标题往下排、按钮固定在其下方 12px，
+ * 剩下的黑底留在屏幕最底部（而不是夹在正文和按钮之间）。
+ * 满 7 行时正好 222px 铺满，不会溢出。
  */
 export const DONE_LAYOUT = {
   stageHeightPx: 14,
@@ -74,10 +74,13 @@ export const DONE_LAYOUT = {
   visibleLines: 7,
   lineHeightPx: 20,
   bodyHeightPx: 140,
-  actionBarHeightPx: 32,
-  columnGapPx: 4,
-  /** 14 + 4 + 22 + 4 + 140 + 4 + 32 = 220（≤ 222）。 */
-  usedHeightPx: 220,
+  actionBarHeightPx: 30,
+  /** done-view 内部（顶栏↔标题、标题↔正文）的缝。 */
+  columnGapPx: 2,
+  /** 正文↔按钮行的固定缝（页面：4px 列间隙 + 8px margin-top）。 */
+  bodyToActionGapPx: 12,
+  /** 14 + 2 + 22 + 2 + 140 + 12 + 30 = 222。 */
+  usedHeightPx: 222,
 } as const
 
 /** 物理规格（近似值，仅用于「实际尺寸」显示）。 */

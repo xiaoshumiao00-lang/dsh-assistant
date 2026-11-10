@@ -41,7 +41,7 @@ import {
 } from '../src/tihu/guard.ts'
 import { createTihuRuntime, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH, TIHU_LANE_LOG_MAX_BYTES, appendTihuLaneLog, screenReasonOf, tihuLaneLogPath, tihuReceiptHoldMs } from '../src/tihu/lane.ts'
 import { BOARD_PAGE_SIZE } from '../src/tihu/task-ledger.ts'
-import { RECEIPT_SECONDS, prepareDoneText } from '../src/tihu/task-screens.ts'
+import { DONE_NO_REPLY_TEXT, RECEIPT_SECONDS, prepareDoneText } from '../src/tihu/task-screens.ts'
 import { TIHU_CONTROL_SECTION_TEXT, createTihuControlRunner, matchSessionRows, tihuActionNames } from '../src/tihu/control.ts'
 import {
   activityEntryOf,
@@ -563,10 +563,18 @@ function cuRecord(id, options = {}) {
   }
 }
 
-function sessionQueryFixture(records) {
+function sessionQueryFixture(records, eventsBySession) {
   return {
     listSessions: async () => records.map(({ projection, ...record }) => record),
     readTitleSnapshots: async (ids) => ids.map((id) => ({ session: { id }, title: { title: '标题:' + id } })),
+    // 2026-11-10：完成页正文兜底会读会话历史（电脑端 CU 任务的内存回复可能是空的）。
+    ...(eventsBySession === undefined ? {} : {
+      readSession: async (sessionId) => ({
+        session: { id: sessionId },
+        inheritedEventCount: 0,
+        events: eventsBySession[sessionId] ?? [],
+      }),
+    }),
   }
 }
 
@@ -2641,9 +2649,12 @@ function unifiedWorkspace(options = {}) {
       },
     }),
   }
-  const fixture = runtimeFor(records, options.noCreate === true
-    ? { sessions }
-    : { remote, sessions, sessionController }, options.tts ?? {})
+  const fixture = runtimeFor(records, {
+    ...(options.noCreate === true ? { sessions } : { remote, sessions, sessionController }),
+    ...(options.sessionEvents === undefined
+      ? {}
+      : { sessionQuery: sessionQueryFixture(records, options.sessionEvents) }),
+  }, options.tts ?? {})
   return {
     ...fixture,
     root,
@@ -3371,6 +3382,68 @@ await testAsync('电脑端会话：点卡片走 session.bind 详情，不发派�
   w.cleanup()
 })
 
+await testAsync('电脑端完成页：内存里没有回复时，从会话历史取最后一条助手原文（不是标题）', async () => {
+  const now = Date.now()
+  const sessionId = 'session-pc-history'
+  const events = [
+    { type: 'turn/start', data: { turn: 1 } },
+    // 思考块与只有工具调用的助手消息都不算回复：必须继续往前找真正的文字。
+    { type: 'assistant/message', data: { message: { content: [{ type: 'reasoning', text: '先想一下怎么写' }] } } },
+    { type: 'assistant/message', data: { message: { content: [{ type: 'tool-call', name: 'read_file' }] } } },
+    { type: 'assistant/message', data: { message: { content: [
+      { type: 'text', text: '先把边界拆成两段：夜间常数 2.448 ℃，白天用 ERA5 降尺度。' },
+      { type: 'text', text: '温度场已经收敛，跨中腹板温差 1.1 ℃。' },
+    ] } } },
+    { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+  ]
+  const w = unifiedWorkspace({
+    records: [cuRecord(sessionId, { live: false, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 120_000, title: '温度场结果核对' })],
+    sessionEvents: { [sessionId]: events },
+  })
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pc-history', protocol: '0' }, 1)))
+  await waitMs(160)
+  const row = framesOf(socket).filter((frame) => frame.type === 'task.list').pop().payload.board.rows[0]
+  assert.equal(row.state, 'done', '两分钟没动静＝完成卡')
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 60, hit: 'task', taskId: 'p1' }, 2)))
+  await waitMs(350)
+  const done = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').pop()
+  assert.ok(done !== undefined, '完成卡打开要出完成屏：' + JSON.stringify(framesOf(socket).filter((frame) => frame.type === 'screen.frame').map((frame) => frame.payload.stage)))
+  const body = done.payload.done.lines.join('')
+  assert.ok(body.includes('边界拆成两段'), '正文要取会话历史里最后一条助手文字：' + body)
+  assert.ok(body.includes('跨中腹板温差'), '最后一条回复的两个 text 块都要在：' + body)
+  assert.equal(body.includes('温度场结果核对'), false, '正文不许拿任务标题冒充')
+  assert.ok(done.payload.done.lines.length >= 2, '长回复要按像素折成多行：' + body)
+  assert.equal(done.payload.done.ranges.length, done.payload.done.lines.length, '区间与历史正文行一一对应')
+  w.cleanup()
+})
+
+await testAsync('电脑端完成页：历史里也没有文字回复时显示「（没有文字回复）」，绝不回退标题', async () => {
+  const now = Date.now()
+  const sessionId = 'session-pc-no-reply'
+  const w = unifiedWorkspace({
+    records: [cuRecord(sessionId, { live: false, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 120_000, title: '基于GNN与PINN的拓扑优化汇报PPT' })],
+    sessionEvents: {
+      [sessionId]: [
+        { type: 'turn/start', data: { turn: 1 } },
+        { type: 'assistant/message', data: { message: { content: [{ type: 'reasoning', text: '只有思考' }] } } },
+        { type: 'assistant/message', data: { message: { content: [{ type: 'tool-call', name: 'click' }] } } },
+        { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+      ],
+    },
+  })
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pc-no-reply', protocol: '0' }, 1)))
+  await waitMs(160)
+  socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 60, hit: 'task', taskId: 'p1' }, 2)))
+  await waitMs(350)
+  const done = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '完成').pop()
+  assert.ok(done !== undefined, '完成卡打开要出完成屏')
+  assert.deepEqual(done.payload.done.lines, [DONE_NO_REPLY_TEXT], '没有文字回复就明说，不能拿标题凑')
+  assert.equal(done.payload.title.includes('GNN'), true, '大标题仍是任务名')
+  w.cleanup()
+})
+
 await testAsync('电脑端同步：一次 hello 只拉一次会话列表（复用 sessionListTtlMs，不额外狂调）', async () => {
   const now = Date.now()
   const records = [
@@ -3542,12 +3615,19 @@ test('page：完成页三键可见（has-actions 有 display:flex 规则）＋ 7
   const doneTitleRule = /#screen \.done-title \{[^}]*\}/.exec(html)?.[0] ?? ''
   assert.equal(/font-size:22px/.test(doneTitleRule), false, '大标题不许还留 22px：' + doneTitleRule)
   assert.ok(/#screen \.done-line\.cur \{ background:#5FD2C8/.test(html), '当前朗读行青底反白')
-  // 两行正文不再全挤在顶部：正文块在「标题下～按钮上」之间垂直居中。
-  assert.ok(/#screen \.done-body \{[^}]*display:flex/.test(html) && /#screen \.done-body \{[^}]*justify-content:center/.test(html),
-    '完成页正文块要垂直居中（行数少时上下匀开）')
+  // 2026-11-10 用户实机要求：正文按行数自适应，不再 flex:1 垂直居中撑出一大片黑带。
+  const doneBodyRule = /#screen \.done-body \{[^}]*\}/.exec(html)?.[0] ?? ''
+  assert.ok(doneBodyRule.includes('flex:none'), '正文块按行数撑开，不许 flex:1 撑满：' + doneBodyRule)
+  assert.ok(doneBodyRule.includes('justify-content:flex-start'), '正文要从标题下方开始排（不许垂直居中）：' + doneBodyRule)
+  assert.equal(/justify-content:center/.test(doneBodyRule), false, '正文块不许再垂直居中：' + doneBodyRule)
+  const doneViewRule = /#screen \.done-view \{[^}]*\}/.exec(html)?.[0] ?? ''
+  assert.ok(doneViewRule.includes('flex:none'), '完成页容器也要按内容收缩（否则按钮还是被推到底）：' + doneViewRule)
+  const doneActionRule = /#screen\.done-mode \.action-bar \{[^}]*\}/.exec(html)?.[0] ?? ''
+  assert.ok(doneActionRule.includes('margin-top:8px'), '正文↔按钮固定 12px（4px 列间隙 + 8px margin）：' + doneActionRule)
+  assert.ok(/#screen \.done-bar \{[^}]*height:14px/.test(html), '顶栏收成 14px，给正文↔按钮腾出 12px 预算')
   const used = DONE_LAYOUT.stageHeightPx + DONE_LAYOUT.titleHeightPx + DONE_LAYOUT.bodyHeightPx
-    + DONE_LAYOUT.actionBarHeightPx + DONE_LAYOUT.columnGapPx * 3
-  assert.ok(used <= 240 - 2 * 8 - 2, `完成页总高 ${used}px 不得超过 222px`)
+    + DONE_LAYOUT.actionBarHeightPx + DONE_LAYOUT.columnGapPx * 2 + DONE_LAYOUT.bodyToActionGapPx
+  assert.equal(used, 240 - 2 * 8 - 2, `完成页总高 ${used}px 必须正好 222px`)
   assert.equal(DONE_LAYOUT.visibleLines, 7)
   assert.equal(DONE_LAYOUT.titleFontPx, 20, '版式预算里的标题字号与 CSS 一致')
   assert.ok(DONE_LAYOUT.titleHeightPx >= DONE_LAYOUT.titleLineHeightPx, '标题块高不得小于行高（否则字形被裁）')

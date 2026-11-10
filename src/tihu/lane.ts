@@ -95,6 +95,7 @@ import {
   type TihuTask,
 } from './task-ledger.ts'
 import {
+  DONE_NO_REPLY_TEXT,
   RECEIPT_SECONDS,
   askWhichFrame,
   boardFrame,
@@ -1697,17 +1698,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         } else if (type === 'turn/end') {
           const pcReason = finishReasonOf(data)
           const pcOk = pcReason === 'stop' || pcReason === 'completed'
-          const pcResult = plainSummaryOf(lastAssistant.get(sessionId)?.text ?? '') || (pcOk ? '做完了' : `中断（${pcReason}）`)
+          // 内存里没有回复时先从活会话快照补一次（同步，不读盘）；轮询镜像任务
+          // 的完成态可能是列表推出来的，`assistant/message` 不保证都在本进程里。
+          const doneReply = lastAssistant.get(sessionId)?.text ?? cachedAssistantText(sessionId)
+          const pcResult = plainSummaryOf(doneReply) || (pcOk ? '做完了' : `中断（${pcReason}）`)
           tasks.syncExternal(taskOfSession.taskId, { state: 'done', summary: pcResult, at })
           // 完成/回答页：任务完成就上完成屏，并从这里开始朗读（读完 60 秒回棋盘）。
           const doneTask = tasks.get(taskOfSession.taskId) ?? taskOfSession
-          const doneReply = lastAssistant.get(sessionId)?.text ?? ''
           doneTask.doneText = doneReply
           const done = doneFrame({
             taskId: doneTask.taskId,
             title: doneTask.title,
             resultLine: firstSentenceOf(doneReply) || pcResult,
-            replyText: doneReply,
+            replyText: doneReply || DONE_NO_REPLY_TEXT,
             bullets: replyBulletsOf(doneReply),
           })
           for (const device of devices) {
@@ -1743,7 +1746,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         } else if (type === 'turn/end') {
           const reason = finishReasonOf(data)
           const ok = reason === 'stop' || reason === 'completed'
-          const reply = lastAssistant.get(sessionId)?.text ?? ''
+          const reply = lastAssistant.get(sessionId)?.text ?? cachedAssistantText(sessionId)
           const resultLine = firstSentenceOf(reply) || (ok ? '做完了' : `中断（${reason}）`)
           tasks.complete(taskOfSession.taskId, { resultLine, now: at })
           taskOfSession.doneText = reply
@@ -1754,7 +1757,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             taskId: taskOfSession.taskId,
             title: taskOfSession.title,
             resultLine,
-            replyText: reply,
+            replyText: reply || DONE_NO_REPLY_TEXT,
             bullets: replyBulletsOf(reply),
             ...(others > 0 ? { others } : {}),
           })
@@ -2088,10 +2091,15 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
               : tasks.get(device.focusedTask)
             if (target !== undefined) {
               try { device.cancelRound?.() } catch { /* 忽略 */ }
-              // 重读＝同一份正文再念一遍（页面清掉旧排程，从第一段重新对齐高亮）。
-              void speakAnnouncement(device, doneBodyTextOf(target), 'done')
-                .then((spokenMs) => { if (spokenMs > 0) armScreenHome(device, spokenMs + HOME_AFTER_SPEECH_MS, target.taskId, '完成') })
-                .catch((error) => log(`tihu replay speak failed: ${(error as Error)?.message ?? String(error)}`))
+              // 正文还没补到（历史读取晚到/失败）：重读前再补一次，顺带重发完成帧；
+              // 否则就照旧只把同一份正文再念一遍（页面清掉旧排程，从第一段重新对齐高亮）。
+              if (String(target.doneText ?? '').trim() === '') {
+                await showDone(device, target, true)
+              } else {
+                void speakAnnouncement(device, doneBodyTextOf(target), 'done')
+                  .then((spokenMs) => { if (spokenMs > 0) armScreenHome(device, spokenMs + HOME_AFTER_SPEECH_MS, target.taskId, '完成') })
+                  .catch((error) => log(`tihu replay speak failed: ${(error as Error)?.message ?? String(error)}`))
+              }
             }
             return
           }
@@ -3169,7 +3177,43 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     })
   }
 
-  /** 完成页正文：优先完整回答，其次一句话结果/摘要。 */
+  /**
+   * 先从不花钱的地方取：内存 Map → 活会话的 `snapshotEvents()`（同步）。
+   * 命中就回填 Map，后续同一任务再开完成页不再读日志。
+   */
+  function cachedAssistantText(sessionId: string): string {
+    const known = String(lastAssistant.get(sessionId)?.text ?? '').trim()
+    if (known !== '') return known
+    const live = liveSessionOf(sessionId)
+    const text = lastAssistantTextOfEvents(typeof live?.snapshotEvents === 'function' ? live.snapshotEvents() : undefined)
+    if (text !== '') lastAssistant.set(sessionId, { text, at: Date.now() } as ProjectReply)
+    return text
+  }
+
+  /**
+   * 完成页正文的最终兜底：内存没有就读会话历史（`sessionQuery.readSession` 对 live/持久化
+   * 都返回完整事件，且不需要把会话加载成活会话）。
+   *
+   * 2026-11-10 实机根因：电脑端 CU 任务只镜像列表投影，完成态常常是轮询推出来的；进程里
+   * 没收到那一轮 `assistant/message` 时 `doneText` 永远为空，旧实现就退回任务标题。
+   */
+  async function readAssistantText(sessionId: string): Promise<string> {
+    const immediate = cachedAssistantText(sessionId)
+    if (immediate !== '') return immediate
+    const query = optionalService(ctx, 'sessionQuery')
+    if (query === undefined || typeof query.readSession !== 'function') return ''
+    try {
+      const loaded = await query.readSession(sessionId)
+      const text = lastAssistantTextOfEvents(loaded?.events)
+      if (text !== '') lastAssistant.set(sessionId, { text, at: Date.now() } as ProjectReply)
+      return text
+    } catch (error) {
+      log(`tihu done text read failed session=${sessionId}: ${(error as Error)?.message ?? String(error)}`)
+      return ''
+    }
+  }
+
+  /** 完成页正文：优先完整回答，其次一句话结果/摘要（**绝不**再拿任务标题冒充）。 */
   function doneReadingTextOf(task: TihuTask): string {
     const text = String(task.doneText ?? '').trim()
     if (text !== '') return text
@@ -3183,7 +3227,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * `charStart/charEnd` 全部基于它，高亮才能跟着真实播放走（少一个字都对不上）。
    */
   function doneBodyTextOf(task: TihuTask): string {
-    return prepareDoneText(doneReadingTextOf(task) || task.title)
+    return prepareDoneText(doneReadingTextOf(task) || DONE_NO_REPLY_TEXT)
   }
 
   /** 同一批里其它已完成条数（「另有 N 条」）。 */
@@ -3196,7 +3240,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   /** 完成页：任务名大标题 + 回答 7 行 + 停止/重读/主页。 */
   function doneScreenOf(task: TihuTask): ScreenFramePayload {
     const body = doneBodyTextOf(task)
-    const resultLine = String(task.resultLine ?? '').trim() || body || '做完了'
+    const resultLine = String(task.resultLine ?? '').trim() || body || DONE_NO_REPLY_TEXT
     return doneFrame({
       taskId: task.taskId,
       title: task.title,
@@ -3211,13 +3255,31 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     device.receiptTimer = undefined
   }
 
-  /** 看完成页：立即切屏（不派单、不建会话），并按「读完 + 60 秒」回棋盘。 */
-  function showDone(device: TihuDevice, task: TihuTask, speak = true): void {
+  /**
+   * 看完成页：立即切屏（不派单、不建会话），并按「读完 + 60 秒」回棋盘。
+   *
+   * 2026-11-10：正文为空时先补一次会话历史再出帧——电脑端 CU 任务是轮询镜像，
+   * 内存里没有回复时不能再拿标题糊弄（旧实现 `doneBodyTextOf` 的 `|| task.title`）。
+   * 取历史可能读一次会话日志（毫秒级），所以这里改成 async；调用方不等它也行。
+   */
+  async function showDone(device: TihuDevice, task: TihuTask, speak = true): Promise<void> {
     clearReceipt(device)
     disarmAutoHome(device)
     device.pendingPick = undefined
     device.focusedTask = task.taskId
     device.onBoard = false
+    if (String(task.doneText ?? '').trim() === '') {
+      const sessionId = task.sessionIds[task.sessionIds.length - 1]
+      if (sessionId !== undefined) {
+        const text = await readAssistantText(sessionId)
+        // 读历史期间用户可能已经回棋盘/切到别的任务：晚到的完成帧不许再抢屏。
+        if (!devices.has(device) || device.focusedTask !== task.taskId || device.onBoard === true) return
+        if (text !== '') {
+          task.doneText = text
+          if (String(task.resultLine ?? '').trim() === '') task.resultLine = firstSentenceOf(text)
+        }
+      }
+    }
     sendFrame(device, doneScreenOf(task), device.sessionId)
     armScreenHome(device, HOME_AFTER_SPEECH_MS, task.taskId, '完成')
     if (!speak) return
@@ -3271,7 +3333,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     if (task === undefined) return false
     disarmAutoHome(device)
     if (task.state === 'done' || task.state === 'announced') {
-      showDone(device, task)
+      void showDone(device, task)
       return true
     }
     if (task.state === 'awaiting') {
@@ -3370,7 +3432,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         } else if (latest.state === 'done' || latest.state === 'announced') {
           // 回执期间完成帧被挡在门外（见 session/event 的 receiptTimer 判断），这里把屏补上。
           // 不再念整段正文：完成播报已由通知总线念过一句，重念等于同一件事说两次。
-          showDone(target, latest, false)
+          void showDone(target, latest, false)
           log(`tihu receipt hold -> done task=${latest.taskId}`)
           return
         }
@@ -4047,6 +4109,32 @@ function finishReasonOf(data: unknown): string {
   const kind = (reason !== null && typeof reason === 'object' ? (reason as Record<string, unknown>).kind : undefined)
     ?? record.kind
   return typeof kind === 'string' ? kind : 'stop'
+}
+
+/**
+ * 会话事件 → 最后一条**有文字**的助手回复（原文）。
+ *
+ * 为什么不能只看内存里的 `lastAssistant`：电脑端 CU 会话是**轮询镜像**，任务完成态可能
+ * 完全由列表缓存推导出来；鹈鹕进程重启、或者任务在事件到达之后才建，内存 Map 里就没有
+ * 这条回复了（2026-11-10 实机核对：p2/p3/p4 三条完成卡全空，只有进程内跑过的 p1 有）。
+ * 这里直接折叠会话事件，live 会话与持久化日志共用同一形状。
+ *
+ * 只收 `assistant/message` 的 text 块：reasoning（思考）与 tool-call 都不算回复；最后一条
+ * 只有工具调用时继续往前找，直到找到真正的文字。
+ */
+function lastAssistantTextOfEvents(events: unknown): string {
+  if (!Array.isArray(events)) return ''
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i] as any
+    if (event?.type !== 'assistant/message') continue
+    const blocks = Array.isArray(event?.data?.message?.content) ? event.data.message.content : []
+    const text = stripToolNoise(blocks
+      .filter((block: any) => block?.type === 'text')
+      .map((block: any) => String(block?.text ?? ''))
+      .join('\n')).trim()
+    if (text !== '') return text
+  }
+  return ''
 }
 
 /** 回复正文的第一句（屏 6 标题与一句播报都用它；超长的收省略号）。 */

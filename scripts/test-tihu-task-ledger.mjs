@@ -42,6 +42,7 @@ import {
   taskTitleOf,
 } from '../src/tihu/task-ledger.ts'
 import {
+  DONE_NO_REPLY_TEXT,
   RECEIPT_SECONDS,
   askWhichFrame,
   boardFrame,
@@ -617,7 +618,7 @@ test('完成页大标题：20px 加粗仍单行省略，不换行不溢出', () 
   assert.equal(frame.title.includes('\n'), false, '标题永远一行')
 })
 
-test('完成页：两行正文也放得下（正文块垂直居中，不再全挤顶部）', () => {
+test('完成页：两行正文也放得下（行数按实际下发，不补空行）', () => {
   const frame = doneFrame({ taskId: 't11', title: '今天几号', resultLine: '十一月十日', replyText: '今天是十一月十日。明天是十一日。' })
   assert.ok(frame.done.lines.length >= 1)
   const lineHeight = 20
@@ -676,6 +677,17 @@ test('完成页帧带 ranges：和 lines 一一对应，可直接驱动高亮', 
   if (fallbackFrame.done.ranges !== undefined) {
     assert.equal(fallbackFrame.done.ranges.length, fallbackFrame.done.lines.length, '回退正文的区间也要对齐')
   }
+})
+
+test('完成页：取不到回复时显示「（没有文字回复）」，绝不用任务标题冒充正文', () => {
+  const title = '基于GNN与PINN的拓扑优化汇报PPT'
+  const frame = doneFrame({ taskId: 't13b', title, resultLine: '', replyText: '' })
+  assert.deepEqual(frame.done.lines, [DONE_NO_REPLY_TEXT], '没有回复就明说，不能拿标题凑')
+  assert.ok(frame.title.startsWith('基于GNN'), '大标题仍是任务名：' + frame.title)
+  assert.equal(frame.done.lines.some((line) => line.includes('GNN')), false, '正文里不许出现标题内容')
+  const ranges = frame.done.ranges
+  assert.ok(Array.isArray(ranges) && ranges.length === 1, '占位正文也要有可朗读的字符区间')
+  assert.deepEqual(ranges[0], [0, [...DONE_NO_REPLY_TEXT].length], '区间覆盖整句占位文字')
 })
 
 test('歧义追问（屏 7）：两个候选 + 「都不是」，序号用数字', () => {
