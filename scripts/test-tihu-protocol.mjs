@@ -537,7 +537,7 @@ function fakeCtx(overrides = {}) {
   const injected = []
   const events = []
   const ctx = {
-    on(name, handler) { events.push({ name, handler }); return () => {} },
+    on(name, handler, options) { events.push({ name, handler, options }); return () => {} },
     get(id) {
       if (id === 'agents') return overrides.agents ?? { get: (sessionId) => sessionId === 'session-1' ? { followup: (message) => injected.push(message) } : undefined }
       if (id === 'speechController') return overrides.speechController ?? { transcribe: async () => '读一下 README' }
@@ -5380,10 +5380,10 @@ await testAsync('待决策：宿主 approval/request → 屏 5（真实正文·�
     assert.equal(decision.payload.title, '这条命令会删掉 .tihu 里的快照', '问题正文来自宿主请求，不许编造')
     assert.equal(decision.payload.tone, 'warn', '待决策是琥珀色')
     assert.deepEqual(decision.payload.actions.map((item) => item.id), ['taskAnswer1', 'taskAnswer2', 'taskBoard'])
-    assert.deepEqual(decision.payload.actions.map((item) => item.label), ['允许一次', '拒绝', '主页'])
+    assert.deepEqual(decision.payload.actions.map((item) => item.label), ['允许一次', '拒绝', '主页'], '按钮顺序不变（允许一次在前）')
     assert.ok(decision.payload.countdown.seconds > 0, '决策页要有倒计时（60 秒到点按默认项）')
-    assert.ok(decision.payload.bullets.some((line) => line.includes('不选就按「允许一次」')),
-      '默认项要写在屏上：' + JSON.stringify(decision.payload.bullets))
+    assert.ok(decision.payload.bullets.some((line) => line.includes('不选就按「拒绝」')),
+      '审批到点默认「拒绝」要写在屏上：' + JSON.stringify(decision.payload.bullets))
 
     const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop()
     const row = board.payload.board.rows.find((item) => item.taskId === 'p1')
@@ -5463,7 +5463,7 @@ await testAsync('待决策：60 秒到点按默认项走（设备没点也回执
     await waitMs(60)
     assert.equal(decisionFramesOf(socket).length, 1, '没到点先挂着待决策屏')
     const value = await answered
-    assert.equal(value, 'allowed-once', '到点按首选项（与托管自动答同一条规则）')
+    assert.equal(value, 'rejected', '审批到点按「拒绝」（用户 2026-11-10 拍板；托管才答允许一次）')
     assert.equal(delegated, false, '到点也是设备侧了结，不再转电脑端')
     await waitMs(120)
     const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop()
@@ -5548,17 +5548,131 @@ await testAsync('待决策：取不到单题原文时用固定文案 +「继续�
   assert.deepEqual(batchAnswer.answers.map((answer) => answer.id), ['q1', 'q2'])
   assert.equal(batchAnswer.answers.every((answer) => answer.selected.length === 0 && typeof answer.custom === 'string'), true,
     '没有选项的题用自由文本默认，不编选项：' + JSON.stringify(batchAnswer))
-  // 审批：官方闭集只有两个结果，选项固定「允许一次 / 拒绝」，默认项＝首选项。
+  // 审批：官方闭集只有两个结果，选项固定「允许一次 / 拒绝」，**到点默认「拒绝」**（用户 2026-11-10）。
   const approval = approvalDecisionOf({ agent: { session: { id: 's' } }, toolName: 'pwsh' })
-  assert.deepEqual(approval.options, APPROVAL_OPTIONS)
-  assert.equal(approval.defaultIndex, 0)
+  assert.deepEqual(approval.options, APPROVAL_OPTIONS, '按钮顺序不变')
+  assert.equal(approval.defaultIndex, 1, '默认项＝「拒绝」（不是首项）')
+  assert.equal(approval.options[approval.defaultIndex], '拒绝')
   assert.equal(approval.question, '允许使用 pwsh？', '取不到 reason 时才用工具名拼一句，且不带正文')
-  assert.equal(approval.answerOf(0), 'allowed-once')
+  assert.equal(approval.answerOf(0), 'allowed-once', '点「允许一次」不改语义')
   assert.equal(approval.answerOf(1), 'rejected')
+  assert.equal(approval.answerOf(approval.defaultIndex), 'rejected', '到点走 rejected')
   // 缺会话 / 缺题 id 的请求一律不接管（交回电脑端）。
   assert.equal(approvalDecisionOf({ toolName: 'pwsh' }), null)
   assert.equal(questionDecisionOf({ agent: { session: { id: 's' } }, questions: [{ question: '没有 id' }] }), null)
   assert.equal(questionDecisionOf({ agent: { session: { id: 's' } }, questions: [] }), null)
+})
+
+/* ---------- 待决策：注册留痕 + 抢屏（2026-11-10 实机复盘） ----------
+ *
+ * 实机事实（session-156f56cf，2026-11-10T09:09:33Z）：ask_user_question 挂住了整整
+ * 60.023 秒，然后按**默认项**交回第一批选项 —— 说明监听确实挂上、确实接管了；用户看到的
+ * 「没落屏」是第二步：设备当时没停在棋盘、也没看着这条任务，而旧实现只给「在棋盘 / 看着
+ * 这条任务」的设备发屏 5，一帧都没发出去。加上 `log()` 只进宿主 logger（桌面端根本看不到），
+ * lane.log 里一行都没有 → 被误判成「handlePendingInteraction 没被调用」。
+ * 下面三条把这三件事钉住：注册参数（prepend）、注册/分支留痕、空闲设备必须抢屏。
+ */
+
+await testAsync('待决策注册：两道 waterfall 都带 { prepend: true }，挂上就写 lane.log', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tihu-pending-reg-'))
+  process.env.TIHU_LANE_LOG = join(dir, 'lane.log')
+  const { ctx, events } = fakeCtx()
+  const runtime = createTihuRuntime(ctx, { log: () => {} })
+  try {
+    const approval = events.find((item) => item.name === 'approval/request')
+    const question = events.find((item) => item.name === 'user-questions/request')
+    assert.ok(approval !== undefined, '必须挂 approval/request')
+    assert.ok(question !== undefined, '必须挂 user-questions/request')
+    assert.equal(approval.options?.prepend, true, '审批监听要 prepend（抢在 api-remotes 转发浏览器之前）')
+    assert.equal(question.options?.prepend, true, '提问监听要 prepend')
+    const log = readFileSync(join(dir, 'lane.log'), 'utf8')
+    assert.ok(log.includes('tihu pending waterfall ready approval/request'), '启动要留一行可对照的注册日志：' + log)
+    assert.ok(log.includes('tihu pending waterfall ready user-questions/request'), '两道都要留：' + log)
+    assert.ok(log.includes('prepend=1'), '日志里要能看出是 prepend：' + log)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    runtime.dispose()
+  }
+})
+
+await testAsync('待决策注册失败：不静默，原因写进 lane.log', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tihu-pending-regfail-'))
+  process.env.TIHU_LANE_LOG = join(dir, 'lane.log')
+  const base = fakeCtx()
+  const ctx = {
+    ...base.ctx,
+    on(name, handler, options) {
+      if (name === 'approval/request' || name === 'user-questions/request') throw new Error('boom-宿主没有这段事件')
+      return base.ctx.on(name, handler, options)
+    },
+  }
+  const runtime = createTihuRuntime(ctx, { log: () => {} })
+  try {
+    const log = readFileSync(join(dir, 'lane.log'), 'utf8')
+    assert.ok(log.includes('tihu pending waterfall 挂不上 approval/request'), '挂不上要留痕：' + log)
+    assert.ok(log.includes('tihu pending waterfall 挂不上 user-questions/request'), '两道都要留：' + log)
+    assert.ok(log.includes('boom-宿主没有这段事件'), '要带上真实原因：' + log)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    runtime.dispose()
+  }
+})
+
+await testAsync('待决策抢屏：设备看着别的任务、不在棋盘，屏 5 也要弹出来并能答回', async () => {
+  const now = Date.now()
+  const w = unifiedWorkspace({
+    records: [
+      cuRecord('session-pc-ask', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 1000, title: '把第三节的结果补上' }),
+      cuRecord('session-pc-other', { live: true, preset: 'computer-use', cwd: '/work/论文', createdAt: now - 600_000, lastPromptAt: now - 2000, title: '整理参考文献格式' }),
+    ],
+  })
+  useTuoguanState(w.root, { off: { 'session-pc-ask': true } })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'pending-claim', protocol: '0' }, 1)))
+    await waitMs(180)
+    const tasks = w.runtime.control.listTasks()
+    const other = tasks.find((task) => String(task.title).includes('整理参考文献'))
+    const target = tasks.find((task) => String(task.title).includes('把第三节'))
+    assert.ok(other !== undefined && target !== undefined, '两张任务卡都要在：' + JSON.stringify(tasks))
+    // 设备打开「另一条」任务的进度页：不在棋盘、也没盯着这条任务（实机就是这种站姿）。
+    socket.emit('data', clientFrame(buildUpstream('task.reply', { command: 'open', taskId: other.taskId }, 2)))
+    await waitMs(120)
+    const opened = framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()
+    assert.equal(opened?.payload.taskId, other.taskId, '先站到另一条任务的进度页')
+
+    let delegated = false
+    const approval = waterfallOf(w, 'approval/request')
+    const answered = approval({
+      agent: { session: { id: 'session-pc-ask' } },
+      toolName: 'pwsh',
+      reason: '这条命令会删掉 .tihu 里的快照',
+    }, async () => { delegated = true; return 'rejected' })
+    await waitMs(160)
+
+    const decision = decisionFramesOf(socket).pop()
+    assert.ok(decision !== undefined, '设备在别的页也要抢屏：'
+      + JSON.stringify(framesOf(socket).filter((frame) => frame.type === 'screen.frame').map((frame) => [frame.payload.stage, frame.payload.taskId])))
+    assert.equal(decision.payload.taskId, target.taskId, '抢屏要弹的是发起审批的那条任务')
+    assert.equal(decision.payload.title, '这条命令会删掉 .tihu 里的快照')
+    assert.ok(decision.payload.bullets.some((line) => line.includes('不选就按「拒绝」')), '默认项写「拒绝」')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes(`tihu decision show task=${target.taskId}`), '抢屏要落 lane.log：' + log)
+    assert.ok(log.includes(`from=task:${other.taskId}`), '记下是从哪条任务页抢过来的：' + log)
+
+    // 点「拒绝」：点选语义不变（即使默认项已经是拒绝，也要真的走设备这一下）。
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 150, hit: 'action', actionId: 'taskAnswer2' }, 3)))
+    const value = await answered
+    assert.equal(value, 'rejected')
+    assert.equal(delegated, false, '设备答了就不许再转电脑端')
+    await waitMs(120)
+    assert.equal(decisionFramesOf(socket).length, 1, '答题后不许再挂一张待决策屏')
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    delete process.env.TIHU_TUOGUAN_STATE
+    w.cleanup()
+  }
 })
 
 /* ---------- 汇总 ---------- */console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)

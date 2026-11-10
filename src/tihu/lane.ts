@@ -702,6 +702,27 @@ export function appendTihuLaneLog(sessionId: string, error: unknown, note = ''):
   return line
 }
 
+/**
+ * 追加一条**没有异常也要留痕**的诊断（待决策/waterfall 注册）。
+ *
+ * 为什么单独一个函数：桌面端 Electron 里 `ctx.logger` 只进主进程 stdout，用户和排查者都看不到；
+ * 2026-11-10 实机就是因此把「待决策到底挂没挂上、走了哪条分支」全丢了。凡是以后要靠 lane.log
+ * 对照的行，一律走它。
+ * @param note - 可检索的分类（如 `tihu-pending`）。
+ * @param text - 一行原文（不写 stack，不换行）。
+ */
+export function appendTihuLaneNote(note: string, text: string): void {
+  const line = `[${new Date().toISOString()}]${note === '' ? '' : ` note=${note}`} message=${JSON.stringify(String(text ?? '').replace(/\s+/g, ' ').trim())}\n`
+  try {
+    const file = tihuLaneLogPath()
+    mkdirSync(dirname(file), { recursive: true })
+    try {
+      if (statSync(file).size > TIHU_LANE_LOG_MAX_BYTES) writeFileSync(file, '', 'utf8')
+    } catch { /* 文件还不存在 */ }
+    appendFileSync(file, line, 'utf8')
+  } catch { /* 日志失败不影响功能 */ }
+}
+
 /** 屏上一行硬截断（中文正文一行约 18 字；英文异常也不许把整屏吃掉）。 */
 function clipScreenBullet(value: unknown, maxChars: number): string {
   const text = String(value ?? '').replace(/\s+/g, ' ').trim()
@@ -742,6 +763,15 @@ function pathnameOf(req: any): string {
  */
 export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRuntime {
   const log = options.log ?? (() => {})
+  /**
+   * 待决策/注册这类诊断：宿主 logger（桌面端只进主进程 stdout，看不到）**和** lane.log 各写一份。
+   * 2026-11-10 实机教训：`log()` 只进宿主 logger，lane.log 里一个字都没有，于是「没记录」被
+   * 误读成「监听没被调用」。
+   */
+  function pendingLog(line: string): void {
+    try { log(line) } catch { /* 宿主 logger 失败不影响 */ }
+    appendTihuLaneNote('tihu-pending', line)
+  }
   const devices = new Set<TihuDevice>()
   /** 会话 id → 活跃窗口（只有 tihu 注入的那个 turn 的工具调用才受闸门约束）。 */
   const activeSessions = new Map<string, TihuWindow>()
@@ -3942,9 +3972,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /**
    * 新待决策上屏：棋盘立刻刷一帧（黄色问号 + 顶行「●N 等你」），
-   * 停在棋盘/这条任务上的设备直接切到屏 5；同时发一条**不朗读**的气泡。
+   * 台上有统一指挥设备就切到屏 5（由 `reveal` 决定切哪台）；同时发一条**不朗读**的气泡。
+   *
+   * 为什么把「切屏」交给 `reveal`：2026-11-10 实机那张题**真的挂住了 60 秒**（宿主请求
+   * 到点按默认项交回），但设备当时停在别的任务页/回执里，而这里只认「在棋盘上」或
+   * 「已经看着这条任务」的设备 → 屏 5 一帧都没发出去，用户看到的就是「没落屏」。
+   * 待决策抢 60 秒，必须在任何空闲设备上弹出来，还不能只弹一次。
    */
-  function announcePendingDecision(task: TihuTask): void {
+  function announcePendingDecision(task: TihuTask, reveal: () => void): void {
     const question = String(task.question ?? '').trim()
     const text = `在等你定：${question === '' ? '一条确认' : question}`
     for (const device of devices) {
@@ -3952,13 +3987,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       device.send('task.notify', { level: 2, taskId: task.taskId, text, spoken: false } satisfies TaskNotifyPayload)
     }
     refreshBoards()
-    for (const device of devices) {
-      if (!device.unified) continue
-      if (device.receiptTimer !== undefined || device.pendingPick !== undefined || device.pendingVoice !== undefined) continue
-      if (!(device.onBoard === true || device.focusedTask === task.taskId)) continue
-      showDecision(device, task)
-    }
-    log(`tihu decision ask task=${task.taskId} session=${task.sessionIds[0] ?? '-'} question=${JSON.stringify(task.question ?? '')} options=${JSON.stringify(task.options ?? [])} default=${String(task.defaultIndex ?? 0)}`)
+    reveal()
+    pendingLog(`tihu decision ask task=${task.taskId} session=${task.sessionIds[0] ?? '-'} question=${JSON.stringify(task.question ?? '')} options=${JSON.stringify(task.options ?? [])} default=${String(task.defaultIndex ?? 0)}`)
   }
 
   /**
@@ -3969,13 +3999,32 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 谁把它们挂住、把答案当返回值交回去，谁就真的回答了会话。
    *
    * 保底（绝不把人卡死）：
-   *   - 60 秒到点 → 按默认项交回（与托管自动答同一条规则，写 `answeredBy＝设备 N 秒超时`）；
+   *   - 60 秒到点 → 按默认项交回（提问＝首选项，审批＝「拒绝」；写 `answeredBy＝设备 N 秒超时`）；
    *   - 设备全掉线 → 立刻 `next()` 还给电脑端（浏览器卡片照旧，这时标「电脑端作答」）；
    *   - 请求被取消（signal abort）/本插件卸载 → 按默认项了结，返回的 promise 不会永远悬着。
    */
   function holdPendingDecision(decision: PendingDecision, task: TihuTask, request: any, next: () => Promise<any>): Promise<any> {
     return new Promise((resolve, reject) => {
       const timeoutMs = tihuDecisionTimeoutMs()
+      /**
+       * 这一帧「该切到屏 5」的设备集合。只要设备空闲（不在回执/选项/录音里），**不管它现在
+       * 是在棋盘还是在看别的任务**都切过来；已经切过的不重复抢屏（用户按主页回棋盘后不再被拽回）。
+       */
+      const shownOn = new Set<string>()
+      const reveal = (): void => {
+        if (bridge.settled || disposed) return
+        for (const device of devices) {
+          if (!device.unified) continue
+          if (shownOn.has(device.id)) continue
+          if (device.receiptTimer !== undefined || device.pendingPick !== undefined || device.pendingVoice !== undefined) continue
+          // 已经在回答另一道待决策：不许互相抢屏（等那一道了结，这里的 watch 会再试）。
+          if (device.screenStage === '待决策' && device.focusedTask !== task.taskId) continue
+          const from = device.onBoard === true ? 'board' : (device.focusedTask === undefined ? 'idle' : `task:${device.focusedTask}`)
+          showDecision(device, task)
+          shownOn.add(device.id)
+          pendingLog(`tihu decision show task=${task.taskId} device=${device.id} from=${from}`)
+        }
+      }
       // 同一任务已经挂着一道题（并行工具调用的极端情况）：旧的按默认项了结，绝不让两条 waterfall 同时挂着。
       const previous = pendingBridges.get(task.taskId)
       if (previous !== undefined) previous.settle(previous.decision.defaultIndex, '被新问题顶替')
@@ -3994,14 +4043,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           tasks.answer(task.taskId, by, Date.now())
           leaveDecisionScreens(task.taskId)
           refreshBoards()
-          log(`tihu decision answer task=${task.taskId} by=${by} index=${String(index)} option=${JSON.stringify(decision.options[index] ?? '')}`)
+          pendingLog(`tihu decision answer task=${task.taskId} by=${by} index=${String(index)} option=${JSON.stringify(decision.options[index] ?? '')}`)
           resolve(decision.answerOf(index))
         },
         delegate(by: string) {
           if (bridge.settled) return
           bridge.settled = true
           clearPendingBridge(bridge)
-          log(`tihu decision delegate task=${task.taskId} why=${by}`)
+          pendingLog(`tihu decision delegate task=${task.taskId} why=${by}`)
           void Promise.resolve()
             .then(() => next())
             .then(
@@ -4028,15 +4077,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         ...(decision.detail === undefined ? {} : { detail: decision.detail }),
         timeoutMs,
       })
-      announcePendingDecision(task)
+      announcePendingDecision(task, reveal)
       const timer = setTimeout(() => bridge.settle(decision.defaultIndex, decisionTimeoutLabel(timeoutMs)), timeoutMs)
       // **不 unref**：这是一道真的挂着的宿主请求（审批/提问），进程闲着也必须到点把它了结，
       // 否则「60 秒到点按默认项」永远不触发、电脑端那张卡永远等。dispose 会统一清掉它。
       bridge.timer = timer
       const watch = setInterval(() => {
         if (disposed) return
-        if (pendingDeviceOnline()) return
-        bridge.delegate('设备已离线')
+        if (!pendingDeviceOnline()) {
+          bridge.delegate('设备已离线')
+          return
+        }
+        // 设备刚才在回执/朗读/看别的任务：一空闲就补推这一屏（只推一次，见 shownOn）。
+        reveal()
       }, PENDING_OFFLINE_CHECK_MS)
       watch.unref?.()
       bridge.watch = watch
@@ -4050,7 +4103,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           tasks.answer(task.taskId, '请求已取消', Date.now())
           leaveDecisionScreens(task.taskId)
           refreshBoards()
-          log(`tihu decision abort task=${task.taskId}`)
+          pendingLog(`tihu decision abort task=${task.taskId}`)
           resolve(decision.answerOf(decision.defaultIndex))
         }
         bridge.onAbort = onAbort
@@ -4104,35 +4157,48 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   async function handlePendingInteraction(kind: 'approval' | 'question', request: any, next: () => Promise<any>): Promise<any> {
     try {
       const decision = kind === 'approval' ? approvalDecisionOf(request) : questionDecisionOf(request)
-      if (decision === null) return await next()
+      if (decision === null) {
+        // **这条分支以前一个字都不记**：请求里取不到会话/题 id 时直接放行，日志里看起来就像
+        // 监听从没被调用（2026-11-10 实机误判就是这么来的）。现在无论放行都留一行。
+        pendingLog(`tihu decision skip kind=${kind} session=${sessionIdOfPendingRequest(request)} why=no-request`)
+        return await next()
+      }
       const task = tasks.ofSession(decision.sessionId)
       if (task === undefined || task.state === 'archived') {
-        log(`tihu decision skip session=${decision.sessionId} kind=${kind} why=no-task`)
+        pendingLog(`tihu decision skip session=${decision.sessionId} kind=${kind} why=no-task`)
         return await next()
       }
       if (tuoguanOnForSession(decision.sessionId, ctx)) {
-        log(`tihu decision skip task=${task.taskId} kind=${kind} why=tuoguan`)
+        pendingLog(`tihu decision skip task=${task.taskId} kind=${kind} why=tuoguan`)
         return await next()
       }
       if (!pendingDeviceOnline()) {
-        log(`tihu decision skip task=${task.taskId} kind=${kind} why=no-device`)
+        pendingLog(`tihu decision skip task=${task.taskId} kind=${kind} why=no-device`)
         return await next()
       }
       return await holdPendingDecision(decision, task, request, next)
     } catch (error) {
       // 我们这边出任何岔子都不许影响宿主原有链路：原样 next()，让电脑端卡片照旧接管。
-      log(`tihu decision failed kind=${kind} session=${sessionIdOfPendingRequest(request)}: ${(error as Error)?.stack ?? String(error)}`)
+      pendingLog(`tihu decision failed kind=${kind} session=${sessionIdOfPendingRequest(request)}: ${(error as Error)?.stack ?? String(error)}`)
       return await next()
     }
   }
 
-  /** 挂一道 waterfall；宿主没给卸载函数/挂不上都只记日志，不影响原有链路。 */
+  /**
+   * 挂一道 waterfall；宿主没给卸载函数/挂不上都只记日志，不影响原有链路。
+   *
+   * 注册结果**一定要留痕**（`tihu pending waterfall ready …`）：桌面端宿主 logger 看不到，
+   * 这条写进 lane.log，今后实机日志一眼就能确认监听到底挂上没挂上、是不是 prepend。
+   */
   function registerPendingWaterfall(kind: 'approval' | 'question', event: string): (() => void) | undefined {
     try {
-      const off = ctx.on?.(event, (request: any, next: () => Promise<any>) => handlePendingInteraction(kind, request, next), { prepend: true })
-      return typeof off === 'function' ? off as () => void : undefined
+      if (typeof ctx?.on !== 'function') throw new Error('宿主没有 ctx.on（事件总线不可用）')
+      const off = ctx.on(event, (request: any, next: () => Promise<any>) => handlePendingInteraction(kind, request, next), { prepend: true })
+      if (typeof off !== 'function') throw new Error('ctx.on 没有返回卸载函数（接口变了？）')
+      pendingLog(`tihu pending waterfall ready ${event} kind=${kind} prepend=1`)
+      return off as () => void
     } catch (error) {
-      log(`tihu pending waterfall 挂不上 ${event}: ${(error as Error)?.message ?? String(error)}`)
+      pendingLog(`tihu pending waterfall 挂不上 ${event} kind=${kind}: ${(error as Error)?.message ?? String(error)}`)
       return undefined
     }
   }
