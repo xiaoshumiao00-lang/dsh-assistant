@@ -80,6 +80,7 @@ import {
   DONE_KEEP_MS,
   TaskLedger,
   TaskNotifyBus,
+  bestCardMatchOf,
   boardOf,
   capsuleOf,
   chineseIndex,
@@ -97,6 +98,7 @@ import {
   type TihuSessionCandidate,
   type TihuTask,
 } from './task-ledger.ts'
+import { commanderReplyTail, parseCommanderReply, type CommanderReply } from './dispatch-protocol.ts'
 import {
   DONE_NO_REPLY_TEXT,
   RECEIPT_SECONDS,
@@ -734,6 +736,34 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
    * 不设过期时间：用户拍板「一直等到判出结果」，卡只在转正 / 彻底失败 / 卸载时摘掉。
    */
   const pendingCommanderTask = new Map<string, { taskId: string; at: number }>()
+  /**
+   * 已经投给指挥台、正等它回「一行 JSON 结论」的那几句话（FIFO）。
+   *
+   * 2026-11-10 实机事故：指挥会话没有挂载 tihu 的 dispatch 工具，收到判断请求后
+   * 自己把活做了（1 分 34 秒），排队卡永远转不正。现在指挥台**纯文本**只回一行
+   * JSON，lane 收到 assistant/message 或 turn/end 后本地解析并派单；这里记录
+   * 「哪句话在等哪个结论」，turn/end 时用 `askedAt` 卡住旧回复（空回复不许拿上
+   * 一轮的 JSON 冒充结论）。
+   */
+  interface CommanderAsk {
+    key: string
+    text: string
+    /** project＝慢路径判项目（有排队卡）；continuity＝灰区判「接着哪条」。 */
+    kind: 'project' | 'continuity'
+    /** 慢路径的排队卡：转正时 taskId 必须不变。 */
+    taskId?: string
+    /** 灰区已知的项目卡。 */
+    card?: { id: string; name: string; folder?: string }
+    candidates?: readonly TihuSessionCandidate[]
+    confidence?: number
+    via: string
+    askedAt: number
+    /** 这次提问落到指挥会话的第几轮（turn/start 时认领）：多句排队时不会互相抢回复。 */
+    turn?: number
+  }
+  const commanderAsks: CommanderAsk[] = []
+  /** 已经结算过回复的指挥会话 turn（防止同一轮的 turn/end 再顶替下一句等待）。 */
+  const commanderTurnReplied = new Set<number>()
   /**
    * 超时兜底已经派过的一句（按字面归一化后的 key）：指挥会话晚到的同一条 dispatch
    * 不能再建第二条任务。只挡模型这条入口，快路径重复说同一句不受影响。
@@ -2030,6 +2060,34 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         const text = stripToolNoise(blocks.filter((b: any) => b?.type === 'text').map((b: any) => String(b?.text ?? '')).join('\n')).trim()
         if (text !== '') lastAssistant.set(sessionId, { text, at } as ProjectReply)
       }
+      // 指挥台纯文本结论：assistant/message 一到就试着解析（好让排队卡尽早转正），
+      // turn/end 是最后期限——解析不出来也要给终态，绝不停在「等指挥台判断」。
+      if (sessionId === commanderSessionId) {
+        const turnValue = Number((data as any)?.turn)
+        const turn = Number.isFinite(turnValue) && turnValue > 0 ? turnValue : undefined
+        if (type === 'turn/start') {
+          // 多句同时排队时，由 turn/start 把本轮认领给最早那句，回复不会串台。
+          assignCommanderTurn(turn ?? 0)
+        } else if (type === 'assistant/message') {
+          // 只认**这一条消息**的正文：没有文字的（纯工具调用）消息不能拿上一轮的 JSON 顶替。
+          const blocks = Array.isArray((data as any)?.message?.content) ? (data as any).message.content : []
+          const replyText = stripToolNoise(blocks
+            .filter((b: any) => b?.type === 'text')
+            .map((b: any) => String(b?.text ?? ''))
+            .join('\n')).trim()
+          if (replyText !== '') {
+            void settleCommanderReply(replyText, false, turn)
+              .catch((error) => log(`tihu commander reply settle failed: ${(error as Error)?.message ?? String(error)}`))
+          }
+        } else if (type === 'turn/end') {
+          const entry = lastAssistant.get(sessionId)
+          const ask = commanderAskForTurn(turn, true)
+          // 空回复不许拿上一轮的 JSON 冒充结论：只认这一问之后到达的回复。
+          const fresh = entry !== undefined && (ask === undefined || entry.at >= ask.askedAt)
+          void settleCommanderReply(fresh ? entry.text : '', true, turn)
+            .catch((error) => log(`tihu commander reply settle failed: ${(error as Error)?.message ?? String(error)}`))
+        }
+      }
       // ---------- 任务登记簿：事件归一到任务（不看有没有设备绑着） ----------
       const taskOfSession = tasks.ofSession(sessionId)
       if (taskOfSession !== undefined && taskOfSession.source === 'pc') {
@@ -2753,9 +2811,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /** 派单会话（含「接着旧会话」复用）必须是 Computer Use 模式。 */
   const DISPATCH_PRESET = TIHU_COMPUTER_USE_PRESET
-
-  /** 指挥会话的尾巴：告诉模型「你只派单，不动手」。 */
-  const COMMANDER_TAIL = '【指挥会话 · 铁律】你只负责判断「这件事该派给哪个项目」然后用 tihu 的 dispatch 派单；不要自己动手做正文。派完用一句话回主人（例如「已派给青年基金申请书」）。拿不准就只问一句。'
 
   function assistantFolder(): string {
     try { return ensureAssistantHome().dir } catch { return process.env.DSH_ASSISTANT_HOME ?? process.cwd() }
@@ -4439,16 +4494,29 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       `【会话衔接 · 灰区】项目「${card.name}」下最近有这些 Computer Use 会话：`,
       list.length === 0 ? '（还没有 CU 会话）' : list.join('\n'),
       `用户这句话：「${text}」`,
-      '判断它是不是接着其中某条在做（内容连续、指代、时间接近都算），然后**只调一次** tihu dispatch：',
-      '· 接着某条 → dispatch 带 session=<那条的短号>（例如 session="98bb83cb"）',
-      '· 确实是一件新事 → dispatch 带 newSession=true',
-      '不要自己动手做正文；拿不准就 newSession=true。',
+      '判断它是不是接着其中某条在做（内容连续、指代、时间接近都算），然后**只输出一行 JSON**：',
+      `{"project":"${card.name}","session":"append|new","append_to":"<那条的短号，新建留空>"}`,
+      '· 接着某条 → "append"，append_to 写那条的短号；确实是一件新事 → "new"，append_to 留空。',
+      '不要做正文、不要解释、不要调用任何工具；除这一行 JSON 外不要输出任何字符。拿不准就 "new"。',
     ].join('\n')
     const sent = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: tail }])
     if (!sent.ok) {
       await showSessionClarify(device, text, card, { ...decision }, candidates, via)
       return false
     }
+    // 先登记再等回复：turn/start 可能抢在 promptSession 返回之后立刻到。
+    // （灰区一次只处理一句：旧的连续追问等待先作废。）
+    dropContinuityAsks()
+    pushCommanderAsk({
+      key: dispatchKeyOf(text),
+      text,
+      kind: 'continuity',
+      card,
+      candidates,
+      confidence: decision.confidence,
+      via,
+      askedAt: Date.now(),
+    })
     armGrayFallback(device, text, card, decision, candidates, via)
     return true
   }
@@ -4462,11 +4530,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     candidates: readonly TihuSessionCandidate[],
     via: string,
   ): void {
-    clearGrayFallback()
+    // 只清上一条计时器；刚登记的这句等待要留着（它的 turn 马上就到）。
+    clearGrayFallback({ keepAsks: true })
     const waitMs = tihuGrayCommanderMs()
     const timer = setTimeout(() => {
       grayFallback = undefined
       if (disposed) return
+      // 计时器到点：灰区的纯文本等待作废，晚到的指挥台回复不许再派一次。
+      dropCommanderAsk(dispatchKeyOf(text))
       try {
         appendTihuLaneLog('-', new Error(`灰区衔接超时：${Math.round(waitMs / 1000)} 秒内指挥台没有派出「${taskTitleOf(text, 24)}」`), 'continuity-gray-timeout')
       } catch { /* 日志失败不影响兜底 */ }
@@ -4478,10 +4549,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     grayFallback = { text, key: dispatchKeyOf(text), card, confidence: decision.confidence, via, timer }
   }
 
-  function clearGrayFallback(): void {
+  function clearGrayFallback(options: { keepAsks?: boolean } = {}): void {
     if (grayFallback === undefined) return
     clearTimeout(grayFallback.timer)
     grayFallback = undefined
+    // 灰区已经有结论（派单/追加/澄清）：这支纯文本等待一并作废。
+    if (options.keepAsks !== true) dropContinuityAsks()
   }
 
   /** 清掉屏上澄清（所有设备）与该计时器。 */
@@ -4712,7 +4785,213 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     for (const [key, hit] of pendingCommanderTask) {
       if (hit.taskId === taskId) pendingCommanderTask.delete(key)
     }
+    // 旧式工具派单（control.dispatch）也能把这张卡转正：对应的纯文本等待一并摘掉，
+    // 否则指挥台随后的收尾话会被当成「没给出结论」，再派第二遍。
+    dropCommanderAsksForTask(taskId)
     if (commanderWait?.taskId === taskId) stopCommanderWait()
+  }
+
+  /* ---------- 指挥台纯文本结论（2026-11-10：不依赖工具挂载） ---------- */
+
+  /** 记一句「在等指挥台回 JSON」的话（同一句只留一条，新的替换旧的）。 */
+  function pushCommanderAsk(ask: CommanderAsk): void {
+    const at = commanderAsks.findIndex((item) => item.key === ask.key)
+    if (at >= 0) commanderAsks.splice(at, 1)
+    commanderAsks.push(ask)
+  }
+
+  /** 摘掉某一句话的等待（投递失败 / 灰区已经按澄清处理 / 新的一句顶替）。 */
+  function dropCommanderAsk(key: string): void {
+    for (let i = commanderAsks.length - 1; i >= 0; i -= 1) {
+      if (commanderAsks[i].key === key) commanderAsks.splice(i, 1)
+    }
+  }
+
+  /** 排队卡已经转正（含旧式工具 dispatch）：不再等这句的文本结论。 */
+  function dropCommanderAsksForTask(taskId: string): void {
+    for (let i = commanderAsks.length - 1; i >= 0; i -= 1) {
+      if (commanderAsks[i].taskId === taskId) commanderAsks.splice(i, 1)
+    }
+  }
+
+  /** 灰区已经走了澄清/计时器：纯文本等待作废（避免晚到回复再派一次）。 */
+  function dropContinuityAsks(): void {
+    for (let i = commanderAsks.length - 1; i >= 0; i -= 1) {
+      if (commanderAsks[i].kind === 'continuity') commanderAsks.splice(i, 1)
+    }
+  }
+
+  /** 日志里的一行原文（压空白 + 截断，避免把整段回复写进 lane.log）。 */
+  function clipForLog(value: unknown, maxChars = 80): string {
+    const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+    const chars = [...text]
+    return chars.length > maxChars ? `${chars.slice(0, maxChars - 1).join('')}…` : text
+  }
+
+  /**
+   * 指挥台提示里列出的「最近项目会话」（短号 + 标题）：append/append_to 才有据可依。
+   * 每张卡最多 3 条、总共最多 8 行；列表走 60 秒缓存，不会为每次派单多打宿主。
+   */
+  async function commanderSessionHints(): Promise<string[]> {
+    const hints: string[] = []
+    for (const card of projectCards() ?? []) {
+      if (hints.length >= 8) break
+      let candidates: TihuSessionCandidate[] = []
+      try { candidates = await projectCuSessionsOf(card) } catch { candidates = [] }
+      for (const candidate of candidates.slice(0, 3)) {
+        if (hints.length >= 8) break
+        const short = candidate.sessionId.replace(/^session-/, '').slice(0, 8)
+        const title = candidate.title.trim() === '' ? '未命名会话' : taskTitleOf(candidate.title, 14)
+        hints.push(`- ${card.name}: ${short} ${title}`)
+      }
+    }
+    return hints
+  }
+
+  /** 项目名 → 已知项目卡（找不到就 undefined，由调用方落个人助手；绝不按幻觉名字建新卡）。 */
+  function cardForCommanderProject(project: string): { id: string; name: string; folder?: string } | undefined {
+    const key = String(project ?? '').trim()
+    if (key === '') return undefined
+    if (/个人助手|assistant/i.test(key)) return ASSISTANT_CARD
+    const cards = projectCards() ?? []
+    const lower = key.toLowerCase()
+    return cards.find((card) => card.id === key || card.name === key)
+      ?? cards.find((card) => card.name.toLowerCase().includes(lower) || lower.includes(card.name.toLowerCase()))
+      ?? cards.find((card) => String(card.folder ?? '').toLowerCase().includes(lower))
+  }
+
+  /** 这一轮（turn）对应哪一句等待；同一轮已经被 assistant/message 结算过就返回 undefined。 */
+  function commanderAskForTurn(turn: number | undefined, final = false): CommanderAsk | undefined {
+    if (turn !== undefined) {
+      const hit = commanderAsks.find((ask) => ask.turn === turn)
+      if (hit !== undefined) return hit
+      // 这一轮的回复已经结算过（turn/end 只是收尾，或回复里没带可解析的结论）：
+      // 绝不能让下一句等待被这一轮的文本顶替。
+      if (final && commanderTurnReplied.has(turn)) return undefined
+      // 回复里没有这一轮的认领记录（steer 进已在跑的 turn / turn/start 没看到）：
+      // 只有一句没认领时才敢认。
+      const unassigned = commanderAsks.filter((ask) => ask.turn === undefined)
+      return unassigned.length === 1 ? unassigned[0] : undefined
+    }
+    // 拿不到 turn（老宿主/测试桩）：只有一句在等时才敢认，多句宁可等它下一轮。
+    return commanderAsks.length === 1 ? commanderAsks[0] : undefined
+  }
+
+  /** 指挥会话 turn/start：把本轮认领给最早一句还没认领的等待。 */
+  function assignCommanderTurn(turn: number): void {
+    if (!Number.isFinite(turn) || turn <= 0) return
+    const ask = commanderAsks.find((item) => item.turn === undefined)
+    if (ask !== undefined) ask.turn = turn
+  }
+
+  /**
+   * 指挥台回复到了（assistant/message 抢先解析，turn/end 是最后期限）。
+   *
+   * - 解析出可用结论 → 立刻执行（续到 append_to 指定会话 / 同项目新建 / 个人助手）；
+   * - `final` 且解析失败或回复为空 → 退回 routeQuick / 最佳卡，给排队卡一个终态，
+   *   绝不停在「等指挥台判断」。
+   */
+  async function settleCommanderReply(raw: string, final: boolean, turn?: number): Promise<void> {
+    const ask = commanderAskForTurn(turn, final)
+    if (ask === undefined) return
+    if (turn !== undefined) {
+      commanderTurnReplied.add(turn)
+      if (commanderTurnReplied.size > 64) {
+        // 只留最近一段（turn 单调递增）：清掉最旧的一半，避免长期运行无限增长。
+        const keep = [...commanderTurnReplied].sort((a, b) => a - b).slice(-32)
+        commanderTurnReplied.clear()
+        for (const value of keep) commanderTurnReplied.add(value)
+      }
+    }
+    const parsed = parseCommanderReply(raw)
+    if (parsed === undefined) {
+      if (!final) return
+      commanderAsks.splice(commanderAsks.indexOf(ask), 1)
+      await fallbackCommanderReply(ask, raw)
+      return
+    }
+    commanderAsks.splice(commanderAsks.indexOf(ask), 1)
+    await applyCommanderReply(ask, parsed, raw)
+  }
+
+  /** 按指挥台的 JSON 结论执行派单（纯文本链路；taskId 复用排队卡）。 */
+  async function applyCommanderReply(ask: CommanderAsk, reply: CommanderReply, raw: string): Promise<void> {
+    stopCommanderWait()
+    const device = [...devices].find((item) => item.unified)
+    const card = ask.kind === 'continuity' && ask.card !== undefined ? ask.card : cardForCommanderProject(reply.project)
+    const target = card ?? ASSISTANT_CARD
+    const meta: DispatchMeta = {
+      via: ask.via,
+      continuity: reply.session,
+      confidence: ask.confidence ?? 1,
+      clarify: 'no',
+      ...(ask.taskId === undefined ? {} : { reuseTaskId: ask.taskId }),
+    }
+    const line = `指挥台 JSON 结论 原文=${JSON.stringify(clipForLog(raw))} 项目=${reply.project || '(未点名)'} 落点=${target.name} 会话=${reply.session}${reply.appendTo === '' ? '' : ` 续=${reply.appendTo}`}`
+    try { appendTihuLaneLog(commanderSessionId ?? '-', new Error(line), 'commander-json') } catch { /* 日志失败不影响派单 */ }
+    log(`tihu ${line}`)
+    if (reply.session === 'append') {
+      let candidates: TihuSessionCandidate[] = []
+      try { candidates = await projectCuSessionsOf(target) } catch { candidates = [] }
+      const hit = findContinuityTarget(candidates, reply.appendTo)
+      if (hit !== undefined) {
+        const task = await appendToSession(device, ask.text, target, hit, { ...meta, continuity: 'append' })
+        if (task !== undefined) return
+        // appendToSession 失败已经出错误屏并撤掉排队卡：不再二次派单（避免一句两卡）。
+        return
+      }
+      try {
+        appendTihuLaneLog('-', new Error(`指挥台说续 ${reply.appendTo}，但项目「${target.name}」下没有这条 CU 会话；按新建派出`), 'commander-append-miss')
+      } catch { /* 日志失败不影响派单 */ }
+      log(`tihu commander append miss target=${reply.appendTo} project=${target.id}`)
+    }
+    await dispatchToCard(device, ask.text, target, undefined, { ...meta, continuity: 'new' })
+  }
+
+  /**
+   * 解析失败 / 回复为空：按 routeQuick → 最佳卡 → 个人助手依次兜底，立刻给终态。
+   *
+   * 灰区（continuity）不走这里：那条没有排队卡，仍由原来的澄清/计时器收尾。
+   */
+  async function fallbackCommanderReply(ask: CommanderAsk, raw: string): Promise<void> {
+    if (ask.kind === 'continuity') {
+      log(`tihu commander continuity reply unusable text=${JSON.stringify(clipForLog(raw))}`)
+      return
+    }
+    stopCommanderWait()
+    const reason = String(raw ?? '').trim() === '' ? '回复为空' : '回复里没有可用 JSON 结论'
+    try {
+      appendTihuLaneLog('-', new Error(`${reason}（${clipForLog(raw) || '空'}），退回 routeQuick/最佳卡`), 'commander-fallback')
+    } catch { /* 日志失败不影响兜底 */ }
+    log(`tihu commander ${reason} -> routeQuick/best-card fallback text=${JSON.stringify(ask.text)}`)
+    const cards = projectCards() ?? []
+    const route = routeQuick({ text: ask.text, cards, tasks: tasks.list() })
+    let card: { id: string; name: string; folder?: string } | undefined
+    let via = 'commander-fallback'
+    if (route.kind === 'card') {
+      card = route.card
+      via = 'fallback-route'
+    } else if (route.kind === 'daily') {
+      card = ASSISTANT_CARD
+      via = 'fallback-daily'
+    } else if (route.kind === 'append') {
+      card = { id: route.task.projectId, name: route.task.projectName, ...(route.task.folder === undefined ? {} : { folder: route.task.folder }) }
+      via = 'fallback-append'
+    } else if (route.kind === 'ambiguous') {
+      card = route.candidates[0]
+      via = 'fallback-best'
+    }
+    if (card === undefined) card = bestCardMatchOf(ask.text, cards)
+    if (card === undefined) card = ASSISTANT_CARD
+    const device = [...devices].find((item) => item.unified)
+    const task = await dispatchToCard(device, ask.text, card, undefined, {
+      via,
+      continuity: 'new',
+      clarify: 'no',
+      reuseTaskId: ask.taskId,
+      note: '指挥台没给出结论，先按最佳卡派出',
+    })
+    if (task !== undefined) log(`tihu commander fallback dispatched task=${task.taskId} project=${card.id} via=${via}`)
   }
 
   /** 停掉「已等 N 秒」的秒表（派单成功 / 新一句话 / 卸载时调用；排队卡本身不动）。 */
@@ -4838,12 +5117,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     showInputError(device, error, '指挥台没接住，个人助手也没派出去，请重说')
   }
 
-  /** 慢路径：交给指挥会话的模型判项目（它再调 tihu dispatch）；投递后**无限等待**。 */
+  /**
+   * 慢路径：交给指挥会话判项目。2026-11-10 起**纯文本**——指挥台只回一行 JSON，
+   * lane 本地解析后派单（不要求指挥会话说挂任何工具）。
+   *
+   * 投递后不设超时（用户拍板「一直等到判出结果」）；但 turn/end 一到就必须有终态：
+   * 解析不出来按 routeQuick/最佳卡兜底，绝不把排队卡停在「等指挥台判断」。
+   */
   async function askCommander(device: TihuDevice, text: string): Promise<void> {
     device.unified = true
     stopCommanderWait()
     // 先上棋盘：排队卡在投递之前就存在（用户要求：立刻计入「●N 排队」）。
     const pending = createCommanderPendingTask(text)
+    const key = dispatchKeyOf(text)
     try {
       const commander = await ensureCommanderSession()
       if (commander === undefined) {
@@ -4851,13 +5137,27 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         return
       }
       beginCommanderWait(device, text, pending.taskId)
-      const sent = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: COMMANDER_TAIL }])
+      // 先登记再投递：assistant/message 可能抢在 prompt() 返回前到达。
+      pushCommanderAsk({
+        key,
+        text,
+        kind: 'project',
+        taskId: pending.taskId,
+        via: 'commander',
+        askedAt: Date.now(),
+      })
+      // 最近的项目会话清单：让「append / append_to」有据可依（最多 8 行，不塞满提示词）。
+      let hints: string[] = []
+      try { hints = await commanderSessionHints() } catch { hints = [] }
+      const sent = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: commanderReplyTail(hints) }])
       if (!sent.ok) {
         // 只有投递本身出错才兜底；投递成功就等，没有计时器。
+        dropCommanderAsk(key)
         await fallbackCommanderDispatch(device, text, pending.taskId, sent.error, 'prompt')
       }
     } catch (error) {
       // 任何意外异常也要有终态（排队卡撤掉 + 错误屏），不能让设备静默停在等待。
+      dropCommanderAsk(key)
       await fallbackCommanderDispatch(device, text, pending.taskId, error, 'exception')
     }
   }
@@ -5271,6 +5571,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       disposed = true
       stopCommanderWait()
       pendingCommanderTask.clear()
+      commanderAsks.length = 0
+      commanderTurnReplied.clear()
       clearGrayFallback()
       clearClarifyPrompt()
       fallbackDispatch = undefined
