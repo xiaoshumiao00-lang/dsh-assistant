@@ -1,0 +1,13 @@
+# ESP32-S3-BOX-3B 16 MB flash layout (ASCII only: parttool.py reads this file
+# with the Windows locale encoding, so keep comments free of non-ASCII text).
+#   0x8000  partition table (IDF default offset)
+#   0x9000  nvs        24 KB
+#   0xf000  phy_init    4 KB
+#   0x10000 factory     8 MB   (firmware: BSP + LVGL + CJK fonts)
+#   0x810000 storage    2 MB   (SPIFFS for fonts/cache/screenshots)
+#   after 0xA10000: ~5.9 MB unallocated, room for OTA/data partitions later
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x800000,
+storage,  data, spiffs,  0x810000, 0x200000,
