@@ -40,6 +40,40 @@ static const char *TAG = "touch";
 #define TOUCH_GT911_STATUS_REG 0x814E
 #define TOUCH_GT911_POINT1_REG 0x8150
 
+/*
+ * INT 边沿探针：GT911 每检测到一次触摸都会把 INT 拉低（电平由 BSP 配成下降沿中断）。
+ * 数一下这条线上的下降沿，就能把两种「点不动」彻底分开：
+ *   - 边沿计数一直 0 → 控制器压根没检测到手指（面板/供电/芯片问题，软件无解）；
+ *   - 边沿在涨但 0x814E 读不到数据 → 芯片报了，是我们的读取时序/寄存器问题。
+ * 只装一个 ISR 计数，不参与点击逻辑，量产也不会影响行为。
+ */
+static volatile uint32_t s_int_edges;
+
+static void IRAM_ATTR touch_int_isr(void *arg)
+{
+    (void)arg;
+    s_int_edges++;
+}
+
+static void touch_int_probe_start(void)
+{
+    esp_err_t err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "INT 探针：gpio_install_isr_service 失败 %s", esp_err_to_name(err));
+        return;
+    }
+    err = gpio_set_intr_type(BSP_LCD_TOUCH_INT, GPIO_INTR_NEGEDGE);
+    if (err == ESP_OK) {
+        err = gpio_isr_handler_add(BSP_LCD_TOUCH_INT, touch_int_isr, NULL);
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "INT 探针已挂：GPIO%d 下降沿计数（每 5 秒一行日志里报）",
+                 (int)BSP_LCD_TOUCH_INT);
+    } else {
+        ESP_LOGW(TAG, "INT 探针没挂上：%s", esp_err_to_name(err));
+    }
+}
+
 static esp_lcd_touch_handle_t s_tp;
 static lv_indev_t *s_indev;
 static bool s_ready;
@@ -128,8 +162,25 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
         err = esp_lcd_panel_io_rx_param(s_tp->io, TOUCH_GT911_POINT1_REG, point,
                                         sizeof(point));
         if (err == ESP_OK) {
-            nx = point[1] | (point[2] << 8);
-            ny = point[3] | (point[4] << 8);
+            /* 原始字节一并打出来：GT911 的坐标可能是大端，也需要看有没有移位。
+             * 解出来 (x,y) 落在 0..319/0..239 之外时，就靠这 8 个字节定位。 */
+            ESP_LOGI(TAG, "GT911 原始点：%02X %02X %02X %02X %02X %02X %02X %02X（状态=0x%02X）",
+                     point[0], point[1], point[2], point[3], point[4], point[5],
+                     point[6], point[7], (unsigned)status);
+            uint16_t x_le = (uint16_t)(point[1] | (point[2] << 8));
+            uint16_t x_be = (uint16_t)((point[1] << 8) | point[2]);
+            uint16_t y_le = (uint16_t)(point[3] | (point[4] << 8));
+            uint16_t y_be = (uint16_t)((point[3] << 8) | point[4]);
+            /* 哪个端序落在 320×240 里就用哪个，两个都超范围就按小端（BSP 驱动的约定）。 */
+            bool le_ok = x_le < 320 && y_le < 240;
+            bool be_ok = x_be < 320 && y_be < 240;
+            if (!le_ok && be_ok) {
+                nx = x_be;
+                ny = y_be;
+            } else {
+                nx = x_le;
+                ny = y_le;
+            }
             pressed = true;
         } else {
             s_read_fail++;
@@ -148,10 +199,11 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     if (now - s_last_report_ms >= 5000) {
         s_last_report_ms = now;
         ESP_LOGI(TAG, "轮询 %u 次（成功 %u 失败 %u），报点 %u 次，状态峰值=0x%02X，"
-                      "INT=%d，最近=%d,%d",
+                      "INT边沿=%u INT电平=%d，最近=%d,%d",
                  (unsigned)(s_read_ok + s_read_fail), (unsigned)s_read_ok,
                  (unsigned)s_read_fail, (unsigned)s_press_count,
-                 (unsigned)s_status_peak, gpio_get_level(BSP_LCD_TOUCH_INT),
+                 (unsigned)s_status_peak, (unsigned)s_int_edges,
+                 gpio_get_level(BSP_LCD_TOUCH_INT),
                  s_last_x, s_last_y);
     }
 
@@ -306,6 +358,7 @@ bool tihu_touch_init(lv_display_t *disp)
     lv_indev_set_read_cb(s_indev, touch_read_cb);
     lv_indev_set_display(s_indev, disp);
     bsp_display_unlock();
+    touch_int_probe_start();
     s_ready = true;
     ESP_LOGI(TAG, "触摸就绪：indev=%p disp=%p（自注册 read 回调；读失败只丢帧不重启）",
              (void *)s_indev, (void *)disp);
