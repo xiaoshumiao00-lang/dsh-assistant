@@ -13,6 +13,11 @@
 
 /* 对外 */
 void tihu_ui_init(void);
+/* boot 后的静态首页：不依赖宿主，标题「鹈鹕 BOX-3B」+ 状态行 + 底部两键。 */
+void tihu_ui_show_boot(const char *status);
+/* flush 回调被调用的累计次数（探针在 tihu_ui_init 里挂到 LVGL display 上）。 */
+unsigned tihu_ui_flush_count(void);
+bool tihu_ui_ready(void);
 void tihu_ui_show_frame(const tihu_screen_frame_t *frame);
 void tihu_ui_set_connection(bool connected, const char *text);
 void tihu_ui_set_listening(bool on, const char *prompt);

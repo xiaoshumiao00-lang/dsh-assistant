@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "config.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "bsp/esp-box-3.h"
@@ -55,6 +56,33 @@ static char s_conn_text[32] = "连接中";
 static bool s_connected;
 
 static void hide_alert(void *arg);
+
+/* ------------------------------ 显示探针 ------------------------------ */
+
+/*
+ * 只靠串口判断「屏幕到底有没有在刷」：把 LVGL 的 flush 回调包一层，统计调用次数
+ * 和像素面积，再原样转发给 BSP 的回调（不碰 display 的 user_data）。
+ */
+static volatile unsigned s_flush_count;
+static lv_display_flush_cb_t s_raw_flush;
+
+static void flush_probe_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
+{
+    s_flush_count++;
+    if (s_raw_flush != NULL) {
+        s_raw_flush(disp, area, px_map);
+    }
+}
+
+unsigned tihu_ui_flush_count(void)
+{
+    return s_flush_count;
+}
+
+bool tihu_ui_ready(void)
+{
+    return s_ready;
+}
 
 /* ------------------------------ 共用样式 ------------------------------ */
 
@@ -157,11 +185,47 @@ bool tihu_ui_connected(void)
 
 void tihu_ui_init(void)
 {
-    lv_display_t *disp = bsp_display_start();
+    /*
+     * 不用 bsp_display_start()：它内部用 ESP_LVGL_PORT_INIT_CONFIG() 的默认值
+     * （LVGL 任务栈 7 KB）。7 KB 画中文 + 一次性建三屏很容易踩到栈顶，这里把
+     * LVGL 任务栈提到 12 KB、tick 周期锁 5 ms，再把返回值/分辨率打进日志。
+     */
+    bsp_display_cfg_t disp_cfg = {
+        .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
+        .buffer_size = BSP_LCD_H_RES * CONFIG_BSP_LCD_DRAW_BUF_HEIGHT,
+        .double_buffer =
+#if CONFIG_BSP_LCD_DRAW_BUF_DOUBLE
+        1,
+#else
+        0,
+#endif
+        .flags = {
+            .buff_dma = true,
+            .buff_spiram = false,
+        },
+    };
+    disp_cfg.lvgl_port_cfg.task_stack = 12 * 1024;
+    disp_cfg.lvgl_port_cfg.timer_period_ms = 5;
+    disp_cfg.lvgl_port_cfg.task_max_sleep_ms = 500;
+
+    lv_display_t *disp = bsp_display_start_with_config(&disp_cfg);
     if (disp == NULL) {
         ESP_LOGE(TAG, "bsp_display_start 失败：检查 BSP/PSRAM 配置");
         return;
     }
+    /* 探针要尽早挂：后面每一帧的 flush 都记进计数。 */
+    s_raw_flush = lv_display_get_flush_cb(disp);
+    lv_display_set_flush_cb(disp, flush_probe_cb);
+    ESP_LOGI(TAG, "bsp_display_start 返回 %p：%dx%d，color=%d，draw buf=%d px，dbl=%d",
+             (void *)disp,
+             (int)lv_display_get_horizontal_resolution(disp),
+             (int)lv_display_get_vertical_resolution(disp),
+             (int)lv_display_get_color_format(disp),
+             (int)disp_cfg.buffer_size, (int)disp_cfg.double_buffer);
+    ESP_LOGI(TAG, "LVGL 任务：栈 %d B / 优先级 %d / tick %d ms；flush 探针已挂（原回调 %p）",
+             12000, (int)disp_cfg.lvgl_port_cfg.task_priority,
+             (int)disp_cfg.lvgl_port_cfg.timer_period_ms, (void *)s_raw_flush);
+
     bsp_display_lock(0);
 
     lv_obj_t *scr = TIHU_ACTIVE_SCREEN();
@@ -210,13 +274,20 @@ void tihu_ui_init(void)
     lv_obj_set_user_data(s_listen, listen_label);
 
     /* 初始屏：连接中。等第一帧 screen.frame 到达后自动切棋盘。 */
+    /* 初始屏：静态首页（不依赖宿主）。等第一帧 screen.frame 到达后自动切棋盘。 */
     tihu_screen_frame_t boot = {0};
-    snprintf(boot.stage, sizeof(boot.stage), "连接");
-    snprintf(boot.title, sizeof(boot.title), "鹈鹕 BOX-3B");
-    snprintf(boot.bullets[0], sizeof(boot.bullets[0]), "正在连接 Wi-Fi…");
-    boot.bullet_count = 1;
+    snprintf(boot.stage, sizeof(boot.stage), "鹈鹕");
+    snprintf(boot.title, sizeof(boot.title), "%s", TIHU_DEVICE_NAME);
+    snprintf(boot.bullets[0], sizeof(boot.bullets[0]), "连接中…");
+    snprintf(boot.bullets[1], sizeof(boot.bullets[1]), "按住 CONFIG 说话");
+    boot.bullet_count = 2;
     snprintf(boot.tone, sizeof(boot.tone), "busy");
     snprintf(boot.mode, sizeof(boot.mode), "status");
+    snprintf(boot.actions[0].id, sizeof(boot.actions[0].id), "home");
+    snprintf(boot.actions[0].label, sizeof(boot.actions[0].label), "主页");
+    snprintf(boot.actions[1].id, sizeof(boot.actions[1].id), "stop");
+    snprintf(boot.actions[1].label, sizeof(boot.actions[1].label), "停止");
+    boot.action_count = 2;
     tihu_ui_progress_update(s_progress, &boot);
 
     lv_obj_add_flag(s_board, LV_OBJ_FLAG_HIDDEN);
@@ -231,10 +302,43 @@ void tihu_ui_init(void)
     };
     esp_timer_create(&alert_args, &s_alert_timer);
 
+    /* 首帧不在这里刷：tihu_ui_init 跑在 main 任务（8 KB 栈）里，lv_refr_now 会在
+     * 调用者栈上做整屏渲染，实测直接把 main 任务栈踩爆。首帧交给 tihu_ui_task
+     * （12 KB 栈）在循环第一次迭代同步刷出。 */
     bsp_display_unlock();
     bsp_display_backlight_on();
     s_ready = true;
-    ESP_LOGI(TAG, "UI 就绪：320x240，三屏已创建");
+    ESP_LOGI(TAG, "UI 就绪：320x240，三屏已创建；首帧交给 UI 任务同步刷出（当前 flush=%u）",
+             tihu_ui_flush_count());
+}
+
+void tihu_ui_show_boot(const char *status)
+{
+    if (!s_ready) {
+        return;
+    }
+    tihu_screen_frame_t boot = {0};
+    snprintf(boot.stage, sizeof(boot.stage), "鹈鹕");
+    snprintf(boot.title, sizeof(boot.title), "%s", TIHU_DEVICE_NAME);
+    snprintf(boot.bullets[0], sizeof(boot.bullets[0]), "%s",
+             status != NULL && status[0] != '\0' ? status : "连接中…");
+    snprintf(boot.bullets[1], sizeof(boot.bullets[1]), "按住 CONFIG 说话");
+    boot.bullet_count = 2;
+    snprintf(boot.tone, sizeof(boot.tone), "busy");
+    snprintf(boot.mode, sizeof(boot.mode), "status");
+    snprintf(boot.actions[0].id, sizeof(boot.actions[0].id), "home");
+    snprintf(boot.actions[0].label, sizeof(boot.actions[0].label), "主页");
+    snprintf(boot.actions[1].id, sizeof(boot.actions[1].id), "stop");
+    snprintf(boot.actions[1].label, sizeof(boot.actions[1].label), "停止");
+    boot.action_count = 2;
+
+    bsp_display_lock(0);
+    lv_obj_add_flag(s_board, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_done, LV_OBJ_FLAG_HIDDEN);
+    tihu_ui_progress_update(s_progress, &boot);
+    lv_obj_clear_flag(s_progress, LV_OBJ_FLAG_HIDDEN);
+    s_current = SCREEN_PROGRESS;
+    bsp_display_unlock();
 }
 
 void tihu_ui_show_frame(const tihu_screen_frame_t *frame)

@@ -14,6 +14,7 @@
 
 #include "config.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -408,6 +409,11 @@ static void start_ws(void)
             .network_timeout_ms = 10000,
             .buffer_size = 16384,
             .disable_auto_reconnect = false,
+            /*
+             * 默认 4 KB 栈太紧：这个任务里要跑我们自己注册的事件回调
+             * （解析 JSON → 改 LVGL → 回一条 ack），实测 4 KB 会在首帧后踩栈。
+             */
+            .task_stack = 8192,
         };
         s_ws = esp_websocket_client_init(&cfg);
         if (s_ws == NULL) {
@@ -429,10 +435,166 @@ static void start_ws(void)
 
 /* ------------------------------ Wi-Fi ------------------------------ */
 
+/*
+ * 连不上时只看这三类日志就能定位：
+ *   1. WIFI_EVENT_STA_DISCONNECTED 的 reason 码 + 中文解释；
+ *   2. 15 秒还没拿到 IP 就重扫一次，把目标 SSID 命中没命中、信道、加密方式、RSSI 打出来；
+ *   3. 从不断线：失败按 3 s / 6 s / 12 s 退避重试，之后每 15 s 重扫重连一次。
+ */
+
+static bool s_wifi_got_ip;
+static int s_wifi_retry_count;
+static esp_timer_handle_t s_wifi_watchdog;
+static TaskHandle_t s_wifi_probe_task;
+
+static const char *wifi_reason_cn(uint8_t reason)
+{
+    switch (reason) {
+    case WIFI_REASON_AUTH_EXPIRE:
+        return "认证超时（密码或加密方式不匹配）";
+    case WIFI_REASON_AUTH_LEAVE:
+        return "AP 主动断开（认证阶段）";
+    case WIFI_REASON_ASSOC_EXPIRE:
+        return "关联超时（信号弱/AP 忙）";
+    case WIFI_REASON_ASSOC_TOOMANY:
+        return "AP 关联数已满";
+    case WIFI_REASON_NOT_AUTHED:
+        return "未认证就收到数据（AP 要求重新认证）";
+    case WIFI_REASON_NOT_ASSOCED:
+        return "未关联就收到数据";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        return "四次握手超时＝密码不对（也见于 PMF/WPA3 混用）";
+    case WIFI_REASON_AUTH_FAIL:
+        return "AP 拒绝认证（密码错；热点刚开机/STA 表满/刚踢过人时也会瞬时拒绝——下一次重试能通就不是密码问题）";
+    case WIFI_REASON_ASSOC_FAIL:
+        return "关联被拒（加密方式不兼容）";
+    case WIFI_REASON_CONNECTION_FAIL:
+        return "连接失败（AP 拒绝或还没准备好；重试能通属瞬时拒绝）";
+    case WIFI_REASON_NO_AP_FOUND:
+        return "扫不到这个 SSID（不在 2.4G / 隐藏 / 已关机）";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+        return "扫到 SSID 但加密不兼容（可能是 WPA3 专用或 WPA2/WPA3 混合）";
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+        return "扫到 SSID 但低于 authmode 阈值（不是 WPA2-PSK）";
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:
+        return "扫到 SSID 但信号太弱";
+    case WIFI_REASON_802_1X_AUTH_FAILED:
+        return "802.1X 认证失败（这是企业网，不是 WPA2 个人版）";
+    case WIFI_REASON_BEACON_TIMEOUT:
+        return "丢 beacon（信号中断）";
+    case WIFI_REASON_STA_LEAVING:
+        return "设备主动离开（本地断开）";
+    default:
+        return "未归类的 reason，按上面的码去对 esp_wifi_types.h";
+    }
+}
+
+static const char *wifi_auth_name(wifi_auth_mode_t auth)
+{
+    switch (auth) {
+    case WIFI_AUTH_OPEN: return "OPEN";
+    case WIFI_AUTH_WEP: return "WEP";
+    case WIFI_AUTH_WPA_PSK: return "WPA-PSK";
+    case WIFI_AUTH_WPA2_PSK: return "WPA2-PSK";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2-PSK";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-ENTERPRISE";
+    case WIFI_AUTH_WPA3_PSK: return "WPA3-SAE";
+    case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3-SAE 混合";
+    case WIFI_AUTH_WAPI_PSK: return "WAPI-PSK";
+    default: return "未知";
+    }
+}
+
+/** 重扫一次并把目标 SSID 的可见性/信道/加密/RSSI 打进日志。只探测，不改连接参数。 */
+static void wifi_scan_and_report(void)
+{
+    wifi_scan_config_t scan_cfg = {
+        .ssid = (uint8_t *)TIHU_WIFI_SSID,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = true,
+    };
+    ESP_LOGI(TAG, "Wi-Fi 重扫：找 SSID=\"%s\"…", TIHU_WIFI_SSID);
+    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "扫描启动失败: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint16_t ap_num = 0;
+    esp_wifi_scan_get_ap_num(&ap_num);
+    if (ap_num > 8) {
+        ap_num = 8;
+    }
+    wifi_ap_record_t *aps = calloc(ap_num > 0 ? ap_num : 1, sizeof(*aps));
+    if (aps == NULL) {
+        ESP_LOGW(TAG, "扫描结果分配失败");
+        return;
+    }
+    uint16_t got = ap_num;
+    if (got > 0) {
+        esp_wifi_scan_get_ap_records(&got, aps);
+    }
+    bool found = false;
+    for (uint16_t i = 0; i < got; i++) {
+        ESP_LOGI(TAG, "  AP[%u] ssid=\"%s\" ch=%d rssi=%d auth=%s",
+                 (unsigned)i, (char *)aps[i].ssid, aps[i].primary,
+                 aps[i].rssi, wifi_auth_name(aps[i].authmode));
+        if (strcmp((const char *)aps[i].ssid, TIHU_WIFI_SSID) == 0) {
+            found = true;
+            ESP_LOGI(TAG, "命中目标 SSID：ch=%d rssi=%d auth=%s bssid=%02x:%02x:%02x:%02x:%02x:%02x",
+                     aps[i].primary, aps[i].rssi, wifi_auth_name(aps[i].authmode),
+                     aps[i].bssid[0], aps[i].bssid[1], aps[i].bssid[2],
+                     aps[i].bssid[3], aps[i].bssid[4], aps[i].bssid[5]);
+        }
+    }
+    free(aps);
+    if (!found) {
+        ESP_LOGW(TAG, "这次扫描没看到 \"%s\"：先确认手机热点还开着、是 2.4G、SSID 没改",
+                 TIHU_WIFI_SSID);
+    }
+}
+
+/** 扫描要阻塞一两秒，不能放 esp_timer 回调里，所以单开一个任务。 */
+static void wifi_probe_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (s_wifi_got_ip) {
+            continue;
+        }
+        wifi_scan_and_report();
+        ESP_LOGI(TAG, "重扫完毕，再连一次 \"%s\"", TIHU_WIFI_SSID);
+        s_wifi_retry_count = 0;
+        esp_wifi_connect();
+        if (s_wifi_watchdog != NULL) {
+            esp_timer_stop(s_wifi_watchdog);
+            esp_timer_start_once(s_wifi_watchdog, 15 * 1000 * 1000);
+        }
+    }
+}
+
+/** 15 秒还没 IP：叫探测任务重扫。回调里只通知，不做阻塞事。 */
+static void wifi_watchdog_cb(void *arg)
+{
+    (void)arg;
+    if (s_wifi_got_ip || s_wifi_probe_task == NULL) {
+        return;
+    }
+    ESP_LOGW(TAG, "连了 15 秒还没拿到 IP，触发一次重扫");
+    xTaskNotifyGive(s_wifi_probe_task);
+}
+
 static void wifi_retry_cb(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "重试 Wi-Fi 连接…");
+    if (s_wifi_got_ip) {
+        return;
+    }
+    s_wifi_retry_count++;
+    ESP_LOGI(TAG, "重试 Wi-Fi 连接（第 %d 次）…", s_wifi_retry_count);
     esp_wifi_connect();
 }
 
@@ -441,15 +603,38 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t event_i
     (void)arg;
     if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
+        if (s_wifi_watchdog != NULL) {
+            esp_timer_stop(s_wifi_watchdog);
+            esp_timer_start_once(s_wifi_watchdog, 15 * 1000 * 1000);
+        }
     } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *evt = (wifi_event_sta_disconnected_t *)event_data;
+        uint8_t reason = evt != NULL ? evt->reason : 0;
         s_connected = false;
+        s_wifi_got_ip = false;
         tihu_ui_set_connection(false, "Wi-Fi 重连");
+        ESP_LOGW(TAG, "Wi-Fi 断开 reason=%u：%s", (unsigned)reason, wifi_reason_cn(reason));
+        if (reason == WIFI_REASON_NO_AP_FOUND ||
+            reason == WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY ||
+            reason == WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD ||
+            reason == WIFI_REASON_802_1X_AUTH_FAILED) {
+            /* 这几类靠重试救不回来，直接重扫看现场。 */
+            if (s_wifi_probe_task != NULL) {
+                xTaskNotifyGive(s_wifi_probe_task);
+            }
+            return;
+        }
         if (s_wifi_retry_timer != NULL) {
             esp_timer_stop(s_wifi_retry_timer);
             esp_timer_start_once(s_wifi_retry_timer, (uint64_t)TIHU_WIFI_RETRY_MS * 1000);
         }
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        s_wifi_got_ip = true;
+        s_wifi_retry_count = 0;
+        if (s_wifi_watchdog != NULL) {
+            esp_timer_stop(s_wifi_watchdog);
+        }
         ESP_LOGI(TAG, "Wi-Fi 已获取 IP：" IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
         tihu_ui_set_connection(false, "连宿主");
@@ -533,7 +718,16 @@ void tihu_net_start(void)
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
+    ESP_LOGI(TAG, "esp_wifi_init 前：内部堆 %u B（最大块 %u B），PSRAM %u B",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    esp_err_t wifi_err = esp_wifi_init(&init_cfg);
+    if (wifi_err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_init 失败: %s（0x%x）——内部 RAM 不够，查 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP",
+                 esp_err_to_name(wifi_err), wifi_err);
+        return;
+    }
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
@@ -542,12 +736,34 @@ void tihu_net_start(void)
     wifi_config_t wifi_cfg = {0};
     snprintf((char *)wifi_cfg.sta.ssid, sizeof(wifi_cfg.sta.ssid), "%s", TIHU_WIFI_SSID);
     snprintf((char *)wifi_cfg.sta.password, sizeof(wifi_cfg.sta.password), "%s", TIHU_WIFI_PASSWORD);
+    /* 明确按 WPA2-PSK 连：不试 WPA3/SAE，也不接 WPA2/WPA3 混合的 SAE 分支。 */
     wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_cfg.sta.threshold.rssi = -127;
+    wifi_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wifi_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     if (TIHU_WIFI_PASSWORD[0] == '\0') {
         wifi_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
     }
-    wifi_cfg.sta.pmf_cfg.capable = true;
+    /* PMF（802.11w）可选、不强制：有些手机热点强制 PMF 会和 WPA2-PSK 打架。 */
+    wifi_cfg.sta.pmf_cfg.capable = false;
     wifi_cfg.sta.pmf_cfg.required = false;
+#if defined(CONFIG_ESP_WIFI_11KV_SUPPORT)
+    ESP_LOGW(TAG, "编译期开了 802.11k/v（CONFIG_ESP_WIFI_11KV_SUPPORT），漫游辅助可能干扰首连");
+#else
+    ESP_LOGI(TAG, "802.11k/v 漫游辅助：编译期已关闭（ESP_WIFI_11KV_SUPPORT=n）");
+#endif
+
+    /* 15 秒看门狗 + 探测任务（扫描会阻塞，不能塞进 esp_timer 回调）。 */
+    esp_timer_create_args_t watch_args = {
+        .callback = wifi_watchdog_cb,
+        .name = "wifi_watch",
+    };
+    esp_timer_create(&watch_args, &s_wifi_watchdog);
+    if (xTaskCreate(wifi_probe_task, "wifi_probe", 4096, NULL, 4,
+                    &s_wifi_probe_task) != pdPASS) {
+        ESP_LOGW(TAG, "Wi-Fi 探测任务创建失败：15 秒重扫不可用");
+        s_wifi_probe_task = NULL;
+    }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
@@ -555,7 +771,9 @@ void tihu_net_start(void)
     esp_wifi_set_ps(WIFI_PS_NONE);
 
     esp_timer_start_periodic(s_heartbeat_timer, (uint64_t)TIHU_PING_INTERVAL_MS * 1000);
-    ESP_LOGI(TAG, "启动完成：SSID=%s host=%s:%d token=%s",
+
+    ESP_LOGI(TAG, "启动完成：SSID=%s host=%s:%d token=%s（authmode=%s，pmf=可选/不强制）",
              TIHU_WIFI_SSID, TIHU_HOST, TIHU_PORT,
-             TIHU_TOKEN[0] != '\0' ? "已配置" : "空");
+             TIHU_TOKEN[0] != '\0' ? "已配置" : "空",
+             TIHU_WIFI_PASSWORD[0] != '\0' ? "WPA2-PSK" : "OPEN");
 }
