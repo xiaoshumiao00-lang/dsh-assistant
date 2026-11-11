@@ -267,12 +267,24 @@ static void handle_downstream(const tihu_downstream_t *msg)
         break;
     case TIHU_DOWN_TTS_AUDIO:
         if (msg->u.tts.pcm != NULL && msg->u.tts.pcm_len > 0) {
+            if (msg->u.tts.seq == 0) {
+                tihu_audio_reset_stats();
+            }
+            /* 每块长度必须上串口：奇数块/超长块是「滋滋」的第一手证据。 */
+            ESP_LOGI(TAG, "tts.audio seq=%d 块长=%u 字节（%u 采样）index=%d sample=%d final=%d",
+                     msg->u.tts.seq, (unsigned)msg->u.tts.pcm_len,
+                     (unsigned)(msg->u.tts.pcm_len / 2), msg->u.tts.index,
+                     msg->u.tts.sample ? 1 : 0, msg->u.tts.final ? 1 : 0);
             tihu_audio_push_pcm(msg->u.tts.pcm, msg->u.tts.pcm_len);
             if (msg->u.tts.seq == 0) {
                 tihu_net_send_playback_state("playing", NULL,
                                              msg->u.tts.index + 1, -1, 0, -1);
             }
             if (msg->u.tts.final) {
+                uint32_t chunks = 0, odd = 0, underruns = 0;
+                tihu_audio_stats(&chunks, &odd, &underruns);
+                ESP_LOGI(TAG, "本次播放统计：块=%u 奇数块=%u 欠载=%u（欠载>0 就会听到嗡/滋滋）",
+                         (unsigned)chunks, (unsigned)odd, (unsigned)underruns);
                 arm_audio_idle(msg->u.tts.pcm_len);
             }
         }
@@ -327,6 +339,26 @@ static void handle_text(const char *data, size_t len)
 
 /* ------------------------------ WS 事件 ------------------------------ */
 
+#if TIHU_AUDIO_SELFTEST
+/** 一次开机只自检一次（断线重连不重复「嘟」）。 */
+static volatile bool s_selftest_done;
+
+/**
+ * 开机音频自检：先播 0.5 s 正弦（验证 I2S/codec 通路），再向宿主请求一句 tts.sample
+ * （验证真实 TTS 链路 + 当前音色）。两段之间留 1.5 s，避免叠在一起听不清。
+ */
+static void audio_selftest_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(800));
+    tihu_audio_play_sine_test();
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    ESP_LOGI(TAG, "音频自检：向宿主请求 tts.sample（%s）", TIHU_AUDIO_SELFTEST_TEXT);
+    send_json(tihu_build_tts_sample(TIHU_AUDIO_SELFTEST_TEXT));
+    vTaskDelete(NULL);
+}
+#endif
+
 static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     (void)arg;
@@ -343,6 +375,14 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
         send_json(tihu_build_hello(s_client_id, TIHU_DEVICE_NAME));
         /* 协议 §6.3：重连先报 idle，宿主丢掉上一轮“朗读中”的假设。 */
         tihu_net_send_playback_state("idle", NULL, 0, -1, 0, -1);
+#if TIHU_AUDIO_SELFTEST
+        if (!s_selftest_done) {
+            s_selftest_done = true;
+            if (xTaskCreate(audio_selftest_task, "tihu_selftest", 4096, NULL, 4, NULL) != pdPASS) {
+                ESP_LOGE(TAG, "音频自检任务创建失败");
+            }
+        }
+#endif
         break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:

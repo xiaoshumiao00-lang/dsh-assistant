@@ -200,6 +200,8 @@ typedef struct {
 
 char *tihu_build_hello(const char *client_id, const char *device_name);
 char *tihu_build_text_input(const char *text, const char *source);
+/** 试听请求：宿主用当前音色合成一句样例并以 tts.audio(sample=true) 回来（音频自检用）。 */
+char *tihu_build_tts_sample(const char *text);
 char *tihu_build_audio_frame(const uint8_t *wav, size_t wav_len, int duration_ms);
 char *tihu_build_screen_tap(int x, int y, const char *hit,
                             const char *action_id, const char *task_id);
