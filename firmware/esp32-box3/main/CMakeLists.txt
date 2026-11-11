@@ -9,6 +9,7 @@ idf_component_register(
         "tihu_net.c"
         "tihu_protocol.c"
         "tihu_audio.c"
+        "tihu_touch.c"
         "ui.c"
         "ui_board.c"
         "ui_progress.c"
@@ -28,4 +29,8 @@ idf_component_register(
         mbedtls
         nvs_flash
         esp_timer
+        # GT911 触摸：BSP 只在**私有**依赖里带 esp_lcd_touch，不会传给 main，
+        # 所以 tihu_touch.c 里用 esp_lcd_panel_io_rx_param/esp_lcd_touch_* 必须在这里显式声明。
+        espressif__esp_lcd_touch
+        espressif__esp-box-3
 )

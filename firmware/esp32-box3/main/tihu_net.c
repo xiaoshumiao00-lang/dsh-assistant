@@ -89,10 +89,24 @@ void tihu_net_send_wav(const uint8_t *wav, size_t len)
     send_json(tihu_build_audio_frame(wav, len, duration_ms));
 }
 
-void tihu_net_send_tap(int x, int y, const char *hit,
+bool tihu_net_send_tap(int x, int y, const char *hit,
                        const char *action_id, const char *task_id)
 {
-    send_json(tihu_build_screen_tap(x, y, hit, action_id, task_id));
+    char *json = tihu_build_screen_tap(x, y, hit, action_id, task_id);
+    if (json == NULL) {
+        ESP_LOGE(TAG, "screen.gesture 组包失败（内存不足？）x=%d y=%d hit=%s actionId=%s",
+                 x, y, hit != NULL ? hit : "", action_id != NULL ? action_id : "");
+        return false;
+    }
+    bool ok = send_json(json);
+    if (!ok) {
+        /* 点屏唯一的下行出口：失败必须能在串口里看见，否则屏上就是「点了没反应」。 */
+        ESP_LOGW(TAG, "screen.gesture 没发出去（%s）：x=%d y=%d hit=%s actionId=%s taskId=%s",
+                 s_connected ? "WS 写失败" : "WebSocket 未连接",
+                 x, y, hit != NULL ? hit : "",
+                 action_id != NULL ? action_id : "", task_id != NULL ? task_id : "");
+    }
+    return ok;
 }
 
 void tihu_net_send_session_end(const char *reason)

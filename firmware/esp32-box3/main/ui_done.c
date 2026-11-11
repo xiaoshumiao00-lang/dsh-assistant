@@ -10,6 +10,10 @@
  *
  * 高亮只跟宿主下发的 done.current 走；真正的“念到哪”由宿主的 tts.audio
  * charStart/charEnd 换算成行后再次下发，固件不按时间猜。
+ *
+ * 三个键的 actionId 必须用宿主完成页 actions 的原名（src/tihu/task-screens.ts 里
+ * done 屏 actions = stop / replay / taskBoard），点一下发
+ * `screen.gesture{tap, hit:"action", actionId}`，宿主 lane.ts 按这三个 id 分派。
  */
 #include "ui.h"
 
@@ -17,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_log.h"
 #include "tihu_net.h"
 
 #define COL_PANEL   0x151C24
@@ -41,10 +46,51 @@ static void done_btn_cb(lv_event_t *event)
         return;
     }
     if (s_action_ids[index][0] == '\0') {
+        ESP_LOGW("ui", "按钮命中但 actionId 为空（index=%d）", index);
         return;
     }
+    ESP_LOGI("ui", "按钮命中 actionId=%s（完成页第 %d 键）", s_action_ids[index], index + 1);
     tihu_ui_send_action(s_action_ids[index], s_task_id,
                         lv_event_get_target(event));
+}
+
+/* 按下即打点：不等 CLICKED，先确认「手指落在哪、落在哪个按钮的矩形里」。 */
+static void done_btn_pressed_cb(lv_event_t *event)
+{
+    int index = (int)(uintptr_t)lv_event_get_user_data(event) - 1;
+    if (index < 0 || index >= 3) {
+        return;
+    }
+    lv_indev_t *indev = lv_indev_active();
+    lv_point_t point = {0, 0};
+    if (indev != NULL) {
+        lv_indev_get_point(indev, &point);
+    }
+    lv_area_t area;
+    lv_obj_get_coords(lv_event_get_target(event), &area);
+    lv_obj_t *label = lv_obj_get_child(s_buttons[index], 0);
+    ESP_LOGI("ui", "按下「%s」：触摸点 x=%d y=%d，按钮区 [%d,%d]-[%d,%d]，actionId=%s",
+             label != NULL ? lv_label_get_text(label) : "?",
+             (int)point.x, (int)point.y,
+             (int)area.x1, (int)area.y1, (int)area.x2, (int)area.y2,
+             s_action_ids[index]);
+}
+
+/*
+ * 完成页容器自己的按下事件：按钮没吃到时才会走到这里（按钮事件不冒泡）。
+ * 有一条 `完成页被按下但没落在按钮上` 就说明触摸在报点、但坐标/命中区不对——
+ * 和「触摸根本没报点」是完全不同的两种故障，串口里一眼能分开。
+ */
+static void done_screen_pressed_cb(lv_event_t *event)
+{
+    (void)event;
+    lv_indev_t *indev = lv_indev_active();
+    lv_point_t point = {0, 0};
+    if (indev != NULL) {
+        lv_indev_get_point(indev, &point);
+    }
+    ESP_LOGW("ui", "完成页被按下但没落在按钮上：x=%d y=%d（三键在 y=202..232）",
+             (int)point.x, (int)point.y);
 }
 
 lv_obj_t *tihu_ui_done_create(lv_obj_t *parent)
@@ -56,7 +102,11 @@ lv_obj_t *tihu_ui_done_create(lv_obj_t *parent)
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(screen, 0, 0);
     lv_obj_set_style_pad_all(screen, 0, 0);
+    /* 容器不滚动 = 子对象坐标不会被滚动偏移偷偷带走（命中区跟画面对得上）。 */
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(screen, LV_DIR_NONE);
+    lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(screen, done_screen_pressed_cb, LV_EVENT_PRESSED, NULL);
 
     s_tone_bar = lv_obj_create(screen);
     lv_obj_set_pos(s_tone_bar, 8, 4);
@@ -94,6 +144,18 @@ lv_obj_t *tihu_ui_done_create(lv_obj_t *parent)
         lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(btn, 5, 0);
         lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_set_style_pad_all(btn, 0, 0);
+        /*
+         * 可点三件套，缺一个就「点了没反应」：
+         *   1) 按钮自己必须 CLICKABLE（lv_button 默认有，这里写明防止以后被改掉）；
+         *   2) 按钮不能滚动，否则按下拖动会被当成滚动、CLICKED 不发射；
+         *   3) 里面的文字 label 默认不 CLICKABLE（lv_label_constructor 里 set_clickable(false)），
+         *      命中会落到按钮上——不要给它加 CLICKABLE，否则它会吞掉整块命中区。
+         */
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(btn, done_btn_pressed_cb, LV_EVENT_PRESSED,
+                            (void *)(uintptr_t)(i + 1));
         lv_obj_add_event_cb(btn, done_btn_cb, LV_EVENT_CLICKED,
                             (void *)(uintptr_t)(i + 1));
         lv_obj_t *label = tihu_ui_label(btn, default_labels[i],
@@ -101,6 +163,15 @@ lv_obj_t *tihu_ui_done_create(lv_obj_t *parent)
                                         0, 4, 96, 22);
         lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
         snprintf(s_action_ids[i], sizeof(s_action_ids[i]), "%.39s", default_ids[i]);
+
+        /* 先跑一次布局，坐标才是真的；否则 get_coords 还停在 [0,0]-[-1,-1]。 */
+        lv_obj_update_layout(btn);
+        lv_area_t area;
+        lv_obj_get_coords(btn, &area);
+        ESP_LOGI("ui", "按钮 #%d「%s」actionId=%s 命中区 [%d,%d]-[%d,%d] clickable=%d",
+                 i + 1, default_labels[i], default_ids[i],
+                 (int)area.x1, (int)area.y1, (int)area.x2, (int)area.y2,
+                 (int)lv_obj_has_flag(btn, LV_OBJ_FLAG_CLICKABLE));
     }
     return screen;
 }

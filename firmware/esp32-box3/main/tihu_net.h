@@ -17,7 +17,8 @@ bool tihu_net_connected(void);
 
 void tihu_net_send_text(const char *text, const char *source);
 void tihu_net_send_wav(const uint8_t *wav, size_t len);
-void tihu_net_send_tap(int x, int y, const char *hit,
+/** 发 screen.gesture{tap}；返回是否真的写进了 WebSocket（失败会在串口打日志）。 */
+bool tihu_net_send_tap(int x, int y, const char *hit,
                        const char *action_id, const char *task_id);
 void tihu_net_send_session_end(const char *reason);
 void tihu_net_send_ack(const char *op_id, bool ok, const char *reason,

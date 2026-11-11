@@ -13,12 +13,15 @@
 #include <string.h>
 
 #include "config.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "bsp/esp-box-3.h"
 #include "tihu_charset.h"
 #include "tihu_net.h"
+#include "tihu_touch.h"
 
 LV_FONT_DECLARE(tihu_font_20)
 LV_FONT_DECLARE(tihu_font_15)
@@ -487,7 +490,23 @@ void tihu_ui_send_action(const char *action_id, const char *task_id,
         x = (area.x1 + area.x2) / 2;
         y = (area.y1 + area.y2) / 2;
     }
-    tihu_net_send_tap(x, y, "action", action_id, task_id);
+    /*
+     * 屏幕按钮的唯一出口：screen.gesture{tap, hit:"action", actionId}。
+     * 字段名与宿主 src/tihu/protocol.ts 的 parseUpstream('screen.gesture') 分支逐字对齐：
+     *   action 只能是 "tap"；hit 只能是 screen/action/task；actionId ≤32 字符。
+     * 这三个 id 用宿主完成页 actions 的原名（stop / replay / taskBoard），不自造。
+     */
+    ESP_LOGI("ui", "发送 screen.gesture action=tap x=%d y=%d hit=action actionId=%s taskId=%s",
+             x, y, action_id != NULL ? action_id : "", task_id != NULL ? task_id : "");
+    bool ok = tihu_net_send_tap(x, y, "action", action_id, task_id);
+    /* 发送结果必须进串口：这是「点了没反应」唯一能定位到的一行。 */
+    ESP_LOGI("ui", "screen.gesture 发送结果=%s actionId=%s（WS=%s）",
+             ok ? "成功" : "失败", action_id != NULL ? action_id : "",
+             s_connected ? "已连接" : "未连接");
+    if (!ok) {
+        ESP_LOGW("ui", "screen.gesture 没发出去（WebSocket 未连接？）actionId=%s",
+                 action_id != NULL ? action_id : "");
+    }
 }
 
 const char *tihu_ui_connection_text(void)
@@ -500,50 +519,117 @@ bool tihu_ui_connected(void)
     return s_connected;
 }
 
-/* ------------------------------ 对外入口 ------------------------------ */
+/* ------------------------------ 显示 + 触摸启动 ------------------------------ */
 
-void tihu_ui_init(void)
+/**
+ * 自己起显示，不用 bsp_display_start_with_config()。
+ *
+ * 两个必须绕开的坑（都来自 BSP / esp_lvgl_port，改不动）：
+ *   1) bsp_display_start_with_config() → bsp_display_indev_init() 里触摸初始化失败会
+ *      直接让**整个显示启动**返回 NULL（屏不亮），而我们需要「触摸坏了屏还亮」；
+ *   2) 它的触摸 indev 读回调里包了 ESP_ERROR_CHECK(esp_lcd_touch_read_data(...))，
+ *      GT911 读一次 NACK 就 abort() 重启（实测上电第一次读必 NACK）。
+ * 所以显示自己起（配置逐项照抄 BSP 的 bsp_display_lcd_init），触摸交给 tihu_touch.c。
+ */
+static lv_display_t *tihu_display_init(void)
 {
     /*
-     * 不用 bsp_display_start()：它内部用 ESP_LVGL_PORT_INIT_CONFIG() 的默认值
-     * （LVGL 任务栈 7 KB）。7 KB 画中文 + 一次性建三屏很容易踩到栈顶，这里把
-     * LVGL 任务栈提到 12 KB、tick 周期锁 5 ms，再把返回值/分辨率打进日志。
+     * 不用 BSP 默认的 7 KB LVGL 任务栈：7 KB 画中文 + 一次性建三屏很容易踩到栈顶，
+     * 这里提到 12 KB、tick 周期锁 5 ms。
      */
-    bsp_display_cfg_t disp_cfg = {
-        .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
-        .buffer_size = BSP_LCD_H_RES * CONFIG_BSP_LCD_DRAW_BUF_HEIGHT,
-        .double_buffer =
+    lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    port_cfg.task_stack = 12 * 1024;
+    port_cfg.timer_period_ms = 5;
+    port_cfg.task_max_sleep_ms = 500;
+
+    esp_err_t err = lvgl_port_init(&port_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "lvgl_port_init 失败：%s", esp_err_to_name(err));
+        return NULL;
+    }
+
+    const bsp_display_config_t bus_cfg = {
+        .max_transfer_sz = (BSP_LCD_H_RES * CONFIG_BSP_LCD_DRAW_BUF_HEIGHT) * sizeof(uint16_t),
+    };
+    esp_lcd_panel_handle_t panel = NULL;
+    esp_lcd_panel_io_handle_t io = NULL;
+    err = bsp_display_new(&bus_cfg, &panel, &io);
+    if (err != ESP_OK || panel == NULL || io == NULL) {
+        ESP_LOGE(TAG, "bsp_display_new 失败：%s（panel=%p io=%p）",
+                 esp_err_to_name(err), (void *)panel, (void *)io);
+        return NULL;
+    }
+    esp_lcd_panel_disp_on_off(panel, true);
+
+    /*
+     * 注意：**不要**手动给 GT911 打硬件复位（RST 与 LCD 共用 GPIO48）。
+     * 实测（2026-11-11）：加「INT 低 + RST 低 10 ms」这一手之后，GT911 再也不应答
+     * I2C（bsp_touch_new 连续 3 次 ESP_ERR_NOT_FOUND），比不复位还糟。
+     * 触摸芯片保持 BSP 的上电状态；初始化失败只降级，不影响屏幕。
+     */
+
+    bool double_buffer = false;
 #if CONFIG_BSP_LCD_DRAW_BUF_DOUBLE
-        1,
-#else
-        0,
+    double_buffer = true;
+#endif
+    const lvgl_port_display_cfg_t disp_cfg = {
+        .io_handle = io,
+        .panel_handle = panel,
+        .buffer_size = BSP_LCD_H_RES * CONFIG_BSP_LCD_DRAW_BUF_HEIGHT,
+        .double_buffer = double_buffer,
+        .hres = BSP_LCD_H_RES,
+        .vres = BSP_LCD_V_RES,
+        .monochrome = false,
+        /* 必须与 BSP bsp_display_lcd_init() 一致：面板在 esp_lcd 里做了 180° 镜像。 */
+        .rotation = {
+            .swap_xy = false,
+            .mirror_x = true,
+            .mirror_y = true,
+        },
+#if LVGL_VERSION_MAJOR >= 9
+        .color_format = LV_COLOR_FORMAT_RGB565,
 #endif
         .flags = {
             .buff_dma = true,
             .buff_spiram = false,
+#if LVGL_VERSION_MAJOR >= 9
+            .swap_bytes = (BSP_LCD_BIGENDIAN ? true : false),
+#endif
         },
     };
-    disp_cfg.lvgl_port_cfg.task_stack = 12 * 1024;
-    disp_cfg.lvgl_port_cfg.timer_period_ms = 5;
-    disp_cfg.lvgl_port_cfg.task_max_sleep_ms = 500;
 
-    lv_display_t *disp = bsp_display_start_with_config(&disp_cfg);
+    lv_display_t *disp = lvgl_port_add_disp(&disp_cfg);
     if (disp == NULL) {
-        ESP_LOGE(TAG, "bsp_display_start 失败：检查 BSP/PSRAM 配置");
+        ESP_LOGE(TAG, "lvgl_port_add_disp 失败：屏幕无法启动");
+        return NULL;
+    }
+    ESP_LOGI(TAG, "显示就绪：%p %dx%d，color=%d，draw buf=%d px，dbl=%d",
+             (void *)disp,
+             (int)lv_display_get_horizontal_resolution(disp),
+             (int)lv_display_get_vertical_resolution(disp),
+             (int)lv_display_get_color_format(disp),
+             (int)disp_cfg.buffer_size, (int)double_buffer);
+    ESP_LOGI(TAG, "LVGL 任务：栈 %d B / 优先级 %d / tick %d ms",
+             12000, (int)port_cfg.task_priority, (int)port_cfg.timer_period_ms);
+    return disp;
+}
+
+/* ------------------------------ 对外入口 ------------------------------ */
+
+void tihu_ui_init(void)
+{
+    lv_display_t *disp = tihu_display_init();
+    if (disp == NULL) {
+        ESP_LOGE(TAG, "显示启动失败：检查 BSP/PSRAM 配置");
         return;
     }
     /* 探针要尽早挂：后面每一帧的 flush 都记进计数。 */
     s_raw_flush = lv_display_get_flush_cb(disp);
     lv_display_set_flush_cb(disp, flush_probe_cb);
-    ESP_LOGI(TAG, "bsp_display_start 返回 %p：%dx%d，color=%d，draw buf=%d px，dbl=%d",
-             (void *)disp,
-             (int)lv_display_get_horizontal_resolution(disp),
-             (int)lv_display_get_vertical_resolution(disp),
-             (int)lv_display_get_color_format(disp),
-             (int)disp_cfg.buffer_size, (int)disp_cfg.double_buffer);
-    ESP_LOGI(TAG, "LVGL 任务：栈 %d B / 优先级 %d / tick %d ms；flush 探针已挂（原回调 %p）",
-             12000, (int)disp_cfg.lvgl_port_cfg.task_priority,
-             (int)disp_cfg.lvgl_port_cfg.timer_period_ms, (void *)s_raw_flush);
+    ESP_LOGI(TAG, "flush 探针已挂（原回调 %p）", (void *)s_raw_flush);
+
+    /* 触摸单独起：3 次重试，失败只降级，不影响屏幕与点击以外的功能。 */
+    tihu_touch_init(disp);
 
     bsp_display_lock(0);
 
