@@ -87,7 +87,7 @@ import { parseWav } from './audio.ts'
 import { applyPersonalTerms, cleanFillers, fixTerms } from '../client/pocket/orb/asr-terms.ts'
 import { loadAssistantConfig } from '../assistant-config.ts'
 import { cardsFromState, groupCardProjects, groupProjects, groupWorkspaceProjects, humanTitle, projectCardsSignature, projectNameOf, type ProjectReply, type TihuCardRow, type TihuWorkspaceRow } from './project-groups.ts'
-import { matchSessionRows, matchTaskRows, type ControlSessionRow, type ControlTaskRow, type DeviceActionOutcome, type DeviceStatusView, type SessionProgressView, type TihuControlDevice, type TihuControlSurface, type TihuDeviceActionOptions } from './control.ts'
+import { createTihuToolRunner, matchSessionRows, matchTaskRows, tihuToolNames, type ControlSessionRow, type ControlTaskRow, type DeviceActionOutcome, type DeviceStatusView, type SessionProgressView, type TihuControlDevice, type TihuControlSurface, type TihuDeviceActionOptions } from './control.ts'
 import type { AlertPayload, TtsAudioPayload, VoiceCreatedPayload, VoiceListPayload } from './protocol.ts'
 import {
   ANNOUNCE_WINDOW_MS,
@@ -118,7 +118,7 @@ import {
   type TihuTask,
 } from './task-ledger.ts'
 import { TaskLedgerStore } from './task-store.ts'
-import { commanderReplyTail, parseCommanderReply, type CommanderReply } from './dispatch-protocol.ts'
+import { commanderReplyTail, parseCommanderDecision, type CommanderDecision, type CommanderReply } from './dispatch-protocol.ts'
 import {
   PENDING_OFFLINE_CHECK_MS,
   approvalDecisionOf,
@@ -142,6 +142,7 @@ import {
   doneLineRangesOf,
   doneSpeechSegmentsOf,
   folderBase,
+  intentClarifyFrame,
   noticeFrame,
   prepareDoneText,
   receiptFrame,
@@ -157,6 +158,15 @@ export const TIHU_LANE_PATH = '/tihu/lane'
 
 /** 棋盘上有在跑的行时，隔多久重发一帧（让右侧蓝色弧跟着已运行时长往前走）。 */
 export const BOARD_TICK_MS = 5_000
+
+/**
+ * 语义判断这一问的等待屏「晚一拍」（2026-11-11）：指挥台判得快（本地模型 1 秒内出结论）
+ * 就根本不刷屏。判成「冲这块屏说的那句话」时，一块「派单中」的屏盖一下比不显示更糟。
+ */
+export const COMMANDER_WAIT_PAINT_MS = 1_500
+
+/** 语义句结论里 `tool` 那一格必须落在这里的名字（工具注册表，不是用户说法词表）。 */
+const TIHU_TOOL_NAME_LIST: readonly string[] = tihuToolNames()
 
 /**
  * 每会话回答历史上限（用户 2026-11-08 要求：最多 8 条，含 sentences/speechSegments/
@@ -458,6 +468,11 @@ interface TihuDevice {
   focusedTask?: string
   /** 屏停在棋盘上（只有它才跟着登记簿自动重画）。 */
   onBoard?: boolean
+  /**
+   * 用户在这次判断期间自己按了「主页」：秒表不再把屏抢回来（判断仍在后台跑）。
+   * 注意它与 `onBoard` 不同——开机就在棋盘上不算「抢屏」，那正是要反馈的地方。
+   */
+  waitMuted?: boolean
   /** 这台设备现在停在哪一屏（sendFrame 记的；进度页每秒重画与回主页计时都按这份判）。 */
   screenStage?: string
   /** 朗读结束后 60 秒自动回棋盘的计时器（任何交互都取消）。 */
@@ -479,6 +494,11 @@ interface TihuDevice {
     /** 项目命中方式（写 lane.log 用）。 */
     via: string
   }
+  /**
+   * 语义两可的追问待答（2026-11-11 语义路由）：用户下一句「1 派它干活 / 2 先不管」，
+   * 或者在屏上点这两个按钮。**这一句在用户答清楚之前不许被派出去**（绝不猜着派单）。
+   */
+  pendingIntent?: { text: string; question: string; key: string }
   /** 派单回执自动回棋盘的计时器（任何交互都取消它）。 */
   receiptTimer?: ReturnType<typeof setTimeout>
   /** 页面选中的音色（default / 克隆音色名）。 */
@@ -885,22 +905,28 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   /** 唯一指挥会话 id（懒建一次；建不出来就直接上错误屏，不退回旧壳）。 */
   let commanderSessionId: string | undefined
   /**
-   * 正在等指挥台判项目的那句话（用户 2026-11-10：**不设超时**，一直等到它回）。
+   * 正在等指挥台判断的那句话（用户 2026-11-10：**不设超时**，一直等到它回）。
    *
    * 屏上每秒重画「已等 N 秒」；用户按「主页」回棋盘时判断照旧在后台跑，
-   * 只停止往屏上刷这一帧（`device.onBoard` 守门），任务卡仍留在棋盘排队区。
+   * 只停止往屏上刷这一帧（`device.onBoard` 守门）。
    */
   let commanderWait: {
     text: string
     key: string
-    taskId: string
+    /** 语义判断这一句**没有**排队卡（判成活儿才立卡）；字段留着给老调用点。 */
+    taskId?: string
     startedAt: number
     ticker: ReturnType<typeof setInterval>
+    /** 晚一拍才画等待屏的那只计时器（判得快就根本不画）。 */
+    paintTimer?: ReturnType<typeof setTimeout>
   } | undefined
   /**
    * 已上棋盘、还在等指挥台判项目的排队卡（字面归一化 key → taskId）。
    * 指挥台晚到的 dispatch 按这句话认领同一张卡：**taskId 不变**，绝不新建第二张。
    * 不设过期时间：用户拍板「一直等到判出结果」，卡只在转正 / 彻底失败 / 卸载时摘掉。
+   *
+   * 2026-11-11 语义路由：慢路径进门不再先立这张卡——判成「冲这块屏说的那句话」不许有任务。
+   * 这张表现在只用在「指挥台自己调了 dispatch 工具」那一跳的转正与去重。
    */
   const pendingCommanderTask = new Map<string, { taskId: string; at: number }>()
   /**
@@ -915,8 +941,10 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   interface CommanderAsk {
     key: string
     text: string
-    /** project＝慢路径判项目（有排队卡）；continuity＝灰区判「接着哪条」。 */
-    kind: 'project' | 'continuity'
+    /** project＝慢路径判项目（有排队卡）；continuity＝灰区判「接着哪条」；intent＝语义路由那一问（不立卡）。 */
+    kind: 'project' | 'continuity' | 'intent'
+    /** 这句是从哪块屏进来的（设备 id）：判成控制意图时补调就补调到这块屏上。 */
+    device?: string
     /** 慢路径的排队卡：转正时 taskId 必须不变。 */
     taskId?: string
     /** 灰区已知的项目卡。 */
@@ -931,6 +959,18 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const commanderAsks: CommanderAsk[] = []
   /** 已经结算过回复的指挥会话 turn（防止同一轮的 turn/end 再顶替下一句等待）。 */
   const commanderTurnReplied = new Set<number>()
+  /**
+   * 指挥台这一轮**自己调过**的 tihu_* 工具（turn → 工具名）。
+   *
+   * 它是一条句子「只允许有一条路由」的门牌：模型已经把这句话办了（停了朗读、翻了页、
+   * 答了那道待决策），lane 就不许再补调、更不许再把它派成任务——否则同一句变成两件事。
+   */
+  const commanderToolCalls = new Map<number, string[]>()
+  /**
+   * 按「冲这块屏说的」结论办过的句子（字面归一化 key → 工具名＋时刻）。
+   * 同一句晚到的派单 JSON / 晚到的 dispatch 工具调用一律不再把它派出去。
+   */
+  const controlHandled = new Map<string, { tool: string; at: number }>()
   /**
    * 超时兜底已经派过的一句（按字面归一化后的 key）：指挥会话晚到的同一条 dispatch
    * 不能再建第二条任务。只挡模型这条入口，快路径重复说同一句不受影响。
@@ -952,6 +992,10 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   } | undefined
   /** 会话衔接澄清的屏上计时器（只问一次；到点按新建）。 */
   let clarifyTimer: ReturnType<typeof setTimeout> | undefined
+  /** 语义两可澄清屏的计时器（到点按「先不管」收掉，绝不猜着派单）。 */
+  let intentClarifyTimer: ReturnType<typeof setTimeout> | undefined
+  /** 补调用的执行器：与注册给模型的 16 个工具同一个（createTihuToolRunner(control)）。 */
+  let runRegisteredTihuTool: ReturnType<typeof createTihuToolRunner> | undefined
   /** 已经问过澄清的句子（字面归一化 key → 问的时刻）：同一条任务不许重复追问。 */
   const clarifyAsked = new Map<string, number>()
   /** 重复追问窗口外的旧记录可以清掉（10 分钟足够覆盖一条任务）。 */
@@ -2551,6 +2595,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         if (type === 'turn/start') {
           // 多句同时排队时，由 turn/start 把本轮认领给最早那句，回复不会串台。
           assignCommanderTurn(turn ?? 0)
+        } else if (type === 'tool/call') {
+          /* 指挥台自己把这句话办了（停了朗读 / 翻了页 / 答了那道待决策）：
+           * lane 记下这一跳，之后既不补调也不派单——一句只允许有一条路由。 */
+          noteCommanderToolCall(turn, (data as any)?.name ?? (data as any)?.call?.name ?? '')
         } else if (type === 'assistant/message') {
           // 只认**这一条消息**的正文：没有文字的（纯工具调用）消息不能拿上一轮的 JSON 顶替。
           const blocks = Array.isArray((data as any)?.message?.content) ? (data as any).message.content : []
@@ -3152,6 +3200,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           /* ---- 新七屏上的按键：棋盘 / 回执 / 详情 / 待决策 / 追问 / 完成 ---- */
           if (actionId === 'taskBoard') {
             try { device.cancelRound?.() } catch { /* 忽略 */ }
+            // 用户自己按主页：这次判断的秒表别再抢屏（判断仍在后台跑，判成活儿照旧立卡）。
+            if (commanderWait !== undefined) device.waitMuted = true
             await runScreenCommand(device, { kind: 'board' })
             return
           }
@@ -3219,6 +3269,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           }
           if (actionId === 'pick1' || actionId === 'pick2') {
             const index = actionId === 'pick1' ? 1 : 2
+            if (device.pendingIntent !== undefined) {
+              // 语义两可的澄清屏：1＝派它干活，2＝先不管。
+              await resolveIntentClarify(device, index === 1 ? 'work' : 'skip')
+              return
+            }
             if (device.pendingClarify !== undefined) {
               await resolveClarify(device, index === 1 ? 'new' : 'same')
               return
@@ -3230,6 +3285,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             return
           }
           if (actionId === 'pickNone') {
+            if (device.pendingIntent !== undefined) {
+              // 追问屏没有「都不是」按钮：按「先不管」收掉这句，不猜着派单。
+              await resolveIntentClarify(device, 'skip')
+              return
+            }
             if (device.pendingClarify !== undefined) {
               // 澄清屏只有两个选项（没有「都不是」按钮）；留着当「新建」处理，避免卡死。
               await resolveClarify(device, 'new')
@@ -5975,7 +6035,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       clearTimeout(clarifyTimer)
       clarifyTimer = undefined
     }
-    for (const item of devices) item.pendingClarify = undefined
+    if (intentClarifyTimer !== undefined) {
+      clearTimeout(intentClarifyTimer)
+      intentClarifyTimer = undefined
+    }
+    for (const item of devices) {
+      item.pendingClarify = undefined
+      item.pendingIntent = undefined
+    }
   }
 
   /**
@@ -6092,15 +6159,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     if (/^(?:新建|新的|新的一条|新会话|另起|另开|重新开|单开)$/.test(clean)) return 'new'
     if (/^(?:接着|继续|原来那条|原来的|刚才那条|那条|同一个|同一会话|还那条)$/.test(clean)) return 'same'
     return undefined
-  }
-
-  /** 追加到已有任务（routeQuick 的 append 出口）：仍要过一遍会话衔接判定。 */
-  async function appendToTask(device: TihuDevice, task: TihuTask, text: string): Promise<void> {
-    const card = { id: task.projectId, name: task.projectName, ...(task.folder === undefined ? {} : { folder: task.folder }) }
-    const outcome = await dispatchWithContinuity(device, text, card, { via: 'append' }, { allowCommander: true })
-    if (outcome.task === undefined && outcome.message.startsWith('错误')) {
-      showInputError(device, new Error(outcome.message), '这条没派出去，请重说')
-    }
   }
 
   /** 歧义追问（屏 7）：只问一次；用户答「一 / 二 / 都不是」。 */
@@ -6299,9 +6357,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   /**
    * 指挥台回复到了（assistant/message 抢先解析，turn/end 是最后期限）。
    *
-   * - 解析出可用结论 → 立刻执行（续到 append_to 指定会话 / 同项目新建 / 个人助手）；
-   * - `final` 且解析失败或回复为空 → 退回 routeQuick / 最佳卡，给排队卡一个终态，
-   *   绝不停在「等指挥台判断」。
+   * 2026-11-11 语义路由：这里拿到的是一句**结论**，四种走向——
+   * - control（「这句话是冲这块屏说的」）→ 执行它点名的 tihu_* 工具；模型自己调过就不补调，
+   *   也**绝不派单**、不建任务、不建会话；
+   * - clarify（两可）→ 屏上问用户一次，不派单；
+   * - dispatch（判成要干活）→ 按派单结论执行（这时才立任务卡）；
+   * - 认不出方向 → 只有本地有把握的工作信号才兜底派单，否则同样只问一次，不猜。
    */
   async function settleCommanderReply(raw: string, final: boolean, turn?: number): Promise<void> {
     const ask = commanderAskForTurn(turn, final)
@@ -6315,20 +6376,54 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         for (const value of keep) commanderTurnReplied.add(value)
       }
     }
-    const parsed = parseCommanderReply(raw)
-    if (parsed === undefined) {
+    const decision = parseCommanderDecision(raw, TIHU_TOOL_NAME_LIST)
+    if (decision === undefined) {
       if (!final) return
       commanderAsks.splice(commanderAsks.indexOf(ask), 1)
       await fallbackCommanderReply(ask, raw)
       return
     }
     commanderAsks.splice(commanderAsks.indexOf(ask), 1)
-    await applyCommanderReply(ask, parsed, raw)
+    if (decision.kind === 'control') {
+      await runCommanderControl(ask, decision)
+      return
+    }
+    if (decision.kind === 'clarify' || decision.kind === 'control-unknown') {
+      const why = decision.kind === 'control-unknown'
+        ? `判成控制意图，但「${decision.said}」不是工具注册表里的名字`
+        : '两种解释都说得通'
+      log(`tihu semantic clarify kind=${decision.kind} text=${JSON.stringify(ask.text)} 为什么=${why}`)
+      try {
+        appendTihuLaneLog(commanderSessionId ?? '-', new Error(`指挥台结论=两可（${why}）原文=${JSON.stringify(clipForLog(raw))}`), 'commander-clarify')
+      } catch { /* 日志失败不影响路由 */ }
+      await askIntentClarify(ask, decision.kind === 'clarify' ? decision.question : '')
+      return
+    }
+    await applyCommanderReply(ask, decision.dispatch, raw)
   }
 
-  /** 按指挥台的 JSON 结论执行派单（纯文本链路；taskId 复用排队卡）。 */
+  /** 按指挥台的 JSON 结论执行派单（纯文本链路；判成工作时才立卡，taskId 复用排队卡）。 */
   async function applyCommanderReply(ask: CommanderAsk, reply: CommanderReply, raw: string): Promise<void> {
     stopCommanderWait()
+    // 同一句只允许有一条路由：已经按「冲这块屏说的」办过的句子，晚到的派单结论不许再派一次。
+    if (controlHandledOf(ask.text)) {
+      log(`tihu commander dispatch skipped（这句已经按屏上命令办过）text=${JSON.stringify(ask.text)}`)
+      return
+    }
+    if (justDispatchedOf(ask.text)) {
+      log(`tihu commander dispatch skipped（这句刚派成任务 ${justDispatchedOf(ask.text)?.taskId}）text=${JSON.stringify(ask.text)}`)
+      return
+    }
+    // 这一轮指挥台**自己**调了工具：那句结论就不许再变成派单（一句只允许一条路由）。
+    const selfTool = commanderCalledToolForTurn(ask.turn)
+    if (selfTool !== undefined) {
+      noteControlHandled(ask.key, selfTool)
+      log(`tihu commander dispatch skipped（这一轮指挥台自己调了 ${selfTool}）text=${JSON.stringify(ask.text)}`)
+      try {
+        appendTihuLaneLog(commanderSessionId ?? '-', new Error(`指挥台自己调了工具 ${selfTool} → 这句不派单（一句只有一条路由）`), 'commander-self-tool')
+      } catch { /* 日志失败不影响路由 */ }
+      return
+    }
     const device = [...devices].find((item) => item.unified)
     const card = ask.kind === 'continuity' && ask.card !== undefined ? ask.card : cardForCommanderProject(reply.project)
     const target = card ?? ASSISTANT_CARD
@@ -6357,12 +6452,24 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       } catch { /* 日志失败不影响派单 */ }
       log(`tihu commander append miss target=${reply.appendTo} project=${target.id}`)
     }
-    await dispatchToCard(device, ask.text, target, undefined, { ...meta, continuity: 'new' })
+    // 判成工作、又没点名要续哪条会话：还是先走一遍「规则 A」（内容重合 → 接到上一条派单会话），
+    // 再走与页面按钮同一条衔接判定（项目内接着旧会话 / 新建 / 灰区问一次）。
+    const followed = await followPreviousDispatch(device, ask.text, target.id)
+    if (followed !== undefined) {
+      reportFollowFailure(device, followed)
+      return
+    }
+    const outcome = await dispatchWithContinuity(device, ask.text, target, { via: ask.via }, { allowCommander: false })
+    if (outcome.task === undefined && outcome.message.startsWith('错误')) {
+      showInputError(device, new Error(outcome.message), '这条没派出去，请重说')
+    }
   }
 
   /**
-   * 解析失败 / 回复为空：按 routeQuick → 最佳卡 → 个人助手依次兜底，立刻给终态。
+   * 没有可用结论（回复空 / 不认方向）：给这一句一个终态。
    *
+   * 2026-11-11 语义路由：**不猜着派单**。本地只有握着「整名命中项目卡」这种硬工作信号时
+   * 才照旧兜底派单（与页面按钮一样的即时行为）；否则屏上问用户一次。
    * 灰区（continuity）不走这里：那条没有排队卡，仍由原来的澄清/计时器收尾。
    */
   async function fallbackCommanderReply(ask: CommanderAsk, raw: string): Promise<void> {
@@ -6370,18 +6477,42 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       log(`tihu commander continuity reply unusable text=${JSON.stringify(clipForLog(raw))}`)
       return
     }
+    if (controlHandledOf(ask.text)) {
+      stopCommanderWait()
+      log(`tihu commander fallback skipped（这句已经按屏上命令办过）text=${JSON.stringify(ask.text)}`)
+      return
+    }
+    // 这一轮指挥台自己调了工具：连「退回最佳卡」也不许把它变成派单。
+    const selfTool = commanderCalledToolForTurn(ask.turn)
+    if (selfTool !== undefined) {
+      stopCommanderWait()
+      noteControlHandled(ask.key, selfTool)
+      log(`tihu commander fallback skipped（这一轮指挥台自己调了 ${selfTool}）text=${JSON.stringify(ask.text)}`)
+      try {
+        appendTihuLaneLog(commanderSessionId ?? '-', new Error(`指挥台自己调了工具 ${selfTool} → 这句不派单（一句只有一条路由）`), 'commander-self-tool')
+      } catch { /* 日志失败不影响路由 */ }
+      return
+    }
     stopCommanderWait()
-    const reason = String(raw ?? '').trim() === '' ? '回复为空' : '回复里没有可用 JSON 结论'
-    try {
-      appendTihuLaneLog('-', new Error(`${reason}（${clipForLog(raw) || '空'}），退回 routeQuick/最佳卡`), 'commander-fallback')
-    } catch { /* 日志失败不影响兜底 */ }
-    log(`tihu commander ${reason} -> routeQuick/best-card fallback text=${JSON.stringify(ask.text)}`)
-    const device = [...devices].find((item) => item.unified)
-    // 指挥台没给结论时，规则 A 仍然优先：语义还接着上一条派单会话，就接到那条会话去。
+    const reason = String(raw ?? '').trim() === '' ? '回复为空' : '回复里没有可用结论'
+    const device = deviceOfCommanderAsk(ask)
+    // 规则 A 仍然优先：语义还接着上一条派单会话，就接到那条会话去（内容重合，不是承接词）。
     const followed = await followPreviousDispatch(device, ask.text)
     if (followed !== undefined) return
     const cards = projectCards() ?? []
     const route = routeQuick({ text: ask.text, cards, tasks: tasks.list() })
+    if (ask.kind === 'intent' && !workSignalOf(route)) {
+      try {
+        appendTihuLaneLog('-', new Error(`${reason}（${clipForLog(raw) || '空'}）：本地也没有工作信号 → 屏上问一次，不猜着派单`), 'commander-clarify')
+      } catch { /* 日志失败不影响路由 */ }
+      log(`tihu commander ${reason} text=${JSON.stringify(ask.text)} -> 问一次（不派单）`)
+      await askIntentClarify(ask, '')
+      return
+    }
+    try {
+      appendTihuLaneLog('-', new Error(`${reason}（${clipForLog(raw) || '空'}），退回 routeQuick/最佳卡`), 'commander-fallback')
+    } catch { /* 日志失败不影响兜底 */ }
+    log(`tihu commander ${reason} -> routeQuick/best-card fallback text=${JSON.stringify(ask.text)}`)
     let card: { id: string; name: string; folder?: string } | undefined
     let via = 'commander-fallback'
     let note = '指挥台没给出结论，先按最佳卡派出'
@@ -6422,6 +6553,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   function stopCommanderWait(): void {
     if (commanderWait === undefined) return
     clearInterval(commanderWait.ticker)
+    if (commanderWait.paintTimer !== undefined) clearTimeout(commanderWait.paintTimer)
     commanderWait = undefined
   }
 
@@ -6429,69 +6561,56 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   function commanderWaitFrameOf(text: string, startedAt: number): ScreenFramePayload {
     const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
     return {
-      ...noticeFrame({ stage: '派单', title: '正在看该派给谁', lines: [taskTitleOf(text, 16), `已等 ${seconds} 秒`], tone: 'busy' }),
+      // 语义路由这一屏不预设是派单：指挥台可能判成「这句话是冲这块屏说的」。
+      ...noticeFrame({ stage: '判断', title: '正在判断这句话', lines: [taskTitleOf(text, 16), `已等 ${seconds} 秒`], tone: 'busy' }),
       // 等待不设超时：必须给一个「主页」出口，用户回棋盘后判断仍在后台继续。
       actions: [{ id: 'taskBoard', label: '主页' }],
     }
   }
 
   /**
-   * 一句话刚进慢路径：**先**在棋盘上立一张排队卡（计入「●N 排队」），再投给指挥台。
-   * 投递失败也复用这张卡派出去，不会出现「屏上等半天、棋盘上什么都没有」。
+   * 进入等待：所有统一设备上「判断 · 正在判断这句话 / 已等 N 秒」，每 1 秒重画一次。
+   *
+   * 2026-11-11 语义路由：等待屏**晚一拍再画**（{@link COMMANDER_WAIT_PAINT_MS}）。
+   * 指挥台判得快（本地模型平均 1 秒内出结论）时屏上根本不动——判成控制意图的句子
+   * 不该被一块「派单中」的屏盖一下，那比不显示更糟。
+   * `waitMuted === true` 的设备（用户在这次判断期间按了「主页」）不再刷屏——判断在后台继续。
    */
-  function createCommanderPendingTask(text: string): TihuTask {
-    const task = tasks.add({
-      title: text,
-      projectId: ASSISTANT_CARD.id,
-      projectName: ASSISTANT_CARD.name,
-      preset: DISPATCH_PRESET,
-      waitingCommander: true,
-    })
-    pendingCommanderTask.set(dispatchKeyOf(text), { taskId: task.taskId, at: Date.now() })
-    refreshBoards()
-    log(`tihu commander pending task=${task.taskId} text=${JSON.stringify(text)}`)
-    return task
-  }
-
-  /**
-   * 进入等待：所有统一设备上「派单 · 正在看该派给谁 / 已等 N 秒」，每 1 秒重画一次。
-   * `onBoard === true` 的设备（用户按了「主页」）不再刷屏——判断在后台继续。
-   */
-  function beginCommanderWait(device: TihuDevice, text: string, taskId: string): void {
+  function beginCommanderWait(device: TihuDevice, text: string, taskId?: string): void {
     stopCommanderWait()
     const startedAt = Date.now()
     const key = device.sessionId ?? device.id
-    const frame = commanderWaitFrameOf(text, startedAt)
-    lastFrames.set(key, frame)
-    const targets = [...devices].filter((item) => item.unified)
-    if (targets.length === 0) targets.push(device)
-    for (const target of targets) {
-      // 新一句话要看的屏不能被上一条回执/完成页的计时抢走。
-      disarmAutoHome(target)
-      if (target.receiptTimer !== undefined) {
-        clearTimeout(target.receiptTimer)
-        target.receiptTimer = undefined
-      }
-      target.pendingPick = undefined
-      target.focusedTask = undefined
-      target.onBoard = false
-      pushFrame(target, frame)
-    }
-    const ticker = setInterval(() => {
+    for (const target of devices) target.waitMuted = false
+    const draw = (): void => {
       if (disposed || commanderWait === undefined) return
-      const next = commanderWaitFrameOf(text, startedAt)
-      // 重建指挥会话会改绑 device.sessionId：诊断用的 lastFrames 跟着新 id 走。
-      lastFrames.set(device.sessionId ?? device.id, next)
+      const frame = commanderWaitFrameOf(text, startedAt)
+      lastFrames.set(device.sessionId ?? device.id, frame)
       for (const target of devices) {
         if (!target.unified) continue
-        // 用户回棋盘了：屏幕不再被秒表抢走，判断照旧在后台跑。
-        if (target.onBoard === true) continue
-        pushFrame(target, next)
+        // 用户在这次判断期间按了「主页」：屏幕不再被秒表抢走，判断照旧在后台跑。
+        if (target.waitMuted === true) continue
+        // 新一句话要看的屏不能被上一条回执/完成页的计时抢走。
+        disarmAutoHome(target)
+        if (target.receiptTimer !== undefined) {
+          clearTimeout(target.receiptTimer)
+          target.receiptTimer = undefined
+        }
+        target.pendingPick = undefined
+        target.focusedTask = undefined
+        target.onBoard = false
+        pushFrame(target, frame)
       }
-    }, 1_000)
-    ticker.unref?.()
-    commanderWait = { text, key, taskId, startedAt, ticker }
-    log(`tihu commander wait task=${taskId} session=${commanderSessionId ?? '-'} text=${JSON.stringify(text)}`)
+    }
+    const firstTimer = setTimeout(() => {
+      draw()
+      if (disposed || commanderWait === undefined) return
+      const ticker = setInterval(draw, 1_000)
+      ticker.unref?.()
+      commanderWait.ticker = ticker
+    }, COMMANDER_WAIT_PAINT_MS)
+    firstTimer.unref?.()
+    commanderWait = { text, key, taskId, startedAt, ticker: firstTimer as unknown as ReturnType<typeof setInterval>, paintTimer: firstTimer }
+    log(`tihu commander wait session=${commanderSessionId ?? '-'} text=${JSON.stringify(text)}`)
   }
 
   /**
@@ -6504,7 +6623,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   async function fallbackCommanderDispatch(
     device: TihuDevice,
     text: string,
-    pendingTaskId: string,
+    pendingTaskId: string | undefined,
     error: unknown,
     stage: string,
   ): Promise<void> {
@@ -6516,7 +6635,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         via: 'commander-fallback',
         continuity: 'new',
         clarify: 'no',
-        reuseTaskId: pendingTaskId,
+        ...(pendingTaskId === undefined ? {} : { reuseTaskId: pendingTaskId }),
         note: '指挥台没接住，先派给个人助手',
       })
       if (task !== undefined) {
@@ -6531,42 +6650,233 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       log(`tihu commander fallback dispatch threw: ${(failure as Error)?.message ?? String(failure)}`)
     }
     // 终态：排队卡撤掉，屏上明确说没派出去（绝不静默停住）。
-    const task = tasks.get(pendingTaskId)
+    const task = pendingTaskId === undefined ? undefined : tasks.get(pendingTaskId)
     if (task !== undefined && task.state !== 'archived') {
-      tasks.drop(pendingTaskId)
+      tasks.drop(task.taskId)
       refreshBoards()
     }
     broadcastBoardSnapshot()
-    releasePendingCommanderTask(pendingTaskId)
+    if (pendingTaskId !== undefined) releasePendingCommanderTask(pendingTaskId)
     showInputError(device, error, '指挥台没接住，个人助手也没派出去，请重说')
   }
 
-  /**
-   * 慢路径：交给指挥会话判项目。2026-11-10 起**纯文本**——指挥台只回一行 JSON，
-   * lane 本地解析后派单（不要求指挥会话说挂任何工具）。
+  /* ---------- 语义路由的执行出口（2026-11-11） ----------
    *
-   * 投递后不设超时（用户拍板「一直等到判出结果」）；但 turn/end 一到就必须有终态：
-   * 解析不出来按 routeQuick/最佳卡兜底，绝不把排队卡停在「等指挥台判断」。
+   * 指挥台判成「这句话是冲这块屏说的」之后，lane 只有三种做法，而且**没有一种会派单**：
+   *   1. 模型自己调了工具 → 什么都不补（补调就是办两遍）；
+   *   2. 模型只回了文本 → 补调它点名的那个 tihu_* 工具；
+   *   3. 两可 / 工具名不成立 → 屏上问用户一次，问完也不许猜着派单。
+   *
+   * 补调与「注册给模型的那 16 个工具」用的是**同一个执行器**（createTihuToolRunner +
+   * 同一份 TIHU_TOOLS 表），所以语义工具调用和真工具调用逐字节同一条路，不存在第二套实现。
    */
-  async function askCommander(device: TihuDevice, text: string): Promise<void> {
+
+  /** 这句按「冲这块屏」办过了没有（派单入口一律拒收同一句）。 */
+  function controlHandledOf(text: string): { tool: string; at: number } | undefined {
+    const hit = controlHandled.get(dispatchKeyOf(text))
+    if (hit === undefined || Date.now() - hit.at > FALLBACK_DEDUPE_MS) return undefined
+    return hit
+  }
+
+  function noteControlHandled(key: string, tool: string): void {
+    controlHandled.set(key, { tool, at: Date.now() })
+    for (const [oldKey, hit] of controlHandled) {
+      if (Date.now() - hit.at > FALLBACK_DEDUPE_MS) controlHandled.delete(oldKey)
+    }
+  }
+
+  /** 同一句晚到的派单（JSON 结论 / dispatch 工具）不许建第二张卡：去重牌只有一张现成的。 */
+  function justDispatchedOf(text: string): { key: string; taskId: string; at: number } | undefined {
+    const hit = fallbackDispatch
+    if (hit === undefined) return undefined
+    if (hit.key !== dispatchKeyOf(text)) return undefined
+    if (Date.now() - hit.at > FALLBACK_DEDUPE_MS) return undefined
+    return hit
+  }
+
+  /**
+   * 本地握着什么才算「工作信号」：只有整名 / 文件夹命中那张项目卡这一种。
+   * 承接词命中（「接着 / 继续 / 再」）与「短句算日常」都不算——那些正是控制说法最常见的形状。
+   */
+  function workSignalOf(route: TaskRoute): boolean {
+    return route.kind === 'card' && isConfidentProjectRoute(route)
+  }
+
+  /** 这句是从哪块屏进来的（补调就补调到这块屏；认不回来就让控制面按「最近活跃的那台」挑）。 */
+  function deviceOfCommanderAsk(ask: CommanderAsk): TihuDevice | undefined {
+    if (ask.device !== undefined) {
+      const direct = [...devices].find((item) => item.id === ask.device)
+      if (direct !== undefined) return direct
+    }
+    return [...devices].find((item) => item.unified)
+  }
+
+  /** 指挥会话的 tool/call：只认工具注册表里的名字（这是**工具名单**，不是用户说法词表）。 */
+  function noteCommanderToolCall(turn: number | undefined, rawName: unknown): void {
+    const name = String(rawName ?? '').trim()
+    if (!TIHU_TOOL_NAME_LIST.some((tool) => tool.toLowerCase() === name.toLowerCase()) || name === '') return
+    const key = turn ?? 0
+    const rows = commanderToolCalls.get(key) ?? []
+    rows.push(name)
+    commanderToolCalls.set(key, rows)
+    if (commanderToolCalls.size > 64) {
+      const keep = [...commanderToolCalls.keys()].sort((a, b) => a - b).slice(-32)
+      for (const oldKey of [...commanderToolCalls.keys()]) if (!keep.includes(oldKey)) commanderToolCalls.delete(oldKey)
+    }
+    log(`tihu semantic control 指挥台自己调了 ${name} turn=${key}`)
+  }
+
+  function commanderCalledToolForTurn(turn: number | undefined): string | undefined {
+    if (turn === undefined) return undefined
+    const rows = commanderToolCalls.get(turn)
+    if (rows === undefined || rows.length === 0) return undefined
+    return rows[0]
+  }
+
+  /** 与注册给模型的工具同一个执行器（补调没有第二套实现）。 */
+  function registeredToolRunner(): ReturnType<typeof createTihuToolRunner> {
+    const runner = runRegisteredTihuTool
+    if (runner === undefined) throw new Error('控制面还没建起来（tihu 运行时内部顺序不对）')
+    return runner
+  }
+
+  /** 补调办完之后那一行屏上回执（工具文案首句，长文案不整个念出来）。 */
+  function showControlOutcome(device: TihuDevice, tool: string, result: string): void {
+    const line = String(result ?? '').split('\n')[0] ?? ''
+    log(`tihu semantic control tool=${tool} 结果=${JSON.stringify(clipForLog(result))}`)
+    device.send('event.progress', { stage: '屏上命令', text: clipScreenBullet(line, 40) } satisfies ProgressPayload)
+  }
+
+  /** 语义判成控制意图：执行它点名的工具（模型没调就补调）。这一句绝不派单。 */
+  async function runCommanderControl(ask: CommanderAsk, decision: Extract<CommanderDecision, { kind: 'control' }>): Promise<void> {
+    stopCommanderWait()
+    clearGrayFallback()
+    const device = deviceOfCommanderAsk(ask)
+    const called = commanderCalledToolForTurn(ask.turn)
+    if (called !== undefined) {
+      noteControlHandled(ask.key, called)
+      log(`tihu semantic control text=${JSON.stringify(ask.text)} 模型已自调 ${called} -> 不补调、不派单`)
+      return
+    }
+    const args: Record<string, unknown> = { ...(decision.args ?? {}) }
+    if (device !== undefined && args.deviceId === undefined) args.deviceId = device.id
+    try {
+      const result = await registeredToolRunner()(decision.tool, args, { sessionId: commanderSessionId })
+      noteControlHandled(ask.key, decision.tool)
+      try {
+        appendTihuLaneLog(commanderSessionId ?? '-', new Error(`指挥台语义结论=控制意图 工具=${decision.tool} 这句=${JSON.stringify(clipForLog(ask.text))}`), 'commander-control')
+      } catch { /* 日志失败不影响路由 */ }
+      if (device !== undefined) showControlOutcome(device, decision.tool, result)
+    } catch (error) {
+      // 工具自己拒了（没在念 / 没有可看的任务 / 设备不在线…）：认这个结论，照样不派单。
+      noteControlHandled(ask.key, decision.tool)
+      log(`tihu semantic control tool=${decision.tool} failed: ${(error as Error)?.message ?? String(error)}`)
+      try { appendTihuLaneLog(commanderSessionId ?? '-', error, 'commander-control-failed') } catch { /* 日志失败不影响路由 */ }
+      if (device !== undefined) showInputError(device, error, '这句是屏上命令，没办成（没有派单）')
+    }
+  }
+
+  /** 两可 / 工具名不成立 → 屏上问一次（同一句只问一次；问过也不猜着派单）。 */
+  async function askIntentClarify(ask: CommanderAsk, question: string): Promise<void> {
+    stopCommanderWait()
+    clearGrayFallback()
+    const askedAt = clarifyAsked.get(ask.key)
+    const alreadyAsked = askedAt !== undefined && Date.now() - askedAt < CLARIFY_ONCE_MS
+    if (!alreadyAsked) clarifyAsked.set(ask.key, Date.now())
+    for (const [oldKey, at] of clarifyAsked) {
+      if (Date.now() - at > CLARIFY_ONCE_MS) clarifyAsked.delete(oldKey)
+    }
+    const device = deviceOfCommanderAsk(ask)
+    const targets = [...devices].filter((item) => item.unified)
+    if (targets.length === 0 && device !== undefined) targets.push(device)
+    if (targets.length === 0) {
+      // 没有任何屏可问：宁可丢掉这句，也不猜着派单。
+      log(`tihu semantic clarify 没有可问的屏，这句不派单 text=${JSON.stringify(ask.text)}`)
+      return
+    }
+    const frame = intentClarifyFrame({ text: ask.text, question, alreadyAsked })
+    for (const target of targets) {
+      disarmAutoHome(target)
+      if (target.receiptTimer !== undefined) {
+        clearTimeout(target.receiptTimer)
+        target.receiptTimer = undefined
+      }
+      target.pendingPick = undefined
+      target.pendingClarify = undefined
+      target.focusedTask = undefined
+      target.onBoard = false
+      target.pendingIntent = { text: ask.text, question, key: ask.key }
+      lastFrames.set(target.sessionId ?? target.id, frame)
+      pushFrame(target, frame)
+    }
+    pushTaskNotify(undefined, 0, alreadyAsked ? '这句判不准，请重说' : `这句两可，先问一句：${ask.text}`)
+    if (intentClarifyTimer !== undefined) clearTimeout(intentClarifyTimer)
+    const timer = setTimeout(() => {
+      intentClarifyTimer = undefined
+      if (disposed) return
+      for (const item of devices) {
+        const pending = item.pendingIntent
+        if (pending === undefined) continue
+        item.pendingIntent = undefined
+        // 没答：按「先不管」收掉，绝不猜着派单。
+        log(`tihu semantic clarify 没答，这句不派单 text=${JSON.stringify(pending.text)}`)
+        void runScreenCommand(item, { kind: 'board' })
+      }
+    }, tihuClarifyMs())
+    timer.unref?.()
+    intentClarifyTimer = timer
+    log(`tihu semantic clarify text=${JSON.stringify(ask.text)} 已问过=${alreadyAsked}`)
+  }
+
+  /** 用户答了澄清屏那一问：1＝派它干活（按本地规则派），2＝先不管（这句丢掉）。 */
+  async function resolveIntentClarify(device: TihuDevice, choice: 'work' | 'skip'): Promise<void> {
+    const pending = device.pendingIntent
+    if (pending === undefined) return
+    device.pendingIntent = undefined
+    if (intentClarifyTimer !== undefined) {
+      clearTimeout(intentClarifyTimer)
+      intentClarifyTimer = undefined
+    }
+    if (choice === 'skip') {
+      log(`tihu semantic clarify 用户选「先不管」，这句不派单 text=${JSON.stringify(pending.text)}`)
+      await runScreenCommand(device, { kind: 'board' })
+      return
+    }
+    const cards = projectCards() ?? []
+    const route = routeQuick({ text: pending.text, cards, tasks: tasks.list() })
+    const card = route.kind === 'card' ? route.card : (bestCardMatchOf(pending.text, cards) ?? ASSISTANT_CARD)
+    log(`tihu semantic clarify 用户选「干活」，按最佳卡派出 text=${JSON.stringify(pending.text)} project=${card.id}`)
+    await dispatchWithContinuity(device, pending.text, card, { via: 'clarified-work' }, { allowCommander: false })
+  }
+
+  /**
+   * 慢路径：交给指挥会话**按语义**判这一句（2026-11-11：这一问不再先立排队卡）。
+   *
+   * 指挥台回一行结论（派单 / 控制 / 澄清），lane 按它执行：
+   * - 判成工作 → 这时才建任务卡、派单；
+   * - 判成控制 → 执行它点名的 tihu_* 工具，不建任务也不建会话；
+   * - 判成两可 → 屏上问用户一次。
+   *
+   * 投递后不设超时（用户拍板「一直等到判出结果」）；turn/end 一到必须有终态。
+   */
+  async function askCommander(device: TihuDevice, text: string, options: { kind?: 'intent' | 'project' } = {}): Promise<void> {
     device.unified = true
     stopCommanderWait()
-    // 先上棋盘：排队卡在投递之前就存在（用户要求：立刻计入「●N 排队」）。
-    const pending = createCommanderPendingTask(text)
     const key = dispatchKeyOf(text)
+    const kind = options.kind ?? 'intent'
     try {
       const commander = await ensureCommanderSession()
       if (commander === undefined) {
-        await fallbackCommanderDispatch(device, text, pending.taskId, new Error('会话新建失败：宿主 sessionController 不可用'), 'ensure')
+        await fallbackCommanderDispatch(device, text, undefined, new Error('会话新建失败：宿主 sessionController 不可用'), 'ensure')
         return
       }
-      beginCommanderWait(device, text, pending.taskId)
+      beginCommanderWait(device, text)
       // 先登记再投递：assistant/message 可能抢在 prompt() 返回前到达。
       pushCommanderAsk({
         key,
         text,
-        kind: 'project',
-        taskId: pending.taskId,
+        kind,
+        device: device.id,
         via: 'commander',
         askedAt: Date.now(),
       })
@@ -6577,12 +6887,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (!sent.ok) {
         // 只有投递本身出错才兜底；投递成功就等，没有计时器。
         dropCommanderAsk(key)
-        await fallbackCommanderDispatch(device, text, pending.taskId, sent.error, 'prompt')
+        await fallbackCommanderDispatch(device, text, undefined, sent.error, 'prompt')
       }
     } catch (error) {
-      // 任何意外异常也要有终态（排队卡撤掉 + 错误屏），不能让设备静默停在等待。
+      // 任何意外异常也要有终态（错误屏），不能让设备静默停在等待。
       dropCommanderAsk(key)
-      await fallbackCommanderDispatch(device, text, pending.taskId, error, 'exception')
+      await fallbackCommanderDispatch(device, text, undefined, error, 'exception')
     }
   }
 
@@ -6741,6 +7051,22 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     // 屏上命令、任务标题、派单文本都不再带「你好，鹈鹕」。
     const value = stripWakeWord(String(text ?? ''))
     if (value === '') return
+    // 语义两可的追问待答：只认「一 / 二」这两格（与澄清屏一个规矩）。
+    // 说了别的一律按新的一句重新判——原来那句绝不猜着派单。
+    if (device.pendingIntent !== undefined) {
+      const index = chineseIndex(value)
+      if (index === 1 || index === 2) {
+        await resolveIntentClarify(device, index === 1 ? 'work' : 'skip')
+        return
+      }
+      const dropped = device.pendingIntent
+      device.pendingIntent = undefined
+      if (intentClarifyTimer !== undefined) {
+        clearTimeout(intentClarifyTimer)
+        intentClarifyTimer = undefined
+      }
+      log(`tihu semantic clarify 用户说了别的，原来那句不猜着派单 text=${JSON.stringify(dropped.text)}`)
+    }
     // 会话衔接澄清待答：「一/二」「新建/接着」立刻派；说了别的就先把原来那句按新建派出去。
     if (device.pendingClarify !== undefined) {
       const choice = clarifyChoiceOf(value)
@@ -6771,6 +7097,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       await answerDirect(device, value)
       return
     }
+    /* 屏上命令快速通道：留着它，只是它现在**等于页面按钮**（零模型、即时），
+     * 它是兜底不是唯一入口——命中不了的说法一律往下走，让指挥台按意思判。
+     * 命中它的那几种说法照旧立刻办，别的控制说法（说法千奇百怪）也不会因为它失效。 */
     const command = parseScreenCommand(value)
     if (command !== undefined) {
       await runScreenCommand(device, command)
@@ -6803,18 +7132,20 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       await dispatchWithContinuity(device, value, route.card, { via: route.via ?? 'card' }, { allowCommander: true })
       return
     }
-    if (route.kind === 'append') {
-      await appendToTask(device, route.task, value)
-      return
-    }
-    if (route.kind === 'daily') {
-      // 规则 A 同样管「判成日常」这一支：上一句在别的项目里，也先看过线没有。
-      const followed = await followPreviousDispatch(device, value, ASSISTANT_CARD.id)
+    if (route.kind === 'append' || route.kind === 'daily') {
+      /*
+       * 2026-11-11 语义路由：这两支的结论只来自「接着 / 继续 / 再」这类承接词或短句形状，
+       * 它们**都可能**是冲这块屏说的（「再来一遍」＝重念、「继续」＝接着念），所以不能直接派单。
+       * 但「接着上一条派单任务」有一条本地唯一有把握的证据：**内容与上一条派单重合**
+       * （规则 A，ledger 里的上一条任务，不认任何词表）。重合就接回那条会话；
+       * 不重合才交给指挥台按意思判——判成活儿才派单，判成控制就办屏上那件事。
+       */
+      const followed = await followPreviousDispatch(device, value)
       if (followed !== undefined) {
         reportFollowFailure(device, followed)
         return
       }
-      await dispatchWithContinuity(device, value, ASSISTANT_CARD, { via: 'daily' }, { allowCommander: true })
+      await askCommander(device, value)
       return
     }
     if (route.kind === 'ambiguous') {
@@ -7632,6 +7963,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         log(`tihu dispatch skipped duplicate text=${JSON.stringify(text)} task=${fallbackDispatch.taskId || '-'}`)
         return `这条刚刚已经派成任务 ${fallbackDispatch.taskId} 了，不用再派一次。`
       }
+      // 同一句只允许一条路由：指挥台判成「冲这块屏说的」并办过的句子，派单入口拒收。
+      const handled = controlHandledOf(text)
+      if (handled !== undefined) {
+        log(`tihu dispatch skipped（这句已按屏上命令办过 tool=${handled.tool}）text=${JSON.stringify(text)}`)
+        return `这句话已经按屏上命令办过（${handled.tool}），没有派单，也不用再派一次。`
+      }
       let card: { id: string; name: string; folder?: string } | undefined
       const folderHint = String(input.folder ?? '').trim()
       if (folderHint !== '') {
@@ -7710,6 +8047,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     },
   }
 
+  // 语义补调与模型自己调工具都从这个执行器走：TIHU_TOOLS 那一份表就是它们的定义表。
+  runRegisteredTihuTool = createTihuToolRunner(control)
+
   return {
     control,
     page: () => tihuPageHtml({ lanePath: TIHU_LANE_PATH, protocol: TIHU_PROTOCOL_VERSION }),
@@ -7723,9 +8063,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       pendingCommanderTask.clear()
       commanderAsks.length = 0
       commanderTurnReplied.clear()
+      commanderToolCalls.clear()
+      controlHandled.clear()
       clearGrayFallback()
       clearClarifyPrompt()
       fallbackDispatch = undefined
+      runRegisteredTihuTool = undefined
       if (childReconcileTimer !== undefined) clearInterval(childReconcileTimer)
       childReconcileTimer = undefined
       deferredReplies.clear()
