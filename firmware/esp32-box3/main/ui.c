@@ -14,8 +14,10 @@
 
 #include "config.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "bsp/esp-box-3.h"
+#include "tihu_charset.h"
 #include "tihu_net.h"
 
 LV_FONT_DECLARE(tihu_font_20)
@@ -262,17 +264,124 @@ static void ui_label_report(lv_obj_t *parent, int depth, int *index, int *missin
     }
 }
 
+/* 把码点写成 UTF-8；日志和抽查字符串用得到。 */
+static size_t utf8_encode(uint32_t cp, char *out)
+{
+    if (cp < 0x80u) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800u) {
+        out[0] = (char)(0xC0u | (cp >> 6));
+        out[1] = (char)(0x80u | (cp & 0x3Fu));
+        return 2;
+    }
+    if (cp < 0x10000u) {
+        out[0] = (char)(0xE0u | (cp >> 12));
+        out[1] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        out[2] = (char)(0x80u | (cp & 0x3Fu));
+        return 3;
+    }
+    out[0] = (char)(0xF0u | (cp >> 18));
+    out[1] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+    out[2] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+    out[3] = (char)(0x80u | (cp & 0x3Fu));
+    return 4;
+}
+
+/* 字库实际能画出字符表里多少个码位（0 表示整表覆盖）。 */
+static unsigned font_coverage(const lv_font_t *font)
+{
+    unsigned hit = 0;
+    for (uint32_t i = 0; i < TIHU_CHARSET_COUNT; i++) {
+        lv_font_glyph_dsc_t dsc = {0};
+        if (lv_font_get_glyph_dsc(font, &dsc, tihu_charset_cps[i], 0)) {
+            hit++;
+        }
+    }
+    return hit;
+}
+
+static void missing_append(char *buf, size_t cap, size_t *used, uint32_t cp)
+{
+    char one[5] = {0};
+    size_t len = utf8_encode(cp, one);
+    if (*used + len < cap) {
+        memcpy(buf + *used, one, len);
+        *used += len;
+        buf[*used] = '\0';
+    }
+}
+
+/*
+ * 完成页正文是宿主任意的中文，固定文案全命中不代表够用。随机抽 50 个字，
+ * 两套字库都要取得到字形——缺字在屏上就是空心方框，只有抽查能提前发现。
+ */
+static bool ui_font_random_probe(const lv_font_t *a, const lv_font_t *b)
+{
+    enum { SAMPLES = 50 };
+    uint16_t picked[SAMPLES];
+    int n = 0;
+    while (n < SAMPLES) {
+        uint16_t cp = tihu_charset_cps[esp_random() % TIHU_CHARSET_COUNT];
+        bool dup = false;
+        for (int i = 0; i < n; i++) {
+            if (picked[i] == cp) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            picked[n++] = cp;
+        }
+    }
+
+    char text[SAMPLES * 4 + 1];
+    size_t used = 0;
+    char miss_a[64] = {0};
+    char miss_b[64] = {0};
+    size_t used_a = 0;
+    size_t used_b = 0;
+    for (int i = 0; i < n; i++) {
+        used += utf8_encode(picked[i], text + used);
+        lv_font_glyph_dsc_t dsc = {0};
+        if (!lv_font_get_glyph_dsc(a, &dsc, picked[i], 0)) {
+            missing_append(miss_a, sizeof(miss_a), &used_a, picked[i]);
+        }
+        dsc = (lv_font_glyph_dsc_t){0};
+        if (!lv_font_get_glyph_dsc(b, &dsc, picked[i], 0)) {
+            missing_append(miss_b, sizeof(miss_b), &used_b, picked[i]);
+        }
+    }
+    text[used] = '\0';
+
+    bool ok = used_a == 0 && used_b == 0;
+    ESP_LOGI(TAG, "字形抽查 50 字（随机）：%s", text);
+    if (ok) {
+        ESP_LOGI(TAG, "字形抽查 PASS：50/50 在 tihu_font_20 与 tihu_font_15 都能取到字形");
+    } else {
+        ESP_LOGE(TAG, "字形抽查 FAIL：tihu_font_20 缺「%s」，tihu_font_15 缺「%s」",
+                 miss_a, miss_b);
+    }
+    return ok;
+}
+
 static void ui_font_selftest(lv_obj_t *root)
 {
     const lv_font_t *fonts[2] = {&tihu_font_20, &tihu_font_15};
     for (int i = 0; i < 2; i++) {
         const lv_font_t *font = fonts[i];
         const lv_font_fmt_txt_dsc_t *dsc = font_txt_dsc(font);
-        ESP_LOGI(TAG, "字库 %s：line_height=%d base_line=%d bpp=%d bitmap_format=%s "
-                      "cmap_num=%d；编译期 LV_USE_FONT_COMPRESSED=%d",
-                 font_name(font), (int)font->line_height, (int)font->base_line,
-                 font_bpp(font), font_bitmap_format(font),
-                 dsc != NULL ? (int)dsc->cmap_num : -1, (int)LV_USE_FONT_COMPRESSED);
+        unsigned covered = font_coverage(font);
+        /* 规模按「字库实际能画多少字」报，不按生成表里的行数报。 */
+        ESP_LOGI(TAG, "字库 %s：%u 字，bpp=%d，%s，line_height=%d（GB2312 全集 %u 码位 + 生僻补充，覆盖 %u/%u）",
+                 font_name(font), covered, font_bpp(font), font_bitmap_format(font),
+                 (int)font->line_height, (unsigned)TIHU_CHARSET_COUNT, covered,
+                 (unsigned)TIHU_CHARSET_COUNT);
+        if (covered < TIHU_CHARSET_COUNT) {
+            ESP_LOGE(TAG, "字库 %s 覆盖不全：还差 %u 个字（生成字符表与 .c 不一致？）",
+                     font_name(font), (unsigned)(TIHU_CHARSET_COUNT - covered));
+        }
         if (dsc != NULL && dsc->bitmap_format != LV_FONT_FMT_TXT_PLAIN &&
             LV_USE_FONT_COMPRESSED == 0) {
             ESP_LOGE(TAG, "字库 %s 的位图是压缩格式，但固件没开 LV_USE_FONT_COMPRESSED："
@@ -290,6 +399,10 @@ static void ui_font_selftest(lv_obj_t *root)
         ESP_LOGE(TAG, "字形断言失败：「鹈」不在 tihu_font_20 里，标题「鹈鹕 BOX-3B」必是空心方框");
     }
     assert(has);
+
+    /* 完成页正文是宿主任意中文，固定文案全命中也不代表够用：随机抽 50 个字，
+     * 两套字库都必须取得到字形。 */
+    ui_font_random_probe(&tihu_font_20, &tihu_font_15);
 
     int index = 0;
     int missing = 0;
