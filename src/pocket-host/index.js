@@ -21,8 +21,9 @@ import { createPocketService } from './service.mjs';
 import { acquirePocketRuntime, releasePocketRuntime } from './runtime.mjs';
 import { installPocketRpc } from './web-rpc.js';
 import { restartHost } from './restart.js';
-import { createTihuRuntime } from '../tihu/lane.ts';
+import { createTihuRuntime, appendTihuLaneNote } from '../tihu/lane.ts';
 import { registerTihuControl } from '../tihu/control.ts';
+import { createTihuDiscoveryResponder, TIHU_DISCOVER_PORT } from './tihu-discovery.mjs';
 import { advancedNoticeScript, DEFAULT_INJECT, classifyHost } from './proxy.mjs';
 import { lanEnabled, setLanEnabled, lanAuthEnabled, setLanAuthEnabled, lanIpOverride, setLanIpOverride, pinCustom, setPinCustom, tunnelMode, setTunnelMode, tunnelToken, setTunnelToken, tunnelHostname, setTunnelHostname, resetSettings, proxyPort, cloudflaredPath, sshTunnelConfig, setSshTunnelConfig, ensureFirstRunSettings } from './settings.mjs';
 
@@ -452,6 +453,31 @@ export function apply(ctx, config = {}, internals = {}) {
 
   const disposers = [];
   if (tihuRuntime) disposers.push(() => tihuRuntime?.dispose());
+
+  // 鹈鹕设备发现响应器（UDP 3082）：设备换 Wi-Fi 后靠广播找到本机，不再写死 IP。
+  // 只回一句 `TIHU_HOST <本机局域网IP> <3081> <局域网PIN>`；收到的请求与回包都进 lane.log
+  // （note=tihu-discover），出问题只看日志就能判断是「没收到广播」还是「回了但设备连不上」。
+  // 独立于 lane 起停：lane 挂载失败也照样能让设备发现到宿主（只是随后 WS 连不上）。
+  const discovery = createTihuDiscoveryResponder({
+    port: TIHU_DISCOVER_PORT,
+    getToken: () => getLanToken(),
+    getLanePort: () => internals.port ?? config.port ?? (proxyPort() || 3081),
+    log: (line) => {
+      try { appendTihuLaneNote('tihu-discover', line) } catch { /* 日志失败不影响发现 */ }
+      try { (logger.info ?? logger.log).call(logger, `dsh-pocket: tihu discover ${line}`); } catch { /* 忽略 */ }
+    },
+  });
+  try {
+    if (discovery.start()) {
+      logger.info(`dsh-pocket: tihu discovery listening on udp ${TIHU_DISCOVER_PORT} | 鹈鹕设备发现已监听`);
+    } else {
+      logger.warn(`dsh-pocket: tihu discovery not started | 鹈鹕发现响应器未启动（UDP ${TIHU_DISCOVER_PORT} 可能被占用）`);
+    }
+  } catch (error) {
+    logger.warn(`dsh-pocket: tihu discovery disabled | 鹈鹕发现响应器失败: ${error?.message ?? error}`);
+  }
+  disposers.push(() => { try { discovery.stop() } catch { /* 忽略 */ } });
+
   const disposeRpc = installPocketRpc(ctx, {
     service,
     desktop: isDesktop,

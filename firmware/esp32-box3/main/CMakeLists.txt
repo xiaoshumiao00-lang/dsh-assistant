@@ -7,6 +7,9 @@ idf_component_register(
     SRCS
         "main.c"
         "tihu_net.c"
+        "tihu_wifi.c"
+        "tihu_provision.c"
+        "tihu_discover.c"
         "tihu_protocol.c"
         "tihu_audio.c"
         "tihu_touch.c"
@@ -25,12 +28,16 @@ idf_component_register(
         esp_wifi
         esp_netif
         esp_event
+        esp_timer
+        # 配网页用的是 IDF 自带的 esp_http_server（不引额外组件）
+        esp_http_server
+        # UDP 广播发现用 lwIP BSD socket（lwip/sockets.h）
+        lwip
         json
         mbedtls
         nvs_flash
-        esp_timer
         # GT911 触摸：BSP 只在**私有**依赖里带 esp_lcd_touch，不会传给 main，
-        # 所以 tihu_touch.c 里用 esp_lcd_panel_io_rx_param/esp_lcd_touch_* 必须在这里显式声明。
+        # 所以 tihu_touch.c 里用 esp_lcd_touch_read_data 必须在这里显式声明。
         espressif__esp_lcd_touch
         espressif__esp-box-3
 )

@@ -1,29 +1,51 @@
 /**
  * 鹈鹕设备固件配置（ESP32-S3-BOX-3B）。
  *
- * 这个文件就是「上机前唯一要改的地方」：Wi-Fi、宿主地址、令牌。
- * 令牌就是本机 pocket 的局域网访问 PIN（打开 /tihu 时 URL 里的 ?token=...）。
- *
- * 注意：127.0.0.1 在板子上指向板子自己，必须填电脑在局域网里的 IPv4 地址。
+ * 现在只有**令牌**是编译期必填的；Wi-Fi 与宿主地址都可以留空：
+ *   - Wi-Fi 留空 → 只用 NVS 里记住的网络（换地方在配网页里加，不用重刷固件）；
+ *   - 宿主留空 → 开机先 UDP 广播发现，发现失败再退回 NVS 里上次成功的地址。
+ * 真需要调参时才动「强制 host」那两行。
  */
 #pragma once
 
 /* ---------- 必填 ---------- */
 
-/** 2.4 GHz Wi-Fi 名称（ESP32-S3 不支持 5 GHz）。 */
-#define TIHU_WIFI_SSID      "YOUR_WIFI_SSID"
+/** pocket 的局域网 PIN；不需要鉴权时留空字符串。UDP 发现会带回宿主当前令牌，这里只是兜底。 */
+#define TIHU_TOKEN          "96528673"
 
-/** Wi-Fi 密码；开放网络留空字符串。 */
-#define TIHU_WIFI_PASSWORD  "YOUR_WIFI_PASSWORD"
+/* ---------- Wi-Fi：可留空（留空 = 完全用 NVS 记忆 + 配网热点） ---------- */
 
-/** 电脑（DSH 宿主）在局域网里的 IPv4，例如 "192.168.1.23"。 */
-#define TIHU_HOST           "192.168.1.23"
+/**
+ * 编译期种子 SSID：留空字符串就完全不写死。
+ * 非空时只在「NVS 里还没有这条」时补写一次，之后一律以 NVS 为准——
+ * 所以换地方以后即使这里还留着老 SSID，也不会盖掉配网页新加的网络。
+ */
+#define TIHU_WIFI_SSID      ""
+
+/** 上面那条种子 SSID 的密码；开放网络留空字符串。 */
+#define TIHU_WIFI_PASSWORD  ""
+
+/* ---------- 宿主地址：可留空（留空 = UDP 发现 → NVS 上次成功地址） ---------- */
+
+/** 写死的宿主 IPv4，例如 "192.168.1.23"。留空字符串 = 全部靠发现/NVS。 */
+#define TIHU_HOST           ""
 
 /** pocket 代理端口，默认 3081。 */
 #define TIHU_PORT           3081
 
-/** pocket 的局域网 PIN；不需要鉴权时留空字符串。 */
-#define TIHU_TOKEN          "YOUR_LAN_PIN"
+/**
+ * 强制 host 开关（调试用）：1 = 完全不发 UDP 发现，直接用上面的 TIHU_HOST。
+ * 必须配合非空的 TIHU_HOST；两个都空时这个开关无效（会打一条警告）。
+ */
+#define TIHU_FORCE_HOST     0
+
+/* ---------- 配网热点 ---------- */
+
+/** 热点名固定前缀，后面自动接 MAC 后 4 位：Pelican-Setup-<XXXX>。 */
+#define TIHU_SETUP_AP_PREFIX "Pelican-Setup-"
+
+/** 配网热点密码（≥8 位；改这里就换密码）。留空 = 开放热点（不推荐）。 */
+#define TIHU_SETUP_AP_PASSWORD "pelican123"
 
 /* ---------- 设备身份 ---------- */
 
@@ -31,7 +53,7 @@
 #define TIHU_DEVICE_NAME    "鹈鹕 BOX-3B"
 
 /** 固件版本，只进 hello 日志。 */
-#define TIHU_FIRMWARE_VERSION "0.1.0"
+#define TIHU_FIRMWARE_VERSION "0.2.0"
 
 /* ---------- 可选：音频 ---------- */
 
@@ -52,5 +74,5 @@
 /** 这么久没收到任何下行就主动断开重连（毫秒）。 */
 #define TIHU_RX_TIMEOUT_MS    60000
 
-/** Wi-Fi 断开后重连间隔（毫秒）。 */
-#define TIHU_WIFI_RETRY_MS    3000
+/** 一个候选网络最多等多久拿到 IP（毫秒）。密码错/根本不在时 12 秒足够下结论。 */
+#define TIHU_WIFI_TRY_TIMEOUT_MS 12000

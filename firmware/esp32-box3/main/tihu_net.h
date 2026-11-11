@@ -20,6 +20,11 @@ void tihu_net_send_wav(const uint8_t *wav, size_t len);
 /** 发 screen.gesture{tap}；返回是否真的写进了 WebSocket（失败会在串口打日志）。 */
 bool tihu_net_send_tap(int x, int y, const char *hit,
                        const char *action_id, const char *task_id);
+/**
+ * 开机自检窗口：打开后，这期间收到的每一条下行（tts.audio 除外）都往串口写一行
+ * `自检回执 type=...`，用来证明设备发的 screen.gesture 宿主真的收到了并回了包。
+ */
+void tihu_net_watch_selftest(bool on);
 void tihu_net_send_session_end(const char *reason);
 void tihu_net_send_ack(const char *op_id, bool ok, const char *reason,
                        const char *stage, int screen_version);
