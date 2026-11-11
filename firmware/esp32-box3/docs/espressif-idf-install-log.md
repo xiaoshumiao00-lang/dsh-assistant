@@ -469,3 +469,48 @@ I (17467) tihu_net: 忽略未知下行 type=task.list
 会写入 **BOM**，kconfig 用 GBK 读文件时直接报
 `UnicodeDecodeError: 'gbk' codec can't decode byte 0xbf in position 2`，编译直接失败。
 改 `sdkconfig` 要用 `[System.IO.File]::WriteAllText($f,$text,(New-Object System.Text.UTF8Encoding($false)))`。
+
+## 10. 真机中文全是空心方框（2026-11-11 16:55–17:20，已烧 COM3 验证）
+
+**现象的两种可能，这次都不是**：`ui.c / ui_board.c / ui_progress.c / ui_done.c` 里所有
+`lv_label_create` 都只在 `tihu_ui_label()` 一处，函数里必然 `lv_obj_set_style_text_font(...)`，
+没有任何 label 落在 `LV_FONT_DEFAULT`/`lv_font_montserrat_14`；字库 cmap 也把屏上要的
+汉字全收了（`鹈` U+9E48 在 20px/15px 里都有）。
+
+**根因是字模的存储格式**：`tools/gen_font_subset.cjs` 调 `lv_font_conv` 的 JS API 时没传
+`no_compress`，默认生成的就是 RLE 压缩位图（`.bitmap_format = 1`）；而 `sdkconfig` 里
+`CONFIG_LV_USE_FONT_COMPRESSED` 没开。于是：
+
+1. `lv_font_get_glyph_dsc_fmt_txt()` 照常命中（字形描述、adv_w、box 都在），排版因此完全正常；
+2. `lv_font_get_bitmap_fmt_txt()` 走进 `#else /*!LV_USE_FONT_COMPRESSED*/` 分支 `return NULL`；
+3. `lv_draw_label.c` 里 `dsc->format = dsc->glyph_data ? g.format : LV_FONT_GLYPH_FORMAT_NONE`；
+4. `LV_USE_FONT_PLACEHOLDER=y` 把 FORMAT_NONE 画成 **1px 空心边框**——就是照片里的方框。
+
+一句话：**不是没设字体，也不是缺字，是压缩字库没配解压器。**
+
+**改法**
+
+| 位置 | 改动 |
+| --- | --- |
+| `tools/gen_font_subset.cjs:102` | 加 `no_compress: true`（等价 CLI `--no-compress`），`opts_string` 同步写上 `--no-compress` |
+| `main/font/tihu_font_20.c` / `tihu_font_15.c` | 重新生成：`.bitmap_format = 0`(PLAIN)、`.bpp = 4`、字形数 1073、cmap 32+95 / 183+65327 |
+| `sdkconfig.defaults:46` + `sdkconfig` | `CONFIG_LV_USE_FONT_COMPRESSED=y`：以后万一又烧进压缩字库也能解，不会再静默画方框 |
+| `main/ui.c:114-300` | 新增字体自检：打印两套字库的 bpp/bitmap_format/cmap_num、逐个 label 打印实际生效字体名与缺字、对「鹈」做 `lv_font_get_glyph_dsc` + `assert` |
+| `main/ui.c:515` | `tihu_ui_init()` 里 unlock 前调 `ui_font_selftest(scr)` |
+| `tools/check_font_chars.cjs`（新增） | 离线核对：解析字体 .c 的 cmap，扫四个 ui 源文件里的屏幕上文案（跳过 ESP_LOG），缺字退出码 1 |
+
+**实测串口**（`idf.py -p COM3 flash` 后冷复位抓 26 s，节选）
+
+```
+I (2038) tihu_ui: 字库 tihu_font_20：line_height=21 base_line=4 bpp=4 bitmap_format=PLAIN cmap_num=2；编译期 LV_USE_FONT_COMPRESSED=1
+I (2041) tihu_ui: 字库 tihu_font_15：line_height=17 base_line=3 bpp=4 bitmap_format=PLAIN cmap_num=2；编译期 LV_USE_FONT_COMPRESSED=1
+I (2054) tihu_ui: 字形断言：「鹈」U+9E48 in tihu_font_20 = 存在（box=20x19 adv=20）
+I (2221) tihu_ui: label #19 标题 font=tihu_font_20 bpp=4 字数=9 缺字=0 text="鹈鹕 BOX-3B"
+I (2240) tihu_ui: label #21 标题 font=tihu_font_20 bpp=4 字数=12 缺字=0 text="按住 CONFIG 说话"
+I (2372) tihu_ui: label #36 正文 font=tihu_font_15 bpp=4 字数=2 缺字=0 text="重读"
+I (2409) tihu_ui: 字体自检 PASS：39 个 label 全部命中字库（20=标题 / 15=正文）
+```
+
+**下次再看到方框，只看两行**：`bitmap_format=` 是不是 PLAIN，以及 `字体自检` 是不是 PASS。
+若 `bitmap_format=COMPRESSED` 而 `LV_USE_FONT_COMPRESSED=0`，日志里会直接
+`E tihu_ui: 字库 ... 位图是压缩格式，但固件没开 LV_USE_FONT_COMPRESSED ...`。

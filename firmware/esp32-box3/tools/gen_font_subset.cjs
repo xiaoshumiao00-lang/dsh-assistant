@@ -94,8 +94,14 @@ console.log(`输出目录 : ${outDir}`);
       lv_font_name: name,
       force_fast_kern_format: true,
       output,
+      // 关键：不压缩位图（等价 CLI 的 --no-compress）。
+      // lv_font_conv 默认会把 4bpp 位图压成 RLE 变体并写 .bitmap_format = 1，
+      // 而 .bitmap_format = 1 只有开了 LV_USE_FONT_COMPRESSED 的固件才解得开；
+      // 没开时 lv_font_get_bitmap_fmt_txt 直接返回 NULL，LVGL 就按「缺字形」
+      // 在屏上画 1px 空心方框（2026-11-11 真机中文全方框就是这个）。
+      no_compress: true,
       // 只影响生成的注释行，保持 ASCII 便于排查。
-      opts_string: `--size ${size} --bpp 4 --format lvgl --symbols <chars.txt>`,
+      opts_string: `--size ${size} --bpp 4 --format lvgl --no-compress --symbols <chars.txt>`,
     });
 
     for (const [filename, data] of Object.entries(files)) {

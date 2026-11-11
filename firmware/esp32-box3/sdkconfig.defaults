@@ -37,6 +37,14 @@ CONFIG_ESP_TIMER_TASK_STACK_SIZE=6144
 # LVGL 由 BSP 的 esp_lvgl_port 配置；这里只固定 16 位色，避免 RGB565 屏偏色。
 CONFIG_LV_COLOR_DEPTH_16=y
 
+# 压缩字库解压器（2026-11-11 真机「中文全是空心方框」的根因开关）。
+# lv_font_conv 默认把 4bpp 位图压成 RLE 变体（生成文件里 .bitmap_format = 1）。
+# 固件没开这一项时 lv_font_get_bitmap_fmt_txt() 直接返回 NULL，LVGL 就按
+# 「缺字形」走 LV_USE_FONT_PLACEHOLDER，把每个字画成 1px 空心方框——看起来
+# 像「字库没挂上」或「label 没设字体」，其实字库和字体都是好的。
+# 现在两套字库都已改成 --no-compress（PLAIN）生成，这里再打开一次纯属保险。
+CONFIG_LV_USE_FONT_COMPRESSED=y
+
 # 串口监视器默认 115200（烧录/日志都用它，省得每次 -b）
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 
