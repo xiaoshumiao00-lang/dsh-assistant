@@ -65,6 +65,9 @@ export const DEVICE_CONTROL_PRIORITY_SECTION = [
   '  答应 / 选第二个 / 就这个 / 那个不行 → `tihu_answer_decision`；随便 / 按默认来 / 你决定 / 驳回 → `tihu_dismiss_decision`；现在什么情况 / 在干嘛 / 念到哪了 / 屏上这条跑到哪了 → `tihu_status`；',
   '  有几个设备 / 哪几块屏在线 → `tihu_list_devices`；声音换个男的 / 语速慢点 / 开免按住 → `tihu_device_settings`。',
   '· 判成控制意图 → **直接调用那个 tihu_* 工具**（工具名照实写，别自己编）。调了工具就不要再输出派单 JSON：这句话已经办了，再派单就是办两遍。',
+  '· **「第几个 / 第二张 / 第二条」＝这块屏当前这一页的行号，从 1 开始**：屏上第一行就是 1，「第二个」＝第 2 行。不是 0 起，也不是「最近完成的那条」。',
+  '· 调 `tihu_open_task` **必须带 `arguments.index`**（例：`{"intent":"control","tool":"tihu_open_task","arguments":{"index":2}}`）；只有用户明确说了标题 / 任务号，或明说「最近那条」，才改用 `title` / `taskId` / `recent:true`，其余一律带 index。拿不准就回 clarify 问一句，别只回工具名。',
+  '· 下面【这块屏现在的棋盘】就是这块屏**当下这一页**（行号 1 起、与屏上逐行一致）；照着它把「第几个」翻成 index。',
   '· 判成要干活（写文档、跑代码、查资料、改文件、做图、审稿、做交付物…）→ 才回派单 JSON。派单绝不用于「让这块屏怎么显示」这件事。',
   '· 两种解释都说得通、说不准 → 只回 `{"intent":"clarify","ask":"…"}`，屏上问用户一次；**绝不猜着派单**。',
 ].join('\n')
@@ -329,9 +332,11 @@ export function parseCommanderDecision(raw: unknown, allowed: readonly string[])
 
 /**
  * 指挥台提示词尾巴：先判「这句话是不是在指挥这块屏」，判成活儿才只回一行派单 JSON。
- * `hints` 是「最近的项目会话（短号 + 标题）」，让 append/append_to 有据可依。
+ * `hints` 是「最近的项目会话（短号 + 标题）」，让 append/append_to 有据可依；
+ * `boardLines` 是这块屏**当前页**的带编号清单（1 起、与屏上逐行一致，见 lane 的
+ * `commanderBoardLines`）——模型照着它把「第二个」翻成 `index:2`。
  */
-export function commanderReplyTail(hints: readonly string[] = []): string {
+export function commanderReplyTail(hints: readonly string[] = [], boardLines: readonly string[] = []): string {
   return [
     DEVICE_CONTROL_PRIORITY_SECTION,
     '【结论只有一行】三种形状各回一条，不许混着回，也不许多解释一个字：',
@@ -344,6 +349,7 @@ export function commanderReplyTail(hints: readonly string[] = []): string {
     '· 接着某条已有会话做 → "append"，append_to 写那条会话的短号；确实是一件新事 → "new"，append_to 留空。',
     '· 派单那一行之外不要输出任何字符：不要代码块围栏、不要解释、不要前后缀。',
     '· 你只判断「这句话往哪儿派 / 是不是在指挥屏」，不干活、不做正文、不解释自己怎么判的。',
+    ...(boardLines.length === 0 ? [] : ['【这块屏现在的棋盘】（行号从 1 开始，与屏上逐行一致）', ...boardLines]),
     ...(hints.length === 0 ? [] : ['最近的项目会话（短号 标题）：', ...hints]),
   ].join('\n')
 }

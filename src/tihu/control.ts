@@ -259,6 +259,14 @@ export interface TihuControlSurface {
   dismissDecision(deviceId: string, options: TihuDeviceActionOptions): Promise<DeviceActionOutcome>
   /** 设备设置（音色 / 免按住）。 */
   deviceSettings(deviceId: string, options: TihuDeviceActionOptions): Promise<DeviceActionOutcome>
+  /**
+   * 工具入参留痕（可选）：每次 `tihu_*` 调用在**校验前**把模型传的原样入参交给它，
+   * lane 落 `lane.log` 的 `tihu_tool_call tool=… args=…` 一行。
+   *
+   * 2026-11-11 实机：「进第二个会话」开出第一张卡，日志只有工具名与原句，
+   * 看不到模型到底传没传 index —— 这类问题只能靠这一行查。
+   */
+  noteToolCall?(tool: string, args: unknown): void
 }
 
 /* ---------- 纯函数（脚本测试直接验） ---------- */
@@ -624,11 +632,11 @@ const deviceTools: TihuToolSpec[] = [
   },
   {
     name: 'tihu_open_task',
-    description: '用户说「打开第 3 条 / 看那个任务 / 看最近完成的」→ 打开某张卡的详情（按状态自动进完成页/待决策页/进度页）。',
+    description: '用户说「打开第 3 条 / 看第二个 / 看看那条任务 / 看最近完成的」→ 打开某张卡的详情（按状态自动进完成页/待决策页/进度页）。「第几个」是**当前棋盘页的行号，从 1 开始**（屏上第一行＝1）。',
     parameters: {
       deviceId: DEVICE_PARAM,
       taskId: { type: 'string', required: false, description: '任务短号 t3 / 纯数字 3' },
-      index: { type: 'number', required: false, description: '当前棋盘页第几行（1 起）' },
+      index: { type: 'number', required: false, description: '当前棋盘页第几行（1 起：屏上第一行＝1，「第二个」＝2；不传就退化成「当前屏上那条/最近完成」，只在用户没报序号时才允许）' },
       title: { type: 'string', required: false, description: '标题关键词（精确 > 前缀 > 包含，命中多条会给候选清单）' },
       recent: { type: 'boolean', required: false, description: '打开最近一条已完成任务（替代旧的 open_recent）' },
     },
@@ -994,6 +1002,8 @@ export function createTihuToolRunner(surface: TihuControlSurface) {
   return async function runTihuTool(name: string, rawArgs?: unknown, caller?: { sessionId?: string }): Promise<string> {
     const spec = tihuToolSpec(name)
     if (spec === undefined) throw new Error(unknownToolError(name))
+    // 入参留痕放在**归一化之前**：模型传的是 `"2"` / `0` / 干脆没传，日志要照原样留下。
+    try { surface.noteToolCall?.(spec.name, rawArgs) } catch { /* 日志失败不影响执行 */ }
     const args = normalizeToolArgs(spec, rawArgs)
     return spec.run(args, {
       surface,

@@ -39,8 +39,8 @@ import {
   takeSnapshot,
   targetPathOf,
 } from '../src/tihu/guard.ts'
-import { createTihuRuntime as createTihuRuntimeRaw, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH, TIHU_LANE_LOG_MAX_BYTES, appendTihuLaneLog, screenReasonOf, tihuLaneLogPath, tihuReceiptHoldMs } from '../src/tihu/lane.ts'
-import { BOARD_PAGE_SIZE, parseScreenCommand } from '../src/tihu/task-ledger.ts'
+import { createTihuRuntime as createTihuRuntimeRaw, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH, TIHU_LANE_LOG_MAX_BYTES, TIHU_TOOL_CALL_ARGS_MAX_CHARS, appendTihuLaneLog, appendTihuToolCallLog, screenReasonOf, tihuLaneLogPath, tihuReceiptHoldMs } from '../src/tihu/lane.ts'
+import { BOARD_PAGE_SIZE, TaskLedger, boardOf, boardRowIndex, parseScreenCommand } from '../src/tihu/task-ledger.ts'
 import {
   APPROVAL_OPTIONS,
   PENDING_OPTION_FALLBACK,
@@ -48,7 +48,7 @@ import {
   approvalDecisionOf,
   questionDecisionOf,
 } from '../src/tihu/pending-interactions.ts'
-import { DONE_NO_REPLY_TEXT, RECEIPT_SECONDS, intentClarifyFrame, prepareDoneText } from '../src/tihu/task-screens.ts'
+import { DONE_NO_REPLY_TEXT, RECEIPT_SECONDS, boardFrame, intentClarifyFrame, prepareDoneText } from '../src/tihu/task-screens.ts'
 import { TIHU_CONTROL_SECTION_TEXT, TIHU_DEVICE_TOOL_NAMES, TIHU_TOOLS, createTihuControlRunner, createTihuToolRunner, formatDeviceResult, matchSessionRows, mostActiveDevice, registerTihuControl, resolveControlDevice, tihuActionNames, tihuToolNames, tihuToolSpec } from '../src/tihu/control.ts'
 import { COMMANDER_CLARIFY_SHAPE, COMMANDER_CONTROL_SHAPE, COMMANDER_REPLY_SHAPE, DEVICE_CONTROL_PRIORITY_SECTION, commanderReplyTail, parseCommanderDecision, parseCommanderReply } from '../src/tihu/dispatch-protocol.ts'
 import {
@@ -7439,6 +7439,190 @@ await testAsync('语义路由：指挥台点哪个工具就执行哪个（含参
       delete process.env.TIHU_ACK_TIMEOUT_MS
       w.cleanup()
     }
+  }
+})
+
+/* ============================================================================
+ * 2026-11-11 实机：「进第二个会话」开出了第一张卡（lane.log 01:21:47）
+ *
+ * 这一节钉住「第几个」的唯一读法：
+ *   - 行号 1 起、用设备**当前页**、顺序与屏上渲染逐行一致（同一个 boardOf）；
+ *   - 0 / 负数 / 小数 / 非数字 → 明确报错，绝不悄悄退化成第 1 行；
+ *   - 模型没带 index 时的退化要留痕（lane.log 的 tihu_open_task_fallback）；
+ *   - 指挥台提示词必须带这块屏当前页的带编号清单，并要求 open_task 带 index。
+ * ============================================================================ */
+
+test('工具入参日志：tihu_tool_call tool=<名> args=<JSON>，超长截到 ~200 字', () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'tihu-toolcall-')), 'lane.log')
+  process.env.TIHU_LANE_LOG = file
+  try {
+    appendTihuToolCallLog('tihu_open_task', { index: 2, title: '很长'.repeat(300) })
+    const line = readFileSync(file, 'utf8').trim()
+    assert.ok(line.includes('note=tihu_tool_call tool=tihu_open_task args={"index":2'), '日志行格式要能一眼搜到工具名与入参：' + line)
+    const argsText = line.slice(line.indexOf('args=') + 5)
+    assert.ok([...argsText].length <= TIHU_TOOL_CALL_ARGS_MAX_CHARS, 'args 要截到 ~200 字（实际 ' + [...argsText].length + '）')
+    assert.ok(argsText.endsWith('…'), '截断要有省略号：' + argsText)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+  }
+})
+
+test('行号语义：boardRowIndex 只认 1 起的正整数（0 / 负数 / 小数 / 非数字一律报错）', () => {
+  assert.equal(boardRowIndex(1), 1, '1 起：第 1 行就是 1')
+  assert.equal(boardRowIndex(2), 2, '「第二个」＝第 2 行')
+  assert.equal(boardRowIndex('2'), 2, '字符串 "2" 也按 1 起解析成第 2 行')
+  assert.equal(boardRowIndex(' 3 '), 3, '带空白的 "3" 也认')
+  for (const bad of [0, -1, 1.5, '0', '-2', 'abc', '', undefined, null, Number.NaN]) {
+    const error = (() => { try { boardRowIndex(bad); return null } catch (caught) { return caught } })()
+    assert.ok(error instanceof Error, `必须明确报错（不许退化成第 1 行）：${String(bad)}`)
+    assert.ok(error.message.includes('从 1 开始'), `报错要说清「1 起」：${error.message}`)
+  }
+})
+
+test('棋盘顺序＝渲染顺序：running 在前，完成态按 finishedAt（不是 updatedAt）倒序，屏按 rows 顺序建行', () => {
+  const ledger = new TaskLedger()
+  const oldDone = ledger.add({ title: '旧完成', projectId: 'pa', projectName: 'A', now: 1000 })
+  oldDone.state = 'done'
+  oldDone.finishedAt = 2000
+  // 完成后又被别的动静碰过 updatedAt：排序若看它，旧完成会跑到最前面（两处时间源不一致的经典症状）。
+  oldDone.updatedAt = 9000
+  const freshDone = ledger.add({ title: '新完成', projectId: 'pb', projectName: 'B', now: 3000 })
+  freshDone.state = 'done'
+  freshDone.finishedAt = 5000
+  freshDone.updatedAt = 5000
+  const running = ledger.add({ title: '执行中', projectId: 'pc', projectName: 'C', now: 4000 })
+  running.state = 'running'
+  running.updatedAt = 4000
+  const queued = ledger.add({ title: '排队', projectId: 'pd', projectName: 'D', now: 6000 })
+
+  const board = boardOf(ledger.list(), 7000)
+  assert.deepEqual(board.rows.map((row) => row.taskId), [running.taskId, queued.taskId, freshDone.taskId, oldDone.taskId],
+    '顺序：执行中 → 排队/完成按时间（完成看 finishedAt）')
+  assert.deepEqual(board.rows.map((row) => row.state), ['running', 'queued', 'done', 'done'])
+  // 下发到屏上的棋盘帧与 boardOf 是同一份 rows（渲染端逐行照排，不再二次排序）。
+  assert.equal(boardFrame(board).board, board, 'screen.frame 的 board 就是这一份（同一对象，不另建一份表）')
+  assert.deepEqual(boardFrame(board).board.rows.map((row) => row.taskId), board.rows.map((row) => row.taskId))
+  const pageSource = readFileSync(new URL('../src/tihu/page.ts', import.meta.url), 'utf8')
+  assert.equal(/board\.rows\.(?:sort|reverse)|rows\.(?:sort|reverse)\(/.test(pageSource), false, '渲染端不许再排序（否则行号与屏上就不是同一份）')
+})
+
+await testAsync('按行号开卡：index=1 开第 1 行、index=2 开第 2 行、index=0 报错、第 2 页 index=2 开第 2 页第 2 行', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tihu-open-index-'))
+  const cards = Array.from({ length: 6 }, (_, index) => {
+    const folder = join(root, `p${index + 1}`)
+    mkdirSync(folder, { recursive: true })
+    return { id: `card-p${index + 1}`, name: `第${index + 1}卡`, folder }
+  })
+  const w = unifiedWorkspace({ cards })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-open-index', protocol: '0' }, 1)))
+    await waitMs(60)
+    for (const card of cards) {
+      const out = await w.runtime.control.dispatch({ text: `把 ${card.name} 的第一段再改一遍`, folder: card.folder })
+      assert.ok(String(out).startsWith('已派给'), '派单要成功：' + out)
+    }
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 30)))
+    await waitMs(150)
+    const boardOnScreen = () => framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop().payload.board
+    let board = boardOnScreen()
+    assert.equal(board.rows.length, 4, '每页 4 行')
+    const deviceId = w.runtime.control.listDevices()[0].id
+    const first = board.rows[0]
+
+    const opened1 = await w.runtime.control.openTaskCard(deviceId, { index: 1 })
+    assert.ok(opened1.text.includes(first.taskId), `index=1 必须开屏上第一行 ${first.taskId}：` + opened1.text)
+
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 31)))
+    await waitMs(120)
+    board = boardOnScreen()
+    const second = board.rows[1]
+    assert.notEqual(second.taskId, first.taskId, '第一行与第二行必须不是同一条')
+    const opened2 = await w.runtime.control.openTaskCard(deviceId, { index: 2 })
+    assert.ok(opened2.text.includes(second.taskId), `index=2 必须开第二行 ${second.taskId}（不是第一行）：` + opened2.text)
+    assert.equal(opened2.text.includes(first.taskId), false, 'index=2 绝不许退化成第 1 行：' + opened2.text)
+
+    // 模型把 index 传成字符串 "2"：按 1 起解析成第 2 行；日志里照原样留 "2"（不走归一化后的值）。
+    const runTool = createTihuToolRunner(w.runtime.control)
+    const openedString = await runTool('tihu_open_task', { index: '2' })
+    assert.ok(openedString.includes(second.taskId), '字符串 "2" 也要开第二行：' + openedString)
+    const logAfterTool = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(logAfterTool.includes('note=tihu_tool_call tool=tihu_open_task args={"index":"2"}'),
+      '工具入参要原样落 lane.log（tihu_tool_call tool=<名> args=<JSON>）：' + logAfterTool)
+
+    // index=0：明确报错，不许当成「第 1 行」。
+    const zero = await w.runtime.control.openTaskCard(deviceId, { index: 0 }).then(() => null, (error) => error)
+    assert.ok(zero instanceof Error && zero.message.includes('从 1 开始'), 'index=0 必须明确报错：' + String(zero))
+
+    // 没带任何定位参数 → 允许退化，但必须留痕（下次再出「开了第一张」能直接对上）。
+    await w.runtime.control.openTaskCard(deviceId, {})
+    const logAfterFallback = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(logAfterFallback.includes('note=tihu_open_task_fallback'), '退化必须留痕：' + logAfterFallback)
+
+    // 当前在第 2 页：index=2 必须是第 2 页第 2 行，不是第 1 页的第 2 行。
+    await w.runtime.control.boardPage(deviceId, { page: 1 })
+    await waitMs(80)
+    const page2 = boardOnScreen()
+    assert.equal(page2.page.index, 1, '已经翻到第 2 页')
+    assert.equal(page2.rows.length, 2, '6 条 → 第 2 页 2 行')
+    const page2Second = page2.rows[1]
+    assert.notEqual(page2Second.taskId, second.taskId, '第 2 页第 2 行与第 1 页第 2 行不是同一条')
+    const openedPage2 = await w.runtime.control.openTaskCard(deviceId, { index: 2 })
+    assert.ok(openedPage2.text.includes(page2Second.taskId), '第 2 页上 index=2 要开第 2 页第 2 行：' + openedPage2.text)
+    assert.equal(openedPage2.text.includes(second.taskId), false, '第 2 页上不许开到第 1 页的行：' + openedPage2.text)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+    try { rmSync(root, { recursive: true, force: true }) } catch { /* 忽略 */ }
+  }
+})
+
+await testAsync('指挥台把「第二个」翻成 index=2：提示词带当前页编号清单，补调开第二行并落工具入参日志', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tihu-open-commander-'))
+  const cards = Array.from({ length: 3 }, (_, index) => {
+    const folder = join(root, `p${index + 1}`)
+    mkdirSync(folder, { recursive: true })
+    return { id: `card-p${index + 1}`, name: `第${index + 1}卡`, folder }
+  })
+  const w = unifiedWorkspace({ cards, commanderAutoReply: '{"intent":"control","tool":"tihu_open_task","arguments":{"index":2}}' })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-open-commander', protocol: '0' }, 1)))
+    await waitMs(60)
+    for (const card of cards) {
+      const out = await w.runtime.control.dispatch({ text: `把 ${card.name} 的第一段再改一遍`, folder: card.folder })
+      assert.ok(String(out).startsWith('已派给'), '派单要成功：' + out)
+    }
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 30)))
+    await waitMs(120)
+    const board = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop().payload.board
+    const second = board.rows[1]
+
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '进第二个会话', source: 'voice' }, 31)))
+    await waitMs(420)
+
+    const ask = w.askPrompts[w.askPrompts.length - 1]
+    assert.ok(ask !== undefined, '这句要交给指挥台判（不是本地词表）')
+    const tail = String(ask.blocks?.[1]?.text ?? '')
+    assert.ok(tail.includes('行号从 1 开始'), '提示词要说清行号 1 起：' + tail)
+    assert.ok(tail.includes('屏上第一行就是 1'), '提示词要写「屏上第一行就是 1」：' + tail)
+    assert.ok(tail.includes('必须带 `arguments.index`'), 'open_task 必须带 index 的要求要在提示词里：' + tail)
+    assert.ok(tail.includes(`1) ${board.rows[0].taskId}`), '当前页清单要从 1) 开始给：' + tail)
+    assert.ok(tail.includes(`2) ${second.taskId}`), '当前页清单要逐行给到第 2 行：' + tail)
+
+    const outcome = framesOf(socket).filter((frame) => frame.type === 'event.progress' && frame.payload.stage === '屏上命令').pop()
+    assert.ok(outcome !== undefined, '补调要真的执行并回一行结果')
+    assert.ok(String(outcome.payload.text).includes(second.taskId), '「进第二个会话」必须开第二行：' + outcome.payload.text)
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('note=tihu_tool_call tool=tihu_open_task args='), '工具入参日志要落 lane.log：' + log)
+    assert.ok(/"index":2/.test(log), '日志里要能看见模型传的 index=2：' + log)
+    assert.ok(log.includes('note=commander-control'), '原有的 commander-control 那行也要在：' + log)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+    try { rmSync(root, { recursive: true, force: true }) } catch { /* 忽略 */ }
   }
 })
 
