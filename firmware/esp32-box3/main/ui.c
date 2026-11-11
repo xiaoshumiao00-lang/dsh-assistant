@@ -6,6 +6,9 @@
  */
 #include "ui.h"
 
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -94,6 +97,209 @@ const lv_font_t *tihu_ui_font_title(void)
 const lv_font_t *tihu_ui_font_body(void)
 {
     return &tihu_font_15;
+}
+
+/* ------------------------------ 字体自检 ------------------------------ */
+
+/*
+ * 真机「中文全是空心方框」的两种成因，都在这里一次说清：
+ *   1) label 没设中文字体（还在用 LV_FONT_DEFAULT / montserrat，没有汉字）；
+ *   2) 字库位图是压缩格式（bitmap_format=1），但固件没开 LV_USE_FONT_COMPRESSED：
+ *      字形描述能找到，位图取不出来（lv_font_get_bitmap_fmt_txt 返回 NULL），
+ *      绘制层于是按「缺字形」走 LV_USE_FONT_PLACEHOLDER，画一个 1px 空心方框。
+ * 两种情况长得一模一样，所以开机就把每个 label 的字体名 / bpp / 缺字数打出来，
+ * 再对「鹈」字做一次 lv_font_get_glyph_dsc 断言。
+ */
+
+#define TIHU_PROBE_GLYPH 0x9E48u /* 「鹈」U+9E48，标题第一字，缺了必是方框 */
+
+static const char *font_name(const lv_font_t *font)
+{
+    if (font == NULL) {
+        return "(null)";
+    }
+    if (font == &tihu_font_20) {
+        return "tihu_font_20";
+    }
+    if (font == &tihu_font_15) {
+        return "tihu_font_15";
+    }
+    if (font == LV_FONT_DEFAULT) {
+        return "LV_FONT_DEFAULT(无汉字)";
+    }
+    return "(其它字体)";
+}
+
+static const lv_font_fmt_txt_dsc_t *font_txt_dsc(const lv_font_t *font)
+{
+    if (font == NULL || font->dsc == NULL ||
+        font->get_glyph_dsc != lv_font_get_glyph_dsc_fmt_txt) {
+        return NULL;
+    }
+    return (const lv_font_fmt_txt_dsc_t *)font->dsc;
+}
+
+static int font_bpp(const lv_font_t *font)
+{
+    const lv_font_fmt_txt_dsc_t *dsc = font_txt_dsc(font);
+    return dsc != NULL ? (int)dsc->bpp : -1;
+}
+
+static const char *font_bitmap_format(const lv_font_t *font)
+{
+    const lv_font_fmt_txt_dsc_t *dsc = font_txt_dsc(font);
+    if (dsc == NULL) {
+        return "n/a";
+    }
+    return dsc->bitmap_format == LV_FONT_FMT_TXT_PLAIN ? "PLAIN" : "COMPRESSED";
+}
+
+static uint32_t utf8_decode(const char **cursor)
+{
+    const unsigned char *s = (const unsigned char *)*cursor;
+    uint32_t cp = s[0];
+    if (cp < 0x80u) {
+        *cursor += 1;
+        return cp;
+    }
+    int extra = cp >= 0xF0u ? 3 : (cp >= 0xE0u ? 2 : 1);
+    cp &= 0x7Fu >> (extra + 1);
+    int used = 0;
+    for (; used < extra; used++) {
+        unsigned char next = s[1 + used];
+        if ((next & 0xC0u) != 0x80u) {
+            break;
+        }
+        cp = (cp << 6) | (next & 0x3Fu);
+    }
+    *cursor += 1 + used;
+    return cp;
+}
+
+/* 返回 text 里该字体画不出的字数，缺失字符写进 missing（UTF-8）。 */
+static int label_missing_chars(const lv_font_t *font, const char *text,
+                               char *missing, size_t missing_len, int *total)
+{
+    if (missing != NULL && missing_len > 0) {
+        missing[0] = '\0';
+    }
+    if (total != NULL) {
+        *total = 0;
+    }
+    if (font == NULL || text == NULL) {
+        return 0;
+    }
+    int miss = 0;
+    int chars = 0;
+    size_t used = 0;
+    const char *cursor = text;
+    while (*cursor != '\0') {
+        const char *start = cursor;
+        uint32_t cp = utf8_decode(&cursor);
+        if (cp == 0) {
+            break;
+        }
+        chars++;
+        lv_font_glyph_dsc_t dsc = {0};
+        if (!lv_font_get_glyph_dsc(font, &dsc, cp, 0)) {
+            miss++;
+            if (missing != NULL && used + (size_t)(cursor - start) + 1 < missing_len) {
+                memcpy(missing + used, start, (size_t)(cursor - start));
+                used += (size_t)(cursor - start);
+                missing[used] = '\0';
+            }
+        } else if (dsc.box_w == 0 || dsc.box_h == 0) {
+            /* 空白字符（space）本来就没有位图，不算缺字。 */
+            if (cp != ' ' && cp != '\t') {
+                miss++;
+                if (missing != NULL && used + (size_t)(cursor - start) + 1 < missing_len) {
+                    memcpy(missing + used, start, (size_t)(cursor - start));
+                    used += (size_t)(cursor - start);
+                    missing[used] = '\0';
+                }
+            }
+        }
+    }
+    if (total != NULL) {
+        *total = chars;
+    }
+    return miss;
+}
+
+static void ui_label_report(lv_obj_t *parent, int depth, int *index, int *missing_total)
+{
+    if (parent == NULL || depth > 4) {
+        return;
+    }
+    uint32_t count = lv_obj_get_child_count(parent);
+    for (uint32_t i = 0; i < count; i++) {
+        lv_obj_t *child = lv_obj_get_child(parent, i);
+        if (child == NULL) {
+            continue;
+        }
+        if (!lv_obj_has_class(child, &lv_label_class)) {
+            ui_label_report(child, depth + 1, index, missing_total);
+            continue;
+        }
+        const char *text = lv_label_get_text(child);
+        /* 要的是「实际生效」的字体，不是我们请求的那个。 */
+        const lv_font_t *font = lv_obj_get_style_text_font(child, LV_PART_MAIN);
+        const char *role = font == &tihu_font_20 ? "标题"
+                           : font == &tihu_font_15 ? "正文"
+                                                   : "非中文字体";
+        char missing[32] = {0};
+        int total = 0;
+        int miss = label_missing_chars(font, text, missing, sizeof(missing), &total);
+        (*index)++;
+        *missing_total += miss;
+        ESP_LOGI(TAG, "label #%d %s font=%s bpp=%d 字数=%d 缺字=%d text=\"%s\"",
+                 *index, role, font_name(font), font_bpp(font), total, miss,
+                 text != NULL ? text : "");
+        if (miss > 0) {
+            ESP_LOGE(TAG, "label #%d 用 %s(bpp=%d) 画不出「%s」→ 屏上会是空心方框",
+                     *index, font_name(font), font_bpp(font), missing);
+        }
+    }
+}
+
+static void ui_font_selftest(lv_obj_t *root)
+{
+    const lv_font_t *fonts[2] = {&tihu_font_20, &tihu_font_15};
+    for (int i = 0; i < 2; i++) {
+        const lv_font_t *font = fonts[i];
+        const lv_font_fmt_txt_dsc_t *dsc = font_txt_dsc(font);
+        ESP_LOGI(TAG, "字库 %s：line_height=%d base_line=%d bpp=%d bitmap_format=%s "
+                      "cmap_num=%d；编译期 LV_USE_FONT_COMPRESSED=%d",
+                 font_name(font), (int)font->line_height, (int)font->base_line,
+                 font_bpp(font), font_bitmap_format(font),
+                 dsc != NULL ? (int)dsc->cmap_num : -1, (int)LV_USE_FONT_COMPRESSED);
+        if (dsc != NULL && dsc->bitmap_format != LV_FONT_FMT_TXT_PLAIN &&
+            LV_USE_FONT_COMPRESSED == 0) {
+            ESP_LOGE(TAG, "字库 %s 的位图是压缩格式，但固件没开 LV_USE_FONT_COMPRESSED："
+                          "字形能找到、位图取不出来，整屏都会是空心方框",
+                     font_name(font));
+        }
+    }
+
+    lv_font_glyph_dsc_t probe = {0};
+    bool has = lv_font_get_glyph_dsc(&tihu_font_20, &probe, TIHU_PROBE_GLYPH, 0);
+    ESP_LOGI(TAG, "字形断言：「鹈」U+%04X in tihu_font_20 = %s（box=%dx%d adv=%d）",
+             (unsigned)TIHU_PROBE_GLYPH, has ? "存在" : "缺失",
+             (int)probe.box_w, (int)probe.box_h, (int)probe.adv_w);
+    if (!has) {
+        ESP_LOGE(TAG, "字形断言失败：「鹈」不在 tihu_font_20 里，标题「鹈鹕 BOX-3B」必是空心方框");
+    }
+    assert(has);
+
+    int index = 0;
+    int missing = 0;
+    ui_label_report(root, 0, &index, &missing);
+    if (missing == 0) {
+        ESP_LOGI(TAG, "字体自检 PASS：%d 个 label 全部命中字库（20=标题 / 15=正文）", index);
+    } else {
+        ESP_LOGE(TAG, "字体自检 FAIL：%d 个 label 共 %d 个字画不出来，见上面的 label 行", index,
+                 missing);
+    }
 }
 
 lv_color_t tihu_ui_tone_color(const char *tone)
@@ -305,6 +511,8 @@ void tihu_ui_init(void)
     /* 首帧不在这里刷：tihu_ui_init 跑在 main 任务（8 KB 栈）里，lv_refr_now 会在
      * 调用者栈上做整屏渲染，实测直接把 main 任务栈踩爆。首帧交给 tihu_ui_task
      * （12 KB 栈）在循环第一次迭代同步刷出。 */
+    /* 字体自检放在 unlock 之前：所有 label 都已创建并设好初始文案。 */
+    ui_font_selftest(scr);
     bsp_display_unlock();
     bsp_display_backlight_on();
     s_ready = true;
