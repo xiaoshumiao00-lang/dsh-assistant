@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -21,6 +22,7 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "tihu_wifi.h"
 
@@ -34,6 +36,11 @@ static httpd_handle_t s_server;
 static bool s_active;
 static bool s_ap_netif_created;
 static char s_ap_ssid[33];
+/* httpd 任务栈最后落在哪：内部 RAM（正常）还是 PSRAM（内部实在挤不出来时的兜底）。 */
+static bool s_stack_in_psram;
+
+/** 写 NVS（save/forget）；栈在 PSRAM 时转给内部栈小任务，见文件后半段定义。 */
+static bool nvs_job_run(bool is_save, const char *ssid, const char *password);
 
 /* ------------------------------ 小工具 ------------------------------ */
 
@@ -78,27 +85,156 @@ static void esc_js(const char *in, char *out, size_t len)
     out[w] = '\0';
 }
 
-/** 发一段（不格式化，% 原样）。 */
-static esp_err_t chunk_text(httpd_req_t *req, const char *text)
+/* ------------------------------ 响应组装 ------------------------------ */
+
+/*
+ * 响应头只允许三样：
+ *   Content-Type: text/html; charset=utf-8   —— 固定，由这里设
+ *   Content-Length                           —— 由 esp_http_server 按正文长度自动写，
+ *                                               绝不手写、也不许 hand-write 一个错值
+ *   Connection: close                        —— 配网页只服务一次请求，发完就断
+ * 正文一律走 body：页面先在内存里拼成一整块，再一次性 httpd_resp_send() 发出去。
+ * 不再用 chunked 边拼边发 —— chunked 没有 Content-Length，浏览器侧看不出总长度，
+ * 也没法一眼判断「头是不是被撑大了」。
+ */
+
+/* 整页缓冲上限：头 ~1.9 KB + 已存网络 8×~230 B + 扫描结果 32×~150 B + 表单 ~1 KB，留一倍余量。 */
+#define PROVISION_PAGE_MAX   14336
+
+static char  *s_page;           /* 整页 HTML 缓冲（PSRAM） */
+static size_t s_page_cap;
+static size_t s_page_len;
+static bool   s_page_truncated;
+
+static void page_reset(void)
 {
-    return httpd_resp_send_chunk(req, text, (ssize_t)strlen(text));
+    s_page_len = 0;
+    s_page_truncated = false;
+    if (s_page != NULL && s_page_cap > 0) {
+        s_page[0] = '\0';
+    }
 }
 
-/** 发一段格式化文本。 */
-static esp_err_t chunk_fmt(httpd_req_t *req, const char *fmt, ...)
+/** 往整页缓冲里追加一段格式化文本（超长就截断并置位，结尾统一报一次）。 */
+static void page_add(const char *fmt, ...)
 {
-    char buf[512];
+    if (s_page == NULL || s_page_len + 1 >= s_page_cap) {
+        s_page_truncated = true;
+        return;
+    }
     va_list args;
     va_start(args, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, args);
+    int n = vsnprintf(s_page + s_page_len, s_page_cap - s_page_len, fmt, args);
     va_end(args);
-    if (n <= 0) {
-        return ESP_OK;
+    if (n < 0) {
+        s_page_truncated = true;
+        return;
     }
-    if (n >= (int)sizeof(buf)) {
-        n = (int)sizeof(buf) - 1;
+    if ((size_t)n >= s_page_cap - s_page_len) {
+        s_page_len = s_page_cap - 1;
+        s_page_truncated = true;
+        return;
     }
-    return httpd_resp_send_chunk(req, buf, n);
+    s_page_len += (size_t)n;
+}
+
+static const char *method_name(httpd_method_t method)
+{
+    switch (method) {
+    case HTTP_GET: return "GET";
+    case HTTP_POST: return "POST";
+    case HTTP_HEAD: return "HEAD";
+    case HTTP_PUT: return "PUT";
+    case HTTP_PATCH: return "PATCH";
+    case HTTP_DELETE: return "DELETE";
+    case HTTP_OPTIONS: return "OPTIONS";
+    default: return "?";
+    }
+}
+
+/**
+ * 按 esp_http_server 真正写出去的字节复算一遍响应头，用途只有两个：
+ *   1. 打出「响应头总长」——下次谁再把正文塞进头里，串口一眼就能看出来；
+ *   2. 把头的键值清单打成一行（\r\n 换成 " | "），和浏览器开发者工具里的
+ *      Response Headers 一一对应。
+ * @returns 响应头（含结尾空行）的字节数。
+ */
+static size_t resp_hdr_summary(const char *status, size_t body_len,
+                               const char *extra_field, const char *extra_value,
+                               char *out, size_t out_len)
+{
+    char raw[512];
+    int n = snprintf(raw, sizeof(raw),
+                     "HTTP/1.1 %s\r\nContent-Type: text/html; charset=utf-8\r\n"
+                     "Content-Length: %u\r\nConnection: close\r\n",
+                     status, (unsigned)body_len);
+    if (n > 0 && (size_t)n < sizeof(raw) && extra_field != NULL && extra_value != NULL) {
+        int m = snprintf(raw + n, sizeof(raw) - (size_t)n, "%s: %s\r\n", extra_field, extra_value);
+        if (m > 0) {
+            n += m;
+        }
+    }
+    if (n > 0 && (size_t)n + 2 < sizeof(raw)) {
+        raw[n++] = '\r';
+        raw[n++] = '\n';
+        raw[n] = '\0';
+    } else {
+        n = 0;
+        raw[0] = '\0';
+    }
+
+    size_t w = 0;
+    /* n - 2：末尾那对空行（\r\n）不算内容，打完最后一个头就收尾。 */
+    for (int i = 0; i + 2 < n; i++) {
+        if (raw[i] == '\r') {
+            continue;
+        }
+        if (raw[i] == '\n') {
+            if (w + 3 < out_len) {
+                out[w++] = ' ';
+                out[w++] = '|';
+                out[w++] = ' ';
+            }
+            continue;
+        }
+        if (w + 1 < out_len) {
+            out[w++] = raw[i];
+        }
+    }
+    if (out_len > 0) {
+        out[w] = '\0';
+    }
+    return (size_t)n;
+}
+
+/**
+ * 发一个完整的 HTML 响应：Content-Type + Content-Length（httpd 自动）+ Connection: close，
+ * 外加调用方指定的一个短头（只允许 Location —— 重定向语义必需，依旧只是几十字节）。
+ * 每个 URI 都打一行「方法 + 路径 + 状态 + 正文字节数 + 响应头字节数」。
+ */
+static esp_err_t send_html(httpd_req_t *req, const char *status,
+                           const char *body, size_t body_len,
+                           const char *extra_field, const char *extra_value)
+{
+    char summary[512];
+    size_t hdr_len = resp_hdr_summary(status, body_len, extra_field, extra_value,
+                                      summary, sizeof(summary));
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    if (extra_field != NULL && extra_value != NULL) {
+        httpd_resp_set_hdr(req, extra_field, extra_value);
+    }
+    ESP_LOGI(TAG, "%s %s → %s · 正文 %u B · 响应头 %u B · 内部堆余 %u B",
+             method_name(req->method), req->uri, status, (unsigned)body_len,
+             (unsigned)hdr_len,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    ESP_LOGI(TAG, "  响应头清单：%s", summary);
+    esp_err_t err = httpd_resp_send(req, body, (ssize_t)body_len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "  发送失败：%s", esp_err_to_name(err));
+    }
+    return err;
 }
 
 /** Content-Type 里取 boundary 不需要；这里只认 urlencoded 表单。 */
@@ -185,141 +321,113 @@ static const char *PAGE_HEAD =
     ".empty{color:#8e8e93;padding:12px 2px}"
     "</style></head><body>";
 
-static esp_err_t page_head(httpd_req_t *req, const char *mode_text)
+static void page_head(const char *mode_text)
 {
-    esp_err_t err = httpd_resp_set_type(req, "text/html; charset=utf-8");
-    if (err != ESP_OK) {
-        return err;
-    }
-    if ((err = chunk_text(req, PAGE_HEAD)) != ESP_OK) {
-        return err;
-    }
+    page_add("%s", PAGE_HEAD);
     tihu_wifi_cred_t saved[TIHU_WIFI_MAX_NETWORKS];
     int saved_count = tihu_wifi_saved(saved, TIHU_WIFI_MAX_NETWORKS);
     char ssid_esc[300];
     esc_html(s_ap_ssid, ssid_esc, sizeof(ssid_esc));
-    return chunk_fmt(req,
-                     "<h1>鹈鹕配网</h1><p class=\"sub\">%s · 热点 %s · 已记住 %d/%d 个网络</p>",
-                     mode_text, ssid_esc, saved_count, TIHU_WIFI_MAX_NETWORKS);
+    page_add("<h1>鹈鹕配网</h1><p class=\"sub\">%s · 热点 %s · 已记住 %d/%d 个网络</p>",
+             mode_text, ssid_esc, saved_count, TIHU_WIFI_MAX_NETWORKS);
 }
 
 /** 已保存网络 + 添加表单。 */
-static esp_err_t page_saved(httpd_req_t *req)
+static void page_saved(void)
 {
     tihu_wifi_cred_t saved[TIHU_WIFI_MAX_NETWORKS];
     int saved_count = tihu_wifi_saved(saved, TIHU_WIFI_MAX_NETWORKS);
-    esp_err_t err = chunk_text(req, "<h2>已保存的网络</h2><div class=\"card\"><ul>");
-    if (err != ESP_OK) {
-        return err;
-    }
+    page_add("<h2>已保存的网络</h2><div class=\"card\"><ul>");
     if (saved_count == 0) {
-        err = chunk_text(req, "<li><span class=\"name empty\">还没有保存任何网络</span></li>");
-        if (err != ESP_OK) {
-            return err;
-        }
+        page_add("<li><span class=\"name empty\">还没有保存任何网络</span></li>");
     }
     for (int i = 0; i < saved_count; i++) {
         char ssid_esc[300];
         esc_html(saved[i].ssid, ssid_esc, sizeof(ssid_esc));
-        err = chunk_fmt(req,
-                        "<li><span class=\"name\">%s</span><span class=\"meta\">%s</span>"
-                        "<form method=\"post\" action=\"/delete\">"
-                        "<input type=\"hidden\" name=\"ssid\" value=\"%s\">"
-                        "<button type=\"submit\">删除</button></form></li>",
-                        ssid_esc, saved[i].password[0] != '\0' ? "有密码" : "开放",
-                        ssid_esc);
-        if (err != ESP_OK) {
-            return err;
-        }
+        page_add("<li><span class=\"name\">%s</span><span class=\"meta\">%s</span>"
+                 "<form method=\"post\" action=\"/delete\">"
+                 "<input type=\"hidden\" name=\"ssid\" value=\"%s\">"
+                 "<button type=\"submit\">删除</button></form></li>",
+                 ssid_esc, saved[i].password[0] != '\0' ? "有密码" : "开放",
+                 ssid_esc);
     }
-    if ((err = chunk_text(req, "</ul></div>")) != ESP_OK) {
-        return err;
-    }
-    return chunk_text(req,
-                      "<h2>添加网络</h2><form method=\"post\" action=\"/save\" id=\"addForm\">"
-                      "<input name=\"ssid\" id=\"ssid\" placeholder=\"Wi-Fi 名称（SSID）\" "
-                      "required maxlength=\"32\" autocomplete=\"off\" autocapitalize=\"off\">"
-                      "<input name=\"password\" id=\"password\" type=\"password\" "
-                      "placeholder=\"密码（开放网络留空）\" maxlength=\"64\" autocomplete=\"off\">"
-                      "<button class=\"primary\" type=\"submit\">保存并重启</button>"
-                      "<p class=\"hint\">保存后设备自动重启，连上后会自动关闭这个热点。</p>"
-                      "</form>");
+    page_add("</ul></div>");
+    page_add("<h2>添加网络</h2><form method=\"post\" action=\"/save\" id=\"addForm\">"
+             "<input name=\"ssid\" id=\"ssid\" placeholder=\"Wi-Fi 名称（SSID）\" "
+             "required maxlength=\"32\" autocomplete=\"off\" autocapitalize=\"off\">"
+             "<input name=\"password\" id=\"password\" type=\"password\" "
+             "placeholder=\"密码（开放网络留空）\" maxlength=\"64\" autocomplete=\"off\">"
+             "<button class=\"primary\" type=\"submit\">保存并重启</button>"
+             "<p class=\"hint\">保存后设备自动重启，连上后会自动关闭这个热点。</p>"
+             "</form>");
 }
 
 /** 扫到的 SSID（点一下填进上面表单）。 */
-static esp_err_t page_scan(httpd_req_t *req)
+static void page_scan(void)
 {
-    tihu_ap_info_t aps[PROVISION_SCAN_MAX];
+    /* static：httpd 只有一个任务、这里串行；放静态区是为了从栈里省出 1.2 KB
+     * （内部 RAM 只剩 ~20 KB，httpd 任务栈给不到 8 KB，见 tihu_provision_start）。 */
+    static tihu_ap_info_t aps[PROVISION_SCAN_MAX];
     int count = tihu_wifi_scan(aps, PROVISION_SCAN_MAX);
-    esp_err_t err = chunk_fmt(req, "<h2>扫到的网络（%d 个，点一下填入上方）</h2><div class=\"card\"><ul>", count);
-    if (err != ESP_OK) {
-        return err;
-    }
+    page_add("<h2>扫到的网络（%d 个，点一下填入上方）</h2><div class=\"card\"><ul>", count);
     if (count == 0) {
-        err = chunk_text(req, "<li><span class=\"name empty\">没扫到 2.4G 网络，点刷新再试</span></li>");
-        if (err != ESP_OK) {
-            return err;
-        }
+        page_add("<li><span class=\"name empty\">没扫到 2.4G 网络，点刷新再试</span></li>");
     }
     for (int i = 0; i < count; i++) {
         char ssid_esc[300];
         char ssid_js[300];
         esc_html(aps[i].ssid, ssid_esc, sizeof(ssid_esc));
         esc_js(aps[i].ssid, ssid_js, sizeof(ssid_js));
-        err = chunk_fmt(req,
-                        "<li onclick=\"pick('%s')\"><span class=\"name\">%s%s</span>"
-                        "<span class=\"meta\">%d dBm · %s</span></li>",
-                        ssid_js, ssid_esc,
-                        tihu_wifi_saved_find(aps[i].ssid, NULL) ? " ✓" : "",
-                        aps[i].rssi, tihu_wifi_auth_name(aps[i].authmode));
-        if (err != ESP_OK) {
-            return err;
-        }
+        page_add("<li onclick=\"pick('%s')\"><span class=\"name\">%s%s</span>"
+                 "<span class=\"meta\">%d dBm · %s</span></li>",
+                 ssid_js, ssid_esc,
+                 tihu_wifi_saved_find(aps[i].ssid, NULL) ? " ✓" : "",
+                 aps[i].rssi, tihu_wifi_auth_name(aps[i].authmode));
     }
-    if ((err = chunk_text(req, "</ul></div>")) != ESP_OK) {
-        return err;
-    }
-    return chunk_text(req,
-                      "<script>"
-                      "function pick(s){var a=document.getElementById('ssid');"
-                      "a.value=s;document.getElementById('password').focus();"
-                      "a.scrollIntoView({behavior:'smooth',block:'center'});}"
-                      "</script>"
-                      "<p class=\"hint\" style=\"margin-top:20px\">"
-                      "<a href=\"/\">刷新扫描结果</a></p></body></html>");
+    page_add("</ul></div>");
+    page_add("<script>"
+             "function pick(s){var a=document.getElementById('ssid');"
+             "a.value=s;document.getElementById('password').focus();"
+             "a.scrollIntoView({behavior:'smooth',block:'center'});}"
+             "</script>"
+             "<p class=\"hint\" style=\"margin-top:20px\">"
+             "<a href=\"/\">刷新扫描结果</a></p></body></html>");
 }
 
 /* ------------------------------ 路由 ------------------------------ */
 
 static esp_err_t handler_root(httpd_req_t *req)
 {
-    ESP_LOGI(TAG, "配网页 GET /（来自 %s）", req->uri);
-    esp_err_t err = page_head(req, "配网热点已开启");
-    if (err == ESP_OK) {
-        err = page_saved(req);
+    if (s_page == NULL) {
+        static const char OOM_PAGE[] =
+            "<!doctype html><meta charset=\"utf-8\"><body style=\"font-family:sans-serif;padding:20px\">"
+            "<h2>配网页缓冲申请失败</h2><p>内部 PSRAM 不足，请断电重上后再试。</p></body>";
+        return send_html(req, "503 Service Unavailable", OOM_PAGE, sizeof(OOM_PAGE) - 1, NULL, NULL);
     }
-    if (err == ESP_OK) {
-        err = page_scan(req);
+    page_reset();
+    page_head("配网热点已开启");
+    page_saved();
+    page_scan();
+    if (s_page_truncated) {
+        ESP_LOGW(TAG, "配网页超过缓冲上限 %u B，内容被截断（扫描结果多时属正常，页面仍可提交）",
+                 (unsigned)s_page_cap);
     }
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "配网页发送失败：%s", esp_err_to_name(err));
-        return ESP_FAIL;
-    }
-    return httpd_resp_send_chunk(req, NULL, 0);
+    esp_err_t err = send_html(req, "200 OK", s_page, s_page_len, NULL, NULL);
+    /* 栈余量是「httpd 任务栈到底够不够」的硬证据：Words × 4 B。 */
+    ESP_LOGI(TAG, "  httpd 栈最低余量 %u B",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL) * (unsigned)sizeof(StackType_t));
+    return err;
 }
 
 static esp_err_t handler_favicon(httpd_req_t *req)
 {
-    httpd_resp_set_status(req, "204 No Content");
-    return httpd_resp_send(req, NULL, 0);
+    return send_html(req, "204 No Content", NULL, 0, NULL, NULL);
 }
 
 /** 不在路由表里的 GET（手机连上热点时的「需要登录网络」探测）：一律引到首页。 */
 static esp_err_t handler_catch_all(httpd_req_t *req)
 {
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
-    return httpd_resp_send(req, NULL, 0);
+    return send_html(req, "302 Found", NULL, 0, "Location", "http://192.168.4.1/");
 }
 
 static void restart_task(void *arg)
@@ -345,45 +453,45 @@ static esp_err_t handler_save(httpd_req_t *req)
     url_decode(raw_pw, password, sizeof(password));
 
     if (ssid[0] == '\0') {
-        httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_set_type(req, "text/html; charset=utf-8");
-        httpd_resp_sendstr(req,
-                           "<!doctype html><meta charset=\"utf-8\">"
-                           "<body style=\"font-family:sans-serif;padding:20px\">"
-                           "<h2>没填 Wi-Fi 名称</h2><p><a href=\"/\">返回</a></p></body>");
-        return ESP_OK;
+        static const char NO_SSID_PAGE[] =
+            "<!doctype html><meta charset=\"utf-8\">"
+            "<body style=\"font-family:sans-serif;padding:20px\">"
+            "<h2>没填 Wi-Fi 名称</h2><p><a href=\"/\">返回</a></p></body>";
+        return send_html(req, "400 Bad Request", NO_SSID_PAGE, sizeof(NO_SSID_PAGE) - 1, NULL, NULL);
     }
 
     ESP_LOGI(TAG, "配网页 POST /save：ssid=\"%s\" 密码=%s", ssid,
              password[0] != '\0' ? "已填" : "空（开放网络）");
-    bool ok = tihu_wifi_save(ssid, password);
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    bool ok = nvs_job_run(true, ssid, password);
     if (!ok) {
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        httpd_resp_sendstr(req,
-                           "<!doctype html><meta charset=\"utf-8\">"
-                           "<body style=\"font-family:sans-serif;padding:20px\">"
-                           "<h2>保存失败</h2><p>NVS 写入失败，请重试。</p>"
-                           "<p><a href=\"/\">返回</a></p></body>");
-        return ESP_OK;
+        static const char FAIL_PAGE[] =
+            "<!doctype html><meta charset=\"utf-8\">"
+            "<body style=\"font-family:sans-serif;padding:20px\">"
+            "<h2>保存失败</h2><p>NVS 写入失败，请重试。</p>"
+            "<p><a href=\"/\">返回</a></p></body>";
+        return send_html(req, "500 Internal Server Error", FAIL_PAGE, sizeof(FAIL_PAGE) - 1, NULL, NULL);
     }
 
     char ssid_esc[300];
     esc_html(ssid, ssid_esc, sizeof(ssid_esc));
-    /* 分段发（不拼一个大会话缓冲）：SSID 最长 32 字节、转义后仍可能 190+ 字节，
-     * 一次 snprintf 进固定缓冲会被 -Wformat-truncation 判成可能截断（等于编不过）。 */
-    httpd_resp_sendstr_chunk(req,
-                             "<!doctype html><meta charset=\"utf-8\">"
-                             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-                             "<body style=\"font-family:-apple-system,sans-serif;padding:24px;line-height:1.6\">"
-                             "<h2>已保存 ");
-    httpd_resp_sendstr_chunk(req, ssid_esc);
-    httpd_resp_sendstr_chunk(req,
-                             "</h2>"
-                             "<p>设备正在重启并尝试连接；连不上会自动回到这个热点。</p>"
-                             "<p style=\"color:#8e8e93\">稍等 10 秒后刷新本页可以查看结果。</p>"
-                             "<p><a href=\"/\">刷新</a></p></body>");
-    httpd_resp_sendstr_chunk(req, NULL);
+    /* 拼成一整块（SSID 转义后最长 190 B，页面本身 ~400 B，1 KB 够）。 */
+    char ok_page[1024];
+    int ok_len = snprintf(ok_page, sizeof(ok_page),
+                          "<!doctype html><meta charset=\"utf-8\">"
+                          "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                          "<body style=\"font-family:-apple-system,sans-serif;padding:24px;line-height:1.6\">"
+                          "<h2>已保存 %s</h2>"
+                          "<p>设备正在重启并尝试连接；连不上会自动回到这个热点。</p>"
+                          "<p style=\"color:#8e8e93\">稍等 10 秒后刷新本页可以查看结果。</p>"
+                          "<p><a href=\"/\">刷新</a></p></body>",
+                          ssid_esc);
+    if (ok_len < 0) {
+        ok_len = 0;
+    }
+    if (ok_len >= (int)sizeof(ok_page)) {
+        ok_len = (int)sizeof(ok_page) - 1;
+    }
+    send_html(req, "200 OK", ok_page, (size_t)ok_len, NULL, NULL);
     if (xTaskCreate(restart_task, "tihu_prov_restart", 3072, NULL, 5, NULL) != pdPASS) {
         ESP_LOGW(TAG, "重启任务创建失败，直接重启");
         tihu_provision_stop();
@@ -401,12 +509,57 @@ static esp_err_t handler_delete(httpd_req_t *req)
     form_field(body, "ssid", raw, sizeof(raw));
     url_decode(raw, ssid, sizeof(ssid));
     if (ssid[0] != '\0') {
-        tihu_wifi_forget(ssid);
+        nvs_job_run(false, ssid, NULL);
         ESP_LOGI(TAG, "配网页删除网络 \"%s\"", ssid);
     }
-    httpd_resp_set_status(req, "303 See Other");
-    httpd_resp_set_hdr(req, "Location", "/");
-    return httpd_resp_send(req, NULL, 0);
+    return send_html(req, "303 See Other", NULL, 0, "Location", "/");
+}
+
+/* ------------------------------ NVS 写入（PSRAM 栈兜底时用） ------------------------------ */
+
+/*
+ * NVS 的 save/forget 会擦写 flash。擦写期间 cache 被关闭，**栈在 PSRAM 的任务**
+ * 这时只要用到栈就会命中 assert(esp_task_stack_is_sane_cache_disabled())
+ * （esp-idf/components/spi_flash/cache_utils.c），直接 panic。
+ * 正常情况 httpd 栈在内部 RAM，这里就是一次普通调用；万一内部 RAM 实在挤不出来、
+ * 退化到 PSRAM 栈，就把这次写入交给一个 4 KB 内部栈的小任务，httpd 任务只等结果。
+ */
+static SemaphoreHandle_t s_nvs_done;
+static char s_nvs_ssid[TIHU_WIFI_SSID_MAX];
+static char s_nvs_password[TIHU_WIFI_PASSWORD_MAX];
+static bool s_nvs_is_save;
+static bool s_nvs_result;
+
+static void nvs_job_task(void *arg)
+{
+    (void)arg;
+    s_nvs_result = s_nvs_is_save ? tihu_wifi_save(s_nvs_ssid, s_nvs_password)
+                                 : tihu_wifi_forget(s_nvs_ssid);
+    xSemaphoreGive(s_nvs_done);
+    vTaskDelete(NULL);
+}
+
+static bool nvs_job_run(bool is_save, const char *ssid, const char *password)
+{
+    if (!s_stack_in_psram) {
+        return is_save ? tihu_wifi_save(ssid, password) : tihu_wifi_forget(ssid);
+    }
+    snprintf(s_nvs_ssid, sizeof(s_nvs_ssid), "%s", ssid);
+    snprintf(s_nvs_password, sizeof(s_nvs_password), "%s", password != NULL ? password : "");
+    s_nvs_is_save = is_save;
+    if (s_nvs_done == NULL) {
+        s_nvs_done = xSemaphoreCreateBinary();
+    }
+    if (s_nvs_done == NULL ||
+        xTaskCreate(nvs_job_task, "tihu_nvs", 4096, NULL, 6, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "内部栈任务起不来，退回在 httpd 任务里直接写 NVS");
+        return is_save ? tihu_wifi_save(ssid, password) : tihu_wifi_forget(ssid);
+    }
+    if (xSemaphoreTake(s_nvs_done, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGW(TAG, "NVS 写入超时（5 s）");
+        return false;
+    }
+    return s_nvs_result;
 }
 
 /* ------------------------------ 启停 ------------------------------ */
@@ -421,7 +574,7 @@ const char *tihu_provision_ap_ssid(void)
     return s_ap_ssid;
 }
 
-static void register_uri(httpd_handle_t server, const char *uri, httpd_method_t method,
+static bool register_uri(httpd_handle_t server, const char *uri, httpd_method_t method,
                          const char *method_name, esp_err_t (*handler)(httpd_req_t *))
 {
     httpd_uri_t route = {
@@ -433,7 +586,9 @@ static void register_uri(httpd_handle_t server, const char *uri, httpd_method_t 
     esp_err_t err = httpd_register_uri_handler(server, &route);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "注册 %s %s 失败：%s", method_name, uri, esp_err_to_name(err));
+        return false;
     }
+    return true;
 }
 
 void tihu_provision_start(void)
@@ -483,29 +638,112 @@ void tihu_provision_start(void)
         ESP_LOGW(TAG, "esp_wifi_start（APSTA）返回 %s", esp_err_to_name(err));
     }
 
-    httpd_config_t http_cfg = HTTPD_DEFAULT_CONFIG();
-    http_cfg.server_port = PROVISION_HTTP_PORT;
-    http_cfg.max_open_sockets = 4;
-    http_cfg.lru_purge_enable = true;
-    http_cfg.stack_size = 8192;
-    http_cfg.uri_match_fn = httpd_uri_match_wildcard;
-    err = httpd_start(&s_server, &http_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP 服务启动失败：%s（热点还在，但网页打不开）", esp_err_to_name(err));
-        return;
-    }
-    register_uri(s_server, "/", HTTP_GET, "GET", handler_root);
-    register_uri(s_server, "/save", HTTP_POST, "POST", handler_save);
-    register_uri(s_server, "/delete", HTTP_POST, "POST", handler_delete);
-    register_uri(s_server, "/favicon.ico", HTTP_GET, "GET", handler_favicon);
-    register_uri(s_server, "/*", HTTP_GET, "GET", handler_catch_all);
-
-    s_active = true;
     /* 2.4G 上强制 HT20 + 只用 11b/g：某些手机/笔记本驱动对 softAP 的 HT40/11n
      * 处理很挑（表现为「扫得到、连不上」，AP 侧日志是 `removing station ... after
-     * unsuccessful auth/assoc`）。配网页只求可靠，不求速率。 */
+     * unsuccessful auth/assoc`）。配网页只求可靠，不求速率。
+     * 注意：这两句会让 softAP 重新应用配置，串口里会再出现一次 AP_START 和
+     * DHCP server started —— 那是 Wi-Fi 事件，不是 httpd 重复启动。放在
+     * httpd_start 之前，保证网页服务起在一个已经稳定的 AP 上。 */
     esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
     esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G);
+
+    /* 只允许一个 httpd：重复调用不会起第二个服务，也不会重复注册 URI。 */
+    if (s_server != NULL) {
+        ESP_LOGW(TAG, "HTTP 服务已在运行，忽略重复启动");
+        s_active = true;
+        return;
+    }
+
+    httpd_config_t http_cfg = HTTPD_DEFAULT_CONFIG();
+    http_cfg.server_port = PROVISION_HTTP_PORT;
+    http_cfg.max_open_sockets = 2;      /* 1 个配网客户端 + 浏览器偶尔并发的 favicon */
+    http_cfg.backlog_conn = 2;
+    http_cfg.lru_purge_enable = true;
+    http_cfg.max_uri_handlers = 8;
+    /* 兜底路由（通配 URI）需要通配匹配（默认 NULL = 精确匹配）。 */
+    http_cfg.uri_match_fn = httpd_uri_match_wildcard;
+
+    /*
+     * 根因（2026-11-11 真机）：AP 起来之后内部 RAM 只剩 ~18–19 KB，而且是碎的。
+     * httpd 的任务栈默认要 8 KB **连续内部 RAM**，xTaskCreate 拿不到就返回
+     * ESP_ERR_HTTPD_TASK —— 现象就是「热点能连、192.168.4.1 打不开」。
+     *
+     * 关键坑：这里**只能调用一次 httpd_start**。IDF 5.3 里任务创建失败时走的是
+     * httpd_delete()，而 httpd_delete 不关 listen_fd（只有 httpd_server_deinit
+     * 会关），80 端口就被那个失败实例占死了；再试第二次一定报
+     * `httpd_server_init: error in listen (112)`（EADDRINUSE）。
+     * 所以先按「最大连续内部块」算一个一定放得下的栈（FreeRTOS 的 TCB 和栈
+     * 是一块连续内存，留 768 B 给 TCB/对齐），内部实在不够才退 PSRAM。
+     */
+    const size_t internal_largest =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t tcb_margin = 768;
+    size_t stack_used;
+    uint32_t stack_caps;
+    if (internal_largest >= 8192 + tcb_margin) {
+        stack_used = 8192;
+        stack_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    } else if (internal_largest >= 6144 + tcb_margin) {
+        stack_used = 6144;
+        stack_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    } else if (internal_largest >= 4096 + tcb_margin) {
+        stack_used = 4096;
+        stack_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    } else {
+        /* 内部 RAM 连 4 KB 连续块都没有：任务栈退到 PSRAM（NVS 写会因此改走内部栈任务）。 */
+        stack_used = 8192;
+        stack_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    }
+    const bool stack_in_psram = (stack_caps & MALLOC_CAP_SPIRAM) != 0;
+
+    ESP_LOGI(TAG, "启动 httpd 前：内部空闲 %u B（最大连续块 %u B），PSRAM 空闲 %u B；max_open_sockets=%d",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)internal_largest,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             (int)http_cfg.max_open_sockets);
+    ESP_LOGI(TAG, "httpd 选栈：stack_size=%u（%s），task_caps=0x%x（最大连续块 %u B − 768 B TCB 余量）",
+             (unsigned)stack_used, stack_in_psram ? "PSRAM" : "内部 RAM",
+             (unsigned)stack_caps, (unsigned)internal_largest);
+
+    /* 整页缓冲放 PSRAM：内部 RAM 只剩不到 20 KB，放不下这个页面。 */
+    if (s_page == NULL) {
+        s_page = heap_caps_malloc(PROVISION_PAGE_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_page_cap = s_page != NULL ? PROVISION_PAGE_MAX : 0;
+        if (s_page == NULL) {
+            ESP_LOGE(TAG, "配网页缓冲（PSRAM %u B）申请失败：GET / 会返回 503",
+                     (unsigned)PROVISION_PAGE_MAX);
+        } else {
+            ESP_LOGI(TAG, "配网页缓冲：PSRAM %u B（整页拼好后一次发，Content-Length 由 httpd 自动写）",
+                     (unsigned)PROVISION_PAGE_MAX);
+        }
+    }
+
+    http_cfg.stack_size = stack_used;
+    http_cfg.task_caps = stack_caps;
+    err = httpd_start(&s_server, &http_cfg);    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP 服务启动失败：%s(0x%x)，stack_size=%u，task_caps=0x%x（热点还在，但网页打不开）",
+                 esp_err_to_name(err), (unsigned)err, (unsigned)stack_used, (unsigned)stack_caps);
+        return;
+    }
+    ESP_LOGI(TAG, "httpd_start 成功：stack_size=%u（%s），返回码 %s(0x%x)",
+             (unsigned)stack_used, stack_in_psram ? "PSRAM" : "内部 RAM",
+             esp_err_to_name(err), (unsigned)err);
+    s_stack_in_psram = stack_in_psram;
+    if (stack_in_psram) {
+        ESP_LOGW(TAG, "httpd 栈落在 PSRAM（%u B）：NVS 写入已改走内部栈小任务", (unsigned)stack_used);
+    }
+
+    int registered = 0;
+    registered += register_uri(s_server, "/", HTTP_GET, "GET", handler_root);
+    registered += register_uri(s_server, "/save", HTTP_POST, "POST", handler_save);
+    registered += register_uri(s_server, "/delete", HTTP_POST, "POST", handler_delete);
+    registered += register_uri(s_server, "/favicon.ico", HTTP_GET, "GET", handler_favicon);
+    registered += register_uri(s_server, "/*", HTTP_GET, "GET", handler_catch_all);
+    ESP_LOGI(TAG, "配网页 HTTP 服务已就绪：端口 %d，栈 %u B（%s），max_open_sockets=%d，路由注册 %d/5",
+             PROVISION_HTTP_PORT, (unsigned)stack_used,
+             stack_in_psram ? "PSRAM" : "内部 RAM", (int)http_cfg.max_open_sockets, registered);
+
+    s_active = true;
     wifi_config_t applied = {0};
     if (esp_wifi_get_config(WIFI_IF_AP, &applied) == ESP_OK) {
         ESP_LOGI(TAG, "AP 实际配置：ssid=\"%s\" ch=%d auth=%d cipher=%d hidden=%d bw=HT20/11bg",
@@ -522,6 +760,12 @@ void tihu_provision_stop(void)
         httpd_stop(s_server);
         s_server = NULL;
         ESP_LOGW(TAG, "配网页已关闭");
+    }
+    if (s_page != NULL) {
+        heap_caps_free(s_page);
+        s_page = NULL;
+        s_page_cap = 0;
+        s_page_len = 0;
     }
     if (s_active) {
         esp_wifi_set_mode(WIFI_MODE_STA);
