@@ -1,4 +1,4 @@
-# Generate the two CJK LVGL fonts used by the tihu firmware.
+﻿# Generate the two CJK LVGL fonts used by the tihu firmware.
 #
 # Requirements:
 #   - Node.js 18+ (npx is used to run lv_font_conv; no global install needed)
@@ -24,13 +24,13 @@ $root = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($OutDir)) {
     $OutDir = Join-Path $root "main\font"
 }
-$charsPath = Join-Path $PSScriptRoot "chars.txt"
+$charsPath = Join-Path $PSScriptRoot "chars_gb2312.txt"
 
 if (-not (Test-Path -LiteralPath $FontPath)) {
     throw "Font not found: $FontPath"
 }
 if (-not (Test-Path -LiteralPath $charsPath)) {
-    throw "chars.txt not found: $charsPath"
+    throw "chars_gb2312.txt not found: $charsPath"
 }
 if (-not (Get-Command npx -ErrorAction SilentlyContinue)) {
     throw "npx not found. Install Node.js 18+ and reopen the terminal."
@@ -65,7 +65,7 @@ $body = $body -replace '\s', ''
 $symbols = -join ($body.ToCharArray() | Sort-Object -Unique)
 
 if ($symbols.Length -lt 100) {
-    throw "Only $($symbols.Length) unique symbols found; check chars.txt encoding."
+    throw "Only $($symbols.Length) unique symbols found; check chars_gb2312.txt encoding."
 }
 
 Write-Host "Font   : $FontPath"
@@ -73,7 +73,7 @@ Write-Host "Chars  : $charsPath"
 Write-Host "Symbols: $($symbols.Length) unique non-ASCII characters"
 Write-Host "Output : $OutDir"
 
-# The Node helper reads chars.txt itself (UTF-8). Do not pass $symbols as a
+# The Node helper reads chars_gb2312.txt itself (UTF-8). Do not pass $symbols as a
 # command-line argument: PowerShell/npx on Windows would re-encode it.
 $env:LV_FONT_CONV_CLI = $cli.FullName
 $nodeScript = Join-Path $PSScriptRoot "gen_font_subset.cjs"
@@ -85,4 +85,4 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ""
 Write-Host "Done. Rebuild with: idf.py build"
-Write-Host "If a project/task name still shows boxes, add its characters to chars.txt and rerun."
+Write-Host "If a project/task name still shows boxes, add its characters to chars_gb2312.txt and rerun."

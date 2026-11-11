@@ -5,14 +5,19 @@
  * 为什么不直接在 PowerShell 里调 lv_font_conv CLI：
  *   Windows 上 npx.cmd 会经过 cmd.exe，中文 --symbols 会被按 ANSI 代码页重编码，
  *   生成的字模和注释都会变成乱码（本项目实际踩过）。这里由 Node 直接读 UTF-8
- *   的 chars.txt，字符不经过命令行参数。
+ *   的字符表，字符不经过命令行参数。
+ *
+ * 字符表现在是 tools/chars_gb2312.txt（GB2312 全集 + 生僻字补充，由
+ * tools/gen_charset.py 生成）；ASCII 0x20..0x7E 仍按 font range 加进去。
  *
  * 参数（PowerShell 脚本会传）：
  *   argv[2] 字体路径
  *   argv[3] 输出目录
  *   argv[4] 字号列表，如 "20,15"
+ *   argv[5] bpp（可选，默认 4）
  * 环境变量：
  *   LV_FONT_CONV_CLI  lv_font_conv.js 的绝对路径
+ *   TIHU_CHARS_FILE   字符表路径（默认 tools/chars_gb2312.txt）
  */
 'use strict';
 
@@ -33,6 +38,7 @@ const sizes = String(process.argv[4] || '20,15')
   .split(',')
   .map((value) => Number(value.trim()))
   .filter((value) => Number.isFinite(value) && value > 0);
+const bpp = Number(process.argv[5] || process.env.TIHU_FONT_BPP || 4);
 
 if (!fontPath || !fs.existsSync(fontPath)) {
   console.error('字体文件不存在: ' + fontPath);
@@ -46,34 +52,48 @@ if (sizes.length === 0) {
   console.error('没有有效字号');
   process.exit(1);
 }
+if (![1, 2, 4, 8].includes(bpp)) {
+  console.error('bpp 只能是 1/2/4/8: ' + bpp);
+  process.exit(1);
+}
 fs.mkdirSync(outDir, { recursive: true });
 
-const charsPath = path.join(__dirname, 'chars.txt');
+const charsPath = process.env.TIHU_CHARS_FILE || path.join(__dirname, 'chars_gb2312.txt');
+if (!fs.existsSync(charsPath)) {
+  console.error('字符表不存在: ' + charsPath);
+  process.exit(1);
+}
 const raw = fs.readFileSync(charsPath, 'utf8');
 
-// 去掉 # 开头的说明行和所有空白；按码点去重（不能按 UTF-16 code unit 切）。
+// 去掉 # 开头的说明行和 ASCII 空白；按码点去重（不能按 UTF-16 code unit 切）。
+// 注意：只去 ASCII 空白。JS 的 \s 连 U+3000（全角空格）也算，会把 GB2312 里的
+// 「　」删掉。
 const body = raw
   .split(/\r?\n/)
   .filter((line) => !/^\s*#/.test(line))
   .join('')
-  .replace(/\s+/gu, '');
-const symbols = Array.from(new Set(Array.from(body))).join('');
+  .replace(/[ \t\r\n]+/g, '');
+// ASCII 由下面的 range [0x20,0x7e] 覆盖，这里只留非 ASCII，避免重复。
+const symbols = Array.from(new Set(Array.from(body)))
+  .filter((ch) => ch.codePointAt(0) > 0x7e)
+  .join('');
 
 if (Array.from(symbols).length < 100) {
-  console.error('chars.txt 里的唯一字符太少: ' + Array.from(symbols).length);
+  console.error('字符表里的唯一字符太少: ' + Array.from(symbols).length);
   process.exit(1);
 }
 
 console.log(`字体     : ${fontPath}`);
 console.log(`字符表   : ${charsPath}`);
-console.log(`唯一字符 : ${Array.from(symbols).length}`);
+console.log(`唯一字符 : ${Array.from(symbols).length}（另加 ASCII 0x20..0x7E）`);
+console.log(`bpp      : ${bpp}`);
 console.log(`输出目录 : ${outDir}`);
 
 (async () => {
   for (const size of sizes) {
     const name = `tihu_font_${size}`;
     const output = path.join(outDir, `${name}.c`);
-    console.log(`生成 ${name} (${size}px, 4bpp) -> ${output}`);
+    console.log(`生成 ${name} (${size}px, ${bpp}bpp) -> ${output}`);
 
     const files = await convert({
       font: [
@@ -88,20 +108,20 @@ console.log(`输出目录 : ${outDir}`);
         },
       ],
       size,
-      bpp: 4,
+      bpp,
       format: 'lvgl',
       lv_include: 'lvgl.h',
       lv_font_name: name,
       force_fast_kern_format: true,
       output,
       // 关键：不压缩位图（等价 CLI 的 --no-compress）。
-      // lv_font_conv 默认会把 4bpp 位图压成 RLE 变体并写 .bitmap_format = 1，
+      // lv_font_conv 默认会把位图压成 RLE 变体并写 .bitmap_format = 1，
       // 而 .bitmap_format = 1 只有开了 LV_USE_FONT_COMPRESSED 的固件才解得开；
       // 没开时 lv_font_get_bitmap_fmt_txt 直接返回 NULL，LVGL 就按「缺字形」
       // 在屏上画 1px 空心方框（2026-11-11 真机中文全方框就是这个）。
       no_compress: true,
       // 只影响生成的注释行，保持 ASCII 便于排查。
-      opts_string: `--size ${size} --bpp 4 --format lvgl --no-compress --symbols <chars.txt>`,
+      opts_string: `--size ${size} --bpp ${bpp} --format lvgl --no-compress --symbols <${path.basename(charsPath)}>`,
     });
 
     for (const [filename, data] of Object.entries(files)) {

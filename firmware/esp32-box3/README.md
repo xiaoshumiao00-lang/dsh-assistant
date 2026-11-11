@@ -27,11 +27,13 @@ firmware/esp32-box3/
 │   ├── ui_board.c                  # 屏 1：任务棋盘
 │   ├── ui_progress.c               # 屏 4：进度
 │   ├── ui_done.c                   # 屏 6：完成
-│   └── font/                       # 已生成：tihu_font_20.c / tihu_font_15.c
+│   └── font/                       # 已生成：tihu_font_20.c / tihu_font_15.c / tihu_charset.h
 ├── tools/
 │   ├── gen_font_subset.ps1         # 重新生成字体的入口
-│   ├── gen_font_subset.cjs         # 真正读 UTF-8 chars.txt 的 Node 脚本
-│   └── chars.txt                   # 977 个常用汉字 + 中文标点
+│   ├── gen_font_subset.cjs         # 真正读 UTF-8 chars_gb2312.txt 的 Node 脚本
+│   ├── gen_charset.py              # GB2312 全码表 + 生僻补充 -> chars_gb2312.txt / tihu_charset.h
+│   ├── check_font_chars.cjs        # 离线核对：字符表/屏上文案是否都有字形
+│   └── chars_gb2312.txt            # 7470 字：GB2312 全集 + 生僻补充
 └── docs/
     └── esp32-box3-bring-up-checklist.md   # 到货当天 10 步验收
 ```
@@ -188,27 +190,38 @@ idf.py -p COM5 flash monitor
 
 ## 3. 字体：不要让它出现方块
 
-`main/font/tihu_font_20.c`、`tihu_font_15.c` 已经用 **977 个常用汉字 + 中文标点 + ASCII** 生成好，能覆盖协议词、状态词和大多数任务名。出现方块只有两种原因：
+`main/font/tihu_font_20.c`、`tihu_font_15.c` 用的是 **GB2312 全字符集**（6763 个汉字 + 682 个区符号/标点/全角字符 + 25 个生僻补充字）+ ASCII 95 字，4bpp PLAIN 位图。完成页正文是宿主任意中文，所以字库按整套标准字符集生成，而不是按固定文案挑字。
 
-1. 新项目名/任务名里有 `chars.txt` 没收录的字；
-2. 你改了 `chars.txt` 但没重新生成 `.c`。
+- 20px：7565 个字形，位图 1,337,385 B；
+- 15px：7565 个字形，位图 760,392 B；
+- 两套字库 + 字形描述约 2.12 MiB，app bin 3.85 MB / 8 MB 分区。
+
+出现方块只有两种原因：
+
+1. 字不在 GB2312 里（如「龘靐齉」，已通过 `RARE_SUPPLEMENT` 显式补进 `tools/chars_gb2312.txt`）；
+2. 改了字符表但没重新生成 `.c`，或 `.bitmap_format` 不是 0（压缩位图，固件没开解压器）。
 
 重新生成：
 
 ```powershell
 # 需要 Node.js 18+；默认用 C:\Windows\Fonts\simhei.ttf
+# 1) 先按字体真实 cmap 生成字符表（GB2312 全集 + 生僻补充）与自检用码位表
+python tools/gen_charset.py
+# 2) 再生成两套 LVGL 字库
 pwsh -File tools\gen_font_subset.ps1
-
-# 或指定字体
-pwsh -File tools\gen_font_subset.ps1 -FontPath "C:\Windows\Fonts\msyh.ttc"
+# 3) 离线核对：字符表、屏上文案是否都命中，bitmap_format 是否为 PLAIN
+node tools/check_font_chars.cjs
 ```
 
 脚本会：
 
-- 读 `tools/chars.txt`（UTF-8，`#` 开头是注释）；
+- 读 `tools/chars_gb2312.txt`（UTF-8，`#` 开头是注释，由 `gen_charset.py` 用 Python 的 gb2312 码表生成，不手敲中文）；
+- 同时生成 `main/font/tihu_charset.h`（7470 个码位），开机自检随机抽 50 个字验证两套字库都有字形；
 - 去重后调 `lv_font_conv` 生成 `main/font/tihu_font_20.c` 和 `tihu_font_15.c`；
-- 字号 20px / 15px，4bpp，ASCII 0x20–0x7E 自动加入。
+- 字号 20px / 15px，4bpp，`no_compress`（`.bitmap_format = 0`），ASCII 0x20–0x7E 自动加入。
 
+> 字号取舍：8 MB app 分区下 4bpp 两套字库约 2.1 MB，bin 3.85 MB、余 4.5 MB，没必要降 2bpp。若以后要上 GBK（2 万字），4bpp 会顶到 4.5 MB 以上，那时应把正文 15px 降 2bpp（中文仍可读），标题 20px 保持 4bpp。
+>
 > 为什么多了一个 `gen_font_subset.cjs`：Windows 上把中文 `--symbols` 传给 `npx.cmd` 会经过 `cmd.exe`，按 ANSI 代码页重编码，生成的字模和注释都会乱码。PowerShell 只负责启动，Node 脚本自己读 UTF-8 文件，字符不经过命令行。
 >
 > 字体许可：默认的 SimHei 是 Windows 系统字体，只适合本机自用；要分发固件请换成 **Noto Sans SC / Source Han Sans** 等可再分发字体，并用 `-FontPath` 指过去。

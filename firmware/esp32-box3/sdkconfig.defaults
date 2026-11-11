@@ -56,3 +56,6 @@ CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 # 本固件不使用 IMU/sensor_hub，BSP 自己用新 API 建 I2C 总线，因此退回旧驱动无副作用。
 CONFIG_I2C_BUS_BACKWARD_CONFIG=y
 
+
+# LV_FONT_FMT_TXT_LARGE: 7563 glyphs x 1.3 MB bitmap -> bitmap_index exceeds 16 bit.
+CONFIG_LV_FONT_FMT_TXT_LARGE=y

@@ -7,7 +7,8 @@
  * 做的事:
  *   1) 从 main/font/tihu_font_20.c、tihu_font_15.c 里解析 cmap 的 unicode 列表;
  *   2) 从 main/ui.c、ui_board.c、ui_progress.c、ui_done.c 里抓出所有 C 字符串字面量
- *      (默认文案/初始文案都在里面) 以及 tools/chars.txt 的全部字符;
+ *      (默认文案/初始文案都在里面), 再并上 tools/chars_gb2312.txt 的全部字符
+ *      (GB2312 全集 + 生僻补充, 由 tools/gen_charset.py 生成);
  *   3) 报出每个字体缺哪些字符, 缺字则退出码 1 (可用于 CI/烧机前自检)。
  */
 'use strict';
@@ -95,14 +96,22 @@ for (const s of sources) {
 for (const ch of '鹈鹕 BOX-3B连接中按住 CONFIG 说话主页停止重读棋盘进度完成等你在跑排队任务失败没有空取消继续播放暂停第页步共条个秒分时用') {
   required.add(ch);
 }
-const charsTxt = fs.readFileSync(path.join(root, 'tools/chars.txt'), 'utf8');
-const charsOnly = Array.from(new Set(Array.from(charsTxt.replace(/^#.*$/gm, '')).filter((c) => c.codePointAt(0) > 0x7e)));
+// 字库的完整字符来源: GB2312 全集 + 生僻补充 (tools/gen_charset.py 生成)。
+// chars.txt 那个 1073 字的旧表已经不够用: 完成页正文是宿主任意中文。
+const charsPath = path.join(root, 'tools/chars_gb2312.txt');
+const charsTxt = fs.readFileSync(charsPath, 'utf8');
+const charset = Array.from(
+  new Set(Array.from(charsTxt.replace(/^#.*$/gm, '')).filter((c) => c.codePointAt(0) > 0x7e))
+);
+
+console.log(`字符表: ${path.basename(charsPath)} -> ${charset.length} 个非 ASCII 字符`);
+console.log(`屏上文案字符: ${required.size} 个`);
 
 let bad = false;
 for (const f of fonts) {
   const info = parseCmap(path.join(root, f));
   const missing = [...required].filter((ch) => !info.cps.has(ch.codePointAt(0)));
-  const missingCharsTxt = charsOnly.filter((ch) => !info.cps.has(ch.codePointAt(0)));
+  const missingCharset = charset.filter((ch) => !info.cps.has(ch.codePointAt(0)));
   console.log(
     `${path.basename(f)}: glyphs=${info.glyphCount} bpp=${info.bpp} bitmap_format=${info.fmt} ` +
       `cmaps=${info.cmaps.map((c) => `${c.start}+${c.len}`).join(',')} unicode=${info.cps.size}`
@@ -114,8 +123,14 @@ for (const f of fonts) {
   } else {
     console.log('  屏上字符全部命中');
   }
-  if (missingCharsTxt.length) {
-    console.log(`  chars.txt 里有但字体缺 (${missingCharsTxt.length}): ${missingCharsTxt.join('')}`);
+  if (missingCharset.length) {
+    console.log(`  字符表里有但字体缺 (${missingCharset.length}): ${missingCharset.join('')}`);
+    bad = true;
+  } else {
+    console.log(`  字符表全部命中 (${charset.length}/${charset.length})`);
+  }
+  if (info.fmt !== '0') {
+    console.log(`  bitmap_format=${info.fmt} 不是 PLAIN(0): 固件没开 LV_USE_FONT_COMPRESSED 时整屏方框`);
     bad = true;
   }
 }
