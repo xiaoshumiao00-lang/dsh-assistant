@@ -18,6 +18,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "iot_button.h"
@@ -33,6 +34,7 @@ static bool s_ptt_active;
 #define TIHU_UI_TASK_STACK   (12 * 1024)
 #define TIHU_UI_TASK_PRIO    3
 #define TIHU_UI_TICK_MS      10
+#define TIHU_MEMLOG_MS       10000   /* 内存水位日志间隔（10 s） */
 
 /**
  * 常驻 UI 任务。
@@ -64,12 +66,18 @@ static void tihu_ui_task(void *arg)
             bsp_display_unlock();
         }
         loops++;
-        if ((loops % (5000 / TIHU_UI_TICK_MS)) == 0) {
+        if ((loops % (TIHU_MEMLOG_MS / TIHU_UI_TICK_MS)) == 0) {
             unsigned flush = tihu_ui_flush_count();
-            ESP_LOGI(TAG, "UI 心跳：handler=%u flush=%u(+%u) 内部堆余=%uB PSRAM 余=%uB",
-                     loops, flush, flush - last_flush,
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            /* 每 10 秒一条内存水位：内部堆/最大连续块/历史最低 + PSRAM，掉得下去就是泄漏。 */
+            ESP_LOGI(TAG, "内存水位：内部堆 %u B（最大块 %u B，最低 %u B）/ PSRAM %u B（最大块 %u B，最低 %u B）；"
+                          "UI handler=%u flush=%u(+%u)",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+                     loops, flush, flush - last_flush);
             last_flush = flush;
         }
         vTaskDelay(pdMS_TO_TICKS(TIHU_UI_TICK_MS));
@@ -113,12 +121,52 @@ static void ptt_release(void *handle, void *usr_data)
     }
 }
 
+/*
+ * 开机自检：启动 5 秒后程序化点一下完成页的「停止」按钮。
+ *
+ * 现场没人按按钮，所以用它证明「触摸/按钮链路到宿主是通的」：
+ * 走的是和真手指完全相同的回调（lv_obj_send_event → done_btn_cb → screen.gesture），
+ * 串口会有三行关键：`按钮命中 actionId=stop`、`screen.gesture 发送结果=成功`、
+ * `自检回执 type=event.progress`（宿主对 stop 的回包）。
+ *
+ * 5 秒时 Wi-Fi 可能还没连上宿主（第一次发送会失败并打日志），所以失败就每 10 秒再试，
+ * 最多 12 次；成功一次后等 6 秒收宿主回包就收工，全程只打日志、不改屏上内容。
+ */
+static void selftest_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    ESP_LOGW(TAG, "=== 开机自检：5 秒到，模拟点一下完成页「停止」（actionId=stop）===");
+    tihu_net_watch_selftest(true);
+    bool sent = false;
+    for (int attempt = 1; attempt <= 12 && !sent; attempt++) {
+        int64_t began = esp_timer_get_time();
+        sent = tihu_ui_simulate_action(0);
+        int cost_ms = (int)((esp_timer_get_time() - began) / 1000);
+        ESP_LOGI(TAG, "开机自检第 %d/12 次：screen.gesture %s（耗时 %d ms，WS %s）",
+                 attempt, sent ? "已发出" : "未发出", cost_ms,
+                 tihu_net_connected() ? "已连接" : "未连接");
+        if (!sent) {
+            vTaskDelay(pdMS_TO_TICKS(10000));
+        }
+    }
+    if (sent) {
+        ESP_LOGI(TAG, "开机自检：已发出，等宿主 ack 6 秒（看下面「自检回执」行）");
+        vTaskDelay(pdMS_TO_TICKS(6000));
+        ESP_LOGI(TAG, "开机自检结束：见上方 自检回执 type=...");
+    } else {
+        ESP_LOGW(TAG, "开机自检结束：12 次都没发出去（一直没连上宿主）");
+    }
+    tihu_net_watch_selftest(false);
+    vTaskDelete(NULL);
+}
+
 static void buttons_init(void)
 {
     /*
      * 只建 CONFIG 键（GPIO0），不走 bsp_iot_button_create()。
      *
-     * 原因：BOX-3 的按键表里 BSP_BUTTON_MAIN 是 GT911 上的「触摸主页键」，
+     * 原因：BOXS-3 的按键表里 BSP_BUTTON_MAIN 是 GT911 上的「触摸主页键」，
      * bsp_iot_button_create() 在 BSP 的静态 tp 为空时会**再 new 一个 GT911 实例**。
      * 现在触摸由 tihu_touch.c 自己持有，两个实例轮流读同一颗芯片会互相吃掉报点
      * （一个把 0x814E 状态读走，另一个就永远看不到按下）。
@@ -162,6 +210,9 @@ void app_main(void)
     tihu_audio_init();
     tihu_net_start();
     buttons_init();
+    if (xTaskCreate(selftest_task, "tihu_selftest", 4096, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "开机自检任务创建失败（不影响正常使用）");
+    }
 
     ESP_LOGI(TAG, "启动完成：UI 任务常驻（app_main 返回不影响屏幕与网络）");
 }

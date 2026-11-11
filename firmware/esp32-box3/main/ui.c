@@ -45,6 +45,17 @@ static const char *TAG = "tihu_ui";
 #define TIHU_ACTIVE_SCREEN() lv_scr_act()
 #endif
 
+/*
+ * LVGL 绘图缓冲行数。
+ *
+ * S3 的 ILI9341 走 SPI，flush 是 esp_lcd_panel_draw_bitmap → SPI DMA：
+ * **只能**是内部 RAM（PSRAM 不能做 SPI DMA 源），所以这块不能像播放缓冲那样挪 PSRAM。
+ * 能挤的只有尺寸：BSP 默认 100 行 = 320×100×2 = 64 KB 内部 DRAM，
+ * 降到 50 行 = 32 KB，内部堆立刻多出 32 KB；5 ms tick 下每帧只是多一次 SPI 传输，
+ * 画面内容和刷新率都没有可见差别。
+ */
+#define TIHU_LCD_DRAW_BUF_ROWS 50
+
 typedef enum {
     SCREEN_BOARD = 0,
     SCREEN_PROGRESS,
@@ -479,7 +490,7 @@ lv_obj_t *tihu_ui_label(lv_obj_t *parent, const char *text, const lv_font_t *fon
     return label;
 }
 
-void tihu_ui_send_action(const char *action_id, const char *task_id,
+bool tihu_ui_send_action(const char *action_id, const char *task_id,
                          lv_obj_t *origin)
 {
     int x = 160;
@@ -507,6 +518,7 @@ void tihu_ui_send_action(const char *action_id, const char *task_id,
         ESP_LOGW("ui", "screen.gesture 没发出去（WebSocket 未连接？）actionId=%s",
                  action_id != NULL ? action_id : "");
     }
+    return ok;
 }
 
 const char *tihu_ui_connection_text(void)
@@ -549,7 +561,7 @@ static lv_display_t *tihu_display_init(void)
     }
 
     const bsp_display_config_t bus_cfg = {
-        .max_transfer_sz = (BSP_LCD_H_RES * CONFIG_BSP_LCD_DRAW_BUF_HEIGHT) * sizeof(uint16_t),
+        .max_transfer_sz = (BSP_LCD_H_RES * TIHU_LCD_DRAW_BUF_ROWS) * sizeof(uint16_t),
     };
     esp_lcd_panel_handle_t panel = NULL;
     esp_lcd_panel_io_handle_t io = NULL;
@@ -575,7 +587,7 @@ static lv_display_t *tihu_display_init(void)
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = io,
         .panel_handle = panel,
-        .buffer_size = BSP_LCD_H_RES * CONFIG_BSP_LCD_DRAW_BUF_HEIGHT,
+        .buffer_size = BSP_LCD_H_RES * TIHU_LCD_DRAW_BUF_ROWS,
         .double_buffer = double_buffer,
         .hres = BSP_LCD_H_RES,
         .vres = BSP_LCD_V_RES,

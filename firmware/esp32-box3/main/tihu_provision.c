@@ -39,8 +39,9 @@ static char s_ap_ssid[33];
 /* httpd 任务栈最后落在哪：内部 RAM（正常）还是 PSRAM（内部实在挤不出来时的兜底）。 */
 static bool s_stack_in_psram;
 
-/** 写 NVS（save/forget）；栈在 PSRAM 时转给内部栈小任务，见文件后半段定义。 */
+/** 写 NVS（Wi-Fi save/forget、公网 save/clear）；栈在 PSRAM 时转给内部栈小任务，见文件后半段定义。 */
 static bool nvs_job_run(bool is_save, const char *ssid, const char *password);
+static bool nvs_public_run(const char *host, int port, bool tls, const char *token);
 
 /* ------------------------------ 小工具 ------------------------------ */
 
@@ -99,7 +100,7 @@ static void esc_js(const char *in, char *out, size_t len)
  */
 
 /* 整页缓冲上限：头 ~1.9 KB + 已存网络 8×~230 B + 扫描结果 32×~150 B + 表单 ~1 KB，留一倍余量。 */
-#define PROVISION_PAGE_MAX   14336
+#define PROVISION_PAGE_MAX   16384
 
 static char  *s_page;           /* 整页 HTML 缓冲（PSRAM） */
 static size_t s_page_cap;
@@ -362,6 +363,36 @@ static void page_saved(void)
              "</form>");
 }
 
+/**
+ * 公网地址（可选）：填了就走公网直连，留空就走局域网 UDP 发现。
+ * 两个输入框是独立表单（/public）：只改公网地址不需要再填一遍 Wi-Fi。
+ */
+static void page_public(void)
+{
+    tihu_public_cfg_t cfg;
+    tihu_wifi_public_get(&cfg);
+
+    page_add("<h2>公网地址（可选）</h2><div class=\"card\">");
+    if (cfg.enabled) {
+        char host_esc[300];
+        esc_html(cfg.host, host_esc, sizeof(host_esc));
+        page_add("<p class=\"hint\" style=\"margin:10px 2px 4px\">当前：%s://%s:%d（token %s）</p>",
+                 cfg.tls ? "wss" : "ws", host_esc, cfg.port,
+                 cfg.token[0] != '\0' ? "已填" : "空");
+    } else {
+        page_add("<p class=\"hint\" style=\"margin:10px 2px 4px\">当前：局域网模式（UDP 发现宿主）</p>");
+    }
+    page_add("<form method=\"post\" action=\"/public\" id=\"publicForm\">"
+             "<input name=\"public\" id=\"public\" maxlength=\"95\" autocomplete=\"off\" "
+             "autocapitalize=\"off\" placeholder=\"公网地址（可选，例 wss://49.234.20.84:7080）\">"
+             "<input name=\"token\" id=\"ptoken\" type=\"password\" maxlength=\"79\" "
+             "autocomplete=\"off\" placeholder=\"token（pocket 的公网 PIN）\">"
+             "<button class=\"primary\" type=\"submit\">保存公网地址并重启</button>"
+             "<p class=\"hint\">填了就走公网（wss:// 或 ws:// 直连），留空就走局域网发现。"
+             "地址要带端口，端口必须和隧道/反代对外暴露的一致；保存后设备重启生效。</p>"
+             "</form></div>");
+}
+
 /** 扫到的 SSID（点一下填进上面表单）。 */
 static void page_scan(void)
 {
@@ -407,6 +438,7 @@ static esp_err_t handler_root(httpd_req_t *req)
     page_reset();
     page_head("配网热点已开启");
     page_saved();
+    page_public();
     page_scan();
     if (s_page_truncated) {
         ESP_LOGW(TAG, "配网页超过缓冲上限 %u B，内容被截断（扫描结果多时属正常，页面仍可提交）",
@@ -437,6 +469,16 @@ static void restart_task(void *arg)
     ESP_LOGW(TAG, "配网完成：关闭配网热点，回 STA 模式，重启生效");
     tihu_provision_stop();
     esp_restart();
+}
+
+/** 先把响应发完再重启（响应已在调用方 send_html 里发出）。 */
+static void kick_restart(void)
+{
+    if (xTaskCreate(restart_task, "tihu_prov_restart", 3072, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "重启任务创建失败，直接重启");
+        tihu_provision_stop();
+        esp_restart();
+    }
 }
 
 static esp_err_t handler_save(httpd_req_t *req)
@@ -492,11 +534,108 @@ static esp_err_t handler_save(httpd_req_t *req)
         ok_len = (int)sizeof(ok_page) - 1;
     }
     send_html(req, "200 OK", ok_page, (size_t)ok_len, NULL, NULL);
-    if (xTaskCreate(restart_task, "tihu_prov_restart", 3072, NULL, 5, NULL) != pdPASS) {
-        ESP_LOGW(TAG, "重启任务创建失败，直接重启");
-        tihu_provision_stop();
-        esp_restart();
+    kick_restart();
+    return ESP_OK;
+}
+
+/**
+ * POST /public —— 存「公网地址 + token」。
+ *   - 地址留空 = 清除公网配置，host_mode=lan（下次开机重新走 UDP 发现）；
+ *   - 地址非空但 token 空 = 拒绝（公网入口一定有 pocket 鉴权）；
+ *   - 地址格式不对 = 拒绝并给出可照抄的示例。
+ */
+static esp_err_t handler_public(httpd_req_t *req)
+{
+    char body[PROVISION_BODY_MAX];
+    body_read(req, body, sizeof(body));
+
+    char raw_public[128] = {0};
+    char raw_token[96] = {0};
+    char public_url[112] = {0};
+    char token[TIHU_PUBLIC_TOKEN_MAX] = {0};
+    form_field(body, "public", raw_public, sizeof(raw_public));
+    form_field(body, "token", raw_token, sizeof(raw_token));
+    url_decode(raw_public, public_url, sizeof(public_url));
+    url_decode(raw_token, token, sizeof(token));
+
+    char host[TIHU_PUBLIC_HOST_MAX] = {0};
+    int port = 0;
+    bool tls = false;
+
+    if (public_url[0] == '\0') {
+        bool ok = nvs_public_run("", 0, false, NULL);
+        ESP_LOGI(TAG, "配网页 POST /public：地址留空 → 清除公网配置（%s）", ok ? "成功" : "失败");
+        static const char CLEARED[] =
+            "<!doctype html><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<body style=\"font-family:-apple-system,sans-serif;padding:24px;line-height:1.6\">"
+            "<h2>已切回局域网模式</h2>"
+            "<p>设备正在重启；连上 Wi-Fi 后用 UDP 广播找宿主。</p>"
+            "<p><a href=\"/\">刷新</a></p></body>";
+        send_html(req, ok ? "200 OK" : "500 Internal Server Error", CLEARED,
+                  sizeof(CLEARED) - 1, NULL, NULL);
+        if (ok) {
+            kick_restart();
+        }
+        return ESP_OK;
     }
+
+    if (token[0] == '\0') {
+        static const char NO_TOKEN[] =
+            "<!doctype html><meta charset=\"utf-8\">"
+            "<body style=\"font-family:sans-serif;padding:20px\">"
+            "<h2>公网模式要填 token</h2>"
+            "<p>token 就是 pocket 的公网 PIN（8 位），填在「公网地址」下面那个框里。</p>"
+            "<p><a href=\"/\">返回</a></p></body>";
+        return send_html(req, "400 Bad Request", NO_TOKEN, sizeof(NO_TOKEN) - 1, NULL, NULL);
+    }
+
+    if (!tihu_wifi_parse_public(public_url, host, sizeof(host), &port, &tls)) {
+        static const char BAD_URL[] =
+            "<!doctype html><meta charset=\"utf-8\">"
+            "<body style=\"font-family:sans-serif;padding:20px\">"
+            "<h2>公网地址格式不对</h2>"
+            "<p>照这个写：<code>wss://49.234.20.84:7080</code> 或 <code>wss://example.com:80</code>；"
+            "只写主机名时默认 wss 443 / ws 80。</p>"
+            "<p><a href=\"/\">返回</a></p></body>";
+        return send_html(req, "400 Bad Request", BAD_URL, sizeof(BAD_URL) - 1, NULL, NULL);
+    }
+
+    ESP_LOGI(TAG, "配网页 POST /public：%s://%s:%d（token 已填，长度 %u）",
+             tls ? "wss" : "ws", host, port, (unsigned)strlen(token));
+    bool ok = nvs_public_run(host, port, tls, token);
+    if (!ok) {
+        static const char FAIL_PAGE[] =
+            "<!doctype html><meta charset=\"utf-8\">"
+            "<body style=\"font-family:sans-serif;padding:20px\">"
+            "<h2>保存失败</h2><p>NVS 写入失败，请重试。</p>"
+            "<p><a href=\"/\">返回</a></p></body>";
+        return send_html(req, "500 Internal Server Error", FAIL_PAGE, sizeof(FAIL_PAGE) - 1, NULL, NULL);
+    }
+
+    char host_esc[300];
+    esc_html(host, host_esc, sizeof(host_esc));
+    /* static：httpd 任务栈可能只有 4 KB，1 KB 的整页放栈上太奢侈（请求串行，复用安全）。 */
+    static char ok_page[1024];
+    int ok_len = snprintf(ok_page, sizeof(ok_page),
+                          "<!doctype html><meta charset=\"utf-8\">"
+                          "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                          "<body style=\"font-family:-apple-system,sans-serif;padding:24px;line-height:1.6\">"
+                          "<h2>已保存公网入口</h2>"
+                          "<p><code>%s://%s:%d</code></p>"
+                          "<p>设备正在重启；开机后直接连这个地址的 <code>/tihu/lane</code>，"
+                          "不再发 UDP 发现。</p>"
+                          "<p style=\"color:#8e8e93\">连不上会自动重试；想改回局域网就在本页把地址留空再保存。</p>"
+                          "<p><a href=\"/\">刷新</a></p></body>",
+                          tls ? "wss" : "ws", host_esc, port);
+    if (ok_len < 0) {
+        ok_len = 0;
+    }
+    if (ok_len >= (int)sizeof(ok_page)) {
+        ok_len = (int)sizeof(ok_page) - 1;
+    }
+    send_html(req, "200 OK", ok_page, (size_t)ok_len, NULL, NULL);
+    kick_restart();
     return ESP_OK;
 }
 
@@ -527,26 +666,53 @@ static esp_err_t handler_delete(httpd_req_t *req)
 static SemaphoreHandle_t s_nvs_done;
 static char s_nvs_ssid[TIHU_WIFI_SSID_MAX];
 static char s_nvs_password[TIHU_WIFI_PASSWORD_MAX];
-static bool s_nvs_is_save;
+static char s_nvs_public_host[TIHU_PUBLIC_HOST_MAX];
+static char s_nvs_public_token[TIHU_PUBLIC_TOKEN_MAX];
+static int  s_nvs_public_port;
+static bool s_nvs_public_tls;
+
+/** 这一次要写什么。三种都走同一个小任务，避免 PSRAM 栈擦 flash 时 panic。 */
+typedef enum {
+    NVS_OP_WIFI_SAVE = 0,
+    NVS_OP_WIFI_FORGET,
+    NVS_OP_PUBLIC_SAVE,      /* host 为空 = 清除公网、回局域网 */
+} nvs_op_t;
+
+static nvs_op_t s_nvs_op;
 static bool s_nvs_result;
 
 static void nvs_job_task(void *arg)
 {
     (void)arg;
-    s_nvs_result = s_nvs_is_save ? tihu_wifi_save(s_nvs_ssid, s_nvs_password)
-                                 : tihu_wifi_forget(s_nvs_ssid);
+    switch (s_nvs_op) {
+    case NVS_OP_WIFI_SAVE:
+        s_nvs_result = tihu_wifi_save(s_nvs_ssid, s_nvs_password);
+        break;
+    case NVS_OP_WIFI_FORGET:
+        s_nvs_result = tihu_wifi_forget(s_nvs_ssid);
+        break;
+    case NVS_OP_PUBLIC_SAVE:
+        s_nvs_result = s_nvs_public_host[0] != '\0'
+                           ? tihu_wifi_public_save(s_nvs_public_host, s_nvs_public_port,
+                                                   s_nvs_public_tls, s_nvs_public_token)
+                           : tihu_wifi_public_clear();
+        break;
+    default:
+        s_nvs_result = false;
+        break;
+    }
     xSemaphoreGive(s_nvs_done);
     vTaskDelete(NULL);
 }
 
 static bool nvs_job_run(bool is_save, const char *ssid, const char *password)
 {
+    s_nvs_op = is_save ? NVS_OP_WIFI_SAVE : NVS_OP_WIFI_FORGET;
+    snprintf(s_nvs_ssid, sizeof(s_nvs_ssid), "%s", ssid);
+    snprintf(s_nvs_password, sizeof(s_nvs_password), "%s", password != NULL ? password : "");
     if (!s_stack_in_psram) {
         return is_save ? tihu_wifi_save(ssid, password) : tihu_wifi_forget(ssid);
     }
-    snprintf(s_nvs_ssid, sizeof(s_nvs_ssid), "%s", ssid);
-    snprintf(s_nvs_password, sizeof(s_nvs_password), "%s", password != NULL ? password : "");
-    s_nvs_is_save = is_save;
     if (s_nvs_done == NULL) {
         s_nvs_done = xSemaphoreCreateBinary();
     }
@@ -554,6 +720,34 @@ static bool nvs_job_run(bool is_save, const char *ssid, const char *password)
         xTaskCreate(nvs_job_task, "tihu_nvs", 4096, NULL, 6, NULL) != pdPASS) {
         ESP_LOGW(TAG, "内部栈任务起不来，退回在 httpd 任务里直接写 NVS");
         return is_save ? tihu_wifi_save(ssid, password) : tihu_wifi_forget(ssid);
+    }
+    if (xSemaphoreTake(s_nvs_done, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGW(TAG, "NVS 写入超时（5 s）");
+        return false;
+    }
+    return s_nvs_result;
+}
+
+/** 存/清公网入口；host 为空 = 清除（回局域网发现）。 */
+static bool nvs_public_run(const char *host, int port, bool tls, const char *token)
+{
+    const char *h = host != NULL ? host : "";
+    const char *t = token != NULL ? token : "";
+    s_nvs_op = NVS_OP_PUBLIC_SAVE;
+    s_nvs_public_port = port;
+    s_nvs_public_tls = tls;
+    snprintf(s_nvs_public_host, sizeof(s_nvs_public_host), "%s", h);
+    snprintf(s_nvs_public_token, sizeof(s_nvs_public_token), "%s", t);
+    if (!s_stack_in_psram) {
+        return h[0] != '\0' ? tihu_wifi_public_save(h, port, tls, t) : tihu_wifi_public_clear();
+    }
+    if (s_nvs_done == NULL) {
+        s_nvs_done = xSemaphoreCreateBinary();
+    }
+    if (s_nvs_done == NULL ||
+        xTaskCreate(nvs_job_task, "tihu_nvs", 4096, NULL, 6, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "内部栈任务起不来，退回在 httpd 任务里直接写 NVS");
+        return h[0] != '\0' ? tihu_wifi_public_save(h, port, tls, t) : tihu_wifi_public_clear();
     }
     if (xSemaphoreTake(s_nvs_done, pdMS_TO_TICKS(5000)) != pdTRUE) {
         ESP_LOGW(TAG, "NVS 写入超时（5 s）");
@@ -736,10 +930,11 @@ void tihu_provision_start(void)
     int registered = 0;
     registered += register_uri(s_server, "/", HTTP_GET, "GET", handler_root);
     registered += register_uri(s_server, "/save", HTTP_POST, "POST", handler_save);
+    registered += register_uri(s_server, "/public", HTTP_POST, "POST", handler_public);
     registered += register_uri(s_server, "/delete", HTTP_POST, "POST", handler_delete);
     registered += register_uri(s_server, "/favicon.ico", HTTP_GET, "GET", handler_favicon);
     registered += register_uri(s_server, "/*", HTTP_GET, "GET", handler_catch_all);
-    ESP_LOGI(TAG, "配网页 HTTP 服务已就绪：端口 %d，栈 %u B（%s），max_open_sockets=%d，路由注册 %d/5",
+    ESP_LOGI(TAG, "配网页 HTTP 服务已就绪：端口 %d，栈 %u B（%s），max_open_sockets=%d，路由注册 %d/6",
              PROVISION_HTTP_PORT, (unsigned)stack_used,
              stack_in_psram ? "PSRAM" : "内部 RAM", (int)http_cfg.max_open_sockets, registered);
 

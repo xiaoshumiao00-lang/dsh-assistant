@@ -11,6 +11,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+
+#include "lwip/sockets.h"
+#include "netdb.h"
 
 #include "config.h"
 #include "esp_event.h"
@@ -54,20 +59,45 @@ static volatile bool s_connecting;      /* 有一次 connect 正在等结果 */
 static volatile bool s_wifi_up;         /* 当前这次连接已拿到 IP */
 static volatile bool s_host_known;      /* 宿主地址已确定（发现或回退） */
 static int s_host_port = TIHU_PORT;
-static char s_host_ip[64];
+static bool s_host_tls;                 /* 公网模式且 wss:// 时为 true */
+static char s_host_ip[TIHU_PUBLIC_HOST_MAX];
 static char s_host_token[80];
 static char s_wifi_ip[20];
 static char s_wifi_ssid[33];
 
-/* WS 分片重组：正常一条 screen.frame/tts.audio 都小于 32KB。 */
-static char s_rx_buf[WS_RX_MAX];
+/*
+ * WS 分片重组：正常一条 screen.frame/tts.audio 都小于 32KB。
+ *
+ * 这块 32 KB 原来是静态数组（.bss，直接占内部 DRAM）。内部堆本来只剩 ~19 KB 时，
+ * esp_websocket_client 连 8 KB 任务栈都建不出来——把这块整体挪到 PSRAM，
+ * 内部堆一次性让出 32 KB（2026-11-11 公网模式实测根因之一）。
+ */
+static char *s_rx_buf;
 static size_t s_rx_len;
+
+/** 懒分配 32 KB 重组缓冲（PSRAM）；失败返回 false，之后下行按分片丢弃。 */
+static bool rx_buf_ensure(void)
+{
+    if (s_rx_buf != NULL) {
+        return true;
+    }
+    s_rx_buf = heap_caps_malloc(WS_RX_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_rx_buf == NULL) {
+        ESP_LOGE(TAG, "WS 重组缓冲 %d B 分配失败（PSRAM 不够？）", WS_RX_MAX);
+        return false;
+    }
+    ESP_LOGI(TAG, "WS 重组缓冲 %d B 走 PSRAM（内部 DRAM 让出 %d B）", WS_RX_MAX, WS_RX_MAX);
+    return true;
+}
 
 /* 开机自检窗口：见 tihu_net_watch_selftest()。 */
 static volatile bool s_selftest_watch;
+/* 网络体检只跑一次（第一次 WS 出错时）。 */
+static bool s_probe_done;
 
 static void start_ws(void);
 static void handle_text(const char *data, size_t len);
+static void net_probe_task(void *arg);
 
 /* ------------------------------ 发送 ------------------------------ */
 
@@ -410,13 +440,15 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
     esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
 
     switch (event_id) {
-    case WEBSOCKET_EVENT_CONNECTED:
+    case WEBSOCKET_EVENT_CONNECTED: {
         s_connected = true;
         s_last_rx_ms = tihu_protocol_now_ms();
         s_rx_len = 0;
-        ESP_LOGI(TAG, "WebSocket 已连接：%s", s_uri);
+        ESP_LOGI(TAG, "WebSocket 已连接（握手成功）：%s（TLS=%s）", s_uri,
+                 s_host_tls ? "开，未校验证书（仅测试）" : "关");
         tihu_ui_set_connection(true, "已连接");
-        send_json(tihu_build_hello(s_client_id, TIHU_DEVICE_NAME));
+        bool hello_ok = send_json(tihu_build_hello(s_client_id, TIHU_DEVICE_NAME));
+        ESP_LOGI(TAG, "hello 已发：clientId=%s（%s）", s_client_id, hello_ok ? "成功" : "失败");
         /* 协议 §6.3：重连先报 idle，宿主丢掉上一轮“朗读中”的假设。 */
         tihu_net_send_playback_state("idle", NULL, 0, -1, 0, -1);
 #if TIHU_AUDIO_SELFTEST
@@ -428,6 +460,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
         }
 #endif
         break;
+    }
 
     case WEBSOCKET_EVENT_DISCONNECTED:
         s_connected = false;
@@ -457,10 +490,13 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
             break;
         }
         /* 分片重组：payload_offset==0 表示新的一条消息。 */
+        if (!rx_buf_ensure()) {
+            break;
+        }
         if (data->payload_offset == 0) {
             s_rx_len = 0;
         }
-        if (s_rx_len + (size_t)data->data_len > sizeof(s_rx_buf)) {
+        if (s_rx_len + (size_t)data->data_len > WS_RX_MAX) {
             ESP_LOGW(TAG, "下行消息超过 %d 字节，丢弃", WS_RX_MAX);
             s_rx_len = 0;
             break;
@@ -475,13 +511,142 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
 
     case WEBSOCKET_EVENT_ERROR:
         s_connected = false;
-        ESP_LOGW(TAG, "WebSocket 错误，底层会自动重连");
+        if (!s_probe_done) {
+            /* 第一次连不上就跑一次网络体检（只诊断，不影响重连）。 */
+            s_probe_done = true;
+            if (xTaskCreate(net_probe_task, "tihu_netprobe", 4096, NULL, 2, NULL) != pdPASS) {
+                ESP_LOGW(TAG, "网络体检任务创建失败（不影响重连）");
+            }
+        }
+        if (data != NULL) {
+            /* 公网/局域网都要能一眼看出「TCP 没通 / TLS 没过 / HTTP 升级被拒」。 */
+            ESP_LOGW(TAG, "WebSocket 错误：type=%d http=%d errno=%d tls_esp=0x%x 目标=%s",
+                     (int)data->error_handle.error_type,
+                     data->error_handle.esp_ws_handshake_status_code,
+                     data->error_handle.esp_transport_sock_errno,
+                     (unsigned)data->error_handle.esp_tls_last_esp_err, s_uri);
+        } else {
+            ESP_LOGW(TAG, "WebSocket 错误，底层会自动重连");
+        }
         tihu_ui_set_connection(false, "重连中");
         break;
 
     default:
         break;
     }
+}
+
+/** 内存水位：WS 启动前后、失败时都打一条，看是不是内部 RAM 卡住的。 */
+static void log_ws_mem(const char *why)
+{
+    ESP_LOGI(TAG, "WS 内存（%s）：内部堆 %u B / 最大块 %u B / 历史最低 %u B，PSRAM %u B / 最大块 %u B",
+             why,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+}
+
+/* --------------------------- 连不上时的网络体检 --------------------------- */
+
+/*
+ * 「WebSocket 错误 type=1 … select() timeout」有两种可能：真没网（网关/防火墙丢 SYN），
+ * 或者只是路由/ARP 不通。一次性的 TCP 体检能把它们区分开：
+ *   通 0       → 目标可达
+ *   -102       → 超时，SYN 没人回（路由/防火墙/AP 隔离）
+ *   ECONNREFUSED → 端口关着但主机可达（网络本身是好的）
+ * 只在第一次 WS 出错时跑一次，不打扰正常重连。
+ */
+static int probe_tcp(const char *host, int port, int timeout_ms)
+{
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &dest.sin_addr) != 1) {
+        return -101;
+    }
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) {
+        return -103;
+    }
+    int flags = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, flags | O_NONBLOCK);
+    int rc = connect(s, (struct sockaddr *)&dest, sizeof(dest));
+    if (rc != 0 && errno != EINPROGRESS) {
+        int e = errno;
+        close(s);
+        return -e;
+    }
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(s, &wfds);
+    struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    rc = select(s + 1, NULL, &wfds, NULL, &tv);
+    if (rc == 0) {
+        close(s);
+        return -102;
+    }
+    int soerr = 0;
+    socklen_t len = sizeof(soerr);
+    getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &len);
+    close(s);
+    return soerr;
+}
+
+static void probe_report(const char *host, int port)
+{
+    int e = probe_tcp(host, port, 4000);
+    if (e == 0) {
+        ESP_LOGI(TAG, "体检 %s:%d → 通", host, port);
+    } else if (e == -102) {
+        ESP_LOGW(TAG, "体检 %s:%d → 超时（SYN 没回应：路由/防火墙/AP 隔离）", host, port);
+    } else if (e == ECONNREFUSED) {
+        ESP_LOGW(TAG, "体检 %s:%d → 端口关闭（主机可达，网络本身没问题）", host, port);
+    } else {
+        ESP_LOGW(TAG, "体检 %s:%d → 失败 code=%d", host, port, e);
+    }
+}
+
+static void net_probe_task(void *arg)
+{
+    (void)arg;
+    wifi_ap_record_t ap;
+    memset(&ap, 0, sizeof(ap));
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        ESP_LOGI(TAG, "体检：AP ssid=\"%s\" rssi=%d dBm ch=%d bssid=%02x:%02x:%02x:%02x:%02x:%02x",
+                 ap.ssid, ap.rssi, ap.primary, ap.bssid[0], ap.bssid[1], ap.bssid[2],
+                 ap.bssid[3], ap.bssid[4], ap.bssid[5]);
+    }
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip;
+    memset(&ip, 0, sizeof(ip));
+    if (sta != NULL && esp_netif_get_ip_info(sta, &ip) == ESP_OK) {
+        ESP_LOGI(TAG, "体检：本机 " IPSTR " 掩码 " IPSTR " 网关 " IPSTR,
+                 IP2STR(&ip.ip), IP2STR(&ip.netmask), IP2STR(&ip.gw));
+        char gw[16];
+        snprintf(gw, sizeof(gw), IPSTR, IP2STR(&ip.gw));
+        probe_report(gw, 80);
+        probe_report(gw, 443);
+    }
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    int gai = getaddrinfo("www.baidu.com", "443", &hints, &res);
+    ESP_LOGI(TAG, "体检：DNS www.baidu.com → %s", gai == 0 ? "解析成功" : "解析失败");
+    if (res != NULL) {
+        freeaddrinfo(res);
+    }
+    probe_report("223.5.5.5", 53);
+    probe_report("49.234.20.84", 80);
+    probe_report("49.234.20.84", 443);
+    probe_report("49.234.20.84", 8443);
+    probe_report("49.234.20.84", 7080);
+    ESP_LOGI(TAG, "体检结束（上行是 TCP connect，不代表 TLS/业务层）");
+    vTaskDelete(NULL);
 }
 
 static void start_ws(void)
@@ -491,29 +656,51 @@ static void start_ws(void)
             .uri = s_uri,
             .reconnect_timeout_ms = 3000,
             .network_timeout_ms = 10000,
-            .buffer_size = 16384,
+            /*
+             * 2 KB：原来 16 KB。esp_websocket_client 的 rx/tx 两块缓冲是 malloc，
+             * 默认能力=内部优先，16 KB×2 直接在内部堆里吃掉 32 KB——内部堆只剩 19 KB
+             * 时这比任务栈更致命。2 KB 后内部只占 4 KB，大消息靠分片重组，行为不变。
+             */
+            .buffer_size = 2048,
             .disable_auto_reconnect = false,
             /*
-             * 默认 4 KB 栈太紧：这个任务里要跑我们自己注册的事件回调
-             * （解析 JSON → 改 LVGL → 回一条 ack），实测 4 KB 会在首帧后踩栈。
+             * 任务栈：BSP/组件默认 4 KB，之前提到 8 KB 反而建不出来——
+             * CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384 把 ≤16 KB 的分配钉死在内部 RAM，
+             * 8 KB 栈根本轮不到 PSRAM，而内部只剩 19 KB 且没有 8 KB 连续块。
+             * 现在 32 KB 重组缓冲已挪 PSRAM，先按 4 KB 走；不够再 5 KB。
              */
-            .task_stack = 8192,
+            .task_stack = 4096,
         };
+        if (s_host_tls) {
+            /* 测试阶段只求连通：不装 CA、不比对证书 CN（走公网时链路上仍是 TLS 加密）。
+             * 正式发布前应改成 crt_bundle_attach = esp_crt_bundle_attach。 */
+            cfg.skip_cert_common_name_check = true;
+        }
         s_ws = esp_websocket_client_init(&cfg);
         if (s_ws == NULL) {
             ESP_LOGE(TAG, "esp_websocket_client_init 失败");
+            log_ws_mem("init 失败");
             return;
         }
         esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
     }
     if (!s_ws_started) {
+        log_ws_mem("start 前");
         esp_err_t err = esp_websocket_client_start(s_ws);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "WebSocket 启动失败: %s", esp_err_to_name(err));
+            ESP_LOGE(TAG, "WebSocket 启动失败: %s（栈 4096 B 需要一块连续内部 RAM）",
+                     esp_err_to_name(err));
+            log_ws_mem("start 失败");
+            if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 12288) {
+                ESP_LOGE(TAG, "内部最大块 < 12 KB：xTaskCreate 必失败。需要继续往 PSRAM 挪缓冲，"
+                              "或改成 xTaskCreateWithCaps(..., MALLOC_CAP_SPIRAM) 建 WS 任务");
+            }
             return;
         }
         s_ws_started = true;
-        ESP_LOGI(TAG, "WebSocket 启动：%s", s_uri);
+        ESP_LOGI(TAG, "WebSocket 启动：%s（TLS=%s，栈 4096 B / 缓冲 2048 B）", s_uri,
+                 s_host_tls ? "开，未校验证书（仅测试）" : "关");
+        log_ws_mem("启动后");
     }
 }
 
@@ -679,15 +866,58 @@ static bool try_connect(const tihu_wifi_cred_t *cred, int rssi, uint8_t authmode
 
 /* ------------------------------ 找宿主（UDP 发现 → NVS → config.h） ------------------------------ */
 
-/** 按要求的那一行格式落日志：发现宿主 ip=... port=... 来源=udp|nvs。 */
+/** 按要求的那一行格式落日志：发现宿主 ip=... port=... 来源=udp|nvs；公网模式另打一条。 */
 static void log_host_source(const char *source)
 {
-    ESP_LOGI(TAG, "发现宿主 ip=%s port=%d 来源=%s", s_host_ip, s_host_port, source);
+    if (s_host_tls) {
+        ESP_LOGI(TAG, "公网模式 → wss://%s:%d/tihu/lane（来源=%s）", s_host_ip, s_host_port, source);
+        ESP_LOGW(TAG, "公网 TLS：未校验证书（skip_cert_common_name_check），仅测试阶段");
+    } else {
+        ESP_LOGI(TAG, "发现宿主 ip=%s port=%d 来源=%s", s_host_ip, s_host_port, source);
+    }
 }
 
 static bool resolve_host(void)
 {
     s_host_known = false;
+
+    /*
+     * 0) 公网模式优先：配网页里填了「公网地址」+ token 就以它为准，
+     *    完全不发 UDP 广播（避免同一个设备既被发现又走公网、宿主上出现两条 lane）。
+     *    留空则 host_mode=lan，落回下面的局域网发现。
+     */
+    tihu_public_cfg_t pub;
+    tihu_wifi_public_get(&pub);
+    if (pub.enabled) {
+        snprintf(s_host_ip, sizeof(s_host_ip), "%s", pub.host);
+        s_host_port = pub.port > 0 ? pub.port : (pub.tls ? 443 : 80);
+        s_host_tls = pub.tls;
+        snprintf(s_host_token, sizeof(s_host_token), "%s", pub.token[0] != '\0' ? pub.token : TIHU_TOKEN);
+        s_host_known = true;
+        log_host_source("nvs/public");
+
+        /*
+         * 域名场景先把 DNS 结果打出来：解析失败时 WS 只会报「错误 type=0 errno=-1」，
+         * 串口里分不清是 DNS、端口还是 TLS 的问题。这里失败也继续（自动重连会再试）。
+         */
+        struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM};
+        struct addrinfo *res = NULL;
+        int rc = getaddrinfo(s_host_ip, NULL, &hints, &res);
+        if (rc == 0 && res != NULL) {
+            char ipbuf[20] = {0};
+            struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
+            inet_ntoa_r(sin->sin_addr, ipbuf, sizeof(ipbuf));
+            ESP_LOGI(TAG, "公网 DNS：%s → %s", s_host_ip, ipbuf);
+        } else {
+            ESP_LOGW(TAG, "公网 DNS 解析失败：%s（rc=%d=%s）", s_host_ip, rc,
+                     rc == EAI_AGAIN ? "EAI_AGAIN" : (rc == EAI_NONAME ? "EAI_NONAME" : "see lwip netdb"));
+        }
+        if (res != NULL) {
+            freeaddrinfo(res);
+        }
+        return true;
+    }
+    s_host_tls = false;
 
 #if TIHU_FORCE_HOST
     if (TIHU_HOST[0] != '\0') {
@@ -858,11 +1088,12 @@ static void heartbeat_cb(void *arg)
 
 static void build_uri(void)
 {
+    const char *scheme = s_host_tls ? "wss" : "ws";
     if (s_host_token[0] != '\0') {
-        snprintf(s_uri, sizeof(s_uri), "ws://%s:%d/tihu/lane?token=%s",
-                 s_host_ip, s_host_port, s_host_token);
+        snprintf(s_uri, sizeof(s_uri), "%s://%s:%d/tihu/lane?token=%s",
+                 scheme, s_host_ip, s_host_port, s_host_token);
     } else {
-        snprintf(s_uri, sizeof(s_uri), "ws://%s:%d/tihu/lane", s_host_ip, s_host_port);
+        snprintf(s_uri, sizeof(s_uri), "%s://%s:%d/tihu/lane", scheme, s_host_ip, s_host_port);
     }
 }
 
@@ -878,6 +1109,15 @@ void tihu_net_start(void)
     if (TIHU_WIFI_SSID[0] != '\0' && !tihu_wifi_saved_find(TIHU_WIFI_SSID, NULL)) {
         tihu_wifi_save(TIHU_WIFI_SSID, TIHU_WIFI_PASSWORD);
         ESP_LOGI(TAG, "config.h 种子 SSID \"%s\" 补进 NVS（之后以 NVS 为准）", TIHU_WIFI_SSID);
+    }
+    /* 公网入口同理：只补一次，落过 host_mode 之后一律以 NVS（配网页）为准。 */
+    if (TIHU_PUBLIC_HOST[0] != '\0' && !tihu_wifi_host_mode_set()) {
+        bool pub_tls = TIHU_PUBLIC_TLS != 0;
+        int pub_port = TIHU_PUBLIC_PORT > 0 ? TIHU_PUBLIC_PORT : (pub_tls ? 443 : 80);
+        if (tihu_wifi_public_save(TIHU_PUBLIC_HOST, pub_port, pub_tls, TIHU_PUBLIC_TOKEN)) {
+            ESP_LOGI(TAG, "config.h 种子公网入口 %s://%s:%d 补进 NVS（之后以配网页为准）",
+                     pub_tls ? "wss" : "ws", TIHU_PUBLIC_HOST, pub_port);
+        }
     }
 
     s_wifi_events = xEventGroupCreate();
@@ -944,9 +1184,15 @@ void tihu_net_start(void)
     ESP_LOGW(TAG, "编译期开了 802.11k/v（CONFIG_ESP_WIFI_11KV_SUPPORT），漫游辅助可能干扰首连");
 #endif
 
-    ESP_LOGI(TAG, "启动完成：令牌=%s，种子 SSID=%s，强制 host=%s，发现端口=%d",
+    tihu_public_cfg_t pub;
+    tihu_wifi_public_get(&pub);
+    ESP_LOGI(TAG, "启动完成：令牌=%s，种子 SSID=%s，宿主模式=%s，发现端口=%d",
              TIHU_TOKEN[0] != '\0' ? "已配置" : "空",
              TIHU_WIFI_SSID[0] != '\0' ? TIHU_WIFI_SSID : "（用 NVS）",
-             TIHU_FORCE_HOST ? "开" : "关（先 UDP 发现）",
+             pub.enabled ? "公网（配网页已填）" : (TIHU_FORCE_HOST ? "强制 host" : "局域网（先 UDP 发现）"),
              TIHU_DISCOVER_PORT);
+    if (pub.enabled) {
+        ESP_LOGI(TAG, "公网入口：%s://%s:%d（token %s）",
+                 pub.tls ? "wss" : "ws", pub.host, pub.port, pub.token[0] != '\0' ? "已填" : "空");
+    }
 }

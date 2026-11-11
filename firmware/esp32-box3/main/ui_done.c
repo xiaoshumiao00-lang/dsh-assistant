@@ -22,6 +22,8 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "bsp/esp-box-3.h"
 #include "tihu_audio.h"
 #include "tihu_net.h"
 
@@ -39,6 +41,8 @@ static lv_obj_t *s_lines[TIHU_MAX_DONE_LINES];
 static lv_obj_t *s_buttons[3];
 static char s_action_ids[3][40];
 static char s_task_id[48];
+/* 最近一次按钮点击的发送结果（tihu_ui_simulate_action 用它回话给开机自检）。 */
+static bool s_last_send_ok;
 
 static void done_btn_cb(lv_event_t *event)
 {
@@ -54,7 +58,7 @@ static void done_btn_cb(lv_event_t *event)
     /*
      * 「停止」必须**本机立刻停声**，不能只等宿主：
      * 宿主收到 screen.gesture{actionId:'stop'} 后只把朗读轮次号 +1（不再下发新的 PCM，
-     * 见 src/tihu/lane.ts 的 cancelSpeaking），**不会**补发 playback.control{stop}；
+     * 见 src/tihu/lane.ts 的 cancelSpeaking），并**不会**补发 playback.control{stop}；
      * 设备缓冲区里已经排进去的那一段会继续念完——现场就是「按了停止，声音还在」。
      * 先本地停，再照常上报（宿主那边同样会掐掉这一轮）。
      */
@@ -62,8 +66,26 @@ static void done_btn_cb(lv_event_t *event)
         tihu_audio_stop();
         ESP_LOGI("ui", "停止键：本地已停声（不等宿主 playback.control）");
     }
-    tihu_ui_send_action(s_action_ids[index], s_task_id,
-                        lv_event_get_target(event));
+    s_last_send_ok = tihu_ui_send_action(s_action_ids[index], s_task_id,
+                                         lv_event_get_target(event));
+}
+
+bool tihu_ui_simulate_action(int index)
+{
+    if (index < 0 || index >= 3 || s_buttons[index] == NULL) {
+        ESP_LOGW("ui", "自检模拟点击失败：完成页按钮 %d 不存在", index);
+        return false;
+    }
+    if (!bsp_display_lock(pdMS_TO_TICKS(1000))) {
+        ESP_LOGW("ui", "自检模拟点击失败：拿不到 LVGL 锁");
+        return false;
+    }
+    s_last_send_ok = false;
+    /* 与真手指同一条链路：LVGL 收到 PRESSED/CLICKED → 上面两个回调。 */
+    lv_obj_send_event(s_buttons[index], LV_EVENT_PRESSED, NULL);
+    lv_obj_send_event(s_buttons[index], LV_EVENT_CLICKED, NULL);
+    bsp_display_unlock();
+    return s_last_send_ok;
 }
 
 /* 按下即打点：不等 CLICKED，先确认「手指落在哪、落在哪个按钮的矩形里」。 */

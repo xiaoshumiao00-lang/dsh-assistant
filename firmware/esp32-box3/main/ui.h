@@ -45,5 +45,15 @@ void tihu_ui_apply_tone_bar(lv_obj_t *bar, const char *tone);
 lv_obj_t *tihu_ui_label(lv_obj_t *parent, const char *text, const lv_font_t *font,
                         lv_color_t color, lv_coord_t x, lv_coord_t y,
                         lv_coord_t width, lv_coord_t height);
-void tihu_ui_send_action(const char *action_id, const char *task_id,
+/** 发 screen.gesture{tap,hit:"action"}；返回 true = 真的写进了 WebSocket。 */
+bool tihu_ui_send_action(const char *action_id, const char *task_id,
                          lv_obj_t *origin);
+
+/*
+ * 开机自检用：程序化点一下完成页第 index 个按钮（0=停止 1=重读 2=主页）。
+ *
+ * 走的是**和真手指完全相同**的那条路：lv_obj_send_event(PRESSED/CLICKED)
+ * → done_btn_cb → tihu_ui_send_action → screen.gesture。
+ * 返回这一次 screen.gesture 是否真的发出去了（没连宿主时是 false）。
+ */
+bool tihu_ui_simulate_action(int index);
