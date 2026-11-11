@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 板载音频：24k PCM 播放 + 16k WAV 录音。
  *
  * 播放走 ES8311（BSP 的 speaker codec），录音走 ES7210（BSP 的 microphone codec）。
@@ -9,6 +9,26 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/*
+ * 开机音频自检（诊断「滋滋」用，默认关）。
+ *
+ * 定义成 1（编译时 -DTIHU_AUDIO_SELFTEST=1 或直接改这里）：网一连上就播 0.5 秒
+ * 1 kHz 正弦，再向宿主发一条 `tts.sample` 让它用**当前配置的音色**念一句示例。
+ * 串口里能同时看到 `正弦测试：24k/16bit/mono 已播放`、每块 `tts.audio ... 块长=...`、
+ * 欠载计数。验证完改回 0（否则每次开机都会「嘟」一声并念一句）。
+ *
+ * 刻意放在这里而不是 config.h：config.h 是「上机前唯一要改的地方」，容易被别人
+ * 按机器改 Wi-Fi/地址；自检开关属于固件行为，不该混进那份本机配置里。
+ */
+#ifndef TIHU_AUDIO_SELFTEST
+#define TIHU_AUDIO_SELFTEST 0
+#endif
+
+/** 音频自检念的示例句（≤60 字；宿主会按「试听」链路合成）。 */
+#ifndef TIHU_AUDIO_SELFTEST_TEXT
+#define TIHU_AUDIO_SELFTEST_TEXT "音频自检：现在是微软晓晓在说话，声音清楚吗？"
+#endif
 
 /** 初始化扬声器、麦克风与播放任务；失败只记日志，不阻塞开机。 */
 void tihu_audio_init(void);
@@ -42,3 +62,16 @@ const uint8_t *tihu_audio_mic_stop(size_t *len);
 
 /** 是否正在录音。 */
 bool tihu_audio_mic_active(void);
+
+/**
+ * 播 0.5 秒 1 kHz 正弦（24 kHz / 16 bit / 单声道），走与真实 TTS 完全相同的播放链路。
+ * 用来区分「通路坏了」还是「网络/分块坏了」：听到干净的一声「嘟」= I2S/codec 正常。
+ * 非阻塞：内部起一次性任务，播完打一行 `正弦测试：24k/16bit/mono 已播放`。
+ */
+void tihu_audio_play_sine_test(void);
+
+/** 播放统计（诊断用）：收到的块数 / 奇数块数 / 欠载次数。传 NULL 的项忽略。 */
+void tihu_audio_stats(uint32_t *chunks, uint32_t *odd_chunks, uint32_t *underruns);
+
+/** 清零播放统计（每次 final 块/重新开始朗读时调）。 */
+void tihu_audio_reset_stats(void);

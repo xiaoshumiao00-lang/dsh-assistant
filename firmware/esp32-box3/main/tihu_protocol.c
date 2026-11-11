@@ -156,6 +156,17 @@ char *tihu_build_text_input(const char *text, const char *source)
     return finish(root);
 }
 
+char *tihu_build_tts_sample(const char *text)
+{
+    cJSON *root = new_envelope("tts.sample");
+    if (root == NULL) {
+        return NULL;
+    }
+    cJSON *payload = cJSON_AddObjectToObject(root, "payload");
+    cJSON_AddStringToObject(payload, "text", text != NULL ? text : "");
+    return finish(root);
+}
+
 char *tihu_build_audio_frame(const uint8_t *wav, size_t wav_len, int duration_ms)
 {
     if (wav == NULL || wav_len == 0) {
