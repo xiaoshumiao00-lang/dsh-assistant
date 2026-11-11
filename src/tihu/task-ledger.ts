@@ -253,6 +253,22 @@ export function boardRankOf(task: TihuTask): number {
 }
 
 /**
+ * 「第几个」→ 棋盘行号：**1 起**，且必须是正整数。
+ *
+ * 2026-11-11 实机：「进第二个会话」开出了第一张卡。行号语义必须只有这一种读法：
+ * 1＝屏上第一行；0 / 负数 / 小数 / 非数字一律**明确报错**，绝不 `rows[index-1]`
+ * 悄悄退化成第 1 行（`rows[-1]` 是 undefined、`Math.trunc(0.5)-1` 又是 -1）。
+ */
+export function boardRowIndex(raw: unknown): number {
+  const text = typeof raw === 'string' ? raw.trim() : raw
+  const num = typeof text === 'number' ? text : Number(text)
+  if (!Number.isFinite(num) || !Number.isInteger(num) || num < 1) {
+    throw new Error(`棋盘行号从 1 开始（屏上第一行就是 1），收到的是 ${JSON.stringify(raw)}；要开第 N 行请传 index=N（N≥1 的整数）。`)
+  }
+  return num
+}
+
+/**
  * 棋盘数据：一条任务一张卡（不再折叠成「+N 条」）。
  *
  * 排序（用户 2026-11-10 定案）：

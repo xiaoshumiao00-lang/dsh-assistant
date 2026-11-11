@@ -96,6 +96,7 @@ import {
   TaskNotifyBus,
   bestCardMatchOf,
   boardOf,
+  boardRowIndex,
   capsuleOf,
   chineseIndex,
   continuityCandidatesOf,
@@ -796,7 +797,31 @@ export function appendTihuLaneLog(sessionId: string, error: unknown, note = ''):
  * @param text - 一行原文（不写 stack，不换行）。
  */
 export function appendTihuLaneNote(note: string, text: string): void {
-  const line = `[${new Date().toISOString()}]${note === '' ? '' : ` note=${note}`} message=${JSON.stringify(String(text ?? '').replace(/\s+/g, ' ').trim())}\n`
+  appendTihuLogLine(`[${new Date().toISOString()}]${note === '' ? '' : ` note=${note}`} message=${JSON.stringify(String(text ?? '').replace(/\s+/g, ' ').trim())}\n`)
+}
+
+/** 工具入参日志里 args 的上限（~200 字：够看 index/taskId/title，又不至于把整段正文写进日志）。 */
+export const TIHU_TOOL_CALL_ARGS_MAX_CHARS = 200
+
+/**
+ * 工具入参留痕：`tihu_tool_call tool=<名> args=<JSON>`（长度截断到 ~200 字）。
+ *
+ * 2026-11-11 实机事故：「进第二个会话」开出第一张卡，lane.log 里只有工具名和原句，
+ * 模型到底传没传 `index`、传的是几，全无记录 —— bug 没法定位。以后类似的「模型传错参数」
+ * 靠这一行就能对齐（补调与模型自己调工具走同一个执行器，都会经过这里）。
+ */
+export function appendTihuToolCallLog(tool: string, args: unknown): void {
+  let json = ''
+  try { json = JSON.stringify(args ?? {}) ?? '{}' } catch { json = '"<args 不可序列化>"' }
+  const chars = [...json]
+  const text = chars.length > TIHU_TOOL_CALL_ARGS_MAX_CHARS
+    ? `${chars.slice(0, TIHU_TOOL_CALL_ARGS_MAX_CHARS - 1).join('')}…`
+    : json
+  appendTihuLogLine(`[${new Date().toISOString()}] note=tihu_tool_call tool=${String(tool ?? '').trim() || '-'} args=${text}\n`)
+}
+
+/** 真正落盘那一跳（appendTihuLaneNote / appendTihuToolCallLog 共用，写失败绝不影响功能）。 */
+function appendTihuLogLine(line: string): void {
   try {
     const file = tihuLaneLogPath()
     mkdirSync(dirname(file), { recursive: true })
@@ -6883,7 +6908,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       // 最近的项目会话清单：让「append / append_to」有据可依（最多 8 行，不塞满提示词）。
       let hints: string[] = []
       try { hints = await commanderSessionHints() } catch { hints = [] }
-      const sent = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: commanderReplyTail(hints) }])
+      // 这块屏**当下这一页**的带编号棋盘：模型照着它把「第二个」翻成 index:2（1 起、与屏上逐行一致）。
+      let boardLines: string[] = []
+      try { boardLines = commanderBoardLines(device) } catch { boardLines = [] }
+      const sent = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: commanderReplyTail(hints, boardLines) }])
       if (!sent.ok) {
         // 只有投递本身出错才兜底；投递成功就等，没有计时器。
         dropCommanderAsk(key)
@@ -7298,6 +7326,26 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return `棋盘第 ${board.page.index + 1}/${board.page.total} 页（等你 ${counts.awaiting} · 在跑 ${counts.running} · 排队 ${counts.queued} · 完成 ${counts.done}）`
   }
 
+  /**
+   * 一页棋盘的带编号清单：`1) t32 完成 微信查看…`。
+   *
+   * 行号＝boardOf.rows 的下标＋1，与设备屏上逐行渲染的顺序**同一份**（page.ts 就按 rows 顺序建行，
+   * 不再排序）。指挥台提示、按行号开卡的错误文案、兜底留痕都从这里取，绝不各写一套。
+   */
+  function numberedRowsOfBoard(board: TaskBoardPayload): string[] {
+    return board.rows.map((row, index) => `${index + 1}) ${row.taskId} ${row.capsule} ${clipForLog(row.title, 14)}`)
+  }
+
+  /** 给指挥台看的那块屏「当前页」清单（1 起；「第二个」＝第 2 行）。 */
+  function commanderBoardLines(device: TihuDevice): string[] {
+    const board = boardOf(tasks.list(), Date.now(), Math.max(0, Math.trunc(device.boardPage ?? 0)))
+    const rows = numberedRowsOfBoard(board)
+    return [
+      `（这块屏在第 ${board.page.index + 1}/${board.page.total} 页；行号从 1 开始，屏上第一行＝1，「第二个」＝第 2 行）`,
+      ...(rows.length === 0 ? ['（这页没有任务）'] : rows),
+    ]
+  }
+
   /** 设备当前屏的人话（进 ack 的 stage / 工具返回的第三段）。 */
   function screenEchoOf(device: TihuDevice): string {
     const stage = device.screenStage ?? ''
@@ -7392,6 +7440,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   const control: TihuControlSurface = {
+    // 工具入参留痕：`tihu_tool_call tool=… args=…`（模型自己调与补调都走同一个执行器）。
+    noteToolCall: (tool, args) => {
+      try { appendTihuToolCallLog(tool, args) } catch { /* 日志失败不影响执行 */ }
+    },
     listDevices: (includeOffline = false) => {
       const online = [...devices].map(controlDeviceOf)
       if (includeOffline !== true) return online
@@ -7694,14 +7746,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     openTaskCard: async (deviceId, options) => {
       const device = requireControlDevice(deviceId)
       let task: TihuTask
+      // 屏上「第几个」只按**这块屏当前这一页**的 boardOf 顺序算（与 sendBoard 下发的那份逐行一致）。
+      const page = Math.max(0, Math.trunc(device.boardPage ?? 0))
+      const pageBoard = boardOf(tasks.list(), Date.now(), page)
+      const pageRows = numberedRowsOfBoard(pageBoard)
       if (options.index !== undefined) {
-        const pageBoard = boardOf(tasks.list(), Date.now(), Math.max(0, Math.trunc(device.boardPage ?? 0)))
-        const row = pageBoard.rows[Math.trunc(options.index) - 1]
+        // 1 起、必须是正整数：0 / 负数 / 小数一律报错，绝不悄悄退化成第 1 行。
+        const index = boardRowIndex(options.index)
+        const row = pageBoard.rows[index - 1]
         if (row === undefined) {
-          throw new Error(`第 ${options.index} 行没有任务：这页只有 ${pageBoard.rows.length} 条（第 ${pageBoard.page.index + 1}/${pageBoard.page.total} 页）。`)
+          throw new Error(`棋盘第 ${pageBoard.page.index + 1}/${pageBoard.page.total} 页没有第 ${index} 行（这页只有 ${pageBoard.rows.length} 条）。这页的行号是：${pageRows.length === 0 ? '（空）' : `\n${pageRows.join('\n')}`}`)
         }
         const hit = tasks.get(row.taskId)
-        if (hit === undefined) throw new Error(`第 ${options.index} 行（${row.taskId}）刚从棋盘上消失，请重新看一眼棋盘。`)
+        if (hit === undefined) throw new Error(`第 ${index} 行（${row.taskId}）刚从棋盘上消失，请重新看一眼棋盘。`)
         task = hit
       } else {
         task = resolveControlTask(device, {
@@ -7709,6 +7766,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           ...(options.title === undefined ? {} : { title: options.title }),
           recent: options.recent === true,
         })
+        // 没给行号/标题/号，也没说「最近那条」→ 退化成「当前屏上那条 / 最近完成」。
+        // 不拦，但**必须留痕**：万一用户嘴上说的是「第二个」，日志能直接对上开的是哪一行。
+        if (options.taskId === undefined && options.title === undefined && options.recent !== true) {
+          try {
+            appendTihuLaneNote('tihu_open_task_fallback', `tool=tihu_open_task 这次没带 index/title/taskId/recent → 开了 ${task.taskId}「${clipForLog(task.title, 30)}」；屏上第 ${pageBoard.page.index + 1}/${pageBoard.page.total} 页行号：${pageRows.length === 0 ? '（空）' : pageRows.join(' / ')}`)
+          } catch { /* 日志失败不影响开卡 */ }
+        }
       }
       openTask(device, task.taskId)
       return {
