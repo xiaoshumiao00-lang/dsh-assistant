@@ -14,6 +14,7 @@
 #include <stdio.h>
 
 #include "config.h"
+#include "button_gpio.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -114,22 +115,29 @@ static void ptt_release(void *handle, void *usr_data)
 
 static void buttons_init(void)
 {
-    button_handle_t btns[BSP_BUTTON_NUM] = {NULL};
-    int count = 0;
-    esp_err_t err = bsp_iot_button_create(btns, &count, BSP_BUTTON_NUM);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "按键初始化失败: %s", esp_err_to_name(err));
+    /*
+     * 只建 CONFIG 键（GPIO0），不走 bsp_iot_button_create()。
+     *
+     * 原因：BOX-3 的按键表里 BSP_BUTTON_MAIN 是 GT911 上的「触摸主页键」，
+     * bsp_iot_button_create() 在 BSP 的静态 tp 为空时会**再 new 一个 GT911 实例**。
+     * 现在触摸由 tihu_touch.c 自己持有，两个实例轮流读同一颗芯片会互相吃掉报点
+     * （一个把 0x814E 状态读走，另一个就永远看不到按下）。
+     * MUTE / MAIN 两个键本固件都没用到，所以只建需要的那一个。
+     */
+    const button_config_t btn_cfg = {0};
+    const button_gpio_config_t gpio_cfg = {
+        .gpio_num = BSP_BUTTON_CONFIG_IO,
+        .active_level = 0,
+    };
+    button_handle_t btn = NULL;
+    esp_err_t err = iot_button_new_gpio_device(&btn_cfg, &gpio_cfg, &btn);
+    if (err != ESP_OK || btn == NULL) {
+        ESP_LOGW(TAG, "CONFIG 键初始化失败: %s", esp_err_to_name(err));
         return;
     }
-    if (BSP_BUTTON_CONFIG < count && btns[BSP_BUTTON_CONFIG] != NULL) {
-        iot_button_register_cb(btns[BSP_BUTTON_CONFIG], BUTTON_PRESS_DOWN, NULL,
-                               ptt_press, NULL);
-        iot_button_register_cb(btns[BSP_BUTTON_CONFIG], BUTTON_PRESS_UP, NULL,
-                               ptt_release, NULL);
-        ESP_LOGI(TAG, "按住 CONFIG 键说话，松开上传");
-    } else {
-        ESP_LOGW(TAG, "没有找到 CONFIG 键，只能用 voice.listen 或屏幕操作");
-    }
+    iot_button_register_cb(btn, BUTTON_PRESS_DOWN, NULL, ptt_press, NULL);
+    iot_button_register_cb(btn, BUTTON_PRESS_UP, NULL, ptt_release, NULL);
+    ESP_LOGI(TAG, "按住 CONFIG 键说话，松开上传");
 }
 
 void app_main(void)
