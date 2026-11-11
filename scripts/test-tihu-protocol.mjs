@@ -40,7 +40,7 @@ import {
   targetPathOf,
 } from '../src/tihu/guard.ts'
 import { createTihuRuntime as createTihuRuntimeRaw, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH, TIHU_LANE_LOG_MAX_BYTES, appendTihuLaneLog, screenReasonOf, tihuLaneLogPath, tihuReceiptHoldMs } from '../src/tihu/lane.ts'
-import { BOARD_PAGE_SIZE } from '../src/tihu/task-ledger.ts'
+import { BOARD_PAGE_SIZE, parseScreenCommand } from '../src/tihu/task-ledger.ts'
 import {
   APPROVAL_OPTIONS,
   PENDING_OPTION_FALLBACK,
@@ -48,9 +48,9 @@ import {
   approvalDecisionOf,
   questionDecisionOf,
 } from '../src/tihu/pending-interactions.ts'
-import { DONE_NO_REPLY_TEXT, RECEIPT_SECONDS, prepareDoneText } from '../src/tihu/task-screens.ts'
-import { TIHU_CONTROL_SECTION_TEXT, TIHU_DEVICE_TOOL_NAMES, TIHU_TOOLS, createTihuControlRunner, createTihuToolRunner, formatDeviceResult, matchSessionRows, mostActiveDevice, resolveControlDevice, tihuActionNames, tihuToolNames, tihuToolSpec } from '../src/tihu/control.ts'
-import { COMMANDER_REPLY_SHAPE, commanderReplyTail, parseCommanderReply } from '../src/tihu/dispatch-protocol.ts'
+import { DONE_NO_REPLY_TEXT, RECEIPT_SECONDS, intentClarifyFrame, prepareDoneText } from '../src/tihu/task-screens.ts'
+import { TIHU_CONTROL_SECTION_TEXT, TIHU_DEVICE_TOOL_NAMES, TIHU_TOOLS, createTihuControlRunner, createTihuToolRunner, formatDeviceResult, matchSessionRows, mostActiveDevice, registerTihuControl, resolveControlDevice, tihuActionNames, tihuToolNames, tihuToolSpec } from '../src/tihu/control.ts'
+import { COMMANDER_CLARIFY_SHAPE, COMMANDER_CONTROL_SHAPE, COMMANDER_REPLY_SHAPE, DEVICE_CONTROL_PRIORITY_SECTION, commanderReplyTail, parseCommanderDecision, parseCommanderReply } from '../src/tihu/dispatch-protocol.ts'
 import {
   activityEntryOf,
   applyEarlyThinking,
@@ -389,15 +389,67 @@ test('指挥台回复：纯 JSON / ```json 包裹 / 前后多余说明 / 中文�
   assert.equal(parseCommanderReply(null), undefined)
 })
 
-test('指挥台提示词：只回一行 JSON、不做正文、不调工具、附最近会话短号', () => {
+test('指挥台提示词：设备控制优先（例子不是词表）＋三种结论形状都在', () => {
   const tail = commanderReplyTail(['- 青年基金申请书: cu-fund 引言第三段压缩'])
-  assert.ok(tail.includes(COMMANDER_REPLY_SHAPE), '提示词要给出结论形状：' + tail)
-  assert.ok(tail.includes('只输出一行 JSON'), '必须强调只回一行 JSON')
+  assert.ok(tail.includes(DEVICE_CONTROL_PRIORITY_SECTION), '提示词要带「设备控制优先」那一整节：' + tail)
+  assert.ok(tail.includes('不是词表'), '举例必须写清「只是例子，不是词表」')
+  assert.ok(tail.includes(COMMANDER_CONTROL_SHAPE), '控制形状要给出来：' + tail)
+  assert.ok(tail.includes(COMMANDER_CLARIFY_SHAPE), '澄清形状要给出来：' + tail)
+  assert.ok(tail.includes(COMMANDER_REPLY_SHAPE), '派单形状要给出来：' + tail)
+  assert.ok(tail.includes('绝不猜着派单'), '两可时不许猜着派单')
+  assert.ok(tail.includes('结论只有一行'), '必须强调结论只有一行')
   assert.ok(tail.includes('不做正文'), '必须禁止做正文')
   assert.ok(tail.includes('不解释'), '必须禁止解释')
-  assert.ok(tail.includes('不调用任何工具'), '不能依赖任何工具挂载')
   assert.ok(tail.includes('cu-fund'), '要带最近会话短号，append_to 才有据可依')
   assert.equal(commanderReplyTail().includes('最近的项目会话'), false, '没有候选就不写空清单')
+  // 2026-11-11：旧那句「不调用任何工具」撤了——指挥台有权直接把这件事办掉。
+  assert.equal(tail.includes('不调用任何工具'), false, '不能禁止指挥台调工具')
+  assert.equal(tail.includes('调 tihu dispatch'), false, '不能再要求指挥台调用 dispatch 工具')
+})
+
+test('语义路由结论：控制 / 澄清 / 派单 / 工具名不成立，四种走向（工具名按注册表校验，不认说法）', () => {
+  const tools = tihuToolNames()
+  const decision = (raw) => parseCommanderDecision(raw, tools)
+
+  // 控制：形状随意（键名、代码块、中文标点、带参数）都要认，且认的是注册表里那个真名字。
+  assert.deepEqual(decision('{"intent":"control","tool":"tihu_stop_speaking"}'),
+    { kind: 'control', tool: 'tihu_stop_speaking', args: {} })
+  assert.deepEqual(decision('```json\n{“intent”：“control”，“tool”：“tihu_replay”，“arguments”：{“from”:1}}\n```'),
+    { kind: 'control', tool: 'tihu_replay', args: { from: 1 } })
+  assert.deepEqual(decision('{intent:"control", tihu_tool:"TIHU_BOARD_PAGE", args:{page:2},}'),
+    { kind: 'control', tool: 'tihu_board_page', args: { page: 2 } })
+  assert.deepEqual(decision('判断完了：{"intent":"control","tool":"tihu_answer_decision","optionIndex":2}，这句不用派单'),
+    { kind: 'control', tool: 'tihu_answer_decision', args: {} })
+
+  // 判成控制但工具名不成立：认这个方向，绝不派单，也只把模型写的词留在日志里（不按它匹配任何东西）。
+  const unknown = decision('{"intent":"control","tool":"tihu_说话算话"}')
+  assert.equal(unknown.kind, 'control-unknown')
+  assert.equal(unknown.said, 'tihu_说话算话')
+
+  // 两可：只回澄清，不猜着派单。
+  assert.deepEqual(decision('{"intent":"clarify","ask":"这句是要我干活，还是只管这块屏？"}'),
+    { kind: 'clarify', question: '这句是要我干活，还是只管这块屏？' })
+  assert.deepEqual(decision('{"ask":"再说一遍？"}'), { kind: 'clarify', question: '再说一遍？' })
+
+  // 派单：老形状仍然照旧认（纯文本这条不能丢）。
+  assert.deepEqual(decision('{"project":"青年基金申请书","session":"append","append_to":"cu-fund"}'),
+    { kind: 'dispatch', dispatch: { project: '青年基金申请书', session: 'append', appendTo: 'cu-fund' } })
+  assert.deepEqual(decision('这件事落在青年基金：\n{"project":"青年基金申请书","session":"new","append_to":""}\\n以上'),
+    { kind: 'dispatch', dispatch: { project: '青年基金申请书', session: 'new', appendTo: '' } })
+
+  // 一句只允许一条路由：既写了工具又写了派单 → 认工具，不认派单。
+  const mixed = decision('{"intent":"control","tool":"tihu_go_home","project":"青年基金申请书","session":"new"}')
+  assert.equal(mixed.kind, 'control')
+  assert.equal(mixed.tool, 'tihu_go_home')
+
+  // 光是一句正文（模型自己在那儿解释）→ 没有方向，调用方自己决定（绝不猜着派单）。
+  assert.equal(decision('我觉得应该派给青年基金申请书'), undefined)
+  assert.equal(decision('{"count":3,"items":["a"]}'), undefined)
+  assert.equal(decision(null), undefined)
+  // 工具名单本身：16 个名字全都能被结论认下来（补调与模型自调走同一张表）。
+  for (const name of tools) {
+    assert.equal(decision(`{"intent":"control","tool":"${name}"}`).kind, 'control')
+  }
 })
 
 /* ---------- 三道闸 ---------- */
@@ -3146,9 +3198,55 @@ function unifiedWorkspace(options = {}) {
   process.env.TIHU_PROJECTS_STATE = stateFile
   const created = []
   const prompted = []
+  /** 指挥台「判这一句」的 prompt 单独记账（接了语义路由后，派单类用例只看任务会话）。 */
+  const askPrompts = []
+  const isCommanderAskPrompt = (blocks) => String(blocks?.[1]?.text ?? '').includes(COMMANDER_CONTROL_SHAPE)
+  const recordPrompt = (entry) => {
+    if (isCommanderAskPrompt(entry.blocks)) askPrompts.push(entry)
+    else prompted.push(entry)
+  }
   const renamed = []
   /** 鹈鹕端默认模型：selectModel 的调用记录（见本函数里 sessionController.selectModel）。 */
   const selectedModels = []
+  /**
+   * 指挥台假结论（2026-11-11 语义路由）。派单类用例要的是「指挥台判成活儿 → 照旧派单」，
+   * 不是真模型：默认结论 `{"project":"个人助手","session":"new","append_to":""}`（＝判成
+   * 要干活、落个人助手新建，与旧的即时派单同一落点）。用例可以：
+   *   - `commanderAutoReply: false` → 自己不答（测「没有可用结论」那条分支）；
+   *   - `commanderAutoReply: '{"intent":"control","tool":"tihu_replay"}'` → 固定结论；
+   *   - `commanderAutoReply: (text) => 结论|undefined` → 按句子给不同结论。
+   */
+  const autoConclusion = options.commanderAutoReply
+  const commanderState = { manualReplyAt: 0, turn: 0 }
+  let cleanedUp = false
+  const COMMANDER_AUTO_REPLY_MS = 0
+  /** 等 `fixture` 建好才能发事件，所以写成函数声明（真正跑起来时 fixture 已经在）。 */
+  function autoCommanderReply(sessionId, blocks) {
+    if (autoConclusion === false || cleanedUp) return
+    const tail = String(blocks?.[1]?.text ?? '')
+    if (!tail.includes(COMMANDER_CONTROL_SHAPE)) return
+    const text = String(blocks?.[0]?.text ?? '')
+    const startedAt = Date.now()
+    setTimeout(() => {
+      if (cleanedUp || commanderState.manualReplyAt >= startedAt) return
+      const handler = fixture.events.find((item) => item.name === 'session/event')?.handler
+      if (typeof handler !== 'function') return
+      const conclusion = autoConclusion === undefined
+        ? '{"project":"个人助手","session":"new","append_to":""}'
+        : typeof autoConclusion === 'function' ? autoConclusion(text) : autoConclusion
+      if (conclusion === undefined) return
+      const turn = commanderState.turn + 1
+      commanderState.turn = turn
+      const session = { id: sessionId, header: { id: sessionId } }
+      handler(session, { type: 'turn/start', time: Date.now(), data: { turn } })
+      handler(session, {
+        type: 'assistant/message',
+        time: Date.now(),
+        data: { turn, message: { content: [{ type: 'text', text: String(conclusion) }] } },
+      })
+      handler(session, { type: 'turn/end', time: Date.now(), data: { turn, reason: { kind: 'completed' } } })
+    }, COMMANDER_AUTO_REPLY_MS)
+  }
   /**
    * 真宿主形态（2026-11-10 承接 bug 回归用）：`ctx.get('sessions')` 是会话存储，
    * **没有客户端那份 `sessions.using`**；投递只能走 `agents.get(id).followup()`。
@@ -3176,7 +3274,8 @@ function unifiedWorkspace(options = {}) {
         if (typeof options.promptThrowsFor === 'function' && options.promptThrowsFor(id)) {
           throw new Error(`宿主会话 ${id} 拒收这条消息（agent.followup 抛错）`)
         }
-        prompted.push({ id, blocks: Array.isArray(message?.content) ? message.content : [], via: 'agent' })
+        recordPrompt({ id, blocks: Array.isArray(message?.content) ? message.content : [], via: 'agent' })
+        autoCommanderReply(id, Array.isArray(message?.content) ? message.content : [])
       },
     }
     liveAgents.set(id, agent)
@@ -3195,6 +3294,18 @@ function unifiedWorkspace(options = {}) {
   if (Array.isArray(options.records)) records.push(...options.records)
   // 会话衔接那组：种子会话要落在临时目录里（fundFolder/home 在函数内才建好）。
   if (typeof options.seedSessions === 'function') records.push(...options.seedSessions({ root, home, fundFolder }))
+  // agentHost 桩：种子里标了 live 的会话在宿主里本来就有活 agent。
+  // 不挂上的话，指挥会话自己收不到「判这一句」，每句都只能走投递兜底（2026-11-11 语义路由）。
+  if (agentHost) {
+    for (const record of records) {
+      const header = record?.header ?? {}
+      if (record?.live !== true || typeof header.id !== 'string') continue
+      mountAgent(header.id, {
+        ...(header.cwd === undefined ? {} : { cwd: header.cwd }),
+        ...(header.agentPreset === undefined ? {} : { agentPreset: header.agentPreset }),
+      })
+    }
+  }
   /**
    * 宿主真实建会话/恢复入口（2026-11-10 核对 app.asar）：
    * `sessionController` 公开的是 **resolveAgent(sessionId)**（返回活 Agent 或 `{ error: RemoteError }`），
@@ -3274,7 +3385,10 @@ function unifiedWorkspace(options = {}) {
       using: async (id, _opts, fn) => fn({
         binding: {
           session: {
-            prompt: async (blocks) => prompted.push({ id, blocks }),
+            prompt: async (blocks) => {
+              recordPrompt({ id, blocks })
+              autoCommanderReply(id, blocks)
+            },
             // 宿主用它给「tihu 语音链路」挂工具闸窗口：派单也算一次 tihu 注入。
             deriveMessages: () => [{ role: 'user', id: 'msg-' + id }],
           },
@@ -3298,6 +3412,9 @@ function unifiedWorkspace(options = {}) {
     cards,
     created,
     prompted,
+    askPrompts,
+    /** 这一句有没有交给指挥台（不论它用的是「判这一句」尾巴还是灰区澄清尾巴）。 */
+    askedCommander: () => askPrompts.some((item) => item.id === 'session-cmd') || prompted.some((item) => item.id === 'session-cmd'),
     renamed,
     selectedModels,
     resumed,
@@ -3306,7 +3423,9 @@ function unifiedWorkspace(options = {}) {
     mountAgent,
     unmountAgent,
     records,
+    commanderState,
     cleanup: () => {
+      cleanedUp = true
       fixture.runtime.dispose()
       delete process.env.DSH_ASSISTANT_HOME
       delete process.env.TIHU_PROJECTS_STATE
@@ -3454,13 +3573,15 @@ await testAsync('统一指挥：日常小事派到「个人助手」文件夹，
   socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u2', protocol: '0' }, 1)))
   await waitMs(50)
   socket.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'voice' }, 2)))
-  await waitMs(90)
+  await waitMs(260)
   assert.equal(w.created.length, 1, '要新建一条任务会话')
   assert.equal(w.created[0].cwd, w.home, '日常任务落助手 home（与长按悬浮球一致）')
   assert.equal(w.created[0].agentPreset, 'computer-use', '派单会话一律 computer-use（设备屏要能看屏/点按）')
-  assert.equal(w.prompted.length, 1, '原话要进任务会话')
-  assert.equal(w.prompted[0].blocks[0].text, '现在几点了')
-  const dispatchTail = String(w.prompted[0].blocks[1].text)
+  const taskPrompt = w.prompted.find((item) => item.id === 'session-task-1')
+  assert.ok(taskPrompt !== undefined, '原话要进任务会话：' + JSON.stringify(w.prompted.map((item) => item.id)))
+  assert.equal(w.prompted.filter((item) => item.id === 'session-task-1').length, 1, '任务会话只投一次')
+  assert.equal(taskPrompt.blocks[0].text, '现在几点了')
+  const dispatchTail = String(taskPrompt.blocks[1].text)
   assert.ok(dispatchTail.includes(`这句话已派到「个人助手」`), '尾巴要带真实项目卡名')
   assert.ok(dispatchTail.includes(`工作目录是 ${w.created[0].cwd}`), '尾巴要带真实 cwd')
   assert.ok(dispatchTail.includes('鹈鹕是主人家里的语音小屏助手'), '新尾巴开场要一致')
@@ -5227,7 +5348,7 @@ test('lane.log：路径可覆盖、超过 2MB 截断重开，每行带时间/ses
 })
 
 await testAsync('重新投递：using 第一次抛错 → 300ms 退避重试后成功（不出「指令未发送」）', async () => {
-  const w = unifiedWorkspace()
+  const w = unifiedWorkspace({ commanderAutoReply: false })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   const socket = openLane(w.runtime)
   socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-retry', protocol: '0' }, 1)))
@@ -5243,8 +5364,9 @@ await testAsync('重新投递：using 第一次抛错 → 300ms 退避重试后�
   socket.emit('data', clientFrame(buildUpstream('text.input', { text: '这两个方向我实在拿不定主意了', source: 'voice' }, 2)))
   await waitMs(650)
   assert.equal(calls, 2, '第一次抛错后要退避重试一次：' + calls)
-  assert.equal(w.prompted.length, 1, '重试成功后要真的投进去')
-  assert.equal(w.prompted[0].id, 'session-cmd', '还是原来的指挥会话，不重建')
+  assert.equal(w.askPrompts.length, 1, '重试成功后要真的投进去')
+  assert.equal(w.askPrompts[0].id, 'session-cmd', '还是原来的指挥会话，不重建')
+  assert.equal(w.prompted.length, 0, '还没判出结论，不许往任务会话投')
   assert.equal(w.created.length, 0, '一次瞬时失败不许新建指挥会话')
   const frames = framesOf(socket)
   assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.title === '指令未发送'), false,
@@ -5257,7 +5379,7 @@ await testAsync('重新投递：using 第一次抛错 → 300ms 退避重试后�
 })
 
 await testAsync('重新投递：指挥会话失效 → 重建「鹈鹕指挥台」、改绑设备后投递成功', async () => {
-  const w = unifiedWorkspace()
+  const w = unifiedWorkspace({ commanderAutoReply: false })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   const socket = openLane(w.runtime)
   socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-rebuild', protocol: '0' }, 1)))
@@ -5275,9 +5397,9 @@ await testAsync('重新投递：指挥会话失效 → 重建「鹈鹕指挥台�
   assert.equal(w.created[0].cwd, w.home, '新指挥会话落助手 home')
   assert.equal(w.created[0].agentPreset, 'standard')
   assert.deepEqual(w.renamed[0], { sessionId: 'session-task-1', title: '鹈鹕指挥台' }, '新建后要写标题「鹈鹕指挥台」')
-  assert.equal(w.prompted.length, 1, '重建后要真的投进去一次')
-  assert.equal(w.prompted[0].id, 'session-task-1', '投给新指挥会话：' + JSON.stringify(w.prompted))
-  assert.ok(String(w.prompted[0].blocks[1].text).includes('指挥会话'), '慢路径的指挥尾巴还在')
+  assert.equal(w.askPrompts.length, 1, '重建后要真的投进去一次')
+  assert.equal(w.askPrompts[0].id, 'session-task-1', '投给新指挥会话：' + JSON.stringify(w.askPrompts))
+  assert.ok(String(w.askPrompts[0].blocks[1].text).includes(COMMANDER_CONTROL_SHAPE), '慢路径的指挥尾巴还在（判这一句要带设备控制口径）')
 
   const frames = framesOf(socket)
   assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.title === '指令未发送'), false,
@@ -5346,10 +5468,10 @@ await testAsync('投递报错：重建指挥会话仍失败 → 立刻在个人�
 
 
 
-await testAsync('慢路径不设超时：排队卡立刻上棋盘、等待屏每秒刷新已等秒数；主页回棋盘不丢判断，派单复用同一 taskId', async () => {
+await testAsync('慢路径不设超时：判断这一句不立卡、等待屏晚一拍才画并每秒刷新已等秒数；主页回棋盘不丢判断，判成活儿才立卡', async () => {
   // 旧实现靠这个环境变量 9 秒兜底；用户已改「一直等到判出结果」，设了也必须无效。
   process.env.TIHU_SLOW_PATH_FALLBACK_MS = '100'
-  const w = unifiedWorkspace()
+  const w = unifiedWorkspace({ commanderAutoReply: false })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   try {
     const socket = openLane(w.runtime)
@@ -5359,21 +5481,20 @@ await testAsync('慢路径不设超时：排队卡立刻上棋盘、等待屏每
     socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, 2)))
     await waitMs(140)
 
-    // 1) 还没派出就已经是棋盘上的一张排队卡（计入 ●N 排队）。
-    const queued = framesOf(socket).filter((frame) => frame.type === 'task.list').pop()
-    assert.ok(queued !== undefined, '要下发棋盘数据')
-    assert.equal(queued.payload.board.rows.length, 1, '等待中也必须有一张卡')
-    assert.equal(queued.payload.board.rows[0].taskId, 't1')
-    assert.equal(queued.payload.board.rows[0].state, 'queued')
-    assert.equal(queued.payload.board.rows[0].capsule, '排队中')
-    assert.equal(queued.payload.board.rows[0].sub, '个人助手 · 等指挥台判断')
-    assert.deepEqual(queued.payload.board.counts, { running: 0, awaiting: 0, queued: 1, done: 0 })
+    // 1) 判断阶段什么都没立：既没有任务会话，也没有卡（判成控制意图的句子更不该有卡）。
+    const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop()
+    assert.ok(board !== undefined, '要下发棋盘数据')
+    assert.equal(board.payload.board.rows.length, 0, '判断阶段不许先立卡：' + JSON.stringify(board.payload.board.rows.map((row) => row.taskId)))
+    assert.deepEqual(board.payload.board.counts, { running: 0, awaiting: 0, queued: 0, done: 0 })
     assert.equal(w.created.length, 0, '判项目阶段不许先建任务会话')
+    // 等待屏晚一拍（1.5 秒）才画：判得快根本不该刷屏。
+    assert.equal(framesOf(socket).some((frame) => frame.payload?.title === '正在判断这句话'), false, '1.5 秒内不许抢屏')
 
     // 2) 等待屏带秒数，且每秒重画（0 秒 → ≥1 秒，至少两个不同值）。
-    const waitFrames = () => framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.title === '正在看该派给谁')
+    const waitFrames = () => framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.title === '正在判断这句话')
+    await waitMs(1_600)
     const first = waitFrames().pop()
-    assert.ok(first !== undefined, '投递成功后停在「正在看该派给谁」')
+    assert.ok(first !== undefined, '等得久一点就要停在「正在判断这句话」')
     assert.ok(first.payload.bullets.some((line) => /^已等 \d+ 秒$/.test(line)), '等待屏要写已等秒数：' + JSON.stringify(first.payload.bullets))
     assert.deepEqual(first.payload.actions.map((item) => item.id), ['taskBoard'], '等待屏要有「主页」出口')
     await waitMs(1_250)
@@ -5385,27 +5506,27 @@ await testAsync('慢路径不设超时：排队卡立刻上棋盘、等待屏每
     assert.ok(seconds.length >= 2, '秒数要每秒刷新：' + JSON.stringify(seconds))
     assert.ok(Math.max(...seconds) >= 1, '至少走到 1 秒：' + JSON.stringify(seconds))
 
-    // 3) 用户按主页回棋盘：屏幕不再被秒表抢走，排队卡还在。
+    // 3) 用户按主页回棋盘：屏幕不再被秒表抢走，判断照旧在后台跑。
     socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 20, y: 200, hit: 'action', actionId: 'taskBoard' }, 3)))
     await waitMs(60)
-    const board = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop()
-    assert.ok(board !== undefined, '按主页要回棋盘')
-    assert.equal(board.payload.board.rows[0]?.taskId, 't1', '回棋盘后仍能在排队区看到这句话')
+    const backBoard = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop()
+    assert.ok(backBoard !== undefined, '按主页要回棋盘')
+    assert.equal(backBoard.payload.board.rows.length, 0, '判断阶段棋盘本来就是空的')
     const waitsAtHome = waitFrames().length
     await waitMs(1_200)
     assert.equal(waitFrames().length, waitsAtHome, '回到棋盘后判断在后台继续，秒表不能把屏抢回来')
     assert.equal(w.created.length, 0, '没有计时器，等再久也不许自己派单')
 
-    // 4) 指挥台晚到的 dispatch：把这张排队卡转成正式任务，taskId 不变。
+    // 4) 指挥台晚到的 dispatch（工具那条路）：这时才立卡派单。
     const reply = await w.runtime.control.dispatch({ text, project: '青年基金申请书' })
-    assert.ok(String(reply).includes('任务 t1'), '必须复用排队卡 t1：' + reply)
+    assert.ok(String(reply).includes('任务 t1'), '判成活儿的第一张卡就是 t1：' + reply)
     await waitMs(80)
     assert.equal(w.created.length, 1, '只新建一条任务会话')
     assert.equal(w.created[0].cwd, w.fundFolder, '判出项目后落项目文件夹')
     assert.equal(w.created[0].agentPreset, 'computer-use')
     const after = framesOf(socket).filter((frame) => frame.type === 'task.list').pop()
     assert.equal(after.payload.board.rows.length, 1, '不许凭空冒出第二张卡')
-    assert.equal(after.payload.board.rows[0].taskId, 't1', 'taskId 保持不变')
+    assert.equal(after.payload.board.rows[0].taskId, 't1', '一张句子一张卡')
     const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
     assert.equal(receipt?.payload.title, '已派给 青年基金申请书')
 
@@ -5449,24 +5570,24 @@ await testAsync('慢路径投递报错且兜底也失败 → 立刻终态（撤�
   }
 })
 
-await testAsync('慢路径：投递成功后 turn/start 不抢等待屏，tihu dispatch 回执立刻盖掉「正在看该派给谁」', async () => {
-  const w = unifiedWorkspace()
+await testAsync('慢路径：判断屏不预设派单、turn/start 不抢屏，tihu dispatch 回执立刻盖掉「正在判断这句话」', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: false })
   try {
     const socket = openLane(w.runtime)
     socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-timeout-cover', protocol: '0' }, 1)))
     await waitMs(60)
     const text = '这两个方向我实在拿不定主意了'
     socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, 2)))
-    await waitMs(90)
+    await waitMs(1_700)
     let last = framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()
-    assert.equal(last.payload.stage, '派单')
-    assert.equal(last.payload.title, '正在看该派给谁', '投递成功后先停在派单提示屏')
+    assert.equal(last.payload.title, '正在判断这句话', '投递成功后停在判断屏（不预设是派单）')
+    assert.equal(last.payload.stage, '判断')
 
     const onSessionEvent = w.events.find((entry) => entry.name === 'session/event').handler
     onSessionEvent({ id: 'session-cmd', header: { id: 'session-cmd' } }, { type: 'turn/start', data: { turn: 1 } })
     await waitMs(30)
     last = framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()
-    assert.equal(last.payload.title, '正在看该派给谁', 'turn/start 不许把派单提示屏抢成别的屏')
+    assert.equal(last.payload.title, '正在判断这句话', 'turn/start 不许把判断屏抢成别的屏')
 
     const reply = await w.runtime.control.dispatch({ text, project: '青年基金申请书' })
     await waitMs(60)
@@ -5500,6 +5621,8 @@ await testAsync('慢路径：投递成功后 turn/start 不抢等待屏，tihu d
  * `text === undefined` 表示这一轮没有 assistant/message（空回复）。
  */
 function commanderTextReply(w, text, options = {}) {
+  // 用例自己答了：假结论不许再顶嘴（autoCommanderReply 按这个时间戳弃权）。
+  if (w.commanderState !== undefined) w.commanderState.manualReplyAt = Date.now()
   const handler = w.events.find((entry) => entry.name === 'session/event').handler
   const session = { id: 'session-cmd', header: { id: 'session-cmd' } }
   const turn = options.turn
@@ -5546,39 +5669,49 @@ async function openSlowPath(w, clientId) {
   return { socket, text }
 }
 
-await testAsync('慢路径 JSON：只回一行 JSON → 排队卡 ≤2 秒同 taskId 转正到项目文件夹（不调工具）', async () => {
-  const w = unifiedWorkspace()
+await testAsync('慢路径结论：只回一行 JSON → ≤2 秒立卡派到项目文件夹（判断这一句不许先有卡）', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: false })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   try {
     const { socket, text } = await openSlowPath(w, 'u-json-normal')
-    const commanderPrompt = w.prompted.find((item) => item.id === 'session-cmd')
+    const commanderPrompt = w.askPrompts.find((item) => item.id === 'session-cmd')
     assert.ok(commanderPrompt !== undefined, '慢路径要投给指挥台')
     const tail = String(commanderPrompt.blocks[1].text)
-    assert.ok(tail.includes('只输出一行 JSON'), '提示词要明确只回一行 JSON：' + tail)
+    // 指挥台拿到的是「判断口径」，不是词表：三种形状都在提示词里，工具名只是举例。
+    assert.ok(tail.includes('设备控制优先'), '提示词要有「设备控制优先」那一节：' + tail)
+    assert.ok(tail.includes('不是词表'), '例子必须写清「只是例子，不是词表」：' + tail)
+    assert.ok(tail.includes(COMMANDER_CONTROL_SHAPE), '控制形状要在提示词里：' + tail)
+    assert.ok(tail.includes(COMMANDER_CLARIFY_SHAPE), '澄清形状要在提示词里：' + tail)
+    assert.ok(tail.includes('绝不猜着派单'), '两可时不许猜：' + tail)
+    assert.ok(tail.includes('结论只有一行'), '提示词要明确只回一行结论：' + tail)
     assert.ok(tail.includes('不做正文'), '提示词禁止做正文')
     assert.ok(tail.includes('不解释'), '提示词禁止解释')
-    assert.ok(tail.includes('不调用任何工具'), '指挥会话不需要任何额外工具')
     assert.ok(tail.includes('append_to'), '提示词要给出结论字段')
     assert.equal(tail.includes('调 tihu dispatch'), false, '不能再要求指挥台调用 dispatch 工具')
+    // 2026-11-11：旧那句「不调用任何工具」撤了——指挥台现在有权直接调工具办这件事。
+    assert.equal(tail.includes('不调用任何工具'), false, '不能再禁止指挥台调工具')
 
-    const waiting = (await w.runtime.control.listTasks())[0]
-    assert.equal(waiting.taskId, 't1')
-    assert.equal(waiting.sub, '个人助手 · 等指挥台判断')
+    const waiting = await w.runtime.control.listTasks()
+    assert.equal(waiting.length, 0, '还没判成活儿就不许有任务（控制意图的句子也不会留下卡）：' + JSON.stringify(waiting))
     assert.equal(w.created.length, 0, '判项目阶段不许先建任务会话')
+    // 等待屏晚一拍（1.5 秒）才画：判得快就不该刷屏，所以这里先等过那一拍。
+    await waitMs(1_600)
+    const waitingFrame = framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()
+    assert.equal(waitingFrame?.payload?.title, '正在判断这句话', '判断那一屏不预设是派单')
 
     const startedAt = Date.now()
     commanderTextReply(w, '{"project":"青年基金申请书","session":"new","append_to":""}')
     const took = await promotionMs(w, async () => w.created.length === 1, startedAt, socket)
-    assert.ok(took >= 0, '2 秒内必须转正（不能继续排队）')
-    assert.ok(took < 2000, `转正耗时 ${took}ms 超过 2 秒`)
+    assert.ok(took >= 0, '2 秒内必须派出去（不能一直卡在判断）')
+    assert.ok(took < 2000, `派单耗时 ${took}ms 超过 2 秒`)
 
     assert.equal(w.created[0].cwd, w.fundFolder, 'JSON 点的项目 → 落项目文件夹')
     assert.equal(w.created[0].agentPreset, 'computer-use')
     assert.equal(w.prompted.find((item) => item.id === 'session-task-1').blocks[0].text, text, '原话原样投给任务会话')
     const tasks = await w.runtime.control.listTasks()
-    assert.equal(tasks.length, 1, '排队卡转正，不新建第二张')
-    assert.equal(tasks[0].taskId, 't1', 'taskId 必须保持不变')
-    assert.equal(tasks[0].sub, '青年基金申请书 · 排队中', '副行不再是「等指挥台判断」')
+    assert.equal(tasks.length, 1, '判成活儿只立一张卡，不新建第二张')
+    assert.equal(tasks[0].taskId, 't1', 'taskId 必须是这一句的第一张')
+    assert.equal(tasks[0].sub, '青年基金申请书 · 排队中', '卡就是派单卡（没有「等指挥台判断」这一状态）')
     const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop().payload.board
     assert.equal(board.rows.length, 1)
     assert.equal(board.rows[0].taskId, 't1')
@@ -5594,8 +5727,8 @@ await testAsync('慢路径 JSON：只回一行 JSON → 排队卡 ≤2 秒同 ta
   }
 })
 
-await testAsync('慢路径 JSON：```json 包裹 + 中文引号 → 续到 append_to 指定的原会话（不新建）', async () => {
-  const w = unifiedWorkspace({ seedSessions: ({ fundFolder }) => seedInFund(fundFolder) })
+await testAsync('慢路径结论：```json 包裹 + 中文引号 → 续到 append_to 指定的原会话（不新建）', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: false, seedSessions: ({ fundFolder }) => seedInFund(fundFolder) })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   try {
     const { socket } = await openSlowPath(w, 'u-json-fence')
@@ -5620,8 +5753,8 @@ await testAsync('慢路径 JSON：```json 包裹 + 中文引号 → 续到 appen
   }
 })
 
-await testAsync('慢路径 JSON：前后带多余说明 → 仍能抠出结论并派单', async () => {
-  const w = unifiedWorkspace()
+await testAsync('慢路径结论：前后带多余说明 → 仍能抠出结论并派单', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: false })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   try {
     const { socket } = await openSlowPath(w, 'u-json-extra')
@@ -5640,38 +5773,82 @@ await testAsync('慢路径 JSON：前后带多余说明 → 仍能抠出结论�
   }
 })
 
-await testAsync('慢路径 JSON：解析失败 → 按 routeQuick/最佳卡兜底，排队卡 2 秒内给终态并写 lane.log', async () => {
-  const w = unifiedWorkspace()
+await testAsync('慢路径 认不出方向（回复里没有结论）→ 屏上问一次，不猜着派单；答「1」才派单', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: false })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   try {
     const { socket } = await openSlowPath(w, 'u-json-bad')
     const startedAt = Date.now()
     commanderTextReply(w, '这两个方向都像青年基金，但我也说不准，主人再想想？')
-    const took = await promotionMs(w, async () => w.created.length === 1, startedAt, socket)
-    assert.ok(took >= 0 && took < 2000, `解析失败也要 ≤2 秒给终态，实际 ${took}ms`)
+    await waitMs(140)
 
-    // 这句话 routeQuick / 最佳卡都指不到卡片 → 个人助手兜底；关键是不能再停在排队。
-    assert.equal(w.created[0].cwd, w.home, '兜底落个人助手文件夹：' + w.created[0].cwd)
-    const tasks = await w.runtime.control.listTasks()
-    assert.equal(tasks.length, 1, '不许留一张假排队卡')
-    assert.equal(tasks[0].taskId, 't1')
-    assert.equal(tasks[0].sub, '个人助手 · 排队中')
-    const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop().payload.board
-    assert.deepEqual(board.counts, { running: 0, awaiting: 0, queued: 1, done: 0 })
-    assert.equal(board.rows[0].sub, '个人助手 · 排队中', '等指挥台判断的副行必须消失')
-    const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
-    assert.ok(receipt?.payload.bullets.some((line) => String(line).includes('按最佳卡派出')), '回执要说明是指挥台没给结论：' + JSON.stringify(receipt?.payload.bullets))
+    // 2026-11-11 语义路由：认不出方向不再猜着派单——屏上问一次，等用户答。
+    assert.ok(Date.now() - startedAt < 2000, '终态要快（不能停在判断里）')
+    assert.equal(w.created.length, 0, '问过还没答，不许先建任务会话')
+    assert.equal((await w.runtime.control.listTasks()).length, 0, '没派出去就没有卡（不许留一张假排队卡）')
+    const clarify = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '澄清').pop()
+    assert.ok(clarify !== undefined, '要有语义澄清屏：' + JSON.stringify(framesOf(socket).map((frame) => frame.type)))
+    assert.ok(String(clarify.payload.title).startsWith('这句是要我干活'), '问法要说清两可：' + clarify.payload.title)
+    assert.ok(String(clarify.payload.bullets.join('')).includes('这两个方向'), '屏上要说清在问哪一句：' + JSON.stringify(clarify.payload.bullets))
+    assert.deepEqual(clarify.payload.actions.map((action) => action.id), ['pick1', 'pick2'])
     const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
-    assert.ok(log.includes('退回 routeQuick/最佳卡'), '解析失败要落 lane.log：' + log)
-    assert.ok(log.includes('commander-fallback'), '要标出兜底来源')
+    assert.ok(log.includes('本地也没有工作信号'), '没工作信号要落 lane.log：' + log)
+    assert.ok(log.includes('不猜着派单'), '要写明这句没有派出去：' + log)
+
+    // 用户答「1」＝派它干活 → 按最佳卡派（个人助手），只有一张卡。
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '一', source: 'voice' }, 3)))
+    await waitMs(300)
+    assert.equal(w.created.length, 1, '答了「干活」才派单：' + JSON.stringify(w.created.map((item) => item.cwd)))
+    assert.equal(w.created[0].cwd, w.home, '落个人助手文件夹：' + w.created[0].cwd)
+    const tasks = await w.runtime.control.listTasks()
+    assert.equal(tasks.length, 1)
+    assert.equal(tasks[0].sub, '个人助手 · 排队中')
+    const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
+    assert.ok(receipt !== undefined, '派出去就要有回执屏')
   } finally {
     delete process.env.TIHU_LANE_LOG
     w.cleanup()
   }
 })
 
-await testAsync('慢路径 JSON：reply 为空 → 不拿上一轮 JSON 冒充结论，2 秒内按兜底给终态', async () => {
-  const w = unifiedWorkspace()
+await testAsync('慢路径 同一句只问一次：再判不准也不重复给选项，更不猜着派单', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: false })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-json-bad2', protocol: '0' }, 1)))
+    await waitMs(50)
+    const text = '这两个方向我实在拿不定主意了'
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, 2)))
+    await waitMs(140)
+    commanderTextReply(w, '说不准')
+    await waitMs(140)
+    const firstFrames = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '澄清')
+    assert.equal(firstFrames.length, 1, '第一问')
+    assert.deepEqual(firstFrames[0].payload.actions.map((action) => action.id), ['pick1', 'pick2'], '第一问才给两个选项')
+    // 同一句再来一遍：问过一次，第二次只标记「已问过」——不再给选项、不派单。
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, 3)))
+    await waitMs(140)
+    commanderTextReply(w, '还是说不准')
+    await waitMs(220)
+    const again = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '澄清')
+    const second = again.slice(1)
+    assert.equal(again.length >= 1, true, '同一句第二次也要有反馈（不许什么都不说）')
+    for (const frame of second) {
+      assert.equal(frame.payload.actions.some((action) => action.id === 'pick1'), false, '第二次不许再给选项：' + JSON.stringify(frame.payload.actions))
+      assert.equal(frame.payload.actions.some((action) => action.id === 'pick2'), false, '第二次不许再给选项：' + JSON.stringify(frame.payload.actions))
+      assert.ok(String(frame.payload.bullets?.join('') ?? '').includes('重说'), '第二次要让用户重说：' + JSON.stringify(frame.payload.bullets))
+    }
+    assert.equal(w.created.length, 0, '问过两次也绝不派单')
+    assert.equal(w.askPrompts.length, 2, '同一句第二次也是真的又判了一次（不是本地词表直接答）：' + JSON.stringify(w.askPrompts.map((item) => item.id)))
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('慢路径 空回复（只有 turn/end）→ 也是问一次，不拿上一轮 JSON 冒充结论', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: false })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   try {
     const socket = openLane(w.runtime)
@@ -5684,27 +5861,24 @@ await testAsync('慢路径 JSON：reply 为空 → 不拿上一轮 JSON 冒充�
 
     const text = '这两个方向我实在拿不定主意了'
     socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, 2)))
-    await waitMs(120)
+    await waitMs(140)
     const startedAt = Date.now()
     commanderTextReply(w, undefined) // 只有 turn/end，没有任何 assistant/message
-    const took = await promotionMs(w, async () => w.created.length === 1, startedAt, socket)
-    assert.ok(took >= 0 && took < 2000, `空回复也要 ≤2 秒给终态，实际 ${took}ms`)
-    assert.equal(w.created[0].cwd, w.home, '空回复不能拿上一轮 JSON 派到项目：' + w.created[0].cwd)
-    const tasks = await w.runtime.control.listTasks()
-    assert.equal(tasks.length, 1)
-    assert.equal(tasks[0].taskId, 't1')
-    assert.equal(tasks[0].sub, '个人助手 · 排队中')
+    await waitMs(140)
+    assert.ok(Date.now() - startedAt < 2000, '空回复也要立刻给终态')
+    assert.equal(w.created.length, 0, '空回复不许拿上一轮 JSON 派到项目，也不许猜着派单')
+    const clarify = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '澄清').pop()
+    assert.ok(clarify !== undefined, '空回复也要屏上问一次')
     const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
     assert.ok(log.includes('回复为空'), '空回复要落 lane.log：' + log)
-    assert.ok(log.includes('退回 routeQuick/最佳卡'))
   } finally {
     delete process.env.TIHU_LANE_LOG
     w.cleanup()
   }
 })
 
-await testAsync('慢路径 JSON：两句话同时排队 → 按 turn 各认领各的回复，不串台', async () => {
-  const w = unifiedWorkspace()
+await testAsync('慢路径结论：两句话各判各的 → 按 turn 认领各的回复，不串台', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: false })
   try {
     const socket = openLane(w.runtime)
     socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-json-two', protocol: '0' }, 1)))
@@ -5716,8 +5890,7 @@ await testAsync('慢路径 JSON：两句话同时排队 → 按 turn 各认领�
     socket.emit('data', clientFrame(buildUpstream('text.input', { text: second, source: 'voice' }, 3)))
     await waitMs(140)
     let tasks = await w.runtime.control.listTasks()
-    assert.equal(tasks.length, 2, '两句话各一张排队卡：' + JSON.stringify(tasks))
-    assert.ok(tasks.every((task) => String(task.sub).includes('等指挥台判断')))
+    assert.equal(tasks.length, 0, '两句都还在判断，谁都不许先立卡（判成控制意图的句子更不该有卡）：' + JSON.stringify(tasks))
 
     // 第一轮只认领第一句。
     commanderTextReply(w, '{"project":"青年基金申请书","session":"new","append_to":""}', { start: true, turn: 1 })
@@ -5725,10 +5898,10 @@ await testAsync('慢路径 JSON：两句话同时排队 → 按 turn 各认领�
     while (Date.now() < firstDeadline && w.created.length < 1) await waitMs(10)
     assert.equal(w.created.length, 1, '第一轮只派第一句')
     tasks = await w.runtime.control.listTasks()
+    assert.equal(tasks.length, 1, '第二句没判之前不许有卡')
     const firstTask = tasks.find((task) => task.taskId === 't1')
-    const secondTask = tasks.find((task) => task.taskId === 't2')
-    assert.ok(firstTask.sub.includes('青年基金申请书'), 't1 已转正：' + JSON.stringify(firstTask))
-    assert.equal(secondTask.sub, '个人助手 · 等指挥台判断', 't2 还在等它的那一轮，绝不能被 t1 的回复顶掉')
+    assert.ok(firstTask.sub.includes('青年基金申请书'), 't1 已经派出：' + JSON.stringify(firstTask))
+    assert.equal(tasks.find((task) => task.taskId === 't2'), undefined, '第二句还在等它的那一轮，绝不能被 t1 的回复顶掉')
 
     // 第二轮认领第二句。
     commanderTextReply(w, '{"project":"个人助手","session":"new","append_to":""}', { start: true, turn: 2 })
@@ -5736,7 +5909,7 @@ await testAsync('慢路径 JSON：两句话同时排队 → 按 turn 各认领�
     while (Date.now() < secondDeadline && w.created.length < 2) await waitMs(10)
     assert.equal(w.created.length, 2, '第二句也要派出')
     tasks = await w.runtime.control.listTasks()
-    assert.equal(tasks.length, 2, '两句两张卡，不合并、不重复')
+    assert.equal(tasks.length, 2, '两句各一张卡，不合并、不重复')
     assert.equal(tasks.find((task) => task.taskId === 't2').sub, '个人助手 · 排队中')
     assert.deepEqual(w.created.map((item) => item.cwd), [w.fundFolder, w.home])
   } finally {
@@ -5744,8 +5917,8 @@ await testAsync('慢路径 JSON：两句话同时排队 → 按 turn 各认领�
   }
 })
 
-await testAsync('等指挥台判断 → dispatch(session=短号)：排队卡转成「续到原会话」，taskId 不变、只有一张卡', async () => {
-  const w = unifiedWorkspace({ seedSessions: ({ fundFolder }) => seedInFund(fundFolder) })
+await testAsync('判断这一句时直接调 dispatch 工具：续到原会话派出、只有一张卡，晚到重复 dispatch 去重', async () => {
+  const w = unifiedWorkspace({ seedSessions: ({ fundFolder }) => seedInFund(fundFolder), commanderAutoReply: false })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   try {
     const socket = openLane(w.runtime)
@@ -5754,11 +5927,11 @@ await testAsync('等指挥台判断 → dispatch(session=短号)：排队卡转�
     const text = '这两个方向我实在拿不定主意了'
     socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, 2)))
     await waitMs(140)
+    // 等待屏晚一拍（1.5 秒）才画：先等过那一拍再看屏。
+    await waitMs(1_600)
     const waiting = framesOf(socket).filter((frame) => frame.type === 'task.list').pop().payload.board
-    const waitingRow = waiting.rows.find((row) => row.taskId === 't1')
-    assert.ok(waitingRow !== undefined, '先出现的排队卡是 t1：' + JSON.stringify(waiting.rows.map((row) => row.taskId)))
-    assert.equal(waitingRow.capsule, '排队中')
-    assert.equal(waitingRow.sub, '个人助手 · 等指挥台判断')
+    assert.equal(waiting.rows.some((row) => row.taskId === 't1'), false, '判断阶段不许先立卡：' + JSON.stringify(waiting.rows.map((row) => row.taskId)))
+    assert.equal(framesOf(socket).filter((frame) => frame.type === 'screen.frame').pop()?.payload?.title, '正在判断这句话')
 
     const reply = await w.runtime.control.dispatch({ text, project: '青年基金申请书', session: 'cu-fund' })
     assert.ok(String(reply).includes('已接着「青年基金申请书」'), '要接着原会话派出：' + reply)
@@ -5766,10 +5939,10 @@ await testAsync('等指挥台判断 → dispatch(session=短号)：排队卡转�
     assert.equal(w.created.length, 0, '续到原会话：不许新建会话')
     assert.equal(w.prompted.filter((item) => item.id === 'session-cu-fund').length, 1, '只投一次')
     const tasks = await w.runtime.control.listTasks()
-    assert.equal(tasks.length, 1, '排队卡转正，不另立一张：' + JSON.stringify(tasks))
-    assert.equal(tasks[0].taskId, 't1', 'taskId 保持不变')
+    assert.equal(tasks.length, 1, '派出去只立一张卡，不另立第二张：' + JSON.stringify(tasks))
+    assert.equal(tasks[0].taskId, 't1', '这张卡就是这句的卡')
     const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop().payload.board
-    assert.equal(board.rows.length, 1, '棋盘上只有这一张卡')
+    assert.equal(board.rows.filter((row) => row.taskId === 't1').length, 1, '棋盘上只有一句的卡')
     assert.equal(board.rows[0].taskId, 't1')
     assert.equal(framesOf(socket).some((frame) => frame.type === 'screen.frame' && frame.payload.stage === '澄清'), false, '给了会话就不再澄清')
 
@@ -5819,7 +5992,7 @@ await testAsync('派单衔接：完全无关 → 个人助手下新建一条 com
     assert.equal(w.prompted[0].id, 'session-task-1', '新任务投进新会话，不塞给天气那条')
     const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
     assert.ok(log.includes('派单决策 项目=个人助手'), 'lane.log 要写项目命中方式：' + log)
-    assert.ok(log.includes('命中=daily'), '日常小事命中方式=daily：' + log)
+    assert.ok(log.includes('命中=commander'), '日常小事也要指挥台判成活儿（命中方式=commander）：' + log)
     assert.ok(log.includes('衔接=new'), '明确无关 → new')
     assert.ok(log.includes('澄清=no'), '没进灰区就不该澄清')
   } finally {
@@ -5902,7 +6075,7 @@ await testAsync('派单衔接：灰区 → 指挥台超时 → 屏上澄清一�
     assert.equal(clarify.length, 1, '灰区且指挥台没结论 → 只问一次：' + JSON.stringify(clarify.map((frame) => frame.payload.title)))
     assert.equal(clarify[0].payload.title, '新建，还是接着刚才那条？')
     assert.ok(clarify[0].payload.bullets.some((line) => String(line).includes('接着「青年基金申请书')), '第二个选项要写清接着哪条：' + JSON.stringify(clarify[0].payload.bullets))
-    assert.ok(w.prompted.some((item) => item.id === 'session-cmd'), '灰区要先让指挥台判一次')
+    assert.ok(w.askedCommander(), '灰区要先让指挥台判一次')
 
     socket.emit('data', clientFrame(buildUpstream('text.input', { text: '二', source: 'voice' }, 3)))
     await waitMs(120)
@@ -5962,7 +6135,7 @@ await testAsync('派单衔接：指挥台判出「接着那条」→ dispatch(se
     const text = '接着把青年基金申请书那个再改一下'
     socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, 2)))
     await waitMs(120)
-    assert.ok(w.prompted.some((item) => item.id === 'session-cmd'), '灰区先问指挥台')
+    assert.ok(w.askedCommander(), '灰区先问指挥台')
     const reply = await w.runtime.control.dispatch({ text, session: 'cu-fund' })
     await waitMs(100)
     assert.ok(String(reply).includes('已接着'), '指挥台给出结论：' + reply)
@@ -6004,24 +6177,27 @@ await testAsync('派单衔接：新一句接着上一条派单任务（跨项目
     await waitMs(80)
 
     socket.emit('data', clientFrame(buildUpstream('text.input', { text: '再读一下后两行', source: 'voice' }, 3)))
-    await waitMs(200)
+    await waitMs(300)
 
     assert.equal(w.created.length, 1, '接着上一条会话：不许新建会话（跨项目也一样）')
-    assert.equal(w.prompted.length, 2, '第二句只投一次')
-    assert.equal(w.prompted[1].id, firstSession, '第二句要投回上一条派单会话：' + JSON.stringify(w.prompted.map((item) => item.id)))
-    assert.equal(w.prompted[1].blocks[0].text, '再读一下后两行', '用户原话原样投递')
-    assert.ok(String(w.prompted[1].blocks[1].text).includes('【续聊 · 鹈鹕】'), '接着上一条要带续聊尾巴')
-    assert.ok(String(w.prompted[1].blocks[1].text).includes('青年基金申请书'), '尾巴要写那条会话所属项目')
+    const continued = w.prompted.filter((item) => item.id === firstSession)
+    assert.equal(continued.length, 2, '第二句只投一次到那条会话：' + JSON.stringify(continued.map((item) => item.blocks[0].text)))
+    assert.equal(continued[1].blocks[0].text, '再读一下后两行', '用户原话原样投递')
+    assert.ok(String(continued[1].blocks[1].text).includes('【续聊 · 鹈鹕】'), '接着上一条要带续聊尾巴')
+    assert.ok(String(continued[1].blocks[1].text).includes('青年基金申请书'), '尾巴要写那条会话所属项目')
     const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
     assert.equal(receipt?.payload.title, '已派给 青年基金申请书', '屏上显示那条会话所属项目，不是命中项目（个人助手）')
     const board = framesOf(socket).filter((frame) => frame.type === 'task.list').pop().payload.board
     const row = board.rows.find((item) => item.taskId === 't1')
     assert.ok(row !== undefined && String(row.sub).includes('青年基金申请书'), '棋盘副行也是那条会话所属项目：' + JSON.stringify(row))
     const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
-    assert.ok(log.includes('命中=previous'), '承接命中要落盘：' + log)
+    // 2026-11-11 语义路由：这句短、又与上一条派单内容重合 → 规则 A 直接接回那条会话。
+    // （规则 A 只认「与上一条派单任务的内容重合」，不认任何词表；不重合的短句才交给指挥台判。
+    //  这一条正是「口头再念一边」不许变成新任务的那一步。）
+    assert.ok(log.includes('命中=previous'), '规则 A（内容重合）接回上一条：' + log)
     assert.ok(log.includes(`会话=${firstSession}`), '要写清接到哪条会话：' + log)
     assert.ok(log.includes('衔接=append'), '承接结论是 append：' + log)
-    assert.equal(w.prompted.some((item) => item.id === 'session-cmd'), false, '过线直接接，不许再问指挥台')
+    assert.equal(w.created.length, 1, '接回上一条就不许再建会话')
   } finally {
     delete process.env.TIHU_LANE_LOG
     w.cleanup()
@@ -6031,6 +6207,7 @@ await testAsync('派单衔接：新一句接着上一条派单任务（跨项目
 await testAsync('派单：低置信 fragment 命中不许单独定项目 → 交给指挥台判，再按结论派单', async () => {
   const gypsumFolder = '/work/磷石膏'
   const w = unifiedWorkspace({
+    commanderAutoReply: false,
     cards: [
       { id: 'card-fund', name: '青年基金申请书' },
       { id: 'card-gypsum', name: '磷石膏SCI', folder: gypsumFolder },
@@ -6061,9 +6238,9 @@ await testAsync('派单：低置信 fragment 命中不许单独定项目 → 交
     await waitMs(150)
 
     assert.equal(w.created.length, 0, '低置信命中不许先建会话')
-    assert.ok(w.prompted.some((item) => item.id === 'session-cmd'), '要先交给指挥台判项目')
-    const waiting = (await w.runtime.control.listTasks())[0]
-    assert.ok(String(waiting.sub).includes('等指挥台判断'), '屏上先立一张「等指挥台判断」的排队卡：' + JSON.stringify(waiting))
+    assert.ok(w.askedCommander(), '要先交给指挥台判项目')
+    const waiting = await w.runtime.control.listTasks()
+    assert.equal(waiting.length, 0, '判之前不许立卡（判成控制意图的句子也不许有卡）：' + JSON.stringify(waiting))
 
     commanderTextReply(w, '{"project":"青年基金申请书","session":"new","append_to":""}')
     await waitMs(150)
@@ -6101,11 +6278,11 @@ await testAsync('派单衔接：语义明显矛盾才新建会话（不硬塞给
     assert.equal(w.created.length, 2, '明显矛盾 → 新建一条会话')
     assert.equal(w.created[1].cwd, w.home, '新任务落个人助手文件夹：' + w.created[1].cwd)
     assert.equal(w.prompted.filter((item) => item.id === firstSession).length, 1, '不许把无关的一句塞回上一条会话')
-    assert.equal(w.prompted[1].id, 'session-task-2')
+    assert.equal(w.prompted.filter((item) => item.id === 'session-task-2').length, 1, '无关的一句派到新会话（只投一次）：' + JSON.stringify(w.prompted.map((item) => item.id)))
     const receipt = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单').pop()
     assert.equal(receipt?.payload.title, '已派给 个人助手')
     const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
-    assert.ok(log.includes('命中=daily'), '无关的一句走日常：' + log)
+    assert.ok(log.includes('命中=commander'), '判成活儿后派到个人助手：' + log)
     assert.ok(log.includes('衔接=new'), '明显矛盾 → 新建会话：' + log)
   } finally {
     delete process.env.TIHU_LANE_LOG
@@ -6134,9 +6311,12 @@ await testAsync('派单衔接：语义明显矛盾才新建会话（不硬塞给
  *   4. 新一句话不许复用**已经结束**的任务：上一张卡 done/announced 就另起一张新卡。
  */
 
+/** 承接类用例的公共结论：指挥台判「接着第一句那条会话（全 id）」→ 走 appendToSession。 */
+const APPEND_TO_FIRST_CONCLUSION = '{"project":"青年基金申请书","session":"append","append_to":"session-task-1"}'
+
 await testAsync('承接保活：idle 会话（agent 不在内存）→ 先 resolveAgent 挂回再 append（不新建、不出错误屏）', async () => {
   // 宿主真实形状（核对 app.asar）：公开口里只有 resolveAgent，没有 resume。
-  const w = unifiedWorkspace({ agentHost: true, noResume: true })
+  const w = unifiedWorkspace({ agentHost: true, noResume: true, commanderAutoReply: APPEND_TO_FIRST_CONCLUSION })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   try {
     const socket = openLane(w.runtime)
@@ -6156,7 +6336,7 @@ await testAsync('承接保活：idle 会话（agent 不在内存）→ 先 resol
     assert.equal(w.liveAgents.has(firstSession), false)
 
     socket.emit('data', clientFrame(buildUpstream('text.input', { text: '再读一下后两行', source: 'voice' }, 3)))
-    await waitMs(300)
+    await waitMs(400)
 
     assert.deepEqual(w.resolved, [firstSession], '承接必须先调宿主公开的 resolveAgent：' + JSON.stringify(w.resolved))
     assert.deepEqual(w.resumed, [], 'resolveAgent 成了就不许再走 resume 兜底：' + JSON.stringify(w.resumed))
@@ -6196,7 +6376,7 @@ await testAsync('承接保活：idle 会话（agent 不在内存）→ 先 resol
 
 await testAsync('承接降级：resolveAgent 也失败 → 同项目新建会话派出（这句的 taskId 不变、不出错误屏、副行仍是项目）', async () => {
   // 现代宿主：resolveAgent 是唯一公开入口，它内部 resume 也失败 → 返回 { error }，没有 resume 可调。
-  const w = unifiedWorkspace({ agentHost: true, noResume: true, resolveFails: true, resolveErrorCode: 'gateway/internal' })
+  const w = unifiedWorkspace({ agentHost: true, noResume: true, resolveFails: true, resolveErrorCode: 'gateway/internal', commanderAutoReply: APPEND_TO_FIRST_CONCLUSION })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   try {
     const socket = openLane(w.runtime)
@@ -6212,7 +6392,7 @@ await testAsync('承接降级：resolveAgent 也失败 → 同项目新建会话
     w.unmountAgent(firstSession)
 
     socket.emit('data', clientFrame(buildUpstream('text.input', { text: '再读一下后两行', source: 'voice' }, 3)))
-    await waitMs(350)
+    await waitMs(450)
 
     assert.deepEqual(w.resolved, [firstSession], '先让宿主 resolveAgent 这条会话：' + JSON.stringify(w.resolved))
     assert.deepEqual(w.resumed, [], '这条宿主没有公开 resume：不许去调不存在的老入口：' + JSON.stringify(w.resumed))
@@ -6254,7 +6434,7 @@ await testAsync('承接降级：resolveAgent 也失败 → 同项目新建会话
 })
 
 await testAsync('老宿主兜底：sessionController 只公开 resume（没有 resolveAgent）时仍能承接（不新建、不出错误屏）', async () => {
-  const w = unifiedWorkspace({ agentHost: true, noResolveAgent: true })
+  const w = unifiedWorkspace({ agentHost: true, noResolveAgent: true, commanderAutoReply: APPEND_TO_FIRST_CONCLUSION })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   try {
     const socket = openLane(w.runtime)
@@ -6270,7 +6450,7 @@ await testAsync('老宿主兜底：sessionController 只公开 resume（没有 r
     w.unmountAgent(firstSession)
 
     socket.emit('data', clientFrame(buildUpstream('text.input', { text: '再读一下后两行', source: 'voice' }, 3)))
-    await waitMs(350)
+    await waitMs(450)
 
     assert.deepEqual(w.resolved, [], '这条宿主没有 resolveAgent：不许调它：' + JSON.stringify(w.resolved))
     assert.deepEqual(w.resumed, [firstSession], '老宿主兜底入口必须是 resume：' + JSON.stringify(w.resumed))
@@ -6312,7 +6492,7 @@ await testAsync('新一句话不复用已结束的任务：上一张卡 done/ann
     w.unmountAgent(firstSession)
 
     socket.emit('data', clientFrame(buildUpstream('text.input', { text: '帮我把 README 的前两行读出来', source: 'voice' }, 3)))
-    await waitMs(300)
+    await waitMs(400)
 
     const after = await w.runtime.control.listTasks()
     assert.equal(after.length, 2, '新一句话必须另起一张卡：' + JSON.stringify(after.map((item) => [item.taskId, item.capsule, item.title])))
@@ -6346,6 +6526,7 @@ await testAsync('承接降级投递失败：既不静默也不丢句（lane.log 
     resolveErrorCode: 'session/writer-held',
     resolveErrorText: 'writer 在这条会话上被另一个 owner 占着',
     promptThrowsFor: (id) => id === 'session-task-2',
+    commanderAutoReply: APPEND_TO_FIRST_CONCLUSION,
   })
   process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
   try {
@@ -6400,7 +6581,7 @@ await testAsync('承接降级投递失败：既不静默也不丢句（lane.log 
 
 await testAsync('resolveAgent 失败要落 append-resume-failed 与真实错误码（{ error } 信封／throw 两种形状都认）', async () => {
   for (const variant of [{ resolveFails: true, resolveErrorCode: 'session/not-found' }, { resolveThrows: true }]) {
-    const w = unifiedWorkspace({ agentHost: true, noResume: true, ...variant })
+    const w = unifiedWorkspace({ agentHost: true, noResume: true, ...variant, commanderAutoReply: APPEND_TO_FIRST_CONCLUSION })
     process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
     try {
       const socket = openLane(w.runtime)
@@ -6895,7 +7076,7 @@ await testAsync('页面重连后 text.input 仍被处理', async () => {
     await waitMs(80)
     second.emit('data', clientFrame(buildUpstream('text.input', { text: '现在几点了', source: 'keyboard' }, 6)))
     await waitMs(200)
-    assert.equal(w.prompted.length, 1, '重连后第一句仍要送到指挥台：' + JSON.stringify(w.prompted.map((item) => item.id)))
+    assert.equal(w.askedCommander(), true, '重连后第一句仍要送到指挥台：' + JSON.stringify(w.prompted.map((item) => item.id)))
     assert.equal(w.created.length > 0, true, '要建任务会话')
   } finally {
     w.cleanup()
@@ -6961,6 +7142,339 @@ await testAsync('「停止阅读」也是停声命令（不是一条新任务）
   }
 })
 
+/* ============================================================================
+ * 2026-11-11 语义路由（实机事故：口头「再念一边」被判成了一条新任务）
+ *
+ * 这一节里没有「说法 → 意图」的词表：假指挥台对每一句都回**同一条**结论，
+ * 用例只看 lane 有没有照它说的办、派单那条路有没有被顶掉。
+ * 句子只是各种说法的样本，判成什么意图由结论决定，不由句子决定。
+ * ============================================================================ */
+
+/** 页面按钮那条即时兜底（parseScreenCommand）一个都不认这些说法：能把它们办成的只有「指挥台判意图」。 */
+const SEMANTIC_CONTROL_SENTENCES = [
+  '安静点', '安静一些好不好', '先停一下', '先停下来一会儿，我还有些事要想', '慢一点说行吗',
+  '继续', '接着说', '接着往下讲', '继续念那段', '讲下去',
+  '再来一遍', '重念', '从头念', '再说一次这个朗读', '从头再来一次这个朗读',
+  '回主界面', '退出去', '回到大本营那个页面', '这屏回到该看的地方吧',
+  '下一页', '往后面再走一页看看', '翻到第 2 页看看',
+  '结束这次语音', '结束这个语音会话吧', '这个语音会话先收掉',
+  '选第二个', '就第二个吧', '挑第二这个',
+  '现在什么情况', '这屏现在都干什么呢', '现在都有什么在跑',
+  '把这块屏的语速改慢一点', '声音大一点',
+]
+const SEMANTIC_CONTROL_VERDICT = '{"intent":"control","tool":"tihu_status"}'
+
+await testAsync('语义路由：各种说法的屏上命令都照指挥台点的工具办（不建任务、不新建会话、不立卡、不派单）', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: SEMANTIC_CONTROL_VERDICT })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  const socket = openLane(w.runtime)
+  let seq = 1
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-semantic-control', protocol: '0' }, seq++)))
+  await waitMs(80)
+  try {
+    for (const sentence of SEMANTIC_CONTROL_SENTENCES) {
+      assert.equal(parseScreenCommand(sentence), undefined, `「${sentence}」不在即时兜底（页面按钮）那条路上，只能靠指挥台判这句`)
+      const promptsBefore = w.askPrompts.length
+      socket.emit('data', clientFrame(buildUpstream('text.input', { text: sentence, source: 'voice' }, seq++)))
+      await waitMs(300)
+      assert.ok(w.askPrompts.length > promptsBefore, `「${sentence}」要交给指挥台判这一句`)
+      assert.equal(w.askedCommander(), true, `「${sentence}」判给了指挥台会话（不是本地词表）`)
+      assert.equal(w.prompted.filter((item) => item.id !== 'session-cmd').length, 0, `「${sentence}」不许投给任何任务会话`)
+      assert.equal(w.created.length, 0, `「${sentence}」不许新建任务会话`)
+      assert.equal((await w.runtime.control.listTasks()).length, 0, `「${sentence}」不许立卡`)
+      const frames = framesOf(socket)
+      assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单'), false, `「${sentence}」不许出派单屏`)
+      assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.stage === '进度'), false, `「${sentence}」不许出任务进度屏`)
+      assert.equal(frames.some((frame) => frame.type === 'task.notify'), false, `「${sentence}」不许报成派单完成`)
+      const outcome = frames.filter((frame) => frame.type === 'event.progress' && frame.payload.stage === '屏上命令').pop()
+      assert.ok(outcome !== undefined, `「${sentence}」要真的执行指挥台点的工具（屏上得有一行结果）`)
+      assert.equal(w.created.length, 0, `「${sentence}」办完也不许补建任务`)
+      const logNow = readFileSync(join(w.root, 'lane.log'), 'utf8')
+      const ranNow = (logNow.match(/note=commander-control /g) ?? []).length
+      assert.equal(ranNow, SEMANTIC_CONTROL_SENTENCES.indexOf(sentence) + 1,
+        `「${sentence}」只许执行一次（实际 ${ranNow} 次；指挥台被问 ${w.askPrompts.length} 次）：` + logNow.slice(-600))
+    }
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.equal(log.includes('派单决策'), false, '判成屏上命令的句子不该写派单决策日志：' + log)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('语义路由：指挥台这一轮自己调了工具 → 不补调、也不许把这句变成派单（一句只有一条路由）', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: false })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-self-tool', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '先停一下', source: 'voice' }, 2)))
+    await waitMs(160)
+    const handler = w.events.find((entry) => entry.name === 'session/event').handler
+    const commander = { id: 'session-cmd', header: { id: 'session-cmd' } }
+    handler(commander, { type: 'turn/start', data: { turn: 1 } })
+    handler(commander, { type: 'tool/call', data: { turn: 1, step: 1, callId: 'c1', name: 'tihu_stop_speaking', arguments: {} } })
+    await waitMs(40)
+    // 模型既调了工具、又回了一行派单结论：一句只允许一条路由 → 不许派单、更不许补调。
+    handler(commander, { type: 'assistant/message', data: { text: '{"project":"个人助手","session":"new","append_to":""}' } })
+    handler(commander, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitMs(260)
+
+    assert.equal(w.created.length, 0, '自己调了工具的这句不许再建任务会话：' + JSON.stringify(w.created))
+    assert.equal((await w.runtime.control.listTasks()).length, 0, '也不许立卡')
+    const frames = framesOf(socket)
+    assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单'), false, '不许出派单屏')
+    assert.equal(frames.some((frame) => frame.type === 'event.progress' && frame.payload.stage === '屏上命令'), false, '模型已经调过了，lane 不许再补调一次')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('指挥台自己调了工具'), '要落 lane.log 说清这句为什么没派单：' + log)
+    assert.equal(log.includes('工具='), false, '没有补调记录：' + log)
+
+    // 晚到的 tihu dispatch 也不能把这句变成任务（这句已经按屏上命令办过）。
+    const late = await w.runtime.control.dispatch({ text: '先停一下' })
+    assert.ok(String(late).includes('已经按屏上命令办过'), '晚到的派单要被挡住：' + late)
+    assert.equal(w.created.length, 0, '晚到的派单不许建会话')
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('语义路由：两可 → 屏上问一次；答「干活」才派单，答「先不管」这句丢掉（绝不猜着派单）', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: '{"intent":"clarify","ask":"这句是要我干活，还是只管这块屏？"}' })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-clarify-work', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '先停一下', source: 'voice' }, 2)))
+    await waitMs(240)
+
+    const frames = framesOf(socket)
+    assert.equal(frames.some((frame) => frame.type === 'screen.frame' && frame.payload.stage === '派单'), false, '问过还没答，不许先派单')
+    assert.equal(w.created.length, 0, '问过还没答，不许先建任务会话')
+    assert.equal((await w.runtime.control.listTasks()).length, 0, '问过还没答，不许立卡')
+    const clarify = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '澄清').pop()
+    assert.ok(clarify !== undefined, '两可要屏上问一次：' + JSON.stringify(frames.map((frame) => frame.payload.title)))
+    const expected = intentClarifyFrame({ text: '先停一下', question: '这句是要我干活，还是只管这块屏？' })
+    assert.deepEqual(clarify.payload.actions.map((action) => action.id), expected.actions.map((action) => action.id), '澄清屏的两个按钮要照语义澄清帧给的那套')
+    assert.ok(clarify.payload.title.includes('干活'), '问法要说清两可：' + clarify.payload.title)
+
+    // 用户答「1」＝派它干活 → 这才立卡派单。
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '一', source: 'voice' }, 3)))
+    await waitMs(300)
+    assert.equal(w.created.length, 1, '答了「干活」才派单')
+    const tasks = await w.runtime.control.listTasks()
+    assert.equal(tasks.length, 1, '只立一张卡')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('命中=clarified-work'), '派单命中要写清是用户答过澄清屏：' + log)
+    assert.ok(log.includes('指挥台结论=两可'), '两可那次也要落 lane.log：' + log)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('语义路由：澄清屏上点「先不管」→ 这句丢掉、回棋盘，绝不猜着派单', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: '{"intent":"clarify"}' })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-clarify-skip', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '先停一下', source: 'voice' }, 2)))
+    await waitMs(240)
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 20, y: 200, hit: 'action', actionId: 'pick2' }, 3)))
+    await waitMs(240)
+    assert.equal(w.created.length, 0, '答「先不管」不许派单')
+    assert.equal((await w.runtime.control.listTasks()).length, 0, '答「先不管」不许立卡')
+    const board = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop()
+    assert.ok(board !== undefined, '答完要回棋盘')
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('语义路由：澄清屏没人答 → 到点按「先不管」收掉，也不猜着派单', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: '{"intent":"clarify"}' })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  process.env.TIHU_CLARIFY_MS = '100'
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-clarify-timeout', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '先停一下', source: 'voice' }, 2)))
+    await waitMs(700)
+    assert.equal(w.created.length, 0, '没答也不许派单')
+    assert.equal((await w.runtime.control.listTasks()).length, 0, '没答也不许立卡')
+    assert.ok(framesOf(socket).some((frame) => frame.type === 'screen.frame' && frame.payload.board), '没答要回棋盘（不许停在澄清屏）')
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    delete process.env.TIHU_CLARIFY_MS
+    w.cleanup()
+  }
+})
+
+await testAsync('语义路由：用户说了别的 → 原来那句不猜着派单（澄清屏上的那句丢掉）', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: '{"intent":"clarify"}' })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-clarify-else', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '先停一下', source: 'voice' }, 2)))
+    await waitMs(240)
+    assert.equal(framesOf(socket).some((frame) => frame.type === 'screen.frame' && frame.payload.stage === '澄清'), true, '先问一句')
+    // 用户重说了别的一句（青年基金申请书整名命中 → 即时派单那条路）：原来那句不许被猜着派出去。
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把青年基金申请书的摘要前两行读出来', source: 'voice' }, 3)))
+    await waitMs(300)
+    const prompts = w.prompted.filter((item) => item.id !== 'session-cmd')
+    assert.equal(prompts.length, 1, '只派了后一句：' + JSON.stringify(prompts.map((item) => item.blocks[0]?.text)))
+    assert.equal(prompts[0].blocks[0].text, '把青年基金申请书的摘要前两行读出来')
+    const tasks = await w.runtime.control.listTasks()
+    assert.equal(tasks.length, 1, '原来那句不许立卡')
+    assert.ok(!String(tasks[0].title).includes('先停一下'), '棋盘上只有后一句：' + JSON.stringify(tasks.map((task) => task.title)))
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('语义路由：判成控制但工具名不成立 → 认这个方向，屏上问一句重说，绝不派单', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: '{"intent":"control","tool":"tihu_随便编的名字"}' })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-bad-tool', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '先停一下', source: 'voice' }, 2)))
+    await waitMs(240)
+    assert.equal(w.created.length, 0, '工具名不成立也不许派单')
+    assert.equal((await w.runtime.control.listTasks()).length, 0, '也不许立卡')
+    const clarify = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '澄清').pop()
+    assert.ok(clarify !== undefined, '要屏上问一句（这句判不准，重说一下）')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('不是工具注册表里的名字'), '要把「为什么没办成」写进 lane.log：' + log)
+    assert.ok(log.includes('tihu_随便编的名字'), '只把模型写的那个词留在日志（不拿它匹配任何东西）：' + log)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+/** 假指挥台点了某个工具 → 用例按那条工具的设备效果核账（没有说法词表）。 */
+async function controlVerdictFixture(verdict, clientId) {
+  const w = unifiedWorkspace({ commanderAutoReply: verdict })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  process.env.TIHU_ACK_TIMEOUT_MS = '1200'
+  const socket = openLane(w.runtime)
+  let seq = 1
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId, protocol: '0' }, seq++)))
+  await waitMs(60)
+  // 页面正在念第 2 段（设备自报）：停/暂停/续念/重读都有活可办。
+  socket.emit('data', clientFrame(buildUpstream('playback.state', { phase: 'playing', segment: 2, line: 3, total: 12 }, seq++)))
+  await waitMs(20)
+  return {
+    w,
+    socket,
+    emitText: (text) => socket.emit('data', clientFrame(buildUpstream('text.input', { text, source: 'voice' }, seq++))),
+    // 设备侧一律照「收到就回 ok」应答（凡带 opId 的下行消息都等回执）。
+    answerControls: async (ms) => {
+      const answered = new Set()
+      const deadline = Date.now() + ms
+      while (Date.now() < deadline) {
+        for (const frame of framesOf(socket)) {
+          const opId = frame.payload?.opId
+          if (typeof opId !== 'string' || answered.has(opId)) continue
+          answered.add(opId)
+          socket.emit('data', clientFrame(buildUpstream('device.ack', { opId, ok: true, stage: '完成 第 3/12 行' }, seq++)))
+        }
+        await waitMs(40)
+      }
+    },
+  }
+}
+
+await testAsync('语义路由：指挥台点哪个工具就执行哪个（含参数照传；工具自己没办成也只认这个结论，绝不派单）', async () => {
+  const verdicts = [
+    { verdict: '{"intent":"control","tool":"tihu_stop_speaking"}', type: 'playback.control' },
+    { verdict: '{"intent":"control","tool":"tihu_pause_speaking"}', type: 'playback.control' },
+    { verdict: '{"intent":"control","tool":"tihu_resume_speaking"}', type: null },
+    { verdict: '{"intent":"control","tool":"tihu_replay"}', type: null },
+    { verdict: '{"intent":"control","tool":"tihu_wake"}', type: null },
+    { verdict: '{"intent":"control","tool":"tihu_end_voice_session"}', type: null },
+    { verdict: '{"intent":"control","tool":"tihu_device_settings","arguments":{"key":"volume","value":"30"}}', type: null },
+    { verdict: '{"intent":"control","tool":"tihu_go_home"}', type: null },
+    { verdict: '{"intent":"control","tool":"tihu_board_page","arguments":{"page":1}}', type: null },
+    { verdict: '{"intent":"control","tool":"tihu_status"}', type: null },
+    { verdict: '{"intent":"control","tool":"tihu_list_devices"}', type: null },
+    { verdict: '{"intent":"control","tool":"tihu_admin","arguments":{"action":"list_tasks"}}', type: null, text: '登记簿' },
+  ]
+  for (const entry of verdicts) {
+    const fixture = await controlVerdictFixture(entry.verdict, 'u-verdict-' + verdicts.indexOf(entry))
+    const { w, socket } = fixture
+    try {
+      fixture.emitText('现在什么情况')
+      await fixture.answerControls(900)
+      const frames = framesOf(socket)
+      const progress = frames.filter((frame) => frame.type === 'event.progress' && frame.payload.stage === '屏上命令')
+      const errorFrame = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.title === '指令未发送')
+      assert.ok(progress.length > 0 || errorFrame.length > 0, `${entry.verdict} 要真的执行那个工具（办成给一行结果，没办成也要给「这句是屏上命令，没办成」那一屏）`)
+      if (entry.type !== null) {
+        assert.ok(frames.some((frame) => frame.type === entry.type), `${entry.verdict} 要真的下发 ${entry.type}（不是只在宿主内部想想）：` + JSON.stringify(frames.map((frame) => frame.type)))
+      }
+      if (entry.text !== undefined) {
+        assert.ok(progress.some((frame) => String(frame.payload.text).includes(entry.text)), `${entry.verdict} 的参数要真的传到工具（结果里该有「${entry.text}」）：` + JSON.stringify(progress.map((frame) => frame.payload.text)))
+      }
+      const toolName = /"tool":"(tihu_[a-z_]+)"/.exec(entry.verdict)?.[1] ?? ''
+      assert.ok(frames.filter((frame) => frame.type === 'screen.frame').every((frame) => frame.payload.title !== '已派给 个人助手'), `${entry.verdict} 不许出派单屏`)
+      assert.equal(w.created.length, 0, `${entry.verdict} 不许建任务会话`)
+      assert.equal(w.prompted.filter((item) => item.id !== 'session-cmd').length, 0, `${entry.verdict} 不许投给任务会话`)
+      assert.equal((await w.runtime.control.listTasks()).length, 0, `${entry.verdict} 不许立卡`)
+      const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+      assert.ok(log.includes(`工具=${toolName}`) || log.includes('commander-control-failed'), `${entry.verdict} 要按点的工具落 lane.log：` + log)
+    } finally {
+      delete process.env.TIHU_LANE_LOG
+      delete process.env.TIHU_ACK_TIMEOUT_MS
+      w.cleanup()
+    }
+  }
+})
+
+await testAsync('工具可见性：16 个工具都注册在根 ctx（指挥会话 preset=standard 看得见的就是这张全局表），lane 补调也照这张表', async () => {
+  const { surface } = controlSurfaceFixture()
+  const registered = []
+  const disposed = []
+  const sections = []
+  const toolsService = {
+    register: (definition) => {
+      registered.push(definition)
+      return () => disposed.push(definition.name)
+    },
+  }
+  const ctx = {
+    tools: toolsService,
+    get: (id) => id === 'tools'
+      ? toolsService
+      : id === 'systemPrompt' ? { section: (section) => { sections.push(section); return () => {} } } : undefined,
+  }
+  const dispose = await registerTihuControl(ctx, surface, () => {})
+  assert.equal(registered.length, 16, '16 个工具都要注册（15 个设备工具 + tihu_admin）')
+  assert.deepEqual(registered.map((definition) => definition.name), tihuToolNames(), '注册的名字就是那张表（补调与模型调同一张）')
+  assert.ok(registered.every((definition) => typeof definition.execute === 'function'), '每个工具都带 execute')
+  assert.ok(registered.every((definition) => Object.keys(definition.parameters).length > 0), '每个工具都带参数表')
+  assert.deepEqual(sections.map((section) => section.name), ['tihu:control'], '设备控制口径的系统提示段落也挂在根 ctx')
+  dispose()
+  assert.equal(disposed.length, 16, '注销要注销全部 16 个（不留半成品）')
+
+  const hostSource = readFileSync(new URL('../src/pocket-host/index.js', import.meta.url), 'utf8')
+  assert.ok(hostSource.includes('registerTihuControl(ctx, tihuRuntime.control'), '注册就在插件拿到的那个 ctx 上（全局那张工具表）')
+  const laneSource = readFileSync(new URL('../src/tihu/lane.ts', import.meta.url), 'utf8')
+  assert.ok(laneSource.includes('createTihuToolRunner(control)'), '补调与模型调的是同一条执行路径（没有第二套实现）')
+  assert.ok(laneSource.includes('tihuToolNames()'), 'lane 认工具名只认那张注册表')
+  assert.equal(/toolFilter|restrict\(/.test(laneSource), false, 'lane 不许用工具黑名单把设备工具挡在指挥会话外面')
+})
 /* ---------- 汇总 ---------- */console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
 if (failed > 0) process.exit(1)
 process.exit(0)

@@ -1070,6 +1070,29 @@ export function callerSessionIdOf(exec: any): string | undefined {
 }
 
 /**
+ * `defineTool` 的 spec 形状 → 等价 JSON Schema（只在宿主那份 defineTool 编不出来时兜底用）。
+ * 与 dsh-tools 的 `parameterSchemaSpecToJsonSchema` 同口径：对象根、required 数组、enum 原样。
+ */
+function jsonSchemaOf(parameters: Record<string, any>): Record<string, unknown> {
+  const properties: Record<string, unknown> = {}
+  const required: string[] = []
+  for (const [key, param] of Object.entries(parameters)) {
+    properties[key] = {
+      type: param?.type,
+      ...(param?.description === undefined ? {} : { description: param.description }),
+      ...(param?.enum === undefined ? {} : { enum: [...param.enum] }),
+    }
+    if (param?.required === true) required.push(key)
+  }
+  return {
+    type: 'object',
+    properties,
+    ...(required.length === 0 ? {} : { required }),
+    additionalProperties: false,
+  }
+}
+
+/**
  * 注册 16 个全局原生工具（15 设备 + 1 admin）+ 系统提示段落。
  *
  * @param ctx 插件 cordis 上下文（tools / systemPrompt 服务）
@@ -1096,12 +1119,21 @@ export async function registerTihuControl(ctx: any, surface: TihuControlSurface,
         ...(param.enum === undefined ? {} : { enum: [...param.enum] }),
       }
     }
-    const off = tools.register(defineTool({
+    const baseDefinition = {
       name: spec.name,
       description: spec.description,
       parameters,
       execute: async (args: unknown, exec: any) => run(spec.name, args, { sessionId: callerSessionIdOf(exec) }),
-    }))
+    }
+    // 宿主那份 dsh-tools 的 defineTool 各版本要求不同（新版还要 output.render）：编不出来就按它
+    // 编出来的等价 JSON Schema 直接注册——版本差异绝不能变成「指挥会话一个设备工具都没有」。
+    let definition: any
+    try {
+      definition = defineTool(baseDefinition as any)
+    } catch {
+      definition = { ...baseDefinition, parameters: jsonSchemaOf(parameters) }
+    }
+    const off = tools.register(definition)
     if (typeof off === 'function') offs.push(off)
   }
   const offSection = registerControlSection(ctx, log)

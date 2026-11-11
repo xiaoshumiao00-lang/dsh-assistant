@@ -518,6 +518,45 @@ export function clarifySessionFrame(input: {
   }
 }
 
+/**
+ * 语义两可的澄清屏（2026-11-11 语义路由）：指挥台判不准这句话是「干活」还是「指挥这块屏」，
+ * 屏上问一次。两个选项固定「1 派它干活 / 2 先不管」；点按钮或说「一/二」都走同一条路。
+ *
+ * **不猜着派单**：没答就按「先不管」收掉（这句丢掉，等用户重说），绝不在这里新建任务。
+ */
+export function intentClarifyFrame(input: {
+  /** 用户原话（屏上第二行显示它，截到 12 字）。 */
+  text: string
+  /** 指挥台想问的那句话（空＝用默认措辞）。 */
+  question?: string
+  /** 同一句已经问过一次：这屏只说「判不准」，不再给选项。 */
+  alreadyAsked?: boolean
+}): ScreenFramePayload {
+  const chars = [...String(input.text ?? '')]
+  const shown = chars.length > 12 ? `${chars.slice(0, 11).join('')}…` : chars.join('')
+  const asked = String(input.question ?? '').trim()
+  const title = clipScreenTitle(asked === '' ? '这句是要我干活，还是只管这块屏？' : asked)
+  const bullets = input.alreadyAsked === true
+    ? [shown, '这句我判不准，重说一下']
+    : [`1 派它干活：${shown}`, '2 先不管（这句丢掉，等你重说）']
+  return {
+    stage: '澄清',
+    title,
+    bullets: fitScreenLines(bullets, SCREEN_SPEC.maxBodyLines),
+    ...(input.alreadyAsked === true ? {} : {
+      ask: {
+        candidates: [
+        { index: 1, projectName: '派它干活', source: shown },
+        { index: 2, projectName: '先不管', source: '' },
+        ],
+      },
+    }),
+    actions: input.alreadyAsked === true ? [{ id: 'taskBoard', label: '主页' }] : [{ id: 'pick1', label: '干活' }, { id: 'pick2', label: '不管' }],
+    tone: 'alert',
+    mode: 'status',
+  }
+}
+
 /** 一句提示屏（撤单、停止、归档这类轻动作的结果；不占棋盘也不进气泡）。 */
 export function noticeFrame(input: { stage: string; title: string; lines?: readonly string[]; tone?: 'idle' | 'busy' | 'ok' | 'alert'; taskId?: string }): ScreenFramePayload {
   return {
