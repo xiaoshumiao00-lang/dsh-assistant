@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "tihu_audio.h"
 #include "tihu_net.h"
 
 #define COL_PANEL   0x151C24
@@ -50,6 +51,17 @@ static void done_btn_cb(lv_event_t *event)
         return;
     }
     ESP_LOGI("ui", "按钮命中 actionId=%s（完成页第 %d 键）", s_action_ids[index], index + 1);
+    /*
+     * 「停止」必须**本机立刻停声**，不能只等宿主：
+     * 宿主收到 screen.gesture{actionId:'stop'} 后只把朗读轮次号 +1（不再下发新的 PCM，
+     * 见 src/tihu/lane.ts 的 cancelSpeaking），**不会**补发 playback.control{stop}；
+     * 设备缓冲区里已经排进去的那一段会继续念完——现场就是「按了停止，声音还在」。
+     * 先本地停，再照常上报（宿主那边同样会掐掉这一轮）。
+     */
+    if (strcmp(s_action_ids[index], "stop") == 0 || strcmp(s_action_ids[index], "taskStop") == 0) {
+        tihu_audio_stop();
+        ESP_LOGI("ui", "停止键：本地已停声（不等宿主 playback.control）");
+    }
     tihu_ui_send_action(s_action_ids[index], s_task_id,
                         lv_event_get_target(event));
 }
