@@ -18,8 +18,9 @@ CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
-# LVGL 的 draw buffer（320×100×2 = 62.5 KB）必须留在内部 RAM 做 SPI DMA，
-# 再加上 12 KB 的 LVGL/UI 任务栈，内部 RAM 就紧到 esp_wifi_init 报 ESP_ERR_NO_MEM。
+# LVGL 的 draw buffer 必须留在内部 RAM 做 SPI DMA（S3 的 SPI 不能 DMA 读 PSRAM），
+# 2026-11-11 已把行数从 BSP 默认 100 降到 50（64 KB → 32 KB，见 main/ui.c）；
+# 再加上 12 KB 的 LVGL/UI 任务栈，内部 RAM 仍偏紧，
 # 打开这个开关后 WiFi/LWIP 的接收缓冲可以退到 PSRAM（官方给 S3+PSRAM 的推荐配置）。
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 

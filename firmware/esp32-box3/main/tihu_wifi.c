@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -41,6 +42,15 @@ void tihu_wifi_store_init(void)
     (void)tihu_wifi_last_host(host, sizeof(host), &port, token, sizeof(token));
     ESP_LOGI(TAG, "NVS 就绪：已记住 %d/%d 个网络，上次宿主=%s:%d",
              saved, TIHU_WIFI_MAX_NETWORKS, host[0] != '\0' ? host : "（无）", port);
+
+    tihu_public_cfg_t pub;
+    tihu_wifi_public_get(&pub);
+    if (pub.enabled) {
+        ESP_LOGI(TAG, "公网配置：%s://%s:%d（token %s）——优先走公网，不再发 UDP 发现",
+                 pub.tls ? "wss" : "ws", pub.host, pub.port, pub.token[0] != '\0' ? "已填" : "空");
+    } else {
+        ESP_LOGI(TAG, "公网配置：未启用（host_mode=lan，走 UDP 发现）");
+    }
 }
 
 static void key_of(const char *prefix, int index, char *out, size_t len)
@@ -302,6 +312,208 @@ bool tihu_wifi_remember_host(const char *host, int port, const char *token)
     if (token != NULL) {
         write_str("token", token);
     }
+    return true;
+}
+
+/* ------------------------------ 公网入口（host_mode / public_*） ------------------------------ */
+
+/*
+ * 为什么单开一组键而不是复用 host/port/token：那三个是「UDP 发现成功后写回」的
+ * 局域网兜底，公网地址是用户手填且要能独立清除。分开存，切回局域网时不会把
+ * 上次发现到的局域网地址也一起擦掉。
+ */
+
+bool tihu_wifi_parse_public(const char *input, char *host, size_t host_len,
+                            int *port, bool *tls)
+{
+    if (input == NULL || host == NULL || host_len == 0) {
+        return false;
+    }
+    host[0] = '\0';
+    if (port != NULL) {
+        *port = 0;
+    }
+    if (tls != NULL) {
+        *tls = false;
+    }
+
+    char buf[160];
+    snprintf(buf, sizeof(buf), "%s", input);
+
+    /* 去掉首尾空白与结尾的 '/'（用户常把路径也一起粘进来）。 */
+    char *p = buf;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        p++;
+    }
+    size_t n = strlen(p);
+    while (n > 0) {
+        char c = p[n - 1];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '/') {
+            p[--n] = '\0';
+        } else {
+            break;
+        }
+    }
+
+    bool use_tls = false;
+    int def_port = 80;
+    if (strncasecmp(p, "wss://", 6) == 0) {
+        use_tls = true;
+        def_port = 443;
+        p += 6;
+    } else if (strncasecmp(p, "ws://", 5) == 0) {
+        p += 5;
+    } else if (strncasecmp(p, "https://", 8) == 0) {
+        use_tls = true;
+        def_port = 443;
+        p += 8;
+    } else if (strncasecmp(p, "http://", 7) == 0) {
+        p += 7;
+    }
+    /* 用户可能把整条 lane 地址粘进来：只取 authority 部分。 */
+    char *slash = strchr(p, '/');
+    if (slash != NULL) {
+        *slash = '\0';
+    }
+    if (p[0] == '\0') {
+        return false;
+    }
+
+    /* 只支持 host 或 IPv4（IPv6 字面量要 [..]，这里不做，域名更稳）。 */
+    char *colon = strrchr(p, ':');
+    if (colon != NULL) {
+        *colon = '\0';
+        char *end = NULL;
+        long v = strtol(colon + 1, &end, 10);
+        if (end == colon + 1 || end == NULL || *end != '\0' || v <= 0 || v > 65535) {
+            return false;
+        }
+        def_port = (int)v;
+    }
+    if (p[0] == '\0' || strlen(p) >= host_len) {
+        return false;
+    }
+    for (const char *q = p; *q != '\0'; q++) {
+        char c = *q;
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_';
+        if (!ok) {
+            return false;
+        }
+    }
+
+    snprintf(host, host_len, "%s", p);
+    if (port != NULL) {
+        *port = def_port;
+    }
+    if (tls != NULL) {
+        *tls = use_tls;
+    }
+    return true;
+}
+
+void tihu_wifi_public_get(tihu_public_cfg_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    out->port = 80;
+    if (!s_nvs_ready) {
+        return;
+    }
+
+    char mode[16] = {0};
+    size_t mode_len = sizeof(mode);
+    bool is_public = nvs_get_str(s_nvs, "host_mode", mode, &mode_len) == ESP_OK &&
+                     strcmp(mode, "public") == 0;
+    size_t host_len = sizeof(out->host);
+    bool has_host = nvs_get_str(s_nvs, "public_host", out->host, &host_len) == ESP_OK &&
+                    out->host[0] != '\0';
+    if (!is_public || !has_host) {
+        out->host[0] = '\0';
+        return;
+    }
+
+    uint8_t tls = 0;
+    if (nvs_get_u8(s_nvs, "public_tls", &tls) == ESP_OK) {
+        out->tls = tls != 0;
+    }
+    uint16_t port = 0;
+    out->port = out->tls ? 443 : 80;
+    if (nvs_get_u16(s_nvs, "public_port", &port) == ESP_OK && port > 0) {
+        out->port = (int)port;
+    }
+    size_t token_len = sizeof(out->token);
+    if (nvs_get_str(s_nvs, "public_token", out->token, &token_len) != ESP_OK) {
+        out->token[0] = '\0';
+    }
+    out->enabled = true;
+}
+
+bool tihu_wifi_host_mode_set(void)
+{
+    if (!s_nvs_ready) {
+        return false;
+    }
+    char mode[16] = {0};
+    size_t len = sizeof(mode);
+    return nvs_get_str(s_nvs, "host_mode", mode, &len) == ESP_OK && mode[0] != '\0';
+}
+
+bool tihu_wifi_public_save(const char *host, int port, bool tls, const char *token)
+{
+    if (host == NULL || host[0] == '\0') {
+        return tihu_wifi_public_clear();
+    }
+    if (!s_nvs_ready) {
+        return false;
+    }
+    if (strlen(host) >= TIHU_PUBLIC_HOST_MAX) {
+        ESP_LOGW(TAG, "公网 host 太长（≤%d 字节），拒绝保存", TIHU_PUBLIC_HOST_MAX - 1);
+        return false;
+    }
+    const char *tok = token != NULL ? token : "";
+    if (strlen(tok) >= TIHU_PUBLIC_TOKEN_MAX) {
+        ESP_LOGW(TAG, "公网 token 太长（≤%d 字节），拒绝保存", TIHU_PUBLIC_TOKEN_MAX - 1);
+        return false;
+    }
+    if (port <= 0 || port > 65535) {
+        port = tls ? 443 : 80;
+    }
+
+    if (!write_str("public_host", host)) {
+        ESP_LOGE(TAG, "写 NVS 失败：public_host");
+        return false;
+    }
+    nvs_set_u16(s_nvs, "public_port", (uint16_t)port);
+    nvs_set_u8(s_nvs, "public_tls", tls ? 1 : 0);
+    if (tok[0] != '\0') {
+        write_str("public_token", tok);
+    } else {
+        nvs_erase_key(s_nvs, "public_token");
+    }
+    write_str("host_mode", "public");
+    nvs_commit(s_nvs);
+
+    /* 只打「有没有 token」，不把 PIN 写进串口日志。 */
+    ESP_LOGI(TAG, "已保存公网入口：%s://%s:%d token=%s（host_mode=public）",
+             tls ? "wss" : "ws", host, port, tok[0] != '\0' ? "已填" : "空");
+    return true;
+}
+
+bool tihu_wifi_public_clear(void)
+{
+    if (!s_nvs_ready) {
+        return false;
+    }
+    nvs_erase_key(s_nvs, "public_host");
+    nvs_erase_key(s_nvs, "public_port");
+    nvs_erase_key(s_nvs, "public_tls");
+    nvs_erase_key(s_nvs, "public_token");
+    write_str("host_mode", "lan");
+    nvs_commit(s_nvs);
+    ESP_LOGI(TAG, "公网入口已清除（host_mode=lan）：开机重新走 UDP 发现");
     return true;
 }
 

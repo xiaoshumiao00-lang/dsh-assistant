@@ -9,6 +9,9 @@
  *   s0..s7 / p0..p7 / q0..q7  —— 第 i 组 SSID / 密码 / 落库序号（序号只用来在写满时淘汰最旧的）
  *   last                      —— 最后连上的 SSID（下次优先）
  *   host / port / token       —— 上次发现成功的宿主（UDP 发现失败时回退用）
+ *   host_mode                 —— "public" = 走公网地址；其它/缺失 = 局域网（UDP 发现）
+ *   public_host / public_port / public_tls / public_token
+ *                             —— 公网入口（host 不带 scheme；tls=1 用 wss://，0 用 ws://）
  */
 #pragma once
 
@@ -61,6 +64,41 @@ bool tihu_wifi_last_host(char *host, size_t host_len, int *port,
 
 /** 发现成功后写回宿主信息（等下次 UDP 发现失败时兜底）。 */
 bool tihu_wifi_remember_host(const char *host, int port, const char *token);
+
+/* ------------------------------ 公网入口（NVS） ------------------------------ */
+
+#define TIHU_PUBLIC_HOST_MAX   96
+#define TIHU_PUBLIC_TOKEN_MAX  80
+
+/** 公网连接配置；enabled=false 表示走局域网（UDP 发现 → NVS 上次地址）。 */
+typedef struct {
+    bool enabled;
+    bool tls;                            /* true = wss://，false = ws:// */
+    int  port;
+    char host[TIHU_PUBLIC_HOST_MAX];     /* 只存主机名/IP，不带 scheme 与路径 */
+    char token[TIHU_PUBLIC_TOKEN_MAX];
+} tihu_public_cfg_t;
+
+/**
+ * 解析用户填的「公网地址」。接受 `wss://host:port`、`ws://host:port`、
+ * `https://host:port`、`http://host:port`、`host:port` 和裸 `host`；路径部分忽略。
+ * 端口缺省：TLS 443 / 明文 80。
+ * @returns true = 解析成功（host 非空且端口合法）。
+ */
+bool tihu_wifi_parse_public(const char *input, char *host, size_t host_len,
+                            int *port, bool *tls);
+
+/** 读公网配置（enabled=false 时 host/token 为空串）。 */
+void tihu_wifi_public_get(tihu_public_cfg_t *out);
+
+/** host_mode 是否已在 NVS 里落过（编译期种子只补写一次，别覆盖用户在配网页里的选择）。 */
+bool tihu_wifi_host_mode_set(void);
+
+/** 存公网配置并把 host_mode 置 public；host 为空 = 清除（host_mode=lan）。 */
+bool tihu_wifi_public_save(const char *host, int port, bool tls, const char *token);
+
+/** 清除公网配置（host_mode=lan，下次开机重新走局域网发现）。 */
+bool tihu_wifi_public_clear(void);
 
 /**
  * 阻塞扫描（APSTA 下调也可以：配网页靠它列 SSID）。
