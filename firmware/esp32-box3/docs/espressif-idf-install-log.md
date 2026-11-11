@@ -292,3 +292,180 @@ idf.py -p COM5 flash monitor      :: COM5 换成设备管理器里的实际串�
 
 分区表改过（8 MB app），第一次烧建议整片写：`idf.py -p COM5 erase-flash` 再 `flash`。
 
+
+---
+
+## 9. 真机两处问题修复（2026-11-11 16:20–17:05，已烧 COM3 验证）
+
+真机 ESP32-S3-BOX-3B（COM3，115200）上电后出现两个问题，这一节记录根因、改法与实测日志。
+
+### 9.1 问题一：屏幕只有最上面一条亮条，其余全黑
+
+**不是「LVGL 循环没跑起来」。** `app_main` 返回是 ESP-IDF 的正常行为（main_task 结束、其它任务继续跑）。
+真正的原因是我们把 **LVGL 的渲染放进了栈不够大的任务里**，画一帧就踩爆栈，板子反复重启，
+屏幕永远停在第 1 帧的一部分（看起来就是顶部一条亮条）。
+
+实测证据（修复前的串口）：
+
+```
+I (2076) tihu_ui: UI 就绪：320x240，三屏已创建        <- 屏初始化成功
+I (2327) wifi:state: init -> auth (0xb0)
+I (2351) main_task: Returned from app_main()
+I (3722) tihu_net: 忽略未知下行 type=session.bound     <- 宿主一打招呼
+Guru Meditation Error: Core 1 panic'ed (LoadProhibited)
+  Backtrace: esp_transport_get_error_handle -> esp_websocket_client_task
+```
+
+换一块板子/换一次启动还会变成：
+
+```
+assert failed: xQueueSemaphoreTake queue.c:1713 (pxQueue->uxItemSize == 0)
+  Backtrace: ... -> esp_websocket_client_task
+```
+
+这两条 backtrace 都落在 websocket 任务里、崩在「和 LVGL 无关的指针字段」上，典型的**栈溢出把相邻堆写坏**。
+`esp_websocket_client` 默认任务栈只有 **4 KB**，而我们在它的事件回调里直接调 LVGL
+（`tihu_ui_show_frame` → `tihu_ui_board_update` → `lv_label_set_text` …）再构 cJSON 回 ack。
+
+用 addr2line 解码后做了对照实验：把同一条渲染链放到 **8 KB 的 main 任务**里（在 `tihu_ui_init` 里调
+`lv_refr_now`），立刻得到确定性的证据：
+
+```
+***ERROR*** A stack overflow in task main has been detected.
+Backtrace: vApplicationStackOverflowHook <- vTaskSwitchContext
+         <- lv_draw_label_iterate_characters <- lv_draw_sw_label <- lv_display_refr_timer
+         <- lv_refr_now <- tihu_ui_init <- app_main
+```
+
+结论：**320×240 一屏中文标签，`lv_refr_now`/`lv_timer_handler` 的调用链要 5–7 KB 栈**。
+所以渲染只能在栈 ≥12 KB 的任务里做，而且不能顺手在 `app_main` 里同步刷首帧。
+
+**改法**
+
+| 位置 | 改动 |
+| --- | --- |
+| `main/ui.c` | 不用 `bsp_display_start()`，改 `bsp_display_start_with_config()`：LVGL 任务栈 12 KB、tick 5 ms；打印返回码/分辨率/颜色格式/draw buf |
+| `main/ui.c` | 挂 **flush 探针**（包一层 `lv_display_set_flush_cb`，计数后原样转发），并公开 `tihu_ui_flush_count()` |
+| `main/ui.c` | 新增 `tihu_ui_show_boot()`：静态首页「鹈鹕 BOX-3B / 连接中… / 按住 CONFIG 说话 + 底部主页·停止两键」，不依赖宿主 |
+| `main/ui.c` | 删掉 `tihu_ui_init` 里的 `lv_refr_now()`（那是 main 任务栈溢出的直接凶手） |
+| `main/main.c` | 新增常驻 `tihu_ui_task`（12 KB 栈、10 ms 一帧、`bsp_display_lock` + `lv_timer_handler`），第一次循环先 `lv_refr_now(NULL)` 同步刷首帧；每 5 s 打一条 `UI 心跳：handler/flush/堆余` |
+| `main/main.c` | 启动顺序改成「屏 + 首页 → UI 任务 → 音频 → 网络 → 按键」，末尾明确打「app_main 返回不影响屏幕与网络」 |
+| `main/tihu_net.c` | websocket 任务栈 4 KB → 8 KB（`cfg.task_stack = 8192`） |
+| `sdkconfig` / `sdkconfig.defaults` | `CONFIG_ESP_TIMER_TASK_STACK_SIZE` 3584 → 6144（esp_timer 任务要跑按键/告警/心跳回调，里面有 LVGL 与 cJSON） |
+
+改大栈之后内部 RAM 不够 `esp_wifi_init` 了（报 `ESP_ERR_NO_MEM`，0x101），于是又加了一项：
+
+| 位置 | 改动 |
+| --- | --- |
+| `sdkconfig` / `sdkconfig.defaults` | `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y`：LVGL 的 draw buffer（320×100×2 = 62.5 KB）必须留在内部 RAM 做 SPI DMA，WiFi/LWIP 的接收缓冲退到 PSRAM |
+
+改完的串口（同一块板，20 s）：
+
+```
+I (1840) tihu_ui: bsp_display_start 返回 0x3fcad5f4：320x240，color=18，draw buf=32000 px，dbl=0
+I (1850) tihu_ui: LVGL 任务：栈 12000 B / 优先级 4 / tick 5 ms；flush 探针已挂（原回调 0x42016e34）
+I (2107) tihu_ui: UI 就绪：320x240，三屏已创建；首帧交给 UI 任务同步刷出（当前 flush=3）
+I (2114) tihu_main: UI 任务已进入常驻循环：10 ms/帧，栈 12288 B，core=0
+I (7268) tihu_main: UI 心跳：handler=500 flush=12(+12) 内部堆余=20891B PSRAM 余=16320700B
+I (12351) tihu_main: UI 心跳：handler=1000 flush=15(+3) 内部堆余=20351B PSRAM 余=16320700B
+I (17438) tihu_main: UI 心跳：handler=1500 flush=18(+3) 内部堆余=20219B PSRAM 余=16317568B
+```
+
+`flush` 计数一直涨 = 屏幕真的在刷；宿主推一帧棋盘就 +3 次 flush。
+**以后只看串口就知道屏有没有在刷**：`flush` 不涨就是渲染/背光/面板的问题，`handler` 不涨就是任务被吊死。
+
+### 9.2 问题二：Wi-Fi 认证失败（MiMover_8ebca3_MI）
+
+**不是密码问题。** 同一 SSID、同一密码 `12345678@@`，设备第一次 auth 被拒、3 秒后重试就通了：
+
+```
+I (4781) wifi:state: init -> auth (0xb0)
+I (4773) wifi:state: auth -> init (0x1c0)          <- 第一次尝试失败
+W (4775) tihu_net: Wi-Fi 断开 reason=202：AP 拒绝认证（密码错；热点刚开机/STA 表满/刚踢过人时也会瞬时拒绝）
+I (13193) tihu_net: 重试 Wi-Fi 连接（第 2 次）…
+I (15716) wifi:connected with MiMover_8ebca3_MI, channel 1, BW20, rssi: -38
+I (15717) wifi:security: WPA2-PSK, phy: bgn
+I (16741) tihu_net: Wi-Fi 已获取 IP：10.113.136.162
+```
+
+关键判据：**reason 202（`WIFI_REASON_AUTH_FAIL`）之后重试能连上、security 协商结果是 WPA2-PSK**，
+说明密码和 authmode 都对；202/205 是**手机热点侧对首次 auth 的瞬时拒绝**（802.11ax 手机热点在
+STA 表冷启动、刚踢人、或与 11k/v 漫游辅助交互时常见）。原固件没有打印 reason、也没有重扫，
+所以日志里只剩 `auth -> init (0x1c0)` 无限循环，看起来像"密码错"。
+
+另外：本次排障时还发现**电脑自己掉到了打印机 `DIRECT-D6-HP Laser 136w` 的 Wi-Fi Direct 上**，
+于是板子在 10.113.136.0/24、电脑在 192.169.0.0/24，WebSocket 一直 `CONNECTION_TIMEOUT`。
+用 `netsh wlan connect name="MiMover_8ebca3_MI"` 把电脑拉回热点后（IP 10.113.136.60）立刻连通。
+**以后遇到「Wi-Fi 连上了但连不上宿主」，先确认电脑和板子在同一个网段。**
+
+**改法**（`main/tihu_net.c`）
+
+| 改动 | 说明 |
+| --- | --- |
+| 打印 disconnect reason + 中文解释 | `WIFI_EVENT_STA_DISCONNECTED` 的 `reason` 逐条对照 `esp_wifi_types.h`：202 密码错/AP 瞬时拒绝、15/204 四次握手超时、201 找不到 SSID、203 关联被拒、23 企业网 802.1X… |
+| 明确 WPA2-PSK | `threshold.authmode = WIFI_AUTH_WPA2_PSK`、`threshold.rssi = -127`、`scan_method = WIFI_ALL_CHANNEL_SCAN`、`sort_method = WIFI_CONNECT_AP_BY_SIGNAL`，不试 WPA3/SAE |
+| 关 PMF / 11k-v | `pmf_cfg.capable = false; required = false`；11k/v 本来就是 `# CONFIG_ESP_WIFI_11KV_SUPPORT is not set`，启动日志里明打一行确认 |
+| 15 s 看门狗 + 重扫 | `esp_timer` 15 s 一发，超时通知 `wifi_probe_task`（扫描会阻塞，不能放 timer 回调）→ 扫到目标 SSID 就打印 `AP[i] ssid/ch/rssi/auth`、命中目标的 BSSID/信道/加密，再重连；找不到 SSID 单独一条中文告警 |
+| 失败退避重试 | 断线后 3 s 重试；`201/210/211/23` 这类重试救不回来的直接重扫 |
+| 日志 | `esp_wifi_init` 前后打印内部堆/最大块/PSRAM，`esp_wifi_init` 失败改成 ERROR + 提示查 `SPIRAM_TRY_ALLOCATE_WIFI_LWIP`（不再 `ESP_ERROR_CHECK` 直接重启） |
+| 附带修好的一件事 | `tihu_audio` 的 64 KB 播放 StreamBuffer 启动时创建失败（`E tihu_audio: 播放 StreamBuffer 创建失败`，TTS 直接没声）→ 改成 `xStreamBufferCreateWithCaps(... MALLOC_CAP_SPIRAM)`、容量 32 KB，内部 RAM 不够再退回调普通分配 |
+
+### 9.3 本次验证的完整 20 秒串口（`idf.py -p COM3 flash` 后复位抓取）
+
+```
+I (1560) tihu_main: 鹈鹕 BOX-3B 固件 0.1.0 启动
+I (1840) tihu_ui: bsp_display_start 返回 0x3fcad5f4：320x240，color=18，draw buf=32000 px，dbl=0
+I (1850) tihu_ui: LVGL 任务：栈 12000 B / 优先级 4 / tick 5 ms；flush 探针已挂（原回调 0x42016e34）
+I (2107) tihu_ui: UI 就绪：320x240，三屏已创建；首帧交给 UI 任务同步刷出（当前 flush=3）
+I (2114) tihu_main: UI 任务已进入常驻循环：10 ms/帧，栈 12288 B，core=0
+I (2204) tihu_net: esp_wifi_init 前：内部堆 84807 B（最大块 31744 B），PSRAM 16417304 B
+I (2321) tihu_net: 802.11k/v 漫游辅助：编译期已关闭（ESP_WIFI_11KV_SUPPORT=n）
+I (2372) tihu_net: 启动完成：SSID=MiMover_8ebca3_MI host=10.113.136.60:3081 token=已配置（authmode=WPA2-PSK，pmf=可选/不强制）
+I (2404) tihu_main: 按住 CONFIG 键说话，松开上传
+I (2410) tihu_main: 启动完成：UI 任务常驻（app_main 返回不影响屏幕与网络）
+I (4781) wifi:state: init -> auth (0xb0)
+I (4791) wifi:state: auth -> assoc (0x0)
+I (4864) wifi:state: assoc -> run (0x10)
+I (4915) wifi:connected with MiMover_8ebca3_MI, aid = 7, channel 1, BW20, bssid = 9a:9f:4b:68:97:32
+I (4915) wifi:security: WPA2-PSK, phy: bgn, rssi: -33
+I (5938) esp_netif_handlers: sta ip: 10.113.136.162, mask: 255.255.255.0, gw: 10.113.136.14
+I (5939) tihu_net: Wi-Fi 已获取 IP：10.113.136.162
+I (5945) websocket_client: Started
+I (5947) tihu_net: WebSocket 启动：ws://10.113.136.60:3081/tihu/lane?token=96528673
+I (6331) tihu_net: WebSocket 已连接：ws://10.113.136.60:3081/tihu/lane?token=96528673
+I (6458) tihu_net: 忽略未知下行 type=session.bound
+I (6462) tihu_net: 事件[指挥]：统一指挥已就绪：说一句话就派单，不用挑会话
+I (6477) tihu_net: 忽略未知下行 type=task.list
+I (6483) tihu_net: 事件[连接]：设备 dev-mwbvk2j8-176a8d17 已就绪
+I (7268) tihu_main: UI 心跳：handler=500 flush=12(+12) 内部堆余=20891B PSRAM 余=16320700B
+I (7452) tihu_net: 忽略未知下行 type=task.list
+I (12351) tihu_main: UI 心跳：handler=1000 flush=15(+3) 内部堆余=20351B PSRAM 余=16320700B
+I (12469) tihu_net: 忽略未知下行 type=task.list
+I (17438) tihu_main: UI 心跳：handler=1500 flush=18(+3) 内部堆余=20219B PSRAM 余=16317568B
+I (17467) tihu_net: 忽略未知下行 type=task.list
+```
+
+20 秒内 **无 panic、无重启**，屏在刷、Wi-Fi 通、宿主连上并推帧。
+
+### 9.4 下次再遇到同类现象怎么查（30 秒定位）
+
+1. **屏黑/只有一条**：先看有没有 `UI 心跳` 与 `flush`。
+   - `handler` 在涨、`flush` 不涨 → 渲染没触发（缺 invalidate / 面板没 disp_on）或背光；
+   - 两个都不涨 → UI 任务被吊死（锁、栈、或任务没创建）；
+   - 有 `***ERROR*** A stack overflow in task ...` → 栈给小了，参照 9.1 的表加栈。
+2. **Wi-Fi 连不上**：只看 `Wi-Fi 断开 reason=` 那一行。
+   - 202/15/204 → 密码或 PMF/WPA3 混用；连续 202 且重试也不通才算密码问题；
+   - 201/210/211 → 扫不到或加密不兼容，看紧随其后的 `AP[i]` 扫描清单；
+   - 有 IP 但 `WebSocket CONNECTION_TIMEOUT` → 先 `ping` 宿主、确认电脑和板子同网段（9.2 末尾的坑）。
+3. 改完务必 `idf.py -p COM3 flash` 后**冷复位抓 20 s**，不要只看编译过没过。
+
+### 9.5 注意：sdkconfig 不入库
+
+`sdkconfig` 在 `.gitignore` 里。本次新增的两个系统配置已同步写进 **`sdkconfig.defaults`**
+（`CONFIG_ESP_TIMER_TASK_STACK_SIZE=6144`、`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y`），
+但**已经存在的 `sdkconfig` 不会自动跟随 defaults**：新机器/重装 IDF 后要
+`idf.py set-target esp32s3`（或删掉 `sdkconfig`）重新生成，再 `idf.py menuconfig` 核对这两项。
+另外 2026-11-11 这次踩到一个坑：用 Windows PowerShell 5.1 的 `Set-Content -Encoding UTF8` 改 `sdkconfig`
+会写入 **BOM**，kconfig 用 GBK 读文件时直接报
+`UnicodeDecodeError: 'gbk' codec can't decode byte 0xbf in position 2`，编译直接失败。
+改 `sdkconfig` 要用 `[System.IO.File]::WriteAllText($f,$text,(New-Object System.Text.UTF8Encoding($false)))`。

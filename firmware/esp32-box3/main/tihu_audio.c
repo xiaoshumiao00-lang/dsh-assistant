@@ -17,6 +17,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
@@ -24,7 +25,7 @@
 
 static const char *TAG = "tihu_audio";
 
-#define AUDIO_STREAM_BYTES   (64 * 1024)
+#define AUDIO_STREAM_BYTES   (32 * 1024)
 #define AUDIO_TASK_STACK     4096
 #define AUDIO_TASK_PRIO      5
 
@@ -177,9 +178,17 @@ void tihu_audio_init(void)
     /* 两个 codec 都 init 完之后再按 24k 打开扬声器，避免 mic init 重配 I2S。 */
     speaker_open_24k();
 
-    s_stream = xStreamBufferCreate(AUDIO_STREAM_BYTES, 512);
+    /*
+     * 64 KB 一次性从内部 RAM 拿会在启动最紧张的时候失败（实测报
+     * “播放 StreamBuffer 创建失败”，TTS 直接没声），放 PSRAM 且减到 32 KB。
+     */
+    s_stream = xStreamBufferCreateWithCaps(AUDIO_STREAM_BYTES, 512,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_stream == NULL) {
-        ESP_LOGE(TAG, "播放 StreamBuffer 创建失败");
+        s_stream = xStreamBufferCreate(AUDIO_STREAM_BYTES, 512);
+    }
+    if (s_stream == NULL) {
+        ESP_LOGE(TAG, "播放 StreamBuffer 创建失败（PSRAM/内部 RAM 都不够）");
         return;
     }
     if (xTaskCreate(audio_task, "tihu_audio", AUDIO_TASK_STACK, NULL,

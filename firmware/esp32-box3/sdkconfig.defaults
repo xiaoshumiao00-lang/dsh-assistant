@@ -18,6 +18,10 @@ CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+# LVGL 的 draw buffer（320×100×2 = 62.5 KB）必须留在内部 RAM 做 SPI DMA，
+# 再加上 12 KB 的 LVGL/UI 任务栈，内部 RAM 就紧到 esp_wifi_init 报 ESP_ERR_NO_MEM。
+# 打开这个开关后 WiFi/LWIP 的接收缓冲可以退到 PSRAM（官方给 S3+PSRAM 的推荐配置）。
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
 # ---- 分区表：自定义（partitions.csv：8 MB app + 2 MB SPIFFS+ 余量）----
 CONFIG_PARTITION_TABLE_CUSTOM=y
@@ -26,6 +30,9 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # ---- 系统 ----
 CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# esp_timer 任务在执行我们的回调：心跳要构 cJSON/发 WS、按键回调要开麦并刷 LVGL 提示条、
+# 15 秒 Wi-Fi 看门狗要通知探测任务。3584 太紧（LVGL 画中文一行就要 1–2 KB），提到 6144。
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=6144
 
 # LVGL 由 BSP 的 esp_lvgl_port 配置；这里只固定 16 位色，避免 RGB565 屏偏色。
 CONFIG_LV_COLOR_DEPTH_16=y
