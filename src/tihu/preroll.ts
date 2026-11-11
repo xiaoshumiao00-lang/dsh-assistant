@@ -99,11 +99,14 @@ export class TihuPreroll {
   /** 存一条；超长/空/写不进去都返回 false（不算错误）。 */
   put(voice: string, text: string, pcm: Buffer): boolean {
     if (pcm.length === 0) return false
-    if (prerollAudioMs(pcm.length) > PREROLL_MAX_AUDIO_MS) return false
+    // 只存整采样（2 字节）：半个采样写进缓存，命中时会让设备整条流错位成噪声。
+    const even = pcm.length % 2 === 0 ? pcm : pcm.subarray(0, pcm.length - 1)
+    if (even.length === 0) return false
+    if (prerollAudioMs(even.length) > PREROLL_MAX_AUDIO_MS) return false
     const key = prerollKeyOf(voice, text)
     try {
       mkdirSync(this.dir, { recursive: true })
-      writeFileSync(this.fileOf(key), pcm)
+      writeFileSync(this.fileOf(key), even)
       this.prune()
       return true
     } catch {

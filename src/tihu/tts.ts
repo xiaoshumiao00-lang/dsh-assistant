@@ -1,8 +1,13 @@
 /**
  * TTS 引擎（鹈鹕模块内置，不依赖任何外部插件 / 独立服务 / 别的仓库）。
  *
- * 主引擎（2026-11-08 用户拍板，第二轮）：**微软 edge-tts 云健**（`scripts/tihu-edge-tts.py`，
- * 音色 zh-CN-YunjianNeural 不变）。理由：试听效果比 Kokoro 自然，且不占本机 CPU。
+ * 主引擎（2026-11-08 用户拍板，第二轮）：**微软 edge-tts**（`scripts/tihu-edge-tts.py`）。
+ * 音色（2026-11-11 用户拍板）：默认 **zh-CN-XiaoxiaoNeural（晓晓）**，优先级
+ * `TIHU_EDGE_VOICE` > `config.json` 的 `tihu.voice.edge` > 晓晓，统一由
+ * `edge-voice.ts` 解析；每次合成会落一行
+ * `tihu tts: 引擎=edge 音色=<id> 来源=config|default`（同时进 lane.log）。
+ * 2026-11-11 实机「不是晓晓」的真因是 edge 驱动脚本的 DNS 解析器坏了 → 每次 exit 3 →
+ * 宿主回落 Kokoro，见 `scripts/tihu-edge-tts.py` 的 `_force_threaded_resolver`。
  * 离线兜底（次选）：**Kokoro multi-lang v1.1-zh（sherpa-onnx，纯 CPU）**，只在
  * 「显式离线 / 探测不到网络 / edge 请求失败 / edge 未安装」时启用：
  *   - 驱动脚本在仓库内：`scripts/tihu-kokoro-tts-server.py`；
@@ -32,8 +37,9 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync } 
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
-import { Pcm16Chunker, TTS_CHUNK_MS, TTS_SAMPLE_RATE, validateReferenceWav } from './audio.ts'
+import { Pcm16Chunker, TTS_CHUNK_MS, TTS_SAMPLE_RATE, ensureEvenPcm, validateReferenceWav } from './audio.ts'
 import { TIHU_CLOUD_VOICE_DEFAULT, isTihuCloudVoice, tihuCloudVoiceShortName } from './cloud-voices.ts'
+import { edgeVoiceLogLine, tihuEdgeVoiceResolution, type TihuEdgeVoiceSource } from './edge-voice.ts'
 import { toTtsSegments } from './protocol.ts'
 import type { VoiceInfo } from './protocol.ts'
 
@@ -653,14 +659,14 @@ export class TihuTts {
       // 缺依赖必须说清「缺哪个文件 + 该跑哪条命令」，不能只报一个空失败。
       const missing = kokoroMissingFiles()
       const reason = `Kokoro 未就绪（缺 ${missing.length} 项：${missing.slice(0, 3).join('；')}${missing.length > 3 ? ' …' : ''}）。${kokoroInstallHint()}`
-      if (this.edgeReady()) return { available: true, model: 'edge-tts 云健(Yunjian)', error: reason }
+      if (this.edgeReady()) return { available: true, model: this.edgeModelLabel(), error: reason }
       return { available: false, error: `${reason}；edge 兜底也不可用` }
     }
     if (backend === 'q4') return { available: true, model: 'qwen3-tts 0.6b-q4' }
     if (backend === 'cpu') return { available: true, model: 'qwen3-tts 0.6b-pt' }
     if (backend === 'qwen-cuda') return { available: true, model: 'qwen3-tts 0.6b-cuda' }
     // edge 主用：脚本、Python、edge_tts 与 ffmpeg 全部通过本机探测才算可用。
-    if (this.edgeReady()) return { available: true, model: 'edge-tts 云健(Yunjian)' }
+    if (this.edgeReady()) return { available: true, model: this.edgeModelLabel() }
     const edgeReason = this.edgeDependencies().error
     if (this.kokoroReady()) {
       return {
@@ -999,13 +1005,19 @@ export class TihuTts {
     return this.edgeDependencies().ok
   }
 
+  /** 这个进程现在会用的 edge 引擎名（设置页/状态屏显示用；不读网络、不起进程）。 */
+  private edgeModelLabel(): string {
+    const { voice } = tihuEdgeVoiceResolution()
+    return `edge-tts ${tihuCloudVoiceShortName(voice)}(${voice})`
+  }
+
   /** 当前引擎的中文标识（页面事件区）。 */
   engineLabel(voice: string): string {
     if (this.engineInUse === 'kokoro') {
       const sid = kokoroSid(voice)
       return `离线兜底：本地 Kokoro ${kokoroVoiceName(sid)}（sid ${sid}）`
     }
-    if (this.engineInUse === 'edge') return '在线主引擎：edge-tts 云健(Yunjian)'
+    if (this.engineInUse === 'edge') return `在线主引擎：${this.edgeModelLabel()}`
     if (this.engineInUse === 'none') return '无语音（仅文字）'
     return `本地 TTS：qwen3-tts 0.6b-cuda / 音色 ${voice || 'default'}`
   }
@@ -1027,12 +1039,19 @@ export class TihuTts {
       onChunk: (chunk: { data: Buffer; seq: number; total: number; final: boolean }) => void
       signal?: AbortSignal
       edgeVoice?: string
+      edgeVoiceSource?: TihuEdgeVoiceSource
     },
   ): Promise<SynthResult> {
     const started = Date.now()
     const deps = this.edgeDependencies()
     if (!deps.ok) throw new Error(`edge 依赖不可用：${deps.error}`)
-    const voice = options.edgeVoice || process.env.TIHU_EDGE_VOICE || TIHU_CLOUD_VOICE_DEFAULT
+    const fallback = tihuEdgeVoiceResolution()
+    const voice = options.edgeVoice || fallback.voice
+    // 显式传了 edgeVoiceSource 就用它（lane 记着这台设备这个音色从哪来）；
+    // 否则按本次真实解析结果——注意不能因为「没传 edgeVoice」就写 default：
+    // 没传时 voice 也是从 config 解析出来的，来源仍是 config。
+    const source: TihuEdgeVoiceSource = options.edgeVoiceSource ?? fallback.source
+    this.logVoiceOnce('edge', voice, source)
     const py = spawn(deps.python, ['-u', deps.script, '--text', text, '--voice', voice], {
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -1074,7 +1093,11 @@ export class TihuTts {
           if (firstAt === 0) { firstAt = Date.now(); clearTimeout(firstTimer) }
           bytes += chunk.length
           for (const block of chunker.push(chunk)) {
-            options.onChunk({ data: block, seq: chunks, total: 0, final: false })
+            // 出口兜底：宁可少半个采样，也不能让半采样进设备（2 字节错位 = 整条流爆音）。
+            const even = ensureEvenPcm(block)
+            if (even.dropped) this.log(`tihu tts: 奇数块已对齐（块长=${block.length}，丢 1 字节）`)
+            if (even.data.length === 0) continue
+            options.onChunk({ data: even.data, seq: chunks, total: 0, final: false })
             chunks += 1
           }
         })
@@ -1093,7 +1116,10 @@ export class TihuTts {
         throw new Error(`edge-tts 没有返回音频：${stderr.split('\n').filter(Boolean).slice(-2).join(' ').slice(0, 200)}`)
       }
       for (const block of tail) {
-        options.onChunk({ data: block.data, seq: chunks, total: chunks + 1, final: block.final })
+        const even = ensureEvenPcm(block.data)
+        if (even.dropped) this.log(`tihu tts: 奇数尾块已对齐（块长=${block.data.length}，丢 1 字节）`)
+        if (even.data.length === 0) continue
+        options.onChunk({ data: even.data, seq: chunks, total: chunks + 1, final: block.final })
         chunks += 1
       }
       const totalMs = Date.now() - started
@@ -1125,6 +1151,8 @@ export class TihuTts {
       voice?: string
       sessionId?: string
       edgeVoice?: string
+      /** `edgeVoice` 从哪来（lane 记录在设备上）：只用于那行 `tihu tts: ... 来源=`。 */
+      edgeVoiceSource?: TihuEdgeVoiceSource
       offlineOnly?: boolean
       onChunk: (chunk: { data: Buffer; seq: number; total: number; final: boolean }) => void
       signal?: AbortSignal
@@ -1162,7 +1190,8 @@ export class TihuTts {
       }
     }
 
-    // ② edge 主引擎：音色保持 zh-CN-YunjianNeural（TIHU_EDGE_VOICE 可覆盖），rate 不动。
+    // ② edge 主引擎：音色由 `edge-voice.ts` 解析（env > config 的 tihu.voice.edge > 晓晓），
+    //    rate 不动；实际生效值会在 synthesizeEdge 里落 `tihu tts: ... 来源=` 那行。
     //    显式离线时跳过（不白发一次注定失败的请求）；edge 刚失败过（60s 冷却）也跳过，别每段白等。
     const edgeCooldown = Date.now() < this.edgeDownUntil
     if (!wantsClone && explicitOffline === '' && edgeCooldown) {
@@ -1259,8 +1288,22 @@ export class TihuTts {
     throw new Error(`本次无语音：${detail || '没有可用引擎（edge 未安装且 Kokoro 未就绪）'}`)
   }
 
-  private setEngine(engine: 'kokoro' | 'gpu' | 'edge' | 'none', voice = ''): void {
-    this.engineInUse = engine
+  /** 这一次合成实际用的音色已落过日志吗（同一个 voice+source 只落一行，切了才再落）。 */
+  private lastVoiceLog = ''
+
+  /**
+   * 落一行 `tihu tts: 引擎=edge 音色=... 来源=config|default`。
+   * 这是「设备到底听谁的」的唯一现场证据：合成入口在这一层，config 解析也在这一层之上，
+   * 页面/设备页/设置页怎么绕，最后都只能从这行看出来。
+   */
+  private logVoiceOnce(engine: string, voice: string, source: TihuEdgeVoiceSource): void {
+    const line = edgeVoiceLogLine(engine, voice, source)
+    if (line === this.lastVoiceLog) return
+    this.lastVoiceLog = line
+    this.log(line)
+  }
+
+  private setEngine(engine: 'kokoro' | 'gpu' | 'edge' | 'none', voice = ''): void {    this.engineInUse = engine
     this.lastLabel = this.engineLabel(voice)
   }
 
@@ -1283,6 +1326,15 @@ export class TihuTts {
   ): Promise<SynthResult> {
     // 只有走到这里才会 spawn（edge 主用时不会碰它）。
     await this.ensureKokoroServer()
+    // 「为什么不是晓晓」最常见的第二种答案：走的是本地 Kokoro。这一行必须留，
+    // 否则用户只能从 tts-server.log 里猜。`来源=手选` / `来源=离线兜底` 一眼区分。
+    const sid = kokoroSid(options.voice)
+    const manual = isKokoroVoice(options.voice)
+    const line = `tihu tts: 引擎=kokoro 音色=${kokoroVoiceName(sid)}（sid ${sid}）来源=${manual ? '手选' : '离线兜底'}`
+    if (line !== this.lastVoiceLog) {
+      this.lastVoiceLog = line
+      this.log(line)
+    }
     return this.serializeLocal(() => this.kokoroRequest(text, options))
   }
 
@@ -1353,7 +1405,10 @@ export class TihuTts {
           if (firstChunkAt === 0) firstChunkAt = Date.now()
           bytes += view.byteLength
           for (const block of chunker.push(view)) {
-            options.onChunk({ data: block, seq: chunks, total: 0, final: false })
+            const even = ensureEvenPcm(block)
+            if (even.dropped) this.log(`tihu tts: 奇数块已对齐（块长=${block.length}，丢 1 字节）`)
+            if (even.data.length === 0) continue
+            options.onChunk({ data: even.data, seq: chunks, total: 0, final: false })
             chunks += 1
           }
         }
@@ -1368,7 +1423,10 @@ export class TihuTts {
       })
       const tail = chunker.finish()
       for (const block of tail) {
-        options.onChunk({ data: block.data, seq: chunks, total: chunks + 1, final: block.final })
+        const even = ensureEvenPcm(block.data)
+        if (even.dropped) this.log(`tihu tts: 奇数尾块已对齐（块长=${block.data.length}，丢 1 字节）`)
+        if (even.data.length === 0) continue
+        options.onChunk({ data: even.data, seq: chunks, total: chunks + 1, final: block.final })
         chunks += 1
       }
       const totalMs = Date.now() - started
@@ -1433,13 +1491,19 @@ export class TihuTts {
         bytes += value.length
         const blocks = chunker.push(value)
         for (const block of blocks) {
-          options.onChunk({ data: block, seq: chunks, total: 0, final: false })
+          const even = ensureEvenPcm(block)
+          if (even.dropped) this.log(`tihu tts: 奇数块已对齐（块长=${block.length}，丢 1 字节）`)
+          if (even.data.length === 0) continue
+          options.onChunk({ data: even.data, seq: chunks, total: 0, final: false })
           chunks += 1
         }
       }
       const tail = chunker.finish()
       for (const block of tail) {
-        options.onChunk({ data: block.data, seq: chunks, total: chunks + 1, final: block.final })
+        const even = ensureEvenPcm(block.data)
+        if (even.dropped) this.log(`tihu tts: 奇数尾块已对齐（块长=${block.data.length}，丢 1 字节）`)
+        if (even.data.length === 0) continue
+        options.onChunk({ data: even.data, seq: chunks, total: chunks + 1, final: block.final })
         chunks += 1
       }
       const totalMs = Date.now() - started
@@ -1472,7 +1536,7 @@ export class TihuTts {
   }
 
   /** 列出音色：默认（edge）+ Kokoro 中文音色（离线兜底/手切）+ 工作区克隆音色。
-   *  `edgeVoice` 是这台设备实际在用的云端音色（宿主配置/TIHU_EDGE_VOICE/云健），
+   *  `edgeVoice` 是这台设备实际在用的云端音色（宿主配置/TIHU_EDGE_VOICE/默认晓晓），
    *  只用来把这句说明写对——别让用户设了「晓晓」、屏上还写着「云健」。 */
   async listVoices(sessionId?: string, edgeVoice?: string): Promise<VoiceInfo[]> {
     const primaryKokoro = this.engineFor() === 'kokoro'

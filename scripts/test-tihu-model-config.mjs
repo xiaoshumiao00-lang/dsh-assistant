@@ -27,25 +27,58 @@ const test = (name, run) => cases.push([name, run])
 
 /* ─────────────── 1. 云音色清单 ─────────────── */
 
-test('云端音色清单：4 个 zh-CN-*Neural，默认云健，本地 Kokoro 一律不算', () => {
+test('云端音色清单：4 个 zh-CN-*Neural，默认晓晓，本地 Kokoro 一律不算', () => {
   assert.deepEqual(cloud.TIHU_CLOUD_VOICES.map((voice) => voice.id), [
     'zh-CN-YunjianNeural', 'zh-CN-YunxiNeural', 'zh-CN-XiaoxiaoNeural', 'zh-CN-YunyangNeural',
-  ], '清单与设备页写死的那 4 项 + 顺序必须一致（别悄悄改默认声音）')
-  assert.equal(cloud.TIHU_CLOUD_VOICE_DEFAULT, 'zh-CN-YunjianNeural', '默认云音色必须还是云健')
+  ], '清单与设备页写死的那 4 项 + 顺序必须一致（别悄悄改顺序）')
+  assert.equal(cloud.TIHU_CLOUD_VOICE_DEFAULT, 'zh-CN-XiaoxiaoNeural', '默认云音色是晓晓（2026-11-11 用户拍板）')
   assert.equal(cloud.isTihuCloudVoice('zh-CN-XiaoxiaoNeural'), true)
   for (const bad of ['zf_060', 'zm_100', '35', 'sid35', '', 'zh-CN-Yunjian', 'kokoro']) {
     assert.equal(cloud.isTihuCloudVoice(bad), false, `${bad} 不该被当成云端音色`)
   }
   assert.equal(cloud.tihuCloudVoiceLabel('zh-CN-XiaoxiaoNeural'), '晓晓 Xiaoxiao（女声）')
   assert.equal(cloud.tihuCloudVoiceShortName('zh-CN-XiaoxiaoNeural'), '晓晓')
-  assert.equal(cloud.tihuCloudVoiceShortName('unknown-id'), '云健', '未知 id 退回默认音色的短名')
+  assert.equal(cloud.tihuCloudVoiceShortName('unknown-id'), '晓晓', '未知 id 退回默认音色的短名')
 })
 
-test('试听句跟着云端音色走（设了晓晓就别念「我是云健」）', async () => {
+test('试听句跟着云端音色走（默认就是晓晓，别再念「我是云健」）', async () => {
   const { tihuSampleTextOf } = await import('../src/tihu/lane.ts')
-  assert.equal(tihuSampleTextOf('zh-CN-YunjianNeural'), '试听：我是云健，声音正常吗？', '没配置时逐字保持原句')
-  assert.equal(tihuSampleTextOf(''), '试听：我是云健，声音正常吗？')
+  assert.equal(tihuSampleTextOf('zh-CN-YunjianNeural'), '试听：我是云健，声音正常吗？', '显式传云健时逐字保持原句')
+  assert.equal(tihuSampleTextOf(''), '试听：我是晓晓，声音正常吗？', '没传 = 默认晓晓')
+  assert.equal(tihuSampleTextOf(undefined), '试听：我是晓晓，声音正常吗？')
   assert.equal(tihuSampleTextOf('zh-CN-XiaoxiaoNeural'), '试听：我是晓晓，声音正常吗？')
+})
+
+test('音色解析：env > config > 默认晓晓，来源要能说清（日志行固定格式）', async () => {
+  const { resolveTihuEdgeVoice, edgeVoiceLogLine } = await import('../src/tihu/edge-voice.ts')
+  assert.deepEqual(resolveTihuEdgeVoice('', ''), { voice: 'zh-CN-XiaoxiaoNeural', source: 'default' })
+  assert.deepEqual(resolveTihuEdgeVoice('', 'zh-CN-YunxiNeural'), { voice: 'zh-CN-YunxiNeural', source: 'config' })
+  assert.deepEqual(resolveTihuEdgeVoice('zh-CN-YunyangNeural', 'zh-CN-YunxiNeural'), { voice: 'zh-CN-YunyangNeural', source: 'env' })
+  assert.deepEqual(resolveTihuEdgeVoice('', 'zf_060'), { voice: 'zh-CN-XiaoxiaoNeural', source: 'default' }, '本地 Kokoro 不算云端音色')
+  assert.equal(
+    edgeVoiceLogLine('edge', 'zh-CN-XiaoxiaoNeural', 'config'),
+    'tihu tts: 引擎=edge 音色=zh-CN-XiaoxiaoNeural 来源=config',
+    '这行是用户点名要的日志，字段与分隔不能变',
+  )
+})
+
+test('TTS 出口只发偶数字节（半采样会让设备整条流错位成噪声）', async () => {
+  const { ensureEvenPcm } = await import('../src/tihu/audio.ts')
+  const even = Buffer.alloc(2880, 1)
+  assert.equal(ensureEvenPcm(even).dropped, false)
+  assert.equal(ensureEvenPcm(even).data.length, 2880)
+  const odd = Buffer.alloc(2881, 1)
+  const fixed = ensureEvenPcm(odd)
+  assert.equal(fixed.dropped, true)
+  assert.equal(fixed.data.length, 2880, '奇数块必须砍到偶数长度再下发')
+  assert.equal(ensureEvenPcm(Buffer.alloc(1)).data.length, 0, '只剩半采样就整块丢掉')
+})
+
+test('edge 驱动脚本：默认解析器必须换成线程版（不然 aiodns 失败 → 每次都回落 Kokoro）', async () => {
+  const { readFileSync } = await import('node:fs')
+  const source = readFileSync(new URL('../scripts/tihu-edge-tts.py', import.meta.url), 'utf8')
+  assert.match(source, /aiohttp\.resolver\.ThreadedResolver/, 'edge-tts 脚本缺线程 DNS 解析器补丁')
+  assert.match(source, /aiohttp\.connector\.DefaultResolver\s*=/, '补丁要改 connector 里的默认解析器（只改 resolver 模块没用）')
 })
 
 /* ─────────────── 2. 配置值解析（环境变量 > config.json） ─────────────── */
@@ -160,25 +193,29 @@ test('selectModelKeepingDefault：并发调用被串行化（不会交错 select
 
 /* ─────────────── 4. 从 config.json 一路读到设备默认音色 ─────────────── */
 
-test('tihuEdgeVoiceDefault：环境变量 > config.json 的 tihu.voice.edge > 云健', async () => {
+test('tihuEdgeVoiceDefault：环境变量 > config.json 的 tihu.voice.edge > 晓晓', async () => {
   process.env.DSH_ASSISTANT_CONFIG = configFile
   delete process.env.TIHU_EDGE_VOICE
   writeFileSync(configFile, JSON.stringify({ tihu: { voice: { edge: 'zh-CN-XiaoxiaoNeural' } } }), 'utf8')
   const { tihuEdgeVoiceDefault } = await import('../src/tihu/lane.ts')
+  const { tihuEdgeVoiceResolution } = await import('../src/tihu/edge-voice.ts')
   assert.equal(tihuEdgeVoiceDefault(), 'zh-CN-XiaoxiaoNeural', '配置里的默认云音色要真的被设备用上')
+  assert.equal(tihuEdgeVoiceResolution().source, 'config', '来源必须标成 config')
 
   process.env.TIHU_EDGE_VOICE = 'zh-CN-YunxiNeural'
   assert.equal(tihuEdgeVoiceDefault(), 'zh-CN-YunxiNeural', '环境变量是临时覆盖，优先级最高')
+  assert.equal(tihuEdgeVoiceResolution().source, 'env')
 
   delete process.env.TIHU_EDGE_VOICE
   writeFileSync(configFile, JSON.stringify({ tihu: { voice: { edge: 'zf_060' } } }), 'utf8')
-  assert.equal(tihuEdgeVoiceDefault(), 'zh-CN-YunjianNeural', '本地 Kokoro 音色不能被当成默认云音色（退回云健）')
+  assert.equal(tihuEdgeVoiceDefault(), 'zh-CN-XiaoxiaoNeural', '本地 Kokoro 音色不能被当成默认云音色（退回默认晓晓）')
 
   writeFileSync(configFile, JSON.stringify({}), 'utf8')
-  assert.equal(tihuEdgeVoiceDefault(), 'zh-CN-YunjianNeural', '没配置时保持历史默认（云健）')
+  assert.equal(tihuEdgeVoiceDefault(), 'zh-CN-XiaoxiaoNeural', '没配置时用新默认（晓晓）')
+  assert.equal(tihuEdgeVoiceResolution().source, 'default')
 
   rmSync(configFile, { force: true })
-  assert.equal(tihuEdgeVoiceDefault(), 'zh-CN-YunjianNeural', '连配置文件都没有也要有默认值')
+  assert.equal(tihuEdgeVoiceDefault(), 'zh-CN-XiaoxiaoNeural', '连配置文件都没有也要有默认值')
 })
 
 /* ─────────────── 5. 接线位置（源码级）：两条建会话路径都接上了、且顺序对 ─────────────── */
@@ -211,6 +248,18 @@ test('page.ts：连上设备时不再把本页写死的云音色推给宿主（�
     '连上就上行本页音色 = 宿主的「默认云音色」被覆盖')
   assert.ok(window.includes("localStorage.getItem('tihu.edgeVoice')"), '应改成「只有本页手工改过才上行」')
   assert.ok(source.includes('payload.edgeVoice'), 'voice.list 回显宿主实际音色')
+})
+
+test('lane.ts / tts.ts：配置优先 + 每次合成落一行来源日志 + 出口偶数对齐', async () => {
+  const { readFileSync } = await import('node:fs')
+  const lane = readFileSync(new URL('../src/tihu/lane.ts', import.meta.url), 'utf8')
+  assert.ok(lane.includes("pinned.source === 'env' || pinned.source === 'config'"),
+    '设备页上行音色必须让 config/env 先过一遍（否则旧 localStorage 会把它压掉）')
+  assert.match(lane, /function logTihuVoice\(device: TihuDevice\)/, '设备连上/切音色时要落音色日志')
+  assert.match(lane, /edgeVoiceSource: device\.edgeVoiceSource/, '合成时要带上来源，日志才知道 config/default')
+  const tts = readFileSync(new URL('../src/tihu/tts.ts', import.meta.url), 'utf8')
+  assert.match(tts, /edgeVoiceLogLine\('edge'|logVoiceOnce\('edge'/, 'synthesizeEdge 里没落音色来源日志')
+  assert.equal((tts.match(/ensureEvenPcm\(/g) ?? []).length >= 4, true, '三条合成链 + 尾块都要过偶数对齐')
 })
 
 let failed = 0

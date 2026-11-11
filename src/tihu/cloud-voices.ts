@@ -32,11 +32,12 @@ export const TIHU_CLOUD_VOICES: readonly TihuCloudVoice[] = [
 ]
 
 /**
- * 没配置任何值时的云端音色。
- * 与 `device.edgeVoice` 的历史兜底值（`TIHU_EDGE_VOICE ?? 'zh-CN-YunjianNeural'`）一致，
- * **不要改**：改它等于悄悄换掉所有人现在的默认声音。
+ * 没配置任何值时的云端音色：**晓晓**（2026-11-11 用户拍板，替换原来的云健）。
+ *
+ * 与 `设备页下拉的默认项`、`tihuSampleTextOf('')`、`tts.status()` 的引擎名一致；
+ * 配置了 `tihu.voice.edge` 的人仍然听自己选的那个（见 `edge-voice.ts` 的优先级）。
  */
-export const TIHU_CLOUD_VOICE_DEFAULT = 'zh-CN-YunjianNeural'
+export const TIHU_CLOUD_VOICE_DEFAULT = 'zh-CN-XiaoxiaoNeural'
 
 /** 是不是清单里的云端音色（本地 Kokoro 的 zf_/zm_/sid 一律 false）。 */
 export function isTihuCloudVoice(raw?: unknown): boolean {

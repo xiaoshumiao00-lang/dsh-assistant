@@ -535,7 +535,7 @@ function TihuPanel() {
             <div style={title}>默认云音色</div>
             <p style={desc}>
               设备说话时的默认声音，只列 edge-tts 云端音色（不列本地 Kokoro：那些是离线兜底）。
-              设备页仍可临时另选，只管这一次连接。
+              没配置时默认晓晓；设备页的临时选择只在没配置时生效（配置优先，日志里写「来源=config」）。
             </p>
           </div>
           <select
@@ -569,7 +569,7 @@ function TihuPanel() {
       <p style={{ ...desc, padding: '0 2px' }}>
         三项都存在本机配置文件（~/.dsh/assistant/config.json）里，手机端与电脑端共用同一份；
         临时改可以用环境变量 TIHU_MODEL_FOREGROUND / TIHU_MODEL_BACKGROUND（provider/model）与
-        TIHU_EDGE_VOICE，环境变量优先级最高。没配置时一切按原样：模型跟随 DSH 默认，音色云健。
+        TIHU_EDGE_VOICE，环境变量优先级最高。没配置时一切按原样：模型跟随 DSH 默认，音色晓晓。
       </p>
     </div>
   )

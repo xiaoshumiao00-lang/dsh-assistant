@@ -72,8 +72,20 @@ export class Pcm16Chunker {
   }
 }
 
-/** WAV 头解析结果。 */
-export interface WavInfo {
+/**
+ * 出口兜底：把一块 PCM 截成偶数字节（16 bit 单声道 = 2 字节一个采样）。
+ *
+ * `Pcm16Chunker` 正常不会产出奇数块，但 edge 首块（ffmpeg 管道边界）与以后新增的引擎
+ * 都可能带半个采样。半个采样送到设备 = 从这里开始整条流错位 → 满幅噪声。
+ * 所以**所有** `tts.audio` 出口都先过这里；`dropped` 用来在日志里留证据。
+ */
+export function ensureEvenPcm(chunk: Buffer | Uint8Array): { data: Buffer; dropped: boolean } {
+  const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+  if (buf.length % 2 === 0) return { data: buf, dropped: false }
+  return { data: buf.subarray(0, buf.length - 1), dropped: true }
+}
+
+/** WAV 头解析结果。 */export interface WavInfo {
   sampleRate: number
   channels: number
   bits: number
