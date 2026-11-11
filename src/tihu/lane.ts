@@ -78,12 +78,13 @@ import {
 import { tihuPageHtml } from './page.ts'
 import { applyEarlyThinking, applySessionEvent, createProgressState, decodeRateOf, formatTokens, pushDecodeSample, type TihuDecodeSample, type TihuProgressState } from './progress.ts'
 import { TihuTts, isKokoroVoice, type TihuTtsPaths } from './tts.ts'
-import { TIHU_CLOUD_VOICE_DEFAULT, isTihuCloudVoice, tihuCloudVoiceShortName } from './cloud-voices.ts'
+import { isTihuCloudVoice, tihuCloudVoiceShortName } from './cloud-voices.ts'
+import { edgeVoiceLogLine, tihuEdgeVoiceDefault, tihuEdgeVoiceResolution, type TihuEdgeVoiceSource } from './edge-voice.ts'
 import { resolveTihuModel, selectModelKeepingDefault, type TihuModelKind } from './model-select.ts'
 import { replyVisibleWindow, replyWindow, splitReplySentences, splitSpeechSegments, type ReplySentence, type SpeechSegment } from './reply.ts'
 import { stripToolNoise, toSpeechText } from './speech-text.ts'
 import { CONTENT_WIDTH_PX, fitScreenLines, PENDING_RAIL_WIDTH_PX, REPLY_LAYOUT, SCREEN_SPEC, wrapTextPx } from './screen-spec.ts'
-import { parseWav } from './audio.ts'
+import { ensureEvenPcm, parseWav } from './audio.ts'
 import { applyPersonalTerms, cleanFillers, fixTerms } from '../client/pocket/orb/asr-terms.ts'
 import { loadAssistantConfig } from '../assistant-config.ts'
 import { cardsFromState, groupCardProjects, groupProjects, groupWorkspaceProjects, humanTitle, projectCardsSignature, projectNameOf, type ProjectReply, type TihuCardRow, type TihuWorkspaceRow } from './project-groups.ts'
@@ -335,20 +336,12 @@ const tihuRuntimeEnv = (globalThis as any).process?.env ?? {} as Record<string, 
 
 /**
  * 鹈鹕端默认云音色：`TIHU_EDGE_VOICE`（临时覆盖，最高优先）→ 本机配置
- * `tihu.voice.edge` → 云健（历史默认值，与 2026-11-10 之前完全一致）。
+ * `tihu.voice.edge` → **晓晓**（2026-11-11 起的默认值，原来是云健）。
  *
- * 只认清单里的云端音色：本地 Kokoro（zf_/zm_/数字）即使被手写进配置文件也当没配——
- * 设置项语义是「默认云音色」，不是「默认引擎」。
+ * 真正的解析在 `edge-voice.ts`（带 `来源=config|default` 的日志要同一个答案）；
+ * 这里保留同名导出，测试与旧调用不用改 import 路径。
  */
-export function tihuEdgeVoiceDefault(): string {
-  const env = String(tihuRuntimeEnv.TIHU_EDGE_VOICE ?? '').trim()
-  if (env !== '') return env
-  try {
-    const configured = String((loadAssistantConfig().tihu as any)?.voice?.edge ?? '').trim()
-    if (isTihuCloudVoice(configured)) return configured
-  } catch { /* 读盘失败按「没配置」处理 */ }
-  return TIHU_CLOUD_VOICE_DEFAULT
-}
+export { tihuEdgeVoiceDefault }
 
 /* ---------- 电脑端（DSH 主 GUI）会话 → 屏幕上的「外部任务」（2026-11-09） ----------
  *
@@ -506,6 +499,12 @@ interface TihuDevice {
   voice: string
   /** edge-tts 兜底音色（在线兜底）。 */
   edgeVoice: string
+  /**
+   * 这个音色从哪来：`env` / `config` / `default` / `device`。
+   * 只用于两件事：① 日志 `tihu tts: ... 来源=...`；② 决定要不要接受设备页上行音色
+   * （config/env 指定时，设备页的旧 localStorage 不许把它压掉）。
+   */
+  edgeVoiceSource: TihuEdgeVoiceSource
   /** 仅离线：禁用 edge-tts。 */
   offlineOnly: boolean
   /** 绑定代际：手动操作使所有旧自动绑定失效；自动操作另有独立代际供超时失效。 */
@@ -1180,7 +1179,13 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const replySessions = new Set<string>()
   /** 本地 TTS sidecar（独立进程；Kokoro 主引擎，缺模型/依赖时 available=false，页面走系统语音）。 */
   const tts = options.tts?.instance ?? new TihuTts({
-    log,
+    // 音色那行要能事后 grep 到：只看 DSH 主进程 stdout 等于没留证据，所以 `tihu tts:` 另落 lane.log。
+    log: (line) => {
+      log(line)
+      if (line.startsWith('tihu tts:')) {
+        try { appendTihuLaneNote('tihu-tts', line) } catch { /* 日志失败不影响合成 */ }
+      }
+    },
     workspaceOf: options.workspaceOf,
     ...(options.tts?.threads === undefined ? {} : { threads: options.tts.threads }),
     ...(options.tts?.disabled === true ? { disabled: true } : {}),
@@ -1194,6 +1199,26 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
    */
   if (options.tts?.prewarm === true && options.tts?.disabled !== true && tts.backend() !== 'none') {
     void tts.ensureServer().catch((error) => log(`tihu tts prewarm failed: ${(error as Error)?.message ?? String(error)}`))
+  }
+
+  /** 每台设备最后一条音色日志（同一行不反复刷）。 */
+  const lastVoiceLine = new Map<string, string>()
+  /**
+   * 落一条「现在到底用什么引擎/什么音色/从哪来」：设备连上、切音色、开仅离线时都调。
+   * 行格式固定为 `tihu tts: 引擎=edge 音色=zh-CN-XiaoxiaoNeural 来源=config|default`，
+   * 同时写 lane.log（`note=tihu-tts`），事后能直接 grep 到，不靠 DSH 主进程 stdout。
+   */
+  function logTihuVoice(device: TihuDevice): void {
+    const engine = tts.engineFor(device.voice, device.offlineOnly)
+    const line = edgeVoiceLogLine(engine, device.edgeVoice, device.edgeVoiceSource)
+    if (lastVoiceLine.get(device.id) === line) return
+    lastVoiceLine.set(device.id, line)
+    log(line)
+    try { appendTihuLaneNote('tihu-tts', line) } catch { /* 日志失败不影响合成 */ }
+  }
+  /** 设备断开时清掉去重记录（下次连上要重新落一行）。 */
+  function forgetTihuVoice(device: TihuDevice): void {
+    lastVoiceLine.delete(device.id)
   }
 
   /** 发一条下行给「绑定到某会话」的所有设备。 */
@@ -2910,6 +2935,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       connectedAt: Date.now(),
       voice: 'default',
       edgeVoice: tihuEdgeVoiceDefault(),
+      edgeVoiceSource: tihuEdgeVoiceResolution().source,
       offlineOnly: process.env.TIHU_OFFLINE_ONLY === '1',
       send(type: string, payload: unknown) {
         try {
@@ -2999,6 +3025,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     socket.on('close', () => {
       invalidateVoiceInput(device)
       rememberRecentDevice(device)
+      forgetTihuVoice(device)
       devices.delete(device)
       // 断开的设备不再有屏：把还挂着的这一轮朗读掐掉，别继续烧合成额度。
       try { device.cancelRound?.() } catch { /* 忽略 */ }
@@ -3142,6 +3169,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         log('tihu unified mode unavailable: commander session could not be created')
       }
       device.send('event.progress', { stage: '连接', text: `设备 ${device.id} 已就绪` } satisfies ProgressPayload)
+      logTihuVoice(device)
       log(`tihu hello client=${payload.clientId} session=${device.sessionId ?? '?'} caps=${JSON.stringify(caps)}`)
       return
     }
@@ -3364,8 +3392,30 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     if (type === 'voice.select') {
       const name = String(message.payload?.name ?? '')
       device.voice = name === '' ? 'default' : name
-      if (typeof message.payload?.edgeVoice === 'string' && message.payload.edgeVoice !== '') device.edgeVoice = message.payload.edgeVoice
+      const requested = typeof message.payload?.edgeVoice === 'string' ? message.payload.edgeVoice.trim() : ''
+      if (requested !== '') {
+        const pinned = tihuEdgeVoiceResolution()
+        if (pinned.source === 'env' || pinned.source === 'config') {
+          // 配置/环境变量是权威：设备页 localStorage 里可能是上一次留下的云健，不许压掉它。
+          if (requested !== device.edgeVoice) {
+            const line = `tihu tts: 忽略设备页音色=${requested}（生效=${device.edgeVoice} 来源=${pinned.source}，配置优先）`
+            log(line)
+            try { appendTihuLaneNote('tihu-tts', line) } catch { /* 日志失败不影响 */ }
+          }
+        } else if (requested !== device.edgeVoice || device.edgeVoiceSource === 'default') {
+          // 没配置 = 设备页可以临时挑一个（单页排障用），日志里如实写「来源=device」。
+          device.edgeVoice = requested
+          device.edgeVoiceSource = 'device'
+        }
+      }
       if (typeof message.payload?.offlineOnly === 'boolean') device.offlineOnly = message.payload.offlineOnly
+      logTihuVoice(device)
+      if (device.offlineOnly) {
+        // 仅离线会绕过 edge（哪怕音色配置是晓晓）：必须留一行，否则「怎么不是晓晓」永远查不到。
+        const line = `tihu tts: 仅离线已开启，合成改走本地 Kokoro（配置音色=${device.edgeVoice} 本次不生效）`
+        log(line)
+        try { appendTihuLaneNote('tihu-tts', line) } catch { /* 日志失败不影响 */ }
+      }
       // 手切到 Kokoro 音色 / 勾了仅离线：这时才允许 spawn Kokoro sidecar（edge 主用不预热）。
       if (isKokoroVoice(device.voice) || device.offlineOnly) {
         if (typeof (tts as any).ensureKokoroServer === 'function') {
@@ -3405,6 +3455,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           voice: device.voice,
           sessionId: device.sessionId,
           edgeVoice: device.edgeVoice,
+          edgeVoiceSource: device.edgeVoiceSource,
           offlineOnly: device.offlineOnly,
           onChunk: (chunk) => {
             device.send('tts.audio', {
@@ -5012,13 +5063,17 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     let spokenMs = 0
     const cacheable = segments.length === 1
     const sendPcm = (pcm: Buffer, segment: { text: string; index: number; start: number; end: number }, final = true): void => {
+      // 预录缓存可能来自旧版本/旧文件，长度不保证是偶数：出口再兜一次（半个采样=设备整条流错位）。
+      const even = ensureEvenPcm(pcm)
+      if (even.dropped) log(`tihu tts: 预录块长=${pcm.length}（奇数），已对齐丢 1 字节`)
+      if (even.data.length === 0) return
       device.send('tts.audio', {
         seq: 0,
         total: 1,
         sampleRate: 24000,
         channels: 1,
         format: 'pcm16',
-        data: pcm.toString('base64'),
+        data: even.data.toString('base64'),
         index: segment.index,
         text: segment.text,
         charStart: segment.start,
@@ -5052,6 +5107,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           voice: device.voice,
           sessionId: key,
           edgeVoice: device.edgeVoice,
+          edgeVoiceSource: device.edgeVoiceSource,
           offlineOnly: device.offlineOnly,
           onChunk: (chunk) => {
             if (stale()) return
@@ -5210,6 +5266,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         voice: device.voice,
         sessionId: key,
         edgeVoice: device.edgeVoice,
+        edgeVoiceSource: device.edgeVoiceSource,
         offlineOnly: device.offlineOnly,
         // 完成页朗读不在这里直接下发：先攒齐这一段的 PCM，再按行切开按序发（行边界＝区间边界）。
         onChunk: (chunk) => { if (!stale()) parts.push(chunk.data) },
@@ -5230,6 +5287,17 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       const found = plan.findIndex((segment) => segment.lastLine >= fromLine)
       return found < 0 ? 0 : found
     })()
+    // 下发节流（2026-11-11 实机）：完成页正文是「合成好一段就整段发」，7 行正文能在
+    // 7.5 秒内推完 14 秒音频，设备 32/64 KB 播放缓冲（≈0.7/1.4 s）必被塞爆 →
+    // 固件只能丢弃整块（听到跳字）或欠载。这里按真实播放速度放行，最多领先 800 ms。
+    const paceStart = Date.now()
+    const PACING_LEAD_MS = 800
+    const pace = async (): Promise<void> => {
+      const ahead = spokenMs - (Date.now() - paceStart)
+      if (ahead > PACING_LEAD_MS) {
+        await new Promise<void>((resolve) => setTimeout(resolve, Math.min(2_000, Math.round(ahead - PACING_LEAD_MS))))
+      }
+    }
     for (let index = startIndex; index < plan.length; index += 1) {
       // 唯一的中途出口：被「停止 / 重读 / 回主页 / P0」抢走（号变了就停手），循环本身不 break。
       if (stale()) return spokenMs
@@ -5257,6 +5325,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             read: 'done',
             ...(lastLine && seq === blocks.length - 1 ? { final: true } : {}),
           } satisfies TtsAudioPayload)
+          await pace()
+          if (stale()) return spokenMs
         }
       }
     }
@@ -7991,6 +8061,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         const ack = await awaitDeviceAck(device, 'device.config', { key: 'voice', value })
         // 真正生效在宿主合成侧（下一条播报就用新音色）；页面只更新下拉显示。
         device.edgeVoice = value
+        device.edgeVoiceSource = 'device'
+        logTihuVoice(device)
         return ack === undefined
           ? { text: `音色已切到 ${tihuCloudVoiceShortName(value)}（${value}）`, deviceId: device.id }
           : { text: `音色已切到 ${tihuCloudVoiceShortName(value)}（${value}）`, deviceId: device.id, acked: true, echo: ackEcho(ack) }

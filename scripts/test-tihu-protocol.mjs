@@ -1697,7 +1697,7 @@ test('Kokoro 不默认自启：edge 主用时 backend=none、ensureServer 不 sp
     instance.edgeReady = () => true
     assert.equal(instance.backend(), 'none', 'edge 主用没有常驻 sidecar')
     assert.equal(instance.localPrimary(), false, 'edge 主用不按本地单路串行（最多 3 路）')
-    assert.equal(instance.status().model, 'edge-tts 云健(Yunjian)')
+    assert.equal(instance.status().model, 'edge-tts 晓晓(zh-CN-XiaoxiaoNeural)', '状态屏要显示真正生效的默认音色（晓晓）')
     assert.equal(instance.engineFor(), 'edge')
     assert.equal(instance.engineFor('zf_060'), 'kokoro', '屏上手选 Kokoro 音色 = 手动切 Kokoro')
     assert.equal(instance.engineFor('default', true), 'kokoro', '仅离线开关 = 离线兜底')

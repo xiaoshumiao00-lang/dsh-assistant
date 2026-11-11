@@ -10,7 +10,23 @@ import os
 import sys
 
 
+def _force_threaded_resolver() -> None:
+    """把 aiohttp 的 DNS 解析器换成线程版（系统 getaddrinfo）。
+
+    2026-11-11 实机根因（不是音色配置）：本机 venv 里装了 aiodns，aiohttp 默认用
+    AsyncResolver，而 pycares 在这台机器上起不来 DNS —— edge-tts 每次都 exit 3
+    （ClientConnectorDNSError: Could not contact DNS servers），宿主于是判定 edge 失败、
+    回落到本地 Kokoro，用户听到的自然不是微软晓晓。线程解析器走系统 getaddrinfo
+    （与浏览器/Invoke-WebRequest 同一条路），实测同一句能正常合成出 PCM。
+    """
+    import aiohttp.connector
+    import aiohttp.resolver
+
+    aiohttp.connector.DefaultResolver = aiohttp.resolver.ThreadedResolver
+
+
 async def run(text: str, voice: str, rate: str, timeout: float, proxy: str | None) -> None:
+    _force_threaded_resolver()
     import edge_tts
 
     version = str(getattr(edge_tts, "__version__", "0"))

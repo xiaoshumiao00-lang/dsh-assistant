@@ -398,12 +398,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     <select id="edgeVoiceSelect" style="flex:1">
       <option value="zh-CN-YunjianNeural">兜底音色：云健 Yunjian</option>
       <option value="zh-CN-YunxiNeural">兜底音色：云希 Yunxi</option>
-      <option value="zh-CN-XiaoxiaoNeural">兜底音色：晓晓 Xiaoxiao</option>
+      <option value="zh-CN-XiaoxiaoNeural">兜底音色：晓晓 Xiaoxiao（默认）</option>
       <option value="zh-CN-YunyangNeural">兜底音色：云扬 Yunyang</option>
     </select>
   </div>
   <label class="hint" style="display:flex;align-items:center;gap:6px;margin-top:8px">
-    <input id="offlineOnly" type="checkbox" style="width:auto" /> 仅离线（跳过 edge 云健，改用本地 Kokoro 兜底）
+    <input id="offlineOnly" type="checkbox" style="width:auto" /> 仅离线（跳过 edge 云音色，改用本地 Kokoro 兜底）
   </label>
   <input id="voiceNote" placeholder="备注（可选）" style="margin-top:8px" />
   <div class="hint" id="voiceHint">仅可用于你本人或已获授权的音色；参考音频只在本机处理，不上传云端。</div>
