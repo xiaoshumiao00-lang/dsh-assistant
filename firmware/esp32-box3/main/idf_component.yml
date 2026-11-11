@@ -1,0 +1,10 @@
+## 只声明 BSP；屏幕、触摸、codec、LVGL port 都由 BSP 的依赖带入。
+## BSP 3.x 要求 ESP-IDF >= 5.3；5.2 请改用 BSP 2.x 并自行处理 LVGL 8/9 差异。
+##
+## espressif/i2c_bus 必须钉住：BSP 3.1.0 的 manifest 允许 ^1.x，组件管理器会解析到
+## 1.5.2，而 1.5.2 用了 i2c_master_get_bus_handle（IDF 5.4+ 才有的 API），在 v5.3 下
+## 编译报 "implicit declaration of function 'i2c_master_get_bus_handle'"。
+dependencies:
+  espressif/esp-box-3: "^3.1.0"
+  espressif/esp_websocket_client: "^1.2.0"
+  espressif/i2c_bus: "~1.4.0"
