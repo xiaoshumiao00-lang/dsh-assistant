@@ -59,3 +59,16 @@ CONFIG_I2C_BUS_BACKWARD_CONFIG=y
 
 # LV_FONT_FMT_TXT_LARGE: 7563 glyphs x 1.3 MB bitmap -> bitmap_index exceeds 16 bit.
 CONFIG_LV_FONT_FMT_TXT_LARGE=y
+
+# ---- 配网页 HTTP 服务：请求头长度上限 ----
+# 2026-11-11 真机「浏览器报 header fields are too long」的根因：
+# esp_http_server 默认 CONFIG_HTTPD_MAX_REQ_HDR_LEN=512，请求头段塞不进这个 scratch
+# 缓冲就直接回 431 Request Header Fields Too Large，正文正好是
+# "Header fields are too long"。安卓 Chrome/WebView 一次普通导航的请求头
+# （UA + Accept + Accept-Encoding + Accept-Language + Sec-Fetch-*）约 550–900 B，
+# 必然超 512 —— 于是手机永远打不开配网页，PC 上用短头的探测请求却没事。
+# 1536 B 对安卓 Chrome/微信 WebView 都够；同时把 URI 上限降到 256 B，
+# 让每个请求对象（httpd_req_t 内嵌 scratch + uri）别涨太多：~1.9 KB/个，
+# 配网页最多 2 个并发连接，内部 RAM 撑得住。
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1536
+CONFIG_HTTPD_MAX_URI_LEN=256
