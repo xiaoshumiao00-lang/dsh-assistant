@@ -1,0 +1,10 @@
+﻿# Android 构建中间产物（每台机器现生成；交付件在 dist/）
+out/
+*.log
+
+# 第三方大文件不入库（AAR / .so / 模型），下载命令见 README
+third_party/**/extracted/
+third_party/**/*.aar
+third_party/**/*.so
+third_party/**/*.onnx
+third_party/**/*.bin

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">个人助手</string>
+    <string name="shortcut_settings">设置地址</string>
+    <string name="shortcut_settings_long">修改电脑地址</string>
+</resources>

@@ -13,7 +13,6 @@
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
-
 #include "lwip/sockets.h"
 #include "netdb.h"
 
@@ -31,12 +30,27 @@
 #include "freertos/task.h"
 #include "tihu_audio.h"
 #include "tihu_discover.h"
+#include "tihu_ota.h"
 #include "tihu_protocol.h"
 #include "tihu_provision.h"
 #include "tihu_wifi.h"
 #include "ui.h"
 
 static const char *TAG = "tihu_net";
+
+/**
+ * 诊断宏：置 1 才打「逐分片」的下行日志（payload_offset/payload_len 一行一条分片）。
+ * websocket_task 栈很紧张，默认关掉；只在抓分片/重组问题时临时改成 1。
+ */
+#ifndef TIHU_WS_DEBUG
+#define TIHU_WS_DEBUG 0
+#endif
+
+/**
+ * 用户明确点名「板子不许再连」的网络（2026-11-12）：开机从 NVS 删一次，之后绝不写回。
+ * config.h 的种子 SSID 也已置空，双保险。
+ */
+#define TIHU_WIFI_BANNED_SSID "HBEU-Student"
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
@@ -45,6 +59,7 @@ static const char *TAG = "tihu_net";
 static EventGroupHandle_t s_wifi_events;
 static esp_websocket_client_handle_t s_ws;
 static bool s_ws_started;
+static int s_ws_task_stack;          /* 实际给 websocket_task 的栈（启动时按内部堆挑） */
 static bool s_connected;
 static char s_uri[320];
 static char s_client_id[64];
@@ -60,6 +75,7 @@ static volatile bool s_wifi_up;         /* 当前这次连接已拿到 IP */
 static volatile bool s_host_known;      /* 宿主地址已确定（发现或回退） */
 static int s_host_port = TIHU_PORT;
 static bool s_host_tls;                 /* 公网模式且 wss:// 时为 true */
+static bool s_host_public;              /* 当前宿主来自公网入口（NVS host_mode=public） */
 static char s_host_ip[TIHU_PUBLIC_HOST_MAX];
 static char s_host_token[80];
 static char s_wifi_ip[20];
@@ -101,24 +117,66 @@ static void net_probe_task(void *arg);
 
 /* ------------------------------ 发送 ------------------------------ */
 
-static bool send_json(char *json)
+static bool send_json_ticks(char *json, TickType_t ticks)
 {
     if (json == NULL) {
+        ESP_LOGW(TAG, "WS 上行组包失败（返回 NULL，多半是内存不足）——没有发送");
         return false;
     }
     if (!s_connected || s_ws == NULL) {
+        ESP_LOGW(TAG, "WS 上行没发：WebSocket 未连接（字节=%d）", (int)strlen(json));
         tihu_free_message(json);
         return false;
     }
     int want = (int)strlen(json);
-    int sent = esp_websocket_client_send_text(s_ws, json, want,
-                                              pdMS_TO_TICKS(10000));
+    /* 上行日志带上 type，串口里能直接看出是哪一条（hello / ping / ack / screen.gesture…）。 */
+    char typebuf[28] = "?";
+    const char *tp = strstr(json, "\"type\":\"");
+    if (tp != NULL) {
+        tp += 8;
+        const char *te = strchr(tp, '"');
+        size_t n = te != NULL ? (size_t)(te - tp) : 0;
+        if (n > 0 && n < sizeof(typebuf)) {
+            memcpy(typebuf, tp, n);
+            typebuf[n] = '\0';
+        }
+    }
+    int sent = esp_websocket_client_send_text(s_ws, json, want, ticks);
     bool ok = sent == want;
+    ESP_LOGI(TAG, "WS 上行 type=%s 字节=%d 发送返回=%d → %s", typebuf, want, sent,
+             ok ? "已写入" : "不完整");
     if (!ok) {
         ESP_LOGW(TAG, "WS 发送不完整 (%d/%d)，下一次心跳会触发重连", sent, want);
     }
     tihu_free_message(json);
     return ok;
+}
+
+static bool send_json(char *json)
+{
+    /* 常规上行：允许等 10 s（一条 base64 WAV 有 400 KB 级，慢链路要时间）。 */
+    return send_json_ticks(json, pdMS_TO_TICKS(10000));
+}
+
+bool tihu_net_send_alert(const char *level, const char *text)
+{
+    /*
+     * 0.3.9 诊断旁路：按键回调（跑在 esp_timer 任务里）发一条 event.alert 自证。
+     *
+     * 为什么单独给 300 ms 上限：这条消息只用来「让宿主日志里出现一行」，
+     * 没有任何功能语义；而 esp_timer 任务是全系统的定时器心脏（iot_button 每 5 ms
+     * 在这里轮询按键、WS 心跳/录音收尾定时器也在这里），为了一条诊断消息把它
+     * 卡上 10 秒，换来的是按键彻底失灵——正好是这次要避免的症状。
+     */
+    if (text == NULL || text[0] == '\0') {
+        return false;
+    }
+    if (!s_connected || s_ws == NULL) {
+        ESP_LOGW(TAG, "事件只打日志（WS 未连接）：level=%s text=%s",
+                 level != NULL ? level : "info", text);
+        return false;
+    }
+    return send_json_ticks(tihu_build_alert(level, text), pdMS_TO_TICKS(300));
 }
 bool tihu_net_connected(void)
 {
@@ -187,7 +245,12 @@ void tihu_net_send_playback_state(const char *phase, const char *task_id,
 static void show_text_screen(const char *stage, const char *title,
                              const char *line, const char *tone)
 {
-    tihu_screen_frame_t frame = {0};
+    /*
+     * 静态：tihu_screen_frame_t 带 done.lines[16] ≈5 KB，压在 websocket 任务（8 KB 栈）上会爆栈。
+     * 本函数只在 WS 任务里调，单实例足够。
+     */
+    static tihu_screen_frame_t frame;
+    memset(&frame, 0, sizeof(frame));
     snprintf(frame.stage, sizeof(frame.stage), "%s", stage != NULL ? stage : "");
     snprintf(frame.title, sizeof(frame.title), "%s", title != NULL ? title : "");
     if (line != NULL && line[0] != '\0') {
@@ -290,7 +353,14 @@ static void handle_voice_listen(const tihu_voice_listen_t *listen)
     if (listen->on) {
         /* 先停声再开麦：避免 24k 播放和 16k 录音抢同一个 I2S。 */
         tihu_audio_stop();
-        tihu_audio_mic_start();
+        if (!tihu_audio_mic_start()) {
+            /* 0.3.9：宿主让开麦但麦克风没就绪——屏上必须说清楚，并回一条不成功回执。 */
+            ESP_LOGW(TAG, "voice.listen：麦克风未就绪，无法进入在听");
+            tihu_ui_set_listening(true, "麦克风未就绪");
+            tihu_net_send_alert("warn", "麦克风未就绪");
+            tihu_net_send_ack(listen->op_id, false, "mic_not_ready", tihu_ui_stage_name(), -1);
+            return;
+        }
         tihu_ui_set_listening(true, listen->prompt[0] != '\0' ? listen->prompt : "在听 · 请说话");
         int timeout_ms = listen->timeout_ms;
         if (timeout_ms < 3000) {
@@ -341,7 +411,15 @@ static void handle_downstream(const tihu_downstream_t *msg)
         break;
     case TIHU_DOWN_TTS_AUDIO:
         if (msg->u.tts.pcm != NULL && msg->u.tts.pcm_len > 0) {
-            if (msg->u.tts.seq == 0) {
+            /*
+             * karaoke 进度只在「一整段朗读真的重新开始」时清零：
+             * 宿主是「一行一段」，每行第一块都是 seq=0；旧代码见 seq==0 就 reset_stats()，
+             * 等于每 0.6 s 把 pushed/written 打回 0，比例永远在 0–100% 之间来回摆
+             * （实机日志 6/7→5/7→6/7，高亮完全不跟声音）。现在要求 seq==0 **且** 段号
+             * index==0 **且** 播放已排空，才算新一轮。
+             */
+            if (!msg->u.tts.sample && msg->u.tts.seq == 0 && msg->u.tts.index == 0 &&
+                tihu_audio_progress_idle()) {
                 tihu_audio_reset_stats();
             }
             /* 每块长度必须上串口：奇数块/超长块是「滋滋」的第一手证据。 */
@@ -349,16 +427,22 @@ static void handle_downstream(const tihu_downstream_t *msg)
                      msg->u.tts.seq, (unsigned)msg->u.tts.pcm_len,
                      (unsigned)(msg->u.tts.pcm_len / 2), msg->u.tts.index,
                      msg->u.tts.sample ? 1 : 0, msg->u.tts.final ? 1 : 0);
+            /* 每行首块（seq==0）在 push 之前记下这一行的起始字节偏移：karaoke 按它查行号。 */
+            if (!msg->u.tts.sample && msg->u.tts.seq == 0) {
+                tihu_audio_note_line(msg->u.tts.index);
+            }
             tihu_audio_push_pcm(msg->u.tts.pcm, msg->u.tts.pcm_len);
             if (msg->u.tts.seq == 0) {
                 tihu_net_send_playback_state("playing", NULL,
                                              msg->u.tts.index + 1, -1, 0, -1);
             }
             if (msg->u.tts.final) {
-                uint32_t chunks = 0, odd = 0, underruns = 0;
-                tihu_audio_stats(&chunks, &odd, &underruns);
-                ESP_LOGI(TAG, "本次播放统计：块=%u 奇数块=%u 欠载=%u（欠载>0 就会听到嗡/滋滋）",
-                         (unsigned)chunks, (unsigned)odd, (unsigned)underruns);
+                /*
+                 * 播放质量汇总不在这里打：此刻音频还在缓冲里播（最多 5 秒），欠载数会偏小。
+                 * 只标一个 final，由 audio_task 在真正排空时打
+                 * 「播放统计：欠载=N 最大空档=xxms 峰值缓冲=xxKB」。
+                 */
+                tihu_audio_mark_final();
                 arm_audio_idle(msg->u.tts.pcm_len);
             }
         }
@@ -400,11 +484,71 @@ static void handle_downstream(const tihu_downstream_t *msg)
     }
 }
 
+/** 从 JSON 里抠一个字符串字段（只用于 device.ota 这种小指令，够用就好）。 */
+static void json_field_str(const char *json, const char *key, char *out, size_t cap)
+{
+    out[0] = '\0';
+    char pat[24];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (p == NULL) {
+        return;
+    }
+    const char *colon = strchr(p + strlen(pat), ':');
+    const char *q1 = colon != NULL ? strchr(colon, '"') : NULL;
+    if (q1 == NULL) {
+        return;
+    }
+    const char *q2 = strchr(q1 + 1, '"');
+    if (q2 == NULL) {
+        return;
+    }
+    size_t n = (size_t)(q2 - q1 - 1);
+    if (n >= cap) {
+        n = cap - 1;
+    }
+    memcpy(out, q1 + 1, n);
+    out[n] = '\0';
+}
+
+/**
+ * 下行 device.ota：宿主要求「立即检查 / 立即升级」。
+ * payload 里 url/version 都可选；url 支持相对路径（/tihu/ota/manifest）或绝对地址。
+ */
+static void handle_device_ota(const char *data, size_t len)
+{
+    char buf[512];
+    size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+    if (data != NULL) {
+        memcpy(buf, data, n);
+    }
+    buf[n] = '\0';
+    char url[160];
+    char ver[40];
+    json_field_str(buf, "url", url, sizeof(url));
+    json_field_str(buf, "version", ver, sizeof(ver));
+    ESP_LOGW(TAG, "收到 device.ota：立即检查 OTA（目标版本=%s，清单=%s）",
+             ver[0] != '\0' ? ver : "(由清单决定)", url[0] != '\0' ? url : "(默认 /tihu/ota/manifest)");
+    tihu_ota_trigger("ws device.ota", url);
+}
+
 static void handle_text(const char *data, size_t len)
 {
-    tihu_downstream_t msg;
+    /*
+     * 为什么是 static：tihu_downstream_t 有 screen.bullets[4][160] 这些，≈1.2 KB。
+     * 放在 websocket_task 栈上（原来 4 KB）第一帧下行就能把栈压爆——2026-11-12 实测。
+     * 这个函数只由 websocket_task 调用（单线程），静态缓冲安全。
+     */
+    static tihu_downstream_t msg;
     if (!tihu_parse_downstream(data, len, &msg)) {
         ESP_LOGW(TAG, "坏帧或非 v0 信封，已忽略 (%u 字节)", (unsigned)len);
+        return;
+    }
+    /* 每帧一行、只拼两个短参数（诊断期要求：收到任何下行都看得见，但别再给 WS 栈加压）。 */
+    ESP_LOGI(TAG, "下行帧 type=%s %uB", msg.type_name, (unsigned)len);
+    if (strcmp(msg.type_name, "device.ota") == 0) {
+        handle_device_ota(data, len);
+        tihu_downstream_free(&msg);
         return;
     }
     handle_downstream(&msg);
@@ -444,11 +588,17 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
         s_connected = true;
         s_last_rx_ms = tihu_protocol_now_ms();
         s_rx_len = 0;
-        ESP_LOGI(TAG, "WebSocket 已连接（握手成功）：%s（TLS=%s）", s_uri,
+        ESP_LOGI(TAG, "WebSocket 已连接（HTTP 101 升级成功，握手完成）：%s（TLS=%s）", s_uri,
                  s_host_tls ? "开，未校验证书（仅测试）" : "关");
         tihu_ui_set_connection(true, "已连接");
-        bool hello_ok = send_json(tihu_build_hello(s_client_id, TIHU_DEVICE_NAME));
-        ESP_LOGI(TAG, "hello 已发：clientId=%s（%s）", s_client_id, hello_ok ? "成功" : "失败");
+        /* hello 诊断：先量字节再发（send_json 内部会 free 这包，之后不能再看它的指针）。 */
+        char *hello = tihu_build_hello(s_client_id, TIHU_DEVICE_NAME);
+        int hello_bytes = hello != NULL ? (int)strlen(hello) : 0;
+        ESP_LOGI(TAG, "CONNECTED 事件里已调用 send_json(hello)：clientId=%s 组包%s 字节=%d",
+                 s_client_id, hello != NULL ? "成功" : "失败（返回 NULL，多半内存不足）", hello_bytes);
+        bool hello_ok = send_json(hello);
+        ESP_LOGI(TAG, "hello 发送结果：%s（字节=%d；上行日志行含 esp_websocket_client_send_text 的返回值）",
+                 hello_ok ? "成功" : "失败", hello_bytes);
         /* 协议 §6.3：重连先报 idle，宿主丢掉上一轮“朗读中”的假设。 */
         tihu_net_send_playback_state("idle", NULL, 0, -1, 0, -1);
 #if TIHU_AUDIO_SELFTEST
@@ -483,12 +633,20 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
             break;
         }
         s_last_rx_ms = tihu_protocol_now_ms();
+        /* 诊断版：非文本帧也要看得见（宿主发二进制/ping/关闭帧时不要闷在肚子里）。 */
+        if (data->op_code != 0x1) {
+            ESP_LOGI(TAG, "下行非文本 op=0x%02x len=%d", (unsigned)data->op_code, data->data_len);
+        }
         if (data->op_code == 0x9) {
             break;  /* 底层 ping 由 esp_websocket_client 自己回 pong */
         }
         if (data->op_code != 0x1) {
             break;
         }
+#if TIHU_WS_DEBUG
+        ESP_LOGI(TAG, "下行分片 off=%d len=%d total=%d", (int)data->payload_offset,
+                 data->data_len, (int)data->payload_len);
+#endif
         /* 分片重组：payload_offset==0 表示新的一条消息。 */
         if (!rx_buf_ensure()) {
             break;
@@ -649,9 +807,30 @@ static void net_probe_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/**
+ * 按当前内部堆挑 websocket_task 的栈：8 KB 优先，拿不出连续块就退 6144，再不行回 4096。
+ *
+ * 为什么不再固定 4 KB：2026-11-12 实机第一次收到下行（session.bound）就
+ * `***ERROR*** A stack overflow in task websocket_task`，4 KB 顶不住「解析 + 打日志」。
+ * 32 KB 重组缓冲挪到 PSRAM 之后，内部最大块回到 30 KB 量级，8 KB 栈可以分配了。
+ * 阈值留 2 KB 余量：任务控制块 + esp_websocket_client 启动时自己的 malloc 也要内部 RAM。
+ */
+static int ws_task_stack_pick(void)
+{
+    static const int cand[] = {8192, 6144};
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    for (size_t i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
+        if (largest >= (size_t)cand[i] + 2048u) {
+            return cand[i];
+        }
+    }
+    return 4096;
+}
+
 static void start_ws(void)
 {
     if (s_ws == NULL) {
+        s_ws_task_stack = ws_task_stack_pick();
         esp_websocket_client_config_t cfg = {
             .uri = s_uri,
             .reconnect_timeout_ms = 3000,
@@ -664,13 +843,15 @@ static void start_ws(void)
             .buffer_size = 2048,
             .disable_auto_reconnect = false,
             /*
-             * 任务栈：BSP/组件默认 4 KB，之前提到 8 KB 反而建不出来——
-             * CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384 把 ≤16 KB 的分配钉死在内部 RAM，
-             * 8 KB 栈根本轮不到 PSRAM，而内部只剩 19 KB 且没有 8 KB 连续块。
-             * 现在 32 KB 重组缓冲已挪 PSRAM，先按 4 KB 走；不够再 5 KB。
+             * 任务栈：原来 4 KB（当初内部堆没有 8 KB 连续块，8 KB 根本建不出来），
+             * 结果第一帧下行就爆栈。现在按内部堆动态挑（见 ws_task_stack_pick）。
              */
-            .task_stack = 4096,
+            .task_stack = s_ws_task_stack,
         };
+        ESP_LOGW(TAG, "WS 任务栈：%d B（候选 8192/6144/4096，内部堆 %u B，内部最大块 %u B）",
+                 s_ws_task_stack,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         if (s_host_tls) {
             /* 测试阶段只求连通：不装 CA、不比对证书 CN（走公网时链路上仍是 TLS 加密）。
              * 正式发布前应改成 crt_bundle_attach = esp_crt_bundle_attach。 */
@@ -678,7 +859,9 @@ static void start_ws(void)
         }
         s_ws = esp_websocket_client_init(&cfg);
         if (s_ws == NULL) {
-            ESP_LOGE(TAG, "esp_websocket_client_init 失败");
+            ESP_LOGE(TAG, "esp_websocket_client_init 失败（栈 %d B，内部最大块 %u B）",
+                     s_ws_task_stack,
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
             log_ws_mem("init 失败");
             return;
         }
@@ -688,8 +871,9 @@ static void start_ws(void)
         log_ws_mem("start 前");
         esp_err_t err = esp_websocket_client_start(s_ws);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "WebSocket 启动失败: %s（栈 4096 B 需要一块连续内部 RAM）",
-                     esp_err_to_name(err));
+            ESP_LOGE(TAG, "WebSocket 启动失败: %s（栈 %d B 需要一块连续内部 RAM；内部最大块 %u B）",
+                     esp_err_to_name(err), s_ws_task_stack,
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
             log_ws_mem("start 失败");
             if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 12288) {
                 ESP_LOGE(TAG, "内部最大块 < 12 KB：xTaskCreate 必失败。需要继续往 PSRAM 挪缓冲，"
@@ -698,8 +882,8 @@ static void start_ws(void)
             return;
         }
         s_ws_started = true;
-        ESP_LOGI(TAG, "WebSocket 启动：%s（TLS=%s，栈 4096 B / 缓冲 2048 B）", s_uri,
-                 s_host_tls ? "开，未校验证书（仅测试）" : "关");
+        ESP_LOGI(TAG, "WebSocket 启动：%s（TLS=%s，栈 %d B / 缓冲 2048 B）", s_uri,
+                 s_host_tls ? "开，未校验证书（仅测试）" : "关", s_ws_task_stack);
         log_ws_mem("启动后");
     }
 }
@@ -806,10 +990,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t event_i
 }
 
 /**
- * 试一组凭据：写 STA 配置 → connect → 等 GOT_IP（最多 TIHU_WIFI_TRY_TIMEOUT_MS）。
+ * 试一组凭据（单次）：写 STA 配置 → connect → 等 GOT_IP（最多 TIHU_WIFI_TRY_TIMEOUT_MS）。
  * 失败会主动 disconnect，让下一组候选干净地开始。
  */
-static bool try_connect(const tihu_wifi_cred_t *cred, int rssi, uint8_t authmode)
+static bool try_connect_once(const tihu_wifi_cred_t *cred, int rssi, uint8_t authmode)
 {
     ESP_LOGI(TAG, "  正在试：ssid=\"%s\" rssi=%d auth=%s", cred->ssid, rssi,
              tihu_wifi_auth_name(authmode));
@@ -864,6 +1048,26 @@ static bool try_connect(const tihu_wifi_cred_t *cred, int rssi, uint8_t authmode
     return false;
 }
 
+/**
+ * 试一组凭据（带重试）：reason=2「认证超时」这类多半是热点瞬时状态（手机热点刚开机、
+ * 睡眠唤醒、STA 表还没准备好），同一条凭据紧跟着再试 1–2 次往往就过了。
+ * 每次仍是独立的 TIHU_WIFI_TRY_TIMEOUT_MS；成功立刻返回。
+ */
+static bool try_connect(const tihu_wifi_cred_t *cred, int rssi, uint8_t authmode)
+{
+    for (int attempt = 1; attempt <= TIHU_WIFI_CONNECT_ATTEMPTS; attempt++) {
+        if (attempt > 1) {
+            ESP_LOGW(TAG, "  重试第 %d/%d 次：ssid=\"%s\"（上一次认证超时/关联失败后重来）",
+                     attempt - 1, TIHU_WIFI_CONNECT_ATTEMPTS - 1, cred->ssid);
+            vTaskDelay(pdMS_TO_TICKS(800));
+        }
+        if (try_connect_once(cred, rssi, authmode)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* ------------------------------ 找宿主（UDP 发现 → NVS → config.h） ------------------------------ */
 
 /** 按要求的那一行格式落日志：发现宿主 ip=... port=... 来源=udp|nvs；公网模式另打一条。 */
@@ -880,11 +1084,33 @@ static void log_host_source(const char *source)
 static bool resolve_host(void)
 {
     s_host_known = false;
+    s_host_public = false;
+
+#if TIHU_FORCE_HOST
+    /*
+     * -1) 编译期强制宿主：优先于 NVS 的 host_mode=public。
+     *     实机联调切「局域网直连本机」时不用进配网页清公网配置，也不碰 NVS 半字节。
+     *     完全不发 UDP 广播，也不去连公网入口（下面那些分支都不会执行）。
+     *     当前 TIHU_FORCE_HOST=0，这整段不参与编译，只作以后联调开关。
+     */
+    if (TIHU_HOST[0] != '\0') {
+        s_host_tls = false;   /* 强制模式一律走 ws:// 局域网，不继承 NVS 的 TLS 配置 */
+        snprintf(s_host_ip, sizeof(s_host_ip), "%s", TIHU_HOST);
+        s_host_port = TIHU_PORT;
+        snprintf(s_host_token, sizeof(s_host_token), "%s", TIHU_TOKEN);
+        s_host_known = true;
+        log_host_source("forced");
+        ESP_LOGW(TAG, "强制宿主模式：ws://%s:%d（忽略 NVS 公网配置）", TIHU_HOST, TIHU_PORT);
+        return true;
+    }
+    ESP_LOGW(TAG, "TIHU_FORCE_HOST=1 但 TIHU_HOST 为空：退回 UDP 发现");
+#endif
 
     /*
-     * 0) 公网模式优先：配网页里填了「公网地址」+ token 就以它为准，
+     * 0) 公网模式：配网页里填了「公网地址」+ token 就以它为准，
      *    完全不发 UDP 广播（避免同一个设备既被发现又走公网、宿主上出现两条 lane）。
      *    留空则 host_mode=lan，落回下面的局域网发现。
+     *    注意：TIHU_FORCE_HOST=1 时上面那一支已经先返回，不会走到这里。
      */
     tihu_public_cfg_t pub;
     tihu_wifi_public_get(&pub);
@@ -892,6 +1118,7 @@ static bool resolve_host(void)
         snprintf(s_host_ip, sizeof(s_host_ip), "%s", pub.host);
         s_host_port = pub.port > 0 ? pub.port : (pub.tls ? 443 : 80);
         s_host_tls = pub.tls;
+        s_host_public = true;   /* OTA 端口要跟着公网端口走（见 build_uri） */
         snprintf(s_host_token, sizeof(s_host_token), "%s", pub.token[0] != '\0' ? pub.token : TIHU_TOKEN);
         s_host_known = true;
         log_host_source("nvs/public");
@@ -918,18 +1145,6 @@ static bool resolve_host(void)
         return true;
     }
     s_host_tls = false;
-
-#if TIHU_FORCE_HOST
-    if (TIHU_HOST[0] != '\0') {
-        snprintf(s_host_ip, sizeof(s_host_ip), "%s", TIHU_HOST);
-        s_host_port = TIHU_PORT;
-        snprintf(s_host_token, sizeof(s_host_token), "%s", TIHU_TOKEN);
-        s_host_known = true;
-        log_host_source("forced");
-        return true;
-    }
-    ESP_LOGW(TAG, "TIHU_FORCE_HOST=1 但 TIHU_HOST 为空：退回 UDP 发现");
-#endif
 
     /* 1) 主路径：UDP 广播发现（不写死 IP）。 */
     char ip[64] = {0};
@@ -1026,9 +1241,38 @@ static void wifi_manager_task(void *arg)
             tihu_ui_set_connection(false, "配网热点");
             tihu_ui_show_alert("没有可用 Wi-Fi：手机连 Pelican-Setup 热点后打开 192.168.4.1 配网");
             tihu_provision_start();
-            /* 配网页保存后会 esp_restart()，这里只需要活着。 */
-            for (;;) {
-                vTaskDelay(pdMS_TO_TICKS(5000));
+            /*
+             * 配网待机：**不再原地躺平**。每 TIHU_PROVISION_RETRY_MS（25 s）重扫一次，
+             * 把 NVS 里记住的网络再试一遍 —— 手机热点（Mi9）重启后常见的 reason=2
+             * 认证超时往往过几十秒就自己好了，光等用户来配网等于把设备锁死。
+             * 配网页保存新网络仍会 esp_restart() 立即重连，不受这个循环影响。
+             */
+            for (int round = 1;; round++) {
+                vTaskDelay(pdMS_TO_TICKS(TIHU_PROVISION_RETRY_MS));
+                int ac = tihu_wifi_scan(aps, 32);
+                int cc = tihu_wifi_candidates(aps, ac, cand, TIHU_WIFI_MAX_NETWORKS,
+                                              rssi, is_last);
+                ESP_LOGW(TAG, "配网待机重试第 %d 次：已记住 %d 个网络，候选 %d 个（可见 AP %d 个）",
+                         round, saved_count, cc, ac);
+                bool got = false;
+                for (int i = 0; i < cc; i++) {
+                    ESP_LOGI(TAG, "  配网待机尝试：ssid=\"%s\" rssi=%d%s", cand[i].ssid, rssi[i],
+                             is_last[i] ? "（最后成功，优先）" : "");
+                    if (try_connect(&cand[i], rssi[i], authmode_of(aps, ac, cand[i].ssid))) {
+                        got = true;
+                        break;
+                    }
+                }
+                if (!got) {
+                    continue;   /* 下一轮再试，配网页一直可用 */
+                }
+                ESP_LOGW(TAG, "连上 ssid=\"%s\"，关闭配网热点（ip=%s）", s_wifi_ssid, s_wifi_ip);
+                tihu_wifi_mark_connected(s_wifi_ssid);
+                tihu_provision_stop();
+                tihu_ui_set_connection(false, "找宿主");
+                vTaskDelay(pdMS_TO_TICKS(800));
+                connected = true;
+                break;
             }
         }
 
@@ -1089,11 +1333,42 @@ static void heartbeat_cb(void *arg)
 static void build_uri(void)
 {
     const char *scheme = s_host_tls ? "wss" : "ws";
+    /*
+     * OTA 端口跟随宿主模式：
+     *   - 公网模式：用公网端口（7080）。VPS:7080 的 ssh -R 反代到本机 relay 3099，
+     *     relay 同时服务 /tihu/ota 与 /tihu/lane —— 公网上没有 3099 这个口，绝不能去连它。
+     *   - 局域网直连/强制 host：用本机 relay 的 TIHU_OTA_PORT(3099)。
+     */
+    int ota_port = s_host_public ? s_host_port : TIHU_OTA_PORT;
+    tihu_ota_set_host(s_host_ip, ota_port, s_host_tls);
     if (s_host_token[0] != '\0') {
         snprintf(s_uri, sizeof(s_uri), "%s://%s:%d/tihu/lane?token=%s",
                  scheme, s_host_ip, s_host_port, s_host_token);
     } else {
         snprintf(s_uri, sizeof(s_uri), "%s://%s:%d/tihu/lane", scheme, s_host_ip, s_host_port);
+    }
+}
+
+/**
+ * 一次性删掉用户点名禁用的网络（TIHU_WIFI_BANNED_SSID）。
+ *
+ * 只删这一条：其余 SSID/密码原样保留，NVS 不擦、不重建。
+ * 删完把剩下的清单打出来，串口里能直接核对「谁还在、谁没了」。
+ */
+static void tihu_wifi_purge_banned(void)
+{
+    if (!tihu_wifi_saved_find(TIHU_WIFI_BANNED_SSID, NULL)) {
+        ESP_LOGI(TAG, "NVS 里没有 \"%s\"，无需删除", TIHU_WIFI_BANNED_SSID);
+        return;
+    }
+    bool ok = tihu_wifi_forget(TIHU_WIFI_BANNED_SSID);
+    tihu_wifi_cred_t left[TIHU_WIFI_MAX_NETWORKS];
+    int left_n = tihu_wifi_saved(left, TIHU_WIFI_MAX_NETWORKS);
+    ESP_LOGW(TAG, "已按用户要求删除网络 %s，剩余 %d 个（%s）", TIHU_WIFI_BANNED_SSID, left_n,
+             ok ? "NVS 已提交" : "删除返回 false，请查 NVS");
+    for (int i = 0; i < left_n; i++) {
+        ESP_LOGW(TAG, "  保留 %d/%d：ssid=\"%s\" 密码%s", i + 1, left_n, left[i].ssid,
+                 left[i].password[0] != '\0' ? "已记" : "空（开放）");
     }
 }
 
@@ -1105,13 +1380,20 @@ void tihu_net_start(void)
              mac[3], mac[4], mac[5]);
 
     tihu_wifi_store_init();
-    /* config.h 里的 SSID 只当「种子」：NVS 里没有才补写一次，绝不覆盖配网页加的网络。 */
-    if (TIHU_WIFI_SSID[0] != '\0' && !tihu_wifi_saved_find(TIHU_WIFI_SSID, NULL)) {
+    /* 用户要求：板子不许再连校园网 —— 开机删一次（其它网络一字不动）。 */
+    tihu_wifi_purge_banned();
+    /* config.h 里的 SSID 只当「种子」：NVS 里没有才补写一次，绝不覆盖配网页加的网络。
+     * 种子为空（当前就是空）时这一步整段跳过；即便有人把种子写成被禁用的 SSID 也不写。 */
+    if (TIHU_WIFI_SSID[0] != '\0' && strcmp(TIHU_WIFI_SSID, TIHU_WIFI_BANNED_SSID) == 0) {
+        ESP_LOGW(TAG, "config.h 种子 SSID 是禁用的 \"%s\"，不写入 NVS", TIHU_WIFI_BANNED_SSID);
+    } else if (TIHU_WIFI_SSID[0] != '\0' && !tihu_wifi_saved_find(TIHU_WIFI_SSID, NULL)) {
         tihu_wifi_save(TIHU_WIFI_SSID, TIHU_WIFI_PASSWORD);
         ESP_LOGI(TAG, "config.h 种子 SSID \"%s\" 补进 NVS（之后以 NVS 为准）", TIHU_WIFI_SSID);
     }
-    /* 公网入口同理：只补一次，落过 host_mode 之后一律以 NVS（配网页）为准。 */
-    if (TIHU_PUBLIC_HOST[0] != '\0' && !tihu_wifi_host_mode_set()) {
+    /* 公网入口同理：只补一次，落过 host_mode 之后一律以 NVS（配网页）为准。
+     * TIHU_FORCE_HOST=1 时连补写都不做：不往 NVS 里塞 host_mode=public，
+     * 已有的 3 条 Wi-Fi 记忆和公网配置原样保留。 */
+    if (TIHU_PUBLIC_HOST[0] != '\0' && !TIHU_FORCE_HOST && !tihu_wifi_host_mode_set()) {
         bool pub_tls = TIHU_PUBLIC_TLS != 0;
         int pub_port = TIHU_PUBLIC_PORT > 0 ? TIHU_PUBLIC_PORT : (pub_tls ? 443 : 80);
         if (tihu_wifi_public_save(TIHU_PUBLIC_HOST, pub_port, pub_tls, TIHU_PUBLIC_TOKEN)) {
@@ -1186,10 +1468,22 @@ void tihu_net_start(void)
 
     tihu_public_cfg_t pub;
     tihu_wifi_public_get(&pub);
+#if TIHU_FORCE_HOST
+    if (TIHU_HOST[0] != '\0') {
+        ESP_LOGW(TAG, "强制宿主模式：ws://%s:%d（忽略 NVS 公网配置，不发 UDP 发现；NVS host_mode=%s 原样保留）",
+                 TIHU_HOST, TIHU_PORT, pub.enabled ? "public" : "lan");
+        ESP_LOGI(TAG, "启动完成：令牌=%s，种子 SSID=%s，宿主模式=强制 host（ws://%s:%d），发现端口=%d",
+                 TIHU_TOKEN[0] != '\0' ? "已配置" : "空",
+                 TIHU_WIFI_SSID[0] != '\0' ? TIHU_WIFI_SSID : "（用 NVS）",
+                 TIHU_HOST, TIHU_PORT, TIHU_DISCOVER_PORT);
+        return;
+    }
+    ESP_LOGW(TAG, "TIHU_FORCE_HOST=1 但 TIHU_HOST 为空：按局域网发现模式继续");
+#endif
     ESP_LOGI(TAG, "启动完成：令牌=%s，种子 SSID=%s，宿主模式=%s，发现端口=%d",
              TIHU_TOKEN[0] != '\0' ? "已配置" : "空",
              TIHU_WIFI_SSID[0] != '\0' ? TIHU_WIFI_SSID : "（用 NVS）",
-             pub.enabled ? "公网（配网页已填）" : (TIHU_FORCE_HOST ? "强制 host" : "局域网（先 UDP 发现）"),
+             pub.enabled ? "公网（配网页已填）" : "局域网（先 UDP 发现）",
              TIHU_DISCOVER_PORT);
     if (pub.enabled) {
         ESP_LOGI(TAG, "公网入口：%s://%s:%d（token %s）",

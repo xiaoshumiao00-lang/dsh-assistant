@@ -218,15 +218,19 @@ test('步数只增不减（乱序到达的 tool/call 不能把第 7 步改回第
   assert.equal(subLineOf(task, '青年基金申请书'), '青年基金申请书 · 第 7 步')
 })
 
-test('棋盘标题只留「状态 + 会话名」，项目名只留在副行', () => {
+test('棋盘标题＝客户端会话标题原文（逐字、不截断、不去项目名）', () => {
   const ledger = new TaskLedger()
   const task = ledger.add({ title: '个人助手 今天几号', projectId: 'p1', projectName: '个人助手' })
   ledger.attachSession(task.taskId, 'session-title')
   ledger.markRunning(task.taskId)
+  // 客户端会话标题一变，棋盘这一行就是那个完整字符串（不是首条消息的前几个字）。
+  const clientTitle = '改 D:\\dsh-assistant 鹈鹕指挥台喂给模型的现场信息，当前太薄只有几行'
+  assert.equal(ledger.setSessionTitle(task.taskId, clientTitle), true)
   const row = boardOf(ledger.list(), 1).rows[0]
-  assert.equal(row.title, '今天几号')
+  assert.equal(row.title, clientTitle, '棋盘标题必须与客户端会话标题逐字一致')
   assert.ok(row.sub.includes('个人助手'), '项目名要留在副行')
-  // 项目名是更长卡名的前缀时不能误删（青年基金 vs 青年基金申请书）。
+  assert.equal(ledger.setSessionTitle(task.taskId, clientTitle), false, '标题没变不动棋盘')
+  // 客户端还没给标题时退回任务名：同样逐字（不截项目名、不加省略号）。
   const longer = ledger.add({ title: '青年基金申请书 改写第 3 段', projectId: 'p2', projectName: '青年基金' })
   assert.equal(boardTitleOf(longer), '青年基金申请书 改写第 3 段')
 })
@@ -735,7 +739,10 @@ test('带唤醒词的口头命令：先剥「你好，鹈鹕」再判命令', ()
   assert.equal(stripWakeWord('鹈鹕能吃吗'), '能吃吗')
   assert.deepEqual(parseScreenCommand('你好，鹈鹕回棋盘'), { kind: 'board' })
   assert.deepEqual(parseScreenCommand('你好鹈鹕，回棋盘'), { kind: 'board' })
-  assert.deepEqual(parseScreenCommand('嗨鹈鹕看第 2 条'), { kind: 'open', index: 2 })
+  // 2026-11-12 用户收窄唤醒词：只认「你好，鹈鹕」与光秃秃的「鹈鹕」。
+  // 「嗨 / 嘿 / 喂」前缀不再算唤醒词 → 整句按任务走，一个字都不剥。
+  assert.equal(parseScreenCommand('嗨鹈鹕看第 2 条'), undefined)
+  assert.equal(stripWakeWord('嗨鹈鹕帮我查一下'), '嗨鹈鹕帮我查一下')
   assert.deepEqual(parseScreenCommand('鹈鹕停止'), { kind: 'stop' })
   // 正文里的「鹈鹕」不是唤醒词：剥不出命令就按原文当任务。
   assert.equal(parseScreenCommand('鹈鹕是什么'), undefined)
@@ -1135,9 +1142,9 @@ test('syncExternal：done→running 可复活；状态没变就不动 updatedAt�
   assert.equal(task.finishedAt, undefined)
   assert.equal(task.startedAt, 11_000, '新一轮的活动重新起算时长环')
   assert.equal(task.resultLine, '又有新进展')
-  // 标题/项目变了也算棋盘变化，标题仍按 taskTitleOf 截断
+  // 标题/项目变了也算棋盘变化：标题存客户端给的**全文**（数据层不截断，省略只发生在渲染）
   assert.equal(ledger.syncExternal(task.taskId, { title: '很长的标题'.repeat(12), projectName: 'B', state: 'running', at: 13_000 }), true)
-  assert.ok([...task.title].length <= 18, '标题必须截断：' + task.title)
+  assert.equal(task.title, '很长的标题'.repeat(12), '标题必须存全文：' + task.title)
   assert.equal(subLineOf(task), '电脑端 · B')
 })
 

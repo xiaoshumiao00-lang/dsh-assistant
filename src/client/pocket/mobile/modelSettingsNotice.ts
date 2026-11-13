@@ -3,6 +3,13 @@ import { domGate, insideComposer } from '../../compositionGate.ts'
 
 const PHRASES = ['加载提供方目录失败', 'Settings are unavailable in this browser']
 const NOTICE = '手机上不支持模型设置，请去电脑端修改设置'
+/**
+ * 唯一在手机端**允许**改的模型设置：鹈鹕设置里的「指挥台模型」卡
+ * （`android/app/src/main/java/com/chenpan/assistant/TihuVoiceUtil.java` 的 `settingsJs()`
+ * 在卡片根节点写这个属性）。它自己的加载失败/目录错误必须原样显示，否则用户看到
+ * 「请去电脑端修改」就跟眼前这张能改的卡自相矛盾。其余模型设置照旧一律改写。
+ */
+const SELF_SERVICE_CARD = '[data-tihu-model-card]'
 /** 让路窗口结束后再来一次（补丁队列不会丢）。 */
 const PATCHER_RETRY_MS = 400
 /** 队列上限：流式渲染期间只留最新节点，绝不无界增长。 */
@@ -16,6 +23,8 @@ export function createModelSettingsNoticePatcher() {
     const el = node.parentElement
     if (el === null || el.dataset?.dshpModelNotice === '1') return
     if (el.closest('[data-dshp-model-notice]') !== null) return
+    // 鹈鹕「指挥台模型」卡：根节点带 marker，卡内文字一个字都不改（见 SELF_SERVICE_CARD）。
+    if (el.closest(SELF_SERVICE_CARD) !== null) return
     // 输入框里的文本不碰：改写宿主 Lexical 编辑器里的文本节点会让正在进行的
     // 语音 / 拼音组合当场中断。
     if (insideComposer(el)) return

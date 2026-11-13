@@ -41,6 +41,14 @@ static const char *TAG = "touch";
 #define TOUCH_GT911_POINT1_REG 0x8150
 
 /*
+ * 面板坐标上限（GT911 配置里 Xmax=320 / Ymax=240，即合法值 0..319 / 0..239）。
+ * 越界的点一律丢弃：以前这里是「把错位的字节直接往下传」，结果 58369 这种值也能
+ * 送到 LVGL，按钮永远命中不了（2026-11-12 实机定位到的根因）。
+ */
+#define TOUCH_X_MAX 319
+#define TOUCH_Y_MAX 239
+
+/*
  * INT 边沿探针：GT911 每检测到一次触摸都会把 INT 拉低（电平由 BSP 配成下降沿中断）。
  * 数一下这条线上的下降沿，就能把两种「点不动」彻底分开：
  *   - 边沿计数一直 0 → 控制器压根没检测到手指（面板/供电/芯片问题，软件无解）；
@@ -86,6 +94,7 @@ static int s_last_y = -1;
 static int s_last_pressed;
 static int s_last_move_log_ms;
 static int s_last_report_ms;
+static int s_bad_point_log_ms;   /* 越界点告警限速（2 秒一条，别刷爆串口） */
 
 static int touch_now_ms(void)
 {
@@ -162,26 +171,34 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
         err = esp_lcd_panel_io_rx_param(s_tp->io, TOUCH_GT911_POINT1_REG, point,
                                         sizeof(point));
         if (err == ESP_OK) {
-            /* 原始字节一并打出来：GT911 的坐标可能是大端，也需要看有没有移位。
-             * 解出来 (x,y) 落在 0..319/0..239 之外时，就靠这 8 个字节定位。 */
-            ESP_LOGI(TAG, "GT911 原始点：%02X %02X %02X %02X %02X %02X %02X %02X（状态=0x%02X）",
-                     point[0], point[1], point[2], point[3], point[4], point[5],
-                     point[6], point[7], (unsigned)status);
-            uint16_t x_le = (uint16_t)(point[1] | (point[2] << 8));
-            uint16_t x_be = (uint16_t)((point[1] << 8) | point[2]);
-            uint16_t y_le = (uint16_t)(point[3] | (point[4] << 8));
-            uint16_t y_be = (uint16_t)((point[3] << 8) | point[4]);
-            /* 哪个端序落在 320×240 里就用哪个，两个都超范围就按小端（BSP 驱动的约定）。 */
-            bool le_ok = x_le < 320 && y_le < 240;
-            bool be_ok = x_be < 320 && y_be < 240;
-            if (!le_ok && be_ok) {
-                nx = x_be;
-                ny = y_be;
+            /*
+             * GT911 标准布局（0x8150 起，每点 5 字节，小端）：
+             *   point[0..1] = x  → x = p[0] | (p[1] << 8)
+             *   point[2..3] = y  → y = p[2] | (p[3] << 8)
+             *   point[4]    = size
+             * 2026-11-12 的 bug 是这里整体后移了一位（拿 p[1..4]），
+             * 于是 x 变成 0xE401=58369、y 变成 0x1B00=6912，按钮必然点不中。
+             */
+            uint8_t points = (uint8_t)(status & 0x0F);
+            uint16_t x_raw = (uint16_t)(point[0] | ((uint16_t)point[1] << 8));
+            uint16_t y_raw = (uint16_t)(point[2] | ((uint16_t)point[3] << 8));
+            ESP_LOGI(TAG, "GT911 原始点：%02X %02X %02X %02X %02X（状态=0x%02X 点数=%u）"
+                          " → x=%u y=%u size=%u",
+                     point[0], point[1], point[2], point[3], point[4], (unsigned)status,
+                     (unsigned)points, (unsigned)x_raw, (unsigned)y_raw, (unsigned)point[4]);
+            if (x_raw > TOUCH_X_MAX || y_raw > TOUCH_Y_MAX) {
+                /* 越界不往下传：宁可丢这一帧，也不要让 LVGL 收到 58369 这种坐标。 */
+                if (now - s_bad_point_log_ms >= 2000) {
+                    s_bad_point_log_ms = now;
+                    ESP_LOGW(TAG, "GT911 点越界，丢弃：x=%u y=%u（上限 %d/%d，原始 %02X %02X %02X %02X）",
+                             (unsigned)x_raw, (unsigned)y_raw, TOUCH_X_MAX, TOUCH_Y_MAX,
+                             point[0], point[1], point[2], point[3]);
+                }
             } else {
-                nx = x_le;
-                ny = y_le;
+                nx = (int)x_raw;
+                ny = (int)y_raw;
+                pressed = true;
             }
-            pressed = true;
         } else {
             s_read_fail++;
             ESP_LOGW(TAG, "GT911 坐标读失败：%s", esp_err_to_name(err));

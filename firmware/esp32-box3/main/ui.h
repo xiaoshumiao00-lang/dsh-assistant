@@ -22,6 +22,8 @@ void tihu_ui_show_frame(const tihu_screen_frame_t *frame);
 void tihu_ui_set_connection(bool connected, const char *text);
 void tihu_ui_set_listening(bool on, const char *prompt);
 void tihu_ui_show_alert(const char *text);
+/** 顶部音量小条：显示「音量 62」/「静音」，约 2 秒后自动消失（浮在最上层，不压正文）。 */
+void tihu_ui_show_volume(int volume, bool muted);
 const char *tihu_ui_stage_name(void);
 const char *tihu_ui_connection_text(void);
 bool tihu_ui_connected(void);
@@ -34,7 +36,15 @@ lv_obj_t *tihu_ui_progress_create(lv_obj_t *parent);
 void tihu_ui_progress_update(lv_obj_t *screen, const tihu_screen_frame_t *frame);
 
 lv_obj_t *tihu_ui_done_create(lv_obj_t *parent);
-void tihu_ui_done_update(lv_obj_t *screen, const tihu_screen_frame_t *frame);
+/** 刷完成页；返回 true = 正文（标题/行数/各行文字）真的变了，false = 宿主重推的同一帧。 */
+bool tihu_ui_done_update(lv_obj_t *screen, const tihu_screen_frame_t *frame);
+/* karaoke：完成页总行数 / 只切高亮不挪窗口（ui.c 的 100 ms 定时器用）。 */
+int tihu_ui_done_line_count(void);
+void tihu_ui_done_set_current(int index);
+
+/* 看板呼吸动画：500 ms 调一次，只动 blink=true 行的圆点。 */
+void tihu_ui_board_anim_step(void);
+bool tihu_ui_board_blink_active(void);
 
 /* 共用样式 */
 const lv_font_t *tihu_ui_font_title(void);

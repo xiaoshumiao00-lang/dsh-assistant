@@ -39,7 +39,7 @@ import {
   takeSnapshot,
   targetPathOf,
 } from '../src/tihu/guard.ts'
-import { createTihuRuntime as createTihuRuntimeRaw, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH, TIHU_LANE_LOG_MAX_BYTES, TIHU_TOOL_CALL_ARGS_MAX_CHARS, appendTihuLaneLog, appendTihuToolCallLog, screenReasonOf, tihuLaneLogPath, tihuReceiptHoldMs } from '../src/tihu/lane.ts'
+import { createTihuRuntime as createTihuRuntimeRaw, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH, TIHU_LANE_LOG_MAX_BYTES, TIHU_TOOL_CALL_ARGS_MAX_CHARS, appendTihuLaneLog, appendTihuToolCallLog, screenReasonOf, tihuLaneLogPath, tihuReceiptHoldMs, createTihuHttpHandler, TIHU_ASR_MAX_BYTES, TIHU_ASR_MAX_AUDIO_MS, TIHU_ASR_MAX_AUDIO_BYTES, TIHU_ASR_TRANSCRIBE_TIMEOUT_MS, ASR_TYPO_HINT, punctuateAsrText, COMMANDER_SESSION_LIMIT, COMMANDER_DIALOGUE_MAX_CHARS, COMMANDER_FIELD_MAX_CHARS } from '../src/tihu/lane.ts'
 import { BOARD_PAGE_SIZE, TaskLedger, boardOf, boardRowIndex, parseScreenCommand } from '../src/tihu/task-ledger.ts'
 import {
   APPROVAL_OPTIONS,
@@ -753,7 +753,7 @@ function agentsFixture(ids) {
   }
 }
 
-function runtimeFor(records, extras = {}, ttsOptions = {}, ledgerPath = undefined) {
+function runtimeFor(records, extras = {}, ttsOptions = {}, ledgerPath = undefined, runtimeOptions = {}) {
   const fixture = fakeCtx({
     sessionQuery: sessionQueryFixture(records),
     sessionProjectionCache: projectionCacheFixture(records),
@@ -764,6 +764,8 @@ function runtimeFor(records, extras = {}, ttsOptions = {}, ledgerPath = undefine
     log: (message) => { if (process.env.TIHU_TEST_LANE_LOG) console.error('[lane] ' + message) },
     tts: { disabled: true, ...ttsOptions },
     ...(ledgerPath === undefined ? {} : { taskLedgerPath: ledgerPath }),
+    // 用例级运行时覆盖（如 commanderTimeoutMs：看门狗窗口不必等满 25 秒）。
+    ...runtimeOptions,
   }) }
 }
 
@@ -3200,7 +3202,12 @@ function unifiedWorkspace(options = {}) {
   const prompted = []
   /** 指挥台「判这一句」的 prompt 单独记账（接了语义路由后，派单类用例只看任务会话）。 */
   const askPrompts = []
-  const isCommanderAskPrompt = (blocks) => String(blocks?.[1]?.text ?? '').includes(COMMANDER_CONTROL_SHAPE)
+  /** 读页硬绑定的判断提示词标记（与 lane 的 readPinCommanderTail 同一句）。 */
+  const READ_PIN_TAIL = '【朗读页 · 路由已锁定】'
+  const isCommanderAskPrompt = (blocks) => {
+    const tail = String(blocks?.[1]?.text ?? '')
+    return tail.includes(COMMANDER_CONTROL_SHAPE) || tail.includes(READ_PIN_TAIL)
+  }
   const recordPrompt = (entry) => {
     if (isCommanderAskPrompt(entry.blocks)) askPrompts.push(entry)
     else prompted.push(entry)
@@ -3208,6 +3215,20 @@ function unifiedWorkspace(options = {}) {
   const renamed = []
   /** 鹈鹕端默认模型：selectModel 的调用记录（见本函数里 sessionController.selectModel）。 */
   const selectedModels = []
+  /**
+   * 「指挥台此刻的模型」桩（＝宿主 `modelSelection` 投影的 next/lastUsed）。
+   * 传了才挂 `sessions.get` + `sessionProjections.cachedSnapshot`，让 lane 走「对一眼现值」那条路；
+   * 不传就退回签名守卫（老宿主/读不到现值的分支）。
+   */
+  const commanderSelection = options.commanderSelection
+  /**
+   * 「任意会话此刻的模型」桩（2026-11-13 读页续聊：会话模型 > 默认模型）。
+   * 传函数 `id => ({provider,model}) | null | undefined`：
+   *   - 对象＝这条会话有明确模型（lane 必须不覆盖）；
+   *   - null＝没有显式选择（在用宿主默认，lane 可以按默认前台模型装一次）；
+   *   - undefined＝读不到（lane 必须保持原样）。
+   */
+  const sessionSelectionOf = options.sessionSelectionOf
   /**
    * 指挥台假结论（2026-11-11 语义路由）。派单类用例要的是「指挥台判成活儿 → 照旧派单」，
    * 不是真模型：默认结论 `{"project":"个人助手","session":"new","append_to":""}`（＝判成
@@ -3224,7 +3245,7 @@ function unifiedWorkspace(options = {}) {
   function autoCommanderReply(sessionId, blocks) {
     if (autoConclusion === false || cleanedUp) return
     const tail = String(blocks?.[1]?.text ?? '')
-    if (!tail.includes(COMMANDER_CONTROL_SHAPE)) return
+    if (!tail.includes(COMMANDER_CONTROL_SHAPE) && !tail.includes(READ_PIN_TAIL)) return
     const text = String(blocks?.[0]?.text ?? '')
     const startedAt = Date.now()
     setTimeout(() => {
@@ -3323,16 +3344,36 @@ function unifiedWorkspace(options = {}) {
       created.push(request)
       if (options.createFailsAfter !== undefined && created.length > options.createFailsAfter) return undefined
       const id = 'session-task-' + created.length
-      records.push(cuRecord(id, { live: true, preset: request.agentPreset, cwd: request.cwd, title: '任务 ' + created.length }))
-      if (agentHost) mountAgent(id, { cwd: request.cwd, agentPreset: request.agentPreset })
-      return { sessionId: id }
+      // 铁律相关用例：宿主可能**没把 computer-use 落上**（预设没注册/被组合改掉），
+      // 这里让用例能把建出来的会话改成别的模式，钉住「建完必须核对模式」。
+      const actualPreset = typeof options.createdPresetOf === 'function' ? options.createdPresetOf(request) : request.agentPreset
+      records.push(cuRecord(id, { live: true, preset: actualPreset, cwd: request.cwd, title: '任务 ' + created.length }))
+      if (agentHost) mountAgent(id, { cwd: request.cwd, agentPreset: actualPreset })
+      return { sessionId: id, ...(actualPreset === undefined ? {} : { agentPreset: actualPreset }) }
     },
     /** 鹈鹕端默认模型走这里（宿主真实通路）。记下「选的时候这条会话投过消息没有」＝顺序证据。 */
     selectModel: async (request) => {
+      const attempt = selectedModels.length + 1
       selectedModels.push({
         ...request,
+        attempt,
         promptedBefore: prompted.some((item) => item.id === request.sessionId),
       })
+      // 指挥台模型「失败不记账、下一轮重试」用例：让第 N 次调用抛错（宿主没就绪那种瞬时失败）。
+      if (typeof options.selectModelThrows === 'function' && options.selectModelThrows(request, attempt) === true) {
+        throw new Error('sessionController.selectModel 暂时不可用（测试桩）')
+      }
+      // 真宿主会把这个选择写成 model/selection 事件，投影的 next 跟着变；这里模拟同一跳，
+      // 用例可以中途手动改 commanderSelection.current 来演「电脑端在 GUI 里换了模型」。
+      if (commanderSelection !== undefined) {
+        commanderSelection.current = {
+          provider: request.provider,
+          model: request.model,
+          ...(request.reasoningEffort === undefined || request.reasoningEffort === ''
+            ? {}
+            : { reasoningEffort: request.reasoningEffort }),
+        }
+      }
       return { selected: { provider: request.provider, model: request.model } }
     },
     rename: async ({ sessionId, title }) => {
@@ -3394,15 +3435,44 @@ function unifiedWorkspace(options = {}) {
           },
         },
       }),
+      // 只在「现值」用例里给活会话：lane 的 liveSessionOf() 走这里拿 Session 再读投影。
+      // 带 __modelStub 标记，好让投影桩只在它身上补 modelSelection（别的行仍用默认缓存，
+      // 否则按标题找回指挥台会被打断）。
+      ...(commanderSelection === undefined && sessionSelectionOf === undefined
+        ? {}
+        : { get: (id) => ({ header: { id, agentPreset: 'standard' }, __modelStub: true }) }),
     }
   const fixture = runtimeFor(records, {
     ...(options.noCreate === true ? { sessions } : { remote, sessions, sessionController }),
+    // 「会话此刻的模型」投影桩：只给活会话那一条补 modelSelection = { lastUsed, next }。
+    // commanderSelection 是全局一个值（指挥台用例）；sessionSelectionOf 按会话 id 取（读页用例）。
+    ...(commanderSelection === undefined && sessionSelectionOf === undefined
+      ? {}
+      : {
+        sessionProjections: {
+          cachedSnapshot: (source) => {
+            const base = projectionCacheFixture(records).cachedSnapshot(source)
+            if (source?.__modelStub !== true) return base
+            if (typeof sessionSelectionOf === 'function') {
+              const id = String(source?.header?.id ?? '')
+              const selection = sessionSelectionOf(id)
+              return {
+                values: selection === undefined
+                  ? { ...(base?.values ?? {}) }
+                  : { ...(base?.values ?? {}), modelSelection: { lastUsed: selection, next: selection } },
+              }
+            }
+            const current = commanderSelection.current ?? null
+            return { values: { ...(base?.values ?? {}), modelSelection: { lastUsed: current, next: current } } }
+          },
+        },
+      }),
     // 子代理用例：agents 注册表要能 list()（宿主用它数「在跑的子代理后代」）。
     ...(agentHost ? { agents: agentRegistry } : options.agents === undefined ? {} : { agents: options.agents }),
     ...(options.sessionEvents === undefined
       ? {}
       : { sessionQuery: sessionQueryFixture(records, options.sessionEvents) }),
-  }, options.tts ?? {}, options.ledgerPath)
+  }, options.tts ?? {}, options.ledgerPath, options.runtimeOptions ?? {})
   return {
     ...fixture,
     root,
@@ -7058,6 +7128,100 @@ await testAsync('鹈鹕端默认前台模型：派单新建的 computer-use 任�
   }
 })
 
+await testAsync('指挥台模型（手机端权威值）：配置值一变，下一轮 hello 立刻重新 selectModel；同值不重复', async () => {
+  const w = unifiedWorkspace()
+  try {
+    await writeTihuConfig(w.home, { model: { background: { provider: 'stub', model: 'bg-a' } } })
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-change', protocol: '0' }, 1)))
+    await waitMs(120)
+    assert.equal(w.selectedModels.filter((item) => item.model === 'bg-a').length, 1,
+      '第一次 hello 要按配置选一次：' + JSON.stringify(w.selectedModels))
+
+    // 配置没动 → 不许再写一次 model/selection（同一条会话每轮重写会污染会话日志）
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-change', protocol: '0' }, 2)))
+    await waitMs(80)
+    assert.equal(w.selectedModels.filter((item) => item.model === 'bg-a').length, 1,
+      '配置签名没变就不该重复选模型')
+
+    // 手机「鹈鹕设置 → 指挥台模型」换了一条 → 不重启 DSH，下一轮 hello 就按新值重放
+    await writeTihuConfig(w.home, { model: { background: { provider: 'stub', model: 'bg-b' } } })
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-change', protocol: '0' }, 3)))
+    await waitMs(120)
+    const changed = w.selectedModels.filter((item) => item.model === 'bg-b')
+    assert.equal(changed.length, 1, '配置值变了必须重新 apply（守卫要按值比对，不能只认 sessionId）：' + JSON.stringify(w.selectedModels))
+    assert.equal(changed[0].sessionId, 'session-cmd', '装在按标题找回的那条指挥台上')
+    assert.equal(changed[0].promptedBefore, false, '选模型要在投消息之前')
+
+    // 改回去也一样要生效（不是「每个方向只认第一次」）
+    await writeTihuConfig(w.home, { model: { background: { provider: 'stub', model: 'bg-a' } } })
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-change', protocol: '0' }, 4)))
+    await waitMs(120)
+    assert.equal(w.selectedModels.filter((item) => item.model === 'bg-a').length, 2,
+      '换回旧值也要重新 apply：' + JSON.stringify(w.selectedModels))
+  } finally {
+    await clearTihuConfig(w.home)
+    w.cleanup()
+  }
+})
+
+await testAsync('指挥台模型：apply 失败不记账，下一轮自动重试（宿主没就绪那种瞬时失败）', async () => {
+  // 第 1 次 selectModel 抛错（模拟 2026-11-13 lane.log 09:25「宿主没有 selectModel」），之后正常。
+  const w = unifiedWorkspace({ selectModelThrows: (_request, attempt) => attempt === 1 })
+  try {
+    await writeTihuConfig(w.home, { model: { background: { provider: 'stub', model: 'bg-retry' } } })
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-retry', protocol: '0' }, 1)))
+    await waitMs(120)
+    assert.equal(w.selectedModels.length, 1, '第一次要真的尝试过：' + JSON.stringify(w.selectedModels))
+
+    // 失败那次不许记账：下一轮 hello 必须重试并成功
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-retry', protocol: '0' }, 2)))
+    await waitMs(120)
+    assert.equal(w.selectedModels.length, 2, '失败后必须重试（旧实现把 id 先塞进 Set，失败也永久当成做过）：' + JSON.stringify(w.selectedModels))
+    assert.equal(w.selectedModels[1].model, 'bg-retry')
+    assert.equal(w.selectedModels[1].sessionId, 'session-cmd', '重试还是装在指挥台上')
+
+    // 成功后才记账：第三轮不再重复
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-retry', protocol: '0' }, 3)))
+    await waitMs(80)
+    assert.equal(w.selectedModels.length, 2, '成功记账后不许每轮重写：' + JSON.stringify(w.selectedModels))
+  } finally {
+    await clearTihuConfig(w.home)
+    w.cleanup()
+  }
+})
+
+await testAsync('指挥台模型：电脑端手动改过 → 下一次派单前按手机设置值改回来（设置是权威值）', async () => {
+  // 投影桩就是「宿主此刻的指挥台模型」；selectModel 成功时它会被同步（模拟 model/selection 事件）。
+  const external = { current: null }
+  const w = unifiedWorkspace({ commanderSelection: external })
+  try {
+    await writeTihuConfig(w.home, { model: { background: { provider: 'stub', model: 'bg-authority' } } })
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-pc', protocol: '0' }, 1)))
+    await waitMs(120)
+    assert.equal(w.selectedModels.length, 1, 'hello 先按设置装一次：' + JSON.stringify(w.selectedModels))
+    assert.deepEqual(external.current, { provider: 'stub', model: 'bg-authority' }, '桩要跟着记录宿主写入的选择')
+
+    // 电脑端在 GUI 里把指挥台换成别的模型（宿主写 model/selection → 投影 next 变）
+    external.current = { provider: 'pc', model: 'pc-handpicked' }
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-pc', protocol: '0' }, 2)))
+    await waitMs(140)
+    assert.equal(w.selectedModels.length, 2, '现值与设置不一致就必须重放（电脑端手动改不算数）：' + JSON.stringify(w.selectedModels))
+    assert.equal(w.selectedModels[1].model, 'bg-authority', '重放的还是手机设置里的值')
+    assert.equal(w.selectedModels[1].sessionId, 'session-cmd', '装在指挥台上')
+
+    // 现值已经等于设置值 → 不再重复写
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-model-pc', protocol: '0' }, 3)))
+    await waitMs(100)
+    assert.equal(w.selectedModels.length, 2, '现值已是设置值，不许每轮重写：' + JSON.stringify(w.selectedModels))
+  } finally {
+    await clearTihuConfig(w.home)
+    w.cleanup()
+  }
+})
+
 await testAsync('页面重连后 text.input 仍被处理', async () => {
   const w = unifiedWorkspace()
   try {
@@ -7335,6 +7499,98 @@ await testAsync('语义路由：用户说了别的 → 原来那句不猜着派�
     const tasks = await w.runtime.control.listTasks()
     assert.equal(tasks.length, 1, '原来那句不许立卡')
     assert.ok(!String(tasks[0].title).includes('先停一下'), '棋盘上只有后一句：' + JSON.stringify(tasks.map((task) => task.title)))
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('指挥台看门狗：到点撤掉待判 → 落到兜底终态（本地没把握就屏上问一次，绝不硬派错项目）', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: false, runtimeOptions: { commanderTimeoutMs: 120 } })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-watchdog', protocol: '0' }, 1)))
+    await waitMs(60)
+    // 这句话不点名任何项目：本地规则也没有硬工作信号 → 兜底必须落「屏上问一次」。
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把石膏板的吸水率试验数据整理一下', source: 'voice' }, 2)))
+    await waitMs(500)
+
+    const frames = framesOf(socket)
+    const progress = frames.filter((frame) => frame.type === 'event.progress' && String(frame.payload?.stage) === '判断').pop()
+    assert.ok(progress !== undefined, '到点必须给屏上一句人话：' + JSON.stringify(frames.map((frame) => frame.payload?.text)))
+    assert.ok(String(progress.payload.text).includes('先按本地规则处理'), '人话要说清先按本地规则处理：' + progress.payload.text)
+    const clarify = frames.filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '澄清').pop()
+    assert.ok(clarify !== undefined, '兜底终态＝屏上问一次（绝不静默停在「正在判断这句话」）')
+    const lastScreen = frames.filter((frame) => frame.type === 'screen.frame').pop()
+    assert.notEqual(String(lastScreen?.payload?.title), '正在判断这句话', '最后不许停在等待屏：' + JSON.stringify(lastScreen?.payload))
+    assert.equal(w.created.length, 0, '本地没把握时绝不硬派错项目')
+    assert.equal((await w.runtime.control.listTasks()).length, 0, '也不许立卡')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('commander-timeout'), '要落 lane.log 说清这次是超时兜底：' + log)
+    assert.equal(w.askedCommander(), true, '这句要先真的投给指挥台（看门狗从投递成功开始计时）')
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('指挥台看门狗：过期回复 / 晚到的 dispatch 不会再派一次（dispatchKey + askedAt 去重）', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: false, runtimeOptions: { commanderTimeoutMs: 120 } })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-stale-reply', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '先停一下', source: 'voice' }, 2)))
+    await waitMs(500)
+    assert.equal((await w.runtime.control.listTasks()).length, 0, '兜底走的是「问一次」，还没有任务')
+    // 指挥台这才回话：晚到的 dispatch 工具调用不许把同一条命令再派一次。
+    const late = await w.runtime.control.dispatch({ text: '先停一下' })
+    assert.ok(String(late).includes('超时兜底'), '晚到的 dispatch 要被过期牌挡住：' + late)
+    // 晚到的 JSON 结论（同一轮）也不许派单、不许顶替下一句的等待。
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    const commanderSession = { id: 'session-cmd', header: { id: 'session-cmd' } }
+    emit(commanderSession, { type: 'turn/start', time: Date.now(), data: { turn: 9 } })
+    emit(commanderSession, {
+      type: 'assistant/message',
+      time: Date.now(),
+      data: { turn: 9, message: { content: [{ type: 'text', text: '{"project":"青年基金申请书","session":"new","append_to":""}' }] } },
+    })
+    await waitMs(240)
+    assert.equal(w.created.length, 0, '晚到的结论不许派单')
+    assert.equal((await w.runtime.control.listTasks()).length, 0, '也不许立卡')
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.ok(log.includes('commander-timeout'), '超时要留日志：' + log)
+  } finally {
+    delete process.env.TIHU_LANE_LOG
+    w.cleanup()
+  }
+})
+
+await testAsync('指挥台看门狗：投递前就查到它在跑长任务 → 不排队，立刻兜底并提示「正忙」', async () => {
+  const w = unifiedWorkspace({ commanderAutoReply: false })
+  process.env.TIHU_LANE_LOG = join(w.root, 'lane.log')
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-commander-busy', protocol: '0' }, 1)))
+    await waitMs(60)
+    // 电脑端那条指挥会话正在跑（turn/start 到了、turn/end 还没到）：新派单不许排在它后面。
+    const emit = w.events.find((entry) => entry.name === 'session/event').handler
+    emit({ id: 'session-cmd', header: { id: 'session-cmd' } }, { type: 'turn/start', time: Date.now(), data: { turn: 1 } })
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '先停一下', source: 'voice' }, 2)))
+    await waitMs(200)
+    assert.equal(w.created.length, 0, '本地没把握时不硬派（兜底是「屏上问一次」）')
+    const tasks = await w.runtime.control.listTasks()
+    assert.equal(tasks.length, 0, '也不许立卡')
+    const clarify = framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.stage === '澄清').pop()
+    assert.ok(clarify !== undefined, '正忙也要立刻给出终态（远小于默认 25 秒窗口），不排队等')
+    const progress = framesOf(socket).filter((frame) => frame.type === 'event.progress' && String(frame.payload?.stage) === '判断').pop()
+    assert.ok(progress !== undefined, '屏上要有提示')
+    assert.ok(String(progress.payload.text).includes('正忙'), '要明说指挥台那条会话正忙：' + progress.payload.text)
+    const log = readFileSync(join(w.root, 'lane.log'), 'utf8')
+    assert.equal(log.includes('commander-busy'), true, '要落日志说清这次是「忙」兜底：' + log)
+    assert.equal(w.askedCommander(), false, '正忙时根本不排队投递（不占那一轮后面）')
   } finally {
     delete process.env.TIHU_LANE_LOG
     w.cleanup()
@@ -7659,6 +7915,715 @@ await testAsync('工具可见性：16 个工具都注册在根 ctx（指挥会�
   assert.ok(laneSource.includes('tihuToolNames()'), 'lane 认工具名只认那张注册表')
   assert.equal(/toolFilter|restrict\(/.test(laneSource), false, 'lane 不许用工具黑名单把设备工具挡在指挥会话外面')
 })
-/* ---------- 汇总 ---------- */console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
+/* ---------- /tihu/asr：手机壳的语音 HTTP 接口（2026-11-12，1.1.0） ---------- */
+
+/** 假 req：body 按真实 IncomingMessage 的方式发 data/end。 */
+function fakeAsrReq(method, body, url = '/tihu/asr') {
+  const req = new EventEmitter()
+  req.method = method
+  req.url = url
+  req.headers = { 'content-type': 'audio/wav' }
+  setImmediate(() => {
+    if (body !== undefined && body.length > 0) req.emit('data', body)
+    req.emit('end')
+  })
+  return req
+}
+
+function fakeAsrRes() {
+  const state = { code: 0, headers: {}, body: '' }
+  const res = {
+    writeHead(code, headers) { state.code = code; state.headers = { ...(headers ?? {}) } },
+    end(body) { state.body = typeof body === 'string' ? body : '' },
+  }
+  return { res, state }
+}
+
+function waitAsrCode(state, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const t0 = Date.now()
+    const tick = () => {
+      if (state.code !== 0) return resolve(state.code)
+      if (Date.now() - t0 > timeoutMs) return reject(new Error('等不到 /tihu/asr 的响应'))
+      setTimeout(tick, 5)
+    }
+    tick()
+  })
+}
+
+await testAsync('HTTP /tihu/asr：POST 原始 WAV → 200 {text,source,ms}', async () => {
+  const seen = []
+  const handler = createTihuHttpHandler({
+    transcribe: async (audio) => {
+      seen.push(audio.length)
+      return { text: '把 README 读一下', raw: '', called: true, elapsedMs: 5, source: 'local' }
+    },
+  })
+  const { res, state } = fakeAsrRes()
+  assert.equal(handler(fakeAsrReq('POST', Buffer.from([1, 2, 3, 4])), res), true, 'POST /tihu/asr 必须被接走')
+  assert.equal(await waitAsrCode(state), 200)
+  const payload = JSON.parse(state.body)
+  assert.equal(payload.text, '把 README 读一下')
+  assert.equal(payload.source, 'local')
+  assert.equal(typeof payload.ms, 'number', 'ms 要是数字（手机端用它显示耗时）')
+  assert.deepEqual(seen, [4], '代理传来的原始字节要原样交给转写（不许再包一层）')
+  assert.equal(state.headers['content-type'], 'application/json; charset=utf-8')
+  assert.equal(TIHU_ASR_MAX_BYTES, 8 * 1024 * 1024, '上限 8MB 是手机端与固件的共同约定（覆盖 3 分钟录音）')
+})
+
+await testAsync('HTTP /tihu/asr：405 / 空文本 no-speech / 413 / 别的路径不接', async () => {
+  let calls = 0
+  const handler = createTihuHttpHandler({
+    transcribe: async () => {
+      calls += 1
+      return { text: '', raw: '', called: true, elapsedMs: 3, source: 'none', error: '本地服务不可用' }
+    },
+    maxBytes: 64,
+  })
+
+  // 1) 非 POST → 405（不被接走就会变成上游 404，手机端分不清「接口没实现」和「方法错了」）
+  const get = fakeAsrRes()
+  assert.equal(handler(fakeAsrReq('GET', Buffer.alloc(0)), get.res), true)
+  assert.equal(await waitAsrCode(get.state), 405)
+  assert.equal(JSON.parse(get.state.body).error, 'method-not-allowed')
+
+  // 2) 空文本 → 200 + no-speech（不是 500：手机端要能把「没听清」和「服务挂了」分开提示）
+  const empty = fakeAsrRes()
+  handler(fakeAsrReq('POST', Buffer.from([1, 2, 3])), empty.res)
+  assert.equal(await waitAsrCode(empty.state), 200)
+  const emptyPayload = JSON.parse(empty.state.body)
+  assert.equal(emptyPayload.text, '')
+  assert.equal(emptyPayload.error, 'no-speech')
+  assert.equal(emptyPayload.source, 'none')
+
+  // 3) body 超限 → 413（且不调用转写）
+  const big = fakeAsrRes()
+  const before = calls
+  handler(fakeAsrReq('POST', Buffer.alloc(128)), big.res)
+  assert.equal(await waitAsrCode(big.state), 413)
+  assert.equal(JSON.parse(big.state.body).error, 'audio-too-large')
+  assert.equal(calls, before, '超限的 body 不许进转写')
+
+  // 4) 别的路径不接走（继续按原来的规则转发）
+  const other = fakeAsrRes()
+  assert.equal(handler(fakeAsrReq('POST', Buffer.from([1]), '/tihu/other'), other.res), false)
+  assert.equal(other.state.code, 0)
+
+  // 5) 空 body → 200 no-audio
+  const none = fakeAsrRes()
+  handler(fakeAsrReq('POST', Buffer.alloc(0)), none.res)
+  assert.equal(await waitAsrCode(none.state), 200)
+  assert.equal(JSON.parse(none.state.body).error, 'no-audio')
+})
+
+await testAsync('HTTP /tihu/asr：运行时把它挂到代理拿得到的 tihu 对象上', async () => {
+  const { ctx } = fakeCtx()
+  const runtime = createTihuRuntime(ctx, { log: () => {} })
+  assert.equal(typeof runtime.handleHttp, 'function', '代理按 tihu.handleHttp 调用')
+  const other = fakeAsrRes()
+  assert.equal(runtime.handleHttp(fakeAsrReq('POST', Buffer.from([1]), '/tihu/nope'), other.res), false, '只接 /tihu/asr')
+  runtime.dispose()
+})
+
+/* ---------- 2026-11-13 朗读页硬绑定：读页录音那一句只落「正在念的那条会话」 ----------
+ *
+ * 原软偏置（大概率接着这条）升级成硬绑定后，三条必须钉住：
+ *   ① 读页消息必落同一 taskId 的会话（不许新建、不许改派）；
+ *   ② 判断保留（仍交给指挥台），但结论只用于理解：指挥台写「别的项目 / 新建」也不许照办；
+ *   ③ 默认前台模型与会话运行模型不一致时，以会话正在跑的模型为准（默认模型不覆盖）。
+ * 另外钉住兜底：taskId 查不到就**不硬绑**，回落指挥台按原逻辑判（不改键盘/其它入口）。
+ */
+await testAsync('朗读页硬绑定：读页消息必落同一 taskId 的会话，判断保留但结论不许改派', async () => {
+  // 指挥台故意判成「另一个项目 + 新建」：硬绑定若失效，这句就会被改派到青年基金申请书。
+  const w = unifiedWorkspace({ commanderAutoReply: '{"project":"青年基金申请书","session":"new","append_to":""}' })
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-read-pin', protocol: '0' }, 1)))
+    await waitMs(60)
+    // 先派一条 t1（session-task-1）：朗读页正在念的就是它。
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把第三段改得口语一点再说一遍', source: 'voice' }, 2)))
+    await waitMs(350)
+    const before = await w.runtime.control.listTasks()
+    assert.equal(before.length, 1, '先要有这条任务：' + JSON.stringify(before))
+    assert.equal(before[0].taskId, 't1')
+    assert.equal(w.created.length, 1, '派单只建了一条任务会话：' + JSON.stringify(w.created))
+    const pinnedSession = 'session-task-1'
+    const createdBefore = w.created.length
+    const pinnedBefore = w.prompted.filter((item) => item.id === pinnedSession).length
+
+    // 朗读页里说的下一句：带「当前屏＝朗读」+ 正在念的 taskId → 硬绑定那条会话。
+    socket.emit('data', clientFrame(buildUpstream('text.input', {
+      text: '刚才那段再口语一点', source: 'voice', screenHint: 'read', taskId: 't1',
+    }, 3)))
+    await waitMs(400)
+
+    // ① 判断保留：依然交给指挥台；提示词写明路由已锁定、不许改派。
+    const judge = w.askPrompts[w.askPrompts.length - 1]
+    assert.ok(judge !== undefined && judge.id === 'session-cmd', '读页这一句仍要交给指挥台判：' + JSON.stringify(w.askPrompts.map((item) => item.id)))
+    assert.equal(judge.blocks[0].text, '刚才那段再口语一点', '原话交给指挥台理解')
+    const tail = String(judge.blocks[1].text)
+    assert.ok(tail.includes('【朗读页 · 路由已锁定】'), '读页判断要带锁定提示：' + tail)
+    assert.ok(tail.includes('不许改派'), '提示词要明确不许改派')
+    assert.ok(tail.includes('task-1'), '要给出正在朗读的那条会话短号：' + tail)
+    assert.ok(tail.includes('只用于理解'), '判断结论只用于理解（不参与路由）')
+    assert.equal(tail.includes('大概率'), false, '不再是「大概率接着」的软偏置')
+
+    // ② 必落同一会话：指挥台结论写的是「青年基金申请书 / 新建」，也不许照它改派。
+    const after = await w.runtime.control.listTasks()
+    assert.equal(after.length, 1, '读页那一句不许新建/改派任务：' + JSON.stringify(after))
+    assert.equal(after[0].taskId, 't1')
+    const toPinned = w.prompted.filter((item) => item.id === pinnedSession)
+    assert.equal(toPinned.length, pinnedBefore + 1, '这一句必须投进朗读页那条会话：' + JSON.stringify(w.prompted.map((item) => item.id)))
+    assert.equal(toPinned[toPinned.length - 1].blocks[0].text, '刚才那段再口语一点', '投进去的就是原话')
+    assert.ok(String(toPinned[toPinned.length - 1].blocks[1].text).includes('【续聊 · 鹈鹕】'), '读页续聊仍带续聊尾巴')
+    assert.equal(w.created.length, createdBefore, '硬绑定不许新建会话：' + JSON.stringify(w.created))
+    assert.equal(w.prompted.some((item) => item.id !== pinnedSession), false, '不许投到别的会话：' + JSON.stringify(w.prompted.map((item) => item.id)))
+  } finally {
+    w.cleanup()
+  }
+})
+
+await testAsync('朗读页硬绑定失败：taskId 查不到 → 不硬绑，回落指挥台按原逻辑判', async () => {
+  const w = unifiedWorkspace()
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-read-pin-miss', protocol: '0' }, 1)))
+    await waitMs(60)
+    // 没有这条任务（朗读页可能刚被清掉/归档）：这句完全按原逻辑交给指挥台，不加锁定提示。
+    socket.emit('data', clientFrame(buildUpstream('text.input', {
+      text: '把第三段说得更口语一点', source: 'voice', screenHint: 'read', taskId: 't-ghost',
+    }, 2)))
+    await waitMs(300)
+    const asked = w.askPrompts[w.askPrompts.length - 1]
+    assert.ok(asked !== undefined && asked.id === 'session-cmd', '绑定失败也要照常交给指挥台判：' + JSON.stringify(w.askPrompts.map((item) => item.id)))
+    const tail = String(asked.blocks[1].text)
+    assert.equal(tail.includes('【朗读页 · 路由已锁定】'), false, '绑定失败不许带锁定提示（不改原判断）')
+    assert.ok(tail.includes(COMMANDER_CONTROL_SHAPE), '仍是原来的指挥台判断协议')
+    // 普通键盘手打（不带 screenHint/taskId）同样不进硬绑定。
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把标题再短一点', source: 'keyboard' }, 3)))
+    await waitMs(300)
+    const typed = w.askPrompts[w.askPrompts.length - 1]
+    assert.ok(typed !== undefined && typed !== asked, '键盘那句照旧单独交给指挥台判')
+    assert.equal(String(typed.blocks[1].text).includes('【朗读页 · 路由已锁定】'), false, '键盘路径不许进读页硬绑定')
+  } finally {
+    w.cleanup()
+  }
+})
+
+await testAsync('朗读页硬绑定：默认前台模型与会话运行模型不一致时，以会话正在跑的模型为准', async () => {
+  /** 会话 → 宿主 modelSelection 桩：对象＝有明确模型、null＝无显式选择、undefined＝读不到。 */
+  const running = {}
+  const w = unifiedWorkspace({ sessionSelectionOf: (id) => running[id] })
+  try {
+    await writeTihuConfig(w.home, { model: { foreground: { provider: 'stub', model: 'fg-read-pin' } } })
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-read-pin-model', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把第三段改得口语一点再说一遍', source: 'voice' }, 2)))
+    await waitMs(350)
+    const tasks = await w.runtime.control.listTasks()
+    assert.equal(tasks.length, 1, '先要有这条任务：' + JSON.stringify(tasks))
+    assert.equal(tasks[0].taskId, 't1')
+    assert.equal(w.created.length, 1, '派单只建了一条任务会话：' + JSON.stringify(w.created))
+    const pinned = 'session-task-1'
+    assert.equal(w.selectedModels.filter((item) => item.sessionId === pinned && item.model === 'fg-read-pin').length, 1,
+      '创建时按默认前台模型装过一次：' + JSON.stringify(w.selectedModels))
+
+    // 电脑端把这条会话换成 pc-handpicked（会话日志里的 model/selection）＝会话正在跑的模型。
+    running[pinned] = { provider: 'pc', model: 'pc-handpicked' }
+    const before = w.selectedModels.length
+    socket.emit('data', clientFrame(buildUpstream('text.input', {
+      text: '刚才那段再口语一点', source: 'voice', screenHint: 'read', taskId: 't1',
+    }, 3)))
+    await waitMs(400)
+    assert.equal(w.prompted[w.prompted.length - 1].id, pinned, '仍投进朗读页那条会话')
+    assert.equal(w.selectedModels.length, before,
+      '会话已有运行模型：默认前台模型一次都不许调：' + JSON.stringify(w.selectedModels.slice(before)))
+    assert.deepEqual(running[pinned], { provider: 'pc', model: 'pc-handpicked' }, '会话运行模型保持原样（默认模型不覆盖）')
+
+    // 会话没有显式选择（null）→ 才允许按默认前台模型装一次（取不到会话模型时的兜底）。
+    running[pinned] = null
+    const beforeNull = w.selectedModels.length
+    socket.emit('data', clientFrame(buildUpstream('text.input', {
+      text: '那段再短一点', source: 'voice', screenHint: 'read', taskId: 't1',
+    }, 4)))
+    await waitMs(400)
+    const applied = w.selectedModels.slice(beforeNull).filter((item) => item.sessionId === pinned)
+    assert.equal(applied.length, 1, '会话无显式模型时才按默认前台模型装一次：' + JSON.stringify(w.selectedModels.slice(beforeNull)))
+    assert.equal(applied[0].model, 'fg-read-pin')
+
+    // 读不到会话现值（undefined）→ 不覆盖、也不掉回默认模型。
+    running[pinned] = undefined
+    const beforeUnknown = w.selectedModels.length
+    socket.emit('data', clientFrame(buildUpstream('text.input', {
+      text: '那段再说得慢一点', source: 'voice', screenHint: 'read', taskId: 't1',
+    }, 5)))
+    await waitMs(400)
+    assert.equal(w.selectedModels.slice(beforeUnknown).filter((item) => item.sessionId === pinned).length, 0,
+      '读不到会话模型时不许拿默认模型覆盖：' + JSON.stringify(w.selectedModels.slice(beforeUnknown)))
+  } finally {
+    await clearTihuConfig(w.home)
+    w.cleanup()
+  }
+})
+
+/* ---------- 2026-11-13：①录音期间禁止朗读 ②录音提示音 ③转录带标点 ---------- */
+
+test('录音闸门：页面提供 __tihuRec 桥，录音一开始先掐掉已排程的朗读', () => {
+  const html = pageHtmlOf()
+  assert.ok(html.includes('window.__tihuRec = function'), '页面要暴露 window.__tihuRec（安卓壳开麦前调它）')
+  assert.ok(html.includes('window.__tihuRecState = function'), '要有自检出口 __tihuRecState（静音态/丢块数/还在念几段）')
+  const setRec = /function setRecMute\(on\) \{([\s\S]*?)\n  \}/.exec(html)
+  assert.ok(setRec !== null, '要有 setRecMute(on) 这一个入口')
+  assert.ok(setRec[1].includes('stopPcm()'), '录音开始必须 stopPcm()：PCM 已排进 WebAudio 时间轴，不逐段 stop 就是照念')
+  assert.ok(setRec[1].includes('state.recMute = want'), '闸门状态要落到 state.recMute')
+  // 录音中到达的朗读必须丢弃，且判断要排在 playPcm 之前（否则会先排进队列再挡）。
+  const muteAt = html.indexOf('if (state.recMute === true) {')
+  const playAt = html.indexOf('var chunkPlayed = playPcm(')
+  assert.ok(muteAt > 0 && playAt > 0 && muteAt < playAt, 'tts.audio 分支要先看 recMute 再 playPcm')
+  assert.ok(html.includes('state.recDropped += 1'), '丢弃要计数（事件区/自检能看出录音期间静了多少块）')
+})
+
+test('录音闸门：本页「按住说话」也走同一套（开始静音 + 提示音，松手恢复）', () => {
+  const html = pageHtmlOf()
+  const start = /function startRecording\(\) \{([\s\S]*?)\n  \}/.exec(html)
+  const stop = /function stopRecording\(\) \{([\s\S]*?)\n  \}/.exec(html)
+  assert.ok(start !== null && stop !== null)
+  assert.ok(start[1].includes('setRecMute(true)'), '开录（拿到麦克风之后）立刻静音')
+  assert.ok(start[1].includes("playRecTone('start')"), '开录要有一声「叮」')
+  assert.ok(stop[1].includes('setRecMute(false)'), '松手恢复朗读')
+  assert.ok(stop[1].includes("playRecTone('stop')"), '结束也要有对应提示音')
+})
+
+test('录音提示音：页面是 1046Hz 一声「叮」（走同一 AudioContext），安卓壳走 ToneFx 的媒体通道', () => {
+  const html = pageHtmlOf()
+  const tone = /function playRecTone\(kind\) \{([\s\S]*?)\n  \}/.exec(html)
+  assert.ok(tone !== null, '页面要有 playRecTone')
+  assert.ok(tone[1].includes('1046'), '「叮」是 1046Hz（高音 C），不是旧的 440Hz 长嘟声')
+  assert.ok(tone[1].includes('exponentialRampToValueAtTime'), '要有指数衰减包络，听感才像「叮」而不是「嘀」')
+
+  const activity = readFileSync(new URL('../android/app/src/main/java/com/chenpan/assistant/MainActivity.java', import.meta.url), 'utf8')
+  const toneFx = readFileSync(new URL('../android/app/src/main/java/com/chenpan/assistant/ToneFx.java', import.meta.url), 'utf8')
+  assert.ok(activity.includes('private void jsRecGate(boolean on)'), '安卓壳要有 jsRecGate（把「录音中」告诉页面）')
+  const gateAt = activity.indexOf('jsRecGate(true);')
+  const startToneAt = activity.indexOf('playTone(ToneFx.START)')
+  assert.ok(gateAt > 0 && startToneAt > gateAt, '先静朗读（jsRecGate(true)）再响提示音/开麦')
+  assert.ok(activity.includes('playTone(ToneFx.STOP)'), '收麦时也要有提示音')
+  assert.ok(/jsRecGate\(false\)/.test(activity), '收麦/取消/失败路径都要解闸门')
+  assert.ok(toneFx.includes('USAGE_MEDIA'), '提示音必须走媒体通道：系统提示音通道常被静音，这正是「点了没声音」的根因')
+  assert.equal(/RINGER_MODE_NORMAL\) return/.test(toneFx), false, '不再因为铃声档位直接吞掉提示音（媒体音量才是指示音开关）')
+
+  const firmware = readFileSync(new URL('../firmware/esp32-box3/main/main.c', import.meta.url), 'utf8')
+  const audio = readFileSync(new URL('../firmware/esp32-box3/main/tihu_audio.c', import.meta.url), 'utf8')
+  assert.ok(firmware.includes('ptt_ding_task'), '固件按住说话要有「叮」（独立任务，不阻塞 esp_timer）')
+  assert.ok(firmware.includes('tihu_audio_play_ding();'), '固件按下录音要调播放叮')
+  assert.ok(audio.includes('if (tihu_audio_mic_active())'), '固件录音期间必须丢弃 tts.audio（既不播也不排队）')
+})
+
+test('转录标点：中文口语按句读恢复（问句「？」、从句「，」、句末「。」）', () => {
+  assert.equal(punctuateAsrText('帮我把第三段说得更口语一点'), '帮我把第三段说得更口语一点。')
+  assert.equal(punctuateAsrText('你看看今天的任务都完成了吗'), '你看看今天的任务都完成了吗？')
+  assert.equal(punctuateAsrText('先看看固件日志然后告诉我为什么录音没声音'),
+    '先看看固件日志，然后告诉我为什么录音没声音？')
+  assert.equal(punctuateAsrText('把温度场那个算例的边界条件改成第二类然后再跑一遍结果发我'),
+    '把温度场那个算例的边界条件改成第二类，然后再跑一遍结果发我。')
+  // 已经有标点的一律不重排，只补句末。
+  assert.equal(punctuateAsrText('帮我看看这个。已经有的标点不要动'), '帮我看看这个。已经有的标点不要动。')
+  assert.equal(punctuateAsrText('真的吗？'), '真的吗？')
+  // 空串/纯空白不许造出标点。
+  assert.equal(punctuateAsrText(''), '')
+  assert.equal(punctuateAsrText('   '), '')
+})
+
+test('转录标点：幂等、长口述才分行、ASR_TYPO_HINT 机制原样保留', () => {
+  for (const raw of [
+    '帮我把第三段说得更口语一点',
+    '嗯那个我想说的是咱们这个鹈鹕端现在录音的时候还在朗读能不能把朗读先停掉然后录完再恢复还有就是按下去要有一声叮',
+    '先看看固件日志然后告诉我为什么录音没声音',
+  ]) {
+    const once = punctuateAsrText(raw)
+    assert.equal(punctuateAsrText(once), once, '同一段转写补两遍标点结果必须一样：' + once)
+    assert.ok(/[。？]$/.test(once), '句末必须收口：' + once)
+  }
+  const long = punctuateAsrText('第一件事是把录音时的朗读停掉然后第二件事是按下去要有一声叮再有就是语音转录的文本要补标点最后别忘了把这次的改动记到更新日志里然后重新构建验证一遍再说')
+  assert.ok(long.length > 90 ? long.includes('\n') : true, '900 字以上长口述才换行，短句保持一行：' + long)
+  assert.ok(ASR_TYPO_HINT.includes('语音'), 'ASR_TYPO_HINT 常量不能被这次改动碰掉')
+})
+
+await testAsync('语音转录送模型仍带 ASR_TYPO_HINT（键盘手打不加）', async () => {
+  const w = unifiedWorkspace()
+  const socket = openLane(w.runtime)
+  socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-asr-hint', protocol: '0' }, 1)))
+  await waitMs(50)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '帮我看看这个任务', source: 'voice' }, 2)))
+  await waitMs(300)
+  const voiceAsk = w.askPrompts[w.askPrompts.length - 1]
+  assert.ok(voiceAsk !== undefined, '语音那句要真的交给指挥台判')
+  assert.ok(JSON.stringify(voiceAsk.blocks).includes(ASR_TYPO_HINT), '语音转录送模型的站点必须带 ASR_TYPO_HINT')
+
+  const before = w.askPrompts.length
+  await waitMs(200)
+  socket.emit('data', clientFrame(buildUpstream('text.input', { text: '帮我看看这个任务', source: 'keyboard' }, 3)))
+  await waitMs(300)
+  const typedAsk = w.askPrompts[w.askPrompts.length - 1]
+  if (w.askPrompts.length > before && typedAsk !== undefined) {
+    assert.equal(JSON.stringify(typedAsk.blocks).includes(ASR_TYPO_HINT), false, '键盘手打不加 ASR_TYPO_HINT')
+  }
+  w.cleanup()
+})
+
+/* ---------- 2026-11-13 ②：录音上限 3 分钟 + 到上限自动发送 / 极简话筒按钮 / 唤醒开关 ---------- */
+
+test('录音上限 3 分钟：手机端 180 秒，到上限自动收尾发送（不是取消）', () => {
+  const activity = readFileSync(new URL('../android/app/src/main/java/com/chenpan/assistant/MainActivity.java', import.meta.url), 'utf8')
+  assert.ok(activity.includes('private static final int REC_MAX_MS = 180000'), '录音上限必须是 180000ms')
+  assert.equal(activity.includes('REC_MAX_MS = 60000'), false, '旧的 60 秒上限必须删掉')
+  // 自动收尾：先按「手动结束」同一套收尾（提示音 + 解静音闸门 + 转写态），再上传转写。
+  const auto = /if \(autoStop\) \{([\s\S]*?)\n                        \}/.exec(activity)
+  assert.ok(auto !== null, '录音线程到上限要进 autoStop 分支')
+  assert.ok(auto[1].includes('stopRecording(true)'), '到上限要走 stopRecording(true)：转写态 + 提示音 + 解闸门')
+  assert.ok(auto[1].includes('已到 3 分钟上限'), '屏上要说明「已到上限，正在转写发送」')
+  const finishAt = activity.indexOf('onRecordingFinished(gen, pcm, autoStop);')
+  assert.ok(finishAt > 0 && auto.index < finishAt, '收尾顺序：先 stopRecording，再 onRecordingFinished（照常发送）')
+  assert.equal(/autoStop\)[\s\S]{0,400}cancelVoice/.test(activity), false, '到上限绝不允许走取消分支')
+  assert.ok(activity.includes('mmss'), '秒数要按 m:ss 显示（3 分钟后会过 99 秒）')
+  assert.ok(activity.includes('conn.setReadTimeout(180000)'), '上传等转写要放宽到 180 秒（3 分钟音频转写更久）')
+})
+
+await testAsync('转写链路覆盖 3 分钟音频：上限 8MB、超时 150 秒，3 分钟 WAV 能过 /tihu/asr', async () => {
+  assert.equal(TIHU_ASR_MAX_AUDIO_MS, 180_000, '3 分钟＝180000ms')
+  assert.ok(TIHU_ASR_TRANSCRIBE_TIMEOUT_MS >= 150_000, '转写超时至少 150 秒（45 秒会 abort 长录音）')
+  // 3 分钟 16k/mono/16bit WAV 的真实字节数必须落在上限之内，且留有余量。
+  assert.ok(TIHU_ASR_MAX_BYTES > TIHU_ASR_MAX_AUDIO_BYTES, '8MB 上限要大于 3 分钟 WAV 的实际字节数')
+  const handler = createTihuHttpHandler({
+    transcribe: async (audio) => ({ text: '这条三分钟的录音要能进来并转写', source: 'local', elapsedMs: 1, bytes: audio.length }),
+  })
+  const threeMinutes = Buffer.alloc(TIHU_ASR_MAX_AUDIO_BYTES, 0)
+  const { res, state } = fakeAsrRes()
+  assert.equal(handler(fakeAsrReq('POST', threeMinutes), res), true)
+  assert.equal(await waitAsrCode(state), 200, '3 分钟 WAV 不许被 413 挡掉')
+  assert.equal(JSON.parse(state.body).text, '这条三分钟的录音要能进来并转写')
+  // 超过 8MB 仍然要挡（不能把上限删掉）。
+  const { res: bigRes, state: bigState } = fakeAsrRes()
+  createTihuHttpHandler({ transcribe: async () => ({ text: 'x' }) })(fakeAsrReq('POST', Buffer.alloc(TIHU_ASR_MAX_BYTES + 1, 0)), bigRes)
+  assert.equal(await waitAsrCode(bigState), 413, '超过上限仍要 413')
+})
+
+test('录音按钮极简：只画话筒 + 一圈圆环，可点区域盖住整圈', () => {
+  const drawable = readFileSync(new URL('../android/app/src/main/java/com/chenpan/assistant/RecorderButtonDrawable.java', import.meta.url), 'utf8')
+  assert.ok(/canvas\.drawCircle\(/.test(drawable), '要有一圈圆环（drawCircle 描边）')
+  assert.ok(/drawRoundRect\(/.test(drawable), '要有话筒麦头（圆角矩形）')
+  assert.ok(/drawArc\(/.test(drawable), '要有话筒的 U 形托架')
+  // 装饰元素：渐变填充、机身圆角矩形、顶部格栅、光晕/阴影一律不许回来。
+  assert.equal(/new (Linear|Radial|Sweep)Gradient/.test(drawable), false, '不许再画渐变填充')
+  assert.equal(/setShader\((?!null\))/.test(drawable), false, '不许挂任何 Shader（只允许 setShader(null) 复位）')
+  assert.equal(/setShadowLayer|BlurMaskFilter/.test(drawable), false, '不许加阴影/光晕')
+  assert.equal(/for \(int i = 0; i < 3; i\+\+\)/.test(drawable), false, '机身格栅那三条横线已删（不再有 3 条循环）')
+  const activity = readFileSync(new URL('../android/app/src/main/java/com/chenpan/assistant/MainActivity.java', import.meta.url), 'utf8')
+  assert.ok(activity.includes('new FrameLayout.LayoutParams(dp(112), dp(112))'), '按钮做成正方形 112dp：可点区域正好盖住整圈圆环')
+  const recBranch = /if \(st == V_REC\) \{([\s\S]*?)\n        \} else if/.exec(activity)
+  assert.ok(recBranch !== null)
+  assert.equal(/startPulse\(\)/.test(recBranch[1]), false, '录音态不再做呼吸放大圈（多余装饰）')
+})
+
+test('语音唤醒开关：持久化 + 关掉真的停本地引擎 + DSH 端可用的 JS 接口', () => {
+  const activity = readFileSync(new URL('../android/app/src/main/java/com/chenpan/assistant/MainActivity.java', import.meta.url), 'utf8')
+  assert.ok(activity.includes('KEY_WAKE_ON = "wake_enabled"'), '开关要存 SharedPreferences（重启保持）')
+  assert.ok(/prefs\.edit\(\)\.putBoolean\(KEY_WAKE_ON, on\)\.apply\(\)/.test(activity), 'wakeSetEnabled 必须持久化')
+  // 1.3.9：Porcupine 退出启动路径，stopWake 只停板内 WakeNet。
+  const stop = /private void stopWake\(\) \{([\s\S]*?)\n    \}/.exec(activity)
+  assert.ok(stop !== null)
+  assert.equal(stop[1].includes('wake.stop()'), false, '1.3.9 起 Porcupine 不再启动，stopWake 不应再引用 wake')
+  assert.ok(stop[1].includes('wakeLocal.stop()'), '必须停板内 WakeNet（关掉才真的释放麦克风）')
+  const start = /private void startWakeIfNeeded\(\) \{([\s\S]*?)\n    \}/.exec(activity)
+  assert.ok(start !== null)
+  assert.ok(start[1].includes('startLocalWake()'), '启动路径只走板内 WakeNet')
+  assert.equal(/wakeKey\(|wakePpnPath\(/.test(activity), false, 'AccessKey/.ppn 已完全退出启动路径')
+  assert.equal(activity.includes('wakeSetKey'), false, 'wakeSetKey 桥已删')
+  assert.equal(activity.includes('wakePickPpn'), false, 'wakePickPpn 桥已删')
+  assert.equal(activity.includes('wakeSetSensitivity'), false, 'wakeSetSensitivity 桥已删')
+  assert.ok(activity.includes('public String wakeEnabled()'), '要有读取状态的 JS 接口 wakeEnabled()')
+  assert.ok(activity.includes('public String wakeToggle()'), '要有 wakeToggle() 一键反转')
+  assert.ok(activity.includes('@android.webkit.JavascriptInterface'), '接口要挂在 TihuNative 上给页面调用')
+  // 录音/转录中切开关不许打断当前流程。
+  const setEnabled = /public void wakeSetEnabled\(final String value\) \{([\s\S]*?)\n        \}/.exec(activity)
+  assert.ok(setEnabled !== null)
+  assert.ok(setEnabled[1].includes('startWakeIfNeeded()'), '打开时走统一的「该不该开」判定（内部已挡录音/转写）')
+  const page = pageHtmlOf()
+  assert.ok(page.includes('window.__tihuWakeEnabled'), '页面要暴露 __tihuWakeEnabled()')
+  assert.ok(page.includes('window.__tihuWakeSet'), '页面要暴露 __tihuWakeSet(on)')
+  assert.ok(page.includes('TihuNative.wakeSetEnabled'), '页面桥要调用壳的 wakeSetEnabled')
+})
+
+/* ---------- 2026-11-13 ③：指挥台现场信息（会话清单 10 条 + 每条最后一轮对话） ----------
+ *
+ * 用户实机：模型只看到「短号＋截断标题」，根本不知道这些会话在聊什么。这组钉住：
+ *   ① 每条会话只带最后一轮：一条用户消息 + 它对应的助手回复（还没回复就只给用户那条并标「尚未回复」）；
+ *   ② 清单上限 10 条（2026-11-13 从 15、12 一路压到 10，现场提示词更短）、按最近活动排序；
+ *   ③ 单条超 800 字截断并标「…（后略）」；整块现场不超过 6000 字。
+ */
+
+await testAsync('指挥台现场信息：每个会话只带最后一轮对话（用户一条＋助手一条，未回复的标出来）', async () => {
+  const now = Date.now()
+  const historyId = 'session-hist3f00'
+  const pendingId = 'session-pend1f00'
+  const historyEvents = [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '问题一：先把第三节的表格补上' }] } },
+    { type: 'assistant/message', data: { message: { content: [
+      { type: 'reasoning', text: '思考：这里要引用第四节的数据' },
+      { type: 'tool-call', name: 'read_file' },
+      { type: 'text', text: '回答一：表格已经补好，三列对齐。' },
+    ] } } },
+    { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '问题二：再核对一遍数字' }] } },
+    { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '回答二：核对完了，差值 0.02。' }] } } },
+    { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '问题三：把结论写成两句' }] } },
+    { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '回答三：结论是温度场已收敛。' }] } } },
+    { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    // 系统/开发者消息不是用户原话：绝不能混进对话记录。
+    { type: 'user/message', data: { source: { kind: 'developer' }, content: [{ type: 'text', text: 'SYSTEM-REMINDER-MUST-NOT-APPEAR' }] } },
+  ]
+  const pendingEvents = [
+    { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '问题甲：把图 3 的坐标轴换掉' }] } },
+    { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '回答甲：坐标轴已经换成对数轴。' }] } } },
+    { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '问题乙：再跑一遍收敛性检查' }] } },
+  ]
+  const w = unifiedWorkspace({
+    commanderAutoReply: false,
+    seedSessions: ({ fundFolder }) => [
+      cuRecord(historyId, { preset: 'computer-use', cwd: fundFolder, createdAt: now - 600_000, lastPromptAt: now - 120_000, title: '温度场结果核对' }),
+      cuRecord(pendingId, { preset: 'computer-use', cwd: fundFolder, createdAt: now - 500_000, lastPromptAt: now - 60_000, title: '图 3 坐标轴修改' }),
+    ],
+    sessionEvents: { [historyId]: historyEvents, [pendingId]: pendingEvents },
+  })
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-field-dialogue', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '帮我看看这个任务', source: 'voice' }, 2)))
+    await waitMs(400)
+
+    const asked = w.askPrompts[w.askPrompts.length - 1]
+    assert.ok(asked !== undefined, '这句要交给指挥台判：' + JSON.stringify(w.askPrompts.map((item) => item.id)))
+    const tail = String(asked.blocks[1].text)
+    // ① 只带最后一轮：问题三＋回答三；上一轮的问答一律不带。
+    assert.ok(tail.includes('用户：问题三：把结论写成两句'), '最新用户提问要原样带出：' + tail)
+    assert.ok(tail.includes('助手：回答三：结论是温度场已收敛。'), '这一轮的助手回复要带出')
+    assert.equal(tail.includes('问题二'), false, '只给最后一轮，上一轮的用户提问不带：' + tail)
+    assert.equal(tail.includes('回答二'), false, '只给最后一轮，上一轮的助手回复也不带')
+    assert.equal(tail.includes('问题一'), false, '更早的对话不带')
+    assert.equal(tail.includes('回答一'), false, '更早的回答不带')
+    // ② 助手只取正文：thinking 与 tool-call 都不许出现。
+    assert.equal(tail.includes('思考：这里要引用第四节的数据'), false, 'thinking 不是回复正文')
+    assert.equal(tail.includes('read_file'), false, '工具调用不是回复正文')
+    assert.equal(tail.includes('SYSTEM-REMINDER-MUST-NOT-APPEAR'), false, '系统提醒不是用户原话')
+    // ③ 最后一条是用户提问（还没回复）→ 只给这一条并标出来；上一轮的回答不带。
+    assert.ok(/用户：问题乙：再跑一遍收敛性检查（尚未回复）/.test(tail), '没回复的用户提问要标「（尚未回复）」：' + tail)
+    assert.equal(tail.includes('回答甲'), false, '未回复时只给那条用户消息，上一轮回答不带：' + tail)
+  } finally {
+    w.cleanup()
+  }
+})
+
+await testAsync('指挥台现场信息：会话清单最多 10 条（每条一轮）、超长对话截到 800 字标「…（后略）」、整块不超 6000 字', async () => {
+  const now = Date.now()
+  const shortOf = (id) => id.replace(/^session-/, '').slice(0, 8)
+  const ids = Array.from({ length: 20 }, (_, index) => `session-${index.toString(16).padStart(2, '0')}beef00`)
+  const longText = '这一段回复很长，用来验证超长截断规则。'.repeat(80) // 19 字 × 80 = 1520 字，必须触发截断
+  const longEvents = [
+    { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '问题：把完整的推导过程写出来' }] } },
+    { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: longText }] } } },
+  ]
+  const w = unifiedWorkspace({
+    commanderAutoReply: false,
+    seedSessions: ({ fundFolder }) => ids.map((id, index) => cuRecord(id, {
+      preset: 'computer-use',
+      cwd: fundFolder,
+      createdAt: now - (index + 2) * 3_600_000,
+      lastPromptAt: now - index * 60_000,
+      title: `批量会话 ${index}`,
+    })),
+    sessionEvents: { [ids[0]]: longEvents },
+  })
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-field-bulk', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '帮我看看这个任务', source: 'voice' }, 2)))
+    await waitMs(600)
+
+    const asked = w.askPrompts[w.askPrompts.length - 1]
+    assert.ok(asked !== undefined, '这句要交给指挥台判')
+    const tail = String(asked.blocks[1].text)
+    // ① 上限 10 条（20 条候选里取最近 10 条），标题行数得对上。
+    const headerLines = tail.split('\n').filter((line) => /^\d+\) 青年基金申请书 [0-9a-f]{8} /.test(line))
+    assert.equal(headerLines.length, COMMANDER_SESSION_LIMIT, '会话清单必须正好 10 条：' + JSON.stringify(headerLines))
+    assert.ok(tail.includes(shortOf(ids[0])), '最近的那条要在清单里：' + shortOf(ids[0]))
+    assert.ok(tail.includes(shortOf(ids[9])), '第 10 条要在清单里：' + shortOf(ids[9]))
+    assert.equal(tail.includes(shortOf(ids[10])), false, '更旧的第 11 条不许进清单')
+    assert.equal(tail.includes('批量会话 10'), false, '更旧会话的标题也不许出现')
+    // ② 单条 800 字截断 + 明确标记。
+    assert.ok(tail.includes('…（后略）'), '超过 800 字的对话要截断并标「…（后略）」：' + tail.slice(tail.indexOf('助手：')))
+    const dialogueLine = tail.split('\n').find((line) => line.includes('助手：这一段回复很长'))
+    assert.ok(dialogueLine !== undefined, '长回复要出现在对话里')
+    const body = dialogueLine.replace(/^\s*助手：/, '').replace(/…（后略）$/, '')
+    assert.ok([...body].length <= COMMANDER_DIALOGUE_MAX_CHARS, `单条正文不得超过 800 字，实际 ${[...body].length}`)
+    assert.equal(body, [...longText].slice(0, COMMANDER_DIALOGUE_MAX_CHARS).join(''), '截断只切尾巴，正文一字不改')
+    // ③ 整块现场（当前屏幕 + 棋盘 + 会话清单及对话）不超过 6000 字。
+    const field = tail.slice(tail.indexOf('【当前屏幕】'))
+    assert.ok([...field].length <= COMMANDER_FIELD_MAX_CHARS,
+      `现场信息 ${[...field].length} 字超过上限 ${COMMANDER_FIELD_MAX_CHARS}`)
+  } finally {
+    w.cleanup()
+  }
+})
+
+/* ---------- 汇总 ---------- */
+
+test('TihuVoiceUtil: model card', () => {
+  const util = readFileSync(new URL('../android/app/src/main/java/com/chenpan/assistant/TihuVoiceUtil.java', import.meta.url), 'utf8')
+  assert.ok(util.includes('function makeModelCard(){'), 'settings panel must have the commander-model card')
+  // 1.3.9：设置面板里过期的 Picovoice 控件（AccessKey/.ppn）必须彻底消失。
+  assert.equal(util.includes('AccessKey'), false, '设置面板不再有 AccessKey')
+  assert.equal(util.includes('选择 .ppn'), false, '设置面板不再有 .ppn 选择')
+  assert.equal(util.includes('wakeSetKey'), false, '设置面板不再调用 wakeSetKey')
+  assert.equal(util.includes('wakePickPpn'), false, '设置面板不再调用 wakePickPpn')
+  assert.ok(util.includes('ts-wake-score'), '唤醒卡片保留实时分数/rms 显示')
+  assert.ok(util.includes('panelBody.appendChild(makeModelCard());'), 'card must be mounted into the panel')
+  assert.ok(util.includes("c.setAttribute('data-tihu-model-card','1');"),
+    'card root carries the marker that modelSettingsNotice.ts exempts')
+  assert.ok(util.includes('/api/assistant/config'), 'read/save via /api/assistant/config')
+  assert.ok(util.includes('/api/assistant/models'), 'model list via /api/assistant/models')
+  assert.ok(util.includes('background:'), 'save writes tihu.model.background (null = follow default)')
+  assert.ok(util.indexOf('panelBody.appendChild(makeWakeCard());') < util.indexOf('panelBody.appendChild(makeModelCard());'),
+    'new card goes after the wake card (incremental insert, no reorder)')
+  const notice = readFileSync(new URL('../src/client/pocket/mobile/modelSettingsNotice.ts', import.meta.url), 'utf8')
+  assert.ok(notice.includes("'[data-tihu-model-card]'"), 'mobile interception exempts exactly this card')
+  assert.ok(notice.includes('SELF_SERVICE_CARD'), 'exemption must be a named constant')
+
+  // 1.4.0「默认进入页面」：卡片增量插在指挥台模型卡之后，启动路径真的读这个键。
+  assert.ok(util.includes('function makeStartCard(){'), 'settings panel must have the start-screen card')
+  assert.ok(util.includes('panelBody.appendChild(makeStartCard());'), 'start card must be mounted into the panel')
+  assert.ok(util.indexOf('panelBody.appendChild(makeModelCard());') < util.indexOf('panelBody.appendChild(makeStartCard());'),
+    'start card goes after the model card (no reorder of the confirmed card)')
+  assert.ok(util.includes('重启 App 后生效') || util.includes('重启 App 才生效'), 'card must say it takes effect after restart')
+  assert.ok(util.includes('startScreenSet'), 'card saves through TihuNative.startScreenSet')
+  const activity = readFileSync(new URL('../android/app/src/main/java/com/chenpan/assistant/MainActivity.java', import.meta.url), 'utf8')
+  assert.ok(activity.includes('KEY_START_SCREEN = "start_screen"'), 'start screen persists in SharedPreferences (start_screen)')
+  assert.ok(activity.includes('configuredStart = normalizeStartScreen(prefs.getString(KEY_START_SCREEN'),
+    'cold start must read the configured page')
+  const startReadAt = activity.indexOf('configuredStart = normalizeStartScreen(prefs.getString(KEY_START_SCREEN')
+  const landingAt = activity.indexOf('boolean startTihu =')
+  assert.ok(startReadAt > 0 && landingAt > 0 && startReadAt < landingAt,
+    'the configured page must be read before the landing-screen decision')
+  assert.ok(activity.includes('public String startScreenValue()'), 'bridge exposes startScreenValue()')
+  assert.ok(activity.includes('public String startScreenSet(final String value)'), 'bridge exposes startScreenSet(value)')
+  assert.ok(/if \(next\.isEmpty\(\)\) return "err:invalid";/.test(activity), 'illegal value must not be persisted')
+})
+
+/* ---------- 2026-11-13 派单铁律：语音/键盘派单只能落 computer-use 会话 ----------
+ *
+ * 用户实测：侧边栏里一条标着「标准模式」的会话（标题正是那句「改 D:\dsh-assistant 鹈鹕指挥台喂…」）
+ * 收到了鹈鹕的语音。三件事必须钉住：
+ *   ① 指挥台只认「标题整条＝鹈鹕指挥台」且自己确实是 standard 的那条——
+ *      标题里带「鹈鹕指挥台」的任务/后台子会话不算（这就是本次根因）；
+ *   ② 新建派单会话必须真的是 computer-use：宿主没把模式落上就拒绝使用，屏上说明，一句话都不投；
+ *   ③ 已有会话是标准模式时，读页硬绑定也不许投（拦下 + 屏上一句主人看得懂的话，不改派）。
+ */
+await testAsync('派单铁律①：标题里带「鹈鹕指挥台」的标准模式任务会话不许被当成指挥台', async () => {
+  const w = unifiedWorkspace({
+    seedCommander: false,
+    records: [cuRecord('session-decoy', {
+      live: true,
+      preset: 'standard',
+      cwd: '/dsh-assistant/改-d-dsh-assistant-鹈鹕指挥台喂给模型',
+      title: '改 D:\\dsh-assistant 鹈鹕指挥台喂',
+      lastPromptAt: Date.now(),
+    })],
+  })
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-dispatch-mode', protocol: '0' }, 1)))
+    await waitMs(80)
+    const bound = framesOf(socket).filter((frame) => frame.type === 'session.bound').pop()
+    assert.ok(bound !== undefined, '应下发 session.bound')
+    assert.notEqual(bound.payload.sessionId, 'session-decoy', '标题里带字样的标准会话不许当指挥台：' + String(bound.payload.sessionId))
+    assert.equal(w.created.length, 1, '没有真指挥台时要新建一条：' + JSON.stringify(w.created))
+    assert.equal(w.created[0].agentPreset, 'standard', '指挥台仍是 standard（它只看单、不看屏）')
+    assert.equal(w.renamed[0].title, '鹈鹕指挥台', '新建的这条才写指挥台标题')
+    assert.equal(w.prompted.some((item) => item.id === 'session-decoy'), false, '一个字的语音都不许投进那条标准会话')
+  } finally {
+    w.cleanup()
+  }
+})
+
+await testAsync('派单铁律②：宿主没把 computer-use 落上 → 拒绝使用并说明，绝不投进去', async () => {
+  const w = unifiedWorkspace({ createdPresetOf: () => 'standard' })
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-dispatch-mode-fallback', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '把第三段改得口语一点再说一遍', source: 'voice' }, 2)))
+    await waitMs(350)
+    assert.equal(w.created.length, 1, '仍然只建这一条：' + JSON.stringify(w.created))
+    assert.equal(w.created[0].agentPreset, 'computer-use', '请求本来带的就是 computer-use')
+    assert.equal(w.prompted.length, 0, '模式没落上就一句话都不许投：' + JSON.stringify(w.prompted.map((item) => item.id)))
+    const frames = framesOf(socket).filter((frame) => frame.type === 'screen.frame')
+    assert.ok(frames.length > 0, '要有屏帧')
+    // 屏上会先出「会话没建成电脑操作模式」，随后外层再补一帧通用失败屏——两帧都算「说清了原因」。
+    const bulletLines = frames.flatMap((frame) => (frame.payload.bullets ?? []).map(String))
+    assert.ok(bulletLines.some((line) => line.includes('电脑操作模式')), '屏上要说清是模式没落上：' + JSON.stringify(bulletLines))
+  } finally {
+    w.cleanup()
+  }
+})
+
+await testAsync('派单铁律③：读页硬绑定的那条会话是标准模式 → 拦下不投，屏上留一句', async () => {
+  const ledgerDir = mkdtempSync(join(tmpdir(), 'tihu-mode-ledger-'))
+  const ledgerPath = join(ledgerDir, 'ledger.json')
+  const now = Date.now()
+  writeFileSync(ledgerPath, JSON.stringify({
+    v: 1,
+    savedAt: now,
+    tasks: [{
+      taskId: 't9',
+      source: 'tihu',
+      title: '朗读页那条标准会话',
+      projectId: 'card-fund',
+      projectName: '青年基金申请书',
+      preset: 'standard',
+      state: 'running',
+      startedAt: now - 60_000,
+      updatedAt: now,
+      sessionIds: ['session-std'],
+    }],
+  }), 'utf8')
+  const w = unifiedWorkspace({
+    ledgerPath,
+    records: [cuRecord('session-std', { live: false, preset: 'standard', cwd: '/w', title: '一条标准模式会话' })],
+  })
+  try {
+    const socket = openLane(w.runtime)
+    socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'u-read-pin-mode', protocol: '0' }, 1)))
+    await waitMs(60)
+    socket.emit('data', clientFrame(buildUpstream('text.input', {
+      text: '刚才那段再口语一点', source: 'voice', screenHint: 'read', taskId: 't9',
+    }, 2)))
+    await waitMs(400)
+    assert.equal(w.prompted.filter((item) => item.id === 'session-std').length, 0,
+      '标准模式会话一句话都不许投：' + JSON.stringify(w.prompted.map((item) => item.id)))
+    const bulletLines = framesOf(socket)
+      .filter((frame) => frame.type === 'screen.frame')
+      .flatMap((frame) => (frame.payload.bullets ?? []).map(String))
+    assert.ok(bulletLines.some((line) => line.includes('标准模式')), '屏上要留一句「那条会话是标准模式」：' + JSON.stringify(bulletLines))
+    assert.equal(w.created.length, 0, '拒绝时不许偷偷新建/改派会话')
+  } finally {
+    w.cleanup()
+    try { rmSync(ledgerDir, { recursive: true, force: true }) } catch { /* 忽略 */ }
+  }
+})
+
+console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'} ${passed}/${passed + failed}`)
+
 if (failed > 0) process.exit(1)
 process.exit(0)

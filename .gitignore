@@ -31,3 +31,22 @@ Thumbs.db
 
 # 鹈鹕（tihu）运行时产物：写前快照与审计日志（会话工作区里自动生成）
 .tihu/
+
+# Local build/runtime artifacts and backups (added 2026-11-13)
+android/tools/
+android/dist/
+android/assistant.keystore
+whisper/
+.artifacts/
+.tihu-preview/
+tmp-serial/
+out/
+build-out.txt
+test-out*.txt
+*.bak
+*.bak2
+*.bak-*
+dist/*.apk
+/*.apk
+/ESP32-S3-BOX-3-AIoT-*.pdf
+/ESP32-S3-BOX-3-AIoT-*.pdf

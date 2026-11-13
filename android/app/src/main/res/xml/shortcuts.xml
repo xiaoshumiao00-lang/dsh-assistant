@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 桌面图标长按 → 「设置地址」：全面屏手势导航的手机没有返回键可长按，这是最稳的入口 -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutId="settings"
+        android:shortcutShortLabel="@string/shortcut_settings"
+        android:shortcutLongLabel="@string/shortcut_settings_long">
+        <intent
+            android:action="android.intent.action.MAIN"
+            android:targetClass="com.chenpan.assistant.MainActivity"
+            android:targetPackage="com.chenpan.assistant">
+            <extra
+                android:name="open_settings"
+                android:value="1"
+                android:valueType="intType" />
+        </intent>
+        <categories android:name="android.shortcut.conversation" />
+    </shortcut>
+</shortcuts>

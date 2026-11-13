@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>鹈鹕 × 控制室 · 最终界面</title>
+<style>
+  :root{
+    --amber:#d9901f; --green:#22a06b; --teal:#2f7d68; --blue:#4a7bd7;
+    --ink:#1f2933; --ink2:#3b4653; --muted:#6b7785; --faint:#93a0ae;
+    --line:#e3e6ea; --line2:#edf0f3;
+    --page:#eef0f3; --panel:#f6f7f9; --card:#fff;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; min-width:1200px; min-height:100vh; background:var(--page); color:var(--ink);
+    font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC",system-ui,-apple-system,sans-serif;
+    -webkit-font-smoothing:antialiased; display:flex; justify-content:center; align-items:center;
+    padding:20px;
+  }
+  button{font-family:inherit; cursor:default; border:0; background:none; padding:0; color:inherit}
+  svg{display:block}
+
+  .app{width:1144px}
+
+  /* ================= 顶部统一外壳 ================= */
+  .shell{
+    height:54px; background:#fff; border:1px solid var(--line); border-radius:14px;
+    box-shadow:0 2px 6px rgba(31,41,51,.05), 0 10px 26px rgba(31,41,51,.05);
+    display:flex; align-items:center; gap:14px; padding:0 14px;
+  }
+  .ball{
+    position:relative; width:32px; height:32px; border-radius:50%; flex:none;
+    background:#fffaf0; border:2px solid var(--amber);
+    box-shadow:0 0 0 4px rgba(217,144,31,.14);
+    display:flex; align-items:center; justify-content:center;
+    font-size:12px; font-weight:700; color:#a86c0c;
+  }
+  .ball::after{
+    content:""; position:absolute; inset:-5px; border-radius:50%;
+    border:1px solid rgba(217,144,31,.35);
+  }
+  .seg{
+    display:flex; padding:3px; background:#f1f3f6; border:1px solid var(--line); border-radius:11px; flex:none;
+  }
+  .seg button{
+    height:24px; padding:0 14px; border-radius:8px; font-size:12px; color:var(--muted);
+  }
+  .seg button.on{
+    background:#fff; color:var(--ink); font-weight:600;
+    box-shadow:0 1px 2px rgba(31,41,51,.12), 0 0 0 1px rgba(31,41,51,.04);
+  }
+  .search{
+    display:flex; align-items:center; gap:8px; height:32px; flex:1; max-width:420px; margin:0 auto;
+    background:#f4f6f8; border:1px solid var(--line); border-radius:10px; padding:0 10px; color:var(--faint);
+  }
+  .search input{
+    border:0; background:none; outline:none; font:inherit; font-size:12.5px; color:var(--ink); width:100%;
+  }
+  .search input::placeholder{color:#9aa5b1}
+  .tools{display:flex; align-items:center; gap:4px; flex:none}
+  .tools button{
+    width:32px; height:32px; border-radius:9px; color:#5d6a78;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .tools button:hover{background:#f2f4f7}
+  .tools button.act{background:#eef7f4; color:var(--teal)}
+
+  /* ================= 密度标签 ================= */
+  .labels{
+    display:grid; grid-template-columns:320px 800px; gap:24px; margin:16px 0 8px; padding:0 2px;
+  }
+  .labels span{font-size:11px; letter-spacing:.14em; color:#8b96a2; display:flex; align-items:center; gap:6px}
+  .labels span::before{content:""; width:5px; height:5px; border-radius:50%; background:#c3cbd4}
+  .labels span:first-child::before{background:var(--teal)}
+  .labels span:last-child::before{background:var(--blue)}
+
+  /* ================= 两栏 ================= */
+  .stage{display:grid; grid-template-columns:320px 800px; gap:24px; align-items:start}
+
+  /* ================= 鹈鹕屏 320×240 ================= */
+  .screen{
+    position:relative; width:320px; height:240px; border-radius:16px; border:1px solid #2f7d68;
+    background:linear-gradient(180deg,#0b1712 0%,#10231c 100%);
+    box-shadow:0 16px 34px rgba(11,23,18,.28), inset 0 0 0 1px rgba(120,220,190,.06);
+    padding:9px 9px 0; overflow:hidden; font-size:7px; color:#cfe3da;
+  }
+  .srow{display:flex; align-items:center; gap:4px; height:16px}
+  .spill{
+    height:15px; padding:0 5px; border-radius:8px; font-size:7px; font-weight:600;
+    display:inline-flex; align-items:center; gap:3px; white-space:nowrap;
+  }
+  .spill b{font-weight:700}
+  .spill .sd{width:3.5px; height:3.5px; border-radius:50%; flex:none}
+  .spill.amber{background:rgba(217,144,31,.16); color:#e9b565; border:1px solid rgba(217,144,31,.32)}
+  .spill.amber .sd{background:var(--amber)}
+  .spill.teal{background:rgba(47,125,104,.28); color:#84d6bd; border:1px solid rgba(79,181,152,.28)}
+  .spill.teal .sd{background:#4fbfa1}
+  .spill.gray{background:rgba(255,255,255,.06); color:#8fa79b; border:1px solid rgba(255,255,255,.08)}
+  .spill.gray .sd{background:#7d8f87}
+  .spill.green{background:rgba(34,160,107,.2); color:#77d6a9; border:1px solid rgba(34,160,107,.3)}
+  .spill.green .sd{background:var(--green)}
+  .stime{margin-left:auto; font-size:7px; color:#6f8a7c; font-variant-numeric:tabular-nums; letter-spacing:.04em}
+
+  .sproj{display:flex; align-items:center; gap:5px; height:14px; margin-top:5px; font-size:7px; color:#7c988a}
+  .sproj .src{
+    height:12px; line-height:12px; padding:0 4px; border-radius:4px; font-size:6.4px;
+    color:#9fe0cb; border:1px solid rgba(79,181,152,.5); background:rgba(47,125,104,.16);
+  }
+  .sproj .sep{color:#4d6558}
+
+  .stask{margin-top:7px}
+  .stitle{font-size:9px; font-weight:600; color:#e9f5ef; letter-spacing:.02em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .sprog{display:flex; align-items:center; gap:5px; margin-top:5px; height:6px}
+  .sbar{flex:1; height:3px; border-radius:2px; background:rgba(255,255,255,.09); overflow:hidden}
+  .sbar i{display:block; height:100%; width:63%; border-radius:2px; background:linear-gradient(90deg,#2f7d68,#4fbfa1)}
+  .snum{font-size:6px; color:#89a597; font-variant-numeric:tabular-nums}
+  .sago{font-size:6px; color:#6d897b}
+
+  .spager{display:flex; align-items:center; justify-content:space-between; margin-top:7px; height:15px}
+  .spg{
+    height:15px; padding:0 7px; border-radius:7px; font-size:7px; color:#a9c4b7;
+    background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.09); display:flex; align-items:center;
+  }
+  .spg.mid{background:none; border:0; color:#dceee6; font-size:7px; font-variant-numeric:tabular-nums}
+  .sdots{display:flex; align-items:center; justify-content:center; gap:3px; height:5px; margin-top:2px}
+  .sdots i{width:3px; height:3px; border-radius:2px; background:rgba(255,255,255,.2)}
+  .sdots i.on{width:10px; background:var(--amber)}
+
+  .spend{
+    height:20px; margin-top:6px; border-radius:6px; display:flex; align-items:center; gap:5px; padding:0 6px;
+    background:rgba(217,144,31,.13); border:1px solid rgba(217,144,31,.4);
+  }
+  .spend .t{font-size:7px; font-weight:600; color:#e9b86a}
+  .spend .tag{
+    margin-left:auto; height:12px; line-height:12px; padding:0 4px; border-radius:5px;
+    font-size:6.2px; color:#d8ad6c; border:1px solid rgba(217,144,31,.35);
+  }
+  .spend.dir{
+    background:rgba(255,255,255,.045); border:1px solid rgba(255,255,255,.1);
+  }
+  .spend.dir .t{color:#a8bdb2; font-weight:500}
+  .spend.dir .tag{color:#8fa79b; border-color:rgba(255,255,255,.12)}
+
+  .sbtns{position:absolute; left:9px; bottom:44px; display:flex; gap:6px}
+  .sbtn{
+    height:18px; padding:0 13px; border-radius:9px; font-size:7.5px; font-weight:600;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .sbtn.a{background:var(--amber); color:#22170a; box-shadow:0 2px 6px rgba(217,144,31,.3)}
+  .sbtn.b{border:1px solid rgba(79,181,152,.5); color:#8fd2bd; background:rgba(47,125,104,.12)}
+
+  .sball{
+    position:absolute; right:10px; bottom:8px; width:32px; height:32px; border-radius:50%;
+    border:2px solid var(--amber); background:rgba(217,144,31,.1);
+    display:flex; align-items:center; justify-content:center;
+    font-size:10px; font-weight:700; color:#e9b565;
+    box-shadow:0 0 0 4px rgba(217,144,31,.1);
+  }
+
+  .svol{
+    position:absolute; left:9px; bottom:8px; width:132px; height:26px; border-radius:8px;
+    background:rgba(255,255,255,.055); border:1px solid rgba(255,255,255,.12);
+    display:flex; align-items:center; gap:6px; padding:0 8px; color:#9db5a8;
+  }
+  .svol .mute{display:flex; align-items:center; gap:3px; font-size:6.5px; color:#8fa79b}
+  .svol .bars{display:flex; align-items:flex-end; gap:2px; height:13px}
+  .svol .bars i{width:3px; border-radius:1px; background:rgba(217,144,31,.55)}
+  .svol .bars i:nth-child(1){height:4px}
+  .svol .bars i:nth-child(2){height:7px}
+  .svol .bars i:nth-child(3){height:9px}
+  .svol .bars i:nth-child(4){height:11px}
+  .svol .bars i:nth-child(5){height:13px; background:var(--amber)}
+  .svol .val{margin-left:auto; font-size:7px; font-weight:700; color:#e2c38c; font-variant-numeric:tabular-nums}
+
+  /* ================= 控制室窗口 ================= */
+  .win{
+    width:800px; background:var(--panel); border:1px solid var(--line); border-radius:14px;
+    box-shadow:0 3px 8px rgba(31,41,51,.05), 0 18px 42px rgba(31,41,51,.12);
+    overflow:visible; position:relative;
+  }
+  .tbar{
+    height:36px; display:flex; align-items:center; gap:7px; padding:0 12px;
+    border-bottom:1px solid var(--line); background:#fff; border-radius:13px 13px 0 0;
+  }
+  .tl{width:10px; height:10px; border-radius:50%}
+  .tl.r{background:#ff5f57}.tl.y{background:#febc2e}.tl.g{background:#28c840}
+  .ttl{margin-left:8px; font-size:11px; color:#8d97a3; letter-spacing:.02em}
+
+  .wbody{
+    position:relative; display:grid; grid-template-columns:178px 306px 268px; gap:12px;
+    padding:12px; align-items:start;
+  }
+  .scrim{
+    position:absolute; inset:0;
+    background:linear-gradient(90deg, rgba(17,26,31,.028) 0%, rgba(17,26,31,.035) 52%, rgba(17,26,31,.10) 100%);
+    border-radius:0 0 13px 13px; z-index:2; pointer-events:none;
+  }
+  .col{position:relative; z-index:1; display:flex; flex-direction:column; gap:10px}
+  .col.right{z-index:3; display:block}
+
+  /* 项目卡 */
+  .pcard{
+    background:var(--card); border:1px solid var(--line); border-radius:12px; padding:10px;
+    box-shadow:0 1px 2px rgba(31,41,51,.04);
+  }
+  .pcard.on{
+    border-color:rgba(217,144,31,.55);
+    box-shadow:0 0 0 3px rgba(217,144,31,.13), 0 2px 6px rgba(31,41,51,.05);
+  }
+  .phead{display:flex; align-items:center; gap:6px}
+  .pico{
+    width:20px; height:20px; border-radius:6px; display:flex; align-items:center; justify-content:center;
+    background:#eef2f7; color:#5b6f8a; flex:none;
+  }
+  .pcard.on .pico{background:#fdf3e2; color:#a8720c}
+  .pname{font-size:11px; font-weight:700; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .pcard.done .pico{background:#e9f6ef; color:#1c7f56}
+  .badge{
+    margin-left:auto; min-width:15px; height:15px; padding:0 4px; border-radius:8px;
+    background:var(--amber); color:#fff; font-size:9px; font-weight:700;
+    display:flex; align-items:center; justify-content:center; flex:none;
+  }
+  .badge.ok{background:var(--green)}
+  .pmeta{display:flex; align-items:center; gap:4px; margin-top:6px; font-size:9px; color:#7b8694}
+  .pdot{width:6px; height:6px; border-radius:50%}
+  .pdot.amber{background:var(--amber); box-shadow:0 0 0 3px rgba(217,144,31,.16)}
+  .pdot.green{background:var(--green); box-shadow:0 0 0 3px rgba(34,160,107,.14)}
+  .pbar{height:3px; border-radius:2px; background:#eef1f5; margin-top:7px; overflow:hidden}
+  .pbar i{display:block; height:100%; border-radius:2px; background:linear-gradient(90deg,#e0a53a,#d9901f)}
+  .pbar.g i{width:100%; background:linear-gradient(90deg,#2fae7a,#22a06b)}
+  .newtask{
+    margin-top:8px; width:100%; height:22px; border-radius:7px; font-size:10px;
+    color:#3f4c5b; background:#f4f6f9; border:1px dashed #d7dde5;
+    display:flex; align-items:center; justify-content:center; gap:3px;
+  }
+  .pfoot{display:flex; gap:4px; margin-top:8px}
+  .pfoot button{
+    flex:1; height:20px; border-radius:6px; border:1px solid var(--line); background:#fff;
+    font-size:8.5px; color:#4a5768; white-space:nowrap; padding:0 2px;
+  }
+  .pfoot button.primary{background:#f3f6fd; border-color:#cfdaf1; color:#2f53a0; font-weight:600}
+
+  /* 会话卡 */
+  .scard{
+    background:var(--card); border:1px solid var(--line); border-radius:12px; padding:11px;
+    box-shadow:0 1px 3px rgba(31,41,51,.05);
+  }
+  .sc-head{display:flex; align-items:center; gap:6px}
+  .sc-title{font-size:12.5px; font-weight:700; letter-spacing:.01em}
+  .sc-dot{width:6px; height:6px; border-radius:50%; background:var(--blue); box-shadow:0 0 0 3px rgba(74,123,215,.14)}
+  .sc-act{display:flex; align-items:center; gap:5px; margin-top:7px; font-size:9.5px; color:#5f6c7b}
+  .sc-act .ago{margin-left:auto; color:#9aa5b1; font-size:9px}
+  .sc-dec{
+    margin-top:9px; border-radius:8px; background:#fdf7ea; border:1px solid #f0dfbc; padding:8px 9px;
+  }
+  .sc-dec .q{font-size:9.5px; color:#8a6412; display:flex; align-items:center; gap:5px}
+  .sc-dec .q i{width:6px; height:6px; border-radius:50%; background:var(--amber); flex:none}
+  .chips{display:flex; gap:5px; margin-top:7px; flex-wrap:wrap}
+  .chips button{
+    height:20px; padding:0 9px; border-radius:6px; font-size:9px; color:#7d5708;
+    background:#fff; border:1px solid #ecd9ad;
+  }
+  .chips button.yes{background:var(--amber); border-color:var(--amber); color:#fff; font-weight:600}
+  .sc-foot{display:flex; gap:5px; margin-top:9px}
+  .sc-foot button{
+    height:22px; padding:0 10px; border-radius:6px; border:1px solid var(--line); background:#fff;
+    font-size:9px; color:#4a5768;
+  }
+  .sc-foot button.primary{background:#eef3fd; border-color:#c9d8f4; color:#2b4f9e; font-weight:600}
+  .sc-att{display:flex; align-items:center; gap:6px; margin-top:10px}
+  .thumb{
+    width:34px; height:34px; border-radius:7px; background:#eef1f5; border:1px solid var(--line);
+    display:flex; align-items:center; justify-content:center; color:#9aa5b1; flex:none;
+  }
+  .achip{
+    height:20px; padding:0 7px; border-radius:6px; background:#f4f6f9; border:1px solid var(--line2);
+    font-size:8.5px; color:#5f6c7b; display:flex; align-items:center; gap:3px; white-space:nowrap;
+  }
+  .drop{
+    flex:1; min-width:84px; height:34px; border-radius:7px; border:1px dashed #ccd4de;
+    color:#8b96a2; font-size:8.5px; display:flex; align-items:center; justify-content:center; gap:4px;
+    background:#fbfcfd;
+  }
+  .sc-dir{display:flex; align-items:center; gap:5px; margin-top:9px; padding-top:9px; border-top:1px solid var(--line2)}
+  .dirbox{
+    flex:1; min-width:0; height:24px; border-radius:6px; border:1px solid var(--line); background:#f8f9fb;
+    display:flex; align-items:center; gap:5px; padding:0 7px; color:#65717f; overflow:hidden;
+  }
+  .dirbox span{font-family:"Cascadia Code",Consolas,monospace; font-size:8px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; direction:ltr}
+  .editable{
+    height:18px; padding:0 5px; border-radius:5px; font-size:8px; color:#2f7d68;
+    background:#e9f4ef; border:1px solid #cfe6da; display:flex; align-items:center; flex:none;
+  }
+  .select{
+    height:24px; padding:0 6px; border-radius:6px; border:1px solid var(--line); background:#fff;
+    font-size:8.5px; color:#4a5768; display:flex; align-items:center; gap:4px; flex:none;
+  }
+
+  /* 会话列表浮层 */
+  .panel{
+    background:#fff; border:1px solid #dde2e8; border-radius:12px;
+    box-shadow:0 16px 36px rgba(17,26,31,.16), 0 2px 6px rgba(17,26,31,.06);
+    overflow:hidden; display:flex; flex-direction:column;
+  }
+  .panel-head{display:flex; align-items:center; gap:6px; padding:9px 10px; border-bottom:1px solid var(--line2)}
+  .panel-head .t{font-size:11px; font-weight:700}
+  .panel-head .c{font-size:8px; color:var(--faint); white-space:nowrap}
+  .panel-head .r{margin-left:auto; display:flex; align-items:center; gap:2px}
+  .icbtn{width:20px; height:20px; border-radius:5px; display:flex; align-items:center; justify-content:center; color:#7d8794}
+  .icbtn.f{border:1px solid var(--line); background:#fafbfc; font-size:7.5px; gap:2px; width:auto; padding:0 5px}
+  .plist{flex:1}
+  .prow{
+    display:flex; flex-direction:column; gap:3px; padding:7px 10px; border-bottom:1px solid #f4f6f8;
+    border-left:3px solid transparent;
+  }
+  .prow .rt{display:flex; align-items:center; gap:5px}
+  .prow .name{font-size:9.5px; color:#33404f; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .prow .meta{display:flex; align-items:center; gap:5px}
+  .prow .dir{
+    font-size:7.5px; color:#7f8b99; background:#f4f6f9; border:1px solid #eef1f5;
+    border-radius:4px; padding:0 4px; height:13px; line-height:12px; white-space:nowrap;
+  }
+  .prow .live{width:5px; height:5px; border-radius:50%; background:var(--blue); margin-left:auto}
+  .prow.cur{background:#eff4fd; border-left-color:var(--blue)}
+  .prow.cur .name{color:#23407a}
+  .panel-foot{
+    display:flex; align-items:center; gap:6px; padding:7px 10px; border-top:1px solid var(--line2);
+    background:#fbfcfd; font-size:8px; color:#8b96a2;
+  }
+  .panel-foot button{
+    height:18px; padding:0 7px; border-radius:5px; border:1px solid var(--line); background:#fff;
+    font-size:8px; color:#5f6c7b;
+  }
+  .panel-foot .pg{margin:0 auto; color:#5f6c7b; font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ===== 合并后的统一外壳：一个球、一套状态、两种密度 ===== -->
+  <div class="shell">
+    <div class="ball">1</div>
+    <div class="seg">
+      <button>办公室</button>
+      <button class="on">外出</button>
+    </div>
+    <div class="search">
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="4.4" stroke="currentColor" stroke-width="1.5"/><path d="M10.4 10.4 14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      <input value="" placeholder="搜索会话">
+    </div>
+    <div class="tools">
+      <button class="act" title="语音输入">
+        <svg width="16" height="16" viewBox="0 0 20 20" fill="none"><rect x="7" y="2.5" width="6" height="10" rx="3" stroke="currentColor" stroke-width="1.5"/><path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+      <button title="语音播报">
+        <svg width="16" height="16" viewBox="0 0 20 20" fill="none"><path d="M4 8h2.4L10 5v10L6.4 12H4V8Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M13 7.5a4 4 0 0 1 0 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+      <button title="设置">
+        <svg width="16" height="16" viewBox="0 0 20 20" fill="none"><path d="M3 6h14M3 10h14M3 14h14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="13" cy="6" r="2.2" fill="#fff" stroke="currentColor" stroke-width="1.5"/><circle cx="7" cy="10" r="2.2" fill="#fff" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="14" r="2.2" fill="#fff" stroke="currentColor" stroke-width="1.5"/></svg>
+      </button>
+      <button title="主题">
+        <svg width="16" height="16" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="3.2" stroke="currentColor" stroke-width="1.5"/><path d="M10 2.9v1.5M10 15.6v1.5M2.9 10h1.5M15.6 10h1.5M5 5l1.1 1.1M13.9 13.9 15 15M15 5l-1.1 1.1M6.1 13.9 5 15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- ===== 密度标签 ===== -->
+  <div class="labels">
+    <span>外出 · 鹈鹕</span>
+    <span>办公室 · 控制室</span>
+  </div>
+
+  <div class="stage">
+
+    <!-- ================= 鹈鹕 320×240 ================= -->
+    <div class="screen">
+
+      <div class="srow">
+        <span class="spill amber"><i class="sd"></i>等你 <b>1</b></span>
+        <span class="spill teal"><i class="sd"></i>在跑 <b>2</b></span>
+        <span class="spill gray"><i class="sd"></i>排队 <b>0</b></span>
+        <span class="spill green"><i class="sd"></i>完成 <b>12</b></span>
+        <span class="stime">09:41</span>
+      </div>
+
+      <div class="sproj">
+        <span class="src">鹈鹕发起</span>
+        <span>dsh-assistant</span>
+        <span class="sep">/</span>
+        <span>PTL-0427</span>
+      </div>
+
+      <div class="stask">
+        <div class="stitle">磷石膏 SCI 第8步 文字优化</div>
+        <div class="sprog">
+          <div class="sbar"><i></i></div>
+          <span class="snum">12/19</span>
+          <span class="sago">2 分钟</span>
+        </div>
+      </div>
+
+      <div class="spager">
+        <span class="spg">上一页</span>
+        <span class="spg mid">第 2 / 5 页</span>
+        <span class="spg">下一页</span>
+      </div>
+      <div class="sdots"><i></i><i class="on"></i><i></i><i></i><i></i></div>
+
+      <div class="spend">
+        <svg width="9" height="9" viewBox="0 0 12 12" fill="none"><rect x="2" y="5.2" width="8" height="5.6" rx="1.4" stroke="#e9b86a" stroke-width="1.2"/><path d="M4 5.2V3.9a2 2 0 0 1 4 0v1.3" stroke="#e9b86a" stroke-width="1.2"/></svg>
+        <span class="t">待补：附件</span>
+        <span class="tag">控制室补齐</span>
+      </div>
+
+      <div class="spend dir">
+        <svg width="9" height="9" viewBox="0 0 12 12" fill="none"><path d="M1.6 3.2h3l1.1 1.3h4.7v5.1H1.6V3.2Z" stroke="#9db5a8" stroke-width="1.1" stroke-linejoin="round"/></svg>
+        <span class="t">待补：目录</span>
+        <span class="tag">镜像</span>
+      </div>
+
+      <div class="sbtns">
+        <button class="sbtn a">应答</button>
+        <button class="sbtn b">语音</button>
+      </div>
+
+      <div class="svol">
+        <span class="mute">
+          <svg width="9" height="9" viewBox="0 0 14 14" fill="none"><path d="M2.4 5.4h2L8 3v8L4.4 8.6h-2V5.4Z" stroke="#9db5a8" stroke-width="1.1" stroke-linejoin="round"/><path d="M10 5.2 12.4 9.4M12.4 5.2 10 9.4" stroke="#c07a4a" stroke-width="1.1" stroke-linecap="round"/></svg>
+          静音
+        </span>
+        <span class="bars"><i></i><i></i><i></i><i></i><i></i></span>
+        <span class="val">85</span>
+      </div>
+
+      <div class="sball">1</div>
+    </div>
+
+    <!-- ================= 控制室 full ================= -->
+    <div class="win">
+      <div class="tbar">
+        <span class="tl r"></span><span class="tl y"></span><span class="tl g"></span>
+        <span class="ttl">dsh-assistant — ConsolePane</span>
+      </div>
+
+      <div class="wbody">
+        <div class="scrim"></div>
+
+        <!-- 左列：项目卡 -->
+        <div class="col left">
+          <div class="pcard on">
+            <div class="phead">
+              <span class="pico">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M2 4.5h4.2l1.4 1.7H14v6.3H2V4.5Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+              </span>
+              <span class="pname">磷石膏 SCI</span>
+              <span class="badge">1</span>
+            </div>
+            <div class="pmeta"><i class="pdot amber"></i>第8步 · 在跑</div>
+            <div class="pbar"><i style="width:63%"></i></div>
+            <button class="newtask">＋ 新任务</button>
+            <div class="pfoot">
+              <button>会话列表</button><button class="primary">＋新建会话</button><button>移交</button>
+            </div>
+          </div>
+
+          <div class="pcard done">
+            <div class="phead">
+              <span class="pico">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M2.5 13V8.2M6.2 13V5.4M9.9 13V7M13.6 13V3.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+              </span>
+              <span class="pname">青年基金 · NSSFC</span>
+              <span class="badge ok">✓</span>
+            </div>
+            <div class="pmeta"><i class="pdot green"></i>完成 · 3 小时前</div>
+            <div class="pbar g"><i></i></div>
+            <div class="pfoot" style="margin-top:10px">
+              <button>会话列表</button><button class="primary">＋新建会话</button><button>移交</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 中列：会话卡 -->
+        <div class="col mid">
+          <div class="scard">
+            <div class="sc-head">
+              <span class="sc-title">磷石膏 SCI · 第8步</span>
+              <span class="sc-dot" style="margin-left:auto"></span>
+            </div>
+            <div class="sc-act">正在跑 · 术语统一检查 12/19<span class="ago">2 分钟前</span></div>
+
+            <div class="sc-dec">
+              <div class="q"><i></i>是否跳过术语统一检查</div>
+              <div class="chips">
+                <button class="yes">是</button>
+                <button>否</button>
+                <button>第8步</button>
+                <button>第9步</button>
+              </div>
+            </div>
+
+            <div class="sc-foot">
+              <button>会话列表</button>
+              <button class="primary">＋新建会话</button>
+              <button>移交</button>
+            </div>
+
+            <div class="sc-att">
+              <div class="thumb">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="2" y="2.6" width="12" height="10.8" rx="2" stroke="currentColor" stroke-width="1.3"/><path d="M2.6 11 6 7.8l2.4 2.2 2-1.8 3 2.6" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+              </div>
+              <span class="achip">
+                <svg width="9" height="9" viewBox="0 0 12 12" fill="none"><path d="M9.6 5.6 5.9 9.3a2.2 2.2 0 0 1-3.1-3.1l4.2-4.2a1.5 1.5 0 0 1 2.1 2.1L5 8.2a.75.75 0 0 1-1.1-1l3.9-3.9" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg>
+                附件 2
+              </span>
+              <span class="achip">
+                <svg width="9" height="9" viewBox="0 0 12 12" fill="none"><rect x="1.8" y="2.4" width="8.4" height="7.2" rx="1.4" stroke="currentColor" stroke-width="1.1"/><path d="M2.2 8 4.6 5.7l1.6 1.5 1.4-1.2 2.2 2" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/></svg>
+                图片 1
+              </span>
+              <button class="drop">＋ 附件 / 图片</button>
+            </div>
+
+            <div class="sc-dir">
+              <div class="dirbox">
+                <svg width="10" height="10" viewBox="0 0 16 16" fill="none" style="flex:none"><path d="M2 4.5h4.2l1.4 1.7H14v6.3H2V4.5Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+                <span>D:\陈潘HBEU\Documents\15磷石膏...</span>
+              </div>
+              <span class="editable">可改</span>
+              <span class="select">项目库
+                <svg width="8" height="8" viewBox="0 0 10 10" fill="none"><path d="M2 4l3 3 3-3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 右列：会话列表浮层 -->
+        <div class="col right">
+          <div class="panel">
+            <div class="panel-head">
+              <span class="t">会话列表</span>
+              <span class="c">24 个 · 第 1/3 页</span>
+              <span class="r">
+                <button class="icbtn f">过滤
+                  <svg width="7" height="7" viewBox="0 0 10 10" fill="none"><path d="M1.6 2.4h6.8L5.8 5.6v3.2L4.2 7.6V5.6L1.6 2.4Z" stroke="currentColor" stroke-width="1"/></svg>
+                </button>
+                <button class="icbtn">
+                  <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M2 2l6 6M8 2l-6 6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+                </button>
+              </span>
+            </div>
+
+            <div class="plist">
+              <div class="prow cur">
+                <div class="rt"><span class="name">磷石膏 SCI · 第8步</span></div>
+                <div class="meta"><span class="dir">项目根</span><span class="live"></span></div>
+              </div>
+              <div class="prow">
+                <div class="rt"><span class="name">术语统一检查</span></div>
+                <div class="meta"><span class="dir">08-全文文字优化</span><span class="live"></span></div>
+              </div>
+              <div class="prow">
+                <div class="rt"><span class="name">Abstract 润色</span></div>
+                <div class="meta"><span class="dir">09-英文翻译</span></div>
+              </div>
+              <div class="prow">
+                <div class="rt"><span class="name">参考文献核对</span></div>
+                <div class="meta"><span class="dir">09-英文翻译</span><span class="live"></span></div>
+              </div>
+              <div class="prow">
+                <div class="rt"><span class="name">图表 3 重绘</span></div>
+                <div class="meta"><span class="dir">项目根</span></div>
+              </div>
+            </div>
+
+            <div class="panel-foot">
+              <button>上一页</button>
+              <span class="pg">第 1 / 3 页</span>
+              <button>下一页</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>

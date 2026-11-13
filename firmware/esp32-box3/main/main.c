@@ -25,11 +25,16 @@
 #include "nvs_flash.h"
 #include "tihu_audio.h"
 #include "tihu_net.h"
+#include "tihu_ota.h"
+#include "tihu_volume.h"
+#include "tihu_wake.h"
 #include "ui.h"
 #include "bsp/esp-box-3.h"
 
 static const char *TAG = "tihu_main";
 static bool s_ptt_active;
+/** 本次按住因为「麦克风未就绪」没开麦：松手时只收屏，不做 mic_stop/上传。 */
+static bool s_ptt_mic_failed;
 
 #define TIHU_UI_TASK_STACK   (12 * 1024)
 #define TIHU_UI_TASK_PRIO    3
@@ -84,6 +89,87 @@ static void tihu_ui_task(void *arg)
     }
 }
 
+/*
+ * 按住 CONFIG 键说话。
+ *
+ * ⚠ 这两个回调**跑在 esp_timer 任务里**（iot_button 用 esp_timer 每 5 ms 轮询按键，
+ * dispatch_method = ESP_TIMER_TASK），WS 心跳、录音收尾、音量小条、OTA 定时全排在
+ * 同一个任务上。所以顺序铁律是：
+ *   1) 先给屏上反馈、先给宿主发自证 alert（短操作、有界超时）；
+ *   2) 再做停声/开麦这类可能慢的事；
+ *   3) 任何一步失败都必须留下看得见的痕迹，不允许静默 return。
+ *
+ * 0.3.9：屏上反馈**无条件先出现**——只要检测到按下就先显示「在听 · 请说话」，
+ * 麦克风没准备好再改成「麦克风未就绪」。0.3.8 是先开麦再上屏，于是「开麦那步卡住」
+ * 和「根本没按到」在屏上、在宿主侧长得一模一样，这正是这次排查最贵的那段成本。
+ */
+
+/*
+ * 语音唤醒（0.6.0）：板内 ESP-SR WakeNet9 中文唤醒词「嗨，乐鑫」（wn9_hilexin）。
+ *
+ * 0.5.0 是「没人按键时循环录 1.8 s → 发给宿主 /tihu/wake 判是不是鹈鹕」，
+ * 依赖网络与宿主；0.6.0 把模型和推理都搬到板子上：tihu_wake.c 常驻跑 AFE+WakeNet，
+ * 命中后先叮一声，再直接调用下面的 voice_command_record()（屏上「在听 · 请说话」
+ * + 录 5 秒 + tihu_net_send_wav 上传），整条链路不再问宿主。
+ *
+ * 原 wake_task / WAKE_PROBE_MS 那段 HTTP 轮询已删除；tihu_ota_wake_check() 保留但不再调用。
+ */
+#define WAKE_COMMAND_MS   5000
+
+static void voice_command_record(void)
+{
+    tihu_ui_set_listening(true, "在听 · 请说话");
+    tihu_net_send_alert("info", "语音唤醒 鹈鹕");
+    if (!tihu_audio_mic_start()) {
+        ESP_LOGW(TAG, "唤醒后开麦失败");
+        tihu_ui_set_listening(false, NULL);
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(WAKE_COMMAND_MS));
+    tihu_ui_set_listening(false, NULL);
+    size_t len = 0;
+    const uint8_t *wav = tihu_audio_mic_stop(&len);
+    if (wav != NULL && len > 44) {
+        ESP_LOGI(TAG, "语音命令录音结束：%u 字节", (unsigned)len);
+        tihu_net_send_wav(wav, len);
+    } else {
+        ESP_LOGW(TAG, "语音唤醒后没录到音频");
+    }
+}
+
+
+/*
+ * 0.6.3：按住说话的开麦任务 —— 先「叮」，播完再切 16 k 开麦。
+ *
+ * 为什么必须是独立任务：ptt_press 跑在 esp_timer 任务里，阻塞 100+ ms 会吞掉抬手事件；
+ * 而「叮」本身要 120 ms 才播完，播到一半切 16 k 会变成闷响，麦克风也会把它录进去。
+ * 抬手早于开麦（极短一按）就干脆不录，免得麦克风在后面一直开着。
+ */
+static void ptt_ding_task(void *arg)
+{
+    (void)arg;
+    tihu_audio_play_ding();
+    /* 叮是 120 ms；播放任务由 push 之后才 busy，先等一小会儿再等排空。 */
+    vTaskDelay(pdMS_TO_TICKS(60));
+    for (int i = 0; i < 25 && tihu_audio_busy(); i++) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (!s_ptt_active) {
+        ESP_LOGW(TAG, "抬手早于开麦：本次不录音（提示音已播完）");
+        vTaskDelete(NULL);
+        return;
+    }
+    if (!tihu_audio_mic_start()) {
+        /* 麦克风没就绪：屏上必须说清楚，并给宿主发同样的告警，不许按下了毫无提示。 */
+        tihu_ui_set_listening(true, "麦克风未就绪");
+        ESP_LOGE(TAG, "按键按下但麦克风未就绪：本次不录音（松开也不会上传）");
+        tihu_net_send_alert("warn", "麦克风未就绪");
+        /* 仍然让 s_ptt_active 留着：松手时要靠 release 把「麦克风未就绪」覆盖层收掉。 */
+        s_ptt_mic_failed = true;
+    }
+    vTaskDelete(NULL);
+}
+
 static void ptt_press(void *handle, void *usr_data)
 {
     (void)handle;
@@ -92,13 +178,35 @@ static void ptt_press(void *handle, void *usr_data)
         return;
     }
     s_ptt_active = true;
+
+    /* 1) 屏上先出「在听」，不依赖 codec/I2C/WS 任何一步。 */
+    tihu_ui_set_listening(true, "在听 · 请说话");
+    /* 2) 自证：宿主日志里出现这一行 = 按键回调真的跑到了。 */
+    ESP_LOGI(TAG, "按键按下 录音开始");
+    tihu_net_send_alert("info", "按键按下 录音开始");
+
     /* 按住说话优先于宿主 voice.listen 的自动收尾，避免录到一半被定时器截走。 */
     tihu_net_cancel_listen();
     /* 录音前先停声：BOX-3 的 speaker/mic 共用 I2S，24k 与 16k 同时开容易把声音带偏。 */
     tihu_audio_stop();
-    tihu_audio_mic_start();
-    tihu_ui_set_listening(true, "正在听 · 松开上传");
-    ESP_LOGI(TAG, "开始录音");
+
+    /*
+     * 0.6.3：按下去先「叮」一声（用户 2026-11-13 明确要求录音提示音），
+     * 等它播完再切 16 k 开麦 —— 反过来会把 24 k 的叮按 16 k 播成闷响，
+     * 而且麦克风一开，提示音自己也会被录进上行 WAV。
+     *
+     * 为什么放独立任务：本回调跑在 esp_timer 任务里（iot_button 每 5 ms 轮询按键），
+     * 在这里阻塞 100+ ms 会吞掉抬手事件，所以「叮 + 排空 + 开麦」整体挪出去。
+     */
+    if (xTaskCreate(ptt_ding_task, "ptt_ding", 4096, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "叮：任务创建失败，退回直接开麦");
+        if (!tihu_audio_mic_start()) {
+            tihu_ui_set_listening(true, "麦克风未就绪");
+            ESP_LOGE(TAG, "按键按下但麦克风未就绪：本次不录音（松开也不会上传）");
+            tihu_net_send_alert("warn", "麦克风未就绪");
+            s_ptt_mic_failed = true;
+        }
+    }
 }
 
 static void ptt_release(void *handle, void *usr_data)
@@ -109,15 +217,24 @@ static void ptt_release(void *handle, void *usr_data)
         return;
     }
     s_ptt_active = false;
+    ESP_LOGI(TAG, "按键松开 上传中");
+    tihu_net_send_alert("info", "按键松开 上传中");
+    /* 先收屏，再等录音任务交数据（mic_stop 最多等 1.5 s）。 */
+    tihu_ui_set_listening(false, NULL);
+    if (s_ptt_mic_failed) {
+        s_ptt_mic_failed = false;
+        ESP_LOGW(TAG, "本次按下没有开麦（已有「麦克风未就绪」告警），松开不发送");
+        return;
+    }
     size_t len = 0;
     const uint8_t *wav = tihu_audio_mic_stop(&len);
-    tihu_ui_set_listening(false, NULL);
     if (wav != NULL && len > 44) {
         ESP_LOGI(TAG, "录音结束：%u 字节（约 %d ms）",
                  (unsigned)len, (int)(((len - 44) * 1000) / (16000 * 2)));
         tihu_net_send_wav(wav, len);
     } else {
         ESP_LOGW(TAG, "没有录到音频（麦克风未初始化或按得太短）");
+        tihu_net_send_alert("warn", "没有录到音频");
     }
 }
 
@@ -170,7 +287,8 @@ static void buttons_init(void)
      * bsp_iot_button_create() 在 BSP 的静态 tp 为空时会**再 new 一个 GT911 实例**。
      * 现在触摸由 tihu_touch.c 自己持有，两个实例轮流读同一颗芯片会互相吃掉报点
      * （一个把 0x814E 状态读走，另一个就永远看不到按下）。
-     * MUTE / MAIN 两个键本固件都没用到，所以只建需要的那一个。
+     * MAIN 键本固件没用到；外壳静音触摸区（GPIO1 = BSP_BUTTON_MUTE_IO）由
+     * tihu_volume.c 自己配 GPIO + 判手势（单击静音 / 双击复位 85 / 长按连续变音量）。
      */
     const button_config_t btn_cfg = {0};
     const button_gpio_config_t gpio_cfg = {
@@ -209,7 +327,18 @@ void app_main(void)
 
     tihu_audio_init();
     tihu_net_start();
+    /*
+     * 板内唤醒词（0.6.0）：ESP-SR WakeNet9「嗨，乐鑫」，模型编在 app 分区里。
+     * 必须在 tihu_net_start() 之后启动——没联网时唤醒任务不会开麦。
+     * 命中后由 tihu_wake 任务先叮一声，再直接调用 voice_command_record()。
+     */
+    tihu_wake_start(voice_command_record);
+    /* OTA 客户端：独立任务 + 10 分钟定时；没联网时自己打「尚未联网，跳过」。
+     * 放在 tihu_net_start() 之后，宿主地址一旦被 tihu_net 解析出来就会同步进去。 */
+    tihu_ota_start();
     buttons_init();
+    /* 机身外壳静音触摸区（GPIO1）→ 音量手势；放在 audio 之后，改音量才有 codec 可写。 */
+    tihu_volume_start();
     if (xTaskCreate(selftest_task, "tihu_selftest", 4096, NULL, 3, NULL) != pdPASS) {
         ESP_LOGW(TAG, "开机自检任务创建失败（不影响正常使用）");
     }

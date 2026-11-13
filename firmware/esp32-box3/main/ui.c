@@ -20,6 +20,7 @@
 #include "esp_timer.h"
 #include "bsp/esp-box-3.h"
 #include "tihu_charset.h"
+#include "tihu_audio.h"
 #include "tihu_net.h"
 #include "tihu_touch.h"
 
@@ -70,11 +71,63 @@ static lv_obj_t *s_conn_dot;
 static lv_obj_t *s_alert;
 static lv_obj_t *s_listen;
 static esp_timer_handle_t s_alert_timer;
+/* 音量小条（0.3.6）：浮在 lv_layer_top()，2 秒后自动收起。 */
+static lv_obj_t *s_vol_toast;
+static esp_timer_handle_t s_vol_timer;
 static screen_id_t s_current = SCREEN_PROGRESS;
 static char s_conn_text[32] = "连接中";
 static bool s_connected;
+/* 上一帧的 mode（"home"/"status"…），只在变化时打一行「屏幕切换」，避免每 5 秒刷一条。 */
+static char s_last_mode[16];
+/* karaoke 高亮（100 ms）与看板呼吸（500 ms）两个 LVGL 定时器；离开对应屏就 pause。 */
+static lv_timer_t *s_karaoke_timer;
+static lv_timer_t *s_board_timer;
+static int s_karaoke_line = -1;
+static int s_karaoke_pct_logged = -1;
+/* 正在朗读的任务号：换任务 / 从别的屏进完成页 = 新一段朗读，进度和行表才清零。 */
+static char s_karaoke_task[48];
+static bool s_board_anim_on;
+/* 定义在文件后面（show_boot 附近），这里先声明给 tihu_ui_init 用。 */
+static void karaoke_timer_cb(lv_timer_t *timer);
+static void board_anim_timer_cb(lv_timer_t *timer);
+
+/** 屏名（日志用）：board=看板 / progress=朗读进度页 / done=完成页。 */static const char *screen_name_of(screen_id_t id)
+{
+    switch (id) {
+    case SCREEN_BOARD:
+        return "看板";
+    case SCREEN_DONE:
+        return "完成页";
+    case SCREEN_PROGRESS:
+    default:
+        return "朗读进度页";
+    }
+}
+
+/**
+ * UTF-8 安全截断：最多 max 字节、且不切断多字节汉字（配合 "%.*s" 用）。
+ * 直接 %s.40 会把 3 字节汉字切成半个，串口里就是乱码尾巴。
+ */
+static size_t utf8_trim(const char *s, size_t max)
+{
+    size_t n = 0;
+    while (s != NULL && n < max && s[n] != '\0') {
+        unsigned char c = (unsigned char)s[n];
+        size_t len = (c < 0x80) ? 1u
+                     : ((c & 0xE0) == 0xC0) ? 2u
+                     : ((c & 0xF0) == 0xE0) ? 3u
+                     : ((c & 0xF8) == 0xF0) ? 4u
+                                            : 1u;
+        if (n + len > max) {
+            break;
+        }
+        n += len;
+    }
+    return n;
+}
 
 static void hide_alert(void *arg);
+static void hide_volume_toast(void *arg);
 
 /* ------------------------------ 显示探针 ------------------------------ */
 
@@ -690,9 +743,34 @@ void tihu_ui_init(void)
     lv_obj_set_style_text_align(listen_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_user_data(s_listen, listen_label);
 
+    /*
+     * 音量小条（0.3.6）：挂在 lv_layer_top() 上，浮在三屏之上；只占顶部 26 px，
+     * 朗读页的正文在下面，不会被压住。触摸区手势一改音量就显示，2 秒后自己消失。
+     */
+    s_vol_toast = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_vol_toast, 132, 26);
+    lv_obj_align(s_vol_toast, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_bg_color(s_vol_toast, lv_color_hex(0x0E1620), 0);
+    lv_obj_set_style_bg_opa(s_vol_toast, LV_OPA_90, 0);
+    lv_obj_set_style_radius(s_vol_toast, 13, 0);
+    lv_obj_set_style_border_width(s_vol_toast, 0, 0);
+    lv_obj_set_style_pad_all(s_vol_toast, 0, 0);
+    lv_obj_clear_flag(s_vol_toast, LV_OBJ_FLAG_CLICKABLE);   /* 只是看，别抢触摸 */
+    lv_obj_clear_flag(s_vol_toast, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_vol_toast, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t *vol_label = tihu_ui_label(s_vol_toast, "", tihu_ui_font_body(),
+                                        lv_color_hex(0xF2F5F8), 0, 4, 132, 18);
+    lv_obj_set_style_text_align(vol_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_user_data(s_vol_toast, vol_label);
+
     /* 初始屏：连接中。等第一帧 screen.frame 到达后自动切棋盘。 */
     /* 初始屏：静态首页（不依赖宿主）。等第一帧 screen.frame 到达后自动切棋盘。 */
-    tihu_screen_frame_t boot = {0};
+    /*
+     * 静态：0.3.5 起 tihu_screen_frame_t 带 done.lines[16]，整个结构体 ≈5 KB。
+     * 放在 main 任务（8 KB 栈）上会直接踩爆——实机就是启动即 panic、Backtrace CORRUPTED 的 RST 循环。
+     */
+    static tihu_screen_frame_t boot;
+    memset(&boot, 0, sizeof(boot));
     snprintf(boot.stage, sizeof(boot.stage), "鹈鹕");
     snprintf(boot.title, sizeof(boot.title), "%s", TIHU_DEVICE_NAME);
     snprintf(boot.bullets[0], sizeof(boot.bullets[0]), "连接中…");
@@ -718,6 +796,12 @@ void tihu_ui_init(void)
         .name = "tihu_alert",
     };
     esp_timer_create(&alert_args, &s_alert_timer);
+    esp_timer_create_args_t vol_args = {
+        .callback = hide_volume_toast,
+        .arg = NULL,
+        .name = "tihu_vol",
+    };
+    esp_timer_create(&vol_args, &s_vol_timer);
 
     /* 首帧不在这里刷：tihu_ui_init 跑在 main 任务（8 KB 栈）里，lv_refr_now 会在
      * 调用者栈上做整屏渲染，实测直接把 main 任务栈踩爆。首帧交给 tihu_ui_task
@@ -727,8 +811,72 @@ void tihu_ui_init(void)
     bsp_display_unlock();
     bsp_display_backlight_on();
     s_ready = true;
+    /* 两个常驻 LVGL 定时器：karaoke 100 ms、看板呼吸 500 ms。默认都暂停，切屏时按需起停。 */
+    s_karaoke_timer = lv_timer_create(karaoke_timer_cb, 100, NULL);
+    s_board_timer = lv_timer_create(board_anim_timer_cb, 500, NULL);
+    if (s_karaoke_timer != NULL) {
+        lv_timer_pause(s_karaoke_timer);
+    }
+    if (s_board_timer != NULL) {
+        lv_timer_pause(s_board_timer);
+    }
     ESP_LOGI(TAG, "UI 就绪：320x240，三屏已创建；首帧交给 UI 任务同步刷出（当前 flush=%u）",
              tihu_ui_flush_count());
+}
+
+/**
+ * karaoke：每 100 ms 把「当前朗读行」往前推。
+ *
+ * 行号不再用 written/pushed 比例硬换算：宿主的 tts.audio 是「一行一段、每行首块带 index」，
+ * tihu_audio 在每行首块 push 之前记下该行的起始字节偏移，这里用「已送 I2S 的字节数」查表，
+ * 高亮位置＝声音真正播到的那一行（比例只留作兜底和日志里的百分比）。
+ * 只在完成页（朗读页）跑；离开该屏时定时器被 pause。
+ */
+static void karaoke_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    const int count = tihu_ui_done_line_count();
+    if (count <= 0) {
+        return;
+    }
+    uint32_t pushed = 0;
+    uint32_t written = 0;
+    tihu_audio_playback_progress(&pushed, &written);
+    if (pushed == 0) {
+        return;
+    }
+    int pct = (int)((uint64_t)written * 100 / pushed);
+    if (pct > 100) {
+        pct = 100;
+    }
+    int idx = tihu_audio_current_line();
+    if (idx < 0) {
+        /* 还没有行信息（非完成页朗读链路）：退回比例估算，至少能单调往前走。 */
+        idx = (int)((uint64_t)pct * count / 100);
+    }
+    if (idx >= count) {
+        idx = count - 1;
+    }
+    if (idx < 0) {
+        idx = 0;
+    }
+    if (idx != s_karaoke_line) {
+        s_karaoke_line = idx;
+        tihu_ui_done_set_current(idx);
+        ESP_LOGI(TAG, "高亮 bullet=%d/%d 进度=%d%%（pushed=%u written=%u）",
+                 idx + 1, count, pct, (unsigned)pushed, (unsigned)written);
+    } else if (pct >= s_karaoke_pct_logged + 20) {
+        s_karaoke_pct_logged = pct;
+        ESP_LOGI(TAG, "高亮 bullet=%d/%d 进度=%d%%（pushed=%u written=%u）",
+                 idx + 1, count, pct, (unsigned)pushed, (unsigned)written);
+    }
+}
+
+/** 看板呼吸：每 500 ms 让 blink 行的圆点在 60%↔100% 之间呼吸一次。 */
+static void board_anim_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    tihu_ui_board_anim_step();
 }
 
 void tihu_ui_show_boot(const char *status)
@@ -736,7 +884,9 @@ void tihu_ui_show_boot(const char *status)
     if (!s_ready) {
         return;
     }
-    tihu_screen_frame_t boot = {0};
+    /* 静态：同 tihu_ui_init 里的理由，≈5 KB 的帧结构不能压在 main 任务栈上。 */
+    static tihu_screen_frame_t boot;
+    memset(&boot, 0, sizeof(boot));
     snprintf(boot.stage, sizeof(boot.stage), "鹈鹕");
     snprintf(boot.title, sizeof(boot.title), "%s", TIHU_DEVICE_NAME);
     snprintf(boot.bullets[0], sizeof(boot.bullets[0]), "%s",
@@ -750,6 +900,12 @@ void tihu_ui_show_boot(const char *status)
     snprintf(boot.actions[1].id, sizeof(boot.actions[1].id), "stop");
     snprintf(boot.actions[1].label, sizeof(boot.actions[1].label), "停止");
     boot.action_count = 2;
+
+    ESP_LOGI(TAG, "屏幕切换：%s → 朗读进度页（启动页 mode=status，status=%.*s）",
+             screen_name_of(s_current),
+             (int)utf8_trim(status != NULL && status[0] != '\0' ? status : "连接中…", 40),
+             status != NULL && status[0] != '\0' ? status : "连接中…");
+    snprintf(s_last_mode, sizeof(s_last_mode), "status");
 
     bsp_display_lock(0);
     lv_obj_add_flag(s_board, LV_OBJ_FLAG_HIDDEN);
@@ -767,9 +923,79 @@ void tihu_ui_show_frame(const tihu_screen_frame_t *frame)
     }
     /* 旧主页/旧回答屏没有 board/done，按协议直接忽略。 */
     if (!frame->has_board && !frame->has_done && strcmp(frame->mode, "home") == 0) {
+        ESP_LOGW(TAG, "渲染跳过：mode=home 但没有 board/done（旧主页帧）");
         return;
     }
+    /*
+     * 逐屏核对日志：mode / stage / title / bullets 条数 + 每条前 40 字。
+     * 本函数由 websocket_task 调用（栈 8 KB），所以不用局部大缓冲、也不拼大字符串，
+     * 直接靠 %.*s 截断；而且全部在 bsp_display_lock 之外打，别让串口写入占着显示锁。
+     */
+    screen_id_t next = frame->has_board ? SCREEN_BOARD
+                                        : (frame->has_done ? SCREEN_DONE : SCREEN_PROGRESS);
+    if (s_current != next || strcmp(s_last_mode, frame->mode) != 0) {
+        ESP_LOGI(TAG, "屏幕切换：%s → %s（mode %s → %s）", screen_name_of(s_current),
+                 screen_name_of(next), s_last_mode[0] != '\0' ? s_last_mode : "-", frame->mode);
+        snprintf(s_last_mode, sizeof(s_last_mode), "%s", frame->mode);
+    }
+    ESP_LOGI(TAG, "渲染 mode=%.*s stage=%.*s title=%.*s bullets=%d%s%s",
+             (int)utf8_trim(frame->mode, 12), frame->mode,
+             (int)utf8_trim(frame->stage, 24), frame->stage,
+             (int)utf8_trim(frame->title, 48), frame->title,
+             frame->bullet_count,
+             frame->has_board ? " [board]" : "", frame->has_done ? " [done]" : "");
+    for (int i = 0; i < frame->bullet_count && i < TIHU_MAX_BULLETS; i++) {
+        ESP_LOGI(TAG, "  渲染 bullet[%d]=%.*s", i,
+                 (int)utf8_trim(frame->bullets[i], 40), frame->bullets[i]);
+    }
+
     bsp_display_lock(0);
+    /*
+     * karaoke：只要进/停在「有字幕行的那一屏」（完成页＝朗读页，mode=status + bullets + done.lines）
+     * 就让 100 ms 定时器跑；离开就 pause。
+     *
+     * 进度清零只发生在「真的换了一段朗读」：从别的屏进完成页，或任务号变了。
+     * 宿主会把同一帧 screen.frame 每 5 秒重推一次，那种帧绝不能把 pushed/written、
+     * 行偏移表和 s_karaoke_line 打回 0——否则高亮每 5 秒跳回第 0 行。
+     */
+    bool karaoke_start = false;
+    if (next == SCREEN_DONE) {
+        const bool task_changed = frame->task_id[0] != '\0' &&
+                                  strcmp(s_karaoke_task, frame->task_id) != 0;
+        if (s_current != SCREEN_DONE || task_changed) {
+            karaoke_start = true;
+            snprintf(s_karaoke_task, sizeof(s_karaoke_task), "%s", frame->task_id);
+            s_karaoke_line = -1;
+            s_karaoke_pct_logged = -1;
+            tihu_audio_reset_stats();   /* 新一段朗读：pushed/written/行偏移从 0 起 */
+        }
+        if (s_karaoke_timer != NULL) {
+            lv_timer_resume(s_karaoke_timer);
+        }
+    } else {
+        if (s_karaoke_timer != NULL) {
+            lv_timer_pause(s_karaoke_timer);
+        }
+        s_karaoke_line = -1;
+        s_karaoke_task[0] = '\0';
+    }
+    if (next == SCREEN_BOARD && tihu_ui_board_blink_active()) {
+        if (s_board_timer != NULL) {
+            lv_timer_resume(s_board_timer);
+        }
+        if (!s_board_anim_on) {
+            s_board_anim_on = true;
+            ESP_LOGI(TAG, "看板动画 timer 启（500ms，blink 行存在）");
+        }
+    } else {
+        if (s_board_timer != NULL) {
+            lv_timer_pause(s_board_timer);
+        }
+        if (s_board_anim_on) {
+            s_board_anim_on = false;
+            ESP_LOGI(TAG, "看板动画 timer 停（离开看板或本页无 blink 行）");
+        }
+    }
     lv_obj_add_flag(s_board, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_progress, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_done, LV_OBJ_FLAG_HIDDEN);
@@ -779,9 +1005,25 @@ void tihu_ui_show_frame(const tihu_screen_frame_t *frame)
         lv_obj_clear_flag(s_board, LV_OBJ_FLAG_HIDDEN);
         s_current = SCREEN_BOARD;
     } else if (frame->has_done) {
-        tihu_ui_done_update(s_done, frame);
+        const bool content_changed = tihu_ui_done_update(s_done, frame);
+        if (content_changed && !karaoke_start) {
+            /* 同一条任务换了正文（重读/新回答）：高亮从头按新行重算，但不清播放计数。 */
+            s_karaoke_line = -1;
+            s_karaoke_pct_logged = -1;
+        }
         lv_obj_clear_flag(s_done, LV_OBJ_FLAG_HIDDEN);
         s_current = SCREEN_DONE;
+        if (karaoke_start) {
+            /*
+             * 一次性自检日志：证明 100 ms 定时器真的起来了、字幕行数不是 0。
+             * 只在「新一段朗读」打一次，宿主每 5 秒重推同一帧不会刷屏。
+             */
+            ESP_LOGI(TAG, "karaoke 启动 行数=%d（任务=%s 宿主首行=%d，timer=%s）",
+                     tihu_ui_done_line_count(),
+                     frame->task_id[0] != '\0' ? frame->task_id : "-",
+                     frame->done.current + 1,
+                     s_karaoke_timer != NULL ? "已建" : "未建");
+        }
     } else {
         tihu_ui_progress_update(s_progress, frame);
         lv_obj_clear_flag(s_progress, LV_OBJ_FLAG_HIDDEN);
@@ -851,6 +1093,49 @@ void tihu_ui_show_alert(const char *text)
     if (s_alert_timer != NULL) {
         esp_timer_stop(s_alert_timer);
         esp_timer_start_once(s_alert_timer, 5000 * 1000);
+    }
+}
+
+static void hide_volume_toast(void *arg)
+{
+    (void)arg;
+    if (!s_ready) {
+        return;
+    }
+    bsp_display_lock(0);
+    lv_obj_add_flag(s_vol_toast, LV_OBJ_FLAG_HIDDEN);
+    bsp_display_unlock();
+}
+
+void tihu_ui_show_volume(int volume, bool muted)
+{
+    if (!s_ready || s_vol_toast == NULL) {
+        return;
+    }
+    if (volume < 0) {
+        volume = 0;
+    }
+    if (volume > 100) {
+        volume = 100;
+    }
+    char buf[32];
+    if (muted) {
+        snprintf(buf, sizeof(buf), "静音");
+    } else {
+        snprintf(buf, sizeof(buf), "音量 %d", volume);
+    }
+    bsp_display_lock(0);
+    lv_obj_t *label = (lv_obj_t *)lv_obj_get_user_data(s_vol_toast);
+    if (label != NULL) {
+        lv_label_set_text(label, buf);
+    }
+    lv_obj_clear_flag(s_vol_toast, LV_OBJ_FLAG_HIDDEN);
+    /* 盖到最上面：连按的时候别被别的小条压住。 */
+    lv_obj_move_foreground(s_vol_toast);
+    bsp_display_unlock();
+    if (s_vol_timer != NULL) {
+        esp_timer_stop(s_vol_timer);
+        esp_timer_start_once(s_vol_timer, 2000 * 1000);
     }
 }
 

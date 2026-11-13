@@ -5,6 +5,11 @@
 ## 1.5.2，而 1.5.2 用了 i2c_master_get_bus_handle（IDF 5.4+ 才有的 API），在 v5.3 下
 ## 编译报 "implicit declaration of function 'i2c_master_get_bus_handle'"。
 dependencies:
-  espressif/esp-box-3: "^3.1.0"
-  espressif/esp_websocket_client: "^1.2.0"
-  espressif/i2c_bus: "~1.4.0"
+  espressif/esp-box-3: ^3.1.0
+  espressif/esp_websocket_client: ^1.2.0
+  espressif/i2c_bus: ~1.4.0
+  # 板内唤醒词（0.6.0）：esp-sr 2.4.7 是最后一个**不依赖 esp-dl** 的 2.x 版本。
+  # 2.5.0 起 esp-sr 引入 esp-dl（WakeNet10 用），esp-dl 3.3.13 用了 IDF 5.4 才有的
+  # MALLOC_CAP_SIMD，在 IDF 5.3 直接编译失败；本工程只用 WakeNet9（wn9_hilexin），
+  # 2.4.7 的 AFE v1 + WakeNet9 完全够用，也不引入视觉算子。
+  espressif/esp-sr: "2.4.7"

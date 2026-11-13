@@ -33,6 +33,43 @@ static lv_obj_t *s_page;
 static lv_obj_t *s_conn;
 static lv_obj_t *s_empty;
 static lv_obj_t *s_tone_bar;
+/* 呼吸动画（2026-11-12）：每行是否 blink、当前相位、有没有需要动的行。 */
+static bool s_blink[TIHU_MAX_BOARD_ROWS];
+static bool s_breath_hi;
+
+/** 有没有 blink=true 的行（ui.c 据此决定 500 ms 定时器要不要跑）。 */
+bool tihu_ui_board_blink_active(void)
+{
+    for (int i = 0; i < TIHU_MAX_BOARD_ROWS; i++) {
+        if (s_blink[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * 500 ms 一次：blink=true 行的圆点在 60% ↔ 100% 不透明度之间呼吸。
+ * blink=false 的行一律回到不透明（静止），别让整屏都在闪。配色一个字节都不改。
+ */
+void tihu_ui_board_anim_step(void)
+{
+    s_breath_hi = !s_breath_hi;
+    for (int i = 0; i < TIHU_MAX_BOARD_ROWS; i++) {
+        if (s_rows[i] == NULL) {
+            continue;
+        }
+        lv_obj_t *dot = lv_obj_get_child(s_rows[i], 3);
+        if (dot == NULL) {
+            continue;
+        }
+        if (s_blink[i]) {
+            lv_obj_set_style_bg_opa(dot, s_breath_hi ? LV_OPA_COVER : (lv_opa_t)153, 0);
+        } else {
+            lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        }
+    }
+}
 
 static void board_row_cb(lv_event_t *event)
 {
@@ -163,6 +200,7 @@ void tihu_ui_board_update(lv_obj_t *screen, const tihu_screen_frame_t *frame)
         if (i >= board->row_count) {
             lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
             s_task_ids[i][0] = '\0';
+            s_blink[i] = false;
             continue;
         }
         const tihu_board_row_t *data = &board->rows[i];
@@ -180,6 +218,8 @@ void tihu_ui_board_update(lv_obj_t *screen, const tihu_screen_frame_t *frame)
         lv_label_set_text(title, data->title);
         lv_label_set_text(sub, data->sub);
         lv_obj_set_style_bg_color(dot, tihu_ui_state_color(data->state), 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        s_blink[i] = data->blink;
         if (data->badge_ask) {
             lv_obj_set_style_bg_color(dot, lv_color_hex(0xF5A623), 0);
         }

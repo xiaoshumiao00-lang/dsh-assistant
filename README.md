@@ -309,6 +309,22 @@ npm run lint       # scripts/lint-standards.mjs（不靠 eslint：查个人化�
 - `CHANGELOG.md`：唯一的公告源（`## [<版本>]` 那一节随包发到控制室）
 - `scripts/install-assistant.mjs` / `scripts/uninstall-assistant.mjs` / `scripts/lint-standards.mjs` / `scripts/test-*.mjs`
 
+## 手机 APK（安卓外壳）
+
+装插件 + 装 APK 就能用：APK 是一块 Android WebView 外壳，里面两个屏——「助手」屏就是电脑上 DSH 那套页面（同一份前端、同一个会话、同一套插件），「鹈鹕」屏是 `/tihu` 模拟设备页 + 底部一键语音输入。
+
+- 源码 / 构建脚本 / 签名密钥 / 交付件都在 [`android/`](android/README.md)；当前版本 **1.2.0**（versionCode 8，包名 `com.chenpan.assistant.generic`）。
+- 交付件：`android/dist/个人助手-通用版-1.2.0.apk`；构建命令见 `android/README.md`。
+- 首次打开进设置页，两项地址（助手 / 鹈鹕）都留空，可手填或点「一键填入常用地址」；两个地址任一填好就能进对应屏，两个都空不会白屏。
+- 鹈鹕屏只留模拟设备显示屏，其余配置/日志收进音量条右端的齿轮「鹈鹕设置」；**默认浅色主题**（设置面板里可切回深色）；显示屏下方的音量条只调页面朗读（WebAudio masterGain），不动系统媒体音量。
+
+### 语音输入依赖什么（重要）
+
+- **转写接口由插件自己提供**：`POST {origin}/tihu/asr`，挂在 pocket 代理的 tihu 分支上（`src/pocket-host/proxy.mjs`），鉴权沿用同一套 token / PIN / cookie，不另开免鉴权口子；实现在 `src/tihu/lane.ts` 的 `handleHttp`。
+- 转写顺序：**本地 whisper（`whisper/` 目录 + `127.0.0.1:3097`，插件自带，默认 medium）优先** → 本地不可用或返回空时回退**宿主 speech 服务**（需要装了语音转写类插件）。
+- 公网 `49.234.20.84:7080` 那条 SSH 反向隧道上的 relay 也实现了同一个 `/tihu/asr`，**只用于反代**；换成局域网 `http://<电脑IP>:3081` 时走的就是插件本体，不需要 relay。
+- 两段都没有文字时接口返回 `{"text":"","error":"no-speech"}` 并写一行 `tihu-asr` 日志，手机端提示「没听清」，不会假装发送成功。
+
 ## 鹈鹕（tihu）本地 TTS 运行时
 
 - 主 TTS：`edge-tts` + `zh-CN-YunjianNeural`（云健），默认语速 `TIHU_EDGE_RATE=+45%`。

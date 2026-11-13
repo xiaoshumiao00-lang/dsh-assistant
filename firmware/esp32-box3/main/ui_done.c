@@ -37,7 +37,26 @@ static lv_obj_t *s_tone_bar;
 static lv_obj_t *s_stage;
 static lv_obj_t *s_conn;
 static lv_obj_t *s_title;
-static lv_obj_t *s_lines[TIHU_MAX_DONE_LINES];
+/* 屏上只摆 7 行（15px/20px，y=56..196，再往下就到按钮了）；正文最多 16 行，靠窗口滚动。 */
+#define DONE_VISIBLE_LINES 7
+static lv_obj_t *s_lines[DONE_VISIBLE_LINES];
+/* 完成页全部正文（最多 TIHU_MAX_DONE_LINES 行）：窗口只显示其中 7 行，高亮走出窗口就跟着滚。 */
+static char s_all_lines[TIHU_MAX_DONE_LINES][TIHU_TEXT_MAX];
+/* karaoke 用：窗口第一条的绝对行号、总行数、当前高亮行。 */
+static int s_window_start;
+static int s_line_count;
+static int s_hl_index = -1;
+/* 顶栏「完成 · N/M」的固定前缀（宿主 stage），数字部分跟着本地高亮走。 */
+static char s_stage_base[48] = "完成";
+/*
+ * 上一帧的正文指纹（title + 每一行）。宿主会周期性重推同一帧 screen.frame，
+ * 只要正文没变就绝不能把高亮拨回 done.current、也不能挪窗口——
+ * 2026-11-12 实机「高亮每 5 秒跳回第 0 行」就是这个无条件重置造成的。
+ */
+static char s_sig_title[TIHU_TITLE_MAX];
+static int  s_sig_count = -1;
+static uint32_t s_sig_hash;
+static bool s_sig_valid;
 static lv_obj_t *s_buttons[3];
 static char s_action_ids[3][40];
 static char s_task_id[48];
@@ -61,10 +80,16 @@ static void done_btn_cb(lv_event_t *event)
      * 见 src/tihu/lane.ts 的 cancelSpeaking），并**不会**补发 playback.control{stop}；
      * 设备缓冲区里已经排进去的那一段会继续念完——现场就是「按了停止，声音还在」。
      * 先本地停，再照常上报（宿主那边同样会掐掉这一轮）。
+     *
+     * 「重读」同理：宿主会从第 0 行重新下发，旧缓冲不清掉就会「先念完旧的再念新的」，
+     * 而且 karaoke 的累计字节/行偏移还停在上一轮——高亮从旧行开始。这里一起清。
      */
     if (strcmp(s_action_ids[index], "stop") == 0 || strcmp(s_action_ids[index], "taskStop") == 0) {
         tihu_audio_stop();
         ESP_LOGI("ui", "停止键：本地已停声（不等宿主 playback.control）");
+    } else if (strcmp(s_action_ids[index], "replay") == 0) {
+        tihu_audio_stop();
+        ESP_LOGI("ui", "重读键：本地清空旧缓冲与朗读进度，等宿主从第 0 行重发");
     }
     s_last_send_ok = tihu_ui_send_action(s_action_ids[index], s_task_id,
                                          lv_event_get_target(event));
@@ -159,7 +184,7 @@ lv_obj_t *tihu_ui_done_create(lv_obj_t *parent)
                             lv_color_hex(COL_TEXT), 8, 28, 304, 26);
     lv_label_set_long_mode(s_title, LV_LABEL_LONG_DOT);
 
-    for (int i = 0; i < TIHU_MAX_DONE_LINES; i++) {
+    for (int i = 0; i < DONE_VISIBLE_LINES; i++) {
         s_lines[i] = tihu_ui_label(screen, "", tihu_ui_font_body(),
                                    lv_color_hex(COL_TEXT), 8, 56 + i * 20, 304, 20);
         lv_label_set_long_mode(s_lines[i], LV_LABEL_LONG_CLIP);
@@ -210,56 +235,175 @@ lv_obj_t *tihu_ui_done_create(lv_obj_t *parent)
     return screen;
 }
 
-void tihu_ui_done_update(lv_obj_t *screen, const tihu_screen_frame_t *frame)
+/** 完成页当前一共几行（karaoke 用它算 bullet 总数）。 */
+int tihu_ui_done_line_count(void)
 {
-    (void)screen;
-    if (frame == NULL || !frame->has_done) {
-        return;
-    }
-    const tihu_done_t *done = &frame->done;
+    return s_line_count;
+}
 
-    char stage[64];
-    if (done->line_count > 0) {
-        snprintf(stage, sizeof(stage), "完成 · %d/%d",
-                 done->current + 1, done->line_count);
+/** FNV-1a：给「正文有没有变」算一个便宜的指纹（不分配内存，8 KB WS 线程里也安全）。 */
+static uint32_t sig_mix(uint32_t hash, const char *text)
+{
+    if (text == NULL) {
+        return hash;
+    }
+    for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; p++) {
+        hash ^= (uint32_t)(*p);
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+/** 顶栏「完成 · N/M」：数字部分跟本地高亮走（宿主只给起点，朗读推进由本机算）。 */
+static void stage_text_update(int index)
+{
+    if (s_line_count > 0) {
+        char stage[96];
+        snprintf(stage, sizeof(stage), "%.39s · %d/%d", s_stage_base, index + 1, s_line_count);
+        lv_label_set_text(s_stage, stage);
     } else {
-        snprintf(stage, sizeof(stage), "完成");
+        lv_label_set_text(s_stage, s_stage_base);
     }
-    lv_label_set_text(s_stage, stage);
-    lv_label_set_text(s_conn, tihu_ui_connection_text());
-    tihu_ui_apply_tone_bar(s_tone_bar, frame->tone);
+}
 
-    lv_label_set_text(s_title, frame->title[0] != '\0' ? frame->title : "任务完成");
-
-    /* 7 行窗口：当前行尽量放在第 3 行，和模拟页一样提前两行。 */
-    int visible = TIHU_MAX_DONE_LINES;
-    int start = done->current - 2;
-    if (start < 0) {
-        start = 0;
-    }
-    if (start > done->line_count - visible) {
-        start = done->line_count - visible;
-    }
-    if (start < 0) {
-        start = 0;
-    }
-
-    for (int i = 0; i < visible; i++) {
-        int index = start + i;
-        if (index < done->line_count) {
-            lv_label_set_text(s_lines[i], done->lines[index]);
-        } else {
-            lv_label_set_text(s_lines[i], "");
-        }
-        bool current = (index == done->current && index < done->line_count);
-        lv_obj_set_style_bg_opa(s_lines[i], current ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
-        if (current) {
+/** 把「全部正文」里的 [top, top+7) 画到 7 个 label 上，并把第 hl 行高亮。 */
+static void render_window(int top, int hl)
+{
+    for (int i = 0; i < DONE_VISIBLE_LINES; i++) {
+        int abs = top + i;
+        bool has = (abs >= 0 && abs < s_line_count);
+        lv_label_set_text(s_lines[i], has ? s_all_lines[abs] : "");
+        bool cur = (abs == hl && has);
+        lv_obj_set_style_bg_opa(s_lines[i], cur ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+        if (cur) {
             lv_obj_set_style_bg_color(s_lines[i], lv_color_hex(COL_CYAN), 0);
             lv_obj_set_style_text_color(s_lines[i], lv_color_hex(COL_DARK), 0);
         } else {
             lv_obj_set_style_text_color(s_lines[i], lv_color_hex(COL_TEXT), 0);
         }
     }
+}
+
+/** 让第 index 行落在窗口里：尽量放第 3 行（与宿主模拟页同一规则），并夹在 [0, 总行数-7]。 */
+static int window_top_for(int index)
+{
+    int top = index - 2;
+    if (top < 0) {
+        top = 0;
+    }
+    if (s_line_count > DONE_VISIBLE_LINES && top > s_line_count - DONE_VISIBLE_LINES) {
+        top = s_line_count - DONE_VISIBLE_LINES;
+    }
+    if (top < 0) {
+        top = 0;
+    }
+    return top;
+}
+
+/**
+ * karaoke 推进：把当前朗读行切到第 index 行；**走出 7 行窗口时窗口跟着滚**（长回答的 8–16 行
+ * 因此也能显示/高亮），窗口内的普通推进只改样式、不重排文字。
+ * 由 ui.c 的 100 ms 定时器按真实播放位置调用（已在 UI 任务里，无需再拿显示锁）。
+ */
+void tihu_ui_done_set_current(int index)
+{
+    if (s_line_count <= 0) {
+        return;
+    }
+    if (index < 0) {
+        index = 0;
+    }
+    if (index >= s_line_count) {
+        index = s_line_count - 1;
+    }
+    if (index == s_hl_index) {
+        return;
+    }
+    s_hl_index = index;
+    stage_text_update(index);
+    if (index < s_window_start || index >= s_window_start + DONE_VISIBLE_LINES) {
+        s_window_start = window_top_for(index);
+        render_window(s_window_start, index);
+        return;
+    }
+    for (int i = 0; i < DONE_VISIBLE_LINES; i++) {
+        int abs = s_window_start + i;
+        bool cur = (abs == index && abs < s_line_count);
+        lv_obj_set_style_bg_opa(s_lines[i], cur ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+        if (cur) {
+            lv_obj_set_style_bg_color(s_lines[i], lv_color_hex(COL_CYAN), 0);
+            lv_obj_set_style_text_color(s_lines[i], lv_color_hex(COL_DARK), 0);
+        } else {
+            lv_obj_set_style_text_color(s_lines[i], lv_color_hex(COL_TEXT), 0);
+        }
+    }
+}
+
+bool tihu_ui_done_update(lv_obj_t *screen, const tihu_screen_frame_t *frame)
+{
+    (void)screen;
+    if (frame == NULL || !frame->has_done) {
+        return false;
+    }
+    const tihu_done_t *done = &frame->done;
+
+    /* 正文指纹：标题 + 行数 + 每一行。宿主每秒/每 5 秒重推同一帧时指纹不变。 */
+    uint32_t hash = 2166136261u;
+    hash = sig_mix(hash, frame->title);
+    hash = sig_mix(hash, frame->stage);
+    hash ^= (uint32_t)done->line_count;
+    hash *= 16777619u;
+    for (int i = 0; i < done->line_count && i < TIHU_MAX_DONE_LINES; i++) {
+        hash = sig_mix(hash, done->lines[i]);
+    }
+    const bool changed = !s_sig_valid || hash != s_sig_hash ||
+                         s_sig_count != done->line_count ||
+                         strcmp(s_sig_title, frame->title) != 0;
+
+    char stage[64];
+    if (done->line_count > 0) {
+        snprintf(stage, sizeof(stage), "完成 · %d/%d", done->current + 1, done->line_count);
+    } else {
+        snprintf(stage, sizeof(stage), "完成");
+    }
+    if (strcmp(s_stage_base, frame->stage) != 0) {
+        snprintf(s_stage_base, sizeof(s_stage_base), "%s",
+                 frame->stage[0] != '\0' ? frame->stage : "完成");
+    }
+    if (!changed) {
+        /*
+         * 同一份正文又推了一帧：只刷新连接/色调/按钮，**不碰**高亮、窗口和 stage 数字。
+         * 朗读中的高亮由 karaoke 定时器按真实播放位置推进，这里一重置就回到第 0 行。
+         */
+        lv_label_set_text(s_conn, tihu_ui_connection_text());
+        tihu_ui_apply_tone_bar(s_tone_bar, frame->tone);
+        snprintf(s_task_id, sizeof(s_task_id), "%s", frame->task_id);
+        snprintf(s_stage_base, sizeof(s_stage_base), "%s",
+                 frame->stage[0] != '\0' ? frame->stage : "完成");
+        return false;
+    }
+
+    lv_label_set_text(s_stage, stage);
+    lv_label_set_text(s_conn, tihu_ui_connection_text());
+    tihu_ui_apply_tone_bar(s_tone_bar, frame->tone);
+
+    lv_label_set_text(s_title, frame->title[0] != '\0' ? frame->title : "任务完成");
+
+    /* 全部正文先入库（最多 TIHU_MAX_DONE_LINES=16 行），屏上只画 7 行窗口。 */
+    s_line_count = done->line_count;
+    if (s_line_count > TIHU_MAX_DONE_LINES) {
+        s_line_count = TIHU_MAX_DONE_LINES;
+    }
+    for (int i = 0; i < s_line_count; i++) {
+        snprintf(s_all_lines[i], TIHU_TEXT_MAX, "%s", done->lines[i]);
+    }
+    s_window_start = window_top_for(done->current);
+    s_hl_index = done->current;
+    render_window(s_window_start, done->current);
+    ESP_LOGI("ui", "完成页正文：共 %d 行（窗口 %d..%d，屏上 7 行；高亮 %d）",
+             s_line_count, s_window_start + 1,
+             s_window_start + (s_line_count < DONE_VISIBLE_LINES ? s_line_count : DONE_VISIBLE_LINES),
+             s_hl_index + 1);
 
     snprintf(s_task_id, sizeof(s_task_id), "%s", frame->task_id);
     static const char *default_ids[3] = {"stop", "replay", "taskBoard"};
@@ -276,4 +420,10 @@ void tihu_ui_done_update(lv_obj_t *screen, const tihu_screen_frame_t *frame)
             lv_label_set_text(label, default_labels[i]);
         }
     }
+    /* 记下这一份正文，下一帧只要一模一样就不再动高亮（见函数开头的 changed 判断）。 */
+    snprintf(s_sig_title, sizeof(s_sig_title), "%s", frame->title);
+    s_sig_count = done->line_count;
+    s_sig_hash = hash;
+    s_sig_valid = true;
+    return true;
 }

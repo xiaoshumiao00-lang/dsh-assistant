@@ -489,6 +489,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     audioCtx: null, pcmSources: [], pcmNextTime: 0, pcmLast: null, droppedAudio: false, readRound: null,
     /* 朗读自检：收到多少块 / 最后一块是否已排程 / 被丢掉的块数（页面事件区与 __tihuAudioCheck 可查） */
     ttsChunks: 0, ttsFinalSeen: false, ttsDropped: 0,
+    /* 录音闸门（2026-11-13）：recMute=true 表示「麦克风正在用」，这段时间一律不播报；
+       recDropped 记下这期间丢掉的 tts.audio 块数（事件区与 __tihuRecState 可查）。 */
+    recMute: false, recDropped: 0,
     samplePending: false, sampleTimer: 0,
     voice: 'default', voices: [], voiceEngine: null,
     highlightLock: false, hostAlert: false, screenMode: 'status', screenScale: 2, actions: [], 
@@ -1126,6 +1129,99 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     // 被停止的这一轮也把诊断行打出来（块数/重叠/采样率照实报，方便对照实机杂音）。
     flushReadRound();
   }
+  /* ---------- 录音闸门（2026-11-13，用户明确要求：录音期间不许朗读） ----------
+   *
+   * 为什么必须在这里做：页面用的是 WebAudio，PCM 块一旦 start() 就排上了同一条时间轴，
+   * 安卓壳/固件那边停掉自己的播放器也管不到它 —— 只有页面自己能逐段 stop()。
+   *
+   *   ① 按下录音的那一瞬间：掐掉已排程/正在念的所有段（录音按钮 handler 先调本函数再开麦）；
+   *   ② 录音没结束就到的 tts.audio：直接丢弃、不排队（见 tts.audio 分支的 recMute 判断），
+   *      否则录完音会把攒下的朗读一次性炸出来；
+   *   ③ 录音结束（或转录卡片发送/取消）：setRecMute(false)，朗读立刻恢复。
+   *
+   * 入口有两处：安卓壳 MainActivity 在开麦前调 window.__tihuRec(true)、收麦后调 false；
+   * 本页「按住说话」/voice.listen 的录音自己调（见 startRecording/stopRecording）。
+   */
+  function setRecMute(on) {
+    var want = on === true;
+    if (want === state.recMute) return state.recMute;
+    if (want) {
+      var had = state.pcmSources.length + (state.pcmLast ? 1 : 0);
+      stopPcm();
+      state.ttsFinalSeen = false;
+      state.highlightLock = false;
+      state.recDropped = 0;
+      addEvent('progress', '录音开始：已停朗读（掐掉 ' + had + ' 段），录音期间不播报');
+    } else {
+      addEvent('progress', '录音结束：恢复朗读（录音期间丢弃 ' + state.recDropped + ' 块）');
+    }
+    state.recMute = want;
+    return state.recMute;
+  }
+  /** 安卓壳（MainActivity）用的原生桥：__tihuRec(true/false)，返回当前闸门状态。 */
+  window.__tihuRec = function (on) { return setRecMute(on === true || on === 1 || on === '1'); };
+  /** 自检/排查：闸门是否生效、丢了多少块、还剩几段在念。 */
+  window.__tihuRecState = function () {
+    return { muted: state.recMute === true, dropped: state.recDropped, playing: state.pcmSources.length };
+  };
+  /* ---------- 语音唤醒开关（2026-11-13）----------
+   *
+   * 真机的唤醒引擎与开关状态都在安卓壳里（WakeNet / Porcupine + SharedPreferences
+   * KEY_WAKE_ON，重启保持），页面只做一层稳定的 JS 出口，给 DSH 端的「唤醒设置页」用：
+   *
+   *   window.TihuNative.wakeEnabled()          → "1" 开 / "0" 关
+   *   window.TihuNative.wakeSetEnabled("1"|"0")→ 开/关（关＝立刻停麦克风监听，开＝恢复监听）
+   *   window.TihuNative.wakeToggle()           → 反转并返回新状态
+   *   window.TihuNative.wakeState()            → 状态 JSON（含 enabled / state / 事件）
+   *
+   * 本页再把它们包成 __tihuWakeEnabled() / __tihuWakeSet(on)：壳不在（浏览器模拟页）时
+   * 返回 null，不抛错。
+   */
+  window.__tihuWakeEnabled = function () {
+    try {
+      var nat = window.TihuNative;
+      return nat && nat.wakeEnabled ? nat.wakeEnabled() : null;
+    } catch (e) { return null; }
+  };
+  window.__tihuWakeSet = function (on) {
+    try {
+      var nat = window.TihuNative;
+      if (!nat || !nat.wakeSetEnabled) return null;
+      nat.wakeSetEnabled(on === true || on === 1 || on === '1' ? '1' : '0');
+      return window.__tihuWakeEnabled();
+    } catch (e) { return null; }
+  };
+  /**
+   * 录音提示音（用户 2026-11-13 要求「按录音要听到一声叮」）：start = 一声 1046Hz「叮」，
+   * stop = 下行两音。走同一个 AudioContext，所以音量跟朗读一致（也受 __tihuSetVolume 管）。
+   * 返回 false 表示音频没解锁（浏览器要求先点一次屏）。
+   */
+  function playRecTone(kind) {
+    var ctx = ensureAudio();
+    if (!ctx) return false;
+    if (!audioRunning(ctx)) {
+      resumeAudio();
+      if (!audioRunning(ctx)) return false;
+    }
+    try {
+      var now = ctx.currentTime;
+      var osc = ctx.createOscillator();
+      var gain = ctx.createGain();
+      osc.type = 'sine';
+      var stop = kind === 'stop';
+      osc.frequency.setValueAtTime(stop ? 880 : 1046, now);
+      if (stop) osc.frequency.setValueAtTime(660, now + 0.07);
+      // 两端各 12ms 淡入淡出；「叮」用指数衰减，听感清脆、不爆音。
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.22, now + 0.012);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.13);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.14);
+      return true;
+    } catch (e) { return false; }
+  }
   /**
    * 每块首尾各 fadeMs 线性淡入淡出（原位改 samples，缺省 5ms）。
    * 完成页把一条合成音频按行、再按 120ms 切块下发，块边界常落在波形中间：
@@ -1521,6 +1617,15 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       v: PROTOCOL, type: type, id: 'dev-' + Date.now().toString(36) + '-' + state.seq, seq: state.seq, ts: Date.now(), payload: payload
     }));
   }
+  /* 朗读页现场（2026-11-13）：正在念的那条任务随指令一起上行，宿主据此把这一句**硬绑定**
+     回那条会话继续发（判断照旧交给指挥台，但结论只用于理解，不许改派到别的项目/会话）。
+     没有在念的东西（普通状态页、只是预览一段文本）就不带字段，宿主完全按原逻辑走。 */
+  function readHint(payload) {
+    if (state.screenMode !== 'done' || !state.doneTaskId) return payload;
+    payload.screenHint = 'read';
+    payload.taskId = state.doneTaskId;
+    return payload;
+  }
   /* ---------- 设备回执 / 播放状态（2026-11-10，规格书 §6.2） ----------
      宿主下发带 opId 的下行（playback.control / voice.listen / session.ended / device.config）
      必须回一条 device.ack，否则工具只能等 1.5 秒超时、给用户一句「设备未回执」。
@@ -1605,6 +1710,13 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         if (payload.sample === true) {
           resumeAudio();
           playSampleAudio(String(payload.data || ''), Number(payload.sampleRate) || 24000);
+          break;
+        }
+        // 录音闸门（2026-11-13）：麦克风正在用，任何新到的朗读都丢弃、不排队，
+        // 录音结束后才恢复（否则录完音会把攒下的整段朗读一次性放出来）。
+        if (state.recMute === true) {
+          state.recDropped += 1;
+          state.ttsFinalSeen = false;
           break;
         }
         // 正式朗读（完成页/回答页）：宿主按块下发 24kHz PCM，这里排队播放。
@@ -1867,10 +1979,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function uploadWav(arrayBuffer, label) {
     decodeAndResample(arrayBuffer).then(function (result) {
       addEvent('progress', label + '：' + result.durationMs + ' ms，已上行，等待转写…');
-      send('audio.frame', {
+      send('audio.frame', readHint({
         format: 'wav', sampleRate: 16000, channels: 1, bits: 16,
         audioBase64: toBase64(result.wav), durationMs: result.durationMs
-      });
+      }));
       // 页面侧兜底：15 秒没等到 transcript 就明确报超时，不能干等。
       state.audioPending = true;
       clearTimeout(state.audioTimer);
@@ -1902,6 +2014,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         blob.arrayBuffer().then(function (buffer) { uploadWav(buffer, '录音'); });
       };
       recorder.start();
+      // 录音期间不许朗读（2026-11-13）：先掐断正在念的，再给一声「叮」。
+      setRecMute(true);
+      playRecTone('start');
       talk.classList.add('rec');
       talk.textContent = '松开发送…';
     }).catch(function (error) {
@@ -1911,6 +2026,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function stopRecording() {
     if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop();
     state.recorder = null;
+    setRecMute(false);
+    playRecTone('stop');
     talk.classList.remove('rec');
     talk.textContent = '按住说话';
   }
@@ -1940,7 +2057,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   $('send').onclick = function () {
     var text = $('text').value.trim();
     if (!text) return;
-    send('text.input', { text: text, source: 'keyboard' });
+    send('text.input', readHint({ text: text, source: 'keyboard' }));
     state.droppedAudio = false;
     hideAudioWarn();
     $('transcript').textContent = text;
@@ -2074,7 +2191,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       listenEnd();
       if (said === '') return;   // 只叫了唤醒词没说话：不算一次唤醒
       stopPcm();
-      send('text.input', { text: said, source: 'voice' });
+      send('text.input', readHint({ text: said, source: 'voice' }));
       addEvent('progress', '免按住：' + said);
     }, 3000);
   }

@@ -17,6 +17,15 @@ bool tihu_net_connected(void);
 
 void tihu_net_send_text(const char *text, const char *source);
 void tihu_net_send_wav(const uint8_t *wav, size_t len);
+/**
+ * 设备侧自证告警（0.3.9 诊断旁路）：向宿主发 `event.alert{level,text}`。
+ *
+ * 只为了「让宿主日志里出现一行」——按键按下/松开、麦克风未就绪都发一条，
+ * 宿主没连上时只打串口日志。发送超时只有 300 ms（调用方可能是 esp_timer
+ * 任务里的按键回调，不能长占），失败/未连接都不影响录音与上传。
+ * @returns true = 真的写进了 WebSocket。
+ */
+bool tihu_net_send_alert(const char *level, const char *text);
 /** 发 screen.gesture{tap}；返回是否真的写进了 WebSocket（失败会在串口打日志）。 */
 bool tihu_net_send_tap(int x, int y, const char *hit,
                        const char *action_id, const char *task_id);
