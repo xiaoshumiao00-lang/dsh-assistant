@@ -243,6 +243,18 @@ char *tihu_build_session_end(const char *reason)
     return finish(root);
 }
 
+char *tihu_build_alert(const char *level, const char *text)
+{
+    cJSON *root = new_envelope("event.alert");
+    if (root == NULL) {
+        return NULL;
+    }
+    cJSON *payload = cJSON_AddObjectToObject(root, "payload");
+    cJSON_AddStringToObject(payload, "level", level != NULL && level[0] != '\0' ? level : "info");
+    cJSON_AddStringToObject(payload, "text", text != NULL ? text : "");
+    return finish(root);
+}
+
 char *tihu_build_device_ack(const char *op_id, bool ok, const char *reason,
                             const char *stage, int screen_version)
 {

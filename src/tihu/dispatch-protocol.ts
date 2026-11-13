@@ -331,12 +331,20 @@ export function parseCommanderDecision(raw: unknown, allowed: readonly string[])
 }
 
 /**
- * 指挥台提示词尾巴：先判「这句话是不是在指挥这块屏」，判成活儿才只回一行派单 JSON。
- * `hints` 是「最近的项目会话（短号 + 标题）」，让 append/append_to 有据可依；
- * `boardLines` 是这块屏**当前页**的带编号清单（1 起、与屏上逐行一致，见 lane 的
- * `commanderBoardLines`）——模型照着它把「第二个」翻成 `index:2`。
+ * 最近会话清单的小标题（2026-11-13：不只短号＋标题，还带项目、状态与最后一轮对话）。
+ * lane 的现场信息预算与这里共用同一份文案，改字只改这一处。
  */
-export function commanderReplyTail(hints: readonly string[] = [], boardLines: readonly string[] = []): string {
+export const COMMANDER_SESSION_SECTION_TITLE = '最近的项目会话（序号 项目 短号 状态 标题；每个会话附最后一轮对话）：'
+
+/**
+ * 指挥台提示词尾巴：先判「这句话是不是在指挥这块屏」，判成活儿才只回一行派单 JSON。
+ * `hints` 是「最近的项目会话」（每条：序号/项目/短号/状态/标题 + 最后一轮对话），
+ * 让 append/append_to 有据可依；
+ * `boardLines` 是这块屏**当前页**的带编号清单（1 起、与屏上逐行一致，见 lane 的
+ * `commanderBoardLines`）——模型照着它把「第二个」翻成 `index:2`；
+ * `screenLines` 是当前屏幕（屏名/页码/行号映射，见 lane 的 `commanderScreenLines`）。
+ */
+export function commanderReplyTail(hints: readonly string[] = [], boardLines: readonly string[] = [], screenLines: readonly string[] = []): string {
   return [
     DEVICE_CONTROL_PRIORITY_SECTION,
     '【结论只有一行】三种形状各回一条，不许混着回，也不许多解释一个字：',
@@ -349,7 +357,8 @@ export function commanderReplyTail(hints: readonly string[] = [], boardLines: re
     '· 接着某条已有会话做 → "append"，append_to 写那条会话的短号；确实是一件新事 → "new"，append_to 留空。',
     '· 派单那一行之外不要输出任何字符：不要代码块围栏、不要解释、不要前后缀。',
     '· 你只判断「这句话往哪儿派 / 是不是在指挥屏」，不干活、不做正文、不解释自己怎么判的。',
+    ...(screenLines.length === 0 ? [] : [...screenLines]),
     ...(boardLines.length === 0 ? [] : ['【这块屏现在的棋盘】（行号从 1 开始，与屏上逐行一致）', ...boardLines]),
-    ...(hints.length === 0 ? [] : ['最近的项目会话（短号 标题）：', ...hints]),
+    ...(hints.length === 0 ? [] : [COMMANDER_SESSION_SECTION_TITLE, ...hints]),
   ].join('\n')
 }

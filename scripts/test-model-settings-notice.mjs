@@ -13,13 +13,21 @@ function element(children = []) {
   const el = {
     nodeType: 1,
     dataset: {},
+    attributes: {},
     children: [],
     parentElement: null,
     isConnected: true,
     closest(selector) {
-      if (selector !== '[data-dshp-model-notice]') return null
-      if (el.dataset.dshpModelNotice === '1') return el
-      return el.parentElement?.closest(selector) ?? null
+      if (selector === '[data-dshp-model-notice]') {
+        if (el.dataset.dshpModelNotice === '1') return el
+        return el.parentElement?.closest(selector) ?? null
+      }
+      // 鹈鹕「指挥台模型」卡：根节点带 data-tihu-model-card="1"（注入 JS 写的就是这个属性）
+      if (selector === '[data-tihu-model-card]') {
+        if (el.attributes['data-tihu-model-card'] === '1') return el
+        return el.parentElement?.closest(selector) ?? null
+      }
+      return null
     },
     set textContent(value) {
       el.children = [text(String(value), el)]
@@ -129,6 +137,19 @@ assert.equal(patcher.collect([{ type: 'characterData', target: composerText }]
 ), false, '输入框里的文本节点改不动，也不该排进队列')
 patcher.flush()
 assert.equal(composerText.nodeValue, 'lib/proxy.mjs', '输入框里的文本一字不改')
+
+// 鹈鹕「指挥台模型」卡（data-tihu-model-card）是手机上唯一允许改的模型设置：
+// 卡内的加载失败/目录错误必须原样显示，卡外同样的文案仍要被改写成「请去电脑端」。
+const modelCard = element([element([text('加载提供方目录失败')])])
+modelCard.attributes['data-tihu-model-card'] = '1'
+const outsideError = element([text('加载提供方目录失败')])
+const bothRoot = element([modelCard, outsideError])
+assert.equal(patcher.collect([{ type: 'childList', addedNodes: [bothRoot] }]), true)
+patcher.flush()
+assert.equal(modelCard.dataset.dshpModelNotice, undefined, '指挥台模型卡自己不许被标成「已改写」')
+assert.equal(modelCard.children[0].children[0].nodeValue, '加载提供方目录失败', '卡内原因必须原样回显')
+assert.equal(outsideError.dataset.dshpModelNotice, '1', '卡外的模型设置照旧改写（不放宽整端）')
+assert.equal(outsideError.children[0].nodeValue, NOTICE)
 
 // 队列有上限：长会话流式渲染期间只留最新 800 个节点，绝不无界增长。
 walkerRoots.length = 0

@@ -98,6 +98,7 @@ import {
   bestCardMatchOf,
   boardOf,
   boardRowIndex,
+  boardTitleOf,
   capsuleOf,
   chineseIndex,
   continuityCandidatesOf,
@@ -120,7 +121,7 @@ import {
   type TihuTask,
 } from './task-ledger.ts'
 import { TaskLedgerStore } from './task-store.ts'
-import { commanderReplyTail, parseCommanderDecision, type CommanderDecision, type CommanderReply } from './dispatch-protocol.ts'
+import { COMMANDER_SESSION_SECTION_TITLE, commanderReplyTail, parseCommanderDecision, type CommanderDecision, type CommanderReply } from './dispatch-protocol.ts'
 import {
   PENDING_OFFLINE_CHECK_MS,
   approvalDecisionOf,
@@ -177,6 +178,33 @@ const TIHU_TOOL_NAME_LIST: readonly string[] = tihuToolNames()
 export const REPLY_HISTORY_LIMIT = 8
 
 /**
+ * 指挥台现场信息（2026-11-13 用户实机：棋盘信息太薄，只有「短号＋截断标题」）。
+ *
+ * 三档上限，改这里就够了：
+ *   - 会话清单最多 {@link COMMANDER_SESSION_LIMIT} 条（不足就有多少给多少，仍按最近活动排序）；
+ *     注意 `CONTINUITY_MAX_SESSIONS = 8` 是「承接候选」的上限，**不是**给模型看的清单上限；
+ *   - 每条会话只带**最后一轮**对话（{@link COMMANDER_DIALOGUE_MESSAGES} 条：一条用户消息 +
+ *     它对应的那条助手回复；还没回复就只给用户那条并标「尚未回复」）；
+ *   - 整块动态现场（当前屏幕＋棋盘＋会话清单及对话）最多 {@link COMMANDER_FIELD_MAX_CHARS} 字。
+ *
+ * 超预算时的砍法（用户拍板「优先保最近会话」）：从**最旧**的会话开始只保留标题行，
+ * 最近的会话对话优先保；任何情况下每一条会话的标题行都在，绝不整条消失。
+ */
+export const COMMANDER_SESSION_LIMIT = 10
+/** 每条会话最多带出几条消息（一轮＝最多 2 条：用户提问 + 它对应的助手回复）。 */
+export const COMMANDER_DIALOGUE_MESSAGES = 2
+/** 单条对话最多字数；超过在末尾标「…（后略）」（用户 2026-11-13：800）。 */
+export const COMMANDER_DIALOGUE_MAX_CHARS = 800
+/** 现场信息（当前屏幕＋棋盘＋会话清单）总字数上限：2026-11-13 压到约 6000 字（原 11000）。 */
+export const COMMANDER_FIELD_MAX_CHARS = 6_000
+/**
+ * 最近对话缓存：同一会话 15 秒内只读一次日志。
+ * `session/event` 一到（user/message、assistant/message、turn/end）就把该会话的缓存删掉，
+ * 所以「刚说完一句就接着说」拿到的是新内容，不会读到上一轮的旧对话。
+ */
+const COMMANDER_DIALOGUE_TTL_MS = 15_000
+
+/**
  * 试听默认示例语句（页面 `tts.sample` 不带 text 时用）。
  * 选一句自报家门的话：用户点「试听」听到的是真人的声音，而不是一声嘟。
  */
@@ -190,10 +218,23 @@ export function tihuSampleTextOf(edgeVoice?: string): string {
   const short = tihuCloudVoiceShortName(edgeVoice)
   return short === '云健' ? TIHU_SAMPLE_TEXT : `试听：我是${short}，声音正常吗？`
 }
-/** 单条 WS 文本帧上限（协议层还有更细的限制）。 */
+/**
+ * 单条 WS 文本帧上限（协议层还有更细的限制）。
+ *
+ * 2026-11-13 复核：这条管的是 WS 文本帧（8MB），与语音上传的
+ * {@link TIHU_ASR_MAX_BYTES} 是两件事，改录音时长时不要把它当成音频上限。
+ */
 const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024
-/** 转写超时。 */
-const TRANSCRIBE_TIMEOUT_MS = 45_000
+/**
+ * 转写超时（2026-11-13：45 秒 → 150 秒）。
+ *
+ * 手机端的录音上限已从 60 秒放宽到 180 秒；本机 whisper.cpp / SenseVoice 转写
+ * 3 分钟音频明显比 1 分钟久（CPU 上 whisper medium 实测每 10 秒音频约 1–2 秒），
+ * 45 秒会把长录音的转写直接 abort 成「转写超时」。150 秒覆盖 180 秒音频留足余量，
+ * 同时仍远小于「用户以为卡死」的容忍度。
+ */
+export const TIHU_ASR_TRANSCRIBE_TIMEOUT_MS = 150_000
+const TRANSCRIBE_TIMEOUT_MS = TIHU_ASR_TRANSCRIBE_TIMEOUT_MS
 /**
  * 一次 tihu 语音会话的「活跃窗口」：**最后一次 tihu 消息之后**这么久内才算活着。
  *
@@ -279,8 +320,8 @@ export function tihuThinkingFlushMs(): number {
 /**
  * 灰区（项目知道、接不接不知道）交给指挥台判一次的等待上限（毫秒）。
  *
- * 注意：这**不是**「派给哪个项目」的判断窗口。用户 2026-11-10 拍板：指挥台判项目
- * 不设超时，一直等到它回；灰区只是「接着哪条会话」的二次确认，到点没结论就按
+ * 注意：这**不是**「派给哪个项目」的判断窗口。派项目那一问的兜底上限见
+ * {@link tihuCommanderTimeoutMs}（默认 25 秒，投递成功才计时）；灰区只是「接着哪条会话」
  * 屏上澄清一次处理（不答就新建），所以这里保留一个有限窗口。
  * TIHU_GRAY_FALLBACK_MS 可覆盖（夹在 50ms ~ 2min；0/负数/非数字回落默认）。
  */
@@ -288,6 +329,20 @@ export function tihuGrayCommanderMs(): number {
   const raw = Number(process.env.TIHU_GRAY_FALLBACK_MS ?? 9_000)
   if (!Number.isFinite(raw) || raw <= 0) return 9_000
   return clampInt(raw, 50, 120_000)
+}
+
+/**
+ * 等指挥台判断这一句的看门狗上限（毫秒，默认 25 秒）。
+ *
+ * 2026-11-13 实机：指挥台那条会话正在跑长任务（电脑端审稿，「深度求索」用时 1 分 12 秒）时，
+ * 新派单的 prompt 只能排在那轮后面，屏上就一直是「正在判断这句话」，等 33 秒以上也派不出去。
+ * 投递成功后就按这个上限计时：到点撤掉待判、走本地规则兜底，绝不无限等。
+ * TIHU_COMMANDER_TIMEOUT_MS 可覆盖（夹在 8 秒 ~ 60 秒；0/负数/非数字回落默认）。
+ */
+export function tihuCommanderTimeoutMs(): number {
+  const raw = Number(process.env.TIHU_COMMANDER_TIMEOUT_MS ?? 25_000)
+  if (!Number.isFinite(raw) || raw <= 0) return 25_000
+  return clampInt(raw, 8_000, 60_000)
 }
 
 /**
@@ -324,6 +379,154 @@ const SPEAK_TAIL_MARGIN_MS = 120
  * 430 块 ≈ 16KB），留在内存里没意义；超出就停止累积（第一句早就够了）。
  */
 const TIHU_THINKING_MAX_CHARS = 4_000
+
+/**
+ * 语音转写（ASR）错别字提醒（2026-11-13）：凡是把**语音转录文本**交给模型的地方
+ * （派单尾巴、续聊尾巴、指挥台判句、灰区判承接、只读问答）都附上这一句。
+ * 键盘手打（source='keyboard'）不加；没传 source（来源不明）按语音算。
+ *
+ * 文案只改这一处：所有站点都引用这个常量，不要再复制第二份字符串。
+ */
+export const ASR_TYPO_HINT = '用户是用语音说的话、由系统转成文字的，转写可能有错别字或同音字；请按读音还原用户真正想说的词，理解本意后再执行，不要机械照搬转写文本。'
+
+/** 转录提醒：语音（或来源不明）给这句话，键盘手打给空串（模板里直接插，前后不加分隔符）。 */
+function asrHintOf(source: TranscriptPayload['source'] | undefined): string {
+  // 2026-11-13：不再区分 keyboard / voice，凡是转录文本一律带这句（APK 注入 #text 再点发送，
+  // 页面侧看到的是 keyboard，排除就漏；用户实测续聊尾巴缺这句就是这么漏的）。
+  void source
+  return ASR_TYPO_HINT
+}
+
+/* ---------------------------------------------------------------- 转录标点（2026-11-13）*/
+
+/**
+ * 语音转录补标点（用户 2026-11-13 诉求：ASR 回来的中文口语**一个标点都没有**，
+ * 屏上和送模型的文本都读成一长串）。
+ *
+ * 为什么不用「ASR 请求带标点提示」：本机 speech 服务（SenseVoice/whisper）的入参
+ * 只有音频，没有 initial_prompt 之类的口子，指望上游加标点是不可靠的；所以在
+ * `transcribe()` 出口做**确定性的句级标点恢复**（不调模型、不看网络，纯规则），
+ * 这样 WS 的 audio.frame 与手机壳的 POST /tihu/asr 两条链路都自动带上标点。
+ *
+ * 规则（幂等，重复调用结果不变）：
+ *   ① 原文已经有句读（，。！？；：等）→ 一个字都不重排，只补句末收口；
+ *   ② 没有标点 → 先按口语停顿词（然后/但是/因为/所以…）切从句，
+ *      过长（默认 16 字）再按「的了过着呢吧嘛啊」这种自然停顿点切；
+ *   ③ 从句之间用「，」；一句话攒到约两倍从句长度换句号；
+ *   ④ 收尾按问句判定：句尾「吗/呢/吧/嘛/没有/是不是…」或句中「什么/怎么/为什么…」→「？」；
+ *   ⑤ 整段超过 maxLineChars（默认 90 字，明显是长口述）才在句界换行——短句绝不换行，
+ *      屏上转录卡片与注入输入框都还是一行。
+ *
+ * 注意：只处理**语音转录文本**；`ASR_TYPO_HINT` 那套提醒机制原样不动。
+ */
+const ASR_QUESTION_TAIL = /(吗|呢|吧|嘛|么|没有|是不是|对不对|行不行|好不好|有没有|能不能|可不可以|怎么样|怎么办)$/
+const ASR_QUESTION_ANY = /(什么|怎么|为什么|为啥|哪个|哪里|哪些|谁|多少|几点|几个|几天|几次|是否|是不是|对不对|行不行|有没有|能不能|可不可以|要不要|会不会)/
+const ASR_CLAUSE_CUES = [
+  '然后', '接着', '之后', '后来', '最后', '首先', '其次', '另外', '不过', '但是', '可是',
+  '所以', '因为', '如果', '要是', '虽然', '而且', '并且', '就是', '对了', '其实', '现在',
+  '刚才', '顺便', '总之', '不然', '否则', '还有',
+]
+const ASR_HAS_PUNCT = /[。！？!?，、；：,;:]/
+const ASR_SOFT_BREAK = '的了过着呢吧嘛啊'
+const ASR_END_PUNCT = /[。！？!?…]$/
+
+/** 句末收口：没有终止标点就按问句/陈述补一个（不动句中已有标点）。 */
+function closeAsrSentence(text: string): string {
+  const body = text.trim()
+  if (body === '') return ''
+  if (ASR_END_PUNCT.test(body)) return body
+  return body + (isAsrQuestion(body) ? '？' : '。')
+}
+
+/** 整句是不是问句：句尾语气词优先，其次看句中疑问词。 */
+function isAsrQuestion(text: string): boolean {
+  const body = String(text ?? '').replace(/[\s。！？!?，、；：,;:]+$/, '')
+  if (body === '') return false
+  return ASR_QUESTION_TAIL.test(body) || ASR_QUESTION_ANY.test(body)
+}
+
+export interface AsrPunctuateOptions {
+  /** 一个从句最多多少字（超过就找停顿点切开）。 */
+  maxClauseChars?: number
+  /** 整段超过多少字才在句界换行。 */
+  maxLineChars?: number
+}
+
+/** 给一段中文口语转录补标点（幂等；导出给测试与页面复用）。 */
+export function punctuateAsrText(input: string, options: AsrPunctuateOptions = {}): string {
+  let text = String(input ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t\u3000]+/g, ' ')
+    .replace(/\n{2,}/g, '\n')
+    .trim()
+  if (text === '') return ''
+  // 英文标点前后别留空格（ASR 偶尔给半个逗号）：只做空白整理，不改字符。
+  text = text.replace(/ +([,.;:!?]) */g, '$1 ')
+  const maxClause = Math.max(6, Math.min(40, Math.round(Number(options.maxClauseChars) || 16)))
+  const maxLine = Math.max(20, Math.min(400, Math.round(Number(options.maxLineChars) || 90)))
+  // ① 已经有句读：不重排（模型真的给了标点时以它为准），只补句末。
+  if (ASR_HAS_PUNCT.test(text)) return closeAsrSentence(text)
+
+  // ② 口语停顿词切从句：只在停顿词前面已经有 4 个字时才切，避免「我，觉得」这种碎句。
+  const parts: string[] = []
+  let rest = text.replace(/\s+/g, '')
+  while (rest !== '') {
+    let cut = -1
+    for (const cue of ASR_CLAUSE_CUES) {
+      const at = rest.indexOf(cue)
+      if (at >= 4 && (cut < 0 || at < cut)) cut = at
+    }
+    if (cut < 0) { parts.push(rest); break }
+    parts.push(rest.slice(0, cut))
+    rest = rest.slice(cut)
+  }
+
+  // ③ 过长的从句再按自然停顿点切成 maxClause 左右的小段。
+  const clauses: string[] = []
+  for (const part of parts) {
+    let chunk = part
+    while (chunk.length > maxClause + 4) {
+      let at = maxClause
+      for (let i = maxClause - 1; i >= Math.max(4, maxClause - 6); i -= 1) {
+        if (ASR_SOFT_BREAK.includes(chunk.charAt(i))) { at = i + 1; break }
+      }
+      clauses.push(chunk.slice(0, at))
+      chunk = chunk.slice(at)
+    }
+    if (chunk !== '') clauses.push(chunk)
+  }
+  if (clauses.length === 0) return closeAsrSentence(text)
+
+  // ④ 从句 → 句子：问句从句用「？」，攒够约两倍从句长度换「。」。
+  const sentences: string[] = []
+  let current: string[] = []
+  let length = 0
+  const flush = (end: string): void => {
+    if (current.length === 0) return
+    sentences.push(current.join('，') + end)
+    current = []
+    length = 0
+  }
+  for (const clause of clauses) {
+    current.push(clause)
+    length += clause.length
+    if (ASR_QUESTION_TAIL.test(clause.replace(/\s+/g, ''))) { flush('？'); continue }
+    if (length >= maxClause * 2) flush('。')
+  }
+  if (current.length > 0) flush(isAsrQuestion(clauses[clauses.length - 1] ?? '') ? '？' : '。')
+
+  // ⑤ 长口述才换行：短句（默认 ≤90 字）永远是一行。
+  const joined = sentences.join('')
+  if (joined.length <= maxLine || sentences.length < 2) return joined
+  const lines: string[] = []
+  let line = ''
+  for (const sentence of sentences) {
+    if (line !== '' && line.length + sentence.length > maxLine) { lines.push(line); line = sentence; continue }
+    line += sentence
+  }
+  if (line !== '') lines.push(line)
+  return lines.join('\n')
+}
 
 /** 环境变量整数化 + 夹到安全区间（NaN / 0 / 负数一律回落兜底值）。 */
 function clampInt(value: number, min: number, max: number): number {
@@ -444,6 +647,39 @@ export function tihuVoiceAutoEligible(text: string): boolean {
   return /^(?:请|帮我|麻烦)?(?:查看|看|读取|读|查询|查|搜索|总结|解释|翻译|列出|汇报|告诉|分析|什么|怎么|哪|现在|目前)/.test(value)
 }
 
+/**
+ * 一条设备输入附带的现场（2026-11-13）：目前只有「朗读页正在念哪条任务」。
+ *
+ * 页面在朗读页发指令时会带 `screenHint='read'` + `taskId`，lane 把 taskId 解析成
+ * 那条任务当前的会话并**硬绑定**（见 {@link TihuReadPin}）；解析不出来就当没有现场，
+ * 完全走原判断。
+ */
+interface TihuUtteranceContext {
+  readTaskId?: string
+}
+
+/**
+ * 读页硬绑定（2026-11-13）：朗读页录音发来的这一句，路由结论锁死为「正在朗读的那条会话」。
+ *
+ * 只对**朗读页**生效：页面的 `readHint()` 在完成页（正在念某条任务）才带
+ * `screenHint='read'` + `taskId`。键盘手打、普通状态页、指挥台自己派来的句子都没有这两个
+ * 字段 → 不进这条路径，行为与改动前完全一样。
+ *
+ * 它是原 `readBiasOf` 软偏置的升级版：之前只是给指挥台一句「大概率接着这条」，判断仍可
+ * 改派到别的项目/新会话；现在判断照旧（内容理解、错别字还原），但结论**不参与路由**，
+ * 一句只投 `sessionId` 这一条会话（见 `dispatchPinnedRead` / `deliverReadPin`）。
+ */
+interface TihuReadPin {
+  /** 朗读页正在念的那条任务（台账短号）。 */
+  taskId: string
+  /** 这条任务当前绑定的会话（最后一个）；硬绑定的唯一落点。 */
+  sessionId: string
+  taskTitle: string
+  projectId: string
+  projectName: string
+  folder?: string
+}
+
 /** 一个已连接的设备（P0 一个页面一个连接）。 */
 interface TihuDevice {
   id: string
@@ -492,7 +728,7 @@ interface TihuDevice {
    * 语义两可的追问待答（2026-11-11 语义路由）：用户下一句「1 派它干活 / 2 先不管」，
    * 或者在屏上点这两个按钮。**这一句在用户答清楚之前不许被派出去**（绝不猜着派单）。
    */
-  pendingIntent?: { text: string; question: string; key: string }
+  pendingIntent?: { text: string; question: string; key: string; source?: TranscriptPayload['source'] }
   /** 派单回执自动回棋盘的计时器（任何交互都取消它）。 */
   receiptTimer?: ReturnType<typeof setTimeout>
   /** 页面选中的音色（default / 克隆音色名）。 */
@@ -520,6 +756,8 @@ interface TihuDevice {
     text: string
     sessionId: string
     autoEligible: boolean
+    /** 朗读页现场（2026-11-13）：这段语音是在「听某条任务」时说出来的，带上那条任务。 */
+    readTaskId?: string
     timer?: ReturnType<typeof setTimeout>
   }
   voiceUi?: {
@@ -642,6 +880,11 @@ export interface TihuRuntimeOptions {
   tts?: { disabled?: boolean; threads?: number; port?: number; paths?: Partial<TihuTtsPaths>; instance?: TihuTts; prewarm?: boolean }
   /** 控制室卡片巡检间隔（毫秒，0 = 关闭；缺省走 tihuHomeSyncMs()/环境变量）。 */
   homeSyncMs?: number
+  /**
+   * 等指挥台判断的看门狗上限（毫秒；缺省走 tihuCommanderTimeoutMs()/环境变量）。
+   * 单测传小值，不必等满 25 秒。
+   */
+  commanderTimeoutMs?: number
   /** 语音预览自动发送延迟（默认 2000ms；测试可注入，不属于设备协议）。 */
   previewDelayMs?: number
   /**
@@ -929,10 +1172,11 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   /** 唯一指挥会话 id（懒建一次；建不出来就直接上错误屏，不退回旧壳）。 */
   let commanderSessionId: string | undefined
   /**
-   * 正在等指挥台判断的那句话（用户 2026-11-10：**不设超时**，一直等到它回）。
+   * 等指挥台判断的那句话（用户 2026-11-10：不设无上限的等——2026-11-13 加了看门狗）。
    *
    * 屏上每秒重画「已等 N 秒」；用户按「主页」回棋盘时判断照旧在后台跑，
-   * 只停止往屏上刷这一帧（`device.onBoard` 守门）。
+   * 只停止往屏上刷这一帧（`device.onBoard` 守门）。投递成功后 {@link tihuCommanderTimeoutMs}
+   * 到点还没结论就撤掉待判、按本地规则兜底（见 giveUpCommanderAsk）。
    */
   let commanderWait: {
     text: string
@@ -947,7 +1191,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   /**
    * 已上棋盘、还在等指挥台判项目的排队卡（字面归一化 key → taskId）。
    * 指挥台晚到的 dispatch 按这句话认领同一张卡：**taskId 不变**，绝不新建第二张。
-   * 不设过期时间：用户拍板「一直等到判出结果」，卡只在转正 / 彻底失败 / 卸载时摘掉。
+   * 不设过期时间：卡只在转正 / 彻底失败 / 卸载时摘掉（2026-11-13 单句提问另有看门狗兜底）。
    *
    * 2026-11-11 语义路由：慢路径进门不再先立这张卡——判成「冲这块屏说的那句话」不许有任务。
    * 这张表现在只用在「指挥台自己调了 dispatch 工具」那一跳的转正与去重。
@@ -977,10 +1221,31 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
     confidence?: number
     via: string
     askedAt: number
+    /** 这句的来源（语音/键盘）：只决定送模型的转录提醒加不加。 */
+    source?: TranscriptPayload['source']
     /** 这次提问落到指挥会话的第几轮（turn/start 时认领）：多句排队时不会互相抢回复。 */
     turn?: number
+    /**
+     * 读页硬绑定（2026-11-13）：这句话来自朗读页录音，判断结论只用于理解，投递只认这条 pin。
+     * 有它时 `settleCommanderReply` 跳过 control/clarify/dispatch 全部分支。
+     */
+    readPin?: TihuReadPin
+    /** 读页判断窗口（到点没回也照样投 pin 会话，这句话不能因为指挥台慢就丢）。 */
+    readTimer?: ReturnType<typeof setTimeout>
+    /**
+     * 投递成功后的看门狗（{@link tihuCommanderTimeoutMs}）：到点撤掉待判、按本地规则兜底。
+     * 读页（有 readPin）与灰区（kind='continuity'，另有灰区计时器）不挂这只表。
+     */
+    watchdog?: ReturnType<typeof setTimeout>
   }
   const commanderAsks: CommanderAsk[] = []
+  /**
+   * 指挥台现场信息里的「最近对话」缓存（sessionId → 已整理好的「用户：…／助手：…」行）。
+   *
+   * 一次判断要读最多 10 条会话的历史，不缓存就会为每句语音多打 10 次宿主；
+   * 15 秒 TTL + `session/event` 即删（见 disposeSession）保证刚说完的话能立刻读到。
+   */
+  const commanderDialogueCache = new Map<string, { at: number; lines: string[] }>()
   /** 已经结算过回复的指挥会话 turn（防止同一轮的 turn/end 再顶替下一句等待）。 */
   const commanderTurnReplied = new Set<number>()
   /**
@@ -996,6 +1261,14 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
    */
   const controlHandled = new Map<string, { tool: string; at: number }>()
   /**
+   * 已经超时（或指挥台正忙）兜底过的提问（字面 key → 那次提问的 askedAt / 兜底时刻 / turn）。
+   *
+   * 2026-11-13：指挥台后来才回的那一条不能把已经兜底过的同一条命令再派一次。
+   * 用 dispatchKey + askedAt 认「同一次提问」：用户重说同一句是新的一次提问（askedAt 不同），
+   * 不该被旧记录挡住。窗口与 {@link FALLBACK_DEDUPE_MS} 一致（模型最晚一两分钟才回）。
+   */
+  const staleCommanderAsks = new Map<string, { askedAt: number; at: number; turn?: number }>()
+  /**
    * 超时兜底已经派过的一句（按字面归一化后的 key）：指挥会话晚到的同一条 dispatch
    * 不能再建第二条任务。只挡模型这条入口，快路径重复说同一句不受影响。
    */
@@ -1004,7 +1277,7 @@ export function createTihuRuntime(ctx: any, options: TihuRuntimeOptions): TihuRu
   const FALLBACK_DEDUPE_MS = 5 * 60_000
   /**
    * 灰区（会话衔接判不准）交给指挥台判一次的计时器：到点还没派出就按「一次澄清」处理。
-   * 与「等指挥台判项目」分开：那一步不设超时，这里只是「接着哪条」的二次确认。
+   * 与「等指挥台判项目」分开：那一问由 {@link tihuCommanderTimeoutMs} 的看门狗兜底，这里只是「接着哪条」的二次确认。
    */
   let grayFallback: {
     text: string
@@ -1295,6 +1568,36 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return shortSessionId(sessionId)
   }
 
+  /**
+   * 棋盘用的客户端会话标题（**逐字**）：与 DSH 网页/电脑端会话列表同一个投影字段 `title`。
+   *
+   * 拿不到活会话投影就返回 ''（**绝不**退回短 id——那会把会话号写上棋盘）；只认探测到的
+   * 真实标题，所以这里不能直接用 {@link titleForSession} 的整条兜底链。
+   */
+  function clientSessionTitleOf(sessionId: string): string {
+    const live = liveSessionOf(sessionId)
+    if (live === undefined) return ''
+    const projected = titleOf(live)
+    return projected.trim() === '' ? '' : projected
+  }
+
+  /**
+   * 棋盘标题同步：把每条任务承载会话的**客户端标题原文**写进登记簿（`sessionTitle`）。
+   *
+   * 每出一帧棋盘前跑一遍：投影读全在内存里（宿主投影缓存），几条任务也就几次取值；
+   * 标题没变时 `setSessionTitle` 什么都不动，棋盘不会因此重排。
+   */
+  function syncBoardTitles(): void {
+    for (const task of tasks.list()) {
+      if (task.state === 'archived') continue
+      const sessionId = task.sessionIds[task.sessionIds.length - 1]
+      if (sessionId === undefined || sessionId === '') continue
+      const title = clientSessionTitleOf(sessionId)
+      if (title === '') continue
+      tasks.setSessionTitle(task.taskId, title)
+    }
+  }
+
   /** 取活会话对象：服务缺失或查不到就给 undefined。 */
   function liveSessionOf(sessionId: string): any {
     const sessions = optionalService(ctx, 'sessions')
@@ -1313,6 +1616,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    */
   /** 屏帧的公共出口：记下这台设备现在停在哪一屏（进度页刷新与回主页计时都按这份判）。 */
   function pushFrame(device: TihuDevice, frame: ScreenFramePayload): void {
+    try {
+      const hint = frame as unknown as Record<string, unknown>
+      if (hint.screenHint === undefined) {
+        const rows = Array.isArray((frame as any).rows) ? (frame as any).rows.length : 0
+        const page = Math.max(0, Math.trunc(device.boardPage ?? 0)) + 1
+        const mode = String((frame as any).mode ?? (frame as any).stage ?? '')
+        hint.screenHint = `${mode === 'board' ? '棋盘' : (mode || '状态')} ${page} · ${rows} 行`.slice(0, 40)
+        hint.convoHint = String((device as any).title ?? '').slice(0, 40)
+      }
+    } catch { /* 提示字段失败不影响推帧 */ }
     device.screenStage = frame.stage
     device.send('screen.frame', frame)
   }
@@ -2120,7 +2433,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         ? result
         : String(result?.text ?? result?.transcript ?? result?.result ?? '').trim()
       applyPersonalTerms(loadAssistantConfig().asrTerms)
-      return cleanFillers(fixTerms(text)).trim()
+      // 2026-11-13：ASR 回来的中文口语没有标点，统一在出口补句读（幂等；已有标点的不重排）。
+      return punctuateAsrText(cleanFillers(fixTerms(text)).trim())
     } finally {
       clearTimeout(timer)
       externalSignal?.removeEventListener('abort', cancel)
@@ -2480,17 +2794,17 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 返回 true 表示「路由已经自己出了一屏」（回执/追问/棋盘/详情/提示）——调用方
    * 不能再补一条通用的「思考 · 模型处理中」帧，否则屏 2/7 会被 1ms 内盖掉。
    */
-  async function routeCommittedText(device: TihuDevice, text: string): Promise<boolean> {
+  async function routeCommittedText(device: TihuDevice, text: string, source: TranscriptPayload['source'] = 'voice', ctx?: TihuUtteranceContext): Promise<boolean> {
     // 统一指挥（2026-11-09）：设备只绑指挥会话，一句话先过派单器（快路径 → 慢路径），
     // 绝不直接注入「设备当前绑的那条会话」——那正是「得先找到是哪条会话」的老毛病。
     if (device.unified) {
-      await dispatchUtterance(device, text)
+      await dispatchUtterance(device, text, source, ctx)
       const key = device.sessionId
       if (key !== undefined) touchWindow(key)
       return true
     }
     // 统一指挥是唯一路径（2026-11-09）：设备绑的永远是指挥会话，说话只走派单器。
-    await dispatchUtterance(device, text)
+    await dispatchUtterance(device, text, source, ctx)
     const key = device.sessionId
     if (key !== undefined) touchWindow(key)
     return true
@@ -2518,18 +2832,18 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       showInputError(device, new Error(`已切换到：${titleForSession(device.sessionId ?? '')}；请重说一次`))
       return
     }
-    await routeCommittedText(device, pending.text)
+    await routeCommittedText(device, pending.text, 'voice', pending.readTaskId === undefined ? undefined : { readTaskId: pending.readTaskId })
     device.send('event.progress', { stage: '注入', text: '已送入当前会话' } satisfies ProgressPayload)
   }
 
   /** ASR 完成后只形成宿主权威草稿；安全白名单才允许约 2 秒自动提交。 */
-  function previewVoice(device: TihuDevice, text: string, attempt: number, quality: ReturnType<typeof inspectTihuVoiceWav>): void {
+  function previewVoice(device: TihuDevice, text: string, attempt: number, quality: ReturnType<typeof inspectTihuVoiceWav>, readTaskId?: string): void {
     if (attempt !== device.voiceAttempt || device.sessionId === undefined || !devices.has(device)) return
     cancelPendingVoice(device)
     const sessionId = device.sessionId
     const autoEligible = quality.kind === 'ok' && tihuVoiceAutoEligible(text)
       && !runningSessions.has(sessionId)
-    const pending: NonNullable<TihuDevice['pendingVoice']> = { attempt, text, sessionId, autoEligible }
+    const pending: NonNullable<TihuDevice['pendingVoice']> = { attempt, text, sessionId, autoEligible, ...(readTaskId === undefined || readTaskId === '' ? {} : { readTaskId }) }
     device.pendingVoice = pending
     device.send('transcript', { text, final: true, source: 'voice', retryable: true } satisfies TranscriptPayload)
     sendFrame(device, {
@@ -2636,6 +2950,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         const blocks = Array.isArray((data as any)?.message?.content) ? (data as any).message.content : []
         const text = stripToolNoise(blocks.filter((b: any) => b?.type === 'text').map((b: any) => String(b?.text ?? '')).join('\n')).trim()
         if (text !== '') lastAssistant.set(sessionId, { text, at } as ProjectReply)
+      }
+      // 现场信息里的「最近对话」缓存：这条会话一有新消息就失效，下一句判断读到的是最新一轮。
+      if (type === 'user/message' || type === 'assistant/message' || type === 'turn/end') {
+        commanderDialogueCache.delete(sessionId)
       }
       // 指挥台纯文本结论：assistant/message 一到就试着解析（好让排队卡尽早转正），
       // turn/end 是最后期限——解析不出来也要给终态，绝不停在「等指挥台判断」。
@@ -3508,6 +3826,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     if (type === 'text.input' || type === 'audio.frame') {
       const inputTarget = device.sessionId
       const source = type === 'audio.frame' ? 'voice' : message.payload.source === 'voice' ? 'voice' : 'keyboard'
+      // 朗读页现场（2026-11-13）：完成朗读页发来的指令带 screenHint='read' + 正在念的 taskId。
+      // 只当软偏置用（更可能接着那条会话），查不到会话就自动不用；路由规则本身不变。
+      const screenCtx = (message.payload ?? {}) as { screenHint?: string; taskId?: string }
+      const readTaskId = screenCtx.screenHint === 'read' ? String(screenCtx.taskId ?? '').trim() : ''
+      const readCtx: TihuUtteranceContext | undefined = readTaskId === '' ? undefined : { readTaskId }
       if (type === 'text.input' && message.payload.source === 'retry') {
         device.send('transcript', { text: '', final: true, source: 'voice', retryable: true } satisfies TranscriptPayload)
         sendFrame(device, { stage: '重说', title: '请重新说', bullets: ['上一条未发送'], tone: 'idle', mode: 'status' } satisfies ScreenFramePayload)
@@ -3556,14 +3879,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           sendFrame(device, { stage: '没听清', title: '请再说一次', bullets: ['这次没有识别到内容'], tone: 'alert', mode: 'status' } satisfies ScreenFramePayload, expectedTarget)
           return
         }
-        previewVoice(device, text, attempt, quality)
+        previewVoice(device, text, attempt, quality, readTaskId)
         return
       }
       const text = String(message.payload.text ?? '').trim()
       if (text === '') return
       try {
         device.send('transcript', { text, final: true, source, retryable: true } satisfies TranscriptPayload)
-        const screenOwned = await routeCommittedText(device, text)
+        const screenOwned = await routeCommittedText(device, text, source, readCtx)
         device.send('event.progress', { stage: '注入', text: '已送入当前会话' } satisfies ProgressPayload)
         // 统一指挥的路由自己已经出了屏（回执/追问/棋盘/详情）：通用「思考」帧会把它
         // 盖掉。这里只给老路径补帧；屏内「思考 ·」活动行本身不动。
@@ -3615,6 +3938,54 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /**
+   * 一条会话**此刻**的 agent preset：活会话投影 > 会话行缓存 > `findSession` 那一行；读不到给空串。
+   *
+   * 铁律口径（2026-11-13）：派单目标只认 {@link TIHU_COMPUTER_USE_PRESET}。只读，绝不改会话模式。
+   */
+  async function dispatchPresetOf(sessionId: string): Promise<string> {
+    const live = liveSessionOf(sessionId)
+    if (live !== undefined) {
+      const preset = presetOf(live)
+      if (preset !== '') return preset
+    }
+    const remembered = sessionPresets.get(sessionId) ?? ''
+    if (remembered !== '') return remembered
+    try {
+      const found = await findSession(sessionId)
+      const preset = found.row?.preset ?? ''
+      if (preset !== '') return preset
+    } catch { /* 读不到就按空处理 */ }
+    return ''
+  }
+
+  /**
+   * 派单前的硬闸（用户 2026-11-13 铁律，语音与键盘共用这一跳）。
+   *
+   * 只放行 computer-use；读到明确别的模式 → 投递前拦住，屏上留一句主人看得懂的话
+   * （**绝不**悄悄派进标准模式）。读不到模式（老宿主/会话不在内存）→ 放行并记日志，
+   * 让真正的投递失败去出错误屏，不因为读不到就把这句话吞掉。
+   *
+   * @param where 日志/审计里标明是哪条入口（append / read-pin）。
+   * @returns true＝可以投递；false＝已拒绝（屏上提示已出，调用方直接返回）。
+   */
+  async function allowDispatchTarget(device: TihuDevice | undefined, sessionId: string, where: string): Promise<boolean> {
+    const preset = await dispatchPresetOf(sessionId)
+    if (preset === '' || isComputerUsePreset(preset)) {
+      if (preset === '') log(`tihu dispatch target preset unknown session=${sessionId}（${where}）→ 按原样投递`)
+      return true
+    }
+    const label = preset === 'standard' ? '标准模式' : `「${preset}」模式`
+    log(`tihu dispatch target blocked session=${sessionId} preset=${preset}（${where}）→ 语音/键盘只许 computer-use`)
+    try {
+      appendTihuLaneLog(sessionId, new Error(`目标会话模式=${preset}（${where}）→ 语音/键盘派单只允许 computer-use，已拒绝投递`), 'target-not-computer-use')
+    } catch { /* 日志失败不改变结论 */ }
+    if (device !== undefined) {
+      showInputError(device, new Error(`目标会话 ${shortSessionId(sessionId)} 是 ${preset} 模式，只许 computer-use`), `那条会话是${label}，不能派`)
+    }
+    return false
+  }
+
+  /**
    * 在指定文件夹新建一条会话。
    *
    * **宿主真实入口是 `sessionController.create()`**：它就是 Typert 暴露成 `ctx.remote.session`
@@ -3628,8 +3999,32 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    *     返回 Session 而非 id，把 options 当 id 传必抛。
    * 两条都失败 → 指挥会话建不出来 → 裸 hello 无声退回项目卡片主页（这次的线上现象）。
    */
-  async function createSessionAt(folder: string, preset: string): Promise<string | undefined> {
+  async function createSessionAt(folder: string, preset: string, requirePreset?: string): Promise<string | undefined> {
     const base = folder !== '' ? { cwd: folder } : {}
+    /**
+     * 建完**核对模式**（用户 2026-11-13 铁律：派单目标必须是 computer-use）。
+     *
+     * 为什么不能只信请求：宿主 `create` 的返回值本来就带 `agentPreset`
+     * （app.asar 里 `SessionCommandController.create` 返回 `{ sessionId, agentPreset }`），
+     * 旧实现把它丢了——预设没注册 / 被组合改掉时宿主可能落成别的模式，lane 却照样把语音投进去
+     * （＝派进标准模式）。现在按「宿主回执 > 会话行/活会话投影」再读一遍；
+     * 读不到才按原样继续（老宿主/会话还没投影，不误伤）。
+     */
+    const finish = async (sessionId: string, reportedPreset: unknown): Promise<string | undefined> => {
+      if (requirePreset === undefined || requirePreset === '') return sessionId
+      const reported = typeof reportedPreset === 'string' ? reportedPreset : ''
+      const actual = reported !== '' ? reported : await dispatchPresetOf(sessionId)
+      if (actual === '') {
+        log(`tihu create session=${sessionId} 模式读不到（老宿主/会话还没投影），按宿主默认继续`)
+        return sessionId
+      }
+      if (actual === requirePreset) return sessionId
+      log(`tihu create session=${sessionId} 模式=${actual} 与要求=${requirePreset} 不符 → 拒绝使用（绝不把语音投进非电脑操作会话）`)
+      try {
+        appendTihuLaneLog(sessionId, new Error(`新建会话模式=${actual}，要求=${requirePreset} → 拒绝派单`), 'create-preset-mismatch')
+      } catch { /* 日志失败不改变结论 */ }
+      return undefined
+    }
     const controller = optionalService(ctx, 'sessionController') as {
       create?: (request: { cwd?: string; agentPreset?: string }) => Promise<any>
     } | undefined
@@ -3643,7 +4038,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           // 刚建的会话还没进列表缓存；不清掉的话 findSession 会判 missing，
           // bindSession 立刻回 session.invalid（2026-11-09 实测：建完却绑不上）。
           sessionListCache = undefined
-          return sessionId
+          return await finish(sessionId, created?.agentPreset)
         }
         log(`tihu sessionController.create returned no sessionId: ${String(JSON.stringify(created ?? null)).slice(0, 140)}`)
       } catch (error) {
@@ -3657,7 +4052,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         const result: any = await remote.session.create({ ...base, agentPreset: preset })
         if (result?.ok === true && typeof result?.value?.sessionId === 'string' && result.value.sessionId !== '') {
           sessionListCache = undefined
-          return result.value.sessionId
+          return await finish(result.value.sessionId, result.value.agentPreset)
         }
         log(`tihu remote.session.create rejected: ${String(JSON.stringify(result?.error ?? null)).slice(0, 140)}`)
       } catch (error) {
@@ -3683,21 +4078,24 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * @param sessionId 刚建好的会话。
    * @param kind 前台（派单任务会话）/ 后台（指挥台会话）。
    * @param note 日志里标明是哪条路径。
+   * @returns true＝按配置处理完了（含「没配置、什么都不做」）；false＝这次没装上，
+   *          调用方（指挥台的签名守卫）据此决定**不记账**、下一轮重试。
    */
-  async function applyTihuModel(sessionId: string, kind: TihuModelKind, note: string): Promise<void> {
+  async function applyTihuModel(sessionId: string, kind: TihuModelKind, note: string): Promise<boolean> {
     let tihu: unknown
     try { tihu = loadAssistantConfig().tihu } catch { tihu = undefined }
     const selection = resolveTihuModel(kind, tihu)
-    if (selection === null) return
+    if (selection === null) return true
     const label = kind === 'foreground' ? '前台' : '后台'
     const result = await selectModelKeepingDefault(ctx, { sessionId, selection }, log)
     if (result.ok) {
       log(`tihu model ${kind} applied session=${sessionId} ${selection.provider}/${selection.model}（${note}）`)
       try { appendTihuLaneNote('tihu-model', `已指定${label}模型 session=${sessionId} ${selection.provider}/${selection.model}`) } catch { /* 日志失败不影响派单 */ }
-      return
+      return true
     }
     log(`tihu model ${kind} NOT applied session=${sessionId}: ${result.error}`)
     try { appendTihuLaneNote('tihu-model', `指定${label}模型失败 session=${sessionId}：${result.error}`) } catch { /* 日志失败不影响派单 */ }
+    return false
   }
 
   /** 给会话写标题：指挥会话靠标题被下次 hello 找回（宿主 sessionTitle 服务，经 sessionController 暴露）。 */
@@ -4000,16 +4398,84 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /**
-   * 指挥台是**按标题长期复用**的（正常情况永远不新建），所以「只影响新建会话」那条说法
-   * 对它等于永远不生效。这里改成「每进程每条指挥台补一次」：复用回来的那条也把默认后台
-   * 模型装上，装过就记下来、下次不再重复（同一会话不会每轮都写一次 model/selection）。
-   * 用户自己不会去改指挥台的模型（它不占屏、看不到），覆盖它是安全的。
+   * 指挥台模型的生效守卫：**按配置值签名比对**，不是「每进程每条只做一次」。
+   *
+   * 2026-11-13（用户拍板语义）：手机「鹈鹕设置 → 指挥台模型」里选的值是**权威值**，
+   * 每次派单前由 lane 同步到指挥台会话；电脑端手动改模型不作为覆盖依据。
+   *
+   * 因此这里必须比「配的是什么」，而不是只记 sessionId：
+   *   - 记的是 `provider/model`（含 reasoningEffort）：手机端换了模型，下一次派单就重放，
+   *     不必重启 DSH（旧实现只认 sessionId，换配置永远不生效）；
+   *   - **apply 成功才记账**：宿主服务还没就绪/超时这类瞬时失败，下一轮自动重试
+   *     （旧实现先把 id 塞进 Set 再 apply，失败也被永久当成「做过」——2026-11-13
+   *     lane.log 09:25 那条「宿主没有 sessionController.selectModel」之后再没重试）；
+   *   - 配置为空（跟随 DSH 默认）时记 `default` 且什么都不做，与 2026-11-10 之前一致。
    */
-  const commanderModelApplied = new Set<string>()
-  async function ensureCommanderModel(sessionId: string): Promise<void> {
-    if (commanderModelApplied.has(sessionId)) return
-    commanderModelApplied.add(sessionId)
-    await applyTihuModel(sessionId, 'background', '指挥台')
+  const commanderModelApplied = new Map<string, string>()
+
+  /**
+   * 一条会话**此刻**的模型选择（宿主 `modelSelection` 投影，`{lastUsed, next}`）。
+   *
+   * 只读、绝不写：`ensureCommanderModel` 拿它判断「现值与手机设置是否一致」，
+   * 读页续聊拿它执行「会话模型 > 默认模型」（见 `ensureReadSessionModel`）。
+   *
+   * @returns 选择对象 / null（这条会话还没有显式选择＝在用全局默认）/
+   *          undefined（读不到：老宿主、会话不在内存）。
+   */
+  function sessionSelectionNow(sessionId: string): { provider: string; model: string; reasoningEffort?: string } | null | undefined {
+    const live = liveSessionOf(sessionId)
+    if (live === undefined) return undefined
+    const values = projectionValuesOf(live)
+    if (!('modelSelection' in values)) return undefined
+    const raw: any = (values as any).modelSelection
+    const pick: any = raw !== null && typeof raw === 'object' ? (raw.next ?? raw.pending ?? raw.lastUsed) : raw
+    if (pick === undefined || pick === null) return null
+    if (typeof pick !== 'object' || typeof pick.provider !== 'string' || typeof pick.model !== 'string') return undefined
+    const effort = typeof pick.reasoningEffort === 'string' && pick.reasoningEffort !== '' ? pick.reasoningEffort : undefined
+    return { provider: pick.provider, model: pick.model, ...(effort === undefined ? {} : { reasoningEffort: effort }) }
+  }
+
+  /**
+   * 指挥台**此刻**的模型选择（宿主 `modelSelection` 投影，`{lastUsed, next}`）。
+   *
+   * 只靠签名守卫只能记住「上一轮我给它装了什么」，不知道电脑端有没有在两次派单之间
+   * 手动改过。用户 2026-11-13 定的语义是「手机设置是权威值，电脑端手动改模型不作为
+   * 覆盖依据」，所以每次派单前还要对一眼现值：不一致就重放。
+   *
+   * @returns 选择对象 / null（这条会话还没有显式选择＝在用全局默认）/
+   *          undefined（读不到：老宿主、会话不在内存，退回签名守卫）。
+   */
+  function commanderSelectionNow(sessionId: string): { provider: string; model: string; reasoningEffort?: string } | null | undefined {
+    return sessionSelectionNow(sessionId)
+  }
+
+  async function ensureCommanderModel(sessionId: string): Promise<boolean> {
+    let tihu: unknown
+    try { tihu = loadAssistantConfig().tihu } catch { tihu = undefined }
+    const selection = resolveTihuModel('background', tihu)
+    const key = selection === null
+      ? 'default'
+      : `${selection.provider}/${selection.model}${selection.reasoningEffort ? `#${selection.reasoningEffort}` : ''}`
+    if (selection === null) {
+      // 跟随 DSH 默认：宿主没有「清掉会话选择」的官方通路，保持原样（与旧行为一致）。
+      commanderModelApplied.set(sessionId, key)
+      return true
+    }
+    const current = commanderSelectionNow(sessionId)
+    if (current === undefined) {
+      // 现值读不到（老宿主/会话不在内存）：退回签名守卫，免得每轮都重复写 model/selection。
+      if (commanderModelApplied.get(sessionId) === key) return true
+    } else if (current !== null
+      && current.provider === selection.provider
+      && current.model === selection.model
+      && (current.reasoningEffort ?? '') === (selection.reasoningEffort ?? '')) {
+      // 现值已经是设置值（含我们自己上一轮装的）：记账，不重复写。
+      commanderModelApplied.set(sessionId, key)
+      return true
+    }
+    const ok = await applyTihuModel(sessionId, 'background', '指挥台')
+    if (ok) commanderModelApplied.set(sessionId, key)
+    return ok
   }
 
   /**
@@ -4031,7 +4497,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     if (options.fresh !== true) {
       let rows: TihuSessionRow[] = []
       try { rows = (await collectSessionRows()).rows } catch { rows = [] }
-      const existing = rows.find((row) => String(row.title ?? '').includes(COMMANDER_TITLE))
+      /*
+       * 根因修正（2026-11-13）：旧实现用 `title.includes(COMMANDER_TITLE)` 找指挥台，
+       * 任何**任务会话 / 后台 code_agent 子会话**只要标题里带「鹈鹕指挥台」就会被认成指挥台
+       * （实测：一句「改 D:\dsh-assistant 鹈鹕指挥台喂…」派出去后，新建出来的 standard 子会话
+       * 标题正好含这四个字，下一次 hello 就把它当指挥台 → 之后所有语音都投进这条标准模式会话）。
+       * 现在只认「标题整条等于 鹈鹕指挥台」且自己确实是 standard 的那条：指挥台只看单、不看屏。
+       */
+      const isCommanderRow = (row: TihuSessionRow): boolean => String(row.title ?? '').trim() === COMMANDER_TITLE
+        && (row.preset === '' || row.preset === TASK_PRESET)
+      const existing = rows.find(isCommanderRow)
       if (existing !== undefined) {
         commanderSessionId = existing.sessionId
         log(`tihu commander reused session=${existing.sessionId}`)
@@ -4123,6 +4598,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     device: TihuDevice | undefined,
     text: string,
     skipProjectId?: string,
+    source?: TranscriptPayload['source'],
   ): Promise<DispatchOutcome | undefined> {
     const previous = previousDispatchTask()
     if (previous === undefined) return undefined
@@ -4146,7 +4622,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       return undefined
     }
     log(`tihu previous-follow append project=${card.id} session=${session.sessionId} score=${hint.confidence.toFixed(2)} ${hint.detail}`)
-    const appendMeta: DispatchMeta = { via: 'previous', continuity: 'append', confidence: hint.confidence, clarify: 'no' }
+    const appendMeta: DispatchMeta = { via: 'previous', continuity: 'append', confidence: hint.confidence, clarify: 'no', source }
     const task = await appendToSession(
       device,
       text,
@@ -4241,6 +4717,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     failure?: unknown
     /** 调用方已经出过终态屏（上层别再补一张「请重说」）。 */
     failureShown?: boolean
+    /** 这句的来源（语音/键盘）：只决定送模型的转录提醒加不加，不影响路由。 */
+    source?: TranscriptPayload['source']
+    /**
+     * 读页硬绑定（2026-11-13）：目标会话接不住时**不许**降级到「同项目新建」（不许跨会话改派）。
+     * 只用于朗读页录音的续聊；其它入口不传，行为不变。
+     */
+    noDegrade?: boolean
   }
 
   /** 决策原因落 ~/.dsh/tihu/lane.log（项目命中方式、会话命中 id、置信分、是否澄清）。 */
@@ -4252,8 +4735,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /** 续聊尾巴：告诉任务会话「这是接着之前那条做」，别推翻已完成的部分。 */
-  function appendTailOf(card: { name: string }, folder: string): string {
-    return `【续聊 · 鹈鹕】这一句是接着本条会话前面的事继续做（项目「${card.name}」，工作目录 ${folder} 不变）。在已有进展上增量修改，别从头再来，也别动前面已经确认过的部分。做完后用简洁中文说明结果：先给结论，再给关键数字或进展，文字不要太长，确实需要长文本的情况除外（例如用户明确要求全文朗读、完整清单），适合直接朗读；不要表格、列表、代码块或长路径。`
+  function appendTailOf(card: { name: string }, folder: string, source?: TranscriptPayload['source']): string {
+    return `【续聊 · 鹈鹕】这一句是接着本条会话前面的事继续做（项目「${card.name}」，工作目录 ${folder} 不变）。在已有进展上增量修改，别从头再来，也别动前面已经确认过的部分。${asrHintOf(source)}做完后用简洁中文说明结果：先给结论，再给关键数字或进展，文字不要太长，确实需要长文本的情况除外（例如用户明确要求全文朗读、完整清单），适合直接朗读；不要表格、列表、代码块或长路径。`
   }
 
   /** 某项目「正在干什么」（追问屏的候选说明用）。 */
@@ -4269,10 +4752,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
   /* ---------- 电脑端会话镜像：轮询 → 登记簿（source='pc'） ---------- */
 
-  /** 会话标题 → 棋盘任务名（沿用 taskTitleOf 截断，裸 id 走 humanTitle 兜底）。 */
+  /**
+   * 会话标题 → 棋盘任务名：**逐字照抄客户端会话标题原文**（不截断、不去项目名）。
+   *
+   * 用户 2026-11-13：看板每一行必须和 DSH 客户端会话列表里的标题一模一样——数据层存全文，
+   * 只有渲染才单行 + 末尾省略（page.ts 的 CSS）。裸 id 兜底只用于客户端还没给标题的空串。
+   */
   function externalTitleOf(row: TihuSessionRow): string {
-    const raw = String(row.title ?? '').trim()
-    return taskTitleOf(humanTitle(raw !== '' ? raw : titleForSession(row.sessionId)))
+    const raw = String(row.title ?? '')
+    if (raw.trim() !== '') return raw
+    return humanTitle(titleForSession(row.sessionId))
   }
 
   /**
@@ -4497,6 +4986,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   /** 棋盘一帧：每页 4 行，页码从这台设备的 `boardPage` 拿（翻不动就夹回最后一张页）。 */
   let boardTicker: ReturnType<typeof setInterval> | undefined
   function boardFrameFor(page: number): { frame: ScreenFramePayload; board: TaskBoardPayload } {
+    // 画棋盘前先把客户端会话标题同步进来（逐字、不截断）：屏上这一行＝客户端那一行。
+    syncBoardTitles()
     const board = boardOf(tasks.list(), Date.now(), page)
     return { frame: boardFrame(board), board }
   }
@@ -4560,6 +5051,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 但下一次按「主页」必须看到这张卡已经没了（不能留一张假排队）。
    */
   function broadcastBoardSnapshot(): void {
+    syncBoardTitles()
     const board = boardOf(tasks.list(), Date.now())
     for (const device of devices) {
       if (device.unified) device.send('task.list', { board } satisfies TaskListPayload)
@@ -5720,9 +6212,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         decision.failureShown = true
       }
     }
-    const sessionId = await createSessionAt(folder, DISPATCH_PRESET)
+    // 每次派单前把「指挥台模型」同步一次：手机「鹈鹕设置」里选的是权威值，改完下一单就生效。
+    // 放在建任务会话之前——它只碰指挥台那条会话，且按配置签名跳过重复（见 ensureCommanderModel）。
+    if (commanderSessionId !== undefined) await ensureCommanderModel(commanderSessionId)
+    const sessionId = await createSessionAt(folder, DISPATCH_PRESET, DISPATCH_PRESET)
     if (sessionId === undefined) {
-      const message = '宿主还不能新建会话（sessionController.create 不可用，见 tihu 日志），这次没派出去'
+      const message = '宿主建不出电脑操作（computer-use）模式的会话（sessionController.create 不可用或模式没落上，见 tihu 日志），这次没派出去'
       decision.failure = new Error(message)
       // 承接降级：这句话不能悄悄丢——原卡留着、屏由 appendToSession 统一出。
       if (decision.keepTaskOnFailure !== true) {
@@ -5736,7 +6231,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       }
       noteDegradedFailure(undefined, new Error(message), '同项目也建不起会话，已留在棋盘')
       if (device !== undefined && decision.quietFailure !== true) {
-        showInputError(device, new Error(message), '任务会话没建起来，请重说')
+        showInputError(device, new Error(message), '会话没建成电脑操作模式')
       }
       log(`tihu dispatch failed: no session service`)
       return undefined
@@ -5747,7 +6242,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       { type: 'text' as const, text },
       {
         type: 'text' as const,
-        text: `【派单 · 鹈鹕】鹈鹕是主人家里的语音小屏助手，负责把设备上说的话转交给对应项目，电脑端再执行任务。这句话已派到「${card.name}」，工作目录是 ${folder}。做完后用简洁中文说明结果：先给结论，再给关键数字或进展，文字不要太长，确实需要长文本的情况除外（例如用户明确要求全文朗读、完整清单），适合直接朗读；不要表格、列表、代码块或长路径。`,
+        text: `【派单 · 鹈鹕】鹈鹕是主人家里的语音小屏助手，负责把设备上说的话转交给对应项目，电脑端再执行任务。${asrHintOf(decision.source)}这句话已派到「${card.name}」，工作目录是 ${folder}。做完后用简洁中文说明结果：先给结论，再给关键数字或进展，文字不要太长，确实需要长文本的情况除外（例如用户明确要求全文朗读、完整清单），适合直接朗读；不要表格、列表、代码块或长路径。`,
       },
     ]
     // 先挂到任务再投消息：工具调用可能抢在 prompt() 返回前发生，闸门按
@@ -5812,6 +6307,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     stopCommanderWait()
     clearGrayFallback()
     clearClarifyPrompt()
+    /*
+     * 铁律（用户 2026-11-13）：语音/键盘派单的目标会话必须是 computer-use。
+     * 目标已经是标准模式（或任何非 CU 模式）就不许投进去——屏上留一句主人看得懂的话后直接返回，
+     * 不建卡、不改派到别的会话（读页硬绑定那条连降级都不许，见下面的 noDegrade）。
+     */
+    if (!(await allowDispatchTarget(device, target.sessionId, meta.noDegrade === true ? 'read-pin' : 'append'))) {
+      meta.failure = new Error('目标会话不是 computer-use 模式，已拒绝投递')
+      meta.failureShown = true
+      return undefined
+    }
     const existing = tasks.ofSession(target.sessionId)
     if (existing !== undefined && existing.source === 'pc') {
       // 外部镜像卡不承接：用真正的鹈鹕任务接管这条会话（电脑端卡下一轮轮询会自己下屏）。
@@ -5820,6 +6325,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     // 这句已经在等指挥台判断：排队卡就是它，taskId 不变；这条会话改挂到这张卡上。
     const reuseTaskId = meta.reuseTaskId ?? pendingCommanderTaskIdOf(text)
     let task: TihuTask | undefined
+    /** 这张卡是本次调用新建的吗（读页 noDegrade 失败时只撤本次新建的，不碰原本在跑的卡）。 */
+    let createdHere = false
     if (reuseTaskId !== undefined) {
       const reused = tasks.get(reuseTaskId)
       // 只有「同一句话的排队卡」才许原位转正；已经结束的卡（完成/已播报/归档）不动。
@@ -5861,6 +6368,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           sessionIds: [target.sessionId],
         })
         tasks.attachSession(task.taskId, target.sessionId)
+        createdHere = true
         if (closedPrevious) {
           log(`tihu append new task=${task.taskId} (previous task=${existing?.taskId} state=${existing?.state} 已结束，不复用)`)
         }
@@ -5886,7 +6394,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       failureNote = 'append-prompt-failed'
       const sent = await promptSession(target.sessionId, [
         { type: 'text', text },
-        { type: 'text', text: appendTailOf(card, folder) },
+        { type: 'text', text: appendTailOf(card, folder, meta.source) },
       ])
       if (sent.ok) {
         tasks.markRunning(task.taskId)
@@ -5910,6 +6418,25 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     // 日志：append 失败 → 同项目新建（带真实原因＋错误码，用户实机排查就看这两行）。
     try { appendTihuLaneLog(target.sessionId, new Error(`append 失败 → 同项目新建：${failureStage}失败：${reason}（任务 ${task.taskId}）`), failureNote) } catch { /* 日志失败不影响兜底 */ }
     log(`tihu append ${failureStage} failed session=${target.sessionId} task=${task.taskId} project=${card.id} reason=${reason} -> new session in same project`)
+    /*
+     * 读页硬绑定（2026-11-13）：目标会话没接住也**不许**降级到同项目新建——那等于跨会话改派，
+     * 正是主人不要的。本次新建的卡撤掉（不留在棋盘上冒充任务），原本在跑的卡留着；屏上如实
+     * 说出原因，让主人重说或去电脑端处理，绝不静默换一条会话把话发出去。
+     */
+    if (meta.noDegrade === true) {
+      if (createdHere) {
+        tasks.drop(task.taskId)
+        releasePendingCommanderTask(task.taskId)
+      }
+      meta.failure = meta.failure ?? failure
+      if (device !== undefined && meta.failureShown !== true) {
+        showDispatchStuck(device, meta.failure, '朗读页那条会话没接住')
+      }
+      meta.failureShown = true
+      refreshBoards()
+      log(`tihu read-pin no-degrade task=${task.taskId} session=${target.sessionId} reason=${reason}`)
+      return undefined
+    }
     const degradeMeta: DispatchMeta = {
       via: meta.via,
       continuity: 'new',
@@ -5921,6 +6448,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       reopenTask: true,
       keepTaskOnFailure: true,
       quietFailure: true,
+      source: meta.source,
     }
     const degraded = await dispatchToCard(device, text, card, task.title, degradeMeta)
     // 降级那一跳已经出过「这条没派出去」的终态屏：回填给本函数，别再重复出第二屏。
@@ -5959,7 +6487,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     text: string,
     card: { id: string; name: string; folder?: string },
     meta: { via: string },
-    options: { allowCommander?: boolean } = {},
+    options: { allowCommander?: boolean; source?: TranscriptPayload['source'] } = {},
   ): Promise<DispatchOutcome> {
     let candidates: TihuSessionCandidate[] = []
     try {
@@ -5979,7 +6507,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
 
     if (decision.kind === 'append') {
       const target = candidates.find((item) => item.sessionId === decision.sessionId)
-      const appendMeta: DispatchMeta = { via: meta.via, continuity: 'append', confidence: decision.confidence, clarify: 'no' }
+      const appendMeta: DispatchMeta = { via: meta.via, continuity: 'append', confidence: decision.confidence, clarify: 'no', source: options.source }
       const task = await appendToSession(
         device,
         text,
@@ -5997,14 +6525,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
 
     if (decision.kind === 'new') {
-      const task = await dispatchToCard(device, text, card, undefined, { via: meta.via, continuity: 'new', confidence: decision.confidence, clarify: 'no' })
+      const task = await dispatchToCard(device, text, card, undefined, { via: meta.via, continuity: 'new', confidence: decision.confidence, clarify: 'no', source: options.source })
       if (task === undefined) return { message: '错误：这条任务没派出去（宿主不能新建会话，或任务会话没接住消息）。' }
       return { task, message: `已派给「${task.projectName}」：${task.title}（任务 ${task.taskId}，落在 ${task.folder ?? '默认目录'}）` }
     }
 
     // 灰区：先让指挥台判一次（项目已知时也可以直接问用户，见 showSessionClarify）。
     if (options.allowCommander === true && device !== undefined) {
-      const asked = await askGrayCommander(device, text, card, decision, candidates, meta.via)
+      const asked = await askGrayCommander(device, text, card, decision, candidates, meta.via, options.source)
       return {
         message: asked
           ? '这句话的衔接在灰区：已请指挥会话判一次（接着哪条 / 还是新建）。'
@@ -6023,6 +6551,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     decision: { confidence: number; sessionId?: string },
     candidates: readonly TihuSessionCandidate[],
     via: string,
+    source?: TranscriptPayload['source'],
   ): Promise<boolean> {
     const commander = await ensureCommanderSession()
     if (commander === undefined) {
@@ -6057,7 +6586,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       const at = candidate.updatedAt > 0 ? new Date(candidate.updatedAt).toISOString().slice(5, 16).replace('T', ' ') : '未知时间'
       return `${index + 1}. ${candidate.title || '未命名会话'}（${short} · ${at}）`
     })
+    const hint = asrHintOf(source)
     const tail = [
+      ...(hint === '' ? [] : [hint]),
       `【会话衔接 · 灰区】项目「${card.name}」下最近有这些 Computer Use 会话：`,
       list.length === 0 ? '（还没有 CU 会话）' : list.join('\n'),
       `用户这句话：「${text}」`,
@@ -6082,6 +6613,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       candidates,
       confidence: decision.confidence,
       via,
+      source,
       askedAt: Date.now(),
     })
     armGrayFallback(device, text, card, decision, candidates, via)
@@ -6288,7 +6820,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /** 派单四出口之一：自己直接答（问答记忆，不落任务）。 */
-  async function answerDirect(device: TihuDevice, text: string): Promise<void> {
+  async function answerDirect(device: TihuDevice, text: string, source?: TranscriptPayload['source']): Promise<void> {
     const commander = await ensureCommanderSession()
     if (commander === undefined) {
       showInputError(device, new Error('会话新建失败：宿主 sessionController 不可用'), '指挥会话还没建好，请重说')
@@ -6311,9 +6843,10 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       target.focusedTask = undefined
       pushFrame(target, frame)
     }
+    const hint = asrHintOf(source)
     const sent = await promptSession(commander, [
       { type: 'text', text },
-      { type: 'text', text: '【只读问答 · 鹈鹕】这是记忆/只读问答：直接回答主人；不要调用 tihu dispatch，不要新建任务。' },
+      { type: 'text', text: `${hint}【只读问答 · 鹈鹕】这是记忆/只读问答：直接回答主人；不要调用 tihu dispatch，不要新建任务。` },
     ])
     if (!sent.ok) showInputError(device, sent.error, '指挥会话没有接住这句话，请重说')
   }
@@ -6325,7 +6858,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       .replace(/[\s，,。.!！?？:：、；;"'"'（）()\[\]【】《》\-_/\\]+/g, '')
   }
 
-  /* ---------- 等指挥台判断（用户 2026-11-10：不设超时，一直等到它判出结果） ---------- */
+  /* ---------- 等指挥台判断（2026-11-13：投递成功后最多等 tihuCommanderTimeoutMs，到点本地兜底） ---------- */
 
   /**
    * 这句话对应的「等指挥台判断」排队卡。
@@ -6361,15 +6894,53 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   /** 记一句「在等指挥台回 JSON」的话（同一句只留一条，新的替换旧的）。 */
   function pushCommanderAsk(ask: CommanderAsk): void {
     const at = commanderAsks.findIndex((item) => item.key === ask.key)
-    if (at >= 0) commanderAsks.splice(at, 1)
+    if (at >= 0) dropCommanderAsk(ask.key)
     commanderAsks.push(ask)
   }
 
-  /** 摘掉某一句话的等待（投递失败 / 灰区已经按澄清处理 / 新的一句顶替）。 */
+  /** 摘掉某一句话的等待（投递失败 / 灰区已经按澄清处理 / 新的一句顶替 / 看门狗到点）。 */
   function dropCommanderAsk(key: string): void {
     for (let i = commanderAsks.length - 1; i >= 0; i -= 1) {
-      if (commanderAsks[i].key === key) commanderAsks.splice(i, 1)
+      if (commanderAsks[i].key !== key) continue
+      const [dropped] = commanderAsks.splice(i, 1)
+      if (dropped?.readTimer !== undefined) clearTimeout(dropped.readTimer)
+      if (dropped?.watchdog !== undefined) {
+        clearTimeout(dropped.watchdog)
+        dropped.watchdog = undefined
+      }
     }
+  }
+
+  /** 记一句「已经兜底过」的提问：晚到的回复 / 晚到的 dispatch 工具不许把同一条命令再派一次。 */
+  function noteStaleCommanderAsk(ask: CommanderAsk): void {
+    staleCommanderAsks.set(ask.key, {
+      askedAt: ask.askedAt,
+      at: Date.now(),
+      ...(ask.turn === undefined ? {} : { turn: ask.turn }),
+    })
+    for (const [key, hit] of staleCommanderAsks) {
+      if (Date.now() - hit.at > FALLBACK_DEDUPE_MS) staleCommanderAsks.delete(key)
+    }
+  }
+
+  /** 这一句那次提问是不是已经兜底过（askedAt 对得上才算同一次提问）。 */
+  function staleCommanderAskOf(key: string, askedAt?: number): boolean {
+    const hit = staleCommanderAsks.get(key)
+    if (hit === undefined) return false
+    if (Date.now() - hit.at > FALLBACK_DEDUPE_MS) {
+      staleCommanderAsks.delete(key)
+      return false
+    }
+    return askedAt === undefined || hit.askedAt === askedAt
+  }
+
+  /** 指挥台这一轮（turn）是不是已经兜底过的那次提问：晚到的回复不许顶替下一句的等待。 */
+  function staleCommanderTurnOf(turn: number | undefined): boolean {
+    if (turn === undefined) return false
+    for (const hit of staleCommanderAsks.values()) {
+      if (hit.turn === turn && Date.now() - hit.at <= FALLBACK_DEDUPE_MS) return true
+    }
+    return false
   }
 
   /** 排队卡已经转正（含旧式工具 dispatch）：不再等这句的文本结论。 */
@@ -6394,23 +6965,127 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /**
-   * 指挥台提示里列出的「最近项目会话」（短号 + 标题）：append/append_to 才有据可依。
-   * 每张卡最多 3 条、总共最多 8 行；列表走 60 秒缓存，不会为每次派单多打宿主。
+   * 「最近的项目会话」清单：先汇总、再按最近活动倒序、最多 10 条。
+   *
+   * 为什么不复用 {@link projectCuSessionsOf}：那个函数是**承接候选**（append 判断用），
+   * 每张卡只回 8 条、且按卡分组；给模型看的清单要跨卡排序、总数 15，语义不同。
+   * 过滤口径仍与它一致：Computer Use、落在某张项目卡（或助手 home）里、7 天内有活动。
    */
-  async function commanderSessionHints(): Promise<string[]> {
-    const hints: string[] = []
-    for (const card of projectCards() ?? []) {
-      if (hints.length >= 8) break
-      let candidates: TihuSessionCandidate[] = []
-      try { candidates = await projectCuSessionsOf(card) } catch { candidates = [] }
-      for (const candidate of candidates.slice(0, 3)) {
-        if (hints.length >= 8) break
-        const short = candidate.sessionId.replace(/^session-/, '').slice(0, 8)
-        const title = candidate.title.trim() === '' ? '未命名会话' : taskTitleOf(candidate.title, 14)
-        hints.push(`- ${card.name}: ${short} ${title}`)
+  async function recentProjectSessions(limit: number): Promise<Array<{ sessionId: string; title: string; projectName: string; updatedAt: number }>> {
+    const cards: Array<{ id: string; name: string; folder?: string }> = [...(projectCards() ?? [])]
+    // 状态文件里不一定有「个人助手」这张虚拟卡：补上，否则 home 里的会话一条都进不了清单。
+    if (!cards.some((card) => card.id === ASSISTANT_CARD.id)) cards.push(ASSISTANT_CARD)
+    if (cards.length === 0) return []
+    let rows: TihuSessionRow[] = []
+    try { rows = (await collectSessionRows()).rows } catch { return [] }
+    const now = Date.now()
+    const out: Array<{ sessionId: string; title: string; projectName: string; updatedAt: number }> = []
+    const seen = new Set<string>()
+    for (const row of rows) {
+      if (row.sessionId === commanderSessionId) continue
+      if (seen.has(row.sessionId)) continue
+      if (!isComputerUsePreset(row.preset)) continue
+      if (!(row.updatedAt > 0) || now - row.updatedAt > CONTINUITY_WINDOW_MS) continue
+      const card = cards.find((item) => sameProjectFolder(resolveTaskFolder(item), row.cwd))
+      if (card === undefined) continue
+      seen.add(row.sessionId)
+      const task = tasks.ofSession(row.sessionId)
+      const title = humanTitle(String(task?.title ?? row.title ?? ''))
+      out.push({
+        sessionId: row.sessionId,
+        title: title !== '' ? title : String(row.title ?? ''),
+        projectName: card.name,
+        updatedAt: row.updatedAt,
+      })
+    }
+    return out.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, Math.max(1, limit))
+  }
+
+  /** 会话此刻的状态（一行三态：执行中 / 完成 / 等；没有任务在跑就是「空闲」）。 */
+  function commanderSessionStatusOf(sessionId: string): string {
+    if (runningSessions.has(sessionId)) return '执行中'
+    const task = tasks.ofSession(sessionId)
+    if (task !== undefined && task.state !== 'archived') {
+      if (task.state === 'running' || task.state === 'awaiting') return '执行中'
+      if (task.state === 'queued') return '等'
+      if (task.state === 'done' || task.state === 'announced') return '完成'
+    }
+    return '空闲'
+  }
+
+  /**
+   * 读一条会话的最后一轮对话（「用户：…」＋「助手：…」，最多 2 条）。
+   *
+   * 数据源：活会话的 `snapshotEvents()`（同步、最便宜）→ 否则 `sessionQuery.readSession`
+   * （live/持久化都给完整事件）。只给最后一条用户消息与它对应的助手回复；还没回复就只给
+   * 用户那条并标「（尚未回复）」——用户 2026-11-13 明确要这个形状（每条会话一轮，省现场字数）。
+   */
+  async function commanderDialoguesOf(sessionId: string): Promise<string[]> {
+    const cached = commanderDialogueCache.get(sessionId)
+    if (cached !== undefined && Date.now() - cached.at < COMMANDER_DIALOGUE_TTL_MS) return cached.lines
+    let events: unknown
+    const live = liveSessionOf(sessionId)
+    if (typeof live?.snapshotEvents === 'function') {
+      try {
+        const snapshot = live.snapshotEvents()
+        if (Array.isArray(snapshot) && snapshot.length > 0) events = snapshot
+      } catch { /* 退回会话日志 */ }
+    }
+    if (events === undefined) {
+      const query = optionalService(ctx, 'sessionQuery')
+      if (query !== undefined && typeof query.readSession === 'function') {
+        try { events = (await query.readSession(sessionId))?.events } catch { events = undefined }
       }
     }
-    return hints
+    const lines = commanderDialogueLinesOf(events)
+    commanderDialogueCache.set(sessionId, { at: Date.now(), lines })
+    // 清单最多 10 条，缓存不该无限长：超过 64 条先清最旧的一半。
+    if (commanderDialogueCache.size > 64) {
+      const keep = [...commanderDialogueCache.entries()].sort((a, b) => b[1].at - a[1].at).slice(0, 32)
+      commanderDialogueCache.clear()
+      for (const [id, value] of keep) commanderDialogueCache.set(id, value)
+    }
+    return lines
+  }
+
+  /**
+   * 指挥台提示里列出的「最近项目会话」（append/append_to 才有据可依）。
+   *
+   * 2026-11-13 用户实机：旧版每张卡最多 3 条、总共 8 条，而且只有「短号＋截断标题」，
+   * 模型看不出这些会话在聊什么。现在每条先给一行
+   * `序号) 项目 短号 状态 标题`，再给最后一轮对话（用户一句＋助手一句）；
+   * 整块现场超过 {@link COMMANDER_FIELD_MAX_CHARS} 时从最旧的会话开始只保留标题行。
+   *
+   * @param usedChars 已经占掉的现场信息字数（当前屏幕＋棋盘＋小标题），预算里要扣掉。
+   */
+  async function commanderSessionHints(usedChars = 0): Promise<string[]> {
+    const entries = await recentProjectSessions(COMMANDER_SESSION_LIMIT)
+    if (entries.length === 0) return []
+    const dialogues = await Promise.all(entries.map(async (entry) => {
+      try { return await commanderDialoguesOf(entry.sessionId) } catch { return [] }
+    }))
+    const headers = entries.map((entry, index) => {
+      const title = entry.title.trim() === '' ? '未命名会话' : clipForLog(entry.title, 40)
+      return `${index + 1}) ${entry.projectName} ${shortSessionId(entry.sessionId)} ${commanderSessionStatusOf(entry.sessionId)} ${title}`
+    })
+    let used = usedChars + fieldCharsOf(headers)
+    const keep: boolean[] = headers.map(() => false)
+    for (let index = 0; index < headers.length; index += 1) {
+      const lines = dialogues[index].map((line) => `   ${line}`)
+      // 最新会话优先：这一条带对话就超预算 → 后面更旧的对话一律不带（标题行全部保留）。
+      if (lines.length > 0 && used + fieldCharsOf(lines) > COMMANDER_FIELD_MAX_CHARS) break
+      if (lines.length > 0) used += fieldCharsOf(lines)
+      keep[index] = true
+    }
+    const out: string[] = []
+    let cut = 0
+    for (let index = 0; index < headers.length; index += 1) {
+      out.push(headers[index])
+      if (keep[index]) out.push(...dialogues[index].map((line) => `   ${line}`))
+      else if (dialogues[index].length > 0) cut += 1
+    }
+    if (cut > 0) out.push(`（后 ${cut} 条会话因篇幅只留标题）`)
+    return out
   }
 
   /** 项目名 → 已知项目卡（找不到就 undefined，由调用方落个人助手；绝不按幻觉名字建新卡）。 */
@@ -6460,6 +7135,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * - 认不出方向 → 只有本地有把握的工作信号才兜底派单，否则同样只问一次，不猜。
    */
   async function settleCommanderReply(raw: string, final: boolean, turn?: number): Promise<void> {
+    // 过期回复保护（2026-11-13）：这一轮已经超时兜底过（或指挥台正忙时就兜了底）→
+    // 晚到的结论一律不执行，也不许被认成下一句的等待。
+    if (staleCommanderTurnOf(turn)) {
+      log(`tihu commander reply skipped（这一轮已经超时兜底过 turn=${turn}）`)
+      return
+    }
     const ask = commanderAskForTurn(turn, final)
     if (ask === undefined) return
     if (turn !== undefined) {
@@ -6472,6 +7153,16 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       }
     }
     const decision = parseCommanderDecision(raw, TIHU_TOOL_NAME_LIST)
+    /*
+     * 读页硬绑定（2026-11-13）：判断已经到手，但结论**只用于理解**——不 control、不 clarify、
+     * 不派单、不新建，直接投回朗读页锁定的那条会话（deliverReadPin 自己去重，保证只投一次）。
+     * 这就是「判断保留、路由不改派」的落点：上面 parse 那步照常跑，模型确实理解了一遍。
+     */
+    if (ask.readPin !== undefined) {
+      log(`tihu read-pin judged kind=${decision === undefined ? 'unparsed' : decision.kind} text=${JSON.stringify(clipForLog(ask.text))}`)
+      await deliverReadPin(deviceOfCommanderAsk(ask), ask, 'judged')
+      return
+    }
     if (decision === undefined) {
       if (!final) return
       commanderAsks.splice(commanderAsks.indexOf(ask), 1)
@@ -6528,6 +7219,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       confidence: ask.confidence ?? 1,
       clarify: 'no',
       ...(ask.taskId === undefined ? {} : { reuseTaskId: ask.taskId }),
+      source: ask.source,
     }
     const line = `指挥台 JSON 结论 原文=${JSON.stringify(clipForLog(raw))} 项目=${reply.project || '(未点名)'} 落点=${target.name} 会话=${reply.session}${reply.appendTo === '' ? '' : ` 续=${reply.appendTo}`}`
     try { appendTihuLaneLog(commanderSessionId ?? '-', new Error(line), 'commander-json') } catch { /* 日志失败不影响派单 */ }
@@ -6549,12 +7241,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
     // 判成工作、又没点名要续哪条会话：还是先走一遍「规则 A」（内容重合 → 接到上一条派单会话），
     // 再走与页面按钮同一条衔接判定（项目内接着旧会话 / 新建 / 灰区问一次）。
-    const followed = await followPreviousDispatch(device, ask.text, target.id)
+    const followed = await followPreviousDispatch(device, ask.text, target.id, ask.source)
     if (followed !== undefined) {
       reportFollowFailure(device, followed)
       return
     }
-    const outcome = await dispatchWithContinuity(device, ask.text, target, { via: ask.via }, { allowCommander: false })
+    const outcome = await dispatchWithContinuity(device, ask.text, target, { via: ask.via }, { allowCommander: false, source: ask.source })
     if (outcome.task === undefined && outcome.message.startsWith('错误')) {
       showInputError(device, new Error(outcome.message), '这条没派出去，请重说')
     }
@@ -6567,7 +7259,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * 才照旧兜底派单（与页面按钮一样的即时行为）；否则屏上问用户一次。
    * 灰区（continuity）不走这里：那条没有排队卡，仍由原来的澄清/计时器收尾。
    */
-  async function fallbackCommanderReply(ask: CommanderAsk, raw: string): Promise<void> {
+  async function fallbackCommanderReply(ask: CommanderAsk, raw: string, timeoutLine?: string): Promise<void> {
     if (ask.kind === 'continuity') {
       log(`tihu commander continuity reply unusable text=${JSON.stringify(clipForLog(raw))}`)
       return
@@ -6589,7 +7281,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       return
     }
     stopCommanderWait()
-    const reason = String(raw ?? '').trim() === '' ? '回复为空' : '回复里没有可用结论'
+    const reason = timeoutLine ?? (String(raw ?? '').trim() === '' ? '回复为空' : '回复里没有可用结论')
     const device = deviceOfCommanderAsk(ask)
     // 规则 A 仍然优先：语义还接着上一条派单会话，就接到那条会话去（内容重合，不是承接词）。
     const followed = await followPreviousDispatch(device, ask.text)
@@ -6610,7 +7302,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     log(`tihu commander ${reason} -> routeQuick/best-card fallback text=${JSON.stringify(ask.text)}`)
     let card: { id: string; name: string; folder?: string } | undefined
     let via = 'commander-fallback'
-    let note = '指挥台没给出结论，先按最佳卡派出'
+    let note = timeoutLine ?? '指挥台没给出结论，先按最佳卡派出'
     if (route.kind === 'card') {
       // 规则 B：低置信/片段命中不许单独定落点。指挥台又没给结论 → 按最保守的「个人助手」派，
       // 不凭一个 2 字片段把任务塞进不相干项目。
@@ -6644,6 +7336,68 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     if (task !== undefined) log(`tihu commander fallback dispatched task=${task.taskId} project=${card.id} via=${via}`)
   }
 
+  /** 看门狗窗口：单测用 options.commanderTimeoutMs，线上走 tihuCommanderTimeoutMs()/环境变量。 */
+  function commanderAskTimeoutMsOf(): number {
+    const fixed = options.commanderTimeoutMs
+    if (fixed !== undefined && Number.isFinite(fixed) && fixed > 0) return clampInt(fixed, 50, 10 * 60_000)
+    return tihuCommanderTimeoutMs()
+  }
+
+  /**
+   * 指挥台那条会话此刻能不能立刻接单。
+   *
+   * 2026-11-13 实机：电脑端在审稿（「深度求索」1 分 12 秒），新派单只能排在那轮后面；
+   * 这种情况**不排队**，直接按本地规则兜底并给屏上一句人话。查不到状态就当空闲，
+   * 只靠投递后的看门狗兜底（不因为读不到状态就不派、也不因为读不到就硬派）。
+   */
+  function commanderBusyNow(sessionId: string): boolean {
+    if (runningSessions.has(sessionId)) return true
+    const task = tasks.ofSession(sessionId)
+    if (task === undefined || task.state === 'archived') return false
+    return task.state === 'running' || task.state === 'awaiting' || task.state === 'queued'
+  }
+
+  /** 投递成功后挂看门狗：到点还没结论就撤掉待判、按本地规则兜底。 */
+  function armCommanderAskWatchdog(ask: CommanderAsk): void {
+    // 读页有自己的判断窗口（readTimer），灰区有自己的 9 秒计时器：不重复挂表。
+    if (ask.readPin !== undefined || ask.kind === 'continuity') return
+    const waitMs = commanderAskTimeoutMsOf()
+    const timer = setTimeout(() => {
+      ask.watchdog = undefined
+      if (disposed || !commanderAsks.includes(ask)) return
+      void giveUpCommanderAsk(ask, 'timeout').catch((error) => log(`tihu commander watchdog failed: ${(error as Error)?.message ?? String(error)}`))
+    }, waitMs)
+    timer.unref?.()
+    ask.watchdog = timer
+    log(`tihu commander watchdog armed after=${waitMs}ms text=${JSON.stringify(ask.text)}`)
+  }
+
+  /**
+   * 等不到指挥台结论时的人话出口（超时 / 它正忙）。
+   *
+   * 顺序固定：先撤掉待判（并留过期牌）→ 屏上给一句人话 → 走**既有**本地兜底
+   * （fallbackCommanderReply：本地有把握才派，没把握就问一次）。绝不静默停住、也不硬派错项目。
+   */
+  async function giveUpCommanderAsk(ask: CommanderAsk, why: 'timeout' | 'busy'): Promise<void> {
+    if (disposed || ask.readPin !== undefined) return
+    if (commanderAsks.includes(ask)) dropCommanderAsk(ask.key)
+    noteStaleCommanderAsk(ask)
+    stopCommanderWait()
+    const seconds = Math.max(1, Math.round(commanderAskTimeoutMsOf() / 1000))
+    const line = why === 'busy'
+      ? '指挥台那条会话正忙（可能在跑别的任务），先按本地规则处理'
+      : `指挥台 ${seconds} 秒还没判出来，先按本地规则处理`
+    log(`tihu commander ${why} give-up after=${seconds}s text=${JSON.stringify(ask.text)}`)
+    try {
+      appendTihuLaneLog(commanderSessionId ?? '-', new Error(`指挥台判断${why === 'busy' ? '忙' : '超时'}（${seconds} 秒窗口）：${line}`), why === 'busy' ? 'commander-busy' : 'commander-timeout')
+    } catch { /* 日志失败不影响兜底 */ }
+    const device = deviceOfCommanderAsk(ask)
+    if (device !== undefined) {
+      device.send('event.progress', { stage: '判断', text: line } satisfies ProgressPayload)
+    }
+    await fallbackCommanderReply(ask, '', line)
+  }
+
   /** 停掉「已等 N 秒」的秒表（派单成功 / 新一句话 / 卸载时调用；排队卡本身不动）。 */
   function stopCommanderWait(): void {
     if (commanderWait === undefined) return
@@ -6658,7 +7412,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return {
       // 语义路由这一屏不预设是派单：指挥台可能判成「这句话是冲这块屏说的」。
       ...noticeFrame({ stage: '判断', title: '正在判断这句话', lines: [taskTitleOf(text, 16), `已等 ${seconds} 秒`], tone: 'busy' }),
-      // 等待不设超时：必须给一个「主页」出口，用户回棋盘后判断仍在后台继续。
+      // 等待有上限（{@link tihuCommanderTimeoutMs}）：到点会有人话终态；「主页」出口照旧保留。
       actions: [{ id: 'taskBoard', label: '主页' }],
     }
   }
@@ -6900,7 +7654,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       target.pendingClarify = undefined
       target.focusedTask = undefined
       target.onBoard = false
-      target.pendingIntent = { text: ask.text, question, key: ask.key }
+      target.pendingIntent = { text: ask.text, question, key: ask.key, source: ask.source }
       lastFrames.set(target.sessionId ?? target.id, frame)
       pushFrame(target, frame)
     }
@@ -6941,7 +7695,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     const route = routeQuick({ text: pending.text, cards, tasks: tasks.list() })
     const card = route.kind === 'card' ? route.card : (bestCardMatchOf(pending.text, cards) ?? ASSISTANT_CARD)
     log(`tihu semantic clarify 用户选「干活」，按最佳卡派出 text=${JSON.stringify(pending.text)} project=${card.id}`)
-    await dispatchWithContinuity(device, pending.text, card, { via: 'clarified-work' }, { allowCommander: false })
+    await dispatchWithContinuity(device, pending.text, card, { via: 'clarified-work' }, { allowCommander: false, source: pending.source })
   }
 
   /**
@@ -6952,41 +7706,55 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
    * - 判成控制 → 执行它点名的 tihu_* 工具，不建任务也不建会话；
    * - 判成两可 → 屏上问用户一次。
    *
-   * 投递后不设超时（用户拍板「一直等到判出结果」）；turn/end 一到必须有终态。
+   * 2026-11-13 起**有上限**：投递成功后挂 {@link tihuCommanderTimeoutMs}（默认 25 秒）看门狗，
+   * 到点撤掉待判、走本地规则兜底；投递前若已查到指挥台那条会话在跑（长任务），不排队、
+   * 当场兜底。晚到的同一条回复由 dispatchKey + askedAt 挡掉（见 giveUpCommanderAsk）。
    */
-  async function askCommander(device: TihuDevice, text: string, options: { kind?: 'intent' | 'project' } = {}): Promise<void> {
+  async function askCommander(device: TihuDevice, text: string, options: { kind?: 'intent' | 'project'; source?: TranscriptPayload['source'] } = {}): Promise<void> {
     device.unified = true
     stopCommanderWait()
     const key = dispatchKeyOf(text)
     const kind = options.kind ?? 'intent'
+    // 先造出「这一次提问」：看门狗与过期牌都认它（askedAt 就是这一次提问的身份）。
+    const ask: CommanderAsk = { key, text, kind, device: device.id, via: 'commander', source: options.source, askedAt: Date.now() }
     try {
       const commander = await ensureCommanderSession()
       if (commander === undefined) {
         await fallbackCommanderDispatch(device, text, undefined, new Error('会话新建失败：宿主 sessionController 不可用'), 'ensure')
         return
       }
+      // 投递前先看一眼：指挥台那条会话正在跑长任务时，新派单只会排在那轮后面无限等。
+      // 查到在跑 → 不排队，立刻按本地规则兜底；查不到/空闲 → 照常投，靠看门狗兜底。
+      if (kind !== 'continuity' && commanderBusyNow(commander)) {
+        await giveUpCommanderAsk(ask, 'busy')
+        return
+      }
       beginCommanderWait(device, text)
       // 先登记再投递：assistant/message 可能抢在 prompt() 返回前到达。
-      pushCommanderAsk({
-        key,
-        text,
-        kind,
-        device: device.id,
-        via: 'commander',
-        askedAt: Date.now(),
-      })
-      // 最近的项目会话清单：让「append / append_to」有据可依（最多 8 行，不塞满提示词）。
-      let hints: string[] = []
-      try { hints = await commanderSessionHints() } catch { hints = [] }
-      // 这块屏**当下这一页**的带编号棋盘：模型照着它把「第二个」翻成 index:2（1 起、与屏上逐行一致）。
+      pushCommanderAsk(ask)
+      // 这块屏**当下这一页**的带编号棋盘 + 当前屏幕：模型照着它把「第二个」翻成 index:2。
       let boardLines: string[] = []
       try { boardLines = commanderBoardLines(device) } catch { boardLines = [] }
-      const sent = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: commanderReplyTail(hints, boardLines) }])
+      let screenLines: string[] = []
+      try { screenLines = commanderScreenLines(device) } catch { screenLines = [] }
+      // 最近的项目会话清单（含最后一轮对话）：让「append / append_to」有据可依。
+      // 最多 10 条；整块现场超过预算时只砍更旧会话的对话，标题行与最近会话优先保。
+      let hints: string[] = []
+      try {
+        const reserved = fieldCharsOf(screenLines) + fieldCharsOf(boardLines) + fieldCharsOf([COMMANDER_SESSION_SECTION_TITLE])
+        hints = await commanderSessionHints(reserved)
+      } catch { hints = [] }
+      const tail = commanderReplyTail(hints, boardLines, screenLines)
+      const headParts = [asrHintOf(options.source)].filter((part) => part !== '')
+      const sent = await promptSession(commander, [{ type: 'text', text }, { type: 'text', text: headParts.length === 0 ? tail : `${headParts.join('\n')}\n${tail}` }])
       if (!sent.ok) {
-        // 只有投递本身出错才兜底；投递成功就等，没有计时器。
+        // 投递本身出错：立刻兜底（这时还没开始计时）。
         dropCommanderAsk(key)
         await fallbackCommanderDispatch(device, text, undefined, sent.error, 'prompt')
+        return
       }
+      // 投递成功才开始计时：从这一刻起最多等 {@link tihuCommanderTimeoutMs}。
+      armCommanderAskWatchdog(ask)
     } catch (error) {
       // 任何意外异常也要有终态（错误屏），不能让设备静默停在等待。
       dropCommanderAsk(key)
@@ -7141,10 +7909,200 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /**
+   * 读页现场 → 硬绑定（2026-11-13）：把朗读页带来的 taskId 解析成「那条任务此刻的会话」。
+   *
+   * 原 `readBiasOf` 只给指挥台一句软提示；现在升级成 pin：判断照旧、路由锁死。
+   * 解析不出来（任务已归档 / 还没绑会话 / 没有这个 taskId）就返回 undefined ——
+   * 这时**不硬绑**，整句完全走原判断（等于回到改动前的行为），只留一行日志好排查。
+   *
+   * 读页专属：只有 `screenHint='read'` 才会带 readTaskId（page.ts 的 readHint）；
+   * 键盘手打、普通状态页、指挥台自己派来的句子都拿不到 pin。
+   */
+  function readPinOf(ctx: TihuUtteranceContext | undefined): TihuReadPin | undefined {
+    const taskId = String(ctx?.readTaskId ?? '').trim()
+    if (taskId === '') return undefined
+    const task = tasks.get(taskId)
+    if (task === undefined || task.state === 'archived') {
+      log(`tihu read-pin miss task=${taskId} reason=${task === undefined ? 'no-task' : 'archived'} → 回落到原判断`)
+      return undefined
+    }
+    const sessionId = task.sessionIds[task.sessionIds.length - 1] ?? ''
+    if (sessionId === '') {
+      log(`tihu read-pin miss task=${taskId} reason=no-session → 回落到原判断`)
+      return undefined
+    }
+    return {
+      taskId: task.taskId,
+      sessionId,
+      taskTitle: task.title,
+      projectId: task.projectId,
+      projectName: task.projectName,
+      ...(task.folder === undefined || task.folder === '' ? {} : { folder: task.folder }),
+    }
+  }
+
+  /** 读页判断提示词（给指挥台）：讲清「判断只用于理解、路由已锁死，不许改派」。 */
+  function readPinCommanderTail(pin: TihuReadPin, source?: TranscriptPayload['source']): string {
+    const short = pin.sessionId.replace(/^session-/, '').slice(0, 8)
+    const folder = pin.folder === undefined ? '默认目录' : pin.folder
+    const hint = asrHintOf(source)
+    return [
+      `【朗读页 · 路由已锁定】主人刚从「${taskTitleOf(pin.taskTitle, 24)}」的朗读页按下录音说了这一句。`,
+      `这条消息已经锁定投回正在朗读的那条任务会话（项目「${pin.projectName}」，会话短号 ${short}，工作目录 ${folder}）继续发送——路由不用你判，也**不许改派**到别的项目或别的会话。`,
+      '你只需要按内容理解这句话（转写可能有错别字，按读音还原本意），结论**只用于理解**：不要调用任何工具、不要输出派单 JSON、不要新建会话、不要点任务。',
+      '就算你觉得它像是另一件事，也只回一句你的理解；lane 仍按锁定路由把它发进这条会话。',
+      ...(hint === '' ? [] : [hint]),
+    ].join('\n')
+  }
+
+  /**
+   * 读页硬绑定的投递口（2026-11-13）：把这一句投进 pin 会话，**一句只投一次**。
+   *
+   * 三路谁先到谁算数：指挥台回复（judged）／判断窗口到点（judge-timeout）／
+   * 指挥台不可用或投递失败（no-commander / commander-prompt-failed / exception）。
+   * 进函数先看这句还在不在等待队列里：不在＝已经投过（回复与超时几乎同时到的情况），直接返回。
+   *
+   * @param why 投递原因（写 lane.log；判断结论本身**不参与**路由）。
+   */
+  async function deliverReadPin(device: TihuDevice | undefined, ask: CommanderAsk, why: string): Promise<void> {
+    const pin = ask.readPin
+    if (pin === undefined || disposed) return
+    const at = commanderAsks.indexOf(ask)
+    if (at < 0) return
+    commanderAsks.splice(at, 1)
+    if (ask.readTimer !== undefined) {
+      clearTimeout(ask.readTimer)
+      ask.readTimer = undefined
+    }
+    stopCommanderWait()
+    const card = { id: pin.projectId, name: pin.projectName, ...(pin.folder === undefined ? {} : { folder: pin.folder }) }
+    try {
+      appendTihuLaneLog(pin.sessionId, new Error(`读页录音 → 锁定投回会话（判断=${why}，任务 ${pin.taskId}）：${JSON.stringify(clipForLog(ask.text, 40))}`), 'read-pin')
+    } catch { /* 日志失败不影响投递 */ }
+    log(`tihu read-pin deliver session=${pin.sessionId} task=${pin.taskId} why=${why}`)
+    // 模型取用顺序：会话正在跑的模型 > 默认前台模型（绝不在这里把会话模型换掉）。
+    await ensureReadSessionModel(pin.sessionId)
+    const meta: DispatchMeta = {
+      via: 'read-pin',
+      continuity: 'append',
+      clarify: 'no',
+      ...(ask.source === undefined ? {} : { source: ask.source }),
+      // 硬绑定：目标会话没接住也**不许**新建/改派到同项目别的会话（见 appendToSession 的 noDegrade）。
+      noDegrade: true,
+    }
+    const task = await appendToSession(device, ask.text, card, { sessionId: pin.sessionId }, meta)
+    if (task === undefined) log(`tihu read-pin failed session=${pin.sessionId} task=${pin.taskId}`)
+  }
+
+  /**
+   * 读页续聊：判断保留、路由锁死（2026-11-13）。
+   *
+   * 为什么仍然问指挥台：用户要的是「内容照旧理解一遍」（错别字还原、这句是不是承接、
+   * 要不要提醒主人），但它的结论**只用于理解**——不管它判成哪个项目、哪条会话、新建，
+   * lane 都只把这句话投回朗读页正在念的那条会话，绝不跨会话改派。
+   *
+   * 判断窗口用 {@link tihuGrayCommanderMs}（默认 9 秒，可用 TIHU_GRAY_FALLBACK_MS 调）：
+   * 到点没回也照样投 pin 会话——这句话不能因为指挥台慢就丢掉。投递只发生一次
+   * （见 deliverReadPin 的去重）。
+   */
+  async function dispatchPinnedRead(device: TihuDevice, text: string, source: TranscriptPayload['source'], pin: TihuReadPin): Promise<void> {
+    device.unified = true
+    const ask: CommanderAsk = {
+      key: dispatchKeyOf(text),
+      text,
+      kind: 'intent',
+      device: device.id,
+      via: 'read-pin',
+      askedAt: Date.now(),
+      readPin: pin,
+      ...(source === undefined ? {} : { source }),
+    }
+    // 先登记再投递/建连：assistant/message 可能抢在 prompt() 返回前到达；失败分支也要靠
+    // 「在队列里」才能走同一个投递口（deliverReadPin 用队列做只投一次的门牌）。
+    pushCommanderAsk(ask)
+    try {
+      const commander = await ensureCommanderSession()
+      if (commander === undefined) {
+        await deliverReadPin(device, ask, 'no-commander')
+        return
+      }
+      const sent = await promptSession(commander, [
+        { type: 'text', text },
+        { type: 'text', text: readPinCommanderTail(pin, source) },
+      ])
+      if (!sent.ok) {
+        await deliverReadPin(device, ask, 'commander-prompt-failed')
+        return
+      }
+      const timer = setTimeout(() => {
+        if (!commanderAsks.includes(ask)) return
+        void deliverReadPin(device, ask, 'judge-timeout')
+      }, tihuGrayCommanderMs())
+      timer.unref?.()
+      ask.readTimer = timer
+    } catch (error) {
+      log(`tihu read-pin exception: ${(error as Error)?.message ?? String(error)}`)
+      await deliverReadPin(device, ask, 'exception')
+    }
+  }
+
+  /**
+   * 读页续聊前的模型取用顺序（2026-11-13）：**会话正在跑的模型 > tihu.model.foreground 默认模型**。
+   *
+   * 为什么单独一条：朗读页上按录音说的下一句必须接回同一条会话继续跑。那条会话可能被主人
+   * 在电脑端换过模型（或创建时按当时的默认装过），这时**默认模型不许覆盖它**——否则同一件事
+   * 前一半用 A 模型、后一半被悄悄换成 B 模型，上下文与进度都可能对不上。
+   *
+   * 三档取值（与 ensureCommanderModel 的「手机设置是权威值」刻意分开，那条只服务指挥台）：
+   *   - 读到明确模型（对象）→ 一律以它为准，一次 selectModel 都不调；
+   *   - 读到 null（这条会话没有显式选择，在用宿主默认）→ 才按默认前台模型装一次；
+   *   - 读不到（undefined：老宿主 / 会话不在内存）→ 不覆盖、也不拿默认去猜，保持原样。
+   *
+   * 任何一路失败都只记日志，绝不挡住这句话的投递。
+   */
+  async function ensureReadSessionModel(sessionId: string): Promise<void> {
+    const running = sessionSelectionNow(sessionId)
+    let tihu: unknown
+    try { tihu = loadAssistantConfig().tihu } catch { tihu = undefined }
+    const wanted = resolveTihuModel('foreground', tihu)
+    const runningLabel = running === null
+      ? '(无显式选择)'
+      : running === undefined
+        ? '(读不到)'
+        : `${running.provider}/${running.model}${running.reasoningEffort === undefined ? '' : `#${running.reasoningEffort}`}`
+    if (running !== undefined && running !== null) {
+      if (wanted !== null && (wanted.provider !== running.provider
+        || wanted.model !== running.model
+        || (wanted.reasoningEffort ?? '') !== (running.reasoningEffort ?? ''))) {
+        log(`tihu model read-pin session=${sessionId} 会话模型=${runningLabel} 与默认前台模型=${wanted.provider}/${wanted.model} 不一致 → 以会话为准，不覆盖`)
+      }
+      return
+    }
+    if (running === undefined) {
+      // 读不到会话现值：绝不拿默认模型去覆盖（那可能正是主人手动选的），保持会话原样。
+      log(`tihu model read-pin session=${sessionId} 读不到会话模型 → 保持会话原样（不拿默认模型覆盖）`)
+      return
+    }
+    if (wanted === null) {
+      log(`tihu model read-pin session=${sessionId} 会话无显式模型且没配默认前台模型 → 跟随宿主默认`)
+      return
+    }
+    const key = `${wanted.provider}/${wanted.model}${wanted.reasoningEffort === undefined ? '' : `#${wanted.reasoningEffort}`}`
+    if (readSessionModelApplied.get(sessionId) === key) return
+    const ok = await applyTihuModel(sessionId, 'foreground', '读页续聊')
+    if (ok) readSessionModelApplied.set(sessionId, key)
+  }
+
+  /** 读页续聊已经按默认模型装过的会话（sessionId → provider/model#effort；成功才记）。 */
+  const readSessionModelApplied = new Map<string, string>()
+
+  /**
    * 一句设备输入（统一指挥模式）的完整分流。
    * 顺序：澄清待答 → 歧义待选 → 屏上命令 → 快路径规则（项目 + 本地会话衔接）→ 慢路径。
    */
-  async function dispatchUtterance(device: TihuDevice, text: string): Promise<void> {
+  async function dispatchUtterance(device: TihuDevice, text: string, source: TranscriptPayload['source'] = 'voice', ctx?: TihuUtteranceContext): Promise<void> {
+    // 读页现场（2026-11-13）：解析成硬绑定；解析不出来就是 undefined（完全不改原判断）。
+    const readPin = readPinOf(ctx)
     // 唤醒词是设备噪声（「你好，鹈鹕，帮我查一下…」）：进门先剥掉一层，
     // 屏上命令、任务标题、派单文本都不再带「你好，鹈鹕」。
     const value = stripWakeWord(String(text ?? ''))
@@ -7180,20 +8138,15 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (index !== undefined && index <= pick.candidates.length) {
         device.pendingPick = undefined
         const card = pick.candidates[index - 1]
-        await dispatchWithContinuity(device, pick.text, card, { via: 'pick' }, { allowCommander: true })
+        await dispatchWithContinuity(device, pick.text, card, { via: 'pick' }, { allowCommander: true, source })
         return
       }
       if (/^(都不是|都不对|不对)/.test(value)) {
         device.pendingPick = undefined
-        await dispatchWithContinuity(device, pick.text, ASSISTANT_CARD, { via: 'pick' }, { allowCommander: true })
+        await dispatchWithContinuity(device, pick.text, ASSISTANT_CARD, { via: 'pick' }, { allowCommander: true, source })
         return
       }
       device.pendingPick = undefined
-    }
-    // 派单四出口之一：问答记忆，自己直接答，不落任务。
-    if (MEMORY_QUESTION.test(value)) {
-      await answerDirect(device, value)
-      return
     }
     /* 屏上命令快速通道：留着它，只是它现在**等于页面按钮**（零模型、即时），
      * 它是兜底不是唯一入口——命中不了的说法一律往下走，让指挥台按意思判。
@@ -7203,10 +8156,27 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       await runScreenCommand(device, command)
       return
     }
+    /*
+     * 读页硬绑定（2026-11-13）：朗读页录音发来的这一句，判断照旧、路由锁死为那条会话。
+     * 位置有讲究：
+     *   - 在屏上命令之后：回棋盘/停朗读这类零模型本地命令不属于「发消息」，仍即时执行；
+     *   - 在问答记忆 / 快路径之前：「刚才那段…」这种开头照样要落回朗读会话，
+     *     不能被 MEMORY_QUESTION 抢去直接答（实机第一句就踩到了）。
+     * 这是读页专属（只有 screenHint='read' 才有 readPin）；键盘手打与其它入口完全不受影响。
+     */
+    if (readPin !== undefined) {
+      await dispatchPinnedRead(device, value, source, readPin)
+      return
+    }
+    // 派单四出口之一：问答记忆，自己直接答，不落任务。
+    if (MEMORY_QUESTION.test(value)) {
+      await answerDirect(device, value, source)
+      return
+    }
     const route = routeQuick({ text: value, cards: projectCards() ?? [], tasks: tasks.list() })
     if (route.kind === 'card') {
       // 规则 A：先看是不是接着上一条派单会话（跨项目也接）。同项目仍交给项目内多候选判定。
-      const followed = await followPreviousDispatch(device, value, route.card.id)
+      const followed = await followPreviousDispatch(device, value, route.card.id, source)
       if (followed !== undefined) {
         reportFollowFailure(device, followed)
         return
@@ -7222,12 +8192,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           const reason = `低置信项目命中（via=${weak.via} 置信=${weak.confidence.toFixed(2)}）不单独定落点，交给指挥台判`
           try { appendTihuLaneLog('-', new Error(reason), 'weak-project-hit') } catch { /* 日志失败不影响派单 */ }
           log(`tihu weak-project hit project=${weak.card.id} via=${weak.via} confidence=${weak.confidence.toFixed(2)} -> commander`)
-          await askCommander(device, value)
+          await askCommander(device, value, { source })
           return
         }
         log(`tihu weak-project hit project=${weak.card.id} via=${weak.via} confidence=${weak.confidence.toFixed(2)} corroborated by previous dispatch`)
       }
-      await dispatchWithContinuity(device, value, route.card, { via: route.via ?? 'card' }, { allowCommander: true })
+      await dispatchWithContinuity(device, value, route.card, { via: route.via ?? 'card' }, { allowCommander: true, source })
       return
     }
     if (route.kind === 'append' || route.kind === 'daily') {
@@ -7238,12 +8208,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
        * （规则 A，ledger 里的上一条任务，不认任何词表）。重合就接回那条会话；
        * 不重合才交给指挥台按意思判——判成活儿才派单，判成控制就办屏上那件事。
        */
-      const followed = await followPreviousDispatch(device, value)
+      const followed = await followPreviousDispatch(device, value, undefined, source)
       if (followed !== undefined) {
         reportFollowFailure(device, followed)
         return
       }
-      await askCommander(device, value)
+      await askCommander(device, value, { source })
       return
     }
     if (route.kind === 'ambiguous') {
@@ -7256,7 +8226,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       reportFollowFailure(device, followed)
       return
     }
-    await askCommander(device, value)
+    await askCommander(device, value, { source })
   }
 
   /** 规则 A 的失败回执：会话没接住时和平时派单失败一样出错误屏，不静默吞掉。 */
@@ -7416,6 +8386,26 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     ]
   }
 
+  /**
+   * 当前屏幕（用户 2026-11-13：屏幕名 / 页码 / 行号映射**继续给**）。
+   *
+   * 屏名取设备此刻真实停的那一屏（棋盘 / 进度 / 完成 / 待决策 …）；页码与行号映射
+   * 跟棋盘同一份 `boardOf`，不另算一份，免得模型按提示词里的页码点错行。
+   */
+  function commanderScreenLines(device: TihuDevice): string[] {
+    const board = boardOf(tasks.list(), Date.now(), Math.max(0, Math.trunc(device.boardPage ?? 0)))
+    const name = device.onBoard === true ? '棋盘' : (device.screenStage ?? '未上报')
+    const playback = device.playback
+    const total = Number(playback?.total)
+    const line = Number(playback?.line)
+    const reading = Number.isFinite(total) && total > 0 && Number.isFinite(line)
+      ? ` · 朗读第 ${line + 1}/${total} 行`
+      : ''
+    return [
+      `【当前屏幕】${name} · 棋盘第 ${board.page.index + 1}/${board.page.total} 页 · 行号从 1 开始（屏上第一行＝1，「第二个」＝第 2 行）${reading}`,
+    ]
+  }
+
   /** 设备当前屏的人话（进 ack 的 stage / 工具返回的第三段）。 */
   function screenEchoOf(device: TihuDevice): string {
     const stage = device.screenStage ?? ''
@@ -7441,7 +8431,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   function controlTaskRows(): ControlTaskRow[] {
     return tasks.list()
       .filter((task) => task.state !== 'archived')
-      .map((task) => ({ taskId: task.taskId, title: task.title, capsule: capsuleOf(task.state), sub: subLineOf(task) }))
+      .map((task) => ({ taskId: task.taskId, title: boardTitleOf(task), capsule: capsuleOf(task.state), sub: subLineOf(task) }))
   }
 
   /** 任务状态 → 屏名（返回文案用）。 */
@@ -8099,6 +9089,12 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         log(`tihu dispatch skipped duplicate text=${JSON.stringify(text)} task=${fallbackDispatch.taskId || '-'}`)
         return `这条刚刚已经派成任务 ${fallbackDispatch.taskId} 了，不用再派一次。`
       }
+      // 过期回复保护（2026-11-13）：这句的提问已经超时/忙兜底过（当时指挥台没赶上）→
+      // 它晚到的 dispatch 工具调用不许再把同一条命令派一次（兜底走的是本地规则，已经处理过）。
+      if (staleCommanderAskOf(dispatchKeyOf(text))) {
+        log(`tihu dispatch skipped stale text=${JSON.stringify(text)}`)
+        return '这条刚刚已经超时兜底处理过了（指挥台那条会话当时在忙），不用再派一次。'
+      }
       // 同一句只允许一条路由：指挥台判成「冲这块屏说的」并办过的句子，派单入口拒收。
       const handled = controlHandledOf(text)
       if (handled !== undefined) {
@@ -8116,6 +9112,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       if (card === undefined) card = ASSISTANT_CARD
       const device = [...devices].find((item) => item.unified)
       const key = dispatchKeyOf(text)
+      // 这句原来的来源（语音/键盘）：指挥台自己调 dispatch 时按字面 key 找回同一条提问。
+      const askSource = commanderAsks.find((item) => item.key === key)?.source
       // 灰区正在等指挥台这一句结论：它带 session = 接着那条，不带 = 明确新建。
       const grayResolution = grayFallback !== undefined && grayFallback.key === key
       const grayConfidence = grayResolution ? grayFallback?.confidence : undefined
@@ -8126,7 +9124,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         if (target === undefined) {
           return `没找到要接着的会话「${sessionHint}」：它必须是该项目文件夹下的 Computer Use 会话（可以先用 list_sessions 看短号）。`
         }
-        const appendMeta: DispatchMeta = { via: 'commander', continuity: 'append', confidence: grayConfidence ?? 1, clarify: 'no' }
+        const appendMeta: DispatchMeta = { via: 'commander', continuity: 'append', confidence: grayConfidence ?? 1, clarify: 'no', source: askSource }
         const task = await appendToSession(
           device,
           text,
@@ -8149,21 +9147,22 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           continuity: 'new',
           ...(grayConfidence === undefined ? {} : { confidence: grayConfidence }),
           clarify: grayResolution ? 'yes' : 'no',
+          source: askSource,
         })
         if (task === undefined) return '错误：这条任务没派出去（宿主不能新建会话，或任务会话没接住消息）。'
         return `已派给「${task.projectName}」：${task.title}（任务 ${task.taskId}，落在 ${task.folder ?? '默认目录'}）`
       }
       // 没点名接哪条：本地衔接先判；灰区只问用户一次（指挥台已经在这条链路上，不能再递归问它）。
-      const outcome = await dispatchWithContinuity(device, text, card, { via: 'commander' }, { allowCommander: false })
+      const outcome = await dispatchWithContinuity(device, text, card, { via: 'commander' }, { allowCommander: false, source: askSource })
       return outcome.message
     },
     listTasks: () => tasks.list()
       .filter((task) => task.state !== 'archived')
-      .map((task) => ({ taskId: task.taskId, title: task.title, capsule: capsuleOf(task.state), sub: subLineOf(task) })),
+      .map((task) => ({ taskId: task.taskId, title: boardTitleOf(task), capsule: capsuleOf(task.state), sub: subLineOf(task) })),
     cancelTask: async (ref) => {
       const rows: ControlTaskRow[] = tasks.list()
         .filter((task) => task.state !== 'archived')
-        .map((task) => ({ taskId: task.taskId, title: task.title, capsule: capsuleOf(task.state), sub: subLineOf(task) }))
+        .map((task) => ({ taskId: task.taskId, title: boardTitleOf(task), capsule: capsuleOf(task.state), sub: subLineOf(task) }))
       if (rows.length === 0) return '登记簿里现在没有任务，没有可撤的。'
       const outcome = matchTaskRows(rows, ref)
       if (outcome.kind === 'none') return `找不到任务「${ref ?? ''}」：用 list_tasks 看一下任务号。`
@@ -8190,6 +9189,18 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     control,
     page: () => tihuPageHtml({ lanePath: TIHU_LANE_PATH, protocol: TIHU_PROTOCOL_VERSION }),
     handleUpgrade,
+    handleHttp: createTihuHttpHandler({
+      /** 手机壳 POST /tihu/asr：复用同一条 transcribe()（含标点恢复），别再另写一份。 */
+      transcribe: async (audio: Buffer) => {
+        const started = Date.now()
+        const text = await transcribe(audio.toString('base64'))
+        return {
+          text,
+          source: text === '' ? 'none' : 'local',
+          elapsedMs: Date.now() - started,
+        }
+      },
+    }),
     dispose: () => {
       disposed = true
       // 卸载时绝不许把宿主的 approval / 提问永远挂住：按默认项了结（与 60 秒到点同一条规则）。
@@ -8197,6 +9208,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       pendingBridges.clear()
       stopCommanderWait()
       pendingCommanderTask.clear()
+      for (const ask of commanderAsks) {
+        if (ask.readTimer !== undefined) clearTimeout(ask.readTimer)
+      }
       commanderAsks.length = 0
       commanderTurnReplied.clear()
       commanderToolCalls.clear()
@@ -8275,6 +9289,84 @@ function finishReasonOf(data: unknown): string {
  * 只收 `assistant/message` 的 text 块：reasoning（思考）与 tool-call 都不算回复；最后一条
  * 只有工具调用时继续往前找，直到找到真正的文字。
  */
+/** 一段提示词的字数（按字符算；每行末尾的换行也算 1 字，跟真正喂给模型的正文同口径）。 */
+function fieldCharsOf(lines: readonly string[]): number {
+  let total = 0
+  for (const line of lines) total += [...line].length + 1
+  return total
+}
+
+/** 一条消息里的 text 块（reasoning / tool-call / 图片等都不是正文，直接不取）。 */
+function messageTextBlocksOf(content: unknown): string {
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((block: any) => block?.type === 'text')
+    .map((block: any) => String(block?.text ?? ''))
+    .join('\n')
+}
+
+/**
+ * 单条对话正文：去 harness/工具噪音、压成一行；超过 800 字就截断并标「…（后略）」。
+ *
+ * 助手回复只取 text 块（thinking 与 tool-call 在结构上就被排除了），diff 之类多来自
+ * 工具结果、不会进正文；`stripToolNoise` 再兜掉 Computer Use 的坐标/图片/英文日志行。
+ */
+function commanderDialogueTextOf(raw: unknown): string {
+  const text = stripToolNoise(String(raw ?? '')).replace(/\s+/g, ' ').trim()
+  const chars = [...text]
+  if (chars.length <= COMMANDER_DIALOGUE_MAX_CHARS) return text
+  return `${chars.slice(0, COMMANDER_DIALOGUE_MAX_CHARS).join('')}…（后略）`
+}
+
+/**
+ * 会话事件 → 最后一轮对话（「用户：…」＋「助手：…」）。
+ *
+ * 只认真正的用户发言（`user/message` 且 `source.kind === 'user'`：system-reminder、
+ * developer、工具注入都不算）和助手正文。每条会话只给**最后一轮**：最后一条用户消息
+ * 与它之后的那条助手回复（这一轮若有多条助手正文，取最后一条＝最终答复）；
+ * 还没回复就只给用户那条并标「（尚未回复）」。
+ */
+function commanderDialogueLinesOf(events: unknown): string[] {
+  if (!Array.isArray(events)) return []
+  const messages: Array<{ role: '用户' | '助手'; text: string }> = []
+  for (const event of events) {
+    const type = String((event as any)?.type ?? '')
+    const data = (event as any)?.data
+    if (data === null || data === undefined) continue
+    if (type === 'user/message') {
+      if ((data as any)?.source?.kind !== 'user') continue
+      // tihu 自己追加在用户消息后面的提醒不算用户原话（续聊/只读问答尾巴）。
+      const raw = messageTextBlocksOf((data as any)?.content)
+        .split(/\r?\n/)
+        .filter((line) => !/^\s*【(?:续聊|只读问答) · 鹈鹕】/.test(line))
+        .join('\n')
+      const text = commanderDialogueTextOf(raw)
+      if (text !== '') messages.push({ role: '用户', text })
+      continue
+    }
+    if (type === 'assistant/message') {
+      const text = commanderDialogueTextOf(messageTextBlocksOf((data as any)?.message?.content))
+      if (text !== '') messages.push({ role: '助手', text })
+    }
+  }
+  // 最后一轮＝最后一条用户消息 + 它之后的那条助手回复（没有就是「尚未回复」）。
+  let lastUser = -1
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i].role === '用户') {
+      lastUser = i
+      break
+    }
+  }
+  if (lastUser < 0) return []
+  const reply = messages.slice(lastUser + 1).filter((message) => message.role === '助手').pop()
+  const round = reply === undefined ? [messages[lastUser]] : [messages[lastUser], reply]
+  const latest = round.slice(0, COMMANDER_DIALOGUE_MESSAGES)
+  return latest.map((message, index) => {
+    const unanswered = message.role === '用户' && latest.length === 1
+    return `${message.role}：${message.text}${unanswered ? '（尚未回复）' : ''}`
+  })
+}
+
 function lastAssistantTextOfEvents(events: unknown): string {
   if (!Array.isArray(events)) return ''
   for (let i = events.length - 1; i >= 0; i -= 1) {
@@ -8309,3 +9401,102 @@ function existsSyncSafe(workspace: string, target: string): boolean {
 
 /** 协议类型集合（测试与文档核对用）。 */
 export const tihuProtocolSurface = { upstream: TIHU_UPSTREAM_TYPES, downstream: TIHU_DOWNSTREAM_TYPES, version: TIHU_PROTOCOL_VERSION, tihuDirOf }
+
+/* ---------------------------------------------------------------- /tihu/asr（1.2.x 恢复）*/
+
+/**
+ * 手机端与固件的共同约定：一次最多上传多长的录音（2026-11-13：60 秒 → 180 秒）。
+ *
+ * 3 分钟 16k/单声道/16bit WAV = 180 × 32000 = 5,760,000 字节 + 44 字节头；
+ * 上限取 8MB，给头部/重采样/结尾补零留余量。**不要只改手机端**：
+ * 公网入口（VPS:7080 → 本机 relay 3099）也有自己的 body 上限与转发超时，
+ * 那边不改的话，手机上按 3 分钟录完照样会 413 / 转写超时。
+ */
+export const TIHU_ASR_MAX_AUDIO_MS = 180_000
+/** 3 分钟 WAV 的字节数（含 44 字节头），给测试与日志用。 */
+export const TIHU_ASR_MAX_AUDIO_BYTES = TIHU_ASR_MAX_AUDIO_MS * 32 + 44
+/** 手机端与固件的共同约定：一次最多 8MB WAV（覆盖 3 分钟）。 */
+export const TIHU_ASR_MAX_BYTES = 8 * 1024 * 1024
+
+export interface TihuHttpHandlerOptions {
+  transcribe: (audio: Buffer) => Promise<{ text?: string; source?: string; error?: string; elapsedMs?: number }>
+  maxBytes?: number
+  log?: (line: string) => void
+}
+
+/** 把 /tihu/asr 挂到代理：返回 false 表示这条请求不归我管。 */
+export function createTihuHttpHandler(options: TihuHttpHandlerOptions): (req: any, res: any) => boolean {
+  const maxBytes = options.maxBytes ?? TIHU_ASR_MAX_BYTES
+  const reply = (res: any, code: number, body: unknown, extra: Record<string, string> = {}): void => {
+    try {
+      res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', ...extra })
+      res.end(JSON.stringify(body))
+    } catch { /* 连接已断 */ }
+  }
+  return (req: any, res: any): boolean => {
+    const raw = String(req?.url ?? req?.path ?? '')
+    const path = raw.split('?')[0]
+    if (path !== '/tihu/asr') return false
+    const started = Date.now()
+    if (String(req?.method ?? 'POST').toUpperCase() !== 'POST') {
+      reply(res, 405, { error: 'method-not-allowed' }, { allow: 'POST' })
+      return true
+    }
+    const run = (audio: Buffer): void => {
+      if (audio.length > maxBytes) {
+        reply(res, 413, { error: 'audio-too-large', maxBytes })
+        return
+      }
+      if (audio.length === 0) {
+        reply(res, 200, { text: '', source: 'none', error: 'no-audio', ms: 0 })
+        return
+      }
+      Promise.resolve(options.transcribe(audio))
+        .then((r) => {
+          const text = String(r?.text ?? '')
+          const source = String(r?.source ?? (text ? 'unknown' : 'none'))
+          const ms = Number.isFinite(Number(r?.elapsedMs)) ? Math.round(Number(r?.elapsedMs)) : Date.now() - started
+          const payload: Record<string, unknown> = { text, source, ms }
+          if (!text) payload.error = 'no-speech'
+          try { appendTihuLaneNote('tihu-asr', `asr bytes=${audio.length} text=${text.length} source=${source} ms=${ms}`) } catch { /* 日志失败不影响响应 */ }
+          reply(res, 200, payload)
+        })
+        .catch((error: unknown) => {
+          const reason = (error as Error)?.message ?? String(error)
+          try { appendTihuLaneNote('tihu-asr', `asr failed: ${reason}`) } catch { /* 忽略 */ }
+          reply(res, 200, { text: '', source: 'none', error: reason || 'asr-failed', ms: Date.now() - started })
+        })
+    }
+    const direct = (req as any)?.body
+    if (Buffer.isBuffer(direct)) {
+      run(direct)
+      return true
+    }
+    const chunks: Buffer[] = []
+    let size = 0
+    let done = false
+    const finish = (): void => {
+      if (done) return
+      done = true
+      run(Buffer.concat(chunks))
+    }
+    try {
+      req.on('data', (chunk: Buffer) => {
+        if (done) return
+        size += chunk.length
+        if (size > maxBytes) {
+          done = true
+          reply(res, 413, { error: 'audio-too-large', maxBytes })
+          return
+        }
+        chunks.push(Buffer.from(chunk))
+      })
+      req.on('end', finish)
+      req.on('error', finish)
+      req.resume?.()
+    } catch {
+      finish()
+    }
+    return true
+  }
+}

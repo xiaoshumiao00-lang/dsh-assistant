@@ -227,6 +227,15 @@ test('lane.ts：派单（前台）与指挥台（后台）两条建会话路径�
   assert.match(source, /await ensureCommanderModel\(commanderSessionId\)/, '复用回来的指挥台没补默认后台模型（它几乎永远不新建）')
   assert.match(source, /await applyTihuModel\(sessionId, 'foreground', '派单'\)/, '派单建会话后没接默认前台模型')
 
+  // 2026-11-13：守卫从「每条会话只做一次」改成「按配置值签名比对」，且 apply 成功才记账。
+  // 语义：手机「鹈鹕设置 → 指挥台模型」是权威值，改完下一轮派单就生效；失败可重试。
+  assert.match(source, /const commanderModelApplied = new Map<string, string>\(\)/,
+    '守卫必须按配置值记账（Map<sessionId, provider/model>），不能只记 sessionId')
+  assert.match(source, /if \(ok\) commanderModelApplied\.set\(sessionId, key\)/,
+    'apply 成功才记账：失败不许被永久当成「做过」（要能重试）')
+  assert.match(source, /if \(commanderSessionId !== undefined\) await ensureCommanderModel\(commanderSessionId\)/,
+    '每次派单前要同步一次指挥台模型（手机端改完下一单生效）')
+
   const foregroundAt = source.indexOf("await applyTihuModel(sessionId, 'foreground', '派单')")
   const promptAt = source.indexOf('const sent = await promptSession(sessionId, blocks)')
   assert.ok(foregroundAt > 0 && promptAt > 0, '派单路径的标记没找到（代码结构变了就同步改这条断言）')

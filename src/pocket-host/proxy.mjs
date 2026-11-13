@@ -1096,6 +1096,16 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
         }
       }
     }
+    // ── 鹈鹕语音转写（手机 APK 底部麦克风）────────────────────────────────
+    // POST /tihu/asr：body 就是原始 WAV（≤2MB）。**鉴权沿用上面那一套**
+    // （token / PIN / HttpOnly cookie / 局域网开关早已判过），这里只负责接走，
+    // 转写在 tihu 运行时里做（本地 whisper 优先 → 宿主 speech 回退），
+    // 所以别人只装插件 + APK 也能用，不依赖任何人私有的 relay。
+    // 其它方法/路径保持原样（不接走，继续按老规则转发或 404）。
+    if (tihu && req.method === 'POST' && urlPath === '/tihu/asr'
+        && typeof tihu.handleHttp === 'function' && tihu.handleHttp(req, res)) {
+      return;
+    }
     // ── 鹈鹕（tihu）模拟设备页 ──────────────────────────────────────────────
     // 由代理**在鉴权之后**直接吐出（不落到上游 dsh web：上游对 /tihu 是 404）。
     // 局域网 / 公网 / 回环三种入口走的就是上面那一套 token + cookie 判定：

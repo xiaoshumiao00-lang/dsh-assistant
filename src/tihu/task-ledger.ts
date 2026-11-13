@@ -65,8 +65,13 @@ export interface TihuTask {
   taskId: string
   /** 任务来源（缺省按鹈鹕派单处理，老数据不受影响）。 */
   source: TihuTaskSource
-  /** 一句话意图的规范化短语。 */
+  /** 一句话意图的规范化短语（完整串，不截断）。 */
   title: string
+  /**
+   * 客户端（DSH 网页/电脑端会话列表）里这条会话的标题，**逐字照抄**：棋盘只显示它。
+   * 空/缺省＝客户端还没生成标题，棋盘退回 {@link title}（见 boardTitleOf）。
+   */
+  sessionTitle?: string
   /** 项目卡 id（日常任务是 `wt-assistant`）。 */
   projectId: string
   /** 项目名（屏上「项目 · 第 N 步」用）。 */
@@ -154,15 +159,25 @@ export function isFinishedState(state: TihuTaskState): boolean {
   return state === 'done' || state === 'announced'
 }
 
-/** 一句话 → 任务标题：去噪音、压空白、按像素省略（18 字以内）。 */
-export function taskTitleOf(text: unknown, maxChars = 18): string {
+/**
+ * 一句话 → 任务名：只去行首行尾的噪音（空白/句读），**不截断**。
+ *
+ * 登记簿里存的是这个完整串（棋盘要逐字显示，截断会把「改 D:\dsh-assistant …」
+ * 切成一串省略号，和电脑端会话列表对不上）。
+ */
+export function taskTitleFullOf(text: unknown): string {
   const clean = String(text ?? '')
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/^[，,。.、\s]+/, '')
     .replace(/[。！？!?；;，,、\s]+$/g, '')
     .trim()
-  if (clean === '') return '这条任务'
+  return clean === '' ? '这条任务' : clean
+}
+
+/** 短文案用的任务名（播报行/日志/回执）——这里才按字数省略（默认 18 字以内）。 */
+export function taskTitleOf(text: unknown, maxChars = 18): string {
+  const clean = taskTitleFullOf(text)
   const chars = [...clean]
   if (chars.length <= maxChars) return clean
   return `${chars.slice(0, Math.max(1, maxChars - 1)).join('')}…`
@@ -197,15 +212,16 @@ export function ringOf(task: TihuTask, now: number): TaskBoardRow['ring'] {
   return { percent, tone: elapsed > RING_FULL_MS ? 'warn' : 'normal' }
 }
 
-/** 棋盘标题：去掉原话开头重复的项目名，只留「状态 + 会话名」；项目名保留在副行。 */
+/**
+ * 棋盘标题：**逐字**用客户端会话标题（投影 `title`），拿不到才退回任务自己的名字。
+ *
+ * 用户 2026-11-13 定案：看板上的一行必须和 DSH 客户端（网页会话列表）里的会话标题
+ * 完全一致——不截断、不去项目名、不加省略号。项目名仍在副行（`subLineOf`）里。
+ */
 export function boardTitleOf(task: TihuTask): string {
-  const title = String(task.title ?? '').trim()
-  const project = String(task.projectName ?? '').trim()
-  if (title === '' || project === '' || !title.startsWith(project)) return title
-  const rest = title.slice(project.length)
-  if (rest !== '' && !/^[\s·:：\-—]/.test(rest)) return title
-  const clean = rest.replace(/^[\s·:：\-—]+/, '').trim()
-  return clean === '' ? title : clean
+  const sessionTitle = String(task.sessionTitle ?? '')
+  if (sessionTitle.trim() !== '') return sessionTitle
+  return String(task.title ?? '').trim()
 }
 
 /** 任务行（棋盘一行）。待决策行给琥珀问号，不显示时长。 */
@@ -384,6 +400,8 @@ export interface LedgerTaskRecord {
   taskId: string
   source: TihuTaskSource
   title: string
+  /** 客户端会话标题（逐字；重启后棋盘仍与客户端一致）。 */
+  sessionTitle?: string
   projectId: string
   projectName: string
   folder?: string
@@ -436,7 +454,7 @@ export function ledgerRecordOf(task: TihuTask): LedgerTaskRecord | undefined {
   const record: LedgerTaskRecord = {
     taskId: task.taskId,
     source: task.source === 'pc' ? 'pc' : 'tihu',
-    title: clipRecordText(task.title, 40),
+    title: clipRecordText(task.title, 200),
     projectId: clipRecordText(task.projectId, 80),
     projectName: clipRecordText(task.projectName, 40),
     preset: clipRecordText(task.preset, 24) || 'standard',
@@ -447,6 +465,8 @@ export function ledgerRecordOf(task: TihuTask): LedgerTaskRecord | undefined {
   }
   const folder = clipRecordText(task.folder, 260)
   if (folder !== '') record.folder = folder
+  const sessionTitle = clipRecordText(task.sessionTitle, 200)
+  if (sessionTitle !== '') record.sessionTitle = sessionTitle
   const finishedAt = recordNumber(task.finishedAt, 0)
   if (finishedAt > 0) record.finishedAt = finishedAt
   const resultLine = clipRecordText(task.resultLine, 120)
@@ -518,7 +538,7 @@ export function restoreLedgerTasks(records: unknown, now = Date.now()): LedgerRe
     const task: TihuTask = {
       taskId,
       source: idMatch[1] === 'p' || record.source === 'pc' ? 'pc' : 'tihu',
-      title: taskTitleOf(record.title),
+      title: taskTitleFullOf(record.title),
       projectId: clipRecordText(record.projectId, 80),
       projectName: clipRecordText(record.projectName, 40),
       sessionIds: Array.isArray(record.sessionIds)
@@ -538,6 +558,8 @@ export function restoreLedgerTasks(records: unknown, now = Date.now()): LedgerRe
     }
     const folder = clipRecordText(record.folder, 260)
     if (folder !== '') task.folder = folder
+    const sessionTitle = clipRecordText(record.sessionTitle, 200)
+    if (sessionTitle !== '') task.sessionTitle = sessionTitle
     seen.add(taskId)
     normalized.push({ task, activity })
   }
@@ -590,7 +612,7 @@ export class TaskLedger {
     const task: TihuTask = {
       taskId: `${source === 'pc' ? 'p' : 't'}${seq}`,
       source,
-      title: taskTitleOf(input.title),
+      title: taskTitleFullOf(input.title),
       projectId: input.projectId,
       projectName: input.projectName,
       sessionIds: [...(input.sessionIds ?? [])],
@@ -690,6 +712,23 @@ export class TaskLedger {
   }
 
   /**
+   * 记下客户端会话标题（**逐字**，不截断、不改写）：棋盘这一行显示的就是它。
+   *
+   * 值没变就什么都不动（棋盘轮询不能把卡片重新顶到最前）；返回 true 表示棋盘该重画。
+   */
+  setSessionTitle(taskId: string, title: string, now = Date.now()): boolean {
+    const task = this.tasks.get(taskId)
+    if (task === undefined) return false
+    const next = String(title ?? '')
+    if (next.trim() === '') return false
+    if (task.sessionTitle === next) return false
+    task.sessionTitle = next
+    task.updatedAt = now
+    this.notifyChange()
+    return true
+  }
+
+  /**
    * 把「等指挥台判断」的排队卡转成正式任务：只改项目/文件夹/标题与等待标记，
    * **taskId 不变**（用户 2026-11-10 要求：不许因为判出结果就冒出第二张卡）。
    */
@@ -698,7 +737,7 @@ export class TaskLedger {
     if (task === undefined) return undefined
     const now = input.now ?? Date.now()
     const title = String(input.title ?? '').trim()
-    if (title !== '') task.title = taskTitleOf(title)
+    if (title !== '') task.title = taskTitleFullOf(title)
     task.projectId = input.projectId
     task.projectName = input.projectName
     if (input.folder !== undefined && input.folder !== '') task.folder = input.folder
@@ -748,9 +787,10 @@ export class TaskLedger {
     if (task === undefined) return false
     const at = Number.isFinite(input.at) ? input.at : Date.now()
     let changed = false
-    const title = String(input.title ?? '').trim()
+    // 和存进去的那份比（同一套规范化）：否则长标题每轮都以「不一样」为由把卡片顶到最前。
+    const title = String(input.title ?? '').trim() === '' ? '' : taskTitleFullOf(input.title)
     if (title !== '' && task.title !== title) {
-      task.title = taskTitleOf(title)
+      task.title = title
       changed = true
     }
     const project = String(input.projectName ?? '').trim()
@@ -1223,13 +1263,16 @@ export function chineseIndex(text: string): number | undefined {
 }
 
 /**
- * 句首唤醒词：「你好，鹈鹕」「嗨鹈鹕」「鹈鹕，」——设备级噪声，不是任务正文。
+ * 句首唤醒词：「你好，鹈鹕」「鹈鹕，」——设备级噪声，不是任务正文。
  *
  * 真机固件与浏览器的关键词聆听都会把唤醒词一起转写进来（2026-11-09 实测：
  * 「你好，鹈鹕回棋盘」没被当命令，反而作为一条任务派给了个人助手）。这里只剥
  * **句首**的唤醒词，正文里出现的「鹈鹕」一个字都不动。
+ *
+ * 2026-11-12 用户要求收窄：只认「你好，鹈鹕」和光秃秃的「鹈鹕」两种，
+ * 去掉原来的「嗨 / 嘿 / 喂」前缀（那几种说法以后按普通正文处理）。
  */
-const WAKE_WORD_PREFIX = /^(?:你好|嗨|嘿|喂)?[，,、。．.！!？?～~\s]*鹈鹕[，,、。．.！!？?～~\s]*/
+const WAKE_WORD_PREFIX = /^(?:你好)?[，,、。．.！!？?～~\s]*鹈鹕[，,、。．.！!？?～~\s]*/
 
 /** 去掉句首唤醒词；整句只有唤醒词时返回空串（上层当空话丢弃）。 */
 export function stripWakeWord(text: string): string {

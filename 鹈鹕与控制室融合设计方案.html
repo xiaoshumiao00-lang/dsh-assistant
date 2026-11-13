@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>鹈鹕 × 控制室 融合设计方案</title>
+<style>
+  :root{
+    --ink:#1b2431; --ink2:#39465a; --muted:#68758a; --faint:#93a0b3;
+    --line:#e2e6ee; --line2:#eef1f6;
+    --bg:#f6f5f1; --paper:#fffefb;
+    --amber:#c8890f; --amber-soft:#fdf3dd; --amber-ink:#7d5708;
+    --blue:#3568d4; --blue-soft:#e9effd;
+    --green:#2b8f63; --green-soft:#e6f4ec;
+    --gray-soft:#f2f4f8;
+    --shadow:0 1px 2px rgba(22,32,50,.05), 0 8px 24px rgba(22,32,50,.05);
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; padding:0; background:var(--bg); color:var(--ink);
+    font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC","Source Han Sans SC",system-ui,-apple-system,sans-serif;
+    font-size:15px; line-height:1.85; letter-spacing:.012em;
+    -webkit-font-smoothing:antialiased;
+  }
+  .page{max-width:1040px; margin:0 auto; background:var(--paper); padding:56px 60px 80px; box-shadow:var(--shadow)}
+  p{margin:0 0 10px}
+  strong{font-weight:700; color:var(--ink)}
+  em{font-style:normal; background:linear-gradient(transparent 62%, #fbe9bd 62%); padding:0 1px}
+  code{font-family:"Cascadia Code","JetBrains Mono",Consolas,"Courier New",monospace; font-size:.86em;
+       background:#f4f6fa; border:1px solid var(--line2); border-radius:4px; padding:1px 5px; color:#2f4260;
+       word-break:break-word}
+  a{color:var(--blue); text-decoration:none; border-bottom:1px solid rgba(53,104,212,.25)}
+
+  /* ---------- 标题区 ---------- */
+  header{border-bottom:2px solid var(--ink); padding-bottom:22px; margin-bottom:26px}
+  .kicker{font-size:12px; letter-spacing:.22em; color:var(--muted); margin:0 0 12px; font-weight:600}
+  h1{margin:0 0 10px; font-size:33px; line-height:1.35; letter-spacing:.01em; font-weight:800}
+  h1 .thin{font-weight:400; color:var(--muted)}
+  .subtitle{margin:0 0 16px; font-size:15.5px; color:var(--ink2); line-height:1.75}
+  .meta{display:flex; flex-wrap:wrap; gap:8px; font-size:12px; color:var(--muted)}
+  .meta span{background:var(--gray-soft); border:1px solid var(--line); border-radius:999px; padding:2px 11px}
+
+  /* ---------- 目录 ---------- */
+  nav.toc{margin:0 0 8px; padding:18px 22px; background:#fbfaf6; border:1px solid var(--line); border-radius:10px}
+  nav.toc h2{border:0; margin:0 0 8px; padding:0; font-size:12px; letter-spacing:.18em; color:var(--muted); font-weight:700}
+  nav.toc ol{margin:0; padding:0; list-style:none; columns:2; column-gap:34px}
+  nav.toc li{font-size:13.5px; padding:2px 0; break-inside:avoid}
+  nav.toc li b{display:inline-block; width:22px; color:var(--faint); font-weight:600}
+  nav.toc a{border:0; color:var(--ink2)}
+
+  /* ---------- 章节 ---------- */
+  section{margin:0 0 8px}
+  h2{display:flex; align-items:center; gap:12px; font-size:21px; font-weight:800; margin:46px 0 16px;
+     padding-bottom:10px; border-bottom:1px solid var(--line); break-after:avoid}
+  h2 .num{display:inline-flex; align-items:center; justify-content:center; width:30px; height:30px;
+     background:var(--ink); color:#fff; border-radius:8px; font-size:14px; font-weight:700; flex:none}
+  h3{font-size:16px; margin:26px 0 8px; break-after:avoid}
+  .lead{font-size:14.5px; color:var(--muted); margin:-4px 0 18px}
+  .small{font-size:12.5px; color:var(--muted)}
+  .note{font-size:12.5px; color:var(--muted); margin-top:8px}
+
+  /* ---------- 结论框 ---------- */
+  .verdict{position:relative; background:#fbf6ea; border:1px solid #ecdcb6; border-left:5px solid var(--amber);
+     border-radius:10px; padding:22px 26px 18px; margin:22px 0 26px; break-inside:avoid}
+  .verdict p{margin:0; font-size:17px; line-height:1.9; color:#3a3121; letter-spacing:.015em}
+  .verdict .tag{display:inline-block; font-size:11px; letter-spacing:.2em; color:var(--amber-ink);
+     font-weight:700; margin-bottom:8px}
+
+  /* ---------- 表格 ---------- */
+  .tbl-wrap{margin:16px 0 10px}
+  table{width:100%; border-collapse:collapse; font-size:13.5px; line-height:1.7; background:#fff}
+  caption{caption-side:top; text-align:left; font-size:12.5px; color:var(--muted); padding-bottom:7px}
+  th,td{border:1px solid var(--line); padding:9px 11px; vertical-align:top; text-align:left}
+  thead th{background:#f4f6fa; font-weight:700; color:var(--ink2); font-size:13px; white-space:nowrap}
+  tbody tr:nth-child(even){background:#fcfcfa}
+  td.center{text-align:center}
+  tr{break-inside:avoid}
+  .c{display:inline-block; min-width:44px; text-align:center; font-size:12px; font-weight:700;
+     border-radius:5px; padding:1px 7px; border:1px solid transparent; white-space:nowrap}
+  .c-ok{color:#1c6f4a; background:#e7f5ec; border-color:#cfe8da}
+  .c-ro{color:#8a6412; background:#fdf3dd; border-color:#eddcb5}
+  .c-no{color:#6b7486; background:#eef0f4; border-color:#e0e4ec}
+
+  /* ---------- 原则 ---------- */
+  .pr{padding:18px 0 6px; border-top:1px solid var(--line2); break-inside:avoid}
+  .pr:first-of-type{border-top:0; padding-top:4px}
+  .pr h3{display:flex; align-items:baseline; gap:10px; margin:6px 0 10px; font-size:16.5px}
+  .pr h3 .n{font-family:"Cascadia Code",Consolas,monospace; font-size:12px; font-weight:700; color:#fff;
+     background:var(--ink2); border-radius:5px; padding:1px 8px; flex:none; letter-spacing:.05em}
+  .pr p{font-size:14.5px; color:#2c3849}
+  .land{margin:10px 0 0; font-size:12.5px; color:var(--muted); border-left:2px solid var(--line);
+     padding:2px 0 2px 12px}
+  .land b{color:var(--ink2)}
+
+  /* ---------- 图 ---------- */
+  figure{margin:22px 0 26px; break-inside:avoid}
+  figure svg{display:block; width:100%; height:auto; max-width:100%}
+  figcaption{font-size:12.5px; color:var(--muted); margin-top:10px; text-align:center}
+
+  .flowbox{border:1px solid var(--line); border-radius:12px; background:#fdfdfb; padding:14px 14px 6px}
+
+  /* ---------- 双 mock ---------- */
+  .mocks{display:grid; grid-template-columns:minmax(300px,.78fr) minmax(360px,1fr); gap:22px; align-items:start}
+  @media (max-width:820px){ .mocks{grid-template-columns:1fr} }
+  .mockbox{border:1px solid var(--line); border-radius:12px; background:#fff; padding:14px 14px 16px; box-shadow:0 1px 0 rgba(20,30,50,.03)}
+  .mocklabel{display:flex; align-items:center; justify-content:space-between; font-size:11.5px;
+     letter-spacing:.12em; color:var(--muted); font-weight:700; margin:0 0 10px}
+  .mocklabel i{font-style:normal; font-weight:400; letter-spacing:0; color:var(--faint)}
+
+  /* micro svg 字号 */
+  .micro-svg text{font-family:"PingFang SC","Microsoft YaHei","Noto Sans SC",system-ui,sans-serif}
+  .t6{font-size:6.4px; fill:var(--faint)}
+  .t7{font-size:7px; fill:#6f7b8e}
+  .t7b{font-size:7px; font-weight:700; fill:var(--ink2)}
+  .t8{font-size:8px; fill:#59657a}
+  .t8b{font-size:8px; font-weight:700; fill:var(--ink)}
+  .t9b{font-size:9.6px; font-weight:700; fill:var(--ink)}
+
+  /* full mock */
+  .stage{position:relative; border:1px solid #d8dee8; border-radius:10px; background:#f1f2f5; overflow:visible}
+  .stage-bar{display:flex; align-items:center; gap:5px; padding:6px 9px; background:#e7e9ee; border-bottom:1px solid #d8dee8; border-radius:9px 9px 0 0}
+  .dot{width:7px; height:7px; border-radius:50%; background:#c9ced8}
+  .dot.r{background:#e5a49c}.dot.y{background:#e8ce9a}.dot.g{background:#a9d3b9}
+  .stage-title{font-size:10px; color:#6a7484; margin-left:4px}
+  .stage-body{position:relative; padding:12px; display:grid; gap:10px}
+  .cc-card{width:52%; min-width:236px; background:#fff; border:1px solid #e3e7ee; border-radius:10px; padding:11px 12px 10px; box-shadow:0 2px 6px rgba(30,40,60,.06)}
+  .cc-head{display:flex; align-items:center; gap:6px; font-size:10.5px; color:#55617a}
+  .cc-ic{width:14px; height:14px; border-radius:4px; background:#e6ecfa; color:#3f63b5; font-size:9px; display:flex; align-items:center; justify-content:center}
+  .cc-name{font-weight:700; color:#2c3849}
+  .cc-state{margin-left:auto; font-size:9px; color:#2b6bab; background:#e9f0fb; border-radius:999px; padding:1px 7px}
+  .cc-title{font-size:12.5px; font-weight:800; margin:7px 0 5px; letter-spacing:.01em}
+  .cc-act{display:flex; align-items:center; gap:5px; font-size:9.5px; color:#5c697f}
+  .pulse{width:6px; height:6px; border-radius:50%; background:var(--blue); box-shadow:0 0 0 3px rgba(53,104,212,.14)}
+  .cc-progress{height:4px; border-radius:2px; background:#eef1f6; margin:8px 0 9px; overflow:hidden}
+  .cc-progress i{display:block; height:100%; background:linear-gradient(90deg,#5b8ae0,#3568d4); border-radius:2px}
+  .cc-amber{display:flex; align-items:center; gap:6px; font-size:9.5px; color:#7d5708; background:#fdf5e3;
+     border:1px solid #eddcb5; border-radius:6px; padding:5px 8px; line-height:1.35}
+  .a-dot{width:7px; height:7px; border-radius:50%; background:var(--amber); flex:none; box-shadow:0 0 0 3px rgba(200,137,15,.15)}
+  .cc-actions{display:flex; gap:6px; margin-top:9px}
+  .cc-actions button{font:inherit; font-size:9.5px; padding:4px 9px; border-radius:6px; border:1px solid #dde2ea;
+     background:#fff; color:#3d4a5f; cursor:default}
+  .cc-actions button.primary{background:#2f5fd0; border-color:#2f5fd0; color:#fff; font-weight:700}
+  .cc-extra{width:52%; min-width:236px; display:flex; flex-wrap:wrap; gap:6px; align-items:center}
+  .chip{font-size:9.5px; color:#4b5770; background:#fff; border:1px solid #dde2ea; border-radius:999px; padding:2px 9px; display:inline-flex; gap:4px; align-items:center}
+  .chip.dir{font-family:"Cascadia Code",Consolas,monospace; font-size:9px; border-radius:6px; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .chip b{font-weight:700}
+  .cc-overlay{position:absolute; right:8px; top:44px; width:46%; max-width:300px; background:#fff;
+     border:1px solid #dfe4ec; border-radius:10px; box-shadow:0 14px 30px rgba(28,38,58,.16); z-index:3; overflow:hidden}
+  @media (max-width:560px){
+    .cc-card,.cc-extra{width:100%; min-width:0}
+    .cc-overlay{position:relative; right:auto; top:auto; width:100%; max-width:none; margin:4px 0 0}
+  }
+  .ov-head{display:flex; align-items:center; padding:7px 10px; border-bottom:1px solid #eef1f6; font-size:10px; font-weight:700; color:#3b4658}
+  .ov-head span{margin-left:auto; color:#9aa4b5; font-weight:400}
+  .ov-row{display:flex; align-items:center; gap:6px; padding:6px 10px; border-bottom:1px solid #f4f6fa; font-size:9.5px; color:#4b5770}
+  .ov-row.cur{background:#f4f7ff; box-shadow:inset 3px 0 0 #3568d4}
+  .ov-row .t{font-weight:600; color:#26313f; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .ov-row .p{font-family:"Cascadia Code",Consolas,monospace; font-size:8px; color:#8b96a8; background:#f5f7fa; border-radius:4px; padding:0 5px; max-width:88px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .bdot{width:6px; height:6px; border-radius:50%; background:#3f7fd6; flex:none}
+  .bdot.off{background:#dfe4ec}
+  .ov-foot{display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 10px; font-size:8.5px; color:#8b96a8; background:#fbfcfd; white-space:nowrap; overflow:hidden}
+  .ov-foot span{overflow:hidden; text-overflow:ellipsis}
+  .ov-foot u{text-decoration:none; color:#4f6ea8; flex:none}
+
+  /* ---------- 清单 ---------- */
+  .rules{background:#f7f9fc; border:1px solid #dfe6f1; border-left:5px solid var(--blue); border-radius:10px;
+     padding:16px 22px 12px; margin:16px 0 4px; break-inside:avoid}
+  .rules h3{margin:0 0 8px; font-size:14px; color:#22406e; letter-spacing:.04em}
+  .rules ol{margin:0; padding-left:20px; font-size:13.5px}
+  .rules li{margin:5px 0}
+  .rules code{background:#fff}
+
+  /* ---------- 阶段 ---------- */
+  .phase-tag{display:inline-block; font-size:10.5px; letter-spacing:.08em; font-weight:700; color:#fff; background:var(--ink2);
+     border-radius:5px; padding:1px 8px; margin-right:4px}
+  .back{font-family:"Cascadia Code",Consolas,monospace; font-size:11.5px; color:#7a4b12; background:#fdf6e7; border:1px solid #edddb8; border-radius:5px; padding:1px 6px}
+
+  /* ---------- 结尾 ---------- */
+  .finale{margin:20px 0 0; padding:28px 32px; border:1px dashed #c9d2e0; border-radius:12px; background:#fcfcfa; break-inside:avoid}
+  .finale p{font-size:16.5px; line-height:1.95; margin:0 0 14px}
+  .finale ul{margin:0; padding-left:20px; font-size:14px; color:#2c3849}
+  .finale li{margin:6px 0}
+  .finale .sign{margin-top:18px; padding-top:12px; border-top:1px solid var(--line); font-size:12.5px; color:var(--muted)}
+
+  footer{margin-top:46px; padding-top:14px; border-top:1px solid var(--line); font-size:11.5px; color:var(--faint); display:flex; justify-content:space-between; gap:12px}
+  .noprint{}
+
+  /* ---------- 打印 A4 ---------- */
+  @page{ size:A4; margin:15mm 13mm 16mm; }
+  @media print{
+    body{background:#fff; font-size:10.2pt; line-height:1.68}
+    .page{max-width:none; width:auto; padding:0; margin:0; box-shadow:none; background:#fff}
+    header{margin-bottom:16px; padding-bottom:14px}
+    h1{font-size:23pt; line-height:1.3}
+    .subtitle{font-size:10.6pt}
+    h2{font-size:14.5pt; margin:22px 0 10px}
+    h2 .num{width:22px; height:22px; font-size:10pt; border-radius:6px}
+    h3{font-size:11.5pt}
+    p,.pr p{font-size:10.2pt}
+    table{font-size:9.2pt}
+    th,td{padding:5px 7px}
+    .verdict p{font-size:11.6pt}
+    .mocks{grid-template-columns:1fr}
+    .mockbox{break-inside:avoid}
+    figure{break-inside:avoid}
+    nav.toc ol{columns:2}
+    .noprint{display:none}
+    a{color:inherit; border:0}
+    *{-webkit-print-color-adjust:exact; print-color-adjust:exact}
+    thead{display:table-header-group}
+    .pr, .rules, .finale, .verdict, .mockbox, figure{break-inside:avoid}
+  }
+</style>
+</head>
+<body>
+<main class="page">
+
+<header>
+  <p class="kicker">DESIGN PROPOSAL · 2026-11-13</p>
+  <h1>鹈鹕 × 控制室 <span class="thin">融合设计方案</span></h1>
+  <p class="subtitle">一个控制室，三种密度，一条语音 lane —— 把 ESP32-BOX3 的 320×240 屏与本地语音，接成 dsh-assistant 的监控与语音外设，而不是第二个产品。</p>
+  <div class="meta">
+    <span>设计稿 v0.1</span><span>单文件 · 纯内联 CSS / SVG</span><span>无外部资源 · 离线可看</span><span>A4 打印友好</span><span>不改动任何源码</span>
+  </div>
+</header>
+
+<nav class="toc noprint" aria-label="目录">
+  <h2>目 录</h2>
+  <ol>
+    <li><b>一</b><a href="#s1">一句话结论与场景对照</a></li>
+    <li><b>二</b><a href="#s2">核心设计原则（六条）</a></li>
+    <li><b>三</b><a href="#s3">能力矩阵</a></li>
+    <li><b>四</b><a href="#s4">状态流转图</a></li>
+    <li><b>五</b><a href="#s5">界面效果示意（micro / full）</a></li>
+    <li><b>六</b><a href="#s6">接口改动清单与硬约束</a></li>
+    <li><b>七</b><a href="#s7">分阶段实施路线</a></li>
+    <li><b>八</b><a href="#s8">一页结论</a></li>
+  </ol>
+</nav>
+
+<!-- ================= 一 ================= -->
+<section id="s1">
+  <h2><span class="num">一</span>一句话结论与场景对照表</h2>
+
+  <div class="verdict">
+    <span class="tag">ONE SENTENCE</span>
+    <p>控制室是唯一的数据源与决策平面；鹈鹕是它的一块 320×240 外接屏加一套语音外设——两端共用同一份会话快照、同一套卡片组件、同一个悬浮球、同一条语音 lane，差别只在<strong>密度</strong>与<strong>可写范围</strong>。</p>
+  </div>
+
+  <p>办公室里的复杂任务（带附件、带图片、要指定项目目录）全部在控制室布置，那里有大屏、键盘、拖拽和目录选择；离开办公室时，鹈鹕只承担日常监控与简单语音任务——它能看见所有任务，但不布置复杂任务。两端看到的是<em>同一批会话对象</em>，不存在「鹈鹕的会话」和「控制室的会话」两套东西。</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <caption>表 1 · 场景对照：同一条会话，两种入口</caption>
+      <thead>
+        <tr><th style="width:15%">维度</th><th style="width:29%">办公室 · 控制室（full）</th><th style="width:28%">外出 · 鹈鹕（micro）</th><th style="width:28%">两者共享</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>典型任务</td><td>附件、图片、指定项目目录的复杂任务；多会话并行、模板库、新建会话</td><td>日常监控、简单语音任务、语音播报、音量与静音手势</td><td>同一批会话对象与同一份历史</td></tr>
+        <tr><td>输入方式</td><td>键盘、拖拽、目录选择、语音入口</td><td>语音（whisper）+ 音量／静音手势 + 单卡翻页</td><td>同一条语音 lane、同一台本地 ASR</td></tr>
+        <tr><td>屏幕与密度</td><td>桌面 Web 卡片墙，full 密度</td><td>320×240 单卡 + 分页，micro 密度</td><td>同一 layout schema，只裁字段</td></tr>
+        <tr><td>任务边界</td><td>无限制，可布置任意复杂任务</td><td>只允许文本与语音；一旦触发附件或目录需求即挂起</td><td>「挂起／待补」两端口径一致</td></tr>
+        <tr><td>数据来源</td><td>宿主会话快照 → sessionIndex / sessionFactCache / sessionStatus</td><td>只读消费同一份快照协议，不建第二套判定</td><td>唯一真值（single source of truth）</td></tr>
+        <tr><td>归属切换</td><td>卡片底部「移交 / 收回」</td><td>保留一行只读镜像 +「去控制室补齐」</td><td>只切换视图归属，绝不改 cwd</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ================= 二 ================= -->
+<section id="s2">
+  <h2><span class="num">二</span>核心设计原则</h2>
+  <p class="lead">六条原则按「数据 → 组件 → 球 → 语音 → 分工 → 交接」排列；每一条都给出可检查的落地位置，避免变成口号。</p>
+
+  <div class="pr">
+    <h3><span class="n">01</span>控制室是唯一数据源</h3>
+    <p>会话状态只有四态：<strong>等你 / 在跑 / 排队 / 完成</strong>。四态全部由控制室现有派生链算出：<code>sessionIndex.ts</code> 提供按快照身份缓存的派生索引（宿主发布新快照时 <code>invalidateSessionSnapshotIndex()</code> 失效，旧宿主原地改快照也读不到旧索引）；<code>sessionFactCache.ts</code> 按 <code>updatedAt:running:completed</code> 做版本缓存，保证长任务「开跑很久才结束」时活动行不会错位；<code>sessionStatus.ts</code> 用 <code>hasPendingInteraction()</code> 判定「等你」——注意新版 <code>sessionStatus</code> 为每个会话都保留一行，必须看行内的 <code>pendingInteraction</code> 是否为空，<strong>不能用 <code>Map.has()</code></strong>，否则空闲会话会被误判成待回答。</p>
+    <p>鹈鹕屏只消费同一份协议下发的结果（<code>displayTitle</code>、<code>running</code>、<code>updatedAt</code>、cwd 相对标签），把历史上可能存在过的「鹈鹕侧任务列表」整体删掉，不再自建第二套会话体系。</p>
+    <p class="land"><b>落地</b>：新增任何状态分支只能落在这三个文件里；<code>lane.ts</code> 与固件侧只做展示映射，禁止复制判定逻辑。Phase 1 验收时用全仓搜索证明「鹈鹕侧 0 处独立状态判定」。</p>
+  </div>
+
+  <div class="pr">
+    <h3><span class="n">02</span>一套卡片组件，三种密度</h3>
+    <p>同一份 layout schema，三种密度：<strong>full</strong>（桌面 Web 控制室，卡片含预览行与完整按钮组）、<strong>compact</strong>（手机 WebView 口袋，单列、字号收一档、按钮收进「···」）、<strong>micro</strong>（320×240 鹈鹕屏，单卡、标题一行、活动一行、进度条、分页行）。三者只是<em>字段裁剪</em>与<em>排版密度</em>不同，不是三份代码——改一处文案、加一个状态徽标，三端同时生效。</p>
+    <p>这样做的直接收益：鹈鹕固件侧不必再写一遍卡片布局，控制室也不必为小屏维护一条分叉的渲染路径；「等你／在跑／排队／完成」的配色、光环语义、相对时间格式只有一处定义。</p>
+    <p class="land"><b>落地</b>：<code>ConsoleCardData</code> → <code>layout({ density })</code> → 三个渲染器。micro 只取 6 个字段，其余字段在序列化前就被裁掉，减少跨端 payload。</p>
+  </div>
+
+  <div class="pr">
+    <h3><span class="n">03</span>两个悬浮球合并为同一逻辑球</h3>
+    <p>球身显示当前状态计数（等你 n / 在跑 n）与<strong>琥珀黄待决策光环</strong>：有 <code>pendingInteraction</code> 时呼吸脉冲；进入<strong>完成态改为静态绿</strong>（不脉冲），点卡片确认后 <code>ack</code>，光环熄灭。这条「完成态静态绿 / 确认即熄灭」的语义原样保留，不因为合并而丢。</p>
+    <p>球上<strong>长按 600ms 或点击</strong>切换「办公室 / 外出」视图密度，沿用鹈鹕音量模块既有的长按节奏（600ms 起、100ms 一步），保证手上肌肉记忆一致。桌面 Electron 悬浮球（<code>desktop-ball.ts</code> 的独立透明小窗）与鹈鹕屏球共用 <code>ballConfigStore</code> 里同一份配置——位置、直径、透明度、光环样式、双击行为、当前密度；任一端修改，另一端下一次轮询即生效。</p>
+    <p class="land"><b>落地</b>：<code>ballConfigStore</code> 只存一份 JSON，两端读写；ack 记录 <code>{ sessionId, updatedAt }</code>，<code>updatedAt</code> 前进则 ack 自动失效、黄灯重新亮起（与 factCache 的版本口径一致）。</p>
+  </div>
+
+  <div class="pr">
+    <h3><span class="n">04</span>语音共用一条 lane</h3>
+    <p>输入侧：本地 whisper.cpp（<code>D:\dsh-assistant\whisper</code>，CUDA 优先、CPU 兜底）同时喂鹈鹕语音输入与控制室的语音输入入口；默认 <code>medium</code>，加载或推理失败自动回退 <code>small</code>。服务只绑 <code>127.0.0.1:3097</code>，<code>POST /transcribe?model=medium|small</code>，后处理为 opencc 繁转简 + 首尾空白清理 + 整段幻觉过滤。<code>lane.ts</code> 的 <code>transcribeDetailed()</code> 先本地、失败再回退宿主 speech。</p>
+    <p>输出侧：语音播报统一走鹈鹕的播放控制与音量手势——单击静音（真写 0）、双击 85、长按 600ms 起 100ms/步 ×2 点往返、15s 兜底定格、松手存 NVS（<code>"tihu"/"volume"</code>），顶部 132×26 小条 2 秒消失。控制室不再接第二家 TTS、也不再维护独立音量，避免「控制室播报很响、鹈鹕很轻」这种割裂。</p>
+    <p class="land"><b>落地</b>：两端的语音输入都指向同一个 HTTP 服务；播报音量读同一份 NVS／配置；<code>paceWhenDeep</code> 这类节奏开关只影响排队，不影响音量与模型选择。</p>
+  </div>
+
+  <div class="pr">
+    <h3><span class="n">05</span>复杂任务分流规则</h3>
+    <p>判据很硬：<strong>需要附件、需要图片、需要指定项目目录</strong>的任务一律在控制室布置。鹈鹕发起的任务只允许文本与语音输入；一旦上游判定命中附件或目录需求，会话<strong>挂起</strong>（不 failed、不 cancel），卡片立刻打标「待补：附件」「待补：目录」，并归入控制室视图。鹈鹕屏保留一行只读镜像与「去控制室补齐」提示，补齐后自动回到排队、继续原会话。</p>
+    <p>这条规则的意义不是限制，而是防错：在 320×240 上选目录、传附件既看不清也点不准，一旦允许就必然产生一批「跑错工作区」的会话——那比拒绝更贵。</p>
+    <p class="land"><b>落地</b>：分流判定放在宿主侧（<code>getConsoleCards</code> 组装时打 <code>pendingAssets</code> / <code>pendingCwd</code> 标记），固件只渲染标记，不做判断。</p>
+  </div>
+
+  <div class="pr">
+    <h3><span class="n">06</span>移交 / 收回：双向交接</h3>
+    <p>控制室卡片底部有<strong>「移交」</strong>：把会话从鹈鹕侧移到控制室继续；<strong>「收回」</strong>：把会话带回鹈鹕，只留只读镜像行。语义只有一个：<em>切换视图归属</em>（<code>viewOwner: 'console' | 'pelican'</code>）。<strong>绝不改会话的 cwd</strong>——cwd 决定会话属于哪个工作区，是硬约束，也是整个系统里最不能碰的字段。</p>
+    <p>移交前后，会话 id、cwd、历史、运行状态全部不变，只是「谁能写」变了。收回不是删除，鹈鹕侧看到的仍是最新快照。</p>
+    <p class="land"><b>落地</b>：交接动作只写 <code>viewOwner</code> 一个字段；Phase 3 验收用 <code>(sessionId, cwd)</code> 哈希断言交接前后完全一致。</p>
+  </div>
+</section>
+
+<!-- ================= 三 ================= -->
+<section id="s3">
+  <h2><span class="num">三</span>能力矩阵</h2>
+  <p class="lead">「可」= 能发起并能写入；「只读」= 看得见、不产生写入；「不做」= 不提供入口，误触也不落库。</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <caption>表 2 · 能力矩阵（控制室 / 鹈鹕 / 手机口袋）</caption>
+      <thead>
+        <tr><th style="width:26%">能力</th><th style="width:22%">控制室</th><th style="width:26%">鹈鹕（320×240）</th><th style="width:26%">手机口袋（compact）</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>新建会话</td><td><span class="c c-ok">可</span> 任意项目目录</td><td><span class="c c-ok">可</span> 仅文本与语音，沿用当前项目</td><td><span class="c c-ok">可</span></td></tr>
+        <tr><td>布置复杂任务（附件 / 图片 / 指定目录）</td><td><span class="c c-ok">可</span></td><td><span class="c c-no">不做</span> 命中即挂起并移交</td><td><span class="c c-ok">可</span></td></tr>
+        <tr><td>附件上传</td><td><span class="c c-ok">可</span> 拖拽 / 选择</td><td><span class="c c-no">不做</span></td><td><span class="c c-ok">可</span> 相册 / 文件</td></tr>
+        <tr><td>指定项目目录（cwd）</td><td><span class="c c-ok">可</span> 目录选择器</td><td><span class="c c-no">不做</span></td><td><span class="c c-ro">只读</span> 只显示相对目录标签</td></tr>
+        <tr><td>会话列表</td><td><span class="c c-ok">可</span> 浮层 + 搜索</td><td><span class="c c-ro">只读</span> 分页镜像</td><td><span class="c c-ok">可</span></td></tr>
+        <tr><td>翻页浏览</td><td><span class="c c-ok">可</span></td><td><span class="c c-ok">可</span> 上一页 / 第 N/M 页 / 下一页</td><td><span class="c c-ok">可</span></td></tr>
+        <tr><td>监控所有任务状态</td><td><span class="c c-ok">可</span> 卡片墙 + 计数</td><td><span class="c c-ok">可</span> 四态计数 + 单卡</td><td><span class="c c-ok">可</span></td></tr>
+        <tr><td>语音输入</td><td><span class="c c-ok">可</span> 同一入口</td><td><span class="c c-ok">可</span> 按键说话 / 本地 ASR</td><td><span class="c c-ok">可</span></td></tr>
+        <tr><td>语音播报</td><td><span class="c c-ok">可</span> 走鹈鹕播放控制</td><td><span class="c c-ok">可</span></td><td><span class="c c-ro">只读</span> 跟随鹈鹕音量，不做独立开关</td></tr>
+        <tr><td>媒体播放</td><td><span class="c c-ok">可</span></td><td><span class="c c-ok">可</span> 本地播放，音量手势接管</td><td><span class="c c-ok">可</span></td></tr>
+        <tr><td>音量与静音手势</td><td><span class="c c-no">不做</span> 无硬件手势</td><td><span class="c c-ok">可</span> 单击静音 / 双击 85 / 长按滑条</td><td><span class="c c-no">不做</span> 交给系统音量</td></tr>
+        <tr><td>OTA 与固件更新</td><td><span class="c c-no">不做</span></td><td><span class="c c-ok">可</span> 每 10 分钟检查，失败退避</td><td><span class="c c-no">不做</span></td></tr>
+        <tr><td>待决策应答与 ack</td><td><span class="c c-ok">可</span> 完整应答</td><td><span class="c c-ok">可</span> 仅封闭式回答（确认 / 继续 / 中止）</td><td><span class="c c-ok">可</span></td></tr>
+        <tr><td>打开完整对话历史</td><td><span class="c c-ok">可</span></td><td><span class="c c-ro">只读</span> 镜像行 + 最近若干条</td><td><span class="c c-ok">可</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">注：鹈鹕的「可」始终受一处限制——不提供附件、图片、目录三个入口，因此不可能布置复杂任务；它的「可」是「发一条文本／语音」，不是「发一个工程」。开放式的待决策回答在鹈鹕上只给出「已知晓」，真正答复回控制室完成。</p>
+</section>
+
+<!-- ================= 四 ================= -->
+<section id="s4">
+  <h2><span class="num">四</span>状态流转图</h2>
+  <p class="lead">主链是四态循环，支线是「鹈鹕发起 → 命中附件或目录 → 挂起 → 移交 → 补齐 → 收回」。两条链共用同一个会话对象，只在视图归属上分叉。</p>
+
+  <figure>
+    <div class="flowbox">
+    <svg viewBox="0 0 900 452" role="img" aria-label="会话状态流转与鹈鹕分流支线示意图">
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#7d899d"/>
+        </marker>
+        <marker id="arA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#c8890f"/>
+        </marker>
+        <marker id="arG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#2b8f63"/>
+        </marker>
+        <marker id="arB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#3568d4"/>
+        </marker>
+      </defs>
+
+      <text x="8" y="22" font-size="11" font-weight="700" fill="#39465a" letter-spacing="1">主链 · 控制室布置与四态流转</text>
+
+      <!-- 节点 -->
+      <g>
+        <rect x="8" y="40" width="120" height="58" rx="9" fill="#eef2fb" stroke="#c9d7f2"/>
+        <text x="68" y="65" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1b2431">发起</text>
+        <text x="68" y="81" text-anchor="middle" font-size="9" fill="#5b6675">控制室 · 键盘/拖拽</text>
+      </g>
+      <g>
+        <rect x="152" y="40" width="120" height="58" rx="9" fill="#f4f6fa" stroke="#dde2ea"/>
+        <text x="212" y="65" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1b2431">排队</text>
+        <text x="212" y="81" text-anchor="middle" font-size="9" fill="#5b6675">入队，尚未开跑</text>
+      </g>
+      <g>
+        <rect x="296" y="40" width="120" height="58" rx="9" fill="#e9effd" stroke="#bfd2f6"/>
+        <text x="356" y="65" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1b2431">在跑</text>
+        <text x="356" y="81" text-anchor="middle" font-size="9" fill="#3c5a92">running = true</text>
+      </g>
+      <g>
+        <rect x="440" y="40" width="120" height="58" rx="9" fill="#fdf3dd" stroke="#e3c078" stroke-width="1.4"/>
+        <text x="500" y="65" text-anchor="middle" font-size="12.5" font-weight="700" fill="#6d4d06">等你</text>
+        <text x="500" y="81" text-anchor="middle" font-size="9" fill="#8a6412">待决策 · 琥珀光环</text>
+      </g>
+      <g>
+        <rect x="584" y="40" width="120" height="58" rx="9" fill="#e6f4ec" stroke="#a9d2ba" stroke-width="1.2"/>
+        <text x="644" y="65" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1d6647">完成</text>
+        <text x="644" y="81" text-anchor="middle" font-size="9" fill="#2b7a57">静态绿 · ack 后熄灭</text>
+      </g>
+      <g>
+        <rect x="736" y="40" width="156" height="58" rx="9" fill="#fbfbfd" stroke="#c6cedb" stroke-dasharray="5 4"/>
+        <text x="814" y="65" text-anchor="middle" font-size="12.5" font-weight="700" fill="#3d4a5f">鹈鹕只读镜像</text>
+        <text x="814" y="81" text-anchor="middle" font-size="9" fill="#6f7b8e">单卡 + 分页，不写</text>
+      </g>
+
+      <!-- 主链箭头 -->
+      <line x1="128" y1="69" x2="146" y2="69" stroke="#7d899d" stroke-width="1.4" marker-end="url(#ar)"/>
+      <line x1="272" y1="69" x2="290" y2="69" stroke="#7d899d" stroke-width="1.4" marker-end="url(#ar)"/>
+      <line x1="416" y1="69" x2="434" y2="69" stroke="#3568d4" stroke-width="1.6" marker-end="url(#arB)"/>
+      <line x1="560" y1="69" x2="578" y2="69" stroke="#7d899d" stroke-width="1.4" marker-end="url(#ar)"/>
+      <line x1="704" y1="69" x2="730" y2="69" stroke="#7d899d" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#ar)"/>
+
+      <text x="424" y="36" text-anchor="middle" font-size="8.5" fill="#5b6675">需要你决策</text>
+      <text x="569" y="36" text-anchor="middle" font-size="8.5" fill="#5b6675">应答完成</text>
+      <text x="717" y="36" text-anchor="middle" font-size="8.5" fill="#8b96a8">同步镜像</text>
+
+      <!-- 支线标题 -->
+      <text x="8" y="278" font-size="11" font-weight="700" fill="#39465a" letter-spacing="1">支线 · 鹈鹕发起命中附件／目录需求后的分流</text>
+
+      <!-- 支线节点 -->
+      <g>
+        <rect x="8" y="296" width="120" height="58" rx="9" fill="#f4f6fa" stroke="#dde2ea"/>
+        <text x="68" y="321" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1b2431">鹈鹕语音发起</text>
+        <text x="68" y="337" text-anchor="middle" font-size="9" fill="#5b6675">whisper · medium</text>
+      </g>
+      <g>
+        <rect x="152" y="296" width="120" height="58" rx="9" fill="#fdf3dd" stroke="#e3c078"/>
+        <text x="212" y="321" text-anchor="middle" font-size="12.5" font-weight="700" fill="#6d4d06">触发需求</text>
+        <text x="212" y="337" text-anchor="middle" font-size="9" fill="#8a6412">要附件 / 要目录</text>
+      </g>
+      <g>
+        <rect x="296" y="296" width="120" height="58" rx="9" fill="#fdf3dd" stroke="#e3c078" stroke-width="1.3"/>
+        <text x="356" y="321" text-anchor="middle" font-size="12.5" font-weight="700" fill="#6d4d06">挂起 · 待补</text>
+        <text x="356" y="337" text-anchor="middle" font-size="9" fill="#8a6412">不 failed，冻结</text>
+      </g>
+      <g>
+        <rect x="440" y="296" width="120" height="58" rx="9" fill="#eef2fb" stroke="#c9d7f2"/>
+        <text x="500" y="321" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1b2431">移交控制室</text>
+        <text x="500" y="337" text-anchor="middle" font-size="9" fill="#3c5a92">视图切换，cwd 不变</text>
+      </g>
+      <g>
+        <rect x="584" y="296" width="120" height="58" rx="9" fill="#eef2fb" stroke="#c9d7f2"/>
+        <text x="644" y="321" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1b2431">补齐</text>
+        <text x="644" y="337" text-anchor="middle" font-size="9" fill="#3c5a92">补附件 / 定目录</text>
+      </g>
+      <g>
+        <rect x="736" y="296" width="156" height="58" rx="9" fill="#f0f7f3" stroke="#b6d8c6"/>
+        <text x="814" y="321" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1d6647">收回鹈鹕</text>
+        <text x="814" y="337" text-anchor="middle" font-size="9" fill="#2b7a57">回到只读镜像行</text>
+      </g>
+
+      <!-- 支线箭头 -->
+      <line x1="128" y1="325" x2="146" y2="325" stroke="#c8890f" stroke-width="1.5" marker-end="url(#arA)"/>
+      <line x1="272" y1="325" x2="290" y2="325" stroke="#c8890f" stroke-width="1.5" marker-end="url(#arA)"/>
+      <line x1="416" y1="325" x2="434" y2="325" stroke="#7d899d" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#ar)"/>
+      <line x1="560" y1="325" x2="578" y2="325" stroke="#7d899d" stroke-width="1.4" marker-end="url(#ar)"/>
+      <line x1="704" y1="325" x2="730" y2="325" stroke="#2b8f63" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arG)"/>
+
+      <!-- 从鹈鹕发起向上接回排队：无附件需求时直接入队 -->
+      <path d="M68,296 L68,190 Q68,172 88,172 L192,172 Q212,172 212,154 L212,100"
+            fill="none" stroke="#7d899d" stroke-width="1.3" stroke-dasharray="5 4" marker-end="url(#ar)"/>
+      <rect x="76" y="154" width="118" height="14" fill="#fdfdfb" opacity=".92"/>
+      <text x="82" y="164.5" font-size="8.6" fill="#6f7b8e">无附件需求 · 直接入队</text>
+
+      <!-- 收回即镜像 -->
+      <path d="M814,296 L814,104" fill="none" stroke="#2b8f63" stroke-width="1.3" stroke-dasharray="5 4" marker-end="url(#arG)"/>
+      <rect x="690" y="196" width="116" height="15" fill="#fdfdfb" opacity=".92"/>
+      <text x="804" y="207" font-size="8.6" fill="#2b7a57" text-anchor="end">收回 = 同一条只读镜像</text>
+
+      <!-- 图例 -->
+      <line x1="8" y1="404" x2="900" y2="404" stroke="#e2e6ee"/>
+      <g font-size="8.6" fill="#6f7b8e">
+        <line x1="8" y1="422" x2="28" y2="422" stroke="#7d899d" stroke-width="1.4"/><text x="34" y="425">自动流转</text>
+        <line x1="106" y1="422" x2="126" y2="422" stroke="#7d899d" stroke-width="1.4" stroke-dasharray="4 3"/><text x="132" y="425">规则或用户触发</text>
+        <circle cx="250" cy="422" r="4" fill="#c8890f"/><text x="260" y="425">等你 / 待补（琥珀）</text>
+        <circle cx="382" cy="422" r="4" fill="#2b8f63"/><text x="392" y="425">完成 / 收回（绿）</text>
+        <circle cx="504" cy="422" r="4" fill="#3568d4"/><text x="514" y="425">在跑（蓝）</text>
+        <text x="596" y="425">硬约束：全程 sessionId 与 cwd 不变，只变 viewOwner</text>
+      </g>
+    </svg>
+    </div>
+    <figcaption>图 1 · 四态主链与鹈鹕分流支线。虚线上方的短箭头表示「未命中附件/目录需求时，鹈鹕发起的任务直接入队」。</figcaption>
+  </figure>
+</section>
+
+<!-- ================= 五 ================= -->
+<section id="s5">
+  <h2><span class="num">五</span>界面效果示意图</h2>
+  <p class="lead">左：320×240 micro 密度（鹈鹕实屏比例）；右：full 密度（桌面控制室卡片 + 会话列表浮层 + 附件与项目目录入口）。两侧共用同一份数据，只有裁剪不同。</p>
+
+  <div class="mocks">
+    <!-- ============ micro ============ -->
+    <div class="mockbox">
+      <div class="mocklabel"><span>MICRO · 320 × 240</span><i>鹈鹕屏</i></div>
+
+      <svg class="micro-svg" viewBox="0 0 320 240" role="img" aria-label="鹈鹕端 320×240 micro 密度界面示意">
+        <defs>
+          <clipPath id="scr"><rect x="0" y="0" width="320" height="240" rx="11"/></clipPath>
+          <linearGradient id="pfill" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="#5b8ae0"/><stop offset="1" stop-color="#3568d4"/>
+          </linearGradient>
+        </defs>
+        <g clip-path="url(#scr)">
+          <rect width="320" height="240" fill="#fdfdfb"/>
+
+          <!-- 顶部状态计数 -->
+          <rect x="0" y="0" width="320" height="26" fill="#f3f5f9"/>
+          <line x1="0" y1="26.5" x2="320" y2="26.5" stroke="#e3e7ef"/>
+          <circle cx="14" cy="13" r="3" fill="#c8890f"/>
+          <text x="21" y="16" class="t8">等你</text><text x="41" y="16" class="t8b" fill="#c8890f">1</text>
+          <circle cx="62" cy="13" r="3" fill="#3568d4"/>
+          <text x="69" y="16" class="t8">在跑</text><text x="89" y="16" class="t8b" fill="#3568d4">2</text>
+          <circle cx="110" cy="13" r="3" fill="#9aa4b5"/>
+          <text x="117" y="16" class="t8">排队</text><text x="137" y="16" class="t8b" fill="#59657a">0</text>
+          <circle cx="158" cy="13" r="3" fill="#2b8f63"/>
+          <text x="165" y="16" class="t8">完成</text><text x="185" y="16" class="t8b" fill="#2b8f63">12</text>
+          <text x="306" y="16" class="t7" text-anchor="end">09:41</text>
+
+          <!-- 品牌位 -->
+          <text x="12" y="44" class="t7" font-weight="700" fill="#3d4a5f">dsh-assistant</text>
+          <text x="12" y="55" class="t6">鹈鹕 · 在线 · 本地 ASR ok</text>
+
+          <!-- 音量小条 132×26 -->
+          <rect x="176" y="32" width="132" height="26" rx="6" fill="#ffffff" stroke="#dcd3bd"/>
+          <path d="M184,41 h4 l4.5,-4.5 v13 l-4.5,-4.5 h-4 z" fill="#8a7745"/>
+          <path d="M196,42 a5,5 0 0 1 0,6" fill="none" stroke="#b5a67f" stroke-width="1.2"/>
+          <rect x="206" y="47" width="4" height="4" rx="1" fill="#c8890f" opacity=".45"/>
+          <rect x="213" y="44" width="4" height="7" rx="1" fill="#c8890f" opacity=".6"/>
+          <rect x="220" y="41" width="4" height="10" rx="1" fill="#c8890f" opacity=".75"/>
+          <rect x="227" y="38" width="4" height="13" rx="1" fill="#c8890f"/>
+          <rect x="234" y="35.5" width="4" height="15.5" rx="1" fill="#c8890f"/>
+          <text x="298" y="45" class="t7b" text-anchor="end" fill="#7a6a45">85</text>
+          <text x="298" y="53" class="t6" text-anchor="end">VOL</text>
+          <text x="176" y="65" class="t6">音量 132×26 · 2 秒消失</text>
+
+          <!-- 当前任务 -->
+          <text x="12" y="78" class="t6" letter-spacing=".6">当前任务</text>
+          <text x="12" y="92" class="t9b">修复 Telegram 推送重复</text>
+          <text x="306" y="92" class="t6" text-anchor="end">PEL-0421</text>
+          <rect x="12" y="98" width="296" height="5" rx="2.5" fill="#e8ecf3"/>
+          <rect x="12" y="98" width="183" height="5" rx="2.5" fill="url(#pfill)"/>
+          <text x="12" y="114" class="t7">正在跑测试用例 12/19</text>
+          <text x="306" y="114" class="t6" text-anchor="end">2 分钟前</text>
+          <line x1="12" y1="122" x2="308" y2="122" stroke="#eef1f6"/>
+
+          <!-- 分页 -->
+          <rect x="12" y="130" width="66" height="18" rx="5" fill="#f5f7fa" stroke="#e0e5ee"/>
+          <text x="45" y="142" class="t7" text-anchor="middle">‹ 上一页</text>
+          <text x="160" y="143" class="t7b" text-anchor="middle">第 2 / 5 页</text>
+          <rect x="242" y="130" width="66" height="18" rx="5" fill="#f5f7fa" stroke="#e0e5ee"/>
+          <text x="275" y="142" class="t7" text-anchor="middle">下一页 ›</text>
+
+          <!-- 待补提示 -->
+          <rect x="12" y="160" width="250" height="28" rx="6" fill="#fdf6e6" stroke="#eddcb5"/>
+          <rect x="12" y="160" width="3" height="28" rx="1.5" fill="#c8890f"/>
+          <text x="23" y="171" class="t7" fill="#7d5708" font-weight="700">待补：附件 —— 去控制室补齐 →</text>
+          <text x="23" y="182" class="t6" fill="#9a7c3f">补齐后自动回到排队，会话不中断</text>
+
+          <!-- 合并后的悬浮球 -->
+          <circle cx="290" cy="210" r="21" fill="#c8890f" opacity=".10"/>
+          <circle cx="290" cy="210" r="17.5" fill="none" stroke="#c8890f" stroke-width="2"/>
+          <circle cx="290" cy="210" r="15" fill="#fff"/>
+          <text x="290" y="213" text-anchor="middle" font-size="11.5" font-weight="800" fill="#c8890f">1</text>
+          <text x="12" y="222" class="t6">长按球 600ms 切换密度 · 单击打开</text>
+
+          <!-- 外框 -->
+          <rect x=".7" y=".7" width="318.6" height="238.6" rx="11" fill="none" stroke="#cbd3e0" stroke-width="1.4"/>
+        </g>
+      </svg>
+
+      <p class="small" style="margin:10px 0 0">读图：顶部四态计数 → 当前任务一行标题 + 进度 → 上一页 / 第 N/M 页 / 下一页 → 橙色「待补：附件 · 去控制室补齐」→ 右下角合并球（琥珀光环 + 计数 1）→ 音量小条 132×26 浮在顶部，2 秒后消失。</p>
+    </div>
+
+    <!-- ============ full ============ -->
+    <div class="mockbox">
+      <div class="mocklabel"><span>FULL · 桌面控制室</span><i>ConsolePane</i></div>
+
+      <div class="stage" role="img" aria-label="桌面控制室 full 密度：卡片、待决策黄灯、会话列表浮层、附件与项目目录入口">
+        <div class="stage-bar">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="stage-title">dsh-assistant — ConsolePane</span>
+        </div>
+        <div class="stage-body">
+          <div class="cc-card">
+            <div class="cc-head">
+              <span class="cc-ic">▣</span>
+              <span class="cc-name">dsh-assistant</span>
+              <span class="cc-state">在跑</span>
+            </div>
+            <div class="cc-title">修复 Telegram 推送重复</div>
+            <div class="cc-act"><span class="pulse"></span>正在跑 · 测试用例 12/19 · 2 分钟前</div>
+            <div class="cc-progress"><i style="width:62%"></i></div>
+            <div class="cc-amber"><span class="a-dot"></span>待决策 · 是否跳过 3 条历史消息</div>
+            <div class="cc-actions">
+              <button>会话列表</button>
+              <button class="primary">＋ 新建会话</button>
+              <button>移交</button>
+            </div>
+          </div>
+
+          <div class="cc-extra">
+            <span class="chip">📎 附件 <b>2</b></span>
+            <span class="chip">🖼 图片 <b>1</b></span>
+            <span class="chip dir">📁 D:\dsh-assistant</span>
+          </div>
+        </div>
+
+        <!-- 会话列表浮层 -->
+        <div class="cc-overlay">
+          <div class="ov-head">会话列表<span>24 个 · 第 1/3 页</span></div>
+          <div class="ov-row cur"><span class="t">修复 Telegram 推送重复</span><span class="p">…\dsh-assistant</span><span class="bdot"></span></div>
+          <div class="ov-row"><span class="t">温度场 XGBoost 复现</span><span class="p">…\15高珂中文论文</span><span class="bdot"></span></div>
+          <div class="ov-row"><span class="t">桥梁截面参数化</span><span class="p">…\15高珂中文论文</span><span class="bdot off"></span></div>
+          <div class="ov-row"><span class="t">hpg 小程序支付排查</span><span class="p">…\hpg-mini-program</span><span class="bdot off"></span></div>
+          <div class="ov-foot"><span>fixed 浮层 · 不被裁剪</span><u>‹ 上一页 · 下一页 ›</u></div>
+        </div>
+      </div>
+
+      <p class="small" style="margin:10px 0 0">读图：卡片标题 / 活动行 / 琥珀待决策行 / 底部三个按钮；下方为附件与项目目录入口（cwd 只在此处可改）；右侧会话列表为浮层——带相对目录标签、运行中蓝点、当前会话高亮，点它只切会话、不改项目绑定。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 六 ================= -->
+<section id="s6">
+  <h2><span class="num">六</span>接口改动清单</h2>
+  <p class="lead">改动集中在控制室的取数与渲染层；鹈鹕固件只在协议字段上跟一次，不新增判定逻辑。</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <caption>表 3 · 改动项、位置、影响面与风险</caption>
+      <thead>
+        <tr><th style="width:23%">改什么</th><th style="width:25%">位置</th><th style="width:23%">影响面</th><th style="width:29%">风险与处置</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>鹈鹕屏卡片协议复用控制室会话快照字段</td>
+          <td><code>getConsoleCards</code> 组装 → lane 下发 → 固件渲染</td>
+          <td>鹈鹕屏渲染、跨端 payload、旧固件兼容</td>
+          <td>字段缺失时回退 <code>displayTitle → title → sessionId</code>；<code>running</code> 缺失按 <code>false</code> 处理，不推断。旧固件不认识新字段时按未知忽略，须灰度。</td>
+        </tr>
+        <tr>
+          <td>分页器统一语义</td>
+          <td>控制室分页组件 + 鹈鹕分页行</td>
+          <td>两端「上一页 / 第 N/M 页 / 下一页」与游标</td>
+          <td>同一分页游标，会话数变化时 <code>clamp</code> 到有效区间，空页回到第 1 页；页码用 1-based。</td>
+        </tr>
+        <tr>
+          <td>新增「移交 / 收回」两个动作</td>
+          <td>卡片 <code>actions</code> + 宿主命令</td>
+          <td>视图归属 <code>viewOwner</code>、两端可见性</td>
+          <td>只改<strong>视图归属</strong>，不碰 cwd、不碰会话历史；命令幂等，重复点击不产生第二条。</td>
+        </tr>
+        <tr>
+          <td><code>getConsoleCards</code> 新增输入参数</td>
+          <td><code>index.tsx</code> 取数入口</td>
+          <td>卡片刷新时机、失效源</td>
+          <td>必须同时接 <code>notifyConsole</code> 失效源，否则参数变了 UI 不刷新（既有约束，见下）。</td>
+        </tr>
+        <tr>
+          <td>跨端与悬浮球轮询</td>
+          <td><code>turn-guard.ts</code> / lane 轮询</td>
+          <td>慢请求堆积、电量与流量、球计数延迟</td>
+          <td>single-flight 去重 + <strong>8 秒 <code>AbortController</code> 超时</strong>；超时视为「本轮没拿到」，保留上一帧，不把状态写成空。</td>
+        </tr>
+        <tr>
+          <td>会话列表浮层定位</td>
+          <td>ConsolePane 浮层</td>
+          <td>被卡片 <code>overflow</code> 裁剪、层叠顺序</td>
+          <td>用 <code>position: fixed</code> 挂到根节点，不要留在卡片内部；滚动时按锚点重算位置。</td>
+        </tr>
+        <tr>
+          <td>点击会话列表项</td>
+          <td>浮层行点击处理</td>
+          <td>项目绑定与当前会话</td>
+          <td>只切换会话，<strong>不改项目绑定</strong>；切换后卡片与鹈鹕镜像同步到新会话，cwd 仍由会话自身决定。</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="rules">
+    <h3>四条不可破坏的既有约束（改代码前先对照）</h3>
+    <ol>
+      <li>新增 <code>getConsoleCards</code> 的输入，<strong>必须同时接 <code>notifyConsole</code> 失效源</strong>——否则数据变了卡片不动，症状是「要切一次页面才更新」。</li>
+      <li>跨端与悬浮球轮询的 <strong>single-flight 必须配 8 秒 <code>AbortController</code> 超时</strong>；超时只丢弃本轮，不能把上一帧状态清空。</li>
+      <li>会话列表浮层用 <code>position: fixed</code>，否则会被卡片的 <code>overflow</code> 裁剪，表现为「列表只露一半」。</li>
+      <li>点会话列表项<strong>只切换会话，不改项目绑定</strong>；cwd 是会话归属的硬约束，任何「顺手改一下」都是事故。</li>
+    </ol>
+  </div>
+</section>
+
+<!-- ================= 七 ================= -->
+<section id="s7">
+  <h2><span class="num">七</span>分阶段实施路线</h2>
+  <p class="lead">五个阶段，每个阶段都能独立上线、独立回退。回退统一用「一个开关」实现，不回滚代码。</p>
+
+  <div class="tbl-wrap">
+    <table>
+      <caption>表 4 · Phase 1–5：内容、验收标准与单开关回退</caption>
+      <thead>
+        <tr><th style="width:17%">阶段</th><th style="width:30%">做什么</th><th style="width:30%">验收标准（可观测）</th><th style="width:23%">回退开关</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span class="phase-tag">P1</span>状态源合一</td>
+          <td>鹈鹕改为消费控制室下发的会话快照（console card 协议）；删除鹈鹕侧本地任务列表与自建状态判定；四态统一由 sessionIndex / sessionFactCache / sessionStatus 派生。</td>
+          <td>同一会话在控制室与鹈鹕屏 3 秒内一致（含「等你 → 完成」翻转）；鹈鹕离线不影响控制室；全仓搜索不到鹈鹕侧第二套状态判定。</td>
+          <td><span class="back">consoleCardProtocol=off</span> 鹈鹕退回旧本地列表；快照解析失败降级为「上次快照 + 时间戳」只读。</td>
+        </tr>
+        <tr>
+          <td><span class="phase-tag">P2</span>三密度 + 球合并</td>
+          <td>一套 layout schema 渲染 full / compact / micro；两个悬浮球并为一个逻辑球，共用 <code>ballConfigStore</code>；长按/点击切换密度。</td>
+          <td>同一 layout JSON 三密度均可渲染；球上计数与光环在两个物理端一致；长按切换 ≤ 200ms 且不重连 lane；改一次 <code>ballConfigStore</code> 两端生效。</td>
+          <td><span class="back">densitySwitch=false</span> 球只显示不切换；<code>ballConfigStore</code> 读旧键回落默认配置。</td>
+        </tr>
+        <tr>
+          <td><span class="phase-tag">P3</span>待补 + 移交收回</td>
+          <td>分流标记（待补：附件 / 待补：目录）、挂起态、卡片「移交」与「收回」、鹈鹕只读镜像行与「去控制室补齐」提示。</td>
+          <td>鹈鹕发起命中附件需求，2 秒内出现「待补：附件」并挂起（不 failed）；移交后控制室可继续、鹈鹕留只读行；收回后控制室回到列表；<code>(sessionId, cwd)</code> 哈希交接前后完全一致。</td>
+          <td><span class="back">handoffEnabled=false</span> 隐藏移交/收回，归属固定控制室；<span class="back">maxLowLaneWaitMs=0</span> 关闭低优等待，鹈鹕任务不再插队。</td>
+        </tr>
+        <tr>
+          <td><span class="phase-tag">P4</span>语音与播报统一</td>
+          <td>控制室语音入口接同一台本地 whisper；播报走鹈鹕播放控制与音量手势；medium 默认、small 兜底。</td>
+          <td>同一段 8 秒参考音频两端转写一致（同为 medium）；medium 加载失败自动 small 且界面有提示；播报音量与 NVS <code>"tihu"/"volume"</code> 一致，单击静音立即为 0。</td>
+          <td><span class="back">whisperModel=small</span> 强制兜底；<span class="back">voiceLane=off</span> 关闭控制室语音入口；<span class="back">paceWhenDeep=false</span> 深队列不降速，保持旧节奏。</td>
+        </tr>
+        <tr>
+          <td><span class="phase-tag">P5</span>媒体与 OTA（可选，保留在鹈鹕）</td>
+          <td>本地媒体播放接入音量手势；OTA 保持 10 分钟/轮检查、失败退避 10 分钟、启动后首查 20 秒；不把 OTA 状态塞进卡片主链。</td>
+          <td>OTA 检查不阻塞录音与播报；媒体播放遇到 ASR 自动暂停；OTA 失败只退避、不刷屏、不影响四态计数。</td>
+          <td><span class="back">OTA_CHECK_PERIOD_MS=1800000</span> 回 30 分钟；<span class="back">mediaLocal=false</span> 关闭本地媒体播放。</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="note">回退思路统一为「单开关 + 默认值即旧行为」：<code>maxLowLaneWaitMs</code> 归零等于不再为鹈鹕低优任务让路，<code>paceWhenDeep</code> 置 false 等于深队列不降速——一个配置项就能退回上一阶段的观感，不需要回滚提交。P1、P3 涉及数据归属，回退开关必须在前端与宿主两侧同时生效，避免「界面回退了、命令还在写」。</p>
+</section>
+
+<!-- ================= 八 ================= -->
+<section id="s8">
+  <h2><span class="num">八</span>一页结论</h2>
+
+  <div class="finale">
+    <p>融合之后，用户面对的只有<strong>一个概念：控制室</strong>。鹈鹕不是第二个产品，而是这个控制室的一块外接屏（320×240、micro 密度、只读镜像）加一套语音外设（一条 whisper lane、一套音量手势与播报）。办公室用它布置复杂任务，外出用它看进度、听播报、说一句话；两边看的是同一批会话，只是密度和可写范围不同。</p>
+    <p>三条边界决定了这个设计能不能长期活下去：</p>
+    <ul>
+      <li><strong>数据只有一份</strong>——四态来自同一条派生链，鹈鹕不建第二套会话体系，删掉重复判定比新增功能更重要。</li>
+      <li><strong>卡片只有一套</strong>——full / compact / micro 是密度，不是三份代码；文案与配色只改一处。</li>
+      <li><strong>红线只有三条</strong>——复杂任务只进控制室；移交收回不改 cwd；新增取数必须接 <code>notifyConsole</code> 与 single-flight + 8 秒超时。</li>
+    </ul>
+    <p class="sign">下一步建议：先做 Phase 1 的「状态源合一」（收益最大、风险最低、可单独验收），再并行推进 Phase 2 的球合并——球是用户每天第一眼看到的东西，它一致了，融合感就成立了一半。</p>
+  </div>
+</section>
+
+<footer>
+  <span>鹈鹕 × 控制室 融合设计方案 · v0.1 · 2026-11-13</span>
+  <span>单文件设计稿 · 不引用外部资源 · 双击即可查看</span>
+</footer>
+
+</main>
+</body>
+</html>

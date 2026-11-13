@@ -22,7 +22,11 @@
 #define TIHU_MAX_BULLETS      4
 #define TIHU_MAX_ACTIONS      4
 #define TIHU_MAX_BOARD_ROWS   4
-#define TIHU_MAX_DONE_LINES   7
+/*
+ * 完成页正文行数上限。0.3.5 从 7 提到 16：长回答（12+ 行）以前第 8 行起既不显示也不高亮；
+ * 现在全文都收（每行 160 字节），屏上仍是 7 行窗口，高亮走出窗口时窗口跟着滚（见 ui_done.c）。
+ */
+#define TIHU_MAX_DONE_LINES   16
 #define TIHU_TEXT_MAX         160
 #define TIHU_TITLE_MAX        160
 #define TIHU_ID_MAX           64
@@ -206,6 +210,18 @@ char *tihu_build_audio_frame(const uint8_t *wav, size_t wav_len, int duration_ms
 char *tihu_build_screen_tap(int x, int y, const char *hit,
                             const char *action_id, const char *task_id);
 char *tihu_build_session_end(const char *reason);
+/**
+ * 设备侧自证/告警上行：`event.alert{level,text}`（0.3.9）。
+ *
+ * 用途是「板子上的事宿主那边也看得见」——按住 CONFIG 键时发一条
+ * `按键按下 录音开始`、松开时发 `按键松开 上传中`，宿主日志里有没有这两行
+ * 就能二分「按键到底触发没有」。level 用协议里已有的 info/warn/error。
+ *
+ * 注意：宿主 v0 协议**没有**把 event.alert 列进上行白名单，收到只会记一条
+ * 「tihu ignored message」；所以它只是诊断旁路，不承担任何功能语义，
+ * 发不出去绝不能影响录音/上传。
+ */
+char *tihu_build_alert(const char *level, const char *text);
 char *tihu_build_device_ack(const char *op_id, bool ok, const char *reason,
                             const char *stage, int screen_version);
 char *tihu_build_playback_state(const char *phase, const char *task_id,

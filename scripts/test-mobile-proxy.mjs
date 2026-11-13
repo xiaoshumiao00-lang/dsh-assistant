@@ -32,10 +32,29 @@ const upstream = createServer((req, res) => {
   }
 })
 await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+let asrCalls = 0
+let asrBytes = 0
+const tihu = {
+  page: () => '<html><body>tihu</body></html>',
+  handleUpgrade: () => false,
+  // 代理只负责在鉴权之后把 POST /tihu/asr 接走，body 原样交给运行时。
+  handleHttp: (req, res) => {
+    const chunks = []
+    req.on('data', (chunk) => chunks.push(chunk))
+    req.on('end', () => {
+      asrCalls += 1
+      asrBytes = Buffer.concat(chunks).length
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ text: '把 README 读一下', source: 'local', ms: 7 }))
+    })
+    return true
+  },
+}
 const proxy = await createPocketProxy({
   port: 0, host: '127.0.0.1',
   upstream: { host: '127.0.0.1', port: upstream.address().port },
   heartbeat: false,
+  tihu,
 })
 async function download(path, encoding = 'gzip') {
   return new Promise((resolve, reject) => {
@@ -49,6 +68,20 @@ async function download(path, encoding = 'gzip') {
     })
     call.on('error', reject)
     call.end()
+  })
+}
+async function post(path, body, type = 'audio/wav') {
+  return new Promise((resolve, reject) => {
+    const call = request({
+      host: '127.0.0.1', port: proxy.port, path, method: 'POST',
+      headers: { 'content-type': type, 'content-length': body.length },
+    }, (res) => {
+      const chunks = []
+      res.on('data', (chunk) => chunks.push(chunk))
+      res.on('end', () => resolve({ body: Buffer.concat(chunks), status: res.statusCode, headers: res.headers }))
+    })
+    call.on('error', reject)
+    call.end(body)
   })
 }
 try {
@@ -73,7 +106,17 @@ try {
   assert.equal(js.includes(account), true, '合包必须保留系统设置模块')
   assert.equal(js.includes(desktop), false)
   assert.equal(js.includes('sourceMappingURL'), false, '合包不应保留单包 sourcemap 尾注')
-  console.log('mobile-proxy: identity HTML + grouped gzip JS batch OK')
+  // 手机壳的语音接口：POST /tihu/asr 必须在鉴权之后被 tihu 接走，body 原样到达。
+  const wav = Buffer.from([0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00])
+  const asr = await post('/tihu/asr', wav)
+  assert.equal(asr.status, 200)
+  assert.equal(JSON.parse(asr.body.toString('utf8')).text, '把 README 读一下')
+  assert.equal(asrCalls, 1, 'POST /tihu/asr 要被 tihu.handleHttp 接走')
+  assert.equal(asrBytes, wav.length, '原始 WAV 字节要原样到运行时')
+  // GET /tihu/asr 不接走（其它方法行为保持原样：继续按老规则转发）
+  await download('/tihu/asr')
+  assert.equal(asrCalls, 1, '只有 POST 才接走')
+  console.log('mobile-proxy: identity HTML + grouped gzip JS batch + /tihu/asr wiring OK')
 } finally {
   await proxy.close()
   await new Promise((resolve) => upstream.close(resolve))

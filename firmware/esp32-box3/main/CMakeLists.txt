@@ -12,7 +12,10 @@ idf_component_register(
         "tihu_discover.c"
         "tihu_protocol.c"
         "tihu_audio.c"
+        "tihu_volume.c"
         "tihu_touch.c"
+        "tihu_ota.c"
+        "tihu_wake.c"
         "ui.c"
         "ui_board.c"
         "ui_progress.c"
@@ -31,6 +34,9 @@ idf_component_register(
         esp_timer
         # 配网页用的是 IDF 自带的 esp_http_server（不引额外组件）
         esp_http_server
+        # OTA 客户端：esp_http_client 拉清单/下固件，app_update 提供 esp_ota_*
+        esp_http_client
+        app_update
         # UDP 广播发现用 lwIP BSD socket（lwip/sockets.h）
         lwip
         json
@@ -40,4 +46,11 @@ idf_component_register(
         # 所以 tihu_touch.c 里用 esp_lcd_touch_read_data 必须在这里显式声明。
         espressif__esp_lcd_touch
         espressif__esp-box-3
+        # 板内语音唤醒（0.6.0）：ESP-SR AFE + WakeNet9（模型在 app 分区内嵌）
+        espressif__esp-sr
 )
+
+# 唤醒词模型包（wn9_hilexin，286 KB）编进 app 镜像：
+#   main/models/srmodels.bin → 符号 _binary_srmodels_bin_start/end，由 tihu_wake.c 的
+#   srmodel_load() 直接解析。**没有 model 分区**，远端 OTA 升 app 就一起换掉模型。
+target_add_binary_data(${COMPONENT_LIB} "models/srmodels.bin" BINARY)

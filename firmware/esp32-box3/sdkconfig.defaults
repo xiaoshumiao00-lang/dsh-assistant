@@ -73,3 +73,33 @@ CONFIG_LV_FONT_FMT_TXT_LARGE=y
 # 配网页最多 2 个并发连接，内部 RAM 撑得住。
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1536
 CONFIG_HTTPD_MAX_URI_LEN=256
+
+# ---- ESP-SR 板内唤醒词（0.6.0）：WakeNet9 中文「嗨，乐鑫」 ----
+# 唤醒词模型 wn9_hilexin（wakeNet9_v1h24_嗨，乐鑫，约 284 KB）。
+# 选它而不是 wn9s/wn10：S3 有 PIE(SIMD)+8 MB PSRAM，wn9 精度最高；wn10 模型 1.6 MB 且
+# 需要新的量化内核，会明显推高 app 体积。
+CONFIG_SR_WN_WN9_HILEXIN=y
+# 模型数据由 main/models/srmodels.bin 打进 **app 分区**（见 main/CMakeLists.txt 的
+# target_add_binary_data + tihu_wake.c 的 srmodel_load），不依赖独立的 model 分区，
+# 这样远端 OTA 一次就能把「固件 + 唤醒词模型」一起换掉。
+# MODEL_IN_FLASH 保持默认：esp-sr 自己的 flash 加载路径只在有 model 分区时才启用；
+# 本工程没有 model 分区，走的是内嵌二进制 + srmodel_load()。
+CONFIG_MODEL_IN_FLASH=y
+# AFE v1 接口（esp_afe_sr_iface.h / afe_config_init），与 esp-sr 2.x 文档一致。
+CONFIG_AFE_INTERFACE_V1=y
+# 噪声抑制 / VAD 用 WebRTC 实现（不额外带 nsnet/vadnet 模型文件，省 flash）。
+CONFIG_SR_NSN_WEBRTC=y
+CONFIG_SR_VADN_WEBRTC=y
+# 不做命令词识别（MultiNet），唤醒后整段 5 s 音频交给宿主。
+CONFIG_SR_MN_CN_NONE=y
+CONFIG_SR_MN_EN_NONE=y
+
+# ---- AFE/唤醒任务用到的 PSRAM 与缓存 ----
+# AFE 的大缓冲（ringbuf / wakenet 系数）走 PSRAM：memory_alloc_mode 在 tihu_wake.c 里
+# 设成 AFE_MEMORY_ALLOC_MORE_PSRAM；这里把 PSRAM 栈/内部堆预留显式钉住。
+# 缓存保持 16 KB I-cache / 32 KB D-cache：当前固件内部 RAM 只剩 ~85 KB（WiFi init 前实测），
+# 再抬到 32/64 会吃掉 48 KB 内部 RAM，LVGL/UI 栈先崩；wn9 在 DET_MODE_95 下系数会载入
+# PSRAM，推理不直接吃 flash cache，所以不抬缓存。
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_16KB=y
+CONFIG_ESP32S3_DATA_CACHE_32KB=y

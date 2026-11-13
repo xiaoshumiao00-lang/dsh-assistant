@@ -192,8 +192,11 @@ export function createPocketService({
   sshTunnel,
   /** 隧道就绪回调（lib/index.js 用它轮换公网密码；参数为 'quick'|'named'） */
   onTunnelReady,
-  /** 鹈鹕（tihu）模拟设备：{ page: () => string, handleUpgrade: (req, socket, head) => boolean }。
-   *  由 lib/index.js 传入；代理在鉴权之后把 /tihu 与 /tihu/lane 交给它。 */
+  /** 鹈鹕（tihu）模拟设备：{ page: () => string,
+   *  handleUpgrade: (req, socket, head) => boolean,
+   *  handleHttp: (req, res) => boolean }。
+   *  由 lib/index.js 传入；代理在鉴权之后把 /tihu、/tihu/lane 与 POST /tihu/asr
+   *  （手机壳的语音转写）交给它。 */
   tihu = null,
   /** 日志（DSH 宿主 ctx.logger 有 info/warn/error；默认 console 无 info，自动退回 log）。
    *  隧道自动恢复的成败必须走这里：console 输出在 DSH Desktop 里不进日志文件，

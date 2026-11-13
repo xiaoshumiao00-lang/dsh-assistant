@@ -149,6 +149,10 @@ export interface AudioFramePayload {
   audioBase64: string
   /** 时长（毫秒），仅日志与上限判断。 */
   durationMs?: number
+  /** 来源屏（2026-11-13）：从朗读页发来的指令带 'read'，宿主据此把这一句硬绑定回正在念的那条会话。 */
+  screenHint?: 'read'
+  /** 朗读页正在念的那条任务（宿主拿它找对应会话；查不到就不硬绑，按原逻辑走）。 */
+  taskId?: string
 }
 
 export interface TextInputPayload {
@@ -156,6 +160,10 @@ export interface TextInputPayload {
   text: string
   /** 来源：语音转写 / 键盘输入 / 撤回重说。 */
   source?: 'voice' | 'keyboard' | 'retry'
+  /** 来源屏（2026-11-13）：从朗读页发来的指令带 'read'，宿主据此把这一句硬绑定回正在念的那条会话。 */
+  screenHint?: 'read'
+  /** 朗读页正在念的那条任务（宿主拿它找对应会话；查不到就不硬绑，按原逻辑走）。 */
+  taskId?: string
 }
 
 export interface PingPayload {

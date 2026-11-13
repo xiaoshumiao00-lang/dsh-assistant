@@ -1,13 +1,17 @@
-# ESP32-S3-BOX-3B 16 MB flash layout (ASCII only: parttool.py reads this file
-# with the Windows locale encoding, so keep comments free of non-ASCII text).
-#   0x8000  partition table (IDF default offset)
-#   0x9000  nvs        24 KB
-#   0xf000  phy_init    4 KB
-#   0x10000 factory     8 MB   (firmware: BSP + LVGL + CJK fonts)
-#   0x810000 storage    2 MB   (SPIFFS for fonts/cache/screenshots)
-#   after 0xA10000: ~5.9 MB unallocated, room for OTA/data partitions later
+# ESP32-S3-BOX-3B 16 MB flash, dual-OTA layout (2026-11-12).
+# ASCII only: parttool.py reads this file with the Windows locale encoding.
+#   0x8000  partition table (ESP-IDF default offset)
+#   0x9000  nvs        24 KB   (Wi-Fi credentials, host_mode -- never erased by OTA)
+#   0xf000  phy_init    4 KB   (RF calibration)
+#   0x10000 otadata     8 KB   (which OTA slot boots)
+#   0x20000 ota_0       6 MB   (firmware slot A: BSP + LVGL + CJK fonts + OTA client)
+#   0x620000 ota_1      6 MB   (firmware slot B, written by OTA while A runs)
+#   0xc20000 storage  3.75 MB  (SPIFFS: fonts/cache/screenshots)
+#   leftover 0xfe0000..0x1000000 = 128 KB unallocated
 # Name,   Type, SubType, Offset,   Size,     Flags
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  0x800000,
-storage,  data, spiffs,  0x810000, 0x200000,
+otadata,  data, ota,     0x10000,  0x2000,
+ota_0,    app,  ota_0,   0x20000,  0x600000,
+ota_1,    app,  ota_1,   0x620000, 0x600000,
+storage,  data, spiffs,  0xc20000, 0x3c0000,
