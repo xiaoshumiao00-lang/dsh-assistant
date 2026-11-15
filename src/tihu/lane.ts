@@ -55,6 +55,7 @@ import {
   type TaskNotifyPayload,
   type TaskReplyPayload,
   type TaskUpdatePayload,
+  type BoardScrollPayload,
   type DeviceAckPayload,
   type PlaybackStatePayload,
   type DeviceConfigPayload,
@@ -927,8 +928,6 @@ interface TihuDevice {
    * 一遍「标题——第一句」（那正是朗读只念到第一句的直接原因）。
    */
   doneReadingTask?: string
-  /** 棋盘翻页页码（0 起）；每页 4 条，用户点「上一页/下一页」就地改这一条。 */
-  boardPage?: number
   /** 这台设备的棋盘上有没有「在跑」的行（决定棋盘时长弧需不需要按时钟重发）。 */
   boardHasRunning?: boolean
   /**
@@ -1811,10 +1810,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     try {
       const hint = frame as unknown as Record<string, unknown>
       if (hint.screenHint === undefined) {
-        const rows = Array.isArray((frame as any).rows) ? (frame as any).rows.length : 0
-        const page = Math.max(0, Math.trunc(device.boardPage ?? 0)) + 1
+        const boardRows = Array.isArray((frame as any).board?.rows) ? (frame as any).board.rows.length
+          : (Array.isArray((frame as any).rows) ? (frame as any).rows.length : 0)
         const mode = String((frame as any).mode ?? (frame as any).stage ?? '')
-        hint.screenHint = `${mode === 'board' ? '棋盘' : (mode || '状态')} ${page} · ${rows} 行`.slice(0, 40)
+        hint.screenHint = (mode === 'home' ? `棋盘 · ${boardRows} 行连续滚动` : `${mode || '状态'} · ${boardRows} 行`)
+          .slice(0, 40)
         hint.convoHint = String((device as any).title ?? '').slice(0, 40)
       }
     } catch { /* 提示字段失败不影响推帧 */ }
@@ -3868,7 +3868,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       return
     }
     if (type === 'screen.gesture') {
-      const payload = message.payload as { action?: string; dy?: number; phase?: string; x?: number; y?: number }
+      // 只有 `tap` 这一条手势有宿主动作：棋盘改成连续滚动后，页面不再发 swipe（滚动由容器自己接管），
+      // 宿主这边也不留 dy/phase 这类没目标的分支。
+      const payload = message.payload as { action?: string; x?: number; y?: number }
       if (payload.action === 'tap' && typeof payload.x === 'number' && typeof payload.y === 'number') {
         const sid = device.sessionId
         if ((payload as any).hit === 'action' && typeof (payload as any).actionId === 'string') {
@@ -3879,17 +3881,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             // 用户自己按主页：这次判断的秒表别再抢屏（判断仍在后台跑，判成活儿照旧立卡）。
             if (commanderWait !== undefined) device.waitMuted = true
             await runScreenCommand(device, { kind: 'board' })
-            return
-          }
-          if (actionId === 'boardPrev' || actionId === 'boardNext') {
-            // 棋盘翻页：就地换页（不重排任务、不派单）。页码夹到真实范围内。
-            const current = Math.max(0, Math.trunc(device.boardPage ?? 0))
-            const step = actionId === 'boardNext' ? 1 : -1
-            const next = Math.max(0, current + step)
-            if (next === current && step < 0) return
-            device.boardPage = next
-            sendBoard(device)
-            log(`tihu board page device=${device.id} page=${device.boardPage + 1}`)
             return
           }
           if (actionId === 'replay') {
@@ -3929,7 +3920,8 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
             return
           }
           if (actionId === 'taskOpen') {
-            const target = device.focusedTask ?? boardOf(tasks.list(), Date.now(), Math.max(0, device.boardPage ?? 0)).rows[0]?.taskId
+            // 「看任务」按钮：没有定位过就看这一列的第一行（棋盘是一列连续滚动的行，没有页码）。
+            const target = device.focusedTask ?? boardOf(tasks.list(), Date.now()).rows[0]?.taskId
             if (target !== undefined) openTask(device, target)
             return
           }
@@ -5496,21 +5488,19 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     }
   }
 
-  /** 棋盘一帧：每页 4 行，页码从这台设备的 `boardPage` 拿（翻不动就夹回最后一张页）。 */
+  /** 棋盘一帧：一列未归档卡（合并后上限 60 条）一次全排完，屏上看得见约 4 行、其余靠页面纵向滚动。 */
   let boardTicker: ReturnType<typeof setInterval> | undefined
-  function boardFrameFor(page: number): { frame: ScreenFramePayload; board: TaskBoardPayload } {
+  function boardFrameFor(): { frame: ScreenFramePayload; board: TaskBoardPayload } {
     // 画棋盘前先把客户端会话标题同步进来（逐字、不截断）：屏上这一行＝客户端那一行。
     syncBoardTitles()
-    const board = boardOf(tasks.list(), Date.now(), page)
+    const board = boardOf(tasks.list(), Date.now())
     return { frame: boardFrame(board), board }
   }
 
   /** 屏 1：任务棋盘（含空态）。同一版式，有任务就是棋盘、没任务就是空盘。 */
-  function sendBoard(device: TihuDevice, resetPage = false): void {
+  function sendBoard(device: TihuDevice): void {
     const key = device.sessionId ?? device.id
-    const { frame, board } = boardFrameFor(resetPage ? 0 : Math.max(0, Math.trunc(device.boardPage ?? 0)))
-    // 页码夹到真实范围内（任务少了一条，最后一张页可能已经没了）。
-    device.boardPage = board.page.index
+    const { frame, board } = boardFrameFor()
     // 回棋盘＝明确离开回执/追问/详情：旧计时器与待选项一起清掉。
     if (device.receiptTimer !== undefined) {
       clearTimeout(device.receiptTimer)
@@ -5525,7 +5515,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     lastFrames.set(key, frame)
     pushFrame(device, frame)
     device.send('task.list', { board } satisfies TaskListPayload)
-    log(`tihu board device=${device.id} rows=${board.rows.length} page=${board.page.index + 1}/${board.page.total} awaiting=${board.counts.awaiting} running=${board.counts.running} queued=${board.counts.queued} done=${board.counts.done}`)
+    log(`tihu board device=${device.id} rows=${board.rows.length} total=${board.total} awaiting=${board.counts.awaiting} running=${board.counts.running} queued=${board.counts.queued} done=${board.counts.done}`)
     device.boardHasRunning = board.rows.some((row) => row.state === 'running')
     ensureBoardTicker()
   }
@@ -6434,14 +6424,14 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   }
 
   /**
-   * 完成页**朗读与折行共用**的一份正文：屏上的 7 行、每行的字符区间、下发给 TTS 的
-   * `charStart/charEnd` 全部基于它，高亮才能跟着真实播放走（少一个字都对不上）。
+   * 完成页**朗读与折行共用**的一份正文：屏上这一列里的行（放得下的按剩余高度算，其余接着往上滑看）、
+   * 每行的字符区间、下发给 TTS 的 `charStart/charEnd` 全部基于它，高亮才能跟着真实播放走（少一个字都对不上）。
    */
   function doneBodyTextOf(task: TihuTask): string {
     return prepareDoneText(doneReadingTextOf(task) || DONE_NO_REPLY_TEXT)
   }
 
-  /** 完成页：任务名大标题 + 回答 7 行 + 停止/重读/主页。`current` ＝首屏高亮从第几行开始。 */
+  /** 完成页：任务名大标题 + 回答正文（整列一屏放不下的行在同一列里往上滑看）+ 停止/重读/主页。`current` ＝首屏高亮从第几行开始。 */
   function doneScreenOf(task: TihuTask, current = 0): ScreenFramePayload {
     const body = doneBodyTextOf(task)
     const resultLine = String(task.resultLine ?? '').trim() || body || DONE_NO_REPLY_TEXT
@@ -6487,7 +6477,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     sendFrame(device, doneScreenOf(task), device.sessionId)
     armScreenHome(device, HOME_AFTER_SPEECH_MS, task.taskId, '完成')
     if (!speak) return
-    // 念屏上这份 7 行正文：分段与 done.ranges 同源，一行一段，全部念完。
+    // 念屏上这一列正文（屏上放得下的行都算上，余下的在同一列里往上滑看）：分段与 done.ranges 同源，一行一段，全部念完。
     readDoneScreen(device, task)
   }
 
@@ -8576,13 +8566,13 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
   /** 屏上口头命令（零模型）。 */
   async function runScreenCommand(device: TihuDevice, command: ScreenCommand): Promise<void> {
     if (command.kind === 'board') {
-      // 口头命令/主页键明确回棋盘：回到第一张页（最该看的那些排在前面）。
-      sendBoard(device, true)
+      // 口头命令/主页键明确回棋盘：整列从最上面那行开始（最该看的那些排在前面）。
+      sendBoard(device)
       return
     }
     if (command.kind === 'open') {
-      // 「开第 N 条」指的是屏上这一页的第 N 行（翻页之后所见即所开）。
-      const rows = boardOf(tasks.list(), Date.now(), Math.max(0, device.boardPage ?? 0)).rows
+      // 「开第 N 条」＝这一列棋盘的第 N 行（连续滚动，行号就是屏上从上往下的顺序）。
+      const rows = boardOf(tasks.list(), Date.now()).rows
       const target = command.index !== undefined ? rows[command.index - 1] : rows[0]
       if (target === undefined) {
         sendFrame(device, noticeFrame({ stage: '任务', title: '现在没有可看的任务', lines: ['说一句话就派单'], tone: 'idle' }))
@@ -9180,41 +9170,48 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
     return ack === undefined ? { kind: 'sent' } : { kind: 'stopped', ack }
   }
 
-  /** 棋盘那一句（回主页/翻页的返回文案都用它，四段计数每次现算）。 */
+  /** 棋盘那一句（回主页等返回文案都用它，四段计数每次现算；没有页码这一说）。 */
   function boardEchoOf(device: TihuDevice): string {
-    const board = boardOf(tasks.list(), Date.now(), Math.max(0, Math.trunc(device.boardPage ?? 0)))
+    const board = boardOf(tasks.list(), Date.now())
     const counts = board.counts
-    return `棋盘第 ${board.page.index + 1}/${board.page.total} 页（等你 ${counts.awaiting} · 在跑 ${counts.running} · 排队 ${counts.queued} · 完成 ${counts.done}）`
+    return `棋盘 ${board.total} 行（等你 ${counts.awaiting} · 在跑 ${counts.running} · 排队 ${counts.queued} · 完成 ${counts.done}；屏上看得见最上面几行，手指往上滑看后面的行）`
   }
 
   /**
-   * 一页棋盘的带编号清单：`1) t32 完成 微信查看…`。
+   * 这一列棋盘的带编号清单：`1) t32 完成 微信查看…`。
    *
    * 行号＝boardOf.rows 的下标＋1，与设备屏上逐行渲染的顺序**同一份**（page.ts 就按 rows 顺序建行，
-   * 不再排序）。指挥台提示、按行号开卡的错误文案、兜底留痕都从这里取，绝不各写一套。
+   * 不再排序；整列都在屏上滚出来，行号和屏上第几行是同一个口径）。指挥台提示、按行号开卡的错误文案、
+   * 兜底留痕都从这里取，绝不各写一套。
    */
   function numberedRowsOfBoard(board: TaskBoardPayload): string[] {
     return board.rows.map((row, index) => `${index + 1}) ${row.taskId} ${row.capsule} ${clipForLog(row.title, 14)}`)
   }
 
-  /** 给指挥台看的那块屏「当前页」清单（1 起；「第二个」＝第 2 行）。 */
+  /** 指挥台棋盘清单最多列几行（后面的行只算进「共 N 行」，行号口径不变）。 */
+  const BOARD_COMMANDER_ROWS = 24
+
+  /** 给指挥台看的那块屏棋盘清单（1 起；「第二个」＝第 2 行；超过预算只列前若干行）。 */
   function commanderBoardLines(device: TihuDevice): string[] {
-    const board = boardOf(tasks.list(), Date.now(), Math.max(0, Math.trunc(device.boardPage ?? 0)))
-    const rows = numberedRowsOfBoard(board)
+    const board = boardOf(tasks.list(), Date.now())
+    const all = numberedRowsOfBoard(board)
+    const shown = all.slice(0, BOARD_COMMANDER_ROWS)
+    const rows = shown
     return [
-      `（这块屏在第 ${board.page.index + 1}/${board.page.total} 页；行号从 1 开始，屏上第一行＝1，「第二个」＝第 2 行）`,
-      ...(rows.length === 0 ? ['（这页没有任务）'] : rows),
+      `（这块屏是一列连续滚动的棋盘，共 ${all.length} 行；行号从 1 开始：屏上第一行就是 1，「第二个」＝第 2 行`
+      + (shown.length < all.length ? `；这里只列前 ${shown.length} 行，后面的行往上滑看得到）` : '）'),
+      ...(rows.length === 0 ? ['（棋盘空着，没有任务）'] : rows),
     ]
   }
 
   /**
-   * 当前屏幕（用户 2026-11-13：屏幕名 / 页码 / 行号映射**继续给**）。
+   * 当前屏幕（用户 2026-11-13：屏幕名 / 行号映射**继续给**）。
    *
-   * 屏名取设备此刻真实停的那一屏（棋盘 / 进度 / 完成 / 待决策 …）；页码与行号映射
-   * 跟棋盘同一份 `boardOf`，不另算一份，免得模型按提示词里的页码点错行。
+   * 屏名取设备此刻真实停的那一屏（棋盘 / 进度 / 完成 / 待决策 …）；行号映射跟棋盘同一份 `boardOf`，
+   * 不另算一份 —— 棋盘改成连续滚动后已经没有「第几页」这个概念，模型只按行号点行。
    */
   function commanderScreenLines(device: TihuDevice): string[] {
-    const board = boardOf(tasks.list(), Date.now(), Math.max(0, Math.trunc(device.boardPage ?? 0)))
+    const board = boardOf(tasks.list(), Date.now())
     const name = device.onBoard === true ? '棋盘' : (device.screenStage ?? '未上报')
     const playback = device.playback
     const total = Number(playback?.total)
@@ -9223,7 +9220,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       ? ` · 朗读第 ${line + 1}/${total} 行`
       : ''
     return [
-      `【当前屏幕】${name} · 棋盘第 ${board.page.index + 1}/${board.page.total} 页 · 行号从 1 开始（屏上第一行＝1，「第二个」＝第 2 行）${reading}`,
+      `【当前屏幕】${name} · 棋盘共 ${board.total} 行、连续滚动 · 行号从 1 开始（屏上第一行就是 1，「第二个」＝第 2 行；没有页码，后面的行往上滑看得到）${reading}`,
     ]
   }
 
@@ -9345,7 +9342,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       // 否则未绑定时永远读不到帧（旧实现用 '__unbound__'，2026-11-10 修）。
       const display = device.sessionId ?? device.id
       const frame = lastFrames.get(display)
-      const board = boardOf(tasks.list(), Date.now(), Math.max(0, Math.trunc(device.boardPage ?? 0)))
+      const board = boardOf(tasks.list(), Date.now())
       const focused = device.focusedTask === undefined ? undefined : tasks.get(device.focusedTask)
       const bridge = focused === undefined ? undefined : pendingBridges.get(focused.taskId)
       const playback = device.playback
@@ -9369,9 +9366,9 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         }),
         ...(focused === undefined ? {} : { taskId: focused.taskId, taskTitle: focused.title }),
         board: {
-          page: board.page.index,
-          total: Math.max(1, board.page.total),
+          // 棋盘是一列连续滚动的行：只报这一列共有几行，不再报「第几页」。
           counts: board.counts,
+          rows: board.total,
           totalTasks: board.total,
         },
         ...(focused === undefined || focused.state !== 'awaiting' || bridge === undefined
@@ -9556,7 +9553,6 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       const stop = options.stopSpeaking !== false
       // `all: true` 是唯一允许「多发」的动作（规格书 §8.2 的显式例外）。
       const targets = options.all === true ? [...devices].filter((item) => item.unified) : [device]
-      const page = Math.max(0, Math.trunc(Number(options.page ?? 0)) || 0)
       let already = 0
       let wasSpeaking = false
       for (const target of targets) {
@@ -9574,13 +9570,11 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
           && target.focusedTask === undefined
           && target.receiptTimer === undefined
           && target.screenStage === ''
-          && Math.max(0, Math.trunc(target.boardPage ?? 0)) === page
         if (alreadyHome) {
           already += 1
           continue
         }
-        target.boardPage = page
-        sendBoard(target, false)
+        sendBoard(target)
       }
       const primary = targets[0] ?? device
       if (stop && wasSpeaking) await awaitDeviceAck(primary, 'playback.control', { action: 'stop', scope: 'round' })
@@ -9594,49 +9588,46 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
       }
     },
 
-    boardPage: async (deviceId, options) => {
+    boardScroll: async (deviceId, options) => {
       const device = requireControlDevice(deviceId)
-      const current = Math.max(0, Math.trunc(device.boardPage ?? 0))
-      const board = boardOf(tasks.list(), Date.now(), current)
-      const total = Math.max(1, board.page.total)
-      if (total <= 1) {
-        return { text: '棋盘只有 1 页', deviceId: device.id, already: true, echo: boardEchoOf(device) }
+      // 滚动只有棋盘这一列有：详情/进度/完成页上没有滚这一层，直说要先回棋盘再滚。
+      if (device.onBoard !== true || device.focusedTask !== undefined) {
+        throw new Error('这块屏现在停在别的屏（不在棋盘上），滚动只对棋盘那一列有效。先 tihu_go_home 回棋盘，再滚。')
       }
-      const wanted = options.page !== undefined
-        ? Math.trunc(Number(options.page))
-        : current + (options.direction === 'prev' ? -1 : 1)
-      const target = Math.max(0, Math.min(total - 1, wanted))
-      if (target === current) {
-        const edge = options.page !== undefined
-          ? '已经是这一页'
-          : (options.direction === 'prev' ? '已经是第一页' : '已经是最后一页')
-        return { text: edge, deviceId: device.id, already: true, echo: boardEchoOf(device) }
+      const rows = boardOf(tasks.list(), Date.now()).rows
+      const to = options.to
+      const index = to === 'top' || to === 'bottom' ? undefined : boardRowIndex(options.index ?? 1)
+      if (index !== undefined && index > rows.length) {
+        throw new Error(`棋盘第 ${index} 行不存在（这一列只有 ${rows.length} 行，行号从 1 起）。`)
       }
-      device.boardPage = target
-      sendBoard(device, false)
-      const pageBoard = boardOf(tasks.list(), Date.now(), target)
-      const rows = pageBoard.rows.map((row, index) => `${index + 1}. ${row.title}（${row.capsule}）`)
+      const scrollPayload = (to === 'top' || to === 'bottom' ? { to } : { row: index }) satisfies BoardScrollPayload
+      const ack = await awaitDeviceAck(device, 'board.scroll', scrollPayload as Record<string, unknown>)
+      if (ack !== undefined && ack.ok === false) throw new Error(`设备拒绝滚动：${ack.reason ?? '原因未知'}（${device.id}）`)
+      const row = index === undefined ? undefined : rows[index - 1]
+      const moved = index === undefined
+        ? (to === 'top' ? '这一列最上面' : `这一列最下面（共 ${rows.length} 行）`)
+        : `第 ${index} 行${row === undefined ? '' : `：${row.capsule}「${row.title}」`}`
       return {
-        text: `已翻到第 ${target + 1}/${total} 页`,
+        text: `已滚到${moved}`,
         deviceId: device.id,
-        acked: true,
-        echo: `第 ${target + 1}/${total} 页${rows.length === 0 ? '（这页没有任务）' : `：${rows.join(' / ')}`}`,
+        ...(ack === undefined ? {} : { acked: true }),
+        echo: boardEchoOf(device),
+        ...(ack === undefined ? { note: '设备没回执（这块屏的页面可能是旧版，不认 board.scroll 这条下行）' } : {}),
       }
     },
 
     openTaskCard: async (deviceId, options) => {
       const device = requireControlDevice(deviceId)
       let task: TihuTask
-      // 屏上「第几个」只按**这块屏当前这一页**的 boardOf 顺序算（与 sendBoard 下发的那份逐行一致）。
-      const page = Math.max(0, Math.trunc(device.boardPage ?? 0))
-      const pageBoard = boardOf(tasks.list(), Date.now(), page)
-      const pageRows = numberedRowsOfBoard(pageBoard)
+      // 屏上「第几个」按这一列棋盘的行号算（棋盘改成连续滚动后没有「这一页」的概念，行号就是屏上顺序）。
+      const board = boardOf(tasks.list(), Date.now())
+      const boardRows = numberedRowsOfBoard(board)
       if (options.index !== undefined) {
         // 1 起、必须是正整数：0 / 负数 / 小数一律报错，绝不悄悄退化成第 1 行。
         const index = boardRowIndex(options.index)
-        const row = pageBoard.rows[index - 1]
+        const row = board.rows[index - 1]
         if (row === undefined) {
-          throw new Error(`棋盘第 ${pageBoard.page.index + 1}/${pageBoard.page.total} 页没有第 ${index} 行（这页只有 ${pageBoard.rows.length} 条）。这页的行号是：${pageRows.length === 0 ? '（空）' : `\n${pageRows.join('\n')}`}`)
+          throw new Error(`棋盘没有第 ${index} 行（这一列只有 ${board.rows.length} 行）。行号是：${boardRows.length === 0 ? '（空）' : `\n${boardRows.join('\n')}`}`)
         }
         const hit = tasks.get(row.taskId)
         if (hit === undefined) throw new Error(`第 ${index} 行（${row.taskId}）刚从棋盘上消失，请重新看一眼棋盘。`)
@@ -9651,7 +9642,7 @@ const lastFrames = new Map<string, Omit<ScreenFramePayload, 'bullets'> & { bulle
         // 不拦，但**必须留痕**：万一用户嘴上说的是「第二个」，日志能直接对上开的是哪一行。
         if (options.taskId === undefined && options.title === undefined && options.recent !== true) {
           try {
-            appendTihuLaneNote('tihu_open_task_fallback', `tool=tihu_open_task 这次没带 index/title/taskId/recent → 开了 ${task.taskId}「${clipForLog(task.title, 30)}」；屏上第 ${pageBoard.page.index + 1}/${pageBoard.page.total} 页行号：${pageRows.length === 0 ? '（空）' : pageRows.join(' / ')}`)
+            appendTihuLaneNote('tihu_open_task_fallback', `tool=tihu_open_task 这次没带 index/title/taskId/recent → 开了 ${task.taskId}「${clipForLog(task.title, 30)}」；棋盘行号：${boardRows.length === 0 ? '（空）' : boardRows.join(' / ')}`)
           } catch { /* 日志失败不影响开卡 */ }
         }
       }

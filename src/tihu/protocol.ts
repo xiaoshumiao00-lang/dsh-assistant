@@ -71,6 +71,7 @@ export const TIHU_DOWNSTREAM_TYPES = [
   'task.list',
   'task.update',
   'task.notify',
+  'board.scroll',
   'playback.control',
   'voice.listen',
   'session.ended',
@@ -458,10 +459,9 @@ export interface SessionEndPayload {
 }
 
 /** 上行：绑定一个会话，或切回「自动跟随」。 */
-/** 屏幕手势：上/下滑（滚动历史）与点击（预留）。 */
+/** 屏幕手势：只有点击（棋盘已改成纵向连续滚动，滑动手势由列表容器自己处理，不再有 swipe 上行）。 */
 export type ScreenGesturePayload =
-  | { action: 'swipe'; dy: number; phase: 'start' | 'move' | 'end' }
-  | { action: 'tap'; x: number; y: number; hit?: 'screen' | 'action' | 'task'; actionId?: string; taskId?: string }
+  { action: 'tap'; x: number; y: number; hit?: 'screen' | 'action' | 'task'; actionId?: string; taskId?: string }
 
 /** 下行：绑定成功（宿主是权威，标题/是否 live/模式以这里为准）。 */
 export interface SessionBoundPayload {
@@ -499,7 +499,7 @@ export type TaskState = 'queued' | 'dispatched' | 'running' | 'awaiting' | 'done
 export interface TaskBoardRow {
   /** 稳定短号（屏与播报都用它）。 */
   taskId: string
-  /** 一句话意图（规范化后的短语）。 */
+  /** 客户端会话标题的**原文**（完整标题；屏上排几行由 `titleLines` 决定，卡片本身仍带着这份全文可获取）。 */
   title: string
   /** 状态（文字胶囊的依据，不只靠颜色）。 */
   state: TaskState
@@ -523,9 +523,19 @@ export interface TaskBoardRow {
   blink?: boolean
   /** 最近 8 步耗时（毫秒）：棋盘微条，只做节奏感，不参与状态。 */
   micro?: number[]
+  /**
+   * 宿主按屏上那一行的真实可用宽折好的标题行（15px×加粗系数，与 screen-spec.ts 同一份口径）。
+   * 页面逐行渲染这些段、不再二次折行；卡片高度跟着这几行撑开，标题永远整行可见、不会半截断尾。
+   * 旧固件兼容：没有它就退回 `title` 自己折（字段只增不删）。
+   */
+  titleLines?: string[]
+  /** 这一行卡片该占的高度（宿主算好：上下内边距 + 标题行数 × 行高 + 副行，最少 48px）。 */
+  rowHeightPx?: number
+  /** 标题比这几行更长（只在最后一行末尾补了省略号）：完整标题仍在 `title` 字段与卡片的 title/aria-label。 */
+  titleTruncated?: boolean
 }
 
-/** 任务棋盘整屏。 */
+/** 任务棋盘整屏（纵向连续滚动：屏上看得见约 4 行，其余行在同一列里滑出来；没有任何页码字段）。 */
 export interface TaskBoardPayload {
   rows: TaskBoardRow[]
   /**
@@ -533,7 +543,7 @@ export interface TaskBoardPayload {
    * 顺序由页面决定；四段都始终下发（0 也要有），计数口径见 task-ledger.ts 的 countsOf。
    */
   counts: { running: number; awaiting: number; queued: number; done: number }
-  page: { index: number; total: number }
+  /** 这一列里总共有几行（= rows.length）；没有「第几页」这一说。 */
   total: number
   /** 一个任务都没有：同一版式的空态（不另开一屏）。 */
   empty: boolean
@@ -542,6 +552,17 @@ export interface TaskBoardPayload {
 /** 下行：整张棋盘（主页数据源）。 */
 export interface TaskListPayload {
   board: TaskBoardPayload
+}
+
+/**
+ * 下行：让这块棋盘这一列滚到哪一行（连续滚动列表，没有页码）。
+ * 宿主只发指令，页面是唯一的执行者（滚不动就当没这回事，绝不让页面卡在别的状态上）。
+ */
+export interface BoardScrollPayload {
+  /** 滚到第几行（1 起，与屏上从上往下数同一个口径）。 */
+  row?: number
+  /** 直接滚到这一列的顶 / 底；给了 `to` 就忽略 `row`。 */
+  to?: 'top' | 'bottom'
 }
 
 /** 下行：单行变更（替代按会话帧刷屏）。 */
@@ -614,6 +635,7 @@ export type TihuDownstreamMessage =
   | TihuEnvelope<'task.list', TaskListPayload>
   | TihuEnvelope<'task.update', TaskUpdatePayload>
   | TihuEnvelope<'task.notify', TaskNotifyPayload>
+  | TihuEnvelope<'board.scroll', BoardScrollPayload>
   | TihuEnvelope<'playback.control', PlaybackControlPayload>
   | TihuEnvelope<'voice.listen', VoiceListenPayload>
   | TihuEnvelope<'session.ended', SessionEndedPayload>
@@ -723,11 +745,8 @@ export function parseUpstream(raw: unknown): TihuUpstreamMessage | null {
         return value as TihuUpstreamMessage
       }
       case 'screen.gesture': {
-        if (payload.action === 'swipe') {
-          if (typeof payload.dy !== 'number' || !Number.isFinite(payload.dy)) return null
-          if (payload.phase !== 'start' && payload.phase !== 'move' && payload.phase !== 'end') return null
-          return value as TihuUpstreamMessage
-        }
+        // 没有 swipe 这一支了（棋盘改成纵向连续滚动，滚动由列表容器自己处理）；
+        // 旧设备页还在发 swipe 的，一律当坏帧丢掉，不落到任何动作。
         if (payload.action === 'tap') {
           if (typeof payload.x !== 'number' || typeof payload.y !== 'number') return null
           if (!Number.isFinite(payload.x) || !Number.isFinite(payload.y)) return null

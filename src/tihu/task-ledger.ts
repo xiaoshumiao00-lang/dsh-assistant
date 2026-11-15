@@ -21,6 +21,7 @@
  * 它替人答首选项，根本不会有待决策）。所以「出现待决策」本身就等于「托管没开」。
  */
 import type { TaskBoardPayload, TaskBoardRow, TaskNotifyLevel, TaskState } from './protocol.ts'
+import { boardTitleLinesOf } from './screen-spec.ts'
 import type { TihuCardRow } from './project-groups.ts'
 
 /** 时长环满圈＝30 分钟（超过继续转琥珀＝跑久了）。 */
@@ -29,8 +30,12 @@ export const RING_FULL_MS = 30 * 60_000
 export const ANNOUNCE_WINDOW_MS = 8_000
 /** 只有一条时也等这么久再念：留给同一秒内到达的其它完成，凑成一句。 */
 export const ANNOUNCE_SINGLE_DELAY_MS = 400
-/** 棋盘每页行数（与屏幕 320×240 的可读行数一致）。 */
-export const BOARD_PAGE_SIZE = 4
+/**
+ * 一块 320×240 屏上一次看得见几行（每行 48px）。
+ * 2026-11-15 用户要求：首页棋盘改成**纵向连续滚动**，不再有「页」的概念 —— 这个数只用来
+ * 说明可视高度里能摆几行（`screen-spec.ts` 的 `boardRows` 与它同步），不再切分行数。
+ */
+export const BOARD_VIEWPORT_ROWS = 4
 /** 登记簿内存上限＝**未归档卡片**的上限（归档条目仍留在台账里，不占这个名额）：棋盘只显示最近这些，更早的直接归档。 */
 export const LEDGER_MAX_TASKS = 60
 /**
@@ -289,6 +294,16 @@ export function rowOf(task: TihuTask, now: number): TaskBoardRow {
     row.blink = true
   }
   if (task.stepDurations !== undefined && task.stepDurations.length > 0) row.micro = task.stepDurations.slice(-8)
+  // 标题按**屏上这一行的真实可用宽**折成几段（同一份口径在 screen-spec.ts）：
+  // 页面拿到几段就渲染几段、卡片跟着长高 —— 半截断尾的标题从此没有了。
+  // `title` 仍是客户端标题原文（完整标题永远可获取，见 boardTitleOf 上方定案）。
+  const wrap = boardTitleLinesOf(row.title, {
+    capsule: row.capsule,
+    microBars: row.micro === undefined ? 0 : row.micro.length,
+  })
+  row.titleLines = wrap.lines
+  row.rowHeightPx = wrap.rowHeightPx
+  if (wrap.truncated) row.titleTruncated = true
   return row
 }
 
@@ -343,8 +358,12 @@ export function boardRowIndex(raw: unknown): number {
  * {@link boardLeaderOf} 选（执行中 → 待决策 → 最新活跃 → 短号），状态/进度取主条的。
  * 合并只在**展示层**：台账与 `sessionIds` 一条不丢，行上的 taskId 仍是主条原号，
  * 点行、撤单、语音续聊都落到主条那条会话。
+ *
+ * 行数（用户 2026-11-15 改口径）：未归档卡（上限 {@link LEDGER_MAX_TASKS}）合并完的
+ * **全部行都排在同一块屏里**，页面靠纵向连续滚动看后面的行；不再有「每页 4 行」的切分，
+ * 也不再有页码。行号＝这份清单从上往下第几行，1 起，与屏上（滚到哪都算）一致。
  */
-export function boardOf(tasks: readonly TihuTask[], now: number, page = 0): TaskBoardPayload {
+export function boardOf(tasks: readonly TihuTask[], now: number): TaskBoardPayload {
   const live = tasks.filter((task) => task.state !== 'archived')
   const awaitingProjects = new Set(
     live.filter((task) => task.state === 'awaiting').map((task) => task.projectId),
@@ -381,13 +400,11 @@ export function boardOf(tasks: readonly TihuTask[], now: number, page = 0): Task
     if (next !== leader) leaders[at] = next
   }
   const rows: TaskBoardRow[] = leaders.map((task) => rowOf(task, now))
-  const totalPages = Math.max(1, Math.ceil(rows.length / BOARD_PAGE_SIZE))
-  const index = Math.max(0, Math.min(Math.trunc(page), totalPages - 1))
   const counts = countsOf(tasks)
+  // 连续滚动：全部行一次下发（未归档卡最多 LEDGER_MAX_TASKS 张），不切页、不夹页码。
   return {
-    rows: rows.slice(index * BOARD_PAGE_SIZE, (index + 1) * BOARD_PAGE_SIZE),
+    rows,
     counts,
-    page: { index, total: totalPages },
     total: rows.length,
     empty: rows.length === 0,
   }

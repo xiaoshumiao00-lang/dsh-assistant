@@ -18,7 +18,7 @@ import { join } from 'node:path'
 import {
   ANNOUNCE_SINGLE_DELAY_MS,
   ANNOUNCE_WINDOW_MS,
-  BOARD_PAGE_SIZE,
+  BOARD_VIEWPORT_ROWS,
   DONE_KEEP_MS,
   LEDGER_RESTORE_MAX,
   LEDGER_MAX_TASKS,
@@ -368,9 +368,9 @@ test('同名只管一行：同标题多张卡合并成一行，合并行仍指�
   assert.equal(ledger.list().filter((task) => task.state !== 'archived').length, 4, '台账不许删任务')
   assert.ok(ledger.list().some((task) => task.sessionIds.includes('session-judge-b')), '被合并会话的 id 仍在台账')
   assert.ok(board.rows.some((row) => row.taskId === other.taskId), '不同标题照旧各占一行')
-  // 页码/总数按合并后的行算（否则「下一页」会翻到空页）。
+  // 行号与总数都按合并后的行算（否则往上滑会滑到没有卡的空行）。
   assert.equal(board.total, 2)
-  assert.equal(board.page.total, 1)
+  assert.equal(board.rows.length, 2)
 
   // 主条规则：都没有执行中/待决策时取最新活跃（完成用完成时刻）。
   const allDone = new TaskLedger()
@@ -433,20 +433,23 @@ test('没有任务 = 同一版式的空态（empty=true，不是另一屏）', (
   assert.equal(board.empty, true)
   assert.deepEqual(board.rows, [])
   assert.deepEqual(board.counts, { running: 0, awaiting: 0, queued: 0, done: 0 })
-  assert.deepEqual(board.page, { index: 0, total: 1 })
+  assert.equal(board.total, 0)
+  assert.equal(board.page, undefined, '空态也没有页码')
   const frame = boardFrame(board)
   assert.equal(frame.mode, 'home')
   assert.equal(frame.board.empty, true)
   assert.equal(frame.tone, 'idle')
 })
 
-test(`棋盘每页 ${BOARD_PAGE_SIZE} 行，页码越界自动夹住`, () => {
+test(`棋盘是一列连续滚动的行：整列一次排完（可视区 ${BOARD_VIEWPORT_ROWS} 行看得见，其余往上滑）`, () => {
   const ledger = new TaskLedger()
   for (let i = 0; i < 7; i += 1) ledger.add({ title: `task-${i}`, projectId: `p${i}`, projectName: `P${i}` })
-  assert.equal(boardOf(ledger.list(), 1, 0).rows.length, BOARD_PAGE_SIZE)
-  assert.equal(boardOf(ledger.list(), 1, 0).page.total, 2)
-  assert.equal(boardOf(ledger.list(), 1, 2).page.index, 1, '越界夹到最后一页')
-  assert.equal(boardOf(ledger.list(), 1, 2).rows.length, 3)
+  const board = boardOf(ledger.list(), 1)
+  assert.equal(board.rows.length, 7, '7 条卡全在这一列里（不切页）')
+  assert.equal(board.total, 7, 'total = rows.length')
+  assert.equal(board.page, undefined, '没有任何页码字段（第 X 页 / 共 N 页 全没了）')
+  const listed = new Set(ledger.list().map((task) => task.taskId))
+  assert.deepEqual(new Set(board.rows.map((row) => row.taskId)), listed, '这一列里的行 = 未归档卡一条不落，且不重不漏')
 })
 
 test('时长环：满圈 30 分钟，超过继续满圈但转琥珀；排队空环', () => {
@@ -514,7 +517,7 @@ test('排空不整批扫：连着派五张，每张都活着上场，台账条�
   assert.equal(ledger.list().filter((task) => task.state === 'archived').length, 5, '一共只退掉五张最老的')
 })
 
-test('棋盘分页：排空到上限后首页仍按未归档条数翻页，派单卡在某一页看得到', () => {
+test('棋盘连续滚动：排空到上限后整列都在同一块屏里，新派单卡也在这一列里', () => {
   const ledger = new TaskLedger()
   for (let i = 0; i < LEDGER_MAX_TASKS; i += 1) {
     const at = 1000 + i
@@ -527,14 +530,10 @@ test('棋盘分页：排空到上限后首页仍按未归档条数翻页，派�
   const now = LEDGER_MIN_LIVE_MS + 1_000_000
   const board = boardOf(ledger.list(), now)
   assert.equal(board.total, LEDGER_MAX_TASKS, '棋盘只数未归档的卡')
-  assert.equal(board.rows.length, BOARD_PAGE_SIZE, '每页固定 4 行')
-  assert.equal(board.page.total, Math.ceil(LEDGER_MAX_TASKS / BOARD_PAGE_SIZE), '页数按未归档条数算')
-  assert.ok(board.page.total > 2, `派单卡活着上场后首页不该只剩两页（页数=${board.page.total}）`)
-  let seen = false
-  for (let page = 0; page < board.page.total; page += 1) {
-    if (boardOf(ledger.list(), now, page).rows.some((row) => row.taskId === fresh.taskId)) seen = true
-  }
-  assert.ok(seen, '这张派单卡必须在棋盘某一页里看得到')
+  assert.equal(board.rows.length, LEDGER_MAX_TASKS, '整列一次全排完（往上滑看后面的行）')
+  assert.equal(board.page, undefined, '没有页码这一说')
+  assert.ok(board.rows.some((row) => row.taskId === fresh.taskId), '这张派单卡就在这一列里')
+  assert.ok(board.rows.length > 4, '行数比可视区多：屏上只看得见前几行，剩下的靠滚动')
 })
 
 test('等指挥台判断的卡不参与排空：待判卡不许被上限排空收走', () => {
@@ -1378,7 +1377,7 @@ test('完成页朗读分段：首段只一行、后续合并整行且不超上�
   assert.deepEqual(doneSpeechSegmentsOf(''), [], '没有正文就没有段（不合成空串）')
 })
 
-test('棋盘排序按状态而不是来源；一条一张卡；每页 4 条、页码夹在范围内', () => {
+test('棋盘排序按状态而不是来源；一条一张卡；整列一次全排完（没有页码）', () => {
   const ledger = new TaskLedger()
   const external = ledger.add({ title: '电脑端那条', projectId: 'pc:s', projectName: 'A', sessionIds: ['s'], source: 'pc', state: 'running', now: 5000 })
   const mine = ledger.add({ title: '派单那条', projectId: 'p', projectName: 'P', now: 1000 })
@@ -1391,17 +1390,13 @@ test('棋盘排序按状态而不是来源；一条一张卡；每页 4 条、�
 
   const many = new TaskLedger()
   for (let i = 1; i <= 6; i += 1) many.add({ title: `任务${i}`, projectId: `proj-${i}`, projectName: `P${i}`, now: 1000 + i })
-  const page0 = boardOf(many.list(), 9000, 0)
-  assert.equal(page0.page.total, 2, '6 条 → 2 页')
-  assert.equal(page0.page.index, 0)
-  assert.equal(page0.rows.length, BOARD_PAGE_SIZE, '每页 4 条')
-  const page1 = boardOf(many.list(), 9000, 1)
-  assert.equal(page1.page.index, 1)
-  assert.equal(page1.rows.length, 2, '第 2 页剩 2 条')
-  assert.equal(new Set([...page0.rows, ...page1.rows].map((row) => row.taskId)).size, 6, '两页不重不漏')
-  assert.equal(boardOf(many.list(), 9000, 9).page.index, 1, '页码越界夹到最后一张页')
-  assert.equal(boardOf(many.list(), 9000, -3).page.index, 0, '负数夹到第 1 页')
-  assert.equal(boardOf([], 9000).page.total, 1, '空盘也算 1 页（翻页条不出现）')
+  const full = boardOf(many.list(), 9000)
+  assert.equal(full.rows.length, 6, '6 条卡全在这一列里（往上滑看后面那些行）')
+  assert.equal(full.total, 6)
+  assert.equal(full.page, undefined, '页码字段整个没有了')
+  assert.equal(new Set(full.rows.map((row) => row.taskId)).size, 6, '这一列不重不漏')
+  assert.equal(boardOf([], 9000).rows.length, 0, '空盘这一列是空的（页面不画行）')
+  assert.equal(boardOf([], 9000).empty, true)
 })
 
 /* ---------- 台账落盘（2026-11-10：跨重启记住完成历史） ---------- */
@@ -1437,7 +1432,7 @@ test('台账落盘 → 重启读盘：完成卡、完成计数、分页都对得
   const board = boardOf(reborn.list(), now)
   assert.deepEqual(board.counts, { running: 0, awaiting: 0, queued: 0, done: 2 })
   assert.equal(board.total, 2)
-  assert.equal(board.page.total, 1, '分页按恢复出来的条数算')
+  assert.equal(board.rows.length, 2, '恢复出来的卡全在这一列里（没有分页这回事）')
   assert.deepEqual(board.rows.map((row) => row.capsule), ['完成', '完成'])
   assert.ok(board.rows.some((row) => row.taskId === first.taskId), '恢复的完成卡要上棋盘')
   const restoredFirst = reborn.get(first.taskId)
