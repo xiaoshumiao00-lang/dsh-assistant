@@ -70,6 +70,34 @@ export interface TihuLocalConfig {
   voice: {
     /** 默认云音色（edge-tts 的 zh-CN-*Neural）；空串 = 跟随 TIHU_EDGE_VOICE / 云健。 */
     edge: string
+    /**
+     * 语音结束词（2026-11-13）：强词表。缺省（undefined）= lane 内置白名单
+     * （完毕/结束/发送/over/done…），配置了就整表替换。
+     */
+    endWords?: string[] | null
+    /** 弱结束词表（好了/行了/搞定/可以了）；只允许尾部且独立成句。缺省 = 内置。 */
+    endWordsWeak?: string[] | null
+    /** 弱词开关（缺省 true）；false = 弱词一律不算结束词。 */
+    endWordWeakEnabled?: boolean | null
+    /** 结束词自动收尾总开关（缺省 true）；false = 不探针、不剥词、不自动发送。 */
+    endWordAutoSend?: boolean | null
+    /** 录音期分段探针间隔（毫秒，缺省 1200，夹 400–5000）。 */
+    segmentMs?: number | null
+    /** 每次探针带的尾部音频长度（毫秒，缺省 3200，夹 1200–8000）。 */
+    segmentTailMs?: number | null
+  }
+  /**
+   * 指挥台「判定会话」（2026-11-13 用户诉求）。
+   *
+   * 缺省（不配这一节）＝每次判定都新开一条短会话（`fresh`）：老行为是每条语音都往
+   * 同一条「鹈鹕指挥台」里追加，判定次数越多历史越长——配本地模型时首载与判定越来越慢。
+   * 想回退旧行为（复用同一条会话、历史继续累积）就写 `judge: 'reuse'`。
+   */
+  commander?: {
+    /** `fresh`（默认）＝每次判定新开一条；`reuse`＝复用同一条常驻指挥台。 */
+    judge?: 'fresh' | 'reuse'
+    /** 判定会话保留条数（1–20，默认 3，含刚建的那条）：超出后最旧的自动归档。 */
+    keep?: number
   }
 }
 
@@ -81,6 +109,11 @@ export interface TihuConfigPatch {
   }
   voice?: {
     edge?: string
+  }
+  /** 判定会话模式与保留条数（见 {@link TihuLocalConfig.commander}）。 */
+  commander?: {
+    judge?: 'fresh' | 'reuse'
+    keep?: number
   }
 }
 
@@ -310,6 +343,36 @@ function normalizeTihuModel(raw: unknown): TihuModelConfig | null {
 }
 
 /**
+ * 读盘时的结束词词表：只收字符串、去空白、去重、压长度；空表/形状错 → undefined
+ * （＝用 lane 内置默认，绝不把「配了个空数组」当成「一个词都不算」）。
+ */
+function normalizeTihuWordList(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const item of raw) {
+    if (typeof item !== 'string') continue
+    const word = item.replace(/\s+/g, ' ').trim()
+    if (word === '' || [...word].length > 24) continue
+    const key = word.toLowerCase().replace(/[\s\p{P}]+/gu, '')
+    if (key === '' || seen.has(key)) continue
+    seen.add(key)
+    out.push(word)
+    if (out.length >= 40) break
+  }
+  return out.length > 0 ? out : undefined
+}
+
+function normalizeTihuOptionalBool(raw: unknown): boolean | undefined {
+  return typeof raw === 'boolean' ? raw : undefined
+}
+
+function normalizeTihuOptionalInt(raw: unknown, min: number, max: number): number | undefined {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return undefined
+  return Math.max(min, Math.min(max, Math.round(raw)))
+}
+
+/**
  * 读盘时的 `tihu` 段归一：任何形状错误都退成「跟随默认」，绝不因为一个坏字段让整份配置失效。
  * 云音色只认清单里的名字——本地 Kokoro（zf_/zm_/数字）即使手写进文件也当没配。
  */
@@ -322,6 +385,28 @@ function normalizeTihu(raw: unknown): TihuLocalConfig {
   const voice = isPlainObject(raw.voice) ? raw.voice : {}
   const edge = typeof voice.edge === 'string' ? voice.edge.trim() : ''
   out.voice.edge = isTihuCloudVoice(edge) ? edge : ''
+  const endWords = normalizeTihuWordList(voice.endWords)
+  if (endWords !== undefined) out.voice.endWords = endWords
+  const endWordsWeak = normalizeTihuWordList(voice.endWordsWeak)
+  if (endWordsWeak !== undefined) out.voice.endWordsWeak = endWordsWeak
+  const weakEnabled = normalizeTihuOptionalBool(voice.endWordWeakEnabled)
+  if (weakEnabled !== undefined) out.voice.endWordWeakEnabled = weakEnabled
+  const autoSend = normalizeTihuOptionalBool(voice.endWordAutoSend)
+  if (autoSend !== undefined) out.voice.endWordAutoSend = autoSend
+  const segmentMs = normalizeTihuOptionalInt(voice.segmentMs, 400, 5000)
+  if (segmentMs !== undefined) out.voice.segmentMs = segmentMs
+  const segmentTailMs = normalizeTihuOptionalInt(voice.segmentTailMs, 1200, 8000)
+  if (segmentTailMs !== undefined) out.voice.segmentTailMs = segmentTailMs
+  // 判定会话（2026-11-13）：两个子键都可缺省；一个都没写就不落这一节
+  // （GET 出去的形状保持原样，老设置页不用改）。
+  if (isPlainObject(raw.commander)) {
+    const commander = raw.commander
+    const judge = commander.judge === 'reuse' ? 'reuse' : commander.judge === 'fresh' ? 'fresh' : undefined
+    const keep = normalizeTihuOptionalInt(commander.keep, 1, 20)
+    if (judge !== undefined || keep !== undefined) {
+      out.commander = { judge: judge ?? 'fresh', keep: keep ?? 3 }
+    }
+  }
   return out
 }
 
@@ -348,7 +433,7 @@ function normalizeTihuForWrite(raw: unknown): TihuConfigPatch | undefined {
   if (!isPlainObject(raw)) return undefined
   const patch: TihuConfigPatch = {}
   for (const key of Object.keys(raw)) {
-    if (key !== 'model' && key !== 'voice') return undefined
+    if (key !== 'model' && key !== 'voice' && key !== 'commander') return undefined
   }
   if ('model' in raw) {
     const model = raw.model
@@ -377,6 +462,24 @@ function normalizeTihuForWrite(raw: unknown): TihuConfigPatch | undefined {
     }
     patch.voice = next
   }
+  if ('commander' in raw) {
+    const commander = raw.commander
+    if (!isPlainObject(commander)) return undefined
+    const next: NonNullable<TihuConfigPatch['commander']> = {}
+    for (const key of Object.keys(commander)) {
+      if (key !== 'judge' && key !== 'keep') return undefined
+      if (key === 'judge') {
+        if (commander.judge !== 'fresh' && commander.judge !== 'reuse') return undefined
+        next.judge = commander.judge
+        continue
+      }
+      const keep = normalizeTihuOptionalInt(commander.keep, 1, 20)
+      if (keep === undefined) return undefined
+      next.keep = keep
+    }
+    if (Object.keys(next).length === 0) return undefined
+    patch.commander = next
+  }
   if (Object.keys(patch).length === 0) return undefined
   return patch
 }
@@ -384,12 +487,23 @@ function normalizeTihuForWrite(raw: unknown): TihuConfigPatch | undefined {
 /** 把一次 `tihu` 补丁合进已落盘的旧值：补丁里没出现的子键原样保留。 */
 function mergeTihuPatch(base: unknown, patch: TihuConfigPatch): TihuLocalConfig {
   const current = normalizeTihu(base)
-  const next: TihuLocalConfig = { model: { ...current.model }, voice: { ...current.voice } }
+  const next: TihuLocalConfig = {
+    model: { ...current.model },
+    voice: { ...current.voice },
+    ...(current.commander === undefined ? {} : { commander: { ...current.commander } }),
+  }
   if (patch.model !== undefined) {
     if ('foreground' in patch.model) next.model.foreground = patch.model.foreground ?? null
     if ('background' in patch.model) next.model.background = patch.model.background ?? null
   }
   if (patch.voice !== undefined && 'edge' in patch.voice) next.voice.edge = patch.voice.edge ?? ''
+  if (patch.commander !== undefined) {
+    const existing = next.commander ?? {}
+    next.commander = {
+      judge: patch.commander.judge ?? existing.judge ?? 'fresh',
+      keep: patch.commander.keep ?? existing.keep ?? 3,
+    }
+  }
   return next
 }
 

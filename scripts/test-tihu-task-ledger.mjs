@@ -21,6 +21,8 @@ import {
   BOARD_PAGE_SIZE,
   DONE_KEEP_MS,
   LEDGER_RESTORE_MAX,
+  LEDGER_MAX_TASKS,
+  LEDGER_MIN_LIVE_MS,
   LEDGER_SNAPSHOT_VERSION,
   RESTORED_INTERRUPTED_LINE,
   RING_FULL_MS,
@@ -327,6 +329,66 @@ test('一条任务一张卡：同项目同状态不再折叠成「+N 条」', ()
   for (const row of board.rows) assert.equal('merged' in row, false, '不再出现 +N 条合并字段')
 })
 
+test('同名只管一行：同标题多张卡合并成一行，合并行仍指向主条那条会话（会话 id 不丢）', () => {
+  const ledger = new TaskLedger()
+  // 实机形状：同一条会话上先挂了一张历史完成卡，这句话又另起了一张执行中卡；
+  // 客户端会话标题相同（只差空白），屏上就只能有一行。
+  const oldCard = ledger.add({ title: '鹈鹕判定 12 读页', projectId: 'judge', projectName: '判定', now: 1000 })
+  ledger.attachSession(oldCard.taskId, 'session-judge-a', 1000)
+  ledger.markRunning(oldCard.taskId, 1100)
+  ledger.complete(oldCard.taskId, { resultLine: '读完了', now: 1500 })
+  ledger.setSessionTitle(oldCard.taskId, '鹈鹕判定 12', 1500)
+  const liveCard = ledger.add({ title: '鹈鹕判定 12 再看一次', projectId: 'judge', projectName: '判定', now: 2000 })
+  ledger.attachSession(liveCard.taskId, 'session-judge-a', 2000)
+  ledger.markRunning(liveCard.taskId, 2200)
+  // 标题只差首尾/连续空白：同一个会话名，必须并成一行。
+  ledger.setSessionTitle(liveCard.taskId, '  鹈鹕判定   12  ', 2200)
+  // 另一条同名但会话不同的卡（不同会话撞了标题）：也只能留一行。
+  const otherSession = ledger.add({ title: '鹈鹕判定 12', projectId: 'judge2', projectName: '判定', now: 3000 })
+  ledger.attachSession(otherSession.taskId, 'session-judge-b', 3000)
+  ledger.markRunning(otherSession.taskId, 3100)
+  ledger.complete(otherSession.taskId, { resultLine: '另一条也读完了', now: 3500 })
+  ledger.setSessionTitle(otherSession.taskId, '鹈鹕判定 12 ', 3500)
+  // 不同标题绝不误并。
+  const other = ledger.add({ title: '青年基金 改写第 3 段', projectId: 'fund', projectName: '青年基金', now: 1200 })
+  ledger.attachSession(other.taskId, 'session-fund', 1200)
+
+  const board = boardOf(ledger.list(), 9000)
+  assert.equal(board.rows.length, 2, '同名三张卡只留一行：' + JSON.stringify(board.rows.map((row) => [row.taskId, row.title])))
+  const merged = board.rows.find((row) => row.title.replace(/\s+/g, ' ').trim() === '鹈鹕判定 12')
+  assert.notEqual(merged, undefined, '合并行要显示客户端会话标题原文')
+  assert.equal(merged.taskId, liveCard.taskId, '主条＝唯一执行中的那张（不是更新的历史完成卡）')
+  assert.equal(merged.state, 'running')
+  assert.equal(merged.capsule, '执行中', '状态与进度取主条如实显示')
+  // 合并行仍指向正确会话：taskId → 登记簿 → 会话 id 原样还在，语音续聊不会落到别的会话。
+  const pointed = ledger.get(merged.taskId)
+  assert.deepEqual(pointed.sessionIds, ['session-judge-a'], '合并行的会话 id 不能丢、也不能换成别人的')
+  assert.equal(pointed.projectId, 'judge')
+  // 合并只发生在展示层：真实任务一条不删，另一条同名会话的 id 仍在台账里（只是不占屏）。
+  assert.equal(ledger.list().filter((task) => task.state !== 'archived').length, 4, '台账不许删任务')
+  assert.ok(ledger.list().some((task) => task.sessionIds.includes('session-judge-b')), '被合并会话的 id 仍在台账')
+  assert.ok(board.rows.some((row) => row.taskId === other.taskId), '不同标题照旧各占一行')
+  // 页码/总数按合并后的行算（否则「下一页」会翻到空页）。
+  assert.equal(board.total, 2)
+  assert.equal(board.page.total, 1)
+
+  // 主条规则：都没有执行中/待决策时取最新活跃（完成用完成时刻）。
+  const allDone = new TaskLedger()
+  const d1 = allDone.add({ title: '同名历史', projectId: 'p', projectName: 'P', now: 1000 })
+  const d2 = allDone.add({ title: '同名历史 2', projectId: 'p', projectName: 'P', now: 1000 })
+  for (const task of [d1, d2]) {
+    allDone.attachSession(task.taskId, `s-${task.taskId}`, 1000)
+    allDone.markRunning(task.taskId, 1000)
+  }
+  allDone.complete(d1.taskId, { resultLine: '早', now: 3000 })
+  allDone.setSessionTitle(d1.taskId, '同一个标题', 3000)
+  allDone.complete(d2.taskId, { resultLine: '晚', now: 5000 })
+  allDone.setSessionTitle(d2.taskId, '同一个标题', 5000)
+  const doneBoard = boardOf(allDone.list(), 9000)
+  assert.equal(doneBoard.rows.length, 1, '同名的完成卡也只留一行')
+  assert.equal(doneBoard.rows[0].taskId, d2.taskId, '选最新完成的那张作主条')
+})
+
 test('子代理还在跑：任务保持执行中并带子任务计数；全部结束才允许完成', () => {
   const ledger = new TaskLedger()
   const task = ledger.add({ title: '主会话', projectId: 'p', projectName: 'P', now: 1000 })
@@ -409,6 +471,82 @@ test('内存上限：超了先归档最老的完成态，会话不删', () => {
   ledger.prune(DONE_KEEP_MS + 10)
   assert.equal(first.state, 'archived')
   assert.deepEqual(first.sessionIds, ['session-keep'], '归档不动会话')
+})
+
+/* ---------- 内存上限排空（用户 2026-11-14 定调：只改状态归档，绝不删条目） ---------- */
+
+test('排空闸门只数未归档卡：满 60 张后再派一张，只退最老的那一张，刚建的卡不许当场归档', () => {
+  const lines = []
+  const ledger = new TaskLedger((line) => lines.push(line))
+  const base = 1000
+  for (let i = 0; i < LEDGER_MAX_TASKS; i += 1) {
+    const at = base + i
+    const task = ledger.add({ title: `灌满 ${i + 1}`, projectId: 'p', projectName: 'P', now: at })
+    ledger.complete(task.taskId, { resultLine: '跑完了', now: at })
+  }
+  assert.equal(ledger.list().filter((task) => task.state !== 'archived').length, LEDGER_MAX_TASKS, '满额不该归档任何东西')
+  assert.equal(lines.length, 0)
+
+  const fresh = ledger.add({ title: '派单卡', projectId: 'p', projectName: 'P', now: LEDGER_MIN_LIVE_MS + 10_000 })
+  assert.equal(fresh.state, 'queued', '刚建的派单卡不许在自己这一趟排空里死于出生')
+  assert.equal(ledger.list().filter((task) => task.state !== 'archived').length, LEDGER_MAX_TASKS, '未归档卡条数要压回上限')
+  assert.equal(ledger.size(), LEDGER_MAX_TASKS + 1, '只改状态：台账条目一条都没少')
+  assert.deepEqual(ledger.list().filter((task) => task.state === 'archived').map((task) => task.title), ['灌满 1'], '退的是最老的完成卡')
+  assert.equal(lines.length, 1, '排掉一张落一行 journal')
+  assert.ok(lines[0].includes('灌满 1'), `journal 只许写排掉的那张：${lines[0]}`)
+  assert.ok(!lines[0].includes('派单卡'), '刚建的那张不许被排空收走')
+})
+
+test('排空不整批扫：连着派五张，每张都活着上场，台账条目只增不减', () => {
+  const ledger = new TaskLedger()
+  for (let i = 0; i < LEDGER_MAX_TASKS; i += 1) {
+    const at = 1000 + i
+    const task = ledger.add({ title: `灌满 ${i + 1}`, projectId: 'p', projectName: 'P', now: at })
+    ledger.complete(task.taskId, { resultLine: '跑完了', now: at })
+  }
+  for (let i = 0; i < 5; i += 1) {
+    const at = LEDGER_MIN_LIVE_MS + 20_000 + i * (LEDGER_MIN_LIVE_MS + 10_000)
+    const card = ledger.add({ title: `连着派 ${i + 1}`, projectId: 'p', projectName: 'P', now: at })
+    assert.notEqual(card.state, 'archived', `连着派第 ${i + 1} 张死于出生`)
+    assert.equal(ledger.list().filter((task) => task.state !== 'archived').length, LEDGER_MAX_TASKS, '每张都只退一张')
+  }
+  assert.equal(ledger.size(), LEDGER_MAX_TASKS + 5, '条目一条都没删')
+  assert.equal(ledger.list().filter((task) => task.state === 'archived').length, 5, '一共只退掉五张最老的')
+})
+
+test('棋盘分页：排空到上限后首页仍按未归档条数翻页，派单卡在某一页看得到', () => {
+  const ledger = new TaskLedger()
+  for (let i = 0; i < LEDGER_MAX_TASKS; i += 1) {
+    const at = 1000 + i
+    const task = ledger.add({ title: `灌满 ${i + 1}`, projectId: 'p', projectName: 'P', now: at })
+    ledger.complete(task.taskId, { resultLine: '跑完了', now: at })
+  }
+  const at = LEDGER_MIN_LIVE_MS + 10_000
+  const fresh = ledger.add({ title: '派单卡', projectId: 'p', projectName: 'P', now: at })
+  ledger.attachSession(fresh.taskId, 'session-new', at)
+  const now = LEDGER_MIN_LIVE_MS + 1_000_000
+  const board = boardOf(ledger.list(), now)
+  assert.equal(board.total, LEDGER_MAX_TASKS, '棋盘只数未归档的卡')
+  assert.equal(board.rows.length, BOARD_PAGE_SIZE, '每页固定 4 行')
+  assert.equal(board.page.total, Math.ceil(LEDGER_MAX_TASKS / BOARD_PAGE_SIZE), '页数按未归档条数算')
+  assert.ok(board.page.total > 2, `派单卡活着上场后首页不该只剩两页（页数=${board.page.total}）`)
+  let seen = false
+  for (let page = 0; page < board.page.total; page += 1) {
+    if (boardOf(ledger.list(), now, page).rows.some((row) => row.taskId === fresh.taskId)) seen = true
+  }
+  assert.ok(seen, '这张派单卡必须在棋盘某一页里看得到')
+})
+
+test('等指挥台判断的卡不参与排空：待判卡不许被上限排空收走', () => {
+  const ledger = new TaskLedger()
+  const waitCard = ledger.add({ title: '待判', projectId: 'wt-assistant', projectName: '个人助手', waitingCommander: true, now: 1000 })
+  for (let i = 0; i < LEDGER_MAX_TASKS + 2; i += 1) {
+    const at = LEDGER_MIN_LIVE_MS * (i + 2) + 10_000
+    const task = ledger.add({ title: `灌满 ${i + 1}`, projectId: 'p', projectName: 'P', now: at })
+    ledger.complete(task.taskId, { resultLine: '跑完了', now: at })
+  }
+  assert.equal(waitCard.state, 'queued', '待判卡还在等判断，排空不许动它')
+  assert.equal(ledger.list().filter((task) => task.state !== 'archived').length, LEDGER_MAX_TASKS, '未归档条数仍在上限内')
 })
 
 test('自动归档也要落 journal 一行（不能悄悄丢）', () => {
@@ -823,6 +961,35 @@ test('任务详情（屏 4）：回合结束后改「第 N 步 · 已结束」�
   assert.ok(frame.bullets[0].includes('已结束'), '最新状态行也标结束：' + frame.bullets[0])
   assert.equal(frame.tone, 'ok')
 })
+
+test('任务详情（屏 4）：后台 agent 进度追加在前台条目之后、统计行之前（最新一条优先）', () => {
+  const frame = detailFrame({
+    taskId: 't4d', title: '后台还在写报告', liveLine: '', step: 3, elapsedMs: 120_000,
+    statsLine: '88 tok/s · 3.2k tok · 上下文 12%', ended: true,
+    backgroundLines: ['运行命令 · 重新构建', '工具调用 · pwsh · {"command":"node build.mjs"}'],
+  })
+  assert.equal(frame.bullets.length, 4, '后台两条 + 步数 + 统计 = 4 行，不溢出：' + JSON.stringify(frame.bullets))
+  assert.equal(frame.bullets[0], '第 3 步 · 已结束', '前台原有步数行保留在前')
+  assert.equal(frame.bullets[1], '运行命令 · 重新构建')
+  assert.ok(frame.bullets[2].startsWith('工具调用 · pwsh'), '最新一条后台状态行：' + JSON.stringify(frame.bullets))
+  assert.ok(frame.bullets[3].includes('88 tok/s'), '统计行仍是最后一行')
+  assert.equal(frame.statsTail, 1)
+  assert.equal(frame.bullets.some((line) => line.includes('本轮没有新状态')), false, '后台有实时进度时不再写「本轮没有新状态」占位')
+})
+
+test('任务详情（屏 4）：前台 live 行在场时后台只占剩下的行、超出的丢最旧', () => {
+  const frame = detailFrame({
+    taskId: 't4e', title: '前台还在跑', liveLine: '工具调用 · click · {"x":1}', step: 2, elapsedMs: 5_000,
+    statsLine: '统计中…',
+    backgroundLines: ['思考 · 第一件事', '思考 · 第二件事', '思考 · 第三件事'],
+  })
+  assert.equal(frame.bullets.length, 4, '最多 4 行：' + JSON.stringify(frame.bullets))
+  assert.equal(frame.bullets[0], '工具调用 · click · {"x":1}', '前台 live 行原样保留')
+  assert.equal(frame.bullets[1], '第 2 步 · 已用 5s')
+  assert.equal(frame.bullets[2], '思考 · 第三件事', '只留最新的后台条目：' + JSON.stringify(frame.bullets))
+  assert.equal(frame.bullets[3], '统计中…')
+})
+
 
 test('任务详情：超长任务名一行省略（不折行挤掉正文）', () => {
   const frame = detailFrame({

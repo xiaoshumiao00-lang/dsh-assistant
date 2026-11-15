@@ -31,8 +31,14 @@ export const ANNOUNCE_WINDOW_MS = 8_000
 export const ANNOUNCE_SINGLE_DELAY_MS = 400
 /** 棋盘每页行数（与屏幕 320×240 的可读行数一致）。 */
 export const BOARD_PAGE_SIZE = 4
-/** 登记簿内存上限：棋盘只显示最近这些，更早的直接归档。 */
+/** 登记簿内存上限＝**未归档卡片**的上限（归档条目仍留在台账里，不占这个名额）：棋盘只显示最近这些，更早的直接归档。 */
 export const LEDGER_MAX_TASKS = 60
+/**
+ * 最小存活窗（毫秒）：刚建／刚派单／刚接会话／刚动过的卡片一律不参与上限排空。
+ * 没有这道窗，一张刚新建的排队卡会在同一次 `add()` 里就被排空分支收走：
+ * journal 留下一行「用时 0s / 无会话 / 已归档」——派单卡死于出生，永远上不了屏。
+ */
+export const LEDGER_MIN_LIVE_MS = 5 * 60_000
 /** 完成/已播报态在棋盘上留多久后自动归档（毫秒）：用户要求至少 3 天，不能更早。 */
 export const DONE_KEEP_MS = 3 * 24 * 60 * 60_000
 /**
@@ -224,6 +230,44 @@ export function boardTitleOf(task: TihuTask): string {
   return String(task.title ?? '').trim()
 }
 
+/**
+ * 棋盘去重键：最终展示的标题，只做首尾/连续空白规范化。
+ *
+ * 用户 2026-11-13：同一个会话名在看板上只占一行。键必须取**屏上真正显示的那串**
+ * （客户端会话标题原文，见 {@link boardTitleOf}）；但不能整串逐字节比：客户端标题末尾
+ * 多一个换行、中间多两个空格仍是同一个名字。除空白外一个字都不许动——大小写、
+ * 标点、省略号都算不同标题，**绝不误并**。
+ */
+export function boardTitleKeyOf(task: TihuTask): string {
+  return boardTitleOf(task).replace(/\s+/g, ' ').trim()
+}
+
+/** 棋盘用的「最新动静时刻」：完成家族用完成时刻，其余用最后变化。 */
+function boardActivityOf(task: TihuTask): number {
+  return isFinishedState(task.state) ? task.finishedAt ?? task.updatedAt : task.updatedAt
+}
+
+/**
+ * 同标题多张卡时选主条（合并行指向谁）：执行中（含子代理在跑）→ 待决策 → 最新活跃 → 短号。
+ *
+ * 为什么执行中优先：合并行要如实显示状态与进度，正在跑的那张才是用户此刻关心、
+ * 也是语音续聊该落到的那条；同标题的老卡（完成家族）只是历史。没有执行中/待决策时取
+ * 最新动过的那张（完成用完成时刻）。最后按短号定序，保证同一份台账每轮算出的主条完全稳定。
+ */
+export function boardLeaderOf(a: TihuTask, b: TihuTask): TihuTask {
+  const rank = (task: TihuTask): number => {
+    if (task.state === 'running') return 0
+    if (task.state === 'dispatched' && (task.childRunning ?? 0) > 0) return 0
+    if (task.state === 'awaiting') return 1
+    return 2
+  }
+  const byRank = rank(a) - rank(b)
+  if (byRank !== 0) return byRank < 0 ? a : b
+  const byTime = boardActivityOf(b) - boardActivityOf(a)
+  if (byTime !== 0) return byTime < 0 ? a : b
+  return a.taskId.localeCompare(b.taskId) <= 0 ? a : b
+}
+
 /** 任务行（棋盘一行）。待决策行给琥珀问号，不显示时长。 */
 export function rowOf(task: TihuTask, now: number): TaskBoardRow {
   const row: TaskBoardRow = {
@@ -285,7 +329,7 @@ export function boardRowIndex(raw: unknown): number {
 }
 
 /**
- * 棋盘数据：一条任务一张卡（不再折叠成「+N 条」）。
+ * 棋盘数据：一条任务一张卡（不再折叠成「+N 条」）；**同名只留一张卡**。
  *
  * 排序（用户 2026-11-10 定案）：
  *   1. 待决策最前（连同它所属项目优先）；
@@ -293,6 +337,12 @@ export function boardRowIndex(raw: unknown): number {
  *   3. 其余按时间倒序。
  * 「项目优先」指：同一类别里，若有同项目的任务正在等你拍板，这个项目的其它任务排前面；
  * 最终 tie-break 仍是时间，再不行才用「鹈鹕派单优先」（保证顺序稳定）。
+ *
+ * 同名合并（用户 2026-11-13）：键＝最终展示标题（{@link boardTitleKeyOf}），同一条会话
+ * 可能挂着多张历史卡、也可能是两条标题撞车的不同会话——屏上只留一行，主条按
+ * {@link boardLeaderOf} 选（执行中 → 待决策 → 最新活跃 → 短号），状态/进度取主条的。
+ * 合并只在**展示层**：台账与 `sessionIds` 一条不丢，行上的 taskId 仍是主条原号，
+ * 点行、撤单、语音续聊都落到主条那条会话。
  */
 export function boardOf(tasks: readonly TihuTask[], now: number, page = 0): TaskBoardPayload {
   const live = tasks.filter((task) => task.state !== 'archived')
@@ -315,7 +365,22 @@ export function boardOf(tasks: readonly TihuTask[], now: number, page = 0): Task
     if (byPin !== 0) return byPin
     return a.taskId.localeCompare(b.taskId)
   })
-  const rows: TaskBoardRow[] = sorted.map((task) => rowOf(task, now))
+  // 同名只留一行：按最终展示标题归组，主条原地替换（保持第一次出现的行位置）。
+  const leaders: TihuTask[] = []
+  const leaderIndex = new Map<string, number>()
+  for (const task of sorted) {
+    const key = boardTitleKeyOf(task)
+    const at = leaderIndex.get(key)
+    if (at === undefined) {
+      leaderIndex.set(key, leaders.length)
+      leaders.push(task)
+      continue
+    }
+    const leader = leaders[at]
+    const next = boardLeaderOf(leader, task)
+    if (next !== leader) leaders[at] = next
+  }
+  const rows: TaskBoardRow[] = leaders.map((task) => rowOf(task, now))
   const totalPages = Math.max(1, Math.ceil(rows.length / BOARD_PAGE_SIZE))
   const index = Math.max(0, Math.min(Math.trunc(page), totalPages - 1))
   const counts = countsOf(tasks)
@@ -628,7 +693,9 @@ export class TaskLedger {
     }
     this.tasks.set(task.taskId, task)
     // 用同一只时钟剪枝：调用方传了 now（单测假时钟）就不能拿真实时间比 3 天窗口。
-    this.prune(now)
+    // 刚建出来的这一张点名保护：它可能连会话都还没挂上（派单卡先落卡、再 attachSession），
+    // 绝不允许在同一趟排空里把自己归档掉。
+    this.prune(now, { protectTaskId: task.taskId })
     this.notifyChange()
     return task
   }
@@ -1037,14 +1104,31 @@ export class TaskLedger {
     return journalLineOf(task)
   }
 
-  /** 内存上限：先归档最老的完成态，再归档最老的空闲任务（自动归档也落 journal 一行）。 */
-  prune(now = Date.now()): void {
+  /**
+   * 内存上限：先归档最老的完成态，再归档最老的空闲任务（自动归档也落 journal 一行）。
+   *
+   * 闸门数的是**未归档的活跃卡片条数**，不是台账条目总数：`archive()` / `drop()` 只改状态、
+   * 条目一律留在簿上（用户 2026-11-14 定调：台账超上限的会话只归档、绝不删条目；删条目只有
+   * `clear()` 这一条路，排空不许走到它）。原先按 `this.tasks.size` 做闸门时 size 单调上涨
+   * 永不回落，于是 `while (size > LEDGER_MAX_TASKS)` 每一次都退不干净——每张新卡片（含刚在
+   * `add()` 里建出来的那张派单卡）都在自己这一趟排空里被当场归档，journal 因此出现一串
+   * 「用时 0s / 无会话 / 已归档」，派单永不上屏。
+   *
+   * `guard.protectTaskId`：刚建的那张卡不参与排空；`minLiveMs`：刚动过（含刚接会话）的卡
+   * 也不参与，等指挥台判断的卡同样不排空（它们迟早会在下一趟排空里退掉）。
+   */
+  prune(now = Date.now(), guard: { protectTaskId?: string; minLiveMs?: number } = {}): void {
     const keep = (taskId: string): void => {
       const line = this.archive(taskId, now)
       if (line !== undefined) this.journal?.(line)
     }
-    if (this.tasks.size <= LEDGER_MAX_TASKS) {
-      for (const task of this.tasks.values()) {
+    const rawMinLive = guard.minLiveMs
+    const minLiveMs = typeof rawMinLive === 'number' && Number.isFinite(rawMinLive) ? Math.max(0, rawMinLive) : LEDGER_MIN_LIVE_MS
+    // 未归档的才算占用上限的额度（归档掉的条目仍在台账里，只是不再算「活跃」）。
+    const live = (): TihuTask[] => this.list().filter((task) => task.state !== 'archived')
+    let liveCount = live().length
+    if (liveCount <= LEDGER_MAX_TASKS) {
+      for (const task of live()) {
         if (isFinishedState(task.state) && task.finishedAt !== undefined && now - task.finishedAt > DONE_KEEP_MS) keep(task.taskId)
         // 电脑端外部会话：静置超过同一个 3 天窗口就下屏（与完成态的归档窗口同一条规则），
         // 不因为「它一直没跑完」就永远占着棋盘。
@@ -1052,10 +1136,15 @@ export class TaskLedger {
       }
       return
     }
-    const byAge = this.list().filter((task) => isFinishedState(task.state) || task.state === 'queued' || task.state === 'dispatched')
-    while (this.tasks.size > LEDGER_MAX_TASKS && byAge.length > 0) {
-      const oldest = byAge.shift()
-      if (oldest !== undefined) keep(oldest.taskId)
+    const byAge = live()
+      .filter((task) => isFinishedState(task.state) || task.state === 'queued' || task.state === 'dispatched')
+      .filter((task) => task.taskId !== guard.protectTaskId && task.waitingCommander !== true && now - task.updatedAt >= minLiveMs)
+      .sort((a, b) => a.updatedAt - b.updatedAt)
+    // 按额度退：排空只把「未归档条数」压回上限，归档一条就少一条活跃卡，这趟一定能走完。
+    for (const task of byAge) {
+      if (liveCount <= LEDGER_MAX_TASKS) break
+      keep(task.taskId)
+      liveCount -= 1
     }
   }
 
@@ -1210,6 +1299,41 @@ export type TaskRoute =
 
 /** 项目命中「够格单独定落点」的置信下限（用户 2026-11-10：低于 0.3 不算数）。 */
 export const PROJECT_MATCH_CONFIDENT = 0.3
+
+/**
+ * 泛称呼（不是「点名项目」）：只靠这些词命中的项目卡，不能当成用户已经选好了落点。
+ *
+ * 2026-11-13 用户口径：弱命中（只靠项目别名/泛关键词，比如「助手」「Assistant」「个人助手」）
+ * 不允许直接派单，必须屏上确认。这里只收**泛到没有区分度**的说法；具体项目名不在此列。
+ */
+const GENERIC_PROJECT_WORDS: ReadonlySet<string> = new Set([
+  '助手', '小助手', '个人助手', '私人助手', '我的助手', 'ai助手', '智能助手',
+  'assistant', 'theassistant', 'personalassistant', 'aiassistant',
+])
+
+/** 这个项目名/文件夹短名是不是泛称呼（「助手 / Assistant / 个人助手」这类）。 */
+export function isGenericProjectName(value: string): boolean {
+  const clean = normalizeAlias(value)
+  if (clean === '') return false
+  if (GENERIC_PROJECT_WORDS.has(clean)) return true
+  // 「Assistant / DSH-Assistant / wt-assistant / 个人助手」在语音里是同一类泛称呼：
+  // 用户说「（那个）Assistant」时并没有点名某个具体项目（2026-11-13 实机 t23 的教训）。
+  return clean.includes('assistant') || clean.endsWith('助手')
+}
+
+/**
+ * 这次项目命中算不算「用户点名了这个项目」。
+ *
+ * 强命中＝整名命中、不是泛称呼（「助手 / Assistant / 个人助手」）、置信 ≥0.3。
+ * 其余（文件夹短名、片段、泛称呼、低置信）都只能算线索，不能单独定落点。
+ */
+export function isNamedProjectHit(route: TaskRoute, text: string): boolean {
+  if (route.kind !== 'card') return false
+  if (route.via !== 'name') return false
+  if (!isConfidentProjectRoute(route)) return false
+  if (isGenericProjectName(route.matched) || isGenericProjectName(route.card.name)) return false
+  return true
+}
 
 /** 打分 → 置信分：整名/文件夹命中视为确定；片段命中按命中字数折算（2 字 0.2、3 字 0.3）。 */
 export function projectMatchConfidenceOf(score: number, via: 'name' | 'folder' | 'fragment'): number {

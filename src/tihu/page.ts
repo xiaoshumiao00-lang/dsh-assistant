@@ -502,6 +502,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     done: null, doneRanges: null,
     /* 完成页当前这条任务（playback.state 与暂停点都要带 taskId） */
     doneTaskId: '',
+    /* 进度页当前这条任务（2026-11-13）：进度屏上录音/发指令时随上行带给宿主做硬绑定（续聊回这条任务）。 */
+    progressTaskId: '',
     /* 段级续播：暂停时记下第几段（1 起），继续时宿主从该段第一个字重发 PCM。
        采样级暂停不可靠（WebAudio 时间轴 + suspended 时丢块），所以只做段级。 */
     pausedAt: null,
@@ -968,6 +970,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     // 回执/待决策的附加块每帧先收掉，只有本帧带了才重画（否则上一帧的圆点/倒计时会留在屏上）。
     renderSteps(payload && payload.steps);
     renderCountdown(payload && payload.countdown);
+    /* 进度页现场（2026-11-13）：这一帧是不是「某条任务的进度页」（detailFrame 的 stage='进度'）。
+       是就记住 taskId，录音/发指令时随上行带给宿主硬绑定回这条任务的会话；离开进度页立刻清空。 */
+    state.progressTaskId = payload && payload.stage === '进度' && payload.taskId ? String(payload.taskId) : '';
     // 任务棋盘（屏 1，含空态）：mode 也是 home，但走 board 分支（行是任务不是项目）。
     if (payload && payload.board) {
       renderBoard(payload);
@@ -1626,6 +1631,19 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     payload.taskId = state.doneTaskId;
     return payload;
   }
+  /* 进度页现场（2026-11-13）：任务进度页上按录音或发指令，也要和读页一样硬绑定回**这条任务**的
+     会话续聊。与读页共用同一形状（screenHint + taskId），只是取值 'progress'；两块屏互斥
+     （完成页 vs 进度页），读页那一支一字不改，进度页只在「状态屏 + stage=进度 + 有 taskId」时生效。
+     没有进度页现场（普通状态页、棋盘、回执/待决策/澄清）就不带字段，宿主完全按原逻辑走。 */
+  function screenHint(payload) {
+    var hinted = readHint(payload);
+    if (hinted.screenHint !== undefined) return hinted;
+    if (state.screenMode === 'status' && state.progressTaskId) {
+      hinted.screenHint = 'progress';
+      hinted.taskId = state.progressTaskId;
+    }
+    return hinted;
+  }
   /* ---------- 设备回执 / 播放状态（2026-11-10，规格书 §6.2） ----------
      宿主下发带 opId 的下行（playback.control / voice.listen / session.ended / device.config）
      必须回一条 device.ack，否则工具只能等 1.5 秒超时、给用户一句「设备未回执」。
@@ -1979,7 +1997,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function uploadWav(arrayBuffer, label) {
     decodeAndResample(arrayBuffer).then(function (result) {
       addEvent('progress', label + '：' + result.durationMs + ' ms，已上行，等待转写…');
-      send('audio.frame', readHint({
+      send('audio.frame', screenHint({
         format: 'wav', sampleRate: 16000, channels: 1, bits: 16,
         audioBase64: toBase64(result.wav), durationMs: result.durationMs
       }));
@@ -2057,7 +2075,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   $('send').onclick = function () {
     var text = $('text').value.trim();
     if (!text) return;
-    send('text.input', readHint({ text: text, source: 'keyboard' }));
+    send('text.input', screenHint({ text: text, source: 'keyboard' }));
     state.droppedAudio = false;
     hideAudioWarn();
     $('transcript').textContent = text;
@@ -2191,7 +2209,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       listenEnd();
       if (said === '') return;   // 只叫了唤醒词没说话：不算一次唤醒
       stopPcm();
-      send('text.input', readHint({ text: said, source: 'voice' }));
+      send('text.input', screenHint({ text: said, source: 'voice' }));
       addEvent('progress', '免按住：' + said);
     }, 3000);
   }

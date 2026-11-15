@@ -354,6 +354,36 @@ function entryLine(entry: TihuActivityEntry): string {
   return fitLine(text, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
 }
 
+/**
+ * 后台 agent 的实时进度行（2026-11-13）：**同一套条目渲染**（`标签 · 明细` 明细行 ＋ 最新状态行），
+ * 只取最新的 max 行、最新一条在最后。
+ *
+ * 为什么单独一条：后台子会话有自己的 applySessionEvent 投影（lane 的 backgroundProgress），
+ * 父任务进度页只认自己的 progressState；两边共用这里的 entryLine/fitLine 口径，
+ * 屏上两种进度条目的排版完全一致，也不会把两批事件混进同一个数组里乱序。
+ */
+export function backgroundProgressLines(state: TihuProgressState | undefined, max = 2): string[] {
+  if (state === undefined || max <= 0) return []
+  const lines: string[] = []
+  const details = new Set<string>()
+  for (const entry of state.activity.slice(-2)) {
+    lines.push(entryLine(entry))
+    details.add(entry.detail)
+  }
+  const live = String(state.lastEventLine ?? '').trim()
+  if (live !== '') {
+    // 最新状态行与刚入栈的明细可能是同一件事（回答/回复同一句）：只留一条，别占两行。
+    const detail = live.includes(' · ') ? live.slice(live.indexOf(' · ') + 3) : live
+    if (!details.has(detail)) lines.push(fitLine(live, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx))
+  }
+  const unique: string[] = []
+  for (const line of lines) {
+    if (line === '' || unique.includes(line)) continue
+    unique.push(line)
+  }
+  return unique.slice(-Math.max(1, Math.trunc(max)))
+}
+
 /** 第四行统计（解码速度 · 总 token · 上下文）。 */
 function statsLine(stats: TihuProgressState['stats']): string {
   if (stats === undefined) return ''
