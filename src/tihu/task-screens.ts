@@ -331,8 +331,14 @@ export function doneSpeechSegmentsOf(text: string, maxChars: number = DONE_SPEEC
 /**
  * 任务进度（屏 4）：**实时**一屏——标题是任务名，正文只有「最新一条状态 + 第 N 步/已用 + tokens」。
  * 最新状态行由宿主按事件重算（applySessionEvent 的 lastEventLine），页面不做翻译。
+ *
+ * 2026-11-13 增量：前台回合结束、后台 agent 还在跑时（棋盘那行绿灯/呼吸点），在**原有前台条目之后、
+ * 统计行之前**追加后台 agent 的实时进度行（同一套 `标签 · 明细` 条目渲染，见
+ * progress.ts 的 backgroundProgressLines）。前台三行一条不动，后台行按 maxBodyLines 截断，
+ * 最后一行恒为统计（statsTail=1）；320×240 最多 4 行正文，页面单行 nowrap + ellipsis。
  */
 export function detailFrame(input: {
+  /** 这条进度页所属任务（2026-11-13：页面拿它做进度页硬绑定，录音/发指令都续聊回这条任务的会话）。 */
   taskId: string
   /** 会话标题／任务标题（一行，超长省略）。 */
   title: string
@@ -343,21 +349,40 @@ export function detailFrame(input: {
   /** `82 tok/s · 12.3k tok · 上下文 41%`。 */
   statsLine: string
   /**
+   * 后台 agent 的实时进度行（2026-11-13）：前台回合结束、子代理还在跑时由宿主追加。
+   * 只放最新几条，超出屏幕容量由这里按 maxBodyLines 截断（保留最新的）。
+   */
+  backgroundLines?: readonly string[]
+  /**
    * 这一轮已经结束（turn/end / 任务完成）：步数行改「第 N 步 · 已结束」。
    * 用户 2026-11-10 实机：结束之后「已用 3m28s」还在按 now 长，必须停住并显式标结束。
    */
   ended?: boolean
 }): ScreenFramePayload {
   const ended = input.ended === true
-  const liveLine = fitLine(input.liveLine || (ended ? '已结束 · 本轮没有新状态' : '思考 · 模型推理中…'), CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
+  const background = (input.backgroundLines ?? [])
+    .map((line) => fitLine(line, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx))
+    .filter((line) => line !== '')
+  // 前台这一轮没有任何状态、但后台 agent 还有实时进度：不要再写「本轮没有新状态」占位
+  // （那与绿灯在闪互相矛盾），把这一格让给后台条目——原始条目一条不动。
+  const rawLive = String(input.liveLine ?? '').trim()
+  const placeholder = ended ? '已结束 · 本轮没有新状态' : '思考 · 模型推理中…'
+  const liveLine = rawLive !== ''
+    ? fitLine(rawLive, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
+    : (background.length > 0 ? '' : fitLine(placeholder, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx))
   const stepLine = fitLine(ended
     ? `第 ${input.step} 步 · 已结束`
     : `第 ${input.step} 步 · 已用 ${formatUsedMs(input.elapsedMs)}`, CONTENT_WIDTH_PX, SCREEN_SPEC.bodyFontPx)
   const statsLine = fitLine(input.statsLine === '' ? '统计中…' : input.statsLine, CONTENT_WIDTH_PX, SCREEN_SPEC.statsFontPx)
+  // 前台原有条目原样保留；后台条目按同一正文口径追加，只占「统计行之外」剩下的行，最新一条优先。
+  const body: string[] = [liveLine, stepLine].filter((line) => line !== '')
+  const room = Math.max(0, SCREEN_SPEC.maxBodyLines - body.length - 1)
+  body.push(...background.slice(-room))
+  body.push(statsLine)
   return {
     stage: '进度',
     title: clipScreenTitle(input.title === '' ? '任务进度' : input.title),
-    bullets: [liveLine, stepLine, statsLine].filter((line) => line !== ''),
+    bullets: body,
     statsTail: 1,
     actions: [
       { id: 'taskStop', label: '停止' },
@@ -552,6 +577,58 @@ export function intentClarifyFrame(input: {
       },
     }),
     actions: input.alreadyAsked === true ? [{ id: 'taskBoard', label: '主页' }] : [{ id: 'pick1', label: '干活' }, { id: 'pick2', label: '不管' }],
+    tone: 'alert',
+    mode: 'status',
+  }
+}
+
+/**
+ * 兜底派单确认（2026-11-13）：指挥台忙/超时，本地又只有弱命中（「助手 / Assistant / 个人助手」
+ * 这类泛词、文件夹短名、片段）或完全判不出项目时，**不许凭这点线索直接派单**。
+ *
+ * 屏上只问一句「这句要派到哪个项目？」：1..N 是候选项目，最后一格是「先不管」。
+ * 用户答完由 lane 把**原来那句**（不是这一声「一」）按 via=fallback-confirm 派出去；
+ * 不答或答不明白就把这句丢掉——宁可问一句，也不许派错。
+ */
+export function projectConfirmFrame(input: {
+  /** 用户原话（放在 ask 候选的 source 行，不占正文四行）。 */
+  text: string
+  /** 候选项目卡（最多 3 张，按最像的排在前面）。 */
+  cards: readonly { name: string }[]
+  /** 同一句已经问过一次：这屏只说「判不准，重说」，不再给选项（也绝不派单）。 */
+  alreadyAsked?: boolean
+  taskId?: string
+}): ScreenFramePayload {
+  const chars = [...String(input.text ?? '')]
+  const shown = chars.length > 12 ? `${chars.slice(0, 11).join('')}…` : chars.join('')
+  const cards = input.cards.slice(0, 3)
+  const labelOf = (name: unknown): string => {
+    const text = String(name ?? '').trim() || '未命名项目'
+    const chars = [...text]
+    return chars.length > 8 ? `${chars.slice(0, 7).join('')}…` : text
+  }
+  if (input.alreadyAsked === true) {
+    return {
+      stage: '澄清',
+      title: clipScreenTitle('这句我判不准'),
+      bullets: fitScreenLines([shown, '判不准，请重说：要派到哪个项目'], SCREEN_SPEC.maxBodyLines),
+      actions: [{ id: 'taskBoard', label: '主页' }],
+      ...(input.taskId === undefined ? {} : { taskId: input.taskId }),
+      tone: 'alert',
+      mode: 'status',
+    }
+  }
+  const bullets = cards.map((card, index) => `${index + 1}) ${labelOf(card.name)}`)
+  bullets.push(`${cards.length + 1}) 先不管（这句先不派）`)
+  const actions = cards.map((card, index) => ({ id: `pick${index + 1}`, label: labelOf(card.name) }))
+  actions.push({ id: 'pickNone', label: '先不管' })
+  return {
+    stage: '澄清',
+    title: clipScreenTitle('这句要派到哪个项目？'),
+    bullets: fitScreenLines(bullets, SCREEN_SPEC.maxBodyLines),
+    ask: { candidates: cards.map((card, index) => ({ index: index + 1, projectName: labelOf(card.name), source: shown })) },
+    actions,
+    ...(input.taskId === undefined ? {} : { taskId: input.taskId }),
     tone: 'alert',
     mode: 'status',
   }

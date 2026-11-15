@@ -149,9 +149,12 @@ export interface AudioFramePayload {
   audioBase64: string
   /** 时长（毫秒），仅日志与上限判断。 */
   durationMs?: number
-  /** 来源屏（2026-11-13）：从朗读页发来的指令带 'read'，宿主据此把这一句硬绑定回正在念的那条会话。 */
-  screenHint?: 'read'
-  /** 朗读页正在念的那条任务（宿主拿它找对应会话；查不到就不硬绑，按原逻辑走）。 */
+  /**
+   * 来源屏（2026-11-13）：朗读页发来的指令带 'read'、任务进度页发来的带 'progress'。
+   * 宿主据此把这一句**硬绑定**回那块屏所属任务的会话（判断照旧交给指挥台，结论只用于理解）。
+   */
+  screenHint?: 'read' | 'progress'
+  /** 朗读页正在念的那条 / 进度页正在看的那条任务（宿主拿它找对应会话；查不到就不硬绑，按原逻辑走）。 */
   taskId?: string
 }
 
@@ -160,9 +163,9 @@ export interface TextInputPayload {
   text: string
   /** 来源：语音转写 / 键盘输入 / 撤回重说。 */
   source?: 'voice' | 'keyboard' | 'retry'
-  /** 来源屏（2026-11-13）：从朗读页发来的指令带 'read'，宿主据此把这一句硬绑定回正在念的那条会话。 */
-  screenHint?: 'read'
-  /** 朗读页正在念的那条任务（宿主拿它找对应会话；查不到就不硬绑，按原逻辑走）。 */
+  /** 来源屏（2026-11-13）：朗读页发来的指令带 'read'、任务进度页发来的带 'progress'。 */
+  screenHint?: 'read' | 'progress'
+  /** 朗读页正在念的那条 / 进度页正在看的那条任务（宿主拿它找对应会话；查不到就不硬绑，按原逻辑走）。 */
   taskId?: string
 }
 
