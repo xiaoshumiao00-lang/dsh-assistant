@@ -395,8 +395,9 @@ export function detailFrame(input: {
 }
 
 /**
- * 完成页（屏 6）：**大标题是任务/会话标题**（不是回答第一句），下面是回答摘要
- * 7 行窗口（当前朗读行反白），状态行给「完成 · N/M」与「另有 N 条」。
+ * 完成页（屏 6）：**大标题是任务/会话标题**（不是回答第一句），下面是回答正文整列
+ * （当前朗读行反白）：屏上放得下多少行由这块区域的真实剩余高度决定，一屏放不下的行
+ * 手指往上滑在这同一列里连续看——没有页码、没有翻页控件。状态行给「完成 · N/M」与「另有 N 条」。
  */
 export function doneFrame(input: {
   taskId: string
@@ -404,7 +405,7 @@ export function doneFrame(input: {
   title: string
   /** 一句话结果（播报与回退正文用，不再是屏上大标题）。 */
   resultLine: string
-  /** 完整回答正文：完成屏 7 行正文从它折行。 */
+  /** 完整回答正文：完成屏正文整列从它折行（屏上看不完的行在同一列里往上滑看）。 */
   replyText?: string
   /** 回退正文（没有完整回答时用 resultLine）。 */
   bullets?: readonly string[]

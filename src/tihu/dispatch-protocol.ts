@@ -60,14 +60,14 @@ export const DEVICE_CONTROL_PRIORITY_SECTION = [
   '· **下面这些只是例子，不是词表**：按意思判，绝不按字面匹配。说法可以是任何样子——',
   '  停 / 别念了 / 安静点 / 先停一下 / 别读了 → `tihu_stop_speaking`；慢一点 / 先停在那儿别动 / 等会儿再说 → `tihu_pause_speaking`；接着说 / 继续念 / 念完它 → `tihu_resume_speaking`；',
   '  再来一遍 / 重念 / 从头念 / 刚才那句再说一次 / 第 3 段重读 → `tihu_replay`；回主界面 / 退出去 / 返回 / 别占着这张屏 / 给我看回去 → `tihu_go_home`；',
-  '  翻页 / 下一页 / 上一页 / 往前翻 / 翻到第 2 页 → `tihu_board_page`；看第几张卡 / 打开那条任务 / 看最近做完的那条 → `tihu_open_task`；',
+  '  往下滑 / 往上滑 / 滑到最下面 / 滑到最上面 / 把第 5 行亮出来 / 滚到那条任务那儿 → `tihu_board_scroll`（这块棋盘是一列连续滚动的行，没有页码）；看第几张卡 / 打开那条任务 / 看最近做完的那条 → `tihu_open_task`；',
   '  跟着这条 / 我就要看这条 / 盯住它跑 → `tihu_follow_task`；结束这次语音 / 关掉语音 / 别在听了 / 收工 → `tihu_end_voice_session`；我说话呢 / 醒醒 / 在听吗 → `tihu_wake`；',
   '  答应 / 选第二个 / 就这个 / 那个不行 → `tihu_answer_decision`；随便 / 按默认来 / 你决定 / 驳回 → `tihu_dismiss_decision`；现在什么情况 / 在干嘛 / 念到哪了 / 屏上这条跑到哪了 → `tihu_status`；',
   '  有几个设备 / 哪几块屏在线 → `tihu_list_devices`；声音换个男的 / 语速慢点 / 开免按住 → `tihu_device_settings`。',
   '· 判成控制意图 → **直接调用那个 tihu_* 工具**（工具名照实写，别自己编）。调了工具就不要再输出派单 JSON：这句话已经办了，再派单就是办两遍。',
-  '· **「第几个 / 第二张 / 第二条」＝这块屏当前这一页的行号，从 1 开始**：屏上第一行就是 1，「第二个」＝第 2 行。不是 0 起，也不是「最近完成的那条」。',
+  '· **「第几个 / 第二张 / 第二条」＝这块屏这一列棋盘从上往下第几行，从 1 开始**：屏上看得见的第一行就是 1，「第二个」＝第 2 行（这一列是连续滚动的，没有「页」，往后都是往上滑）。不是 0 起，也不是「最近完成的那条」。',
   '· 调 `tihu_open_task` **必须带 `arguments.index`**（例：`{"intent":"control","tool":"tihu_open_task","arguments":{"index":2}}`）；只有用户明确说了标题 / 任务号，或明说「最近那条」，才改用 `title` / `taskId` / `recent:true`，其余一律带 index。拿不准就回 clarify 问一句，别只回工具名。',
-  '· 下面【这块屏现在的棋盘】就是这块屏**当下这一页**（行号 1 起、与屏上逐行一致）；照着它把「第几个」翻成 index。',
+  '· 下面【这块屏现在的棋盘】就是这块屏这一列连续滚动的行（行号 1 起、与屏上从上往下同一份；往后那些行是往上滑看出来的）；照着它把「第几个」翻成 index。',
   '· 判成要干活（写文档、跑代码、查资料、改文件、做图、审稿、做交付物…）→ 才回派单 JSON。派单绝不用于「让这块屏怎么显示」这件事。',
   '· 两种解释都说得通、说不准 → 只回 `{"intent":"clarify","ask":"…"}`，屏上问用户一次；**绝不猜着派单**。',
 ].join('\n')
@@ -340,9 +340,9 @@ export const COMMANDER_SESSION_SECTION_TITLE = '最近的项目会话（序号 �
  * 指挥台提示词尾巴：先判「这句话是不是在指挥这块屏」，判成活儿才只回一行派单 JSON。
  * `hints` 是「最近的项目会话」（每条：序号/项目/短号/状态/标题 + 最后一轮对话），
  * 让 append/append_to 有据可依；
- * `boardLines` 是这块屏**当前页**的带编号清单（1 起、与屏上逐行一致，见 lane 的
+ * `boardLines` 是这块屏这一列棋盘的带编号清单（1 起、与屏上从上往下同一份，见 lane 的
  * `commanderBoardLines`）——模型照着它把「第二个」翻成 `index:2`；
- * `screenLines` 是当前屏幕（屏名/页码/行号映射，见 lane 的 `commanderScreenLines`）。
+ * `screenLines` 是当前屏幕（屏名 / 这一列共几行 / 行号映射，见 lane 的 `commanderScreenLines`）。
  */
 export function commanderReplyTail(hints: readonly string[] = [], boardLines: readonly string[] = [], screenLines: readonly string[] = []): string {
   return [
@@ -358,7 +358,7 @@ export function commanderReplyTail(hints: readonly string[] = [], boardLines: re
     '· 派单那一行之外不要输出任何字符：不要代码块围栏、不要解释、不要前后缀。',
     '· 你只判断「这句话往哪儿派 / 是不是在指挥屏」，不干活、不做正文、不解释自己怎么判的。',
     ...(screenLines.length === 0 ? [] : [...screenLines]),
-    ...(boardLines.length === 0 ? [] : ['【这块屏现在的棋盘】（行号从 1 开始，与屏上逐行一致）', ...boardLines]),
+    ...(boardLines.length === 0 ? [] : ['【这块屏现在的棋盘】（行号从 1 开始，与屏上从上往下同一份；这一列是连续滚动的，没有页码）', ...boardLines]),
     ...(hints.length === 0 ? [] : [COMMANDER_SESSION_SECTION_TITLE, ...hints]),
   ].join('\n')
 }

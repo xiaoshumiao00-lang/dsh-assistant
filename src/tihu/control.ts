@@ -81,10 +81,10 @@ export interface DevicePlaybackView {
   charStart?: number
 }
 
-/** 棋盘四段计数（工具读「回主页之后屏上是什么」用的真相源之一）。 */
+/** 棋盘计数与行数（工具读「回主页之后屏上是什么」用的真相源之一；棋盘已改成纵向连续滚动，没有页码）。 */
 export interface DeviceBoardView {
-  page: number
-  total: number
+  /** 这一列棋盘共几行（= 未归档卡合并后的行数；屏上看得见前几行，其余往上滑）。 */
+  rows: number
   counts: { running: number; awaiting: number; queued: number; done: number }
   totalTasks: number
 }
@@ -103,7 +103,7 @@ export interface DeviceStatusView {
   /** 屏上这条任务（完成/进度/待决策屏）。 */
   taskId?: string
   taskTitle?: string
-  /** 棋盘计数与页码（任何屏都有，回主页后用它证明「真的回到棋盘了」）。 */
+  /** 棋盘计数与行数（任何屏都有，回主页后用它证明「真的回到棋盘了」）。 */
   board?: DeviceBoardView
   /** 屏上这道待决策。 */
   decision?: { taskId: string; question: string; options: string[]; secondsLeft: number; defaultIndex?: number }
@@ -190,8 +190,8 @@ export interface TihuDeviceActionOptions {
   force?: boolean
   all?: boolean
   stopSpeaking?: boolean
-  page?: number
-  direction?: 'prev' | 'next'
+  /** 滚到这一列棋盘的哪一头（连续滚动；只有棋盘上有这个容器）。 */
+  to?: 'top' | 'bottom'
   index?: number
   title?: string
   recent?: boolean
@@ -243,8 +243,8 @@ export interface TihuControlSurface {
   replay(deviceId: string, options: TihuDeviceActionOptions): Promise<DeviceActionOutcome>
   /** 回主页（棋盘）。 */
   goHome(deviceId: string, options: TihuDeviceActionOptions): Promise<DeviceActionOutcome>
-  /** 棋盘翻页（页码夹到真实范围）。 */
-  boardPage(deviceId: string, options: TihuDeviceActionOptions): Promise<DeviceActionOutcome>
+  /** 棋盘这一列滚到第几行 / 顶 / 底（连续滚动，没有页码）。 */
+  boardScroll(deviceId: string, options: TihuDeviceActionOptions): Promise<DeviceActionOutcome>
   /** 打开某张卡的详情。 */
   openTaskCard(deviceId: string, options: TihuDeviceActionOptions): Promise<DeviceActionOutcome>
   /** 跟随一条正在跑的任务。 */
@@ -526,7 +526,7 @@ export const TIHU_DEVICE_TOOL_NAMES = [
   'tihu_resume_speaking',
   'tihu_replay',
   'tihu_go_home',
-  'tihu_board_page',
+  'tihu_board_scroll',
   'tihu_open_task',
   'tihu_follow_task',
   'tihu_end_voice_session',
@@ -595,48 +595,47 @@ const deviceTools: TihuToolSpec[] = [
     },
   },
 
-  /* ---- B. 屏幕导航（4） ---- */
+  /* ---- B. 屏幕导航（4）：棋盘是一列连续滚动的行，导航只有「滚到哪一行」和「开哪一行」 ---- */
   {
     name: 'tihu_go_home',
-    description: '用户说「回主页 / 回棋盘 / 回列表 / 退出这页」→ 设备回任务棋盘，默认同时停朗读（用户要主页通常就是要安静）。',
+    description: '用户说「回主页 / 回棋盘 / 回列表 / 退出这页」→ 设备回任务棋盘（从这一列最上面那行开始），默认同时停朗读（用户要主页通常就是要安静）。',
     parameters: {
       deviceId: DEVICE_PARAM,
       all: { type: 'boolean', required: false, description: '所有在线设备一起回（默认 false＝只回当前这台）' },
       stopSpeaking: { type: 'boolean', required: false, description: '回主页是否同时停朗读（默认 true）' },
-      page: { type: 'number', required: false, description: '回第几页（0 起，默认 0）' },
     },
     run: async (args, api) => {
       const device = deviceFor(args, api)
       return formatDeviceResult(await api.surface.goHome(device.id, {
         all: boolOf(args, 'all', false),
         stopSpeaking: boolOf(args, 'stopSpeaking', true),
-        ...(numOf(args, 'page') === undefined ? {} : { page: numOf(args, 'page') }),
       }))
     },
   },
   {
-    name: 'tihu_board_page',
-    description: '用户说「下一页 / 上一页 / 翻到第 2 页」→ 棋盘翻页（每页 4 条，页码自动夹到真实范围，到底了就停在末页）。',
+    name: 'tihu_board_scroll',
+    description: '用户说「往下滑 / 往上滑 / 滑到底 / 滑到顶 / 看第 5 行（把那行亮出来）」→ 让这块棋盘那一列滚到第几行或哪一头。棋盘没有页码，只有滚动这一条路。',
     parameters: {
       deviceId: DEVICE_PARAM,
-      direction: { type: 'string', required: false, description: 'prev / next（默认 next）', enum: ['prev', 'next'] },
-      page: { type: 'number', required: false, description: '直接指定页码（0 起；给了就忽略 direction）' },
+      to: { type: 'string', required: false, description: 'top / bottom（滚到这一列的顶或底；给了就不看 index）', enum: ['top', 'bottom'] },
+      index: { type: 'number', required: false, description: '滚到第几行（1 起：屏上从上往下数；不传就滚到最上面那行）' },
     },
     run: async (args, api) => {
       const device = deviceFor(args, api)
-      return formatDeviceResult(await api.surface.boardPage(device.id, {
-        direction: (strOf(args, 'direction') as 'prev' | 'next' | undefined) ?? 'next',
-        ...(numOf(args, 'page') === undefined ? {} : { page: numOf(args, 'page') }),
+      const to = strOf(args, 'to')
+      return formatDeviceResult(await api.surface.boardScroll(device.id, {
+        ...(to === 'top' || to === 'bottom' ? { to } : {}),
+        ...(numOf(args, 'index') === undefined ? {} : { index: numOf(args, 'index') }),
       }))
     },
   },
   {
     name: 'tihu_open_task',
-    description: '用户说「打开第 3 条 / 看第二个 / 看看那条任务 / 看最近完成的」→ 打开某张卡的详情（按状态自动进完成页/待决策页/进度页）。「第几个」是**当前棋盘页的行号，从 1 开始**（屏上第一行＝1）。',
+    description: '用户说「打开第 3 条 / 看第二个 / 看看那条任务 / 看最近完成的」→ 打开某张卡的详情（按状态自动进完成页/待决策页/进度页）。「第几个」是**这一列棋盘从上往下第几行，从 1 开始**（屏上第一行＝1，没有页码）。',
     parameters: {
       deviceId: DEVICE_PARAM,
       taskId: { type: 'string', required: false, description: '任务短号 t3 / 纯数字 3' },
-      index: { type: 'number', required: false, description: '当前棋盘页第几行（1 起：屏上第一行＝1，「第二个」＝2；不传就退化成「当前屏上那条/最近完成」，只在用户没报序号时才允许）' },
+      index: { type: 'number', required: false, description: '这一列棋盘的第几行（1 起：屏上第一行＝1，「第二个」＝2；整列都在屏上滚出来，行号和屏上顺序同一份；不传就退化成「当前屏上那条/最近完成」，只在用户没报序号时才允许）' },
       title: { type: 'string', required: false, description: '标题关键词（精确 > 前缀 > 包含，命中多条会给候选清单）' },
       recent: { type: 'boolean', required: false, description: '打开最近一条已完成任务（替代旧的 open_recent）' },
     },
@@ -853,7 +852,7 @@ export function formatDeviceStatus(view: DeviceStatusView): string {
   }
   if (view.board !== undefined) {
     const c = view.board.counts
-    lines.push(`棋盘：等你 ${c.awaiting} · 在跑 ${c.running} · 排队 ${c.queued} · 完成 ${c.done}（第 ${view.board.page + 1}/${view.board.total} 页，共 ${view.board.totalTasks} 条）`)
+    lines.push(`棋盘：等你 ${c.awaiting} · 在跑 ${c.running} · 排队 ${c.queued} · 完成 ${c.done}（这一列共 ${view.board.rows} 行，往上滑看后面的行）`)
   }
   if (view.decision !== undefined) {
     lines.push(`待决策：${view.decision.taskId}「${view.decision.question}」（还有 ${view.decision.secondsLeft} 秒，不选按默认项）`)

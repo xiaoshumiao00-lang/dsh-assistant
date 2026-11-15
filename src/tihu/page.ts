@@ -12,7 +12,7 @@
  *
  * TTS 只播放宿主下发的 PCM（edge 云健 / Qwen GPU）；页面不再使用浏览器语音。
  */
-import { ACTUAL_SIZE_SCALE, DONE_LAYOUT, DONE_TITLE_FONT_PX, DONE_TITLE_LINE_HEIGHT_PX, SCREEN_SPEC } from './screen-spec.ts'
+import { ACTUAL_SIZE_SCALE, BOARD_LAYOUT, DONE_LAYOUT, DONE_TITLE_FONT_PX, DONE_TITLE_LINE_HEIGHT_PX, SCREEN_SPEC } from './screen-spec.ts'
 import { condition as conditionVoicePcm, trimSilence as trimVoiceSilence } from '../client/pocket/orb/voice.ts'
 export function tihuPageHtml(options: { lanePath: string; protocol: string }): string {
   const lane = JSON.stringify(options.lanePath)
@@ -107,8 +107,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen.home-mode .home-body { display:block; }
   #screen.home-mode .title, #screen.home-mode ul,
   #screen.home-mode .action-bar { display:none; }
-  /* 旧式翻页条已整体删除（用户 2026-11-09：设备屏不要翻页控件）。
-     棋盘固定最多 4 条（BOARD_PAGE_SIZE）：顶行 14 + 间隙 4 + 4×48 = 210 ≤ 222，四行都完整。 */
+  /* 翻页控件与页码文字已整体删除（用户 2026-11-09 要求删、2026-11-10 又要回来、2026-11-15 再确认删）：
+     设备屏上没有「上一页 / 下一页」、没有「第 X 页 / 共 N 页」、也没有「第几行至第几行」这一类页码提示。
+     棋盘改成一列**纵向连续滚动**的行：可视区约 4 行（每行 48px），行更多时手指往上滑看后面的行。 */
   /* 状态屏/回执/完成屏的底部动作条 */
   #screen .action-bar { display:none; flex:none; gap:6px; padding-top:4px; }
   #screen.has-actions .action-bar { display:flex; }
@@ -123,23 +124,40 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   @keyframes tapFlash { from { opacity:.8; transform:scale(.4); } to { opacity:0; transform:scale(1.4); } }
 
   /* ── 任务棋盘（屏 1，2026-11-09 统一指挥会话）──
-     顶行 14 + 间隙 4 + 每页最多 4 行任务 + 底部翻页条 12（2026-11-10 用户明确要回来）：
-     内容高 222 = 顶行 14 + 间隙 4 + 4×48（每行 20px 标题 + 16px 副行 + 上下 6px）+ 翻页条 12。
-     翻页条只有一页时 JS 直接不建，什么都不显示。 */
+     顶行 14 + 间隙 2 + 列表区：可视区正好 4 行（每行 20px 标题 + 16px 副行 + 上下 6px = 48px）。
+     未归档卡最多 60 张全排在这一列里，看后面的行靠**纵向连续滚动**（2026-11-15 用户改口径：
+     往上滑就出现下面的会话），不再有「每页 4 行」的切分，也没有底部翻页条。 */
   #screen.board-mode .home-top { display:flex; }
   #screen.board-mode .stage, #screen.board-mode .title, #screen.board-mode ul,
   #screen.board-mode .action-bar { display:none; }
-  /* 棋盘：列表区吃掉翻页条上方的全部高度，翻页条**钉在屏底**（用户 2026-11-10 实机：
-     第 2 页只有 2 条时，翻页栏跟着列表往上跑，位置和第 1 页不一样）。
-     高度预算 222 = 顶行 14 + 间隙 2 + 列表区（4×48 = 192）+ 翻页条 12 + 底边距 2。 */
+  /* 棋盘：列表区吃掉屏内除顶行以外的全部高度，并在这块区域里自己纵向滚动
+     （用户 2026-11-10 实机抱怨过「翻页栏跟着列表往上跑」——现在整条翻页栏已经没有了）。
+     高度预算 222 = 顶行 14 + 间隙 2 + 列表区（可视 4×48 = 192）+ 底边距 14（留给滚动条/底部空隙）。 */
   #screen.board-mode { gap:2px; }
   #screen.board-mode .home-body { display:flex; flex-direction:column; min-height:0; }
-  #screen .board-list { flex:1 1 auto; min-height:0; overflow:hidden; }
-  #screen .board-item { height:48px; box-sizing:border-box; padding:6px 0; overflow:hidden; }
-  #screen .board-row1 { display:flex; align-items:center; gap:6px; font-size:15px; font-weight:700; line-height:20px; white-space:nowrap; overflow:hidden; }
+  /* 连续滚动：整列在 .board-list 里滚，手指往上滑＝看后面的行；不切页、不夹行。
+     overscroll-behavior 只让这个容器自己滚，不把手势冒泡到宿主浮层与页面。 */
+  #screen .board-list {
+    flex:1 1 auto; min-height:0;
+    overflow-y:auto; overflow-x:hidden;
+    -webkit-overflow-scrolling:touch;
+    overscroll-behavior:contain;
+    touch-action:pan-y;
+    scrollbar-width:thin;
+  }
+  #screen .board-list .board-item { flex:none; }
+  /* 卡片高度按**标题实际折出来的行数**给足（2026-11-15 用户要求）：一行标题时正好 48px，
+     标题折出更多行就把卡片撑高 —— 宁可一屏少显示几行，也不许出现半截断尾的标题。
+     宿主算好的每行高度写在每张卡的内联 style（renderBoard 里 row.rowHeightPx），
+     这里只兜下限。 */
+  #screen .board-item { min-height:${SCREEN_SPEC.boardRowMinHeightPx}px; height:auto; box-sizing:border-box; padding:${SCREEN_SPEC.boardRowPaddingPx}px 0; overflow:hidden; }
+  #screen .board-row1 { display:flex; align-items:center; gap:${SCREEN_SPEC.boardRowGapPx}px; font-size:${SCREEN_SPEC.boardTitleFontPx}px; font-weight:700; line-height:${SCREEN_SPEC.boardTitleLineHeightPx}px; }
+  /* 标题每一段都是宿主按屏宽折好的整行：页面逐行渲染，绝不靠 CSS 裁掉尾巴。 */
+  #screen .board-title { flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; }
+  #screen .board-title-line { display:block; height:${SCREEN_SPEC.boardTitleLineHeightPx}px; line-height:${SCREEN_SPEC.boardTitleLineHeightPx}px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   /* 状态胶囊：文字优先（色盲/强光下也读得出），颜色只做辅助 */
-  #screen .board-capsule { flex:none; font-size:11px; line-height:14px; font-weight:700; letter-spacing:.5px;
-    padding:1px 5px; border-radius:4px; background:#1b2430; color:#9fb0c0; border:1px solid #2b3a4a; }
+  #screen .board-capsule { flex:none; font-size:${SCREEN_SPEC.boardCapsuleFontPx}px; line-height:14px; font-weight:700; letter-spacing:${SCREEN_SPEC.boardCapsuleLetterSpacingPx}px;
+    padding:1px ${SCREEN_SPEC.boardCapsuleHPaddingPx}px; border-radius:4px; background:#1b2430; color:#9fb0c0; border:${SCREEN_SPEC.boardCapsuleBorderPx}px solid #2b3a4a; }
   #screen .board-capsule.running { color:#8ef0c4; border-color:#2a6b56; background:#10241e; }
   /* 「已绑会话、还没开跑」仍属排队中：与 queued 同一套灰，不另造「派单」色 */
   #screen .board-capsule.dispatched { color:#9fb0c0; border-color:#2b3a4a; background:#1b2430; }
@@ -152,8 +170,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .ask-main { min-width:0; display:flex; flex-direction:column; }
   #screen .ask-name { font-size:13px; font-weight:700; line-height:15px; color:#e6edf3; }
   #screen .ask-source { font-size:10px; line-height:12px; color:#9fb0c0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  #screen .board-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
-  #screen .board-row2 { display:flex; align-items:center; gap:6px; font-size:12px; line-height:16px; color:#8b97a5; }
+  #screen .board-row2 { display:flex; align-items:center; gap:${SCREEN_SPEC.boardRowGapPx}px; font-size:${SCREEN_SPEC.boardSubFontPx}px; line-height:${SCREEN_SPEC.boardSubLineHeightPx}px; color:#8b97a5; }
   #screen .board-sub { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
   /* 右侧状态图形（用户 2026-11-10 定案，不再用 10px 实心点）：右对齐、离屏幕外沿正好 10px
      （#screen 内边距 8 + 边框 1 → 内容右界 311；图形外边距 1 → 右界 310 → 距外沿 10px）。
@@ -175,18 +192,14 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .board-status.subagents { width:12px; height:12px; border-radius:50%; background:#4f9fd8;
     animation:boardBreath 1.2s ease-in-out infinite; }
   @keyframes boardBreath { 0%, 100% { opacity:.35; } 50% { opacity:1; } }
-  /* 翻页条：上一页 / 第 N/M 页 / 下一页（只有一页时 JS 不建这条）。
-     钉在屏底：flex:none + margin-bottom:2px → 条底边离屏幕外沿 8+1+2 = 11px（用户要求 10–12px），
-     不管这一页剩 4 条还是 1 条，它都在同一个位置。 */
-  #screen .board-pager { display:flex; flex:none; align-items:center; justify-content:center; gap:8px;
-    height:12px; margin-bottom:2px; }
-  #screen .board-pager button { border:0; background:none; padding:0; color:#9fb0c0; font-size:11px; line-height:12px; }
-  #screen .board-pager button.cur { color:#5FD2C8; font-weight:700; }
-  #screen .board-pager button.off { color:#48525d; }
-  #screen .board-pager .page { font-size:11px; line-height:12px; color:#c8d4dd; }
+  /* 翻页条已整体删除（2026-11-15：上一页 / 下一页 / 第 N/M 页 一个都不留，棋盘改成纵向连续滚动）。
+     滚动条只留一条细的，不抢行高。 */
+  #screen .board-list::-webkit-scrollbar { width:3px; }
+  #screen .board-list::-webkit-scrollbar-thumb { background:#33414f; border-radius:2px; }
+  #screen .board-list::-webkit-scrollbar-track { background:transparent; }
   /* 微条：最近 8 步耗时（只给节奏感，不显示数字） */
-  #screen .board-micro { display:flex; flex:none; align-items:flex-end; gap:2px; height:10px; margin-left:2px; }
-  #screen .board-micro span { width:2px; min-height:2px; background:#3fb6a8; border-radius:1px; opacity:.85; }
+  #screen .board-micro { display:flex; flex:none; align-items:flex-end; gap:${SCREEN_SPEC.boardMicroGapPx}px; height:10px; margin-left:${SCREEN_SPEC.boardMicroMarginPx}px; }
+  #screen .board-micro span { width:${SCREEN_SPEC.boardMicroBarPx}px; min-height:2px; background:#3fb6a8; border-radius:1px; opacity:.85; }
   /* 空态：没有任务时是同一张棋盘的另一种脸（不是另开一屏） */
   #screen .board-empty { display:flex; flex-direction:column; align-items:center; justify-content:center;
     height:100%; gap:5px; text-align:center; }
@@ -211,12 +224,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
      裁剪/滚动（7 行 140 ≤ 145 全放得下），正文与按钮永不重叠。
      高度预算：14 + 2 + 22 + 2 + 145 正文区 + 4 列间隙 + 30 三键 + 3 margin = 222
      （内容高 240−2×8−2×1）。「12px 底边」= 3px margin + 8px 内边距 + 1px 边框。 */
-  #screen .done-view { display:none; flex:1 1 auto; min-height:0; overflow:hidden; flex-direction:column; gap:2px; }
+  #screen .done-view { display:none; flex:1 1 auto; min-height:0; overflow:hidden; flex-direction:column; gap:${DONE_LAYOUT.columnGapPx}px; }
   #screen.done-mode .done-view { display:flex; }
   #screen.done-mode .home-top, #screen.done-mode .stage, #screen.done-mode .title,
   #screen.done-mode ul, #screen.done-mode .steps,
   #screen.done-mode .cd-row, #screen.done-mode .home-body { display:none; }
-  #screen .done-bar { position:relative; flex:none; height:14px; display:flex; align-items:center; gap:6px; }
+  #screen .done-bar { position:relative; flex:none; height:${DONE_LAYOUT.stageHeightPx}px; display:flex; align-items:center; gap:6px; }
   #screen .done-stage { flex:none; font-size:11px; line-height:14px; color:#5FD2C8; font-weight:400; }
   #screen .done-wave { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); display:flex; align-items:center; gap:2px; height:14px; }
   #screen .done-wave span { display:block; width:2px; height:5px; border-radius:1px; background:#5FD2C8; animation:doneBarWave .9s ease-in-out infinite; }
@@ -230,9 +243,14 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     line-height:${DONE_TITLE_LINE_HEIGHT_PX}px; color:#ffffff;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   /* 正文块吃掉标题与三键之间的剩余高度（flex:1）：一行时下面留白仍在正文区里，
-     所以视觉上是「正文贴顶、空白在正文与按钮之间」，按钮永远贴在屏幕底部。 */
-  #screen .done-body { flex:1 1 auto; min-height:0; overflow:hidden; display:flex; flex-direction:column; justify-content:flex-start; }
-  #screen .done-line { flex:none; height:20px; line-height:20px; box-sizing:border-box; padding:0 8px; font-size:15px; color:#e8edf2;
+     所以视觉上是「正文贴顶、空白在正文与按钮之间」，按钮永远贴在屏幕底部。
+     正文比这块放得下来时（行数按真实剩余高度算，见 paintDone），整块正文在同一列里手指往上滑
+     连续看——纵向滚动、没有页码也没有翻页控件；滑过去的行至少留整行，不会半行挂在半空。 */
+  #screen .done-body { flex:1 1 auto; min-height:0; overflow:hidden; overflow-y:auto; overflow-x:hidden;
+    -webkit-overflow-scrolling:touch; overscroll-behavior:contain; touch-action:pan-y; scrollbar-width:thin;
+    display:flex; flex-direction:column; justify-content:flex-start; }
+  #screen .done-line { flex:none; height:${DONE_LAYOUT.lineHeightPx}px; line-height:${DONE_LAYOUT.lineHeightPx}px; box-sizing:border-box;
+    padding:0 ${DONE_LAYOUT.textPaddingPx}px; font-size:${DONE_LAYOUT.bodyFontPx}px; color:#e8edf2;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen .done-line.cur { background:#5FD2C8; color:#04110f; font-weight:700; border-radius:4px; }
   /* 三键：深灰等宽圆角、键间距 8px、高 30px、浅青字。
@@ -445,6 +463,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   /* 真机屏幕规格：与 src/tihu/screen-spec.ts 同一份常量（页面只消费，不另写数值）。 */
   var SCREEN = ${JSON.stringify(SCREEN_SPEC)};
   var DONE = ${JSON.stringify(DONE_LAYOUT)};
+  /* 棋盘版式（标题折行/卡高/胶囊与微条占宽）：同样只从 screen-spec.ts 拿，页面不另写数值。 */
+  var BOARD = ${JSON.stringify(BOARD_LAYOUT)};
   var ACTUAL_SCALE = ${JSON.stringify(ACTUAL_SIZE_SCALE)};
   function clipScreen(value, max) {
     var text = String(value == null ? '' : value).replace(/\\s+/g, ' ').trim();
@@ -500,6 +520,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     /* 完成页：done = { lines, current }；高亮只由每段 PCM 的真实开始/结束事件推进
        （见 segmentStarted/segmentEnded），没有任何按时间翻行的兜底计时器。 */
     done: null, doneRanges: null,
+    /* 完成页正文窗口：这一列此刻放得下几整行（真实剩余高度 ÷ 行高）＋上一次画到的高亮行
+       （只有高亮换行时才把那一行滚进可视区，同一行不换就不动用户滑到的位置）。 */
+    doneVisibleLines: 0, donePaintedCurrent: -1,
     /* 完成页当前这条任务（playback.state 与暂停点都要带 taskId） */
     doneTaskId: '',
     /* 进度页当前这条任务（2026-11-13）：进度屏上录音/发指令时随上行带给宿主做硬绑定（续聊回这条任务）。 */
@@ -598,8 +621,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   }
 
   /* ---------- 任务棋盘（屏 1）：一行一任务 ----------
-   * 版式：顶行四段计数（等你 在跑 排队 完成）→ 最近 5 行任务。旧式翻页条已整体删除
-   * （用户 2026-11-09：设备屏不要上一页/下一页），5 行分掉原来那 28px，320×240 不溢出。
+   * 版式：顶行四段计数（等你 在跑 排队 完成）→ 一列任务，**纵向连续滚动**看后面的行。
+   * 没有任何翻页控件与页码文字（用户 2026-11-09 要求删、2026-11-15 再确认删）：
+   * 未归档卡（宿主上限 60 张）合并完的行全部排在这一列里，可视区约 4 行，往上滑出现下面的会话。
    * 每行只说三件事：状态胶囊（文字）、任务名、副行「项目 · 第 N 步」＋右侧时长环。
    * 没有任务时是**同一张棋盘的另一种脸**（空态），不另开一屏。
    */
@@ -610,6 +634,34 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     // 段间用窄空格（小间距），不换行；宽度由 fitTextPx 兜底缩放。
     return '●' + (Number(c.awaiting) || 0) + ' 等你' + '\u2009●' + (Number(c.running) || 0) + ' 在跑'
       + '\u2009●' + (Number(c.queued) || 0) + ' 排队' + '\u2009●' + (Number(c.done) || 0) + ' 完成';
+  }
+
+  /**
+   * 这一行的标题该排几行：宿主已经把标题按屏上那一行的真实可用宽折好下发（row.titleLines），
+   * 页面**逐行渲染、不二次折行**，卡片高度就按这几行长 —— 半截断尾的标题从此没有。
+   * 帧里没有 titleLines（旧帧/旧固件）才在页面这边按同一份宽（BOARD.titleWidthMinPx：胶囊最宽
+   * + 微条满格都扣掉）兜底折；折到 BOARD.maxTitleLines 还放不下就只在最后一行补省略号，绝不切半个字。
+   */
+  function boardTitleLinesFor(row) {
+    var text = String(row.title || '');
+    var given = Array.isArray(row.titleLines)
+      ? row.titleLines.map(function (line) { return String(line || ''); }).filter(function (line) { return line.trim() !== ''; })
+      : null;
+    if (given && given.length) return given.slice(0, BOARD.maxTitleLines);
+    var font = BOARD.titleFontPx * BOARD.titleBoldFactor;
+    var lines = wrapPx(text, BOARD.titleWidthMinPx, font);
+    if (lines.length <= BOARD.maxTitleLines) return lines;
+    var shown = lines.slice(0, BOARD.maxTitleLines - 1);
+    shown.push(fitTextPx(lines.slice(BOARD.maxTitleLines - 1).join(''), BOARD.titleWidthMinPx, font));
+    return shown;
+  }
+
+  /** 这张卡该占的高度：宿主算好的 rowHeightPx；没有就按这几行标题现算（同一份版式常量）。 */
+  function boardItemHeight(row, lines) {
+    var given = Number(row.rowHeightPx);
+    if (given > 0) return Math.max(BOARD.rowMinHeightPx, given);
+    return Math.max(BOARD.rowMinHeightPx,
+      BOARD.rowPaddingPx * 2 + Math.max(1, lines.length) * BOARD.titleLineHeightPx + BOARD.subLineHeightPx);
   }
   function applyScreenClass(base) {
     var screen = $('screen');
@@ -636,8 +688,12 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     renderSteps([]);
     renderCountdown(null);
     var body = $('homeBody');
+    // 列表区单独一层：整列在 .board-list 里**纵向连续滚动**（手指往上滑＝看后面的行）。
+    // 重画前先把这一列此刻的滚动位置读出来（读 scrollTop 必须在拆掉旧层之前），重画完再放回去 ——
+    // 宿主按时钟重发帧，不保住位置就会把人滑到的行顶回头部。
+    var oldList = body.querySelector('.board-list');
+    var keepScroll = oldList ? (oldList.scrollTop || 0) : 0;
     body.innerHTML = '';
-    // 列表区单独一层（flex:1）：翻页条在它下面，钉在屏底 —— 一条还是四条都不影响翻页条的位置。
     var list = document.createElement('div');
     list.className = 'board-list';
     body.appendChild(list);
@@ -675,7 +731,21 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       capsule.textContent = row.capsule || '';
       var title = document.createElement('span');
       title.className = 'board-title';
-      title.textContent = row.title || '';
+      var titleText = String(row.title || '');
+      var titleLines = boardTitleLinesFor(row);
+      for (var ti = 0; ti < titleLines.length; ti += 1) {
+        var titleLine = document.createElement('span');
+        titleLine.className = 'board-title-line';
+        titleLine.textContent = titleLines[ti];
+        title.appendChild(titleLine);
+      }
+      // 完整标题永远留在这张卡的可获取处（title / aria-label）：屏上折到上限时只有最后一行带省略号。
+      item.setAttribute('title', titleText);
+      title.setAttribute('aria-label', titleText);
+      // 卡片按标题实际行数长高：宿主算好的高度走内联 !important，压过 APK 壳里那套
+      // 「flex:1 1 0 !important / height:auto !important / min-height:48px !important」（壳的 !important
+      // 会把卡片压回一行高、把标题裁成半截）。
+      item.style.setProperty('min-height', boardItemHeight(row, titleLines) + 'px', 'important');
       row1.appendChild(capsule);
       row1.appendChild(title);
       // 微条放在标题行末尾：副行最右边只留「状态图形」这一枚（用户 2026-11-10 实机反馈：
@@ -706,31 +776,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       item.appendChild(row2);
       list.appendChild(item);
     }
-    // 翻页条：每页 4 条（BOARD_PAGE_SIZE）；只有一页时整条不建（用户 2026-11-10「首页恢复翻页」）。
-    var page = board.page || { index: 0, total: 1 };
-    var pageIndex = Math.max(0, Math.floor(Number(page.index) || 0));
-    var pageTotal = Math.max(1, Number(page.total) || 1);
-    if (rows.length > 0 && pageTotal > 1) {
-      var pager = document.createElement('div');
-      pager.className = 'board-pager';
-      var prevBtn = document.createElement('button');
-      prevBtn.type = 'button';
-      prevBtn.textContent = '上一页';
-      prevBtn.setAttribute('data-action', 'boardPrev');
-      prevBtn.className = pageIndex > 0 ? 'cur' : 'off';
-      var nextBtn = document.createElement('button');
-      nextBtn.type = 'button';
-      nextBtn.textContent = '下一页';
-      nextBtn.setAttribute('data-action', 'boardNext');
-      nextBtn.className = pageIndex < pageTotal - 1 ? 'cur' : 'off';
-      var pageText = document.createElement('span');
-      pageText.className = 'page';
-      pageText.textContent = '第 ' + (pageIndex + 1) + '/' + pageTotal + ' 页';
-      pager.appendChild(prevBtn);
-      pager.appendChild(pageText);
-      pager.appendChild(nextBtn);
-      body.appendChild(pager);
-    }
+    // 连续滚动（2026-11-15）：宿主按时钟重发帧（时长弧要跟着跑），这里必须保住用户此刻的滚动位置，
+    // 否则滑到第 12 行看的东西会被下一次重画顶回第一行。翻页条 / 页码文字已整块删除。
+    if (keepScroll > 0) list.scrollTop = Math.min(keepScroll, list.scrollHeight);
     applyScreenClass('board-mode');
   }
 
@@ -789,6 +837,8 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.doneRanges = null;
     state.done = null;
     state.doneTaskId = '';
+    state.donePaintedCurrent = -1;
+    state.doneVisibleLines = 0;
     var body = $('doneBody');
     if (body) body.innerHTML = '';
   }
@@ -803,18 +853,32 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     if (more && state.doneMoreText !== undefined) more.textContent = state.doneMoreText;
     var body = $('doneBody');
     if (!body) return;
+    // 重画前先把这一列此刻的滚动位置读出来（读 scrollTop 必须在拆掉旧层之前），重画完再放回去：
+    // 宿主按时钟重发帧、段与段之间也要重画，不保住位置就会把人滑到的行顶回头部（沿用棋盘那口径）。
+    var keepScroll = body.scrollTop || 0;
+    var prevCurrent = typeof state.donePaintedCurrent === 'number' ? state.donePaintedCurrent : -1;
     body.innerHTML = '';
-    // 正文区高度＝标题与贴底按钮之间的剩余空间（不固定 7×20）：按真实可视高度取整行数，
-    // 放不下的行交给窗口滚动/裁剪，正文永远不会压到按钮上。
-    var visible = DONE.visibleLines;
+    // 正文区高度＝标题与贴底按钮之间的剩余空间（不固定 7×20）：这块区域还剩多高就放得下几整行，
+    // 一行不落全排在这同一列里，放不下的行手指往上滑连续看——没有页码、没有翻页控件。
     var avail = body.clientHeight;
-    if (avail > 0) visible = Math.max(1, Math.min(DONE.visibleLines, Math.floor(avail / DONE.lineHeightPx)));
-    var start = Math.max(0, Math.min(done.current - 2, Math.max(0, total - visible)));
-    for (var i = start; i < Math.min(total, start + visible); i += 1) {
+    var visible = avail > 0 ? Math.max(1, Math.floor(avail / DONE.lineHeightPx)) : DONE.visibleLines;
+    state.doneVisibleLines = visible;
+    for (var i = 0; i < total; i += 1) {
       var line = document.createElement('div');
       line.className = 'done-line' + (i === done.current ? ' cur' : '');
       line.textContent = done.lines[i];
       body.appendChild(line);
+    }
+    var curLine = body.querySelector('.done-line.cur');
+    if (done.current !== prevCurrent) {
+      // 高亮的行换到了别一行（新起一段 / 跳段 / 段级续播）→ 把它滚进可视区，
+      // 只滚这一列（overscroll-behavior:contain），绝不顶回头部。
+      if (curLine && curLine.scrollIntoView) curLine.scrollIntoView({ block: 'nearest' });
+      state.donePaintedCurrent = done.current;
+    } else if (keepScroll > 0) {
+      body.scrollTop = Math.min(keepScroll, Math.max(0, body.scrollHeight - body.clientHeight));
+    } else if (curLine && curLine.scrollIntoView) {
+      curLine.scrollIntoView({ block: 'nearest' });
     }
   }
   /** 字符位置 → 行（依据宿主的 done.ranges，码点下标）。 */
@@ -890,9 +954,16 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     state.screenMode = 'done';
     state.hostAlert = false;
     state.highlightLock = false;
+    var taskId = payload.taskId ? String(payload.taskId) : '';
+    // 同一张完成页被宿主按时钟重发（同任务、同正文、同高亮行）：paintDone 里 current 与上次画的一致
+    // 就保住人此刻滑到的位置；正文换了（重读/跳段/新任务）才把高亮那一行滚进可视区。
+    var sameFrame = !!state.done && state.doneTaskId === taskId
+      && state.done.current === current
+      && JSON.stringify(state.done.lines) === JSON.stringify(lines);
+    if (!sameFrame) state.donePaintedCurrent = -1;
     state.done = { lines: lines, current: current };
     state.doneRanges = Array.isArray(raw.ranges) ? raw.ranges : null;
-    state.doneTaskId = payload.taskId ? String(payload.taskId) : '';
+    state.doneTaskId = taskId;
     state.actions = Array.isArray(payload.actions) ? payload.actions : [];
     state.doneMoreText = payload.more && payload.more.text ? String(payload.more.text) : '';
     $('stage').style.display = 'none';
@@ -978,7 +1049,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       renderBoard(payload);
       return;
     }
-    // 完成页：顶栏 + 任务名大标题 + 7 行回答摘要 + 三键（不是旧的状态屏）。
+    // 完成页：顶栏 + 任务名大标题 + 回答正文整列 + 三键（可视行数按正文区真实剩余高度算，放不下的行在这一列里往上滑）。
     if (payload && payload.done) {
       renderDone(payload);
       return;
@@ -1652,11 +1723,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function stageEcho() {
     if (state.listenOn) return '在听';
     if (state.screenMode === 'board') {
-      var board = state.board || {};
-      var page = board.page || {};
-      var index = Number(page.index) || 0;
-      var total = Math.max(1, Number(page.total) || 1);
-      return '棋盘第 ' + (index + 1) + '/' + total + ' 页';
+      // 页码文字已去掉（2026-11-15）：这块屏自报只剩「棋盘」，行数与计数由宿主的 boardEchoOf 给。
+      var boardTotal = Number((state.board || {}).total) || 0;
+      return '棋盘' + (boardTotal > 0 ? '（' + boardTotal + ' 行，往上滑看后面的行）' : '');
     }
     if (state.screenMode === 'done' && state.done) {
       var lines = state.done.lines.length;
@@ -1827,6 +1896,36 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       case 'task.notify':
         if (payload && payload.text) addEvent(payload.level === 0 ? 'alert' : 'progress', (payload.spoken ? '播报：' : '通知：') + payload.text);
         break;
+      /* ---- 2026-11-15 棋盘连续滚动（tihu_board_scroll）：宿主让这一列滚到第几行 / 哪一头。
+         这一层自己滚，页面不切页也不夹行；行没渲染出来时当空滚，不报错。 */
+      case 'board.scroll': {
+        var boardBody = state.screenMode === 'board' ? $('homeBody') : null;
+        var boardList = boardBody ? boardBody.querySelector('.board-list') : null;
+        var move = payload || {};
+        var movedTo = '';
+        if (boardList) {
+          if (move.to === 'top') { boardList.scrollTop = 0; movedTo = '到最上面'; }
+          else if (move.to === 'bottom') { boardList.scrollTop = boardList.scrollHeight; movedTo = '到最下面'; }
+          else if (typeof move.row === 'number' && move.row >= 1) {
+            var boardRowEl = boardList.children[move.row - 1];
+            if (boardRowEl && boardRowEl.scrollIntoView) boardRowEl.scrollIntoView({ block: 'nearest' });
+            else {
+              // 这一列的行高已经不固定（标题折几行、卡就多高）：兜底按前面每一行的真实高度累加，
+              // 绝不用「行号 × 48」这种假定值。
+              var scrollOffset = 0;
+              for (var oi = 0; oi < move.row - 1 && oi < boardList.children.length; oi += 1) {
+                scrollOffset += boardList.children[oi].offsetHeight || BOARD.rowMinHeightPx;
+              }
+              boardList.scrollTop = scrollOffset;
+            }
+            movedTo = '第 ' + move.row + ' 行';
+          }
+          if (movedTo !== '') addEvent('progress', '棋盘滚到' + movedTo);
+        }
+        // 回执带 opId：滚成了回 ok:true，滚不成（不在棋盘那一列）回 ok:false + 原因，宿主绝不假装成功。
+        ackDown(payload, movedTo === '' ? { ok: false, reason: boardList ? '这一列没有可滚的行' : '这块屏不在棋盘那一列' } : {});
+        break;
+      }
       /* ---- 2026-11-10（规格书 §6.1）：四类反向控制 ----
          这四类以前到了页面**没有任何反应**，于是「停止朗读 / 暂停 / 强制在听 / 结束会话」
          只能靠宿主单方面不发 PCM——页面已经排进 WebAudio 时间轴的块照念。 */
@@ -2301,16 +2400,31 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   try { if (!(window.SpeechRecognition || window.webkitSpeechRecognition)) $('wake').classList.add('unsupported'); } catch (e) { /* 忽略 */ }
 
 
-  /* ---------- 屏幕手势：滚轮 / 拖拽 / 触摸 → screen.gesture（宿主持有滚动位置） ---------- */
+  /* ---------- 屏幕手势：点击 → screen.gesture；纵向滚动交给容器自己（原生接管） ----------
+   * 2026-11-15 用户改口径：首页棋盘是一列**连续滚动**的行，往上滑就出现下面的会话。
+   * 原来这一层把 wheel/pointer 全部 preventDefault 吃掉，再发一条 screen.gesture 上行（action=swipe，带 dy）
+   * 给宿主 —— 而 lane 那边根本没有 'swipe' 这条动作（死分支），结果设备上手指滚不动列表。
+   * 现在：落点在「真正能滚」的容器里就不劫持（不 capture、不 preventDefault、不发上行），
+   * 手指直接滚那一层；落点在可滚容器外才照旧拦住拖拽，只留 tap 这一条上行。
+   */
   (function bindScreenGestures() {
     var screen = $('screen');
     var dragging = false;
-    var lastY = 0;
     var startX = 0;
     var startY = 0;
     var moved = false;
-    function swipe(dy, phase) {
-      send('screen.gesture', { action: 'swipe', dy: dy, phase: phase });
+    var nativeScroll = false;
+    /** 落点是不是落在一个**此刻真的能滚**的容器里（棋盘列表 / 完成正文 / 状态屏长文）。 */
+    function scrollOwner(target) {
+      var node = target;
+      while (node && node !== screen) {
+        if (node.nodeType === 1 && node.scrollHeight > node.clientHeight + 2) {
+          var overflow = (window.getComputedStyle(node).overflowY || '').trim();
+          if (overflow === 'auto' || overflow === 'scroll') return node;
+        }
+        node = node.parentNode;
+      }
+      return null;
     }
     function tapFlash(visX, visY) {
       var flash = document.createElement('div');
@@ -2321,24 +2435,24 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       setTimeout(function () { if (flash.parentNode) flash.parentNode.removeChild(flash); }, 200);
     }
     screen.addEventListener('wheel', function (event) {
+      // 可滚容器自己滚（棋盘列表、完成正文…）；滚不动的区域只拦住 wheel，别把整页拽走。
+      if (scrollOwner(event.target)) return;
       event.preventDefault();
-      swipe(event.deltaY, 'move');
     }, { passive: false });
     screen.addEventListener('pointerdown', function (event) {
       dragging = true;
       moved = false;
-      lastY = event.clientY;
       startX = event.clientX;
       startY = event.clientY;
+      nativeScroll = scrollOwner(event.target) !== null;
+      if (nativeScroll) return;
       try { screen.setPointerCapture(event.pointerId); } catch (e) { /* 忽略 */ }
       event.preventDefault();
     });
     screen.addEventListener('pointermove', function (event) {
       if (!dragging) return;
-      var dy = event.clientY - lastY;
-      lastY = event.clientY;
       if (Math.abs(event.clientX - startX) > 5 || Math.abs(event.clientY - startY) > 5) moved = true;
-      if (dy !== 0) swipe(dy, 'move');
+      if (nativeScroll) return;
       event.preventDefault();
     });
     function endDrag(event) {
@@ -2355,10 +2469,9 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         if (under && under.getAttribute) {
           var actionId = under.getAttribute('data-action');
           if (actionId) {
-            // 停止/重读/回主页/翻页统一走 applyPlayback（2026-11-10）：与宿主 playback.control
-            // 完全同一条路，手指点和嘴上说效果一致；差别只是不回「已停止朗读」提示。
-            if (actionId === 'stop' || actionId === 'home' || actionId === 'prev' || actionId === 'next'
-              || actionId === 'taskBoard' || actionId === 'boardPrev' || actionId === 'boardNext') {
+            // 停止 / 主页 / 重读：与宿主 playback.control 完全同一条路，手指点和嘴上说效果一致
+            // （差别只是不回「已停止朗读」提示）。旧的翻页按键 id 已全部从页面上消失，这里不再留分支。
+            if (actionId === 'stop' || actionId === 'taskBoard') {
               applyPlayback('stop');
             }
             if (actionId === 'pause') applyPlayback('pause');
@@ -2377,7 +2490,6 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
               }
             }
             if (actionId === 'taskBoard') clearDoneState();
-            if (actionId === 'home') tapFlash(event.clientX - rect.left, event.clientY - rect.top);
             send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'action', actionId: actionId });
             return;
           }
@@ -2394,7 +2506,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         send('screen.gesture', { action: 'tap', x: x, y: y, hit: 'screen' });
         return;
       }
-      swipe(0, 'end');
+      nativeScroll = false;
     }
     screen.addEventListener('pointerup', endDrag);
     screen.addEventListener('pointercancel', endDrag);

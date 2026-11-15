@@ -40,7 +40,7 @@ import {
   targetPathOf,
 } from '../src/tihu/guard.ts'
 import { createTihuRuntime as createTihuRuntimeRaw, buildTihuUserMessage, REPLY_HISTORY_LIMIT, TIHU_LANE_PATH, TIHU_PAGE_PATH, TIHU_LANE_LOG_MAX_BYTES, TIHU_TOOL_CALL_ARGS_MAX_CHARS, appendTihuLaneLog, appendTihuToolCallLog, screenReasonOf, tihuLaneLogPath, tihuReceiptHoldMs, tihuCommanderTimeoutMs, createTihuHttpHandler, TIHU_ASR_MAX_BYTES, TIHU_ASR_MAX_AUDIO_MS, TIHU_ASR_MAX_AUDIO_BYTES, TIHU_ASR_TRANSCRIBE_TIMEOUT_MS, ASR_TYPO_HINT, ASR_TYPO_NOTE_TITLE, punctuateAsrText, COMMANDER_SESSION_LIMIT, COMMANDER_DIALOGUE_MAX_CHARS, COMMANDER_FIELD_MAX_CHARS } from '../src/tihu/lane.ts'
-import { BOARD_PAGE_SIZE, TaskLedger, boardOf, boardRowIndex, parseScreenCommand } from '../src/tihu/task-ledger.ts'
+import { BOARD_VIEWPORT_ROWS, TaskLedger, boardOf, boardRowIndex, parseScreenCommand } from '../src/tihu/task-ledger.ts'
 import {
   APPROVAL_OPTIONS,
   PENDING_OPTION_FALLBACK,
@@ -173,11 +173,11 @@ function voicedWavBase64() {
 
 console.log('[tihu] 协议 v0')
 
-test('screen.gesture 校验：swipe/tap 字段合法才收', () => {
-  assert.ok(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'swipe', dy: -40, phase: 'move' }, 60))) !== null)
+test('screen.gesture 校验：只认 tap（swipe 上行整个从协议里删了，旧设备页还发 swipe 的一律当坏帧）', () => {
   assert.ok(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'tap', x: 12, y: 34 }, 61))) !== null)
-  assert.equal(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'swipe', dy: '40', phase: 'move' }, 62))), null)
-  assert.equal(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'swipe', dy: 1, phase: 'x' }, 63))), null)
+  assert.ok(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'tap', x: 12, y: 34, hit: 'action', actionId: 'taskBoard' }, 60))) !== null)
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'swipe', dy: -40, phase: 'move' }, 62))), null, '没有 swipe 这一支：dy/phase 都不再是合法字段')
+  assert.equal(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'swipe', dy: 40 }, 63))), null)
   assert.equal(parseUpstream(JSON.stringify(buildUpstream('screen.gesture', { action: 'tap', x: 1 }, 64))), null)
 })
 
@@ -187,7 +187,8 @@ test('版本号与类型清单固定', () => {
   assert.deepEqual([...TIHU_UPSTREAM_TYPES], ['hello', 'audio.frame', 'text.input', 'session.end', 'screen.gesture', 'voice.list', 'voice.create', 'voice.select', 'tts.sample', 'task.reply', 'device.ack', 'playback.state', 'ping'])
   // 2026-11-09 统一指挥会话：下行 +3（task.list / task.update / task.notify）；
   // 2026-11-10 设备控制：下行 +4（playback.control / voice.listen / session.ended / device.config）。
-  assert.equal(TIHU_DOWNSTREAM_TYPES.length, 16, '旧界面消息（tts.text/event.done/confirm.ask/sessions.list/session.invalid）已随界面删除')
+  // 2026-11-15 棋盘连续滚动：下行 +1（board.scroll：让这一列滚到第几行 / 顶 / 底）。
+  assert.equal(TIHU_DOWNSTREAM_TYPES.length, 17, '旧界面消息（tts.text/event.done/confirm.ask/sessions.list/session.invalid）已随界面删除')
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('tts.audio'))
   assert.equal(TIHU_DOWNSTREAM_TYPES.includes('sessions.list'), false)
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('session.bound'))
@@ -197,6 +198,7 @@ test('版本号与类型清单固定', () => {
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('task.list'))
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('task.update'))
   assert.ok(TIHU_DOWNSTREAM_TYPES.includes('task.notify'))
+  assert.ok(TIHU_DOWNSTREAM_TYPES.includes('board.scroll'), '下行必须含 board.scroll（棋盘连续滚动）')
   // 四类反向控制：没有它们，「停声/暂停/在听/结束会话」只能是假动作。
   for (const type of ['playback.control', 'voice.listen', 'session.ended', 'device.config']) {
     assert.ok(TIHU_DOWNSTREAM_TYPES.includes(type), `下行必须含 ${type}`)
@@ -418,8 +420,8 @@ test('语义路由结论：控制 / 澄清 / 派单 / 工具名不成立，四�
     { kind: 'control', tool: 'tihu_stop_speaking', args: {} })
   assert.deepEqual(decision('```json\n{“intent”：“control”，“tool”：“tihu_replay”，“arguments”：{“from”:1}}\n```'),
     { kind: 'control', tool: 'tihu_replay', args: { from: 1 } })
-  assert.deepEqual(decision('{intent:"control", tihu_tool:"TIHU_BOARD_PAGE", args:{page:2},}'),
-    { kind: 'control', tool: 'tihu_board_page', args: { page: 2 } })
+  assert.deepEqual(decision('{intent:"control", tihu_tool:"TIHU_BOARD_SCROLL", args:{row:2},}'),
+    { kind: 'control', tool: 'tihu_board_scroll', args: { row: 2 } })
   assert.deepEqual(decision('判断完了：{"intent":"control","tool":"tihu_answer_decision","optionIndex":2}，这句不用派单'),
     { kind: 'control', tool: 'tihu_answer_decision', args: {} })
 
@@ -2336,7 +2338,7 @@ console.log('[tihu] 控制工具')
 test('控制工具：15 个设备工具 + tihu_admin 的名字与顺序固定（旧单 tihu 多 action 形态已删）', () => {
   assert.deepEqual([...TIHU_DEVICE_TOOL_NAMES], [
     'tihu_stop_speaking', 'tihu_pause_speaking', 'tihu_resume_speaking', 'tihu_replay',
-    'tihu_go_home', 'tihu_board_page', 'tihu_open_task', 'tihu_follow_task',
+    'tihu_go_home', 'tihu_board_scroll', 'tihu_open_task', 'tihu_follow_task',
     'tihu_end_voice_session', 'tihu_wake',
     'tihu_answer_decision', 'tihu_dismiss_decision',
     'tihu_status', 'tihu_list_devices', 'tihu_device_settings',
@@ -2517,12 +2519,12 @@ function controlSurfaceFixture(options = {}) {
       },
       goHome: async (deviceId, actionOptions) => {
         record('goHome', deviceId, JSON.stringify(actionOptions))
-        if (options.homeAlready === true) return outcome('本来就在主页', deviceId, { already: true, echo: '棋盘第 1/2 页（等你 1 · 在跑 2 · 排队 0 · 完成 3）' })
-        return outcome('已回主页', deviceId, { echo: '棋盘第 1/2 页（等你 1 · 在跑 2 · 排队 0 · 完成 3）' })
+        if (options.homeAlready === true) return outcome('本来就在主页', deviceId, { already: true, echo: '棋盘 6 行（等你 1 · 在跑 2 · 排队 0 · 完成 3；手指往上滑看后面的行）' })
+        return outcome('已回主页', deviceId, { echo: '棋盘 6 行（等你 1 · 在跑 2 · 排队 0 · 完成 3；手指往上滑看后面的行）' })
       },
-      boardPage: async (deviceId, actionOptions) => {
-        record('boardPage', deviceId, JSON.stringify(actionOptions))
-        return outcome('已翻到第 2/3 页', deviceId, { echo: '第 2/3 页：1. 改写第 3 段（执行中）' })
+      boardScroll: async (deviceId, actionOptions) => {
+        record('boardScroll', deviceId, JSON.stringify(actionOptions))
+        return outcome('已滚到第 5 行：完成「改写第 3 段」', deviceId, { echo: '棋盘 6 行（等你 1 · 在跑 2 · 排队 0 · 完成 3；手指往上滑看后面的行）' })
       },
       openTaskCard: async (deviceId, actionOptions) => {
         record('openTaskCard', deviceId, JSON.stringify(actionOptions))
@@ -2671,7 +2673,7 @@ await testAsync('设备工具：15 个工具逐个走通，返回文案都带「
     ['tihu_resume_speaking', {}, 'resumeSpeaking', '已继续'],
     ['tihu_replay', { segment: 1 }, 'replay', '正在重读'],
     ['tihu_go_home', {}, 'goHome', '已回主页'],
-    ['tihu_board_page', { direction: 'next' }, 'boardPage', '已翻到第 2/3 页'],
+    ['tihu_board_scroll', { index: 5 }, 'boardScroll', '已滚到第 5 行'],
     ['tihu_open_task', { taskId: 't3' }, 'openTaskCard', '已打开 t3'],
     ['tihu_follow_task', { taskId: 't3' }, 'followTask', '已跟随 t3'],
     ['tihu_end_voice_session', {}, 'endVoiceSession', '已结束本次语音会话'],
@@ -2706,7 +2708,7 @@ await testAsync('设备工具：幂等 —— 已达成时返回「本来…」�
   const homeText = await runHome('tihu_go_home', {})
   assert.ok(homeText.includes('本来就在主页'), homeText)
   // 幂等的结果也必须带设备号与当前屏（用户要能确认「真的没动」）
-  assert.ok(homeText.includes('dev-1') && homeText.includes('棋盘第'), homeText)
+  assert.ok(homeText.includes('dev-1') && homeText.includes('棋盘') && homeText.includes('往上滑'), homeText)
   // 回执格式化：没回执就写「设备未回执」，绝不静默成功
   assert.equal(formatDeviceResult({ text: '已下发停止', deviceId: 'dev-1' }), '已下发停止 · dev-1 · 设备未回执')
   assert.equal(formatDeviceResult({ text: '已停止朗读', deviceId: 'dev-1', acked: true, echo: '停在 完成 第 3/12 行' }), '已停止朗读 · dev-1 · 停在 完成 第 3/12 行')
@@ -2808,7 +2810,7 @@ await testAsync('设备控制（lane）：没回执时如实说「设备未回�
   delete process.env.TIHU_ACK_TIMEOUT_MS
 })
 
-await testAsync('设备控制（lane）：回主页之后状态查询一致（屏=棋盘、页码与计数同源）', async () => {
+await testAsync('设备控制（lane）：回主页之后状态查询一致（屏=棋盘、行数与计数同源）', async () => {
   const w = unifiedWorkspace()
   const socket = openLane(w.runtime)
   socket.emit('data', clientFrame(buildUpstream('hello', { clientId: 'ctl-home', protocol: '0' }, 1)))
@@ -2823,7 +2825,9 @@ await testAsync('设备控制（lane）：回主页之后状态查询一致（�
 
   const home = await w.runtime.control.goHome(device.id, { stopSpeaking: true })
   assert.equal(home.text, '已回主页', JSON.stringify(home))
-  assert.ok(String(home.echo).includes('棋盘第 1/1 页'), String(home.echo))
+  assert.ok(String(home.echo).includes('棋盘'), String(home.echo))
+  assert.ok(String(home.echo).includes('往上滑看后面的行'), '回主页后宿主报的是连续滚动这一列：' + String(home.echo))
+  assert.equal(String(home.echo).includes('页'), false, '回声里没有「页」这个字（页码文字全删了）：' + String(home.echo))
 
   const status = w.runtime.control.deviceStatus(device.id)
   assert.equal(status.pinned, true, '回主页后必须真的停在棋盘上')
@@ -3088,18 +3092,25 @@ test('page：状态屏底部贯穿长横线已整条删除（旧 .bar / #progres
     '不再用 18px 黑条盖底部：那会把追问/进度屏底部内容裁掉')
 })
 
-test('page：顶行 14px，棋盘不再有旧式翻页条，4 行 ×48px 收进 222 内容高', () => {
+test('page：顶行 14px，棋盘是一列连续滚动的行（可视 4 行 ×48px 收进 222 内容高）', () => {
   const html = pageHtmlOf()
   assert.ok(/#screen \.home-top \{[^}]*height:14px/.test(html), '顶行高 14px（与 stage 那一行同高）')
   assert.ok(/#screen \.home-top \.signal \{[^}]*height:13px/.test(html), '信号柱容器高 13px（不越过行高）')
   assert.ok(/#screen \.home-top \.signal \.bar\.b3 \{ height:13px/.test(html), '最长那根柱 13px')
-  assert.equal(html.includes('home-pager'), false, '旧式翻页条（上一页/下一页）已整体删除')
   const itemH = Number((html.match(/#screen \.board-item \{[^}]*height:(\d+)px/) || [0, 0])[1])
-  assert.equal(itemH, 48, '棋盘一行 48px（4 行 × 两行字，含上下 6px 内边距）')
-  assert.equal(BOARD_PAGE_SIZE, 4, '棋盘最多 4 条')
-  const used = 14 + 4 + BOARD_PAGE_SIZE * itemH
-  assert.ok(used <= SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx, `棋盘内容高 ${used}px 不得超过 ${SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx}px`)
-  assert.ok(SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx - used >= 8, '底部要留白（不贴屏底）')
+  assert.equal(itemH, 48, '棋盘单行标题的卡片 48px（下限：4 行 × 两行字，含上下 6px 内边距；多行标题再长高）')
+  assert.equal(BOARD_VIEWPORT_ROWS, 4, '可视区一次看得见 4 行（与 screen-spec.boardRows 同一份）')
+  const visible = 14 + 2 + BOARD_VIEWPORT_ROWS * itemH
+  assert.ok(visible <= SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx, `可视区 ${visible}px 不得超过 ${SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx}px（其余行靠滚）`)
+  assert.ok(SCREEN_SPEC.heightPx - 2 * SCREEN_SPEC.paddingPx - visible >= 8, '底部要留白（留给滚动条与语音栏空隙）')
+  // 列表层吃掉除顶行以外的全部高度，并在这层里自己纵向滚。
+  const listRule = (html.match(/#screen \.board-list \{([\s\S]*?)\}/) || ['', ''])[1]
+  assert.ok(listRule.includes('flex:1 1 auto') && listRule.includes('min-height:0'), '列表区吃掉全部剩余高度：' + listRule)
+  assert.ok(listRule.includes('overflow-y:auto'), '列表区自己纵向滚（手指往上滑＝看后面的行）：' + listRule)
+  assert.ok(listRule.includes('-webkit-overflow-scrolling:touch'), '移动端惯性滚：' + listRule)
+  assert.ok(listRule.includes('overscroll-behavior:contain'), '滚到边界不冒泡到宿主浮层：' + listRule)
+  assert.ok(/#screen\.board-mode \{ gap:2px; \}/.test(html), '棋盘间距收到 2px：顶行 14 + 间隙 2 + 可视 4×48')
+  assert.deepEqual(SCREEN_SPEC.boardRows, BOARD_VIEWPORT_ROWS, 'screen-spec 的可视行数与 ledger 的常量同一份')
 })
 
 
@@ -3612,7 +3623,8 @@ await testAsync('台账恢复：重启后棋盘照样有完成卡与完成计数
   assert.ok(board !== undefined, '屏帧要带 board')
   assert.deepEqual(board.payload.board.counts, { running: 0, awaiting: 0, queued: 0, done: 2 }, '完成计数要包含恢复的历史')
   assert.equal(board.payload.board.total, 2)
-  assert.equal(board.payload.board.page.total, 1, '分页跟着恢复出来的条数算')
+  assert.equal(board.payload.board.page, undefined, '这一列没有页码：board 帧里不带 page 字段')
+  assert.equal(board.payload.board.rows.length, 2, '恢复出来的两条全在这一列里')
   const doneRow = board.payload.board.rows.find((row) => row.taskId === 't7')
   assert.ok(doneRow !== undefined, '恢复的完成卡要上棋盘')
   assert.equal(doneRow.capsule, '完成')
@@ -4502,7 +4514,7 @@ await testAsync('模式过滤：CU 会话切回普通模式 → 自动下屏归�
 
 /* ---------- 2026-11-10：棋盘 4 条 / 状态点 / 完成页三键 / 进度页实时 ---------- */
 
-test('page：棋盘右侧状态图形（完成实心圆／待决策问号／进行中蓝色弧／排队细环）＋ 底部翻页条', () => {
+test('page：棋盘右侧状态图形（完成实心圆／待决策问号／进行中蓝色弧／排队细环）· 翻页控件已删光', () => {
   const html = pageHtmlOf()
   // 用户 2026-11-10 定案：右对齐、离屏幕外沿 10px（内容右界 311 − 1px 外边距 = 310）。
   assert.ok(/#screen \.board-status \{[^}]*margin-right:1px/.test(html), '状态图形右缘离屏幕外沿 10px')
@@ -4527,36 +4539,38 @@ test('page：棋盘右侧状态图形（完成实心圆／待决策问号／进�
   assert.ok(html.includes('if (percent >= 1) percent = 0.94'), '进行中：满 30 分钟停在满圈差一点（未闭合）')
   assert.ok(/#4f9fd8/.test(html), '进行中：蓝色弧')
   assert.equal(html.includes('board-dot'), false, '旧的 10px 实心点已整体换掉')
-  // 翻页条：每页 4 条＋上一页/下一页＋第 N/M 页；只有一页时 JS 不建。
-  assert.ok(/#screen \.board-pager \{ display:flex/.test(html), '翻页条版式在')
-  assert.ok(html.includes("prevBtn.textContent = '上一页'"), '有「上一页」')
-  assert.ok(html.includes("nextBtn.textContent = '下一页'"), '有「下一页」')
-  assert.ok(html.includes("pageText.textContent = '第 ' + (pageIndex + 1) + '/' + pageTotal + ' 页'"), '有「第 N/M 页」')
-  assert.ok(html.includes("prevBtn.setAttribute('data-action', 'boardPrev')"), '上一页点下去发 boardPrev')
-  assert.ok(html.includes("nextBtn.setAttribute('data-action', 'boardNext')"), '下一页点下去发 boardNext')
-  assert.ok(html.includes('if (rows.length > 0 && pageTotal > 1)'), '只有一页时整条翻页栏不出现')
-  assert.ok(html.includes("pageIndex < pageTotal - 1 ? 'cur' : 'off'"), '当前页方向看得出（可翻=亮、到头=暗）')
+  // 连续滚动（2026-11-15）：翻页控件与页码文字整条删光，剩下的行靠手指往上滑。
+  assert.equal(html.includes('board-pager'), false, '翻页条整条（DOM + 版式 + 点击）已删除')
+  assert.equal(html.includes("prevBtn.textContent = '上一页'"), false, '没有「上一页」')
+  assert.equal(html.includes("nextBtn.textContent = '下一页'"), false, '没有「下一页」')
+  assert.equal(html.includes('第 ') && html.includes('pageTotal'), false, '没有「第 N/M 页」这种页码文字')
+  assert.equal(/pageIndex|boardPage|pageText/.test(html), false, '页码变量整套都不留（pageText/pageIndex/pageTotal）')
 })
 
-test('page：棋盘翻页条钉在屏底（列表区 flex:1，一页 4 条还是 1 条都不动位置）', () => {
+test('page：棋盘列表层吃掉全部剩余高度并自己纵向滚（翻页条整条已删，行不切页）', () => {
   const html = pageHtmlOf()
-  // 用户 2026-11-10 实机：第 2 页只剩 2 条时翻页栏跟着列表往上跑 → 必须钉死在屏底。
+  // 2026-11-15：翻页条没了，列表层吃掉 .home-body 的全部剩余高度，超出可视区的行在这层里滚。
   const bodyRule = /#screen\.board-mode \.home-body \{[^}]*\}/.exec(html)?.[0] ?? ''
-  assert.ok(bodyRule.includes('display:flex'), '棋盘正文是纵向 flex（列表 + 翻页条两段）：' + bodyRule)
+  assert.ok(bodyRule.includes('display:flex'), '棋盘正文是纵向 flex（只剩列表一段）：' + bodyRule)
   assert.ok(bodyRule.includes('flex-direction:column'), '纵向排列：' + bodyRule)
   assert.ok(bodyRule.includes('min-height:0'), 'min-height:0 才能让列表区被压缩/撑满：' + bodyRule)
   const listRule = /#screen \.board-list \{[^}]*\}/.exec(html)?.[0] ?? ''
-  assert.ok(listRule.includes('flex:1 1 auto'), '列表区吃掉翻页条上方的全部高度：' + listRule)
-  assert.ok(listRule.includes('min-height:0') && listRule.includes('overflow:hidden'), '列表区超出就裁掉（不挤翻页条）：' + listRule)
-  const pagerRule = /#screen \.board-pager \{[^}]*\}/.exec(html)?.[0] ?? ''
-  assert.ok(pagerRule.includes('flex:none'), '翻页条不许被压缩/拉伸：' + pagerRule)
-  assert.ok(pagerRule.includes('margin-bottom:2px'), '翻页条底边 = 8 内边距 + 1 边框 + 2 = 11px（10–12px 之间）：' + pagerRule)
-  assert.ok(pagerRule.includes('height:12px'), '翻页条固定 12px 高：' + pagerRule)
-  assert.ok(/#screen\.board-mode \{ gap:2px; \}/.test(html), '棋盘间距收到 2px：列表 192 + 翻页条 12 + 底 2 正好放进 222')
-  // 行必须挂进 .board-list（挂回 home-body 就会把翻页条顶上去）。
+  assert.ok(listRule.includes('flex:1 1 auto'), '列表区吃掉全部剩余高度：' + listRule)
+  assert.ok(listRule.includes('min-height:0'), '列表区允许被压缩（不然撑不出滚动）：' + listRule)
+  assert.ok(listRule.includes('overflow-y:auto') && listRule.includes('overflow-x:hidden'), '列表区纵向滚、不横滚：' + listRule)
+  assert.ok(listRule.includes('-webkit-overflow-scrolling:touch'), '移动端惯性滚：' + listRule)
+  assert.ok(listRule.includes('overscroll-behavior:contain'), '滚到头不冒泡（不弹整屏）：' + listRule)
+  assert.ok(listRule.includes('touch-action:pan-y'), '手势只吃纵向平移，不劫持卡片点击：' + listRule)
+  assert.ok(/#screen\.board-mode \{ gap:2px; \}/.test(html), '棋盘间距收到 2px：顶行 14 + 间隙 2 + 可视 4×48 = 208，剩下留给滚动条')
+  // 行必须挂进 .board-list（挂回 home-body 就会把整屏顶高）。
   assert.ok(html.includes("list.className = 'board-list'"), '棋盘渲染要建列表容器')
   assert.ok(html.includes('list.appendChild(item)'), '任务行挂进列表区')
   assert.equal(/body\.appendChild\(item\)/.test(html), false, '任务行不许再直接挂在 home-body 上')
+  // 连续滚动：整列一次排完，页面上的渲染函数不许按行切片。
+  const renderBoard = /function renderBoard\(payload\) \{([\s\S]*?)\n  \}/.exec(html)?.[1] ?? ''
+  assert.ok(renderBoard.includes('for (var i = 0; i < rows.length; i += 1)'), '一行不切：把所有行都排出来：' + renderBoard.slice(0, 120))
+  assert.equal(/rows\.slice\(/.test(renderBoard), false, '不许用 rows.slice 只画前几条')
+  assert.ok(renderBoard.includes('keepScroll'), '重画要保住当前位置（滚下去还在滚下去的地方）')
 })
 
 test('page：朗读音频链路（5ms 淡入淡出 / -1dBFS 限幅 / 排程不重叠 / PCM16 不是 float / 诊断行）', () => {
@@ -4609,7 +4623,7 @@ test('page：完成页三键贴底（离屏幕下沿 12px）＋ 标题/正文贴
   const doneBodyRule = /#screen \.done-body \{[^}]*\}/.exec(html)?.[0] ?? ''
   assert.ok(doneBodyRule.includes('flex:1 1 auto'), '正文区要吃掉剩余高度（空白留在正文与按钮之间）：' + doneBodyRule)
   assert.ok(doneBodyRule.includes('min-height:0'), '正文区必须 min-height:0 才能被压缩：' + doneBodyRule)
-  assert.ok(doneBodyRule.includes('overflow:hidden'), '正文超出按剩余高度裁剪：' + doneBodyRule)
+  assert.ok(doneBodyRule.includes('overflow-y:auto'), '正文超出一屏在同一列里往上滑连续看（没有页码）：' + doneBodyRule)
   assert.equal(/flex:none/.test(doneBodyRule), false, '正文区不许再按内容收缩：' + doneBodyRule)
   assert.ok(doneBodyRule.includes('justify-content:flex-start'), '正文要从标题下方开始排（不许垂直居中）：' + doneBodyRule)
   assert.equal(/justify-content:center/.test(doneBodyRule), false, '正文块不许再垂直居中：' + doneBodyRule)
@@ -4648,7 +4662,7 @@ test('page：完成页正文窗口按正文区真实高度取整行数（贴底�
   assert.ok(paintDone[1].includes('body.clientHeight'), '可视行数要按正文区真实高度算（按钮贴底后不再是固定 7×20）：' + paintDone[1])
   assert.ok(paintDone[1].includes('DONE.lineHeightPx'), '行高取自 DONE_LAYOUT（与 CSS 同一份常量）')
   assert.equal(/var visible = 7;/.test(paintDone[1]), false, '不许再把 7 行写死')
-  assert.ok(/DONE\.visibleLines/.test(paintDone[1]), '上限仍是 DONE_LAYOUT.visibleLines')
+  assert.ok(/DONE\.visibleLines/.test(paintDone[1]), '量不到正文区高度时退回预算下限 DONE_LAYOUT.visibleLines')
   const renderDone = /function renderDone\(payload\) \{([\s\S]*?)\n  \}/.exec(html)
   assert.ok(renderDone !== null)
   const classAt = renderDone[1].indexOf('applyScreenClass(')
@@ -4702,10 +4716,10 @@ test('page：重读从第一段重新开始、停止清空回调且高亮停住'
   assert.ok(stopPcm !== null)
   assert.ok(stopPcm[1].includes('source.onended = null'), '停止/重读必须清空每段的开始/结束回调')
   assert.ok(stopPcm[1].includes('state.pcmLast = null'), '停止后不再和旧时间轴首尾相接')
-  // 停止/回主页/翻页统一走 applyPlayback('stop')：掐音频、清每段回调（翻页也要立刻停口）。
-  const stopCall = /if \(actionId === 'stop' \|\| actionId === 'home'[\s\S]{0,320}?applyPlayback\('stop'\)/.exec(html)?.[0] ?? ''
-  assert.ok(stopCall !== '', '停止/回主页统一走 applyPlayback(stop)：清回调、掐音频')
-  assert.ok(stopCall.includes("actionId === 'boardPrev'") && stopCall.includes("actionId === 'boardNext'"), '翻页也先停口：' + stopCall)
+  // 停止 / 回主页统一走 applyPlayback('stop')：掐音频、清每段回调（翻页按键已删，不留分支）。
+  const stopCall = /if \(actionId === 'stop' \|\| actionId === 'taskBoard'\)[\s\S]{0,320}?applyPlayback\('stop'\)/.exec(html)?.[0] ?? ''
+  assert.ok(stopCall !== '', '停止/点卡片统一走 applyPlayback(stop)：清回调、掐音频')
+  assert.equal(stopCall.includes("actionId === 'boardPrev'") || stopCall.includes("actionId === 'boardNext'"), false, '翻页按键的停口分支已随翻页一起删掉：' + stopCall)
   assert.equal(/actionId === 'stop'\) \{/.test(html), false, '停止不再单独挂一个会改高亮的分支')
 })
 
@@ -5078,9 +5092,9 @@ await testAsync('进度页看门狗：30 秒没有新帧（测试调成 1 秒）
   }
 })
 
-await testAsync('统一指挥：棋盘每页 4 条 + 翻页（第 N/M 页、上一页/下一页、到头钳住）', async () => {
+await testAsync('统一指挥：棋盘是一列连续滚动的行（整列一次下发、没有 page 字段、滚到第几行要有下行＋回执）', async () => {
   // 同项目同状态的卡片会折叠成一行（那是登记簿本来的折叠规则），所以这里用 6 张不同的卡，
-  // 每条任务落在不同 projectId 上，才能真正产生 2 页。
+  // 每条任务落在不同 projectId 上，才能真正产生 6 行。
   const root = mkdtempSync(join(tmpdir(), 'tihu-page-cards-'))
   const cards = Array.from({ length: 6 }, (_, index) => {
     const folder = join(root, `p${index + 1}`)
@@ -5099,33 +5113,56 @@ await testAsync('统一指挥：棋盘每页 4 条 + 翻页（第 N/M 页、上�
     socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 30)))
     await waitMs(120)
     const boardOf = () => framesOf(socket).filter((item) => item.type === 'screen.frame' && item.payload.board).pop().payload.board
-    let board = boardOf()
-    assert.equal(board.rows.length, 4, '每页就 4 条：' + board.rows.length)
-    assert.equal(board.page.total, 2, '6 条 → 2 页')
-    assert.equal(board.page.index, 0, '回棋盘回到第 1 页')
-    const firstPage = board.rows.map((row) => row.taskId)
-    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 60, y: 232, hit: 'action', actionId: 'boardNext' }, 31)))
-    await waitMs(120)
-    board = boardOf()
-    assert.equal(board.page.index, 1, '点「下一页」立刻翻到第 2 页')
-    assert.equal(board.rows.length, 2, '第 2 页剩 2 条')
-    const secondPage = board.rows.map((row) => row.taskId)
-    assert.equal(new Set([...firstPage, ...secondPage]).size, 6, '两页合起来正好 6 条、不重不漏')
+    const board = boardOf()
+    assert.equal(board.rows.length, 6, '一帧排完全列（6 条就是 6 行，不是「每页 4 条」）：' + board.rows.length)
+    assert.equal(board.page, undefined, '这一帧不夹 page 字段')
+    assert.equal(new Set(board.rows.map((row) => row.taskId)).size, 6, '6 行不重不漏')
+    assert.ok(board.rows.some((row) => row.capsule === '排队中'), '派单出来的任务在这块棋盘上：' + JSON.stringify(board.rows.map((row) => row.capsule)))
+    assert.equal(boardOf().rows.length, 6, '再刷一遍还是整列 6 行（重画不许把行丢掉）')
+    assert.equal(w.runtime.control.listTasks().length, 6, '登记簿里真站着 6 条')
+
+    // 旧手势（swipe 上/下 + 翻页按键）在协议里已经没有目标：发过来也不许凭空冒出「页」。
+    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'swipe', direction: 'next' }, 31)))
+    await waitMs(90)
     socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 60, y: 232, hit: 'action', actionId: 'boardNext' }, 32)))
     await waitMs(90)
-    assert.equal(boardOf().page.index, 1, '最后一页再点「下一页」钳住不动')
-    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 232, hit: 'action', actionId: 'boardPrev' }, 33)))
-    await waitMs(90)
-    assert.equal(boardOf().page.index, 0, '点「上一页」回第 1 页')
-    socket.emit('data', clientFrame(buildUpstream('screen.gesture', { action: 'tap', x: 40, y: 232, hit: 'action', actionId: 'boardPrev' }, 34)))
-    await waitMs(90)
-    assert.equal(boardOf().page.index, 0, '第一页再点「上一页」钳住不动')
-    // 只有一页时不该有第二页（用户要求「一页就隐藏」）：清到只剩 1 条再看。
-    for (const task of w.runtime.control.listTasks()) await w.runtime.control.cancelTask(task.taskId)
+    const afterLegacy = boardOf()
+    assert.equal(afterLegacy.rows.length, 6, '这一列还是整列 6 行')
+    assert.equal(afterLegacy.page, undefined, '没有任何一条旧路径会把「页」塞回来')
+    assert.equal(w.runtime.control.listTasks().length, 6, '旧手势一律忽略，绝不静默变成派一单')
+
+    // 滚到第 6 行：宿主发 board.scroll（带 opId），页面回 device.ack 才算真滚成。
+    const deviceId = w.runtime.control.listDevices()[0].id
+    const scrolling = w.runtime.control.boardScroll(deviceId, { index: 6 })
     await waitMs(80)
-    board = boardOf()
-    assert.equal(board.page.total, 1, '一条都不剩多页时只留 1 页')
-    assert.equal(board.page.index, 0, '页码夹回第 1 页')
+    const scroll = framesOf(socket).filter((frame) => frame.type === 'board.scroll').pop()
+    assert.ok(scroll !== undefined, '要下发 board.scroll 这一条下行（不是只在宿主内部想想）')
+    assert.equal(scroll.payload.row, 6, '下行要带行号')
+    assert.equal(typeof scroll.payload.opId, 'string', '要带 opId 等回执')
+    socket.emit('data', clientFrame(buildUpstream('device.ack', { opId: scroll.payload.opId, ok: true, stage: '棋盘' }, 33)))
+    const scrolled = await scrolling
+    assert.ok(String(scrolled.text).includes('已滚到第 6 行'), '回执到了才说滚成：' + String(scrolled.text))
+    assert.equal(scrolled.acked, true, '设备回了 ack 才算真滚成')
+    assert.equal(boardOf().rows.length, 6, '滚动不改这一列里的行')
+
+    // 滚到最上面 / 最下面（不带行号）也要真的发出去
+    const toTop = w.runtime.control.boardScroll(deviceId, { to: 'top' })
+    await waitMs(80)
+    const topFrame = framesOf(socket).filter((frame) => frame.type === 'board.scroll').pop()
+    assert.equal(topFrame.payload.to, 'top', '滚到最上面要发 { to: \'top\' }')
+    socket.emit('data', clientFrame(buildUpstream('device.ack', { opId: topFrame.payload.opId, ok: true, stage: '棋盘' }, 34)))
+    assert.ok(String((await toTop).text).includes('已滚到'), '滚到顶要有回执文本')
+    const toBottom = w.runtime.control.boardScroll(deviceId, { to: 'bottom' })
+    await waitMs(80)
+    const bottomFrame = framesOf(socket).filter((frame) => frame.type === 'board.scroll').pop()
+    assert.equal(bottomFrame.payload.to, 'bottom', '滚到最下面要发 to bottom 这一条下行')
+    socket.emit('data', clientFrame(buildUpstream('device.ack', { opId: bottomFrame.payload.opId, ok: true, stage: '棋盘' }, 35)))
+    const bottomed = await toBottom
+    assert.ok(String(bottomed.text).includes('这一列最下面'), '滚到底要说清这一列有几行：' + String(bottomed.text))
+
+    // 行号超出这一列 → 明确报错，没有任何「翻到第 N 页」的假动作
+    const bad = await w.runtime.control.boardScroll(deviceId, { index: 9 }).then(() => null, (error) => error)
+    assert.ok(bad instanceof Error && String(bad.message).includes('这一列只有'), '滚到不存在的行要报错：' + String(bad))
   } finally {
     w.cleanup()
     try { rmSync(root, { recursive: true, force: true }) } catch { /* 忽略 */ }
@@ -7867,7 +7904,9 @@ await testAsync('语义路由：指挥台点哪个工具就执行哪个（含参
     { verdict: '{"intent":"control","tool":"tihu_end_voice_session"}', type: null },
     { verdict: '{"intent":"control","tool":"tihu_device_settings","arguments":{"key":"volume","value":"30"}}', type: null },
     { verdict: '{"intent":"control","tool":"tihu_go_home"}', type: null },
-    { verdict: '{"intent":"control","tool":"tihu_board_page","arguments":{"page":1}}', type: null },
+    // 这块 fixture 的屏此刻停在朗读那一屏（不是棋盘那一列），board.scroll 在宿主侧就被挡下：
+    // 这条只核「工具名照实执行、结论落 lane.log」，真的下发与回执另有一节专门核（见「棋盘连续滚动」那节）。
+    { verdict: '{"intent":"control","tool":"tihu_board_scroll","arguments":{"index":2}}', type: null },
     { verdict: '{"intent":"control","tool":"tihu_status"}', type: null },
     { verdict: '{"intent":"control","tool":"tihu_list_devices"}', type: null },
     { verdict: '{"intent":"control","tool":"tihu_admin","arguments":{"action":"list_tasks"}}', type: null, text: '登记簿' },
@@ -7907,10 +7946,10 @@ await testAsync('语义路由：指挥台点哪个工具就执行哪个（含参
  * 2026-11-11 实机：「进第二个会话」开出了第一张卡（lane.log 01:21:47）
  *
  * 这一节钉住「第几个」的唯一读法：
- *   - 行号 1 起、用设备**当前页**、顺序与屏上渲染逐行一致（同一个 boardOf）；
+ *   - 行号 1 起、用设备这一列**整列**行（连续滚动，没有页）、顺序与屏上渲染逐行一致（同一个 boardOf）；
  *   - 0 / 负数 / 小数 / 非数字 → 明确报错，绝不悄悄退化成第 1 行；
  *   - 模型没带 index 时的退化要留痕（lane.log 的 tihu_open_task_fallback）；
- *   - 指挥台提示词必须带这块屏当前页的带编号清单，并要求 open_task 带 index。
+ *   - 指挥台提示词必须带这块屏这一列的带编号清单，并要求 open_task 带 index。
  * ============================================================================ */
 
 test('工具入参日志：tihu_tool_call tool=<名> args=<JSON>，超长截到 ~200 字', () => {
@@ -7967,7 +8006,7 @@ test('棋盘顺序＝渲染顺序：running 在前，完成态按 finishedAt（�
   assert.equal(/board\.rows\.(?:sort|reverse)|rows\.(?:sort|reverse)\(/.test(pageSource), false, '渲染端不许再排序（否则行号与屏上就不是同一份）')
 })
 
-await testAsync('按行号开卡：index=1 开第 1 行、index=2 开第 2 行、index=0 报错、第 2 页 index=2 开第 2 页第 2 行', async () => {
+await testAsync('按行号开卡：index=1 开第 1 行、index=2 开第 2 行、index=0 报错、整列第 5 行照样按行号开（没有页可翻）', async () => {
   const root = mkdtempSync(join(tmpdir(), 'tihu-open-index-'))
   const cards = Array.from({ length: 6 }, (_, index) => {
     const folder = join(root, `p${index + 1}`)
@@ -7988,7 +8027,8 @@ await testAsync('按行号开卡：index=1 开第 1 行、index=2 开第 2 行�
     await waitMs(150)
     const boardOnScreen = () => framesOf(socket).filter((frame) => frame.type === 'screen.frame' && frame.payload.board).pop().payload.board
     let board = boardOnScreen()
-    assert.equal(board.rows.length, 4, '每页 4 行')
+    assert.equal(board.rows.length, 6, '这一列一次排完 6 行（没有「每页 4 行」那回事）：' + JSON.stringify(board.rows.map((row) => row.taskId)))
+    assert.equal(board.page, undefined, '这一帧不带页码')
     const deviceId = w.runtime.control.listDevices()[0].id
     const first = board.rows[0]
 
@@ -8021,17 +8061,34 @@ await testAsync('按行号开卡：index=1 开第 1 行、index=2 开第 2 行�
     const logAfterFallback = readFileSync(join(w.root, 'lane.log'), 'utf8')
     assert.ok(logAfterFallback.includes('note=tihu_open_task_fallback'), '退化必须留痕：' + logAfterFallback)
 
-    // 当前在第 2 页：index=2 必须是第 2 页第 2 行，不是第 1 页的第 2 行。
-    await w.runtime.control.boardPage(deviceId, { page: 1 })
+    // 整列都在这一块屏上：第 5 行不用「翻页」就能按行号开（可视区只画前几行，行号照样是它）。
+    const whole = boardOnScreen()
+    const fifth = whole.rows[4]
+    assert.ok(fifth !== undefined, '6 行全在这一列里：' + JSON.stringify(whole.rows.map((row) => row.taskId)))
+    const openedFifth = await w.runtime.control.openTaskCard(deviceId, { index: 5 })
+    assert.ok(openedFifth.text.includes(fifth.taskId), 'index=5 要开这一列的第 5 行：' + openedFifth.text)
+    assert.equal(openedFifth.text.includes(second.taskId), false, '不许退化成前面的行：' + openedFifth.text)
+
+    // 行号超出这一列 → 明确报错（没有「翻到第 N 页」那种钳住动作）。
+    const overflow = await w.runtime.control.openTaskCard(deviceId, { index: 7 }).then(() => null, (error) => error)
+    assert.ok(overflow instanceof Error && String(overflow.message).includes('这一列只有'), '超出这一列的行号要报错：' + String(overflow))
+
+    // 滚过去：宿主发 board.scroll（带 opId），页面回 device.ack 才算真滚成。
+    socket.emit('data', clientFrame(buildUpstream('text.input', { text: '回棋盘', source: 'voice' }, 32)))
+    await waitMs(150)
+    const scrolling = w.runtime.control.boardScroll(deviceId, { index: 6 })
     await waitMs(80)
-    const page2 = boardOnScreen()
-    assert.equal(page2.page.index, 1, '已经翻到第 2 页')
-    assert.equal(page2.rows.length, 2, '6 条 → 第 2 页 2 行')
-    const page2Second = page2.rows[1]
-    assert.notEqual(page2Second.taskId, second.taskId, '第 2 页第 2 行与第 1 页第 2 行不是同一条')
-    const openedPage2 = await w.runtime.control.openTaskCard(deviceId, { index: 2 })
-    assert.ok(openedPage2.text.includes(page2Second.taskId), '第 2 页上 index=2 要开第 2 页第 2 行：' + openedPage2.text)
-    assert.equal(openedPage2.text.includes(second.taskId), false, '第 2 页上不许开到第 1 页的行：' + openedPage2.text)
+    const scroll = framesOf(socket).filter((frame) => frame.type === 'board.scroll').pop()
+    assert.ok(scroll !== undefined, 'boardScroll 要下发 board.scroll 这一条下行')
+    assert.equal(scroll.payload.row, 6, '下行要带行号')
+    assert.equal(typeof scroll.payload.opId, 'string', '要带 opId 等回执')
+    socket.emit('data', clientFrame(buildUpstream('device.ack', { opId: scroll.payload.opId, ok: true, stage: '棋盘' }, 33)))
+    const scrolled = await scrolling
+    assert.ok(String(scrolled.text).includes('已滚到第 6 行'), '回执到了才说滚成：' + String(scrolled.text))
+    assert.equal(scrolled.acked, true, '设备回执到了才算数')
+    assert.equal(String(scrolled.echo).includes('页'), false, '回声里没有「页」：' + String(scrolled.echo))
+    const badScroll = await w.runtime.control.boardScroll(deviceId, { index: 9 }).then(() => null, (error) => error)
+    assert.ok(badScroll instanceof Error && String(badScroll.message).includes('这一列只有'), '滚到不存在的行要报错：' + String(badScroll))
   } finally {
     delete process.env.TIHU_LANE_LOG
     w.cleanup()
@@ -8039,7 +8096,7 @@ await testAsync('按行号开卡：index=1 开第 1 行、index=2 开第 2 行�
   }
 })
 
-await testAsync('指挥台把「第二个」翻成 index=2：提示词带当前页编号清单，补调开第二行并落工具入参日志', async () => {
+await testAsync('指挥台把「第二个」翻成 index=2：提示词带这一列的编号清单，补调开第二行并落工具入参日志', async () => {
   const root = mkdtempSync(join(tmpdir(), 'tihu-open-commander-'))
   const cards = Array.from({ length: 3 }, (_, index) => {
     const folder = join(root, `p${index + 1}`)
