@@ -215,7 +215,7 @@ public class MainActivity extends Activity {
                 int sec = (int) (ms / 1000);
                 // 3 分钟上限后秒数会过 99，必须按 m:ss 显示（旧写法 "0:" + 秒会变成 0:179）。
                 String mmss = (sec / 60) + ":" + (sec % 60 < 10 ? "0" + (sec % 60) : String.valueOf(sec % 60));
-                recLine.setText("在听… " + mmss + " · 再点一下结束（满 3 分钟自动发送）");
+                recLine.setText("在听… " + mmss + " · 说「完毕」就发送（也可再点一下结束）");
             }
             handler.postDelayed(this, 1000);
         }
@@ -280,6 +280,31 @@ public class MainActivity extends Activity {
     private String lastAsrText;
     private long recStartMs;
     private android.animation.ValueAnimator pulseAnim;
+
+    // ---- 结束词自动收尾（2026-11-13）------------------------------------------
+    //
+    // 录音期间每 endWordProbeMs 取尾部 endWordTailMs 的 PCM 发 /tihu/asr?probe=1，
+    // 由宿主判定末尾有没有结束词（白名单/开关/分段粒度全在 config.json）。
+    // 命中就自己停录，整段转写回来后宿主再剥一次词，设备直接发送（不再弹确认卡）。
+    // 这些字段只在录音线程/探针线程/主线程之间传，标量都是 volatile，PCM 走锁。
+    private final Object probeLock = new Object();
+    /** 录音 PCM 的尾部环形缓冲（默认 12 秒，够 8 秒探针窗口 + 余量）。 */
+    private byte[] probeRing = new byte[0];
+    private int probeRingWrite;
+    private long probeRingTotal;
+    private volatile boolean endWordProbeStop = true;
+    private Thread endWordProbeThread;
+    private volatile HttpURLConnection probeConn;
+    /** 探针间隔（宿主可经响应里的 segmentMs 覆盖）。 */
+    private volatile int endWordProbeMs = 1200;
+    /** 探针尾部窗口（宿主可经响应里的 segmentTailMs 覆盖）。 */
+    private volatile int endWordTailMs = 3200;
+    /** 宿主是否开启结束词（旧服务不返回 probe/endWord 时自动停用）。 */
+    private volatile boolean endWordAutoSend = true;
+    /** 这一次录音是否已经按结束词发过（同一条只触发一次）。 */
+    private boolean endWordSent;
+    /** 命中的结束词（状态行回显用）。 */
+    private String endWordHit = "";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private Runnable backLongPress;
@@ -2506,6 +2531,9 @@ public class MainActivity extends Activity {
         recStop = false;
         recCancelled = false;
         autoStopped = false;
+        endWordSent = false;
+        endWordHit = "";
+        probeRingReset();
         final int gen = ++voiceGen;
 
         AudioRecord rec = null;
@@ -2553,7 +2581,7 @@ public class MainActivity extends Activity {
         wave.begin();
         recProgress = 0f;
         if (recLine != null) {
-            recLine.setText("在听… 0:00 · 再点一下结束（满 3 分钟自动发送）");
+            recLine.setText("在听… 0:00 · 说「完毕」就发送（也可再点一下结束）");
             recLine.setVisibility(View.VISIBLE);
             recLine.setTextColor(lightTheme ? L_DIM : DIM);
         }
@@ -2585,6 +2613,8 @@ public class MainActivity extends Activity {
                             } catch (Throwable ignored) {
                                 // 内存吃紧就丢掉这一小段
                             }
+                            // 结束词探针只看尾部：抄进环形缓冲，探针线程不碰整段 ByteArrayOutputStream。
+                            probeRingPut(bufBytes, n * 2);
                             double rms = Math.sqrt(sum / Math.max(1, n));
                             wave.postLevel((float) rms, (float) peak);
                         } else if (n < 0) {
@@ -2632,6 +2662,8 @@ public class MainActivity extends Activity {
             }
         }, "tihu-rec");
         recThread.start();
+        // 结束词探针与录音线程并行：只读环形缓冲的尾部，不阻塞录音。
+        startEndWordProbe(gen);
     }
 
     private AudioRecord createRecorder(int source, int bufSize) {
@@ -2652,9 +2684,10 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 用户点「结束」或 3 分钟上限（auto=true 时是上限自动收尾，仍照常发送）。 */
+    /** 用户点「结束」、3 分钟上限，或结束词探针命中（auto=true 时都是自动收尾，仍照常发送）。 */
     private void stopRecording(boolean auto) {
         recStop = true;
+        stopEndWordProbe();
         // 收麦＝录音结束：提示音 + 恢复朗读（页面那边解除静音闸门）。
         playTone(ToneFx.STOP);
         jsRecGate(false);
@@ -2680,6 +2713,7 @@ public class MainActivity extends Activity {
             // 已经被取消：丢弃，绝不发送
             return;
         }
+        stopEndWordProbe();
         stopPulse();
         if (pcm == null || pcm.length < 3200) {
             setVoiceState(V_ERR);
@@ -2697,6 +2731,7 @@ public class MainActivity extends Activity {
     private void cancelVoice(boolean tell) {
         playTone(ToneFx.CANCEL);
         jsRecGate(false);
+        stopEndWordProbe();
         boolean wasBusy = (voiceState == V_REC || voiceState == V_ASR);
         voiceGen++;
         recStop = true;
@@ -2734,6 +2769,231 @@ public class MainActivity extends Activity {
         scheduleWakeRestart();
 
 
+    }
+
+    // ------------------------------------------------------- 语音：结束词探针
+    //
+    // 本机 whisper 是一次性整段转写，没有流式接口。所以「录音期间判定」= 定时把
+    // 最近 2–8 秒的 PCM 单独发一次 /tihu/asr?probe=1，让宿主用同一套白名单判尾部；
+    // 命中就立刻收麦，整段转写回来后宿主再剥词并给出 endWord，设备直接发送。
+    // 探针失败/旧服务（响应里没有 probe/endWord）→ 自动停用，不影响手动按钮兜底。
+
+    /** 探针环形缓冲：12 秒（16k/单声道/16bit = 384000 字节）。 */
+    private static final int PROBE_RING_MS = 12000;
+
+    private void probeRingReset() {
+        synchronized (probeLock) {
+            probeRing = new byte[TihuVoiceUtil.SAMPLE_RATE * 2 * PROBE_RING_MS / 1000];
+            probeRingWrite = 0;
+            probeRingTotal = 0;
+        }
+    }
+
+    /** 录音线程每读一块就抄进环形缓冲（只留最近 12 秒）。 */
+    private void probeRingPut(byte[] data, int len) {
+        if (data == null || len <= 0) return;
+        synchronized (probeLock) {
+            int cap = probeRing.length;
+            if (cap == 0) return;
+            int count = Math.min(len, cap);
+            int src = len - count;
+            int first = Math.min(count, cap - probeRingWrite);
+            System.arraycopy(data, src, probeRing, probeRingWrite, first);
+            if (first < count) {
+                System.arraycopy(data, src + first, probeRing, 0, count - first);
+            }
+            probeRingWrite = (probeRingWrite + count) % cap;
+            probeRingTotal += count;
+        }
+    }
+
+    /** 取最近 bytes 字节（按时间顺序）；不足就返回现有的全部。 */
+    private byte[] probeRingTail(int bytes) {
+        synchronized (probeLock) {
+            int cap = probeRing.length;
+            int have = (int) Math.min(probeRingTotal, cap);
+            int n = Math.min(bytes, have);
+            if (n <= 0) return new byte[0];
+            byte[] out = new byte[n];
+            int start = (probeRingWrite - n + cap) % cap;
+            int first = Math.min(n, cap - start);
+            System.arraycopy(probeRing, start, out, 0, first);
+            if (first < n) {
+                System.arraycopy(probeRing, 0, out, first, n - first);
+            }
+            return out;
+        }
+    }
+
+    private void startEndWordProbe(final int gen) {
+        stopEndWordProbe();
+        endWordProbeStop = false;
+        endWordProbeThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                probeLoop(gen);
+            }
+        }, "tihu-endword");
+        endWordProbeThread.start();
+    }
+
+    /** 幂等：停录/取消/收尾/切屏都能反复调。 */
+    private void stopEndWordProbe() {
+        endWordProbeStop = true;
+        Thread t = endWordProbeThread;
+        endWordProbeThread = null;
+        if (t != null && t != Thread.currentThread()) {
+            try {
+                t.interrupt();
+            } catch (Throwable ignored) {
+                // 忽略
+            }
+        }
+        HttpURLConnection c = probeConn;
+        probeConn = null;
+        if (c != null) {
+            try {
+                c.disconnect();
+            } catch (Throwable ignored) {
+                // 忽略
+            }
+        }
+    }
+
+    private void probeLoop(int gen) {
+        while (!endWordProbeStop && gen == voiceGen) {
+            long since = SystemClock.elapsedRealtime() - recStartMs;
+            int wait = since < 1000 ? 300 : endWordProbeMs;
+            try {
+                Thread.sleep(Math.max(200, wait));
+            } catch (InterruptedException e) {
+                return;
+            }
+            if (endWordProbeStop || gen != voiceGen) return;
+            if (voiceState != V_REC) continue;
+            int tailBytes = endWordTailMs * 32; // 16k × 2 字节 = 32 B/ms
+            byte[] tail = probeRingTail(tailBytes);
+            // 太短的窗口 whisper 容易出幻觉，至少 0.4 秒再探。
+            if (tail.length < 12800) continue;
+            String body = postAsrProbe(TihuVoiceUtil.wrapWav(tail));
+            if (body == null || body.isEmpty()) {
+                endWordProbeMs = Math.min(4000, endWordProbeMs + 600); // 失败退避，下一轮成功会重置
+                continue;
+            }
+            try {
+                JSONObject o = new JSONObject(body);
+                if (!o.has("probe")) {
+                    // 旧版 relay/lane 没有探针字段：别每 1.2 秒白跑一次 whisper。
+                    endWordAutoSend = false;
+                    return;
+                }
+                endWordAutoSend = o.optBoolean("enabled", true);
+                int seg = o.optInt("segmentMs", endWordProbeMs);
+                int tailMs = o.optInt("segmentTailMs", endWordTailMs);
+                if (seg >= 400 && seg <= 5000) endWordProbeMs = seg;
+                if (tailMs >= 1200 && tailMs <= 8000) endWordTailMs = tailMs;
+                if (!endWordAutoSend) return;
+                JSONObject ew = o.optJSONObject("endWord");
+                if (ew != null && ew.optBoolean("matched", false)) {
+                    final String word = ew.optString("word", "");
+                    final boolean only = ew.optBoolean("onlyWord", false);
+                    final int hitGen = gen;
+                    handler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (hitGen != voiceGen || voiceState != V_REC) return;
+                            endWordHit = word;
+                            // 先收麦再写状态行：stopRecording 会把状态行改成「正在转写…」。
+                            stopRecording(true);
+                            if (recLine != null) {
+                                recLine.setTextColor(lightTheme ? L_ACCENT : TEAL);
+                                recLine.setText(only
+                                        ? "只听到结束词「" + word + "」 · 正在确认…"
+                                        : "听到结束词「" + word + "」 · 正在转写发送…");
+                                recLine.setVisibility(View.VISIBLE);
+                            }
+                        }
+                    });
+                    return;
+                }
+            } catch (Throwable ignored) {
+                // 响应不是 JSON：当这次探针没结果，继续下一轮
+            }
+        }
+    }
+
+    /** 探针上行：短超时、短 body；失败返回 null（不影响录音）。 */
+    private String postAsrProbe(byte[] wav) {
+        String base = TihuVoiceUtil.asrUrlOf(tihuUrl());
+        if (TextUtils.isEmpty(base)) return null;
+        String url = base + "?probe=1&model=small";
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(url).openConnection();
+            probeConn = conn;
+            conn.setRequestMethod("POST");
+            conn.setConnectTimeout(6000);
+            conn.setReadTimeout(20000);
+            conn.setDoOutput(true);
+            conn.setFixedLengthStreamingMode(wav.length);
+            conn.setRequestProperty("Content-Type", "audio/wav");
+            conn.setRequestProperty("Accept", "application/json");
+            OutputStream os = conn.getOutputStream();
+            try {
+                os.write(wav);
+                os.flush();
+            } finally {
+                try {
+                    os.close();
+                } catch (Throwable ignored) {
+                    // 忽略
+                }
+            }
+            int code = conn.getResponseCode();
+            InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+            return readAll(is);
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            probeConn = null;
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Throwable ignored) {
+                    // 忽略
+                }
+            }
+        }
+    }
+
+    /** 一次转写响应里的结束词判定（旧服务没有 endWord → enabled=false）。 */
+    private static final class EndWordHit {
+        boolean enabled = true;
+        boolean matched;
+        boolean weak;
+        boolean onlyWord;
+        String word = "";
+        String text = "";
+    }
+
+    private EndWordHit parseEndWord(JSONObject o) {
+        EndWordHit hit = new EndWordHit();
+        if (o == null) {
+            hit.enabled = false;
+            return hit;
+        }
+        hit.enabled = o.optBoolean("enabled", true);
+        JSONObject ew = o.optJSONObject("endWord");
+        if (ew == null) {
+            hit.enabled = false;
+            return hit;
+        }
+        hit.matched = ew.optBoolean("matched", false);
+        hit.weak = ew.optBoolean("weak", false);
+        hit.onlyWord = ew.optBoolean("onlyWord", false);
+        hit.word = ew.optString("word", "");
+        hit.text = ew.optString("text", "");
+        return hit;
     }
 
     // ------------------------------------------------------- 语音：上传转写
@@ -2802,11 +3062,12 @@ public class MainActivity extends Activity {
         if (gen != voiceGen) return; // 已作废（用户中断）
         String text = "";
         String apiErr = null;
+        JSONObject parsed = null;
         if (body != null && !body.isEmpty()) {
             try {
-                JSONObject o = new JSONObject(body);
-                text = o.optString("text", "");
-                apiErr = o.optString("error", "");
+                parsed = new JSONObject(body);
+                text = parsed.optString("text", "");
+                apiErr = parsed.optString("error", "");
             } catch (Throwable t) {
                 apiErr = "转写服务返回的不是 JSON";
             }
@@ -2829,6 +3090,30 @@ public class MainActivity extends Activity {
             return;
         }
         lastAsrText = text;
+        // 结束词（2026-11-13）：整段转写回来后宿主已经按尾部判过一次并给了剥词后的正文。
+        // 命中且不是「只说了结束词」→ 直接发送（不再弹 1.5 秒确认卡），同一条只发一次。
+        EndWordHit end = parseEndWord(parsed);
+        if (end.enabled && end.matched) {
+            stopEndWordProbe();
+            if (end.onlyWord || TextUtils.isEmpty(end.text.trim())) {
+                setVoiceState(V_ERR);
+                showErrorLine("只听到结束词「" + (TextUtils.isEmpty(end.word) ? "结束" : end.word) + "」，没有要做的事");
+                return;
+            }
+            if (!endWordSent) {
+                endWordSent = true;
+                pendingText = end.text;
+                playTone(ToneFx.SENT);
+                setVoiceState(V_DONE);
+                if (recLine != null) {
+                    recLine.setTextColor(lightTheme ? L_ACCENT : TEAL);
+                    recLine.setText("结束词「" + (TextUtils.isEmpty(end.word) ? "结束" : end.word) + "」 · 已发送");
+                    recLine.setVisibility(View.VISIBLE);
+                }
+                injectText(end.text);
+                return;
+            }
+        }
         pendingText = text;
         showProposal(text);
     }
