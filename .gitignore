@@ -32,6 +32,12 @@ Thumbs.db
 # 鹈鹕（tihu）运行时产物：写前快照与审计日志（会话工作区里自动生成）
 .tihu/
 
+# Python 运行时缓存（asr-sensevoice）与虚拟环境，不入库
+__pycache__/
+*.pyc
+asr-sensevoice/venv*/
+asr-sensevoice/.venv*/
+
 # Local build/runtime artifacts and backups (added 2026-11-13)
 android/tools/
 android/dist/
