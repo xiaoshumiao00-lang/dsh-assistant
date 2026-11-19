@@ -4,6 +4,255 @@
 控制室里的「更新公告」正文由 `npm run build` 从本文件里当前版本那一节抽出来（见 `build.mjs`），
 不再手写常量——改了代码就必须改这一节，公告与实现不会各说各话。
 
+## [0.2.33] - 2026-11-19
+
+🛑 弃用并移除 Computer Use 离屏隐形操作（0.2.19–0.2.32 那一串离屏改动）：Computer Use 行为回到 0.2.18，今后不再新增这个功能
+
+【为什么】离屏这条路由 0.2.19 引进后越改越深（0.2.29 所有权闸门、0.2.30 空闲归还、0.2.31 全局热键、0.2.32 任意窗口迁入＋输入分层），实测把宿主 Computer Use 拖进崩溃路径、用户 2026-11-19 拍板整体弃用，回滚到最后一个不带离屏的版本 **0.2.18** 的行为。0.2.19–0.2.32 这几节正文照原样留着，它们是历史事实。
+
+【移走的东西（全部搬出仓库，没有一份被删除）】
+- 备份目录（绝对路径）：`C:\Users\Administrator\.dsh\cu-offscreen-backups\rollback-20261119T0925\`
+- `src\cu-offscreen\` 整个目录（21 个源码文件）→ 备份 `src-cu-offscreen\cu-offscreen\`
+- `vendor\computer-use\offscreen\` 整个目录（`capture.py` / `uia-helper.ps1` / README 与 `driver\` 的 MttVDD.inf/dll/cat＋nefcon 两个 exe）→ 备份 `vendor-computer-use-offscreen\offscreen\`
+- 离屏专用脚本 14 个（`test-cu-offscreen*.mjs`、`verify-cu-offscreen*.mjs`、`red-cu-offscreen-anywindow-0232.mjs`、`baseline-physical-0232.mjs`、`gui-preview-0232.mjs`）与 `scripts\host-session\` 的离屏 e2e profile 夹具 → 备份 `scripts-cu-offscreen\`
+- 当前未提交 23 个改动文件的完整 diff → 备份 `worktree.patch`（3,416,881 字节）；另存了改动前的 `CHANGELOG.md` / `package.json` / `dsh.plugin.json` / `cordis.patch.yml` 原样副本、`git status` / HEAD / 未入库文件清单，以及手机分页保留文件的副本与插件状态文件的带时间戳备份
+
+【摘掉的离屏接线】
+- `src\assistant.ts`：删掉 `registerCuOffscreen` 注册块与其 `disposables`、日志写入，以及给悬浮球的 `state:` / `command:` 两个参数
+- `src\desktop-ball.ts`、`src\client\assistant-settings.tsx`：整份回到 HEAD 版本（离屏右键菜单「离屏预览窗 / 接管 / 还给助手 / 移入窗口… / 预览窗热键」、球状态行推送、设置页「操作模式：离屏隐形操作」「虚拟显示器驱动」「离屏实时预览」三块面板全部没有）
+- `vendor\computer-use\index.js`、`index.d.ts`、`backend-18yEf5Jq.js`：`git checkout --` 回到 HEAD（恢复前逐个核对过 diff，里面没有手机分页改动）——注入桥 `Symbol.for('dsh-assistant.cu-offscreen')`、`runWithComputerUseExec`、`production()` 的离屏分支、`resetObservation`、hotkey 的 `inputResult` 与 `hotkeyInputNote` 全部撤掉
+- `cordis.patch.yml`：离屏 reload-marker 换成 0.2.33 回退标记；`dsh.plugin.json` / `package.json` / `package-lock.json` 版本号统一到 0.2.33
+- `npm test`：删掉 7 条离屏测试条目，其余 59 条一个没动
+
+【实际被恢复的关键点（对照 0.2.18 的 HEAD 树）】
+- **前台 Computer Use**：vendor `production()` 只剩原生 Win32 前台路径，没有注入桥、没有会话级身份、也没有「接管」这套概念
+- **悬浮球与预览入口**：桌面球回到「轻点＝控制室 / 长按＝私人助手 / Ctrl+Alt+A 唤起」，右键没有离屏菜单；离屏预览小窗（MJPEG 流、`capture.py`、预览 helper）整条入口消失，设置页也没有「打开预览小窗」
+- **无光标裁剪**：不再有 `ClipCursor`、200ms 虚拟屏边界钳制守卫、`SetCursorPos` 兜底——光标完全交给系统，物理屏与任意真实副屏随便走
+- **不搬任何用户窗口**：没有窗口收养、没有所有权登记与审计 JSONL、没有虚拟屏摆位（`ChangeDisplaySettingsEx` 完全不参与）；真实显示器排列与用户已有窗口一律不动
+- 鹈鹕（tihu）、托管、微信、支付、手机访问等其它模块未受本次回滚影响
+
+【保留】与离屏无关的这批未提交改动一字未动：手机端会话分页（`src\client\pocket\mobile\MobileSessionPagination.tsx`、`session-pagination.mjs`、`locales.ts` / `mobile-apply.tsx` 接线、`scripts\test-mobile-session-pagination.mjs`）、手机端上行历史封顶（`src\pocket-host\mobile-uplink-history.mjs`、`proxy.mjs`、`ws-deflate.mjs` 帧整形通道）、`mobile-boot.mjs` 真实包体三路权重与 `scripts\test-mobile-boot.mjs` 回归，以及鹈鹕信号柱三档与页面布局（`src\tihu\page.ts`、`scripts\test-tihu-protocol.mjs`）。
+
+【状态文件】profile 的 `dsh-assistant-cu-offscreen.json` 里 `mode` 从 `offscreen` 改回 `foreground`，离屏遗留字段（`input` / `previewEnabled` / `takeoverEnabled` / `takeoverHotkey` / `arrangeVirtualScreen` / `arrangedVirtualScreenDone`）已从文件里清掉，只剩 `{"mode": "foreground"}`；`dsh-assistant-cu-offscreen-preview.json` 里离屏预览热键遗留字段清成 `{"closedByUser": true}`；`dsh-assistant-cu-offscreen-takeover.json`（当时 `sessions` 为空、没有任何在途接管）按带时间戳备份原样归档进上面的备份目录。真实显示器排列（DISPLAY1=0,0 1920x1080、DISPLAY2=-1920,0 1920x1080、DISPLAY15=1920,109 1920x1080）与用户已有窗口均未改动，也没有重启或杀掉宿主进程。
+
+【手机端点「＋」不弹输入法】（2026-11-19，纯客户端）手机会话页点输入框左侧那颗「＋」（出「电脑文件 / 文件 / 目标 / 计划」那串命令菜单）时，软键盘会跟着顶起来。根因在宿主 `dsh-client-ui-conversation` 的 InputBar：那颗按钮挂着 `onMouseDown: keepFocus`（`keepDraftFocus` → `editor.getRootElement().focus({preventScroll:true})`）和 `onClick: onToggleCommandMenu`（`focusDraftEditor(editor, revealSelection)`），安卓 WebView 只要 DOM focus 落到 `[data-composer-input]` 就 `showSoftInput`。原先 `composerFocusGate` 的判据只看「pointerdown 有没有落在 `[data-conversation-region="composer"]` 里」，而那颗「＋」正好在输入区树里，于是被当成「用户要点输入框」→ 放行 → 键盘弹。现在把输入区里的落点分成两类：点在输入框本体 / 卡片空白 / 发送钮 = 要打字（照旧放行），点在 `button[aria-haspopup="listbox"]` 或 `[data-trigger-menu]`（菜单里的选项行、面包屑）= 在挑菜单（挡）。判据按时间序，菜单落点只压住它之后紧跟的那次程序化聚焦，用户随后点输入框照旧弹键盘。菜单与命令本身不受影响：`toggleCommandMenu` 只读草稿坐标 `caretSpan()`，不需要 DOM 焦点，`commandUi` 的 `run`（电脑文件走插件自己的 PathBrowser）与附件挂载都不经过 focus。`src/client/pocket/mobile/composerFocusGate.ts` 与 `scripts/test-composer-focus-gate.mjs` 已补回归断言；纯客户端改动，手机端整页刷新即生效，不用重启 DSH Desktop。
+
+【要留意】`lib\` 已按 0.2.33 重建，但正在运行的 DSH Desktop 仍加载旧的 0.2.32 bundle——**需要用户手动重启 DSH Desktop** 才会加载 0.2.33（重启后 Computer Use 走前台路径，设置页不再出现离屏面板）。本次全程未 `git commit`、未 push。
+
+## [0.2.32] - 2026-11-18
+
+🪟 Computer Use 离屏：任意普通桌面窗口（Win32/WinForms/WPF/UWP/Electron/Qt/WPS/Office/资源管理器/终端）都能被显式点名迁入虚拟屏；输入先解析子窗口并用 UIA/消息/真实键盘兜底，点一次、输一次就验证结果
+
+【现象】离屏模式此前只对「本次 launch 新出现」或「全局热键唤醒」的窗口建立所有权；用户桌面上已经开着的 WorkBuddy、WPS、记事本、资源管理器等，CU 用 `open_app` 点名也不会被迁入。输入只把 `WM_*` 投给顶层 hwnd，记事本正文、画图 MDI 子窗口、WinForms 按钮/文本框都点不中、输不进；失败后只能靠反复试点碰运气。
+
+【修法】
+- **显式应用收养**：`open_app`/`activate_app` 点名的应用若已在运行，按进程名/常见中文别名/标题匹配真实窗口；多窗口应用用「可见、非工具窗、非零尺寸、最近前台、面积合理」评分选主窗口，同等候选返回候选列表（不随便挑），没有则走 launch 并让新窗口按 `explicit-app-target` 收养。每次只迁当前会话需要的那一个窗口。
+- **可审计记录**：新增 `src/cu-offscreen/adoption.ts` 与 `window-picker.ts`；记录 `source=explicit-app-target|explicit-user-pick`、`sessionKey+hwnd+pid+processCreation+processName+exePath+windowClass+原始 primaryRect+virtualRect+monitor`，追加 JSONL 审计；turn/end、空闲归还、会话结束按原始 placement/矩形安全归还并清理记录与所有权，旧记录无强身份绝不自动搬入。
+- **用户通用入口**：预览窗工具栏新增「移入窗口…」面板，列出物理屏上真实可迁入的窗口（排除 DSH 自身/预览/悬浮球/helper/shell/IME/工具窗/不可见小窗），本会话已迁入的窗口在同一面板「移出」；悬浮球右键菜单新增「移入窗口…」子菜单（直接列出窗口）与「在预览窗中选择…」。
+- **输入通道**：新增 `src/cu-offscreen/input.ts` 与常驻 `uia-helper.ps1`。先按屏幕点解析最深的子 hwnd（DPI 感知、客户区偏移、`WindowFromPoint` + 子窗口枚举兜底），标准控件优先 UIA `Invoke/Select/Toggle/ValuePattern.SetValue`，Chromium/Electron/Qt/画布类先投子窗口消息；文本域点击用 `AttachThreadInput+SetFocus` 收尾（不改变物理前台），文本用子控件 `WM_CHAR`，UWP 等拒收消息时再走 UIA 设值，最后才用「仅键盘」`SendInput`（先确认用户最近无键鼠输入、切前台前记录原前台、注入后恢复）。鼠标绝不使用真实注入，光标不进虚拟屏。
+- **结果验证**：每次点击/输入/按键都记录通道、顶层/子 hwnd、窗口类、耗时、是否验证成功；点击用标题/窗口变化、UIA 焦点、点击点像素差验证；文本用控件值/名字与焦点控件区域像素差验证。验证失败只换下一条通道重试一次并写明方法，不允许连续盲试。
+- **安全边界不变**：不改真实显示器排列，不搬用户未点名的窗口；未点名的普通窗口仍只能救出不能搬入；预览仍 virtual-only；接管/归还仍不写 `settings.mode`；默认输入仍是 `postmessage`，无需用户改设置。
+
+【验收】新增 `scripts/test-cu-offscreen-anywindow-0232.mjs`（纯逻辑 7/7）、`scripts/verify-cu-offscreen-anywindow-0232.mjs`（WinForms/Office 类/WPF/Qt/Electron 各 5 次，5/5）、`scripts/verify-cu-offscreen-systemapps-0232.mjs`（Notepad/Calculator/Paint/Chrome 各 5 次，5/5；Explorer 为 32767 哨兵坐标边界，已安全排除）、`scripts/baseline-physical-0232.mjs`（物理基线 click≈634ms/insert≈787ms）与真实 GUI 入口证据；另保留 RED 复现 `scripts/red-cu-offscreen-anywindow-0232.mjs`。`npm run build`、`npm test`、`node --check` 全过；真实显示器排列、真实 profile 状态文件与用户已有窗口/文档均未改动。活宿主仍是 0.2.31 bundle，需用户重启 DSH Desktop 后才会加载 0.2.32（重启后 `/status.inputRouting.version` 应为 6）。
+
+## [0.2.31] - 2026-11-17
+
+⌨️ Computer Use 离屏：空虚拟桌面不再拒绝显式热键；全局快捷键走真实 SendInput（只发键盘、光标不动），按窗口/前台快照严格收养，清理残留 Virtual Desktop 伪目标
+
+【现象】离屏虚拟屏没有任何已绑定窗口时执行 `hotkey`（如用户要求的 Ctrl+Alt+W），工具在发送前直接报「当前虚拟屏还没有可操作窗口；先用 open_app 或 open_in_browser”。切到会话级接管后第一次 hotkey 又报「keyboard focus could not be moved to Virtual Desktop」，说明空屏截图生成的合成观察泄漏到了原生路径。
+
+【根因】`ops.targetPtr()` 把「没有 owned 窗口」当成硬错误，连全局热键也在发送前拒绝；而 `vendor` 的 `restoreObservedFocus()` 会拿上一次 `listScreens()` 缓存的合成 `Virtual Desktop`（windowId=0）去 `focusWindow(0)`。此外，空桌面输入没有合法目标；窗口/前台快照、严格唯一收养、伪目标清理与会话生命周期清理都缺失。
+
+【修法】
+- **输入分流**：新增 `src/cu-offscreen/global-hotkey.ts` 与完整 chord 入口。窗口内文本/普通组合键继续走当前会话 owned window 的 PostMessage；Ctrl+Alt、Win、插件配置热键、焦点切换键和空桌面显式 hotkey 走真实 `SendInput` 键盘路径。鼠标事件绝不进入该路径，发送前后读光标位置作证据，不调用 `SetCursorPos`。
+- **真正 OS 热键 + 严格收养**：热键前后对全部顶层窗口做强身份快照；只接受「快照中不存在」或「此前隐藏/最小化→可见」的窗口。已正常可见的窗口仅获得焦点、改标题或被看见一律不收养；多候选/无法唯一识别、DSH/预览/悬浮球/helper/shell/IME 一律拒绝。唯一候选才按 `explicit-global-hotkey` 登记 `sessionKey + hwnd + pid + processCreation + processName + source + adoptedAt`，搬入前再次核对强身份，防 hwnd 重用。
+- **真实失败语义**：SendInput 部分失败会明确报「热键没有完整发送」；发送成功但无候选、多候选、被排除、搬入失败都不伪装成「未发送」，工具输出附 `inputResult`（发送数/期望数/收养结果/候选/原因），空桌面无结果也如实返回。
+- **空桌面合法输入**：`targetPtr()` 不再要求先 open_app；无 owned 窗口时鼠标/普通按键投给桌面窗口（`GetDesktopWindow`），空虚拟桌面点击/按键不再在发送前拒绝。
+- **清理伪目标与会话隔离**：vendor 的观察缓存按 ops 路由与会话身份失效，turn/end、session/disposed、takeover、give-back、前台模式与卸载都会清缓存；原生 hotkey 遇到 windowId<=0、已死 hwnd 或身份不符的观察直接不再 focus。ops 增加 per-session 诊断与重置：pending launch、修饰键、鼠标按键、失效目标/历史不跨会话继承；turn/end 仍保留有效目标的强身份，下一轮 CU 可继续。
+- **安全边界不变**：只搬有明确所有权的窗口；已知可见的物理屏用户窗口绝不因获得焦点被搬；未知窗口只能救出不能搬入；预览仍 virtual-only；接管/归还仍不中断、不写 `settings.mode`；input 默认仍 `postmessage`，不要求用户改设置。
+
+【验收】新增 `scripts/test-cu-offscreen-global-hotkey-0231.mjs`（8/8）与 `scripts/verify-cu-offscreen-global-hotkey-0231.mjs`（自建 WinForms 探针注册 Ctrl+Alt+F8/F9/F10/F11/F12；19/20 功能项 PASS，唯一 FAIL 是活宿主尚未热载 0.2.31，需用户重启宿主；完整值见报告与 result.json）。另有 RED 复现证明两处旧错误均在真实发送前发生。`npm run build`、`npm test`、`node --check` 全过；真实显示器布局、真实 profile 三个状态文件与窗口均未改。
+
+## [0.2.30] - 2026-11-17
+
+🛟 Computer Use 离屏：turn 结束自动把真实应用救回物理屏，陈旧 running/takeover 正确收尾；连续 CU 不再反复 `ClipCursor(0)`，物理光标稳定
+
+【根因】0.2.29 只在切前台、卸载或手动恢复时还原窗口，没有接 `turn/end` / `session/disposed`，所以正常任务结束后窗口仍留虚拟屏。`runningComputerUseSessions()` 又把 `agent.status=running` 当成正在执行 CU，普通后台任务会无限保护陈旧 takeover；TTL 回收还会按旧 `virtualRect` 把窗口搬回虚拟屏。光标方面，`currentOps()` 每次工具调用都 `syncIsolation()` → `isolationHold()` → `ClipCursor(0)`，连续工具链因此反复写全局光标状态。
+
+【修法】
+- **事件驱动的空闲归还**：新增真实 CU 活动跟踪，认 `turn/start`、工具 in-flight、`turn/end` 与 `session/disposed`，不再认笼统的 agent running。turn 结束后 grace 1500ms；新 turn 会取消旧 grace，连续工具链和模型思考间隔不会主屏↔虚拟屏来回搬。老宿主无 turn 事件时，工具结束后才走 15000ms fallback，单个长工具 in-flight 期间绝不过期。
+- **统一安全归还**：会话结束、宿主启动、活动标记清空、takeover 过期回收、前台切换与卸载都走虚拟屏→物理屏同一函数。可信 OriginalPlacement / 身份匹配的 primaryRect 精确恢复；没有 ownership、旧记录或身份无法确认的真实应用也保留尺寸级联救出，不再 fail closed。跳过预览/helper、shell、`EdgeUiInputTopWndClass`、不可见/cloaked、工具小窗与 4px 辅助条；写窗前再次确认中心仍在虚拟屏，绝不搬物理屏用户窗口。
+- **接管一致性**：有效 takeover 的窗口若异常留虚拟屏会立即救到主屏；无真实 CU 活动的覆盖直接收尾并恢复 offscreen 守卫。TTL/回收/启动不再把任何窗口搬回虚拟屏。显式「还给助手」在活动 turn 内仍保留 0.2.29 的精确回虚拟屏语义；下一轮真实 CU 可继续收养并操作本会话窗口。
+- **光标稳定**：`isolationHold()` / `isolationRelease()` 幂等，只有 inactive→active 与 active→inactive 各清一次历史夹取；重复配置同步不再 `ClipCursor(0)`。守卫仍只在真实越界时 `SetCursorPos`，物理屏内静止/移动只读坐标。离屏 ops、预览与 capture.py 没有 `ShowCursor` / `SetCursor` / 硬件光标隐藏，mss 捕获方式不变。
+- **回归**：新增 `scripts/test-cu-offscreen-idle-cursor-0230.mjs`（先 RED 后 GREEN），覆盖 turn 生命周期、fallback、级联/负坐标、系统窗跳过、旧接管回收方向与重复 Clip/SetCursor 计数；新增真机验收覆盖任务结束空闲归还、下一轮继续、未知诱饵救出、有效 takeover、最小化/最大化/尺寸保留和 60 秒连续 CU 光标序列。
+
+## [0.2.29] - 2026-11-17
+
+🔒 Computer Use 离屏：把「看见窗口」与「拥有窗口」彻底分开；接管/归还/回收只搬本会话有强所有权证据的窗口，首次真实 CU 调用会立即 arm 光标守卫并自动打开虚拟屏预览
+
+【根因】0.2.28 的 `currentOps()` 只返回离屏 ops，没有同步守卫或触发预览；启动时若残留接管记录尚未被状态读取回收，`syncIsolation()` 已短路，回收回调又没有重新 arm。接管集合则直接枚举虚拟屏上的全部可见窗口，旧 takeover 记录只有 hwnd/标题/矩形，TTL 回收还会凭这些弱字段自动搬回，存在 hwnd 重用后误搬用户窗口的风险。离屏 ops 还是跨会话共享的可变单例，目标、修饰键与 launch 收养状态会串会话。
+
+【修法】
+- **强所有权**：新增 `src/cu-offscreen/ownership.ts`。只有本会话 launch 前快照中不存在、launch 后新出现且目标进程匹配的窗口才登记；已有窗口改标题、成为前台、被截图或出现在工具参数里都不构成所有权。窗口身份固定为 `hwnd + pid + GetProcessTimes 创建 FILETIME + 进程名`，缺任一项即拒绝。
+- **所有自动搬窗同一道闸门**：接管、还给助手、TTL/句柄回收、退出还原、目标重新校正都在搬动前重新核对强身份；旧 takeover 记录没有 `ownership` 时只清状态，绝不自动搬动。接管集合从「全部虚拟屏可见窗口」收紧为「当前会话拥有且仍在虚拟屏的窗口」。`activateApp` / `focusWindow` 不再收养用户已有窗口。
+- **按会话隔离 ops**：目标窗口、目标历史、待收养 launch、鼠标按键与修饰键状态都按会话分开；异步 launch 轮询显式回到原会话。离屏观察面只暴露本会话拥有的窗口，没有窗口时才回退整块虚拟桌面。
+- **首次 CU 完整激活**：新会话第一次真实工具调用会清掉上一会话留下的预览关闭记忆、自动拉起预览，并立即 `syncIsolation()`；`/status` 的 bridgeMode 探测改为只读，不再产生激活副作用。回收残留覆盖后也会立即重新评估守卫。
+- **光标可核验**：新增 `runCursorGuardOnce()` 与 `setCursorCount/tickCount`。物理屏内静止或移动只读 `GetCursorPos`，绝不 `SetCursorPos`；只有越界才钳到最近物理屏边缘，贴边后周期 tick 不重复移动。仍只调用 `ClipCursor(0)` 清残留，不新增设置开关。
+- **前台不变**：全局 `foreground` 下 `currentOps()` 仍返回 `undefined`，走 vendor 原生 Windows 路径；不创建预览 helper/pos.json，手动预览仍拒绝为「当前为前台模式，无需预览」，不 arm 守卫。
+
+【安全边界】本版不改真实显示器排列；DISPLAY15 保持 `1920,0 1920x1080`、桌面并集 `0,0→3840,1080`。真机验收使用独立 WinForms 探针与私有 profile，不操作微信、WorkBuddy、资源管理器或用户浏览器。
+
+【验收】新增 `scripts/test-cu-offscreen-ownership-0229.mjs`（先 RED 后 GREEN），覆盖会话 ops 隔离、首次激活接线、launch 所有权、旧记录拒绝、hwnd/pid 重用、物理屏静止/移动零 SetCursorPos 与最近边缘钳制；新增 `scripts/verify-cu-offscreen-acceptance-0229.mjs` 跑真实 vendor 工具、两个预先存在的诱饵窗口、两个会话新建窗口、预览 JPEG、接管/归还继续输入、TTL 回收与独立前台宿主。详细实测值见 `.tmp/vdd-test/验证报告-离屏预期验收-0.2.29.md` 及同名 result.json。
+
+
+
+## [0.2.28] - 2026-11-17
+
+🛠 Computer Use 离屏：虚拟屏摆位这条**失效的路**修好了 —— 「只按当前布局摆位」：已孤立（贴边/碰角/有空隙）就不碰布局并一次性记下「已排过」，只有真压在主屏或物理副屏上才按 右侧→下方→左侧→上方 挑自由边重排；主屏与任何物理屏永不移动、分辨率永不改；执行前后打印实际矩形，失败或不确定就回滚
+
+【现象】0.2.27 之后仍然看到的样子：`arrangeVirtualScreen=true` + `arrangedVirtualScreenDone=false` 一直不变，重启宿主每次都「重试摆位」但布局什么都没动；设置页那个「自动把虚拟屏挪到只与主屏碰角」开关点一下也只是把 flag 清成 false，实际不搬。
+【根因】`display.ts` 的 `touchesPrimaryEdge()`（296-303）读的是 `virtual.right` / `virtual.bottom`（以及主屏的 right/bottom）这些对象上**不存在**的字段——`findVirtualMonitor()` 只回 `{deviceName,left,top,width,height,deviceId}`、`findPrimaryMonitor()` 只回 `{left,top,width,height}`——运行时这些值恒为 `undefined` → 四个共边判定全 false → `arrangeVirtualIsolated()` 必在 `display.ts:313` 早退 → `ChangeDisplaySettingsExW`（旧 326 行，目标 (1920,1080)）永远走不到 → `changed:false`，既不摆位也不会写 `arrangedVirtualScreenDone`（所以它恒 false，每次重启尾块都重试）。tsc 一直在那 6 处报 TS2339，正是这条死路的证据。
+【修法】
+- **边界就地算**：`edgedRect()` 用 `right = left + width`、`bottom = top + height`（右/下边界是「第一个不属于该屏的坐标」；所以贴边判据是 `前一块的 left + width === 后一块的 left`，差 1px 就不算贴边——口径写清，避免 off-by-one）。`touchesPrimaryEdge()`、`rectsOverlap()`、`layoutRelation()`、`planIsolatedPosition()` 全走这套口径，不再读不存在的字段。
+- **策略常量（可判定，README 里同一条）**：`ARRANGE_POLICY_KEEP_ISOLATED` / `ARRANGE_NEVER_MOVE_PHYSICAL` / `ARRANGE_NEVER_CHANGE_RESOLUTION`。已孤立 → `isolated:true` + `changed:false` + `planned:null`，不叫 `ChangeDisplaySettingsExW`；旧 hack `DM_PELSWIDTH_OR`（往 dmFields 多挂宽度字段）删除。
+- **只有真压屏才重排**：目标位置按优先级挑自由边——主屏右侧 `(primary.left+primary.width, primary.top)` → 下方 → 左侧 → 上方（负坐标合法，用虚拟屏自己的宽高算）；四条边都被物理屏占掉就 `planned:null` + `error=「没有可用的自由边」`，布局保持原样、不记「已排过」。
+- **`index.ts` 的 `arrangeVirtualIfNeeded()` 三条分支**：重排生效 → 记 `arrangedVirtualScreenDone=true`；**已孤立也一次性记 `arrangedVirtualScreenDone=true`（停掉「每次重启都重试」）**；带 error（算不清 / API 失败 / 已回滚）→ 不记，下次再看。入口仍只有插件加载尾块 `if (mode === 'offscreen')` 与设置页开关 POST（`arrangeVirtualScreen:true` 顺带把 flag 清成 false → 立刻执行一次 = 「用户明确请求 / 重置摆位」那条路）；新的 Computer Use 会话注册、`enterTakeover`、`giveBack`、0.2.27 的接管回收路径都不触发摆位（回收只调 `ensureVirtualDisplay()`，最多修分辨率、不碰位置）。
+- **只允许移动虚拟屏**：`isVirtualDeviceName()` 拿 MttVDD 适配器列表核对，不在列表里的设备名一律拒绝（主屏/物理屏绝不移动）；DEVMODE 只新增 `DM_POSITION`（写 dmPositionX/Y），`dmPelsWidth/Height/dmDisplayFrequency` 一律不写，并额外校验「dmFields 不能新增分辨率字段」（多挂就拒绝执行）；改分辨率只归 `ensureVirtualDisplay()`。
+- **打印 + 回滚，绝不留半截布局**：`log` 回调按顺序给「摆位前布局（主屏 / 虚拟屏 / 其它物理屏清单）」「当前 DEVMODE（EnumDisplaySettings 读到的位置与尺寸）」「计划重定位 (X,Y)（自由边=…）」「重排后实际矩形」；`ChangeDisplaySettingsEx` 返回非 0、之后找不到虚拟屏、或重排后矩形与计划不符（含尺寸被顺手改了）→ 一律 `restorePosition(before.left, before.top)` 回滚、报告 `rolledBack`、`changed:false`。`dryRun: true`（真机只读探针与单测用）只打印计划、不写布局。
+【影响】真机当前布局（`\.\DISPLAY2 0,0 1920x1080` 主屏 + `\.\DISPLAY15 1920,0 1920x1080`，并集 0,0→3840,1080）在新代码里判为**已孤立（连接=right）**：不动布局、不叫 `ChangeDisplaySettingsExW`；宿主重启加载 0.2.28 时，`arrangedVirtualScreenDone` 会被一次性写成 `true`（settings 文件随之重写、0.2.24 起遗留的 `cursorClip`/`cursorGuard` 旧字段自然消失），此后每次重启不再重试摆位。要再摆一次只能走设置页开关（`arrangeVirtualScreen:true`）。
+【验收】`scripts/test-cu-offscreen.mjs` 新增第 14 组：真机形状判为已孤立（`isolated:true`/`changed:false`/`planned:null`/无 error）；`1800,0` 重叠才给计划（right=`(1920,0)`）；右侧被占→下方 `(0,1080)`；右侧+下方被占→左侧 `(-1920,0)`（负坐标）；再加左侧→上方 `(0,-1080)`；四条全占→`planned:null` + error；`800x600` 任意尺寸按虚拟屏自己的尺寸挑边；非 MttVDD 设备名直接拒；corner / gap / overlap / overlapsPhysical 各口径核对；文本级断言旧 bug 写法与 `DM_PELSWIDTH_OR` 已消失、摆位体不写 172/176/184 偏移、只带 `DM_POSITION`、失败回滚、`index.ts` 两条 `settings.update({ arrangedVirtualScreenDone: true })`、README 写有「只按当前布局摆位」。计数 **PASS 14/14**（前 13 组一字未改）。另有真机只读探针（`dryRun`、不写布局、不搬窗口）打印 `touchesPrimaryEdge` 对当前真实布局的返回值、`arrangeVirtualIsolated` 的 `changed/isolated/error`、`EnumDisplaySettings` 逐字节前后对比与桌面并集不变，并核对 settings/takeover 两个文件 size/sha256/mtime 未变。tsc 在 `cu-offscreen` 的真实错误由 7 条降到 1 条（`display.ts` 那 6 处 TS2339 全清）。
+
+## [0.2.27] - 2026-11-16
+
+🧹 Computer Use 离屏：会话级接管记录做过期回收（句柄全死 / 10 分钟无观测 / 正在跑 Computer Use 的会话绝不回收），回收后光标守卫才真的会 arm
+
+【现象】离屏全功能实测（e2e-0226）跑完之后，profile 里的 `dsh-assistant-cu-offscreen-takeover.json` 还挂着一条 `sid:session-f219d202-…`：它那两个窗口句柄 4721410 / 30544358 所属进程早就不在了，记录却一条都不会自己消失。后果是 `anyTakeoverActive()` 永远为 true，`index.ts` 里「离屏且没有任何接管 → 起光标守卫」那条短路被死条目永远压住（守卫一直不 arm），设置页与悬浮球也一直在报「会话级接管」。
+
+【根因】0.2.22 起会话级覆盖只有「显式还给助手」才删；加载与写盘两条路径都没有过期判据，句柄到底还活着没有从来没人查过。
+
+【修法】`takeover.ts` 加三条判据（任一命中即回收；回收结果直接写盘、不静默、打日志行）：
+
+- 判据 a `all-windows-gone`：条目里**所有**句柄 `IsWindow` 都返回 false → 整条立刻回收。为此在 `windows.ts` 新增三态查询 `windowLiveness()`（`true`=还在 / `false`=确定没了 / `undefined`=问不到）；问不到一律保守留用，绝不当成「窗口没了」把会话踢掉。`isWindowAlive()` 的对外行为不变。空 `windows` 列表的条目不走判据 a（刚登记、还没搬窗口的接管不能被瞬秒），只走判据 b。
+- 判据 b `stale-lastseen`：`lastSeenAt`（为 0 就用 `startedAt` 解析出的时刻）距评估时刻超过常量 `TAKEOVER_STALE_AFTER_MS = 600000`（**10 分钟无观测即回收**，严格大于才算过线）→ 回收。正在跑 Computer Use 的会话（store 通过 `liveKeysProvider` 现场取 `runningComputerUseSessions()` 的 sessionId）绝不回收，且在 `/status` 的 `prune.last.keptForLive` 与日志各留痕一条。
+- 判据 c：`sanitizeTakeoverState(raw, options)` 在**加载 store 时**就用同一套判据过滤；`createTakeoverStore` 的 `runPrune()` 真删了东西就 `writeRaw` 落盘，`save()`（登记/归还）也过同一套判据 —— 内存与磁盘一致，不只清内存。会话还活着但某个句柄已经没了的条目只清那个句柄，不整条删。回收评估抛错（存活查询/日志炸了）或写盘失败时，本轮状态原样返回、磁盘不动、统计不吹牛，状态读取与登记/归还都不会被打断。
+- 回收掉的条目若还有活着的窗口：`index.ts` 的 `onTakeoverPruned()` 按记录里的 `virtualRect` 把窗口搬回虚拟屏（不留孤儿窗口留在物理屏上），随后刷新悬浮球状态行。
+
+【隔离判据】`index.ts` 新增导出纯函数 `shouldArmIsolation(mode, takeoverActive)`（= `mode === 'offscreen' && takeoverActive === false`），`syncIsolation()` 改走它 —— 死条目回收完，离屏模式的光标守卫这才真的 arm。`observeCuCall()` 写 `lastSeenAt` 的现状语义一字未改（只用于排序/时效）。
+
+【状态接口】`/status` 的 `takeover` 与 `/takeover-status` 各新增 `prunedEntries`、`prunedHwnds`、`lastPruneAt`、`staleAfterMs`，以及 `prune: { checkedEntries, checkedHwnds, entriesNow, last: { removed[], droppedHwnds[], keptForLive[] } }`；`sessions`、`currentSession`、`windows`、`message` 等旧字段一个没删、形状不变（向后兼容）。设置页 POST 响应也带同一份统计。写盘仍保持 `version: 2` 与结构一字不改、UTF-8 无 BOM。
+
+【验收】`node scripts/test-cu-offscreen.mjs` 13/13：新增第 13 组断言覆盖「死句柄整条回收」「句柄级只清坏句柄、活会话不被误删」「回收真的落盘（`version`/无 BOM/开头字节）」「TTL 阈值边界（等于阈值不回收、过线 1ms 就回收、`ageMs` 精确、回收细节带句柄清单）」「`liveKeys` 里的会话哪怕 100 倍阈值也绝不回收」「存活问不到 = 保守留用」「回收完 `anyTakeoverActive()===false` 且 `shouldArmIsolation('offscreen', false)===true`、接管中/前台模式仍 `false`」「生产接线（`liveKeysProvider` / `staleAfterMs` / `windowLiveness` / 阈值常量）文本级齐全」；前 12 组一字未改（未接上判据的旧 store 调用路径行为完全不变，`pruning` 关闭时 `save()` 不回收）；`npm run build` 通过。
+
+## [0.2.26] - 2026-11-16
+
+🩹 Computer Use 离屏：驱动状态不再被 pnputil 的中文本地化 / GBK 输出坑住（0.2.25 全链路真机实测抓出来的）
+
+【现象】虚拟屏明明在线、驱动明明装着，`/status` 与设置页却报 `installed:false / deviceInstance:null`（`oemInf` 反倒对得上）。本机 `pnputil /enum-devices /class Display` 明确列出 `ROOT\DISPLAY\0001 · Virtual Display Driver · MikeTheTech · Started · oem32.inf`，`EnumDisplayDevices` 也给 `Root\MttVDD` + `\\.\DISPLAY15`。
+
+【根因】`driver.ts` 里 `execFile(..., { encoding: 'utf8' })` 在无控制台句柄的进程里拿到的是 **系统 ANSI 代码页（中文 Windows = GBK）字节 + 本地化标签**（`实例 ID:`）；旧解析 `parseMttVddInstance` 只认英文 `Instance ID:` → 正则不命中 → 判成未安装。`oemInf` 靠 `oem\d+.inf` 兜底正则侥幸命中，所以看起来「半对半错」。
+
+【修法】命令行一律改成 `encoding: 'buffer'` 再走新的 `decodeConsoleOutput()`：先严格 UTF-8，解不动退 GBK；`parseMttVddInstance` 不再依赖标签用词——命中 MttVDD 那块后先认「Instance ID」/「实例 ID」两种标签，都没有就直接从块里抽设备实例串（`ROOT\DISPLAY\000\d` 形状）。安装 / 卸载命令本身一字未动，`driverStatus()` 的字段形状不变。
+
+## [0.2.25] - 2026-11-16
+
+🖥️ Computer Use 离屏：预览窗永远只反映虚拟屏（会话级接管时窗照旧开着 · 画面是空的虚拟屏 · 不再切主屏画面）
+
+【新规则·预览只剩一个画面源】预览窗的画面源只剩虚拟屏：`PreviewSourceKind` 只剩 `'virtual'`，抓屏矩形恒为 `targetMonitor()` → `findVirtualMonitor()`；「第二个画面源」`applySource()` / `setSource()` / `source: 'primary'` / `captureRegion()` 全部删掉——主屏、真实副屏等任何实体屏都不会进预览画面（`capture.py` 也只有虚拟屏矩形参数，没有整屏/主屏预设）。
+
+【接管不收起、不换画面】会话级接管激活时预览小窗**保持开着**，画面仍是那块虚拟屏：窗口已被搬到主屏，所以你在预览里看到的多半是一片空桌面。窗内状态胶囊改成「已接管 · 助手在主屏操作（画面仍是虚拟屏）」，交还后自动改回「离屏运行中 · 虚拟屏」（小窗每 1.5 秒 poll 自己的 `/takeover-status`，工具栏「接管」变灰、「还给助手」变可用，接管期间照常用）。`give-back` 不需要「重新拉起」——窗一直没关；`enterTakeover` / `giveBack` 都只调 `ensurePreviewRunning()`（确保抓屏子进程在跑 + 按 `previewEnabled` / `closedByUser` 偏好补开小窗）。
+
+【手动开预览不再被拒（接管期间）】悬浮球菜单「离屏预览窗」、预览热键（Ctrl+Alt+P / Ctrl+Shift+P / Ctrl+Alt+O）、设置页「打开预览小窗」在会话级接管期间照常开窗；只有全局前台模式仍返回「当前为前台模式，无需预览」，这条拒绝一字未动。
+
+【后果·要留意】接管期间看不到助手在主屏的画面：预览窗里是空虚拟屏，助手在主屏干什么只能自己到主屏现场看，或先点「还给助手（当前会话）」。接管 / 归还仍不中断会话、不写全局 `settings.mode`。
+
+【只有前台模式与卸载才真停抓屏】新增 `PreviewServer.stopCapture()`：全局前台模式切换（`settings.mode=foreground`）、插件卸载收尾、驱动卸载收尾都停 MJPEG 截图子进程 + 丢帧 + 断开客户端；会话级接管**不走**这条。启动时磁盘上已有接管记录也不收起预览，照旧按偏好开小窗。
+
+【状态接口与悬浮球文案】`/status` 的 `preview.source` 恒 `"virtual"`（`windowOpen` 照旧）；`/takeover-status` 返回 `previewSource: "virtual"` + `previewOpen` + `takeoverNote`（接管期显示「预览窗仍开着 · 画面是虚拟屏」）；`/preview-window` 新增 `takeoverActive`；小窗自己的 `/takeover-status` 返回 `previewSource: "virtual"`、`paused: false`。悬浮球状态行 `preview-source:virtual`（恒 virtual），菜单项「离屏预览窗（接管中 · 画面仍是虚拟屏）」、「接管：会话级接管 · 主屏操作（全局默认模式不变 · 预览窗画面仍是虚拟屏）」；「接管（当前会话）」「还给助手（当前会话）」措辞不变，没有新增开关。
+
+【验收】单测 `node scripts/test-cu-offscreen.mjs` 12/12：新增「预览只有 `'virtual'` 一个画面源」（`preview.ts` 里不再出现 `'primary'` / `setSource` / `captureRegion` / `findPrimaryMonitor`，`PreviewSourceKind = 'virtual'`、`targetMonitor()` 恒取 `findVirtualMonitor`）与「接管后预览状态是 `active` 且 `previewSource` 仍是 `virtual`、小窗不被收起」（`index.ts` 有 `ensurePreviewRunning()`、没有 `collapsePreview` / 接管拒绝文案；`source: 'virtual'` 恒写死，前台模式拒绝文案 `'当前为前台模式，无需预览'` 保留）两条断言；小窗胶囊文案改判 `'已接管 · 助手在主屏操作'` + `'离屏运行中'` + `'虚拟屏'`；光标守卫的 9 布局几何断言（约 31 条）一字未动；`test-release-consistency` 6/6；`npm run build` 通过。
+
+## [0.2.24] - 2026-11-16
+
+🖱️ Computer Use 离屏：光标守卫变成默认生效的纯守卫（去掉开关），几何支持任意屏幕排列
+
+【没有开关了】「光标夹取 / 光标守卫」两个设置项删除：离屏模式激活时光标守卫**恒定生效**，不再读 `settings.cursorGuard` / `cursorClip`；老配置里写着 `false` 也一律忽略（`sanitizeCuOffscreenSettings` 不再拷贝这两个字段，下次写盘自然消失）。设置页把两个开关换成只读说明：虚拟屏（MttVDD）进不去、物理屏（主屏 + 任意真实副屏）随便走，并显示物理屏/虚拟屏块数、守卫是否生效、累计钳制次数与最近一次 `(from) → (to)`。
+
+【几何通用】钳制不再写死「虚拟屏在右边」，改成通用最近边缘算法（`clampToPhysical` 纯函数）：候选 = 每块物理屏的矩形钳制点 + 所在虚拟屏边界外 1px 的四个点，取「确实落在物理屏上、且不在任何虚拟屏内」里距离最近的那个，另一个轴尽量保持原坐标。因此虚拟屏在右/左/上/下、只碰角、与某块物理屏部分重叠都按几何最近边处理；1 屏 / 2 屏 / 3 屏以上、任意分辨率、任意 DPI、负坐标都成立。虚拟屏只碰角时落到最近的物理屏角点内侧，绝不会把光标送进空桌面区域；物理屏之间（任意两块）始终自由通行。
+
+【彻底弃用 ClipCursor】纯守卫实现，运行期不再调用 `ClipCursor(rect)`（历史副作用清零），只在离屏激活/释放时 `ClipCursor(0)` 清掉旧版本可能留下的夹取；守卫逻辑本身仍是 200ms 贴边钳制（位移 1~2 像素，不弹回旧坐标）。
+
+【验收】单测 `node scripts/test-cu-offscreen.mjs` 覆盖 9 种布局（单屏+右侧虚拟屏、双屏+右侧、双屏+左侧、虚拟屏在上、在下、只碰角、三屏混合、不同分辨率+负坐标、虚拟屏与物理屏部分重叠），断言钳制点落在最近的物理屏边缘内侧且位移最小；`test-release-consistency` 6/6；`npm run build` 通过。
+
+## [0.2.23] - 2026-11-16
+
+🖱️ Computer Use 离屏：物理副屏不再被拦截，光标隔离改成「虚拟屏边界钳制」
+
+【问题】0.2.22 的夹取矩形只取 Primary 主屏，200ms 守卫把「主屏之外」一律当误入并回拉到上一次坐标：接一块真实副屏（DISPLAY2 在 -1920）后，鼠标一越过主屏就被弹回来，副屏完全没法用。
+
+【物理屏 / 虚拟屏严格分开】`display.ts` 新增 `listDisplayLayout()`：虚拟屏只认 MttVDD（DeviceID 含 MttVDD 或适配器名含 Virtual Display Driver），**其余显示器一律算物理屏**——主屏、DISPLAY2 这类真实副屏都在放行区里，绝不夹取、绝不回拉；枚举不上 MttVDD 时宁可多放行。`/status` 的 `isolation.layout` 直接给出物理屏/虚拟屏清单与整桌面并集。
+
+【守卫改为边界钳制，不弹回旧位置】200ms 守卫读 `GetCursorPos`：坐标在任意物理屏内 → 直接放行；落进虚拟屏（或掉到任何物理屏之外）→ 钳到**最近的物理屏矩形内侧**。虚拟屏在主屏右侧时就是 `x=主屏右边界-1`、`y` 保持不变并钳进主屏高度，位移只有 1~2 像素，用户看到的是鼠标贴在屏幕边缘抖动，而不是跳回上一次的坐标。虚拟屏换方位（左/上/下）按几何最近边同理处理。纯函数 `clampIntoPhysical()` 与 `planClipping()` 单独可测。
+
+【ClipCursor 只在单物理屏可用】单一矩形表达不了「多物理屏 + 虚拟屏」，所以 `clipEnabled` 仅在**恰好一块物理屏**时才真正调用 `ClipCursor`；检测到多块物理屏自动禁用，状态里给 `clip.autoDisabled + reason`，设置页照原文写清原因。默认值改为 `cursorClip=false`、`cursorGuard=true`；磁盘上已经是 `false` 的用户设置原样尊重，代码不强行打开。
+
+【保留放行】助手用 SendInput 打虚拟屏坐标时守卫仍临时暂停（`isolationVirtualInput`），工具调用完成后光标落在物理屏边界而不是被弹飞；接管 / 还给助手 / 退出离屏仍然 `ClipCursor(0)` 释放，不留锁死残留。顺带修掉 sendinput 输入方式的坐标映射：绝对坐标现在同时带 `MOUSEEVENTF_VIRTUALDESK`（0.2.22 只给了 `MOUSEEVENTF_ABSOLUTE`，Windows 按主屏归一化，离屏点击其实一直落在主屏）。
+
+【设置页】「虚拟屏鼠标隔离」一段写清物理屏（主屏 + 真实副屏，一律放行）与虚拟屏（MttVDD，只给助手离屏用）的区别，并显示物理屏/虚拟屏块数、当前夹取状态、多物理屏自动禁用原因、守卫累计钳制次数。
+
+【验收】真实工具层（本机三屏：DISPLAY1 0,0 1920x1080 / DISPLAY2 -1920,0 / DISPLAY15 1920,109）：副屏 (-500,500)、(-1900,900) 各停 1 秒不被改动；虚拟屏 (2000,500) 稳定钳回 (1919,500) 连续 5 次；离屏工具调用期间副屏仍可用；空闲 `GetClipCursor` 等于整桌面并集；单测新增「多物理屏禁用 ClipCursor」与钳制几何用例。证据在 `.tmp/vdd-test/host-session/cursor-clamp-0223/result.json`。
+
+## [0.2.22] - 2026-11-16
+
+🖥️ Computer Use 离屏「接管 / 还给助手」变成会话级覆盖，预览小窗跟着换画面源
+
+【接管只影响当前会话】点「接管」、按 <b>Ctrl+Alt+T</b> 或悬浮球菜单，都只给**当前这条 Computer Use 会话**登记「主屏操作」覆盖：它的窗口照旧搬到 Primary 主屏工作区（保持相对偏移、几乎重叠时层叠错开、不抢前台），这条会话后续的工具调用走原生前台 ops。接管**绝不写全局 `settings.mode`**——那玩意儿只有设置页能改；之后新建的会话仍按全局默认（离屏）在虚拟屏隐形操作。「还给助手」只清掉这条会话的覆盖并按记录把窗口搬回虚拟屏、恢复光标夹取，提示「已切回离屏模式」。会话身份按 ①最近调过 Computer Use 的会话（vendor 工具调用上下文经 `runWithComputerUseExec` 传进注入桥）→ ②正在运行的 Computer Use 会话 → ③前台 DSH 窗口标题里的会话名（形如「会话名 — DeepSeek Harness」）依次挑一个，全都没有就落 `unscoped`（只有无身份的调用会吃到它）。状态文件 `dsh-assistant-cu-offscreen-takeover.json` 升为 `version: 2` 的 `sessions` 表（0.2.21 的单一 active 形状自动迁移成一条 `legacy` 覆盖）。
+
+【接管 / 归还都不中断会话】两条动作都只换操作通道：不去调用宿主的取消 turn、不发中断事件、不把会话变成失败或结束态。点接管时若正有 Computer Use 工具调用在跑，它正常完成，之后的调用才走新屏；文案里不会出现「已中断 / 已取消 / 已暂停」。
+
+【预览小窗不关，画面跟着换】接管不再关闭预览小窗：离屏时看虚拟屏画面，接管期间同一路 MJPEG 流改抓**主屏整屏**（Python 侧只换 `--left/--top/--width/--height` 区域），小窗状态胶囊显示「主屏操作中」，还给助手后画面切回「离屏运行中 · 虚拟屏」。用户手动关窗的偏好仍然记住，接管与归还都不会强行开或关小窗。
+
+【全局前台模式不弹预览】`settings.mode = foreground` 时不再自动弹预览小窗（即便 `previewEnabled=true`），悬浮球「离屏预览窗」菜单项与预览热键也不弹窗，改给提示「当前为前台模式，无需预览」；设置页此时显示「当前为前台模式，无需预览」。
+
+【状态接口】`/status`、`/takeover-status`、`/preview-window` 一并返回「当前会话覆盖状态」和「全局默认模式」：`takeover.sessions[]` / `takeover.currentSession`、`globalMode`、`previewSource`（`virtual` / `primary`）、`windows[]`；预览小窗自己的 `/takeover-status` 也照此扩展。`/api/assistant/cu-offscreen/settings` 里手动改全局模式时会顺带收口会话级接管（切回离屏走归还流程，切到前台丢弃记录）。
+
+【验收】真实 vendor Computer Use 工具层端到端 36/36：接管后 `settings.mode` 仍是 `offscreen`（设置文件字节与 mtime 不变）、当前会话在主屏截图/点击/新窗口都在主屏（物理光标被搬进主屏点击点）、**新建的会话仍按全局设置走离屏**（它的窗口落在虚拟屏、离屏点击物理光标不动）、还给助手后该会话回离屏且预览画面切回虚拟屏、别的会话的离屏窗口不动；接管与归还时正在跑的那次调用正常完成、无取消/中断记录；接管不关预览小窗、画面源换成主屏（同一路 MJPEG 换抓主屏，帧哈希跟着变）；全局前台模式下预览不自动弹且手动开被拒、接管被拒；收尾恢复 foreground、GetClipCursor 已释放、无残留测试窗口。证据在 `.tmp/vdd-test/host-session/takeover-session-0222/result.json`。
+
+## [0.2.21] - 2026-11-16
+
+🖥️ Computer Use 离屏「接管 / 还给助手」改为主屏接管，不再暂停助手
+
+【接管】点「接管」后枚举虚拟屏上**所有可见顶层应用窗口**（包括助手启动与用户手动拖入的窗口，不再只处理助手搬过的窗口），按虚拟屏相对偏移逐个搬到 Primary 主屏工作区；窗口几乎完全重叠时自动层叠错开，全程不调用 SetForegroundWindow、不抢前台。接管前的虚拟屏矩形逐窗持久化，主屏原有窗口不动，已关闭窗口在归还时自动跳过。
+
+【助手继续操作】接管会把设置写为 `foreground`，注入桥直接返回原生前台 ops；旧版 paused-ops、「助手已暂停」报错与取消当前 turn 的行为全部移除，助手下一次 Computer Use 调用就在主屏正常点击/截图。接管时释放 ClipCursor、停止 200ms 守卫并自动关闭预览小窗，但不改用户的「不想自动弹」偏好；toast / 悬浮球提示「已接管，已切到主屏操作」，菜单状态显示「前台模式 · 主屏操作」。
+
+【还给助手与持久状态】点「还给助手」按记录把仍存在的窗口搬回虚拟屏原矩形，设置切回 `offscreen`，重新启用光标夹取与守卫，并按 previewEnabled 与既有关闭偏好恢复预览窗，提示「已切回离屏模式」。接管状态与窗口矩形存于 profile 的 `dsh-assistant-cu-offscreen-takeover.json`，宿主重启后仍能识别「前台（已接管）」并归还；`/api/assistant/cu-offscreen/takeover-status` 返回 active / mode / state / windows。
+
+【离屏目标恢复】归还时若接管前的离线目标已关闭，从最近收养历史中恢复一个仍存在的虚拟屏窗口，保证下一步 click/截图不会报「当前虚拟屏还没有可操作窗口」。预览资源探测会同时检查插件根与当前工作目录下的 `capture.py`，测试 bundle 落在 `.tmp` 时不再误报「capture.py 缺失」。
+
+【验收】真实 vendor Computer Use 工具层端到端 24/24：接管前窗口在虚拟屏、接管后全部搬到 Primary 且不抢前台、主屏原生截图/点击成功；归还后窗口按记录回虚拟屏、ClipCursor 重新夹取、离屏截图/点击成功；收尾设置 foreground、GetClipCursor 为整桌面联合矩形、无残留测试窗口。证据在 `.tmp/vdd-test/host-session/takeover-foreground-0221/result.json`。
+
+## [0.2.20] - 2026-11-16
+
+🧷 Computer Use 离屏：新增「接管（用户暂停助手）」与「虚拟屏鼠标隔离」
+
+【接管】离屏预览小窗顶部叠两个半透明工具栏按钮「接管 / 还给助手」（不挡画面）；全局热键默认 <b>Ctrl+Alt+T</b>（可配置，避开预览热键 Ctrl+Alt+P / Ctrl+Shift+P / Ctrl+Alt+O）；悬浮球右键菜单也加了「接管 / 还给助手」并显示当前状态。点「接管」：把离屏窗口**立即全部搬回物理屏原位**（不抢前台），进入「用户接管」态——此时注入面 `currentOps()` 返回「已暂停」ops，助手任何 Computer Use 操作会**立刻失败**并返回可读错误「用户已接管，助手已暂停，请停止操作并等待用户指示」（不会退回原生前台操作）；尽力触发宿主取消当前 turn；给可见反馈（预览小窗 toast + 系统通知气泡「已接管，助手暂停」）。点「还给助手」：窗口搬回虚拟屏、退出暂停、恢复夹取/守卫。设置页 Computer Use 面板有接管开关 + 热键选择。
+
+【鼠标隔离】离屏激活期间用 `ClipCursor` 把光标夹在主屏内（默认开），防止鼠标滑进右侧虚拟屏后找不回来；另有 200ms 兜底守卫：光标若落进虚拟屏就复位到主屏最后位置并记日志；SendInput 打虚拟屏坐标时临时放行夹取与守卫、避免打架。退出离屏 / 接管 / 插件卸载 / 进程退出都 `ClipCursor(NULL)` 释放，绝不留锁死鼠标的残留（GetClipCursor 可查）。另可选自动把虚拟屏挪到只与主屏碰角（`ChangeDisplaySettingsEx` DM_POSITION，不与主屏共边；用户手动排过之后尊重其排列、不再强行覆盖）。设置页有「夹取光标 / 兜底守卫 / 自动摆位」三个开关与说明。
+
+【不影响的既有行为】前台模式与原有预览小窗 / 悬浮球热键 / 窗口位置记忆回归测试全部通过；未触碰鹈鹕、微信、支付、托管等其它模块。
+
+## [0.2.19] - 2026-11-15
+
+🖥️ Computer Use 双模式：前台（默认，原行为完全不变）+ 离屏隐形操作（新）
+
+【离屏模式】设置页「个人助手 → Computer Use」一键切换，持久化在 profile 的 `dsh-assistant-cu-offscreen.json`。切到离屏后，Computer Use 会话把目标应用窗口搬到一块 MttVDD 虚拟显示器上（记录原位置，任务结束/切回前台自动还原）：截图取虚拟屏整屏，点击/键盘/滚轮/拖拽默认用 PostMessage 投递到目标窗口——物理屏零弹窗、光标不动、前台窗口不被抢（2026-11-15 可行性验证结论：PostMessage 点击 Chrome 实测有效）。个别软件不响应时设置里可切 SendInput 回退（输入打虚拟屏坐标，物理屏指针会暂时消失）。实现上 vendor computer-use 的 `production()` 增加了一个逐次询问的注入桥（`Symbol.for('dsh-assistant.cu-offscreen')`）：前台模式返回 undefined 走原生路径，坐标映射/点击编排/typeText 剪贴板流程全部沿用 vendor 原逻辑，只替换底层屏幕/输入/窗口操作。
+
+【虚拟显示器驱动一键安装】驱动文件（MttVDD.inf/dll/cat + nefcon x64，SignPath 签名）随插件打包在 `vendor/computer-use/offscreen/driver/`；设置页「安装虚拟显示器驱动」按验证过的三步执行（pnputil 入库 → nefcon 建 Root\MttVDD 节点 → pnputil 重新枚举）。未安装时引导 UAC 提权，非管理员有明确提示；每步失败给可读错误；已安装显示设备实例与卸载按钮。虚拟屏识别按设备路径/适配器特征（MttVDD），不写死坐标；默认 800x600 会在任务开始时自动切 1920x1080。
+
+【实时预览】Python（mss+Pillow，缺依赖自动 `pip install --user`）截虚拟屏推 8fps JPEG 流：Electron 置顶小窗（可拖动、可关可再开，复用 dsh-orb 运行时）、设置页内嵌画面、手机端经 pocket 代理同源可看同一接口。设置里可关。
+
+新增 `scripts/test-cu-offscreen.mjs`（PNG 编码器结构、驱动命令与解析器齐备、设置清洗与持久化、路由清单、MJPEG 帧流切分）。新增源码 `src/cu-offscreen/`（win32/display/windows/ops/png/settings/driver/preview/index），vendor 仅 `backend-18yEf5Jq.js` 的 `production()` 一处注入缝；键盘组合键的 PostMessage 限制（Ctrl+V 已翻译为 WM_CHAR 逐字符输入）与 SendInput 回退说明见 `vendor/computer-use/offscreen/README.md`。
+
 ## 起点版（v0.2.17-qidian）
 
 🎯 立项基线：鹈鹕（tihu）语音助理项目从这一版代码起步，版本号**仍是 0.2.17**，只另打 annotated tag `v0.2.17-qidian`

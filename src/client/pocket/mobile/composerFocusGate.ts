@@ -13,16 +13,28 @@
  * 【做法】不去改宿主（宿主在 app.asar / profile node_modules 里，改了一升级就没了）。
  * 在客户端插件这一层把「不是用户点进去的」那类程序化聚焦挡掉：
  *
- *   判据只有一条 —— **这一次聚焦之前的一小段时间（默认 1.2 s）内，用户的
- *   pointerdown 是不是落在输入区里**（`[data-conversation-region="composer"]`，
- *   宿主给 composerSeat 打的标记，输入卡片 / 发送钮 / 菜单 / 附件都在这一棵树里）。
+ *   判据有两条 —— **这一次聚焦之前的一小段时间（默认 1.2 s）内，用户的 pointerdown
+ *   是不是落在输入区里**（`[data-conversation-region="composer"]`，宿主给 composerSeat
+ *   打的标记，输入卡片 / 发送钮 / 命令菜单 / 附件都在这一棵树里），**以及落在输入区里的
+ *   那一下点的是「要打字的地方」还是「菜单」**：
  *
  *   - 切会话 / 启动恢复上一个会话：最近一次点击在侧栏会话行、悬浮球、控制台卡片上
  *     → 挡，键盘不弹，界面照常渲染；
- *   - 用户点输入框（含卡片空白、发送钮、命令菜单）：pointerdown 就在输入区里
+ *   - 用户点输入框（含卡片空白、发送钮）：pointerdown 就在输入区里且不是菜单
  *     → 放行，键盘正常弹出；
+ *   - 点「＋」命令菜单那颗按钮、或菜单里的选项行 / 面包屑（电脑文件、文件、目标、计划）：
+ *     这一下算「在挑菜单」，不是要打字 → 挡（2026-11-19 的这次改动）。宿主的
+ *     `InputBar` 给「＋」挂了两条抢焦点的路径：`onMouseDown: keepFocus`（
+ *     `keepDraftFocus` → `editor.getRootElement().focus()`）和 `onClick:
+ *     onToggleCommandMenu`（`focusDraftEditor(editor, revealSelection)` 再聚焦一次），
+ *     安卓 WebView 里这两下任意一条都会 `showSoftInput`，所以点「＋」键盘就跟着弹出来。
+ *     菜单本身照由宿主开（`toggleCommandMenu` 只读 `caretSpan()`，那是草稿坐标，
+ *     不需要 DOM 焦点），命令的 `run` / 附件挂载也照由宿主走，都不经过 focus。
  *   - 正在打字：编辑器本来就有焦点，挡与不挡都没差别（挡只是不做无效聚焦，
  *     不会把已有焦点弄丢）。
+ *
+ * 菜单那一下只压住「它之后紧跟的那次程序化聚焦」：判据是时间序——菜单点击比输入点击
+ * 更晚就按菜单点击处理。用户随后点输入框（那一下不是菜单）照样放行，键盘正常弹出。
  *
  * 只挡 `[data-composer-input]` 这一个元素（宿主 Lexical 的 contenteditable 本体）。
  * 插件自己的输入框（`[data-pocket-orb="textarea"]`）、文件选择框、搜索框、重命名框
@@ -35,8 +47,17 @@
 /** 宿主输入框本体：dsh-client-ui-conversation 的 ComposerContentEditable 渲染的 div。 */
 export const COMPOSER_INPUT_SELECTOR = '[data-composer-input]'
 
-/** 宿主给 composerSeat 打的区域标记；输入区里的一切点击都算「用户要打字」。 */
+/** 宿主给 composerSeat 打的区域标记；输入区里的点击分「要打字」和「在挑菜单」两类。 */
 export const COMPOSER_SEAT_SELECTOR = '[data-conversation-region="composer"]'
+
+/**
+ * 输入框左侧那颗「＋」（宿主 InputBar 的命令按钮，`aria-haspopup="listbox"`）。
+ * 点它只开菜单，不该把输入法顶起来。
+ */
+export const COMPOSER_COMMAND_BUTTON_SELECTOR = 'button[aria-haspopup="listbox"]'
+
+/** 命令菜单本体（宿主的 MenuSurface，选项行 / 面包屑都在它里面）；菜单里的点击不算要打字。 */
+export const COMPOSER_MENU_SELECTOR = '[data-trigger-menu]'
 
 /**
  * 「点进输入区」之后多久内的程序化聚焦仍算用户主动。
@@ -45,14 +66,17 @@ export const COMPOSER_SEAT_SELECTOR = '[data-conversation-region="composer"]'
  */
 export const SEAT_GRACE_MS = 1200
 
-/** 只在宿主输入区里「最近点过」时放行；其余一律挡。 */
+/** 输入区里那一下点击的意图：点在打字的地方（输入框 / 卡片空白 / 发送钮），还是点在菜单上。 */
+export type ComposerTapKind = 'typing' | 'menu'
+
+/** 输入区里「最近点过」时放行；点过菜单或什么都没点过一律挡。 */
 export interface ComposerFocusGate {
-  /** 记录一次 pointerdown：只有落在输入区里才算「用户要打字」。 */
-  notePointer(inSeat: boolean, now: number): void
+  /** 记录一次 pointerdown：只有落在输入区里才算数；`kind` 区分要打字 / 在挑菜单。 */
+  notePointer(inSeat: boolean, now: number, kind?: ComposerTapKind): void
   /** now 时刻的这一次程序化聚焦要不要挡。 */
   shouldBlock(now: number): boolean
   /** 只读快照（单测 / 诊断用）。 */
-  inspect(): { lastSeatPointerAt: number | null; graceMs: number }
+  inspect(): { lastSeatPointerAt: number | null; lastMenuTapAt: number | null; graceMs: number }
 }
 
 /**
@@ -63,23 +87,34 @@ export interface ComposerFocusGate {
 export function createComposerFocusGate(graceMs: number = SEAT_GRACE_MS): ComposerFocusGate {
   const grace = Number.isFinite(graceMs) && graceMs >= 0 ? graceMs : SEAT_GRACE_MS
   let lastSeatPointerAt: number | null = null
+  let lastMenuTapAt: number | null = null
   return {
-    notePointer(inSeat: boolean, now: number): void {
+    notePointer(inSeat: boolean, now: number, kind: ComposerTapKind = 'typing'): void {
       // 区外点击不刷新时间戳：点了会话列表不等于用户要打字。
       if (!inSeat || !Number.isFinite(now)) return
+      if (kind === 'menu') {
+        lastMenuTapAt = now
+        return
+      }
       lastSeatPointerAt = now
     },
     shouldBlock(now: number): boolean {
-      if (lastSeatPointerAt === null) return true
+      if (lastSeatPointerAt === null && lastMenuTapAt === null) return true
       if (!Number.isFinite(now)) return true
+      // 菜单那一下比最后一次输入点击更晚（或同一时刻）→ 这一次聚焦是「点开菜单」顺手带出来的，挡。
+      if (lastMenuTapAt !== null) {
+        const typingIsNewer = lastSeatPointerAt !== null && lastSeatPointerAt > lastMenuTapAt
+        if (!typingIsNewer) return true
+      }
+      if (lastSeatPointerAt === null) return true
       const elapsed = now - lastSeatPointerAt
       // 时钟倒退（页面被挂起后 performance.now 异常）按「刚点过」放行：
       // 宁可弹键盘，也不能把用户点输入框这一下也挡掉。
       if (elapsed < 0) return false
       return elapsed > grace
     },
-    inspect(): { lastSeatPointerAt: number | null; graceMs: number } {
-      return { lastSeatPointerAt, graceMs: grace }
+    inspect(): { lastSeatPointerAt: number | null; lastMenuTapAt: number | null; graceMs: number } {
+      return { lastSeatPointerAt, lastMenuTapAt, graceMs: grace }
     },
   }
 }
@@ -123,19 +158,43 @@ export function installComposerFocusGate(host: ComposerFocusGateHost = {}): () =
   const originalFocus = proto.focus
   let blocked = 0
 
+  /** 落点元素（文本节点没有 `closest`，从 parentElement 起）。 */
+  const elementOf = (event: Event): Element | null => {
+    const target = event.target as (Element | (Node & { parentElement?: Element | null }) | null)
+    if (target !== null && typeof (target as Element).closest === 'function') return target as Element
+    const parent = (target as (Node & { parentElement?: Element | null }) | null)?.parentElement
+    return typeof (parent as Element | null)?.closest === 'function' ? (parent as Element) : null
+  }
+
   /** 这一次 pointerdown 是不是落在宿主输入区里。读不到就当区外（保守：不弹键盘）。 */
   const isSeatTarget = (event: Event): boolean => {
     try {
-      const target = event.target as (Element | null)
-      if (target === null || typeof target.closest !== 'function') return false
-      return target.closest(COMPOSER_SEAT_SELECTOR) !== null
+      const el = elementOf(event)
+      if (el === null) return false
+      return el.closest(COMPOSER_SEAT_SELECTOR) !== null
+    } catch {
+      return false
+    }
+  }
+
+  /** 落在「＋」命令按钮本身、或命令菜单里的那一下：是挑菜单，不是要打字。 */
+  const isMenuTarget = (event: Event): boolean => {
+    try {
+      const el = elementOf(event)
+      if (el === null) return false
+      return el.closest(COMPOSER_MENU_SELECTOR) !== null
+        || el.closest(COMPOSER_COMMAND_BUTTON_SELECTOR) !== null
     } catch {
       return false
     }
   }
 
   const onPointerDown = (event: Event): void => {
-    gate.notePointer(isSeatTarget(event), clock())
+    if (!isSeatTarget(event)) {
+      gate.notePointer(false, clock())
+      return
+    }
+    gate.notePointer(true, clock(), isMenuTarget(event) ? 'menu' : 'typing')
   }
 
   const patchedFocus = function focus(this: HTMLElement, ...args: unknown[]): void {
