@@ -27,6 +27,7 @@ import { startFeaturePresenceWatch } from './featurePresence.mjs'
 import { mountDrawerChrome, showHealToast } from './drawer-chrome.ts'
 import { domGate, createGatedThrottle, insideComposer, setVoiceReporter, createVoiceTally } from '../../compositionGate.ts'
 import { reportMobileError, reportMobileStage, schedulePostMobileProbes } from '../orb/diag.ts'
+import { installMobileSessionPagination } from './MobileSessionPagination.tsx'
 
 /** dsh-web-ui 的 explorer/preview 列最长等待窗口：过了就不为它保留整页观察。 */
 const AIONUI_PRESENCE_MS = 15000
@@ -277,6 +278,13 @@ export function mobileApply(ctx): void {
   })
 
   const pocketT = (pocketKey: string): string => pocketTranslate(ctx, pocketKey)
+  const navT = (key: MobileNavKey): string => {
+    try {
+      return String(ctx.locale.bind(NS)(key))
+    } catch {
+      return key === 'sessionLoadMore' ? '加载更多' : key === 'sessionLoaded' ? '已加载' : key
+    }
+  }
   // 手机端判据（纯函数，可单测）：强制抽屉 / 窄于 1024 / (pointer: coarse) 三者之一。
   // 用 pointer:coarse 而不是 hover:hover —— 手机 WebView（微信 XWEB、小米浏览器）上
   // coarse 为 true，hover 能力报得不可靠。真桌面（≥1024 + fine）不打扰。
@@ -326,6 +334,13 @@ export function mobileApply(ctx): void {
       reportMobileStage('drawer-open', { ms: info.ms, up: info.upgrade === true, src: info.src ?? 'btn' })
     },
   }), 'dsh-mobile-nav: drawer chrome')
+
+  // 会话首屏截页只包手机平铺列表；桌面与目录视图仍走宿主原组件和原生 watermark。
+  // 原 WorkspaceBrowser 的 actions / children slots / view store 原样复用，不复制 CRUD。
+  safeEffect(() => installMobileSessionPagination(ctx, {
+    loadMore: navT('sessionLoadMore'),
+    loaded: navT('sessionLoaded'),
+  }), 'dsh-mobile-nav: session pagination')
 
   /** 首屏探针：一次扫描数出三种 chrome 与壳层占位（原来是 4 次全页 querySelectorAll，
    *  在两三万节点的长会话页面上就是四次全树走一遍，正压在首屏那几百毫秒上） */
@@ -704,11 +719,13 @@ export function mobileApply(ctx): void {
     }
   }, 'dsh-mobile-nav: replace model-settings load error with mobile hint')
 
-  // 进入会话不再自动弹输入法（2026-11-05）：宿主 InputBar 在挂载/切会话时会把光标
-  // 送回输入框（`[data-composer-input]`），安卓 WebView 一拿到 DOM focus 就顶起系统
-  // 输入法 —— 手机端点进任何会话，第一秒都被键盘糊住。这里只挡「不是用户点进输入区」
-  // 的那类程序化聚焦：点侧栏会话行 / 悬浮球 / 控制台卡片进来的，键盘不弹；点输入框
-  // （含卡片空白、发送钮、命令菜单）照常弹。桌面布局在上面就 return 了，不受影响。
+  // 进入会话不再自动弹输入法（2026-11-05）+ 点「＋」命令菜单不再抢输入框焦点（2026-11-19）：
+  // 宿主 InputBar 在挂载/切会话时会把光标送回输入框（`[data-composer-input]`），安卓 WebView
+  // 一拿到 DOM focus 就顶起系统输入法 —— 手机端点进任何会话，第一秒都被键盘糊住。那颗「＋」
+  // 更糟：`onMouseDown: keepFocus` + `onClick: onToggleCommandMenu` 两道都聚焦，点它出菜单的
+  // 同一天键盘也弹出来。这里只挡「不是用户点输入框」的那类程序化聚焦：点侧栏会话行 / 悬浮球 /
+  // 控制台卡片进来的、以及点「＋」或命令菜单里的选项行，键盘不弹；点输入框（含卡片空白、发送钮）
+  // 照常弹。菜单本身照由宿主开，命令与附件照由宿主走，都不经过 focus。桌面布局在上面就 return 了，不受影响。
   safeEffect(() => {
     if (!narrow.matches) return () => {}
     const dispose = installComposerFocusGate({
