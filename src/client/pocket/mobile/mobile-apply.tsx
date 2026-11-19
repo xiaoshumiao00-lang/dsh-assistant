@@ -719,18 +719,27 @@ export function mobileApply(ctx): void {
     }
   }, 'dsh-mobile-nav: replace model-settings load error with mobile hint')
 
-  // 进入会话不再自动弹输入法（2026-11-05）+ 点「＋」命令菜单不再抢输入框焦点（2026-11-19）：
-  // 宿主 InputBar 在挂载/切会话时会把光标送回输入框（`[data-composer-input]`），安卓 WebView
-  // 一拿到 DOM focus 就顶起系统输入法 —— 手机端点进任何会话，第一秒都被键盘糊住。那颗「＋」
-  // 更糟：`onMouseDown: keepFocus` + `onClick: onToggleCommandMenu` 两道都聚焦，点它出菜单的
-  // 同一天键盘也弹出来。这里只挡「不是用户点输入框」的那类程序化聚焦：点侧栏会话行 / 悬浮球 /
-  // 控制台卡片进来的、以及点「＋」或命令菜单里的选项行，键盘不弹；点输入框（含卡片空白、发送钮）
-  // 照常弹。菜单本身照由宿主开，命令与附件照由宿主走，都不经过 focus。桌面布局在上面就 return 了，不受影响。
+  // 进入会话不再自动弹输入法（2026-11-05）+ 点「＋」命令菜单不再抢输入框焦点（2026-11-19，
+  // 同日收紧口径）：宿主 InputBar 有四条路把光标送回 `[data-composer-input]`（挂载/切会话
+  // 的 focusDraftEditor、卡片 mousedown 的 keepFocus 空白分支、「＋」的两道 focus、Lexical
+  // 选区同步），安卓 WebView 一拿到 DOM focus 就顶起输入法。现在按「默认全挡 + 窄白名单」判：
+  // 只有真实落点在输入框本体（contenteditable）、卡片控件行以外的空白、发送/停止那颗、语音那颗
+  // 这四类算「要打字」；「＋」按钮本体与它外面的 Tooltip 包层 / 工具行空白 / 权限·计划·模型·托管
+  // 胶囊 / 命令菜单与电脑文件面板 / dock chip / 输入区外的落点（换会话、侧栏、悬浮球）全都算
+  // block 落点，谁更晚压住谁 —— 有历史记录的会话里那一行最挤，点「＋」很容易落在按钮外面，
+  // 旧口径把这一下当成「要打字」，1.2 s 放行窗口就被刷活，键盘就弹了（本轮修的就是这条）。
+  // 取证开关默认关：pocket 页面 URL 加 ?composerFocusLog=1，或 localStorage 把
+  // 'dsh-assistant.composerFocusLog' 设成 '1'，才发决策记录到 diag.jsonl，方便手机上远程确认判定。
   safeEffect(() => {
     if (!narrow.matches) return () => {}
     const dispose = installComposerFocusGate({
       // 真机证据走诊断信标（diag.jsonl 的 mobile-stage，stage=composer-focus-blocked）
-      onBlocked: (count: number) => reportMobileStage('composer-focus-blocked', { n: count }),
+      onBlocked: (count) => reportMobileStage('composer-focus-blocked', { n: count }),
+      // 开关打开时才有：挡下 / 放行都各留一条，带落点意图与是哪条白名单放行的
+      onDecision: (decision) => reportMobileStage(
+        decision.blocked ? 'composer-focus-blocked-decision' : 'composer-focus-allowed',
+        { k: decision.kind, r: decision.reason, t: decision.target, n: decision.count },
+      ),
     })
     // 装上了就报一条（stage 名只有新版客户端才有）：手机刷新后对着
     // diagnostic.jsonl 一看就知道新 bundle 到底上没上，不用瞎猜缓存。
