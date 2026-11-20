@@ -4,6 +4,10 @@
 控制室里的「更新公告」正文由 `npm run build` 从本文件里当前版本那一节抽出来（见 `build.mjs`），
 不再手写常量——改了代码就必须改这一节，公告与实现不会各说各话。
 
+## [0.2.35] - 2026-11-20
+
+📱 【手机端点「＋」还是弹输入法——本轮定稿口径】0.2.33 / 0.2.34 两轮都在挡 `HTMLElement.prototype.focus`，用户实测 0.2.34 仍然弹。真页面取证（Playwright + Chrome 156，390×844 触屏，探针挂在 `focus` / `Selection.*` / `mousedown` / `focusin`，打开 pocket 真页面并恢复一条有历史记录的会话）：点「＋」时宿主确实调了三次 `focus({preventScroll:true})`（mousedown 的 `keepFocus` 一次、click 的 `onToggleCommandMenu` 两次），**全被闸门挡掉，且没有任何 `Selection.*` 调用、`activeElement` 始终是 body** —— 也就是说闸门挡的那条路本来就没让键盘弹起来。真正弹键盘的前提是**输入框在点「＋」之前就已经持有 DOM 焦点**：宿主每个工具钮的 mousedown 都 `preventDefault()` 把焦点锁在输入框里（`keepDraftFocus` 的设计目的），用户先前点过输入框 / 打过一个字之后输入框一直是 `activeElement`，安卓把输入法收起来之后，下一次手势落下时 WebView 会把仍然聚焦着的 contenteditable 的 IME 重新顶起来 —— 挡「新聚焦」与「已有焦点」互不相干，所以两轮都白挡。修法（`src/client/pocket/mobile/composerFocusGate.ts` 重写）：① 默认不聚焦 + 窄白名单（输入框本体 / 卡片空白 / 发送 / 语音才放行）；② 面板类落点（「＋」本体、包着它的整组工具按钮、命令菜单外层锚点、电脑文件面板、dock chip、输入区外）那一刻**把输入框已有的焦点 blur 掉**——菜单里的选项行例外（宿主的 / 命令面板就是在输入框有焦点时挑的，挑完还要接着打参数，这条已按真页面验证：合成 pointerdown 打在那 42 行选项上，`activeElement` 仍是输入框）（同一次探针验证：blur 后 `activeElement=body`，命令菜单 5 行照常打开、1.6 s 后仍开着，再点输入框 / 打字 / 发送都正常）；③ `focusin` 兜底：Lexical 提交 DOM 选区（`setBaseAndExtent`）会给 contenteditable 附送一个焦点，这条不经过 `prototype.focus`，只能在 focusin 阶段再收一次；④ 工具按钮组不再只靠 `[class$="_tools"]` 这类后缀认，改成「谁的子树里包着那颗『＋』」的结构判据，宿主换 CSS-module 哈希也认得出来；去掉了 0.2.33 那个 1.2 s 放行窗口（那种启发式正是「偶尔放行、看不出为什么」的来源）。新增 `composer-ime-open` 信标：`visualViewport` 高度阶跃下跌 > 120px（= 输入法真弹了）时报一条，带当时的 `activeElement` 与最近落点意图，下次复发看 `diagnostic.jsonl` 就知道是哪条路。`scripts/test-composer-focus-gate.mjs` 重写为 60+ 条断言（点「＋」不聚焦 / 已有焦点被收掉 / 选区副作用被收掉 / 点输入框仍放行 / 逐落点 reason 对得上 / 结构判据 / 输入法观测）。纯客户端改动：已重跑 `node build.mjs` 生成 `lib\client.js`，**手机端整页刷新即生效，不用重新打包 APK**（APK 只是个 WebView 壳，页面和 bundle 都从宿主取）。
+
 ## [0.2.34] - 2026-11-20
 
 🛠 Computer Use 三处 harness 侧耗时修复（对着 2026-11-20「录入店铺到轰趴后台」那次 60.5 分钟实录改的）
