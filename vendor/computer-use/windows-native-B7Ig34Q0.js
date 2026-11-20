@@ -155,17 +155,31 @@ const GWL_STYLE = -16;
 const GWL_EXSTYLE = -20;
 const WS_POPUP = 2147483648;
 const WS_EX_TOOLWINDOW = 128;
+/** 覆盖层三件套：恒置顶 + 不可激活 + 点击穿透（Electron 悬浮球 / ribbon 就是这样）。 */
+const WS_EX_TOPMOST = 8;
+const WS_EX_TRANSPARENT = 32;
+const WS_EX_NOACTIVATE = 2048;
+/** 抓屏长边上限（像素）。0 或不提供 = 不缩放，按原尺寸抓。 */
+const DEFAULT_CAPTURE_MAX_EDGE_PX = 1280;
 const DWMWA_EXTENDED_FRAME_BOUNDS = 9;
 const DWMWA_CLOAKED = 14;
 const MONITOR_DEFAULTTONEAREST = 2;
 const MDT_EFFECTIVE_DPI = 0;
 const VK_MENU = 18;
+/** `SetWindowPos` 的 z 序顶端与不激活/不移动/不改尺寸标志：只为验证覆盖层之上，不抢焦点。 */
+const HWND_TOP = 0;
+const SWP_NOSIZE = 1;
+const SWP_NOMOVE = 2;
+const SWP_NOACTIVATE = 16;
 /** `CURSORINFO.flags` bit set while the pointer is drawn. */
 const CURSOR_SHOWING = 1;
 /** Per-monitor v2, then per-monitor. `SetThreadDpiAwarenessContext` returns NULL when the context is unsupported. */
 const DPI_PER_MONITOR_V2 = -4;
 const DPI_PER_MONITOR = -3;
 const FOREGROUND_RETRY_MS = 50;
+/** `SendInput` 鼠标事件位：移动、绝对坐标、坐标映射到整块虚拟桌面（而不是主屏）。 */
+const MOUSEEVENTF_MOVE = 1;
+const MOUSEEVENTF_VIRTUALDESK = 16384;
 koffi.struct("DSH_CU_RECT", {
 	left: "int32",
 	top: "int32",
@@ -286,6 +300,10 @@ function bind(libraries) {
 		GetWindowLongPtrW: user32.func("intptr __stdcall GetWindowLongPtrW(void *hWnd, int nIndex)"),
 		ShowWindow: user32.func("int __stdcall ShowWindow(void *hWnd, int nCmdShow)"),
 		SetForegroundWindow: user32.func("int __stdcall SetForegroundWindow(void *hWnd)"),
+		AttachThreadInput: user32.func("int __stdcall AttachThreadInput(uint32 idAttach, uint32 idAttachTo, int fAttach)"),
+		GetCurrentThreadId: kernel32.func("uint32 __stdcall GetCurrentThreadId()"),
+		BringWindowToTop: user32.func("int __stdcall BringWindowToTop(void *hWnd)"),
+		SetWindowPos: user32.func("int __stdcall SetWindowPos(void *hWnd, void *hWndInsertAfter, int X, int Y, int cx, int cy, uint32 uFlags)"),
 		MonitorFromWindow: user32.func("void * __stdcall MonitorFromWindow(void *hwnd, uint32 dwFlags)"),
 		GetMonitorInfoW: user32.func("int __stdcall GetMonitorInfoW(void *hMonitor, _Inout_ uint8_t *lpmi)"),
 		GetSystemMetrics: user32.func("int __stdcall GetSystemMetrics(int nIndex)"),
@@ -421,17 +439,50 @@ foreach ($window in @($shell.Windows())) {
 		return;
 	}
 }
-function sendMouse(api, flags, x, y, data = 0) {
+/**
+ * 物理像素全局坐标 → SendInput 绝对坐标。
+ * `MOUSEEVENTF_ABSOLUTE` 的 0..65535 是 `MOUSEEVENTF_VIRTUALDESK` 所定义的**整块虚拟桌面**
+ * 包围盒的归一化值（不带 VIRTUALDESK 时只映射到主屏，负坐标根本表达不出来），原点可以是负的，
+ * 尺寸随屏幕数量变化，所以只能拿 GetSystemMetrics 的四个虚拟屏指标实时换算。
+ * 这条路径只在 {@link placePointer} 的 SetCursorPos 回退里用；正常落点不做归一化。
+ * @param point - 物理像素全局坐标。
+ * @param virtualScreen - `virtualScreen()` 查到的虚拟屏包围盒。
+ * @returns `{ dx, dy }`，直接喂进 MOUSEINPUT。
+ */
+function absoluteInputCoordinates(point, virtualScreen) {
+	return {
+		dx: Math.round((point.x - virtualScreen.x) * 65535 / Math.max(1, virtualScreen.width - 1)),
+		dy: Math.round((point.y - virtualScreen.y) * 65535 / Math.max(1, virtualScreen.height - 1))
+	};
+}
+/**
+ * 虚拟屏包围盒（物理像素）。单屏就是主屏；多屏含负原点；宿主 DPI 虚拟化时与查询同一套坐标。
+ * @param api - Win32 operations.
+ * @returns 运行时查询到的虚拟屏矩形。
+ */
+function virtualScreenOf(api) {
+	return {
+		x: api.GetSystemMetrics(SM_XVIRTUALSCREEN),
+		y: api.GetSystemMetrics(SM_YVIRTUALSCREEN),
+		width: Math.max(1, api.GetSystemMetrics(SM_CXVIRTUALSCREEN)),
+		height: Math.max(1, api.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+	};
+}
+function sendMouse(api, flags, x, y, data = 0, basis) {
 	const absolute = (flags & MOUSEEVENTF_ABSOLUTE) !== 0;
-	const left = api.GetSystemMetrics(SM_XVIRTUALSCREEN);
-	const top = api.GetSystemMetrics(SM_YVIRTUALSCREEN);
-	const width = Math.max(1, api.GetSystemMetrics(SM_CXVIRTUALSCREEN));
-	const height = Math.max(1, api.GetSystemMetrics(SM_CYVIRTUALSCREEN));
+	const virtual = basis ?? virtualScreenOf(api);
+	const target = absolute ? absoluteInputCoordinates({
+		x,
+		y
+	}, virtual) : {
+		dx: x,
+		dy: y
+	};
 	const input = {
 		type: INPUT_MOUSE,
 		u: { mi: {
-			dx: absolute ? Math.round((x - left) * 65535 / Math.max(1, width - 1)) : x,
-			dy: absolute ? Math.round((y - top) * 65535 / Math.max(1, height - 1)) : y,
+			dx: target.dx,
+			dy: target.dy,
 			mouseData: data >>> 0,
 			dwFlags: flags,
 			time: 0,
@@ -607,16 +658,81 @@ function drawCursor(api, dc, pixels, width, height, bounds) {
 		if (!isNull(cursor.mask)) api.DeleteObject(cursor.mask);
 	}
 }
+/**
+ * 抓屏尺寸：只有超过 `maxEdge` 的长边才缩放，比例保持原样。
+ * @param width - 原始物理像素宽。
+ * @param height - 原始物理像素高。
+ * @param maxEdge - 长边上限像素；非正或非数字 = 不缩放。
+ * @returns 缩放后的目标尺寸，或 undefined 表示不需要缩放。
+ */
+function fitCaptureSize(width, height, maxEdge) {
+	if (!Number.isFinite(maxEdge) || maxEdge < 1) return void 0;
+	if (width <= maxEdge && height <= maxEdge) return void 0;
+	const factor = Math.min(maxEdge / width, maxEdge / height);
+	const scaledWidth = Math.max(1, Math.round(width * factor));
+	const scaledHeight = Math.max(1, Math.round(height * factor));
+	if (scaledWidth === width && scaledHeight === height) return void 0;
+	return {
+		width: scaledWidth,
+		height: scaledHeight
+	};
+}
+/**
+ * 盒式平均缩放一帧 BGRA 光栅，保持宽高比已经由 {@link fitCaptureSize} 决定。
+ * 整帧降采样比把原始 PNG 交给模型便宜得多：每步观察的像素越少，回喂的 token 也越少。
+ * @param pixels - 源 top-down BGRA 像素。
+ * @param srcWidth - 源宽。
+ * @param srcHeight - 源高。
+ * @param dstWidth - 目标宽。
+ * @param dstHeight - 目标高。
+ * @returns 目标尺寸的光栅，`dstWidth * dstHeight * 4` 字节。
+ */
+function downscaleBgra(pixels, srcWidth, srcHeight, dstWidth, dstHeight) {
+	const out = Buffer.alloc(dstWidth * dstHeight * 4);
+	const xScale = srcWidth / dstWidth;
+	const yScale = srcHeight / dstHeight;
+	for (let row = 0; row < dstHeight; row += 1) {
+		const y0 = Math.min(srcHeight - 1, Math.floor(row * yScale));
+		const y1 = Math.min(srcHeight, Math.max(y0 + 1, Math.ceil((row + 1) * yScale)));
+		for (let column = 0; column < dstWidth; column += 1) {
+			const x0 = Math.min(srcWidth - 1, Math.floor(column * xScale));
+			const x1 = Math.min(srcWidth, Math.max(x0 + 1, Math.ceil((column + 1) * xScale)));
+			let blue = 0;
+			let green = 0;
+			let red = 0;
+			let alpha = 0;
+			let samples = 0;
+			for (let sy = y0; sy < y1; sy += 1) {
+				for (let sx = x0; sx < x1; sx += 1) {
+					const at = (sy * srcWidth + sx) * 4;
+					blue += pixels[at] ?? 0;
+					green += pixels[at + 1] ?? 0;
+					red += pixels[at + 2] ?? 0;
+					alpha = Math.max(alpha, pixels[at + 3] ?? 0);
+					samples += 1;
+				}
+			}
+			const dest = (row * dstWidth + column) * 4;
+			out[dest] = Math.round(blue / samples);
+			out[dest + 1] = Math.round(green / samples);
+			out[dest + 2] = Math.round(red / samples);
+			out[dest + 3] = alpha;
+		}
+	}
+	return out;
+}
 function monitorOf(api, hwnd, fallback) {
 	const handle = api.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
 	if (isNull(handle)) return {
 		monitor: fallback,
+		workArea: fallback,
 		dpi: 96
 	};
 	const info = Buffer.alloc(40);
 	info.writeUInt32LE(40, 0);
 	if (api.GetMonitorInfoW(handle, info) === 0) return {
 		monitor: fallback,
+		workArea: fallback,
 		dpi: 96
 	};
 	const left = info.readInt32LE(4);
@@ -629,28 +745,56 @@ function monitorOf(api, hwnd, fallback) {
 		width: right - left,
 		height: bottom - top
 	};
+	// MONITORINFO.rcWork：这块显示器去掉任务栏/贴边栏后的工作区。观察面与点击基准都跟它求交，
+	// 所以屏幕原点是否为负、任务栏在哪一侧、几块屏，全部由运行时决定，代码里不出现任何几何常量。
+	const workLeft = info.readInt32LE(20);
+	const workTop = info.readInt32LE(24);
+	const workRight = info.readInt32LE(28);
+	const workBottom = info.readInt32LE(32);
+	const workArea = workRight > workLeft && workBottom > workTop ? {
+		x: workLeft,
+		y: workTop,
+		width: workRight - workLeft,
+		height: workBottom - workTop
+	} : monitor;
 	const readDpi = api.GetDpiForMonitor;
 	if (readDpi === void 0) return {
 		monitor,
+		workArea,
 		dpi: 96
 	};
 	const dpiX = [0];
 	if (readDpi(handle, MDT_EFFECTIVE_DPI, dpiX, [0]) !== 0) return {
 		monitor,
+		workArea,
 		dpi: 96
 	};
 	const dpi = dpiX[0] ?? 0;
 	return {
 		monitor,
+		workArea,
 		dpi: dpi > 0 ? dpi : 96
 	};
+}
+/**
+ * 抓屏长边上限：0 = 关闭缩放（原样全尺寸抓），非有限值 = 用默认上限。
+ * @param value - 插件提供的配置值，可能为 undefined。
+ * @returns 上限像素（0 表示不缩放）。
+ */
+function resolveCaptureMaxEdge(value) {
+	if (value === 0) return 0;
+	return Number.isFinite(value) && value >= 1 ? Math.round(value) : DEFAULT_CAPTURE_MAX_EDGE_PX;
 }
 function stylesOf(api, hwnd) {
 	const style = low32(api.GetWindowLongPtrW(hwnd, GWL_STYLE));
 	const extended = low32(api.GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
 	return {
 		popup: (style & WS_POPUP) !== 0,
-		toolWindow: (extended & WS_EX_TOOLWINDOW) !== 0
+		toolWindow: (extended & WS_EX_TOOLWINDOW) !== 0,
+		// 助手自己的悬浮球 / 覆盖条带：不可激活 + 恒置顶 + 点击穿透，永远不会是用户正在操作的那个应用窗口。
+		topmost: (extended & WS_EX_TOPMOST) !== 0,
+		noActivate: (extended & WS_EX_NOACTIVATE) !== 0,
+		clickThrough: (extended & WS_EX_TRANSPARENT) !== 0
 	};
 }
 function cachedAppName(api, cache, pid) {
@@ -662,9 +806,10 @@ function cachedAppName(api, cache, pid) {
 }
 /**
 * Win32 operations for the production Windows backend.
+* @param options - 插件配置：`captureMaxEdgePx` = 抓屏长边上限像素（0 = 不缩放）。
 * @returns operations that capture and post input on this machine.
 */
-function createProductionWindowsOps() {
+function createProductionWindowsOps(options = {}) {
 	if (process.arch === "x64" && INPUT.size !== 40) throw new Error(`computer-use: INPUT size ${String(INPUT.size)} is not 40`);
 	if (process.arch === "x64" && (CURSORINFO.size !== 24 || ICONINFO.size !== 32 || BITMAP.size !== 32)) throw new Error("computer-use: cursor structs are not laid out for x64");
 	const api = bind({
@@ -676,6 +821,8 @@ function createProductionWindowsOps() {
 		dwmapi: koffi.load("dwmapi.dll")
 	});
 	const selfRid = integrityRid(api, process.pid);
+	/** 每步观察截图的长边上限；0 = 保持全尺寸。 */
+	const captureMaxEdge = resolveCaptureMaxEdge(options.captureMaxEdgePx);
 	function perMonitor(fn) {
 		const set = api.SetThreadDpiAwarenessContext;
 		if (set === void 0) return fn();
@@ -687,15 +834,38 @@ function createProductionWindowsOps() {
 			set(restore);
 		}
 	}
+	/**
+	* 一次指针动作只认一套坐标：**物理像素全局坐标**。
+	* `BitBlt` 抓屏、`GetWindowRect`、DWM 扩展帧、`GetCursorPos` 全都在这个空间里，
+	* 所以落点直接交给 `SetCursorPos`（它本来就吃物理坐标），不做 0..65535 归一化 ——
+	* 没有归一化就没有"映射基准 ≠ 归一化基准"的漂移，多屏负坐标也天然成立。
+	* 只有 `SetCursorPos` 被拒（安全桌面等）时才退回 `SendInput` 绝对坐标，那时归一化基准
+	* 只能是 `MOUSEEVENTF_VIRTUALDESK` 定义的整块虚拟桌面；两条路径都以 `GetCursorPos`
+	* 的回读值为准，落不到请求的点就报错，绝不"当作成功"接着按键。
+	* @param x - 物理像素全局 x。
+	* @param y - 物理像素全局 y。
+	* @throws when the pointer cannot be placed at the requested pixel.
+	*/
 	function placePointer(x, y) {
-		sendMouse(api, 49153, x, y);
 		const pos = {
 			x: 0,
 			y: 0
 		};
-		if (api.GetCursorPos(pos) === 0 || pos.x !== x || pos.y !== y) {
-			if (api.SetCursorPos(x, y) === 0) throw new Error("computer-use: pointer input failed");
-		}
+		if (api.SetCursorPos(x, y) !== 0 && api.GetCursorPos(pos) !== 0 && pos.x === x && pos.y === y) return;
+		sendMouse(api, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, x, y);
+		if (api.GetCursorPos(pos) === 0 || pos.x !== x || pos.y !== y) throw new Error(`computer-use: pointer input failed (wanted ${x},${y}; got ${pos.x},${pos.y})`);
+	}
+	/** 指针现在实际在哪（物理像素）。用于把落点回传给调用方自证，而不是等下一次截图猜。 */
+	function cursorPosition() {
+		const pos = {
+			x: 0,
+			y: 0
+		};
+		if (api.GetCursorPos(pos) === 0) return void 0;
+		return {
+			x: pos.x,
+			y: pos.y
+		};
 	}
 	function listWindows() {
 		return perMonitor(() => {
@@ -723,8 +893,12 @@ function createProductionWindowsOps() {
 					cloaked: cloaked(api, hwnd),
 					toolWindow: styles.toolWindow,
 					popup: styles.popup,
+					topmost: styles.topmost,
+					noActivate: styles.noActivate,
+					clickThrough: styles.clickThrough,
 					frame,
 					monitor: display.monitor,
+					workArea: display.workArea,
 					monitorDpi: display.dpi
 				});
 			}
@@ -742,24 +916,51 @@ function createProductionWindowsOps() {
 		for (const hwnd of enumTopLevel(api)) if (hwndId(hwnd) === id) return hwnd;
 	}
 	/**
-	* `SetForegroundWindow` is ignored unless this process received the last input.
-	* A posted Alt transition satisfies that, then the key is released.
+	* 把 `target` 弄到键盘前台，**以 `GetForegroundWindow` 的实际结果为准**。
+	*
+	* 判定顺序（每步都先读 GetForegroundWindow，而不是看 `SetForegroundWindow` 的返回值）：
+	*  0. 目标本来就在前台 → 直接放行，一个按键都不发。`SetForegroundWindow` 对前台窗口
+	*     返回 false，但那不是失败；此前这里无条件先按一下 Alt，等于给已经是前台的窗口
+	*     塞了一个系统键，前台反而可能被这根 Alt 带走，然后被判成「focus could not be moved」。
+	*  1. 最小化就先恢复，再直接抢一次（本进程刚收到过输入时有效）。
+	*  2. 经典解锁一：发一个 Alt 按下/抬起，让自己成为「最后输入」的所有者，再抢。
+	*  3. 经典解锁二：`AttachThreadInput` 把本线程输入队列临时挂到当前前台线程上，再抢，
+	*     无论成败都立刻断开（不留下被挂着输入队列的线程）。
+	*  4. 最后才提 z 序（不激活、不移动、不改尺寸）补 `SetForegroundWindow`，重读一次。
+	* 全程不碰 ForegroundLockTimeout 之类的用户级设置。
 	* @param target - top-level HWND pointer from `EnumWindows`.
-	* @returns false when `target` is still not foreground after one retry.
+	* @returns 目标此刻是否真的在前台（由 `GetForegroundWindow` 读出）。
 	*/
 	function becomeForeground(target) {
+		if (isForeground(target)) return true;
 		if (api.IsIconic(target) !== 0) api.ShowWindow(target, SW_RESTORE);
+		api.SetForegroundWindow(target);
+		if (isForeground(target)) return true;
 		postKey(api, VK_MENU, true, false);
 		try {
 			api.SetForegroundWindow(target);
-			if (!isForeground(target)) {
-				sleepSync(FOREGROUND_RETRY_MS);
-				if (!isForeground(target)) return false;
-			}
-			return true;
 		} finally {
 			postKey(api, VK_MENU, false, false);
 		}
+		if (isForeground(target)) return true;
+		const foreground = api.GetForegroundWindow();
+		if (!isNull(foreground)) {
+			const selfThread = api.GetCurrentThreadId();
+			const foregroundThread = api.GetWindowThreadProcessId(foreground, [0]);
+			if (foregroundThread !== 0 && foregroundThread !== selfThread && api.AttachThreadInput(selfThread, foregroundThread, 1) !== 0) {
+				try {
+					api.SetForegroundWindow(target);
+				} finally {
+					api.AttachThreadInput(selfThread, foregroundThread, 0);
+				}
+				if (isForeground(target)) return true;
+			}
+		}
+		api.BringWindowToTop(target);
+		api.SetWindowPos(target, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+		sleepSync(FOREGROUND_RETRY_MS);
+		api.SetForegroundWindow(target);
+		return isForeground(target);
 	}
 	return {
 		listWindows,
@@ -799,7 +1000,9 @@ function createProductionWindowsOps() {
 					if (api.GetDIBits(memory, bitmap, 0, height, pixels, header, 0) === 0) throw new Error("computer-use: screen capture failed");
 					flipRows(pixels, width * 4, height);
 					drawCursor(api, memory, pixels, width, height, region);
-					return encodeBgraPng(width, height, pixels, false);
+					const fit = fitCaptureSize(width, height, captureMaxEdge);
+					if (fit === void 0) return encodeBgraPng(width, height, pixels, false);
+					return encodeBgraPng(fit.width, fit.height, downscaleBgra(pixels, width, height, fit.width, fit.height), false);
 				} finally {
 					api.SelectObject(memory, previous);
 					api.DeleteObject(bitmap);
@@ -819,9 +1022,16 @@ function createProductionWindowsOps() {
 				placePointer(x, y);
 			});
 		},
-		mouseButton(button, down) {
+		cursorPosition,
+		/**
+		* 只发按键事件，**绝不移动指针**：按下与抬起都必须落在同一个坐标上，
+		* 中间插入任何移动都会被窗口当成拖拽（搬运窗口/拖选正文就是这么来的）。
+		*/
+		mouseButton(button, down, point) {
 			const flags = button === "right" ? down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP : down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
 			perMonitor(() => {
+				// 按下前把落点再确认一次；抬起时绝不移动（移动会在按键期间变成拖拽）。
+				if (down === true && point !== void 0) placePointer(point.x, point.y);
 				sendMouse(api, flags, 0, 0);
 			});
 		},
@@ -914,6 +1124,9 @@ try { [System.Windows.Forms.Clipboard]::SetImage($image) } finally { $image.Disp
 		foregroundWindowId() {
 			return hwndId(api.GetForegroundWindow()) ?? 0;
 		},
+		virtualScreen() {
+			return perMonitor(() => virtualScreenOf(api));
+		},
 		focusWindow(hwnd) {
 			return perMonitor(() => {
 				const target = windowPointer(hwnd);
@@ -929,4 +1142,4 @@ try { [System.Windows.Forms.Clipboard]::SetImage($image) } finally { $image.Disp
 	};
 }
 //#endregion
-export { createProductionWindowsOps };
+export { createProductionWindowsOps, fitCaptureSize, downscaleBgra, resolveCaptureMaxEdge, absoluteInputCoordinates, virtualScreenOf };

@@ -75,7 +75,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
      换成「本地时钟 HH:MM」+「三格信号柱」。这一行占掉 stage 原来那一行的位置（12px/行高 14），
      总高度不变（底部翻页条已在 2026-11-09 删除）。状态屏的 stage 行照旧。
      信号柱是纯 CSS 内联元素（三根 <span>，高度递增、底对齐），没有 emoji、没有图片、没有外部字体图标；
-     断开只靠颜色（红）区分，不写「断开」两个字。 */
+     屏内那一行不写「断开」两个字——档位全靠格子点亮数 + 颜色（2026-11-15 起）：
+       满格绿＝正常连接；两格黄＝信号不稳（延迟偏高）；一格黄＝较弱/一次心跳没回/正在重连（呼吸）；
+       一格红（其余格暗灰）＝未连接，切入时整组闪一次。判定用真实信号（心跳 RTT/连续失败/通道开关），
+       见 JS 里 setConnState / sendHeartbeat / notePong。 */
   #screen .home-top { display:none; flex:none; align-items:flex-end; gap:8px; height:14px; box-sizing:border-box; }
   #screen.home-mode .home-top { display:flex; }
   #screen.home-mode .stage { display:none; }
@@ -88,16 +91,27 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   #screen .home-top .clock { font-size:12px; line-height:14px; letter-spacing:1px; color:var(--accent); font-weight:bold;
     font-variant-numeric:tabular-nums; white-space:nowrap; overflow:hidden; flex:none; }
   /* 三格信号柱：3 根 ×5px + 2 个间隙 ×2px = 19px（页面 JS 里 HOME_TOP_* 常量要和这两个数字一致）。 */
+  /* 三格信号柱：3 根 ×5px + 2 个间隙 ×2px = 19px（页面 JS 里 HOME_TOP_* 常量要和这两个数字一致）。
+     棋盘那屏顶行也显示它（2026-11-15：原先 board-mode 把它藏了，等于永远看不见——信号柱就是
+     给棋盘顶行做的，宿主换统一指挥后主页只有棋盘这一张脸）。 */
   #screen .home-top .signal { flex:none; margin-left:auto; display:flex; align-items:flex-end; gap:2px; height:13px; }
   #screen .home-top .home-counts { margin-left:auto; font-size:11px; line-height:14px; color:var(--dim); white-space:nowrap; }
-  #screen.board-mode .home-top .signal { display:none; }
-  #screen .home-top .signal .bar { display:block; width:5px; border-radius:1px; background:#6b7785; }
+  #screen .home-top .signal .bar { display:block; width:5px; border-radius:1px; background:#39434f; } /* 未点亮的格：暗灰 */
   #screen .home-top .signal .bar.b1 { height:5px; }
   #screen .home-top .signal .bar.b2 { height:9px; }
   #screen .home-top .signal .bar.b3 { height:13px; }
-  #screen .home-top .signal.conn-online .bar { background:#35d07f; }            /* 已连上宿主：绿 */
-  #screen .home-top .signal.conn-connecting .bar { background:#6b7785; opacity:.55; } /* 连接中 / 重连中：灰、柱条稍淡 */
-  #screen .home-top .signal.conn-offline .bar { background:var(--err); }        /* 断开：红（只有颜色） */
+  /* 三档 + 两个过渡态（s-* class 由 setConnState 写）：亮几格＝档位，颜色＝状态。 */
+  #screen .home-top .signal.s-good .bar { background:#35d07f; }                                  /* 满格绿：正常连接 */
+  #screen .home-top .signal.s-fair .bar.b1,
+  #screen .home-top .signal.s-fair .bar.b2 { background:var(--warn); }                           /* 两格黄：信号不稳 */
+  #screen .home-top .signal.s-poor .bar.b1,
+  #screen .home-top .signal.s-connecting .bar.b1 { background:var(--warn); }                     /* 一格黄：较弱 / 正在重连 */
+  #screen .home-top .signal.s-off .bar.b1 { background:var(--err); }                             /* 一格红：未连接（其余暗灰） */
+  /* 正在连接/重连：那一格黄灯呼吸（连上即停）；未连接：切入红色时整组红闪一次（animation 跑一次即止）。 */
+  #screen .home-top .signal.s-connecting .bar { animation:tihu-sig-blink 1.2s ease-in-out infinite; }
+  #screen .home-top .signal.s-off { animation:tihu-sig-flash .9s ease-out 1; }
+  @keyframes tihu-sig-blink { 0%,100% { opacity:1; } 50% { opacity:.3; } }
+  @keyframes tihu-sig-flash { 0% { filter:drop-shadow(0 0 4px var(--err)); } 100% { filter:none; } }
   #screen .title { font-size:18px; font-weight:700; line-height:22px;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #screen ul { margin:0; padding:0; list-style:none; font-size:16px; line-height:20px; color:#c3ccd5; }
@@ -358,7 +372,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       <div class="mics"><span></span><span></span></div>
       <div id="screen">
         <div class="stage" id="stage">连接</div>
-        <div id="homeTop" class="home-top"><span class="clock" id="homeClock">--:--</span><span class="home-counts" id="boardCounts"></span><span class="signal conn-connecting" id="homeSignal"><span class="bar b1"></span><span class="bar b2"></span><span class="bar b3"></span></span></div>
+        <div id="homeTop" class="home-top"><span class="clock" id="homeClock">--:--</span><span class="home-counts" id="boardCounts"></span><span class="signal s-connecting" id="homeSignal" role="img" aria-label="正在连接"><span class="bar b1"></span><span class="bar b2"></span><span class="bar b3"></span></span></div>
         <div class="title" id="title">正在连接宿主…</div>
         <div id="steps" class="steps"></div>
         <ul id="bullets"></ul>
@@ -504,7 +518,10 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   var state = { ws: null, seq: 0, clientId: '', sessionId: '', 
     
     lastTranscript: '', recorder: null, chunks: [], retryTimer: 0, audioPending: false, audioTimer: 0,
-    connState: 'connecting', clockTimer: 0,
+    connState: 'connecting', clockTimer: 0, silenceTimer: 0,
+    /* 信号柱的观测数据（2026-11-15）：心跳发出时刻 / nonce（迟到包一律不认）/ pong 超时计时器 /
+       RTT 指数平均 / 连续无响应次数 / 连续良好次数（滞回）/ 最后一次收到下行的时刻（静默 watchdog）。 */
+    pingSentAt: 0, pingNonce: '', pongTimer: 0, confirmTimer: 0, rttEma: 0, missedPongs: 0, goodPongs: 0, lastInboundAt: 0,
     
     audioCtx: null, pcmSources: [], pcmNextTime: 0, pcmLast: null, droppedAudio: false, readRound: null,
     /* 朗读自检：收到多少块 / 最后一块是否已排程 / 被丢掉的块数（页面事件区与 __tihuAudioCheck 可查） */
@@ -594,6 +611,20 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   var SIGNAL_W = SIGNAL_BAR_W * 3 + SIGNAL_GAP_W * 2;   /* 19 */
   var HOME_TOP_GAP_W = 8;
 
+  /* ---------- 信号柱三档判定（2026-11-15）：全部接的是页面自己观测的真实链路信号 ----------
+     心跳仍是页面往 lane 发的那条 ping（宿主原样回 nonce），节奏 25 秒不变；
+     档位由「通道开/关 + pong 往返时间 + 连续失败次数 + 下行静默 watchdog」推出来，
+     不新增协议字段（这条 WS 的生命周期页面自己全知道，宿主再推一份只会 stale）。 */
+  var PING_INTERVAL_MS = 25000;        /* 与改动前的 setInterval 一致，只是挪成命名常量 */
+  var PONG_TIMEOUT_MS = 8000;          /* 一次心跳最长等待：没回记一次失败，连续 2 次失败＝通道已死，主动断开重连 */
+  var RTT_EMA_GOOD_MS = 800;           /* 往返 ≤ 800ms＝良好（满格绿） */
+  var RTT_EMA_FAIR_MS = 2500;          /* ≤ 2.5s＝尚可（两格黄）；再差＝一格黄（弱） */
+  var RTT_EMA_NEW_WEIGHT = 0.4;        /* RTT 指数平均里新样本的权重（压单次毛刺） */
+  var GOOD_PONGS_FOR_GREEN = 2;        /* 连续 2 次良好 pong 才回满格绿（滞回，防绿黄抖动） */
+  var CONFIRM_PING_DELAY_MS = 3000;    /* 满格提速：第一个良好样本到手 3 秒后补发一次「确认 ping」（主节奏 25 秒照旧） */
+  var LINK_SILENCE_MS = PING_INTERVAL_MS + PONG_TIMEOUT_MS + 5000;  /* 这么久没有任何下行＝半开连接（隧道断了但浏览器没触发 onclose）：主动断开走既有 2 秒重连 */
+  var CLOCK_W_PX = 40;                 /* 顶行时钟粗体实测宽（见上面 CSS 注释）：量计数可用宽时扣掉它 */
+
   /** 本地时钟：只显示到分钟、24 小时制、零补齐 → 19:32。不取宿主帧推送（靠宿主推会 stale）。 */
   function clockText() {
     var now = new Date();
@@ -602,13 +633,72 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     return (hh < 10 ? '0' : '') + hh + ':' + (mm < 10 ? '0' : '') + mm;
   }
   /**
-   * 连接状态：接页面已有那一份（#conn 那条 + ws 开/关），不新增协议字段。
-   * online = 已连上宿主（绿）；connecting = 连上前 / 2 秒后重连时正在拨号（灰、柱条稍淡）；
-   * offline = 刚刚关掉连接、还没开始下一次重连（红）。断开只有颜色，没有文字。
+   * 信号柱档位（2026-11-15 重做）：接的是页面自己观测的真实链路，不新增协议字段——
+   *   通道开/关（onopen/onclose）、ping→pong 往返（宿主原样带回 nonce）、连续心跳失败、下行静默。
+   *   s-good 满格绿＝正常连接；s-fair 两格黄＝信号不稳；s-poor 一格黄＝较弱或一次心跳没回；
+   *   s-connecting 一格黄呼吸＝正在拨号/重连；s-off 一格红其余暗灰＝未连接（切入时闪一次）。
+   * 屏内那一行照旧只有格子没有文字：文字说明走 title / aria-label（点击看事件区，见底部）。
    */
+  var CONN_LABELS = { good: '正常连接', fair: '信号不稳', poor: '信号较弱', connecting: '正在连接', off: '未连接' };
   function setConnState(next) {
     state.connState = next;
+    var signal = $('homeSignal');
+    if (signal) {
+      signal.className = 'signal s-' + next;
+      var label = CONN_LABELS[next] || next;
+      signal.title = label;
+      signal.setAttribute('aria-label', label);
+    }
     renderHomeTop();
+  }
+  /** 按心跳统计重算档位（只在通道开着时调用；断开由 onclose 直接落到 s-off）。 */
+  function recomputeConnTier() {
+    if (!state.ws || state.ws.readyState !== 1) return;
+    // 还没有 RTT 样本（刚连上）或已经有一次心跳没回＝先亮一格黄，别装作满格。
+    if (state.rttEma <= 0 || state.missedPongs > 0) { setConnState('poor'); return; }
+    if (state.rttEma <= RTT_EMA_GOOD_MS && state.goodPongs >= GOOD_PONGS_FOR_GREEN) { setConnState('good'); return; }
+    if (state.rttEma <= RTT_EMA_FAIR_MS) { setConnState('fair'); return; }
+    setConnState('poor');
+  }
+  /** 收到 pong：量往返、更新 EMA 与滞回计数。nonce 对不上（重连前来的迟到包）不量、也不动状态。 */
+  function notePong(payload) {
+    if (!payload || String(payload.nonce || '') !== state.pingNonce || !state.pingSentAt) return;
+    var rtt = Date.now() - state.pingSentAt;
+    state.pingNonce = '';
+    state.pingSentAt = 0;
+    clearTimeout(state.pongTimer);
+    state.pongTimer = 0;
+    state.missedPongs = 0;
+    state.rttEma = state.rttEma > 0
+      ? Math.round(state.rttEma * (1 - RTT_EMA_NEW_WEIGHT) + rtt * RTT_EMA_NEW_WEIGHT)
+      : rtt;
+    state.goodPongs = state.rttEma <= RTT_EMA_GOOD_MS ? state.goodPongs + 1 : 0;
+    if (state.goodPongs === 1) {
+      // 第一个良好样本到手：3 秒后补一次「确认 ping」，满格绿不必非等下一次 25 秒排程（滞回仍要连续两次良好）
+      clearTimeout(state.confirmTimer);
+      state.confirmTimer = setTimeout(sendHeartbeat, CONFIRM_PING_DELAY_MS);
+    }
+    recomputeConnTier();
+  }
+  /** 发一次心跳并武装超时：pong 到点没回来记一次失败；连续 2 次没回＝通道已死，主动断开走重连。 */
+  function sendHeartbeat() {
+    if (!state.ws || state.ws.readyState !== 1) return;
+    state.pingNonce = 'hb-' + Date.now().toString(36) + '-' + state.seq;
+    state.pingSentAt = Date.now();
+    send('ping', { nonce: state.pingNonce });
+    clearTimeout(state.pongTimer);
+    state.pongTimer = setTimeout(function () {
+      state.pingNonce = '';
+      state.pingSentAt = 0;
+      state.goodPongs = 0;
+      state.missedPongs += 1;
+      if (state.missedPongs >= 2) {
+        addEvent('alert', '心跳连续无响应，断开重连');
+        try { state.ws.close(); } catch (e) { /* 忽略 */ }
+        return;
+      }
+      recomputeConnTier();
+    }, PONG_TIMEOUT_MS);
   }
   /** 顶行：本地时钟 HH:MM + 棋盘右端四段计数（等你/在跑/排队/完成）/ 信号柱（页面自己画，不读宿主帧）。 */
   function renderHomeTop() {
@@ -616,7 +706,11 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
     if (clock) clock.textContent = clockText();
     var counts = $('boardCounts');
     if (counts) {
-      counts.textContent = state.screenMode === 'board' ? fitTextPx(boardCountsText(state.board && state.board.counts), 240, 11) : '';
+      // 顶行现在同时有时钟（≈40px）+ 计数 + 信号柱（19px）+ 两处行间隙：计数最多排到这里就省略，
+      // 保证这一行永远不换行、信号柱也不会被顶出屏幕（304 − 40 − 8×2 − 19 = 229）。
+      counts.textContent = state.screenMode === 'board'
+        ? fitTextPx(boardCountsText(state.board && state.board.counts), stageWidthPx() - CLOCK_W_PX - HOME_TOP_GAP_W * 2 - SIGNAL_W, 11)
+        : '';
     }
   }
 
@@ -1637,12 +1731,17 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
   function connect() {
     var ws = new WebSocket(laneUrl());
     state.ws = ws;
-    // 正在拨号 = 连接中（信号柱灰）；这一份状态同时喂首页那三格信号柱，不新增协议字段。
+    // 正在拨号 = 连接中（信号柱一格黄、呼吸）；这一份状态同时喂首页那三格信号柱，不新增协议字段。
     setConnState('connecting');
     ws.onopen = function () {
       $('conn').textContent = '已连接';
       $('conn').className = 'on';
-      setConnState('online');
+      // 通道开了，但还没量到第一次往返：先当「正在连接」（一格黄呼吸），第一次 pong 回来才定档。
+      setConnState('connecting');
+      state.rttEma = 0; state.missedPongs = 0; state.goodPongs = 0;
+      state.pingNonce = ''; state.pingSentAt = 0; state.lastInboundAt = Date.now();
+      clearTimeout(state.confirmTimer);
+      state.confirmTimer = 0;
       state.clientId = state.clientId || ('web-' + Math.random().toString(36).slice(2, 10));
       // 统一指挥是唯一入口：永远裸 hello（宿主绑「鹈鹕指挥台」，屏上是任务棋盘）。
       sendHello('', false);
@@ -1662,13 +1761,21 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         try { send('voice.select', payload); } catch (e) { /* 忽略 */ }
       })();
       clearInterval(state.retryTimer);
-      state.retryTimer = setInterval(function () { send('ping', { nonce: String(Date.now()) }); }, 25000);
+      // 心跳：连上立刻发一次（快定档），之后每 25 秒一次；pong 带回 nonce 量往返，超时记失败。
+      state.retryTimer = setInterval(sendHeartbeat, PING_INTERVAL_MS);
+      sendHeartbeat();
     };
     ws.onclose = function (event) {
       $('conn').textContent = '已断开' + (event && event.code ? '（' + event.code + '）' : '');
       $('conn').className = 'off';
-      // 断开：屏内只靠信号柱变红区分，不再往那一行前面塞「离线 · 」文字（那一行现在是时钟）。
-      setConnState('offline');
+      // 断开：屏内只靠信号柱（一格红、其余暗灰，切入时闪一次）区分，不再往那一行前面塞「离线 · 」文字（那一行现在是时钟）。
+      setConnState('off');
+      clearTimeout(state.pongTimer);
+      state.pongTimer = 0;
+      clearTimeout(state.confirmTimer);
+      state.confirmTimer = 0;
+      state.pingNonce = ''; state.pingSentAt = 0;
+      state.rttEma = 0; state.missedPongs = 0; state.goodPongs = 0;
       state.audioPending = false;
       clearTimeout(state.audioTimer);
       addEvent('alert', '连接已断开，2 秒后自动重连（期间发送的内容不会送达）');
@@ -1680,6 +1787,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
       addEvent('alert', 'WebSocket 出错（' + (token ? '凭据已带，检查网络/宿主是否在跑' : '没找到 token：请用带 ?token= 的链接打开本页') + '）');
     };
     ws.onmessage = function (event) {
+      state.lastInboundAt = Date.now();   // 静默 watchdog 的基准：任何下行都算「链路活着」
       var msg;
       try { msg = JSON.parse(event.data); } catch (e) { return; }
       if (!msg || msg.v !== PROTOCOL) return;           /* 未知版本：忽略 */
@@ -1991,7 +2099,7 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
         ackDown(payload, { ok: false, reason: 'unsupported' });
         break;
       }
-      case 'pong': break;
+      case 'pong': notePong(payload); break;   /* 心跳往返量在这里（见 sendHeartbeat） */
       default: break; /* 未知 type：忽略 */
     }
   }
@@ -2574,6 +2682,23 @@ export function tihuPageHtml(options: { lanePath: string; protocol: string }): s
      收到 screen.frame 时 renderScreen 也顺手重画一次，保证同一帧里时钟不会花。 */
   renderHomeTop();
   state.clockTimer = setInterval(renderHomeTop, 1000);
+  /* 下行静默 watchdog（每 1 秒查一次）：通道看着开着、但这么久一条下行都没收到
+     （SSH/公网隧道半开、pong 全丢），浏览器永远不会自己触发 onclose——主动掐掉
+     走既有 2 秒重连，信号柱落到「未连接」。 */
+  state.silenceTimer = setInterval(function () {
+    if (!state.ws || state.ws.readyState !== 1 || state.lastInboundAt <= 0) return;
+    if (Date.now() - state.lastInboundAt > LINK_SILENCE_MS) {
+      addEvent('alert', '下行长时间静默，断开重连');
+      try { state.ws.close(); } catch (e) { /* 忽略 */ }
+    }
+  }, 1000);
+  /* 点一下信号柱：在事件区（屏外调试区）留一句当前状态说明；屏内那一行照样只有格子没有文字。 */
+  if ($('homeSignal')) {
+    $('homeSignal').addEventListener('click', function () {
+      addEvent('progress', '连接状态：' + (CONN_LABELS[state.connState] || state.connState) +
+        (state.rttEma > 0 ? '（心跳往返 ' + state.rttEma + 'ms）' : ''));
+    });
+  }
   connect();
 })();
 </script>

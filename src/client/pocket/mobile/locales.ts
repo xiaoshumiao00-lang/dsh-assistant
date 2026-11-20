@@ -15,6 +15,8 @@ export const zh = {
   'layoutDesktop': '电脑',
   'layoutSwitchHint': '点一下切换：自动 → 抽屉 → 电脑',
   'layoutReloadHint': '已切换：刷新页面后生效',
+  'sessionLoadMore': '加载更多',
+  'sessionLoaded': '已加载',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -30,6 +32,8 @@ export const en: Record<MobileNavKey, string> = {
   'layoutDesktop': 'Desktop',
   'layoutSwitchHint': 'Tap to cycle: Auto → Drawer → Desktop',
   'layoutReloadHint': 'Switched — reload the page to apply',
+  'sessionLoadMore': 'Load more',
+  'sessionLoaded': 'Loaded',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

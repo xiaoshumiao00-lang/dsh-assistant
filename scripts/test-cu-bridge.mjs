@@ -21,6 +21,7 @@ import {
   resetBridgeQueues,
   resolveCallerId
 } from '../src/cu-bridge-core.mjs'
+import { createWindowsDesktopBackend, windowSurfaceRect } from '../vendor/computer-use/backend-18yEf5Jq.js'
 
 let seq = 0
 const createUserMessage = (input) => ({
@@ -337,6 +338,93 @@ cases.push(['resolveCallerId：registry 缺行时退回创建时的父会话', a
     'cu-2'
   )
   assert.equal(resolveCallerId({ get: () => undefined }, 'bg-1', 'cu-1'), 'cu-1')
+}])
+
+/** 记录型宿主：只记抓屏矩形、指针落点和前台判定，不碰真机。 */
+function recordingHost(snapshot) {
+  const log = []
+  let cursor = { x: 0, y: 0 }
+  return {
+    log,
+    listWindows: () => snapshot,
+    foregroundWindowId: () => snapshot.foregroundHwnd,
+    focusWindow: (hwnd) => {
+      log.push({ kind: 'focusWindow', hwnd })
+      return false
+    },
+    targetBlocksInput: () => false,
+    capturePng: (bounds) => {
+      log.push({ kind: 'capturePng', bounds })
+      return Buffer.from([137, 80, 78, 71])
+    },
+    movePointer: (x, y) => {
+      cursor = { x, y }
+      log.push({ kind: 'movePointer', x, y })
+    },
+    mouseButton: (button, down, point) => {
+      log.push({ kind: 'mouseButton', button, down, point })
+    },
+    cursorPosition: () => ({ ...cursor }),
+    key: (virtualKey, down) => {
+      log.push({ kind: 'key', virtualKey, down })
+    },
+    scrollWheel: () => {},
+    virtualScreen: () => ({ x: 0, y: 0, width: 1920, height: 1080 })
+  }
+}
+
+function wechatWindow(options = {}) {
+  return {
+    hwnd: 4000412,
+    pid: 28788,
+    ownerHwnd: 0,
+    className: 'Qt51514QWindowIcon',
+    appName: 'WeChat',
+    title: '微信',
+    visible: true,
+    iconic: false,
+    cloaked: false,
+    toolWindow: false,
+    popup: false,
+    topmost: false,
+    noActivate: false,
+    clickThrough: false,
+    frame: { x: 428, y: 146, width: 710, height: 756 },
+    monitor: { x: 0, y: 0, width: 1920, height: 1080 },
+    workArea: { x: 0, y: 0, width: 1920, height: 1040 },
+    monitorDpi: 96,
+    ...options
+  }
+}
+
+cases.push(['回传那一步的点击必须落在前台会话看到的那块截图上（同一个 rect）', async () => {
+  const target = wechatWindow()
+  const host = recordingHost({ foregroundHwnd: target.hwnd, windows: [target] })
+  const backend = createWindowsDesktopBackend(host, {})
+  const screens = await backend.listScreens()
+  await backend.capture(screens[0])
+  const grabbed = host.log.filter((entry) => entry.kind === 'capturePng')
+  assert.deepEqual(grabbed[0].bounds, screens[0].bounds, '抓屏矩形必须等于观察面 bounds')
+  assert.deepEqual(screens[0].bounds, windowSurfaceRect(target), '观察面 bounds 必须等于 frame ∩ workArea')
+  const clicked = await backend.click({ screen: screens[0], position: [450, 19], button: 'left', count: 1 })
+  const moved = host.log.filter((entry) => entry.kind === 'movePointer')
+  assert.equal(moved.length, 1, '一次点击只摆一次指针')
+  assert.deepEqual({ x: moved[0].x, y: moved[0].y }, { x: 748, y: 160 }, '428+0.45*710=747.5 四舍五入 748, 146+0.019*756=160')
+  assert.deepEqual(clicked.landed, { x: 748, y: 160 }, '落点要能从结果里读出来')
+  const buttons = host.log.filter((entry) => entry.kind === 'mouseButton')
+  assert.deepEqual(buttons[0].point, buttons[1].point, 'down 与 up 必须同一个坐标')
+  assert.deepEqual(host.log.map((entry) => entry.kind).filter((kind) => kind === 'movePointer' || kind === 'mouseButton'), ['movePointer', 'mouseButton', 'mouseButton'])
+}])
+
+cases.push(['前台会话本来就在前台时，回传这一步不该去抢焦点', async () => {
+  const target = wechatWindow()
+  const host = recordingHost({ foregroundHwnd: target.hwnd, windows: [target] })
+  const backend = createWindowsDesktopBackend(host, {})
+  const screens = await backend.listScreens()
+  await backend.capture(screens[0])
+  await backend.click({ screen: screens[0], position: [500, 500], button: 'left', count: 1 })
+  await backend.hotkey({ keys: ['ctrl', 'alt', 'w'] })
+  assert.deepEqual(host.log.filter((entry) => entry.kind === 'focusWindow'), [], '前台已经是目标窗口，不许 SetForegroundWindow')
 }])
 
 for (const [name, run] of cases) {

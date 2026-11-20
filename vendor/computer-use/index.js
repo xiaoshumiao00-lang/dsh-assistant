@@ -15,10 +15,26 @@ import { AttachmentId } from "@deepseek-ai/dsh-attachment";
 * @module @deepseek-ai/dsh-experimental-tool-computer-use/src/config
 */
 /** Loader schema for the Computer Use plugin. */
-const Config = z.object({ postActionWaitMs: z.number().default(600) });
+const Config = z.object({
+	postActionWaitMs: z.number().default(600),
+	/** 观察截图长边上限像素；0 = 保持全尺寸。 */
+	captureMaxEdgePx: z.number().default(1280),
+	/** 追加的助手自身窗口标题标记（内置标记之外）。 */
+	selfWindowTitles: z.array(z.string()).default([]),
+	/** 观察面 owner 的最小边长像素。 */
+	ownerMinEdgePx: z.number().default(64)
+});
 function requireFiniteNonNegative(value, name) {
 	if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be a finite number ≥ 0`);
 	return value;
+}
+/** 把已解析的 tunables 变成平台后端吃的观察配置。 */
+function observationConfigOf(config) {
+	return {
+		captureMaxEdgePx: config.captureMaxEdgePx,
+		ownerMinEdgePx: config.ownerMinEdgePx,
+		...Array.isArray(config.selfWindowTitles) ? { selfWindowTitles: config.selfWindowTitles } : {}
+	};
 }
 /**
 * Apply defaults and reject invalid tunables at load.
@@ -26,7 +42,12 @@ function requireFiniteNonNegative(value, name) {
 * @returns resolved tunables.
 */
 function resolveComputerUseConfig(config = {}) {
-	return { postActionWaitMs: requireFiniteNonNegative(config.postActionWaitMs ?? 600, "postActionWaitMs") };
+	return {
+		postActionWaitMs: requireFiniteNonNegative(config.postActionWaitMs ?? 600, "postActionWaitMs"),
+		captureMaxEdgePx: requireFiniteNonNegative(config.captureMaxEdgePx ?? 1280, "captureMaxEdgePx"),
+		ownerMinEdgePx: requireFiniteNonNegative(config.ownerMinEdgePx ?? 64, "ownerMinEdgePx"),
+		...Array.isArray(config.selfWindowTitles) ? { selfWindowTitles: config.selfWindowTitles.filter((title) => typeof title === "string" && title !== "") } : {}
+	};
 }
 //#endregion
 //#region src/overlay-guard.ts
@@ -1183,7 +1204,9 @@ function screenshotIntro(paths, outcome) {
 }
 function clickResultText(value) {
 	const mods = value.modifiers === void 0 ? "" : `, modifiers ${value.modifiers.join(", ")}`;
-	return `Clicked screen ${String(value.screenIndex)} at [${value.position.join(", ")}] (${value.button}, count ${String(value.count)}${mods}). ${coordinatesRemain(value)}`;
+	// 落点回读：物理像素里的实际位置。分数对了但落点变了，这句话立刻能看出来，不用等下一次截图标定。
+	const landed = value.landed === void 0 ? "" : ` Pointer landed at [${value.landed.join(", ")}] physical pixels.`;
+	return `Clicked screen ${String(value.screenIndex)} at [${value.position.join(", ")}] (${value.button}, count ${String(value.count)}${mods}).${landed} ${coordinatesRemain(value)}`;
 }
 /**
 * Register the exclusive GUI tools, the policy section, and first-frame screenshot attachment.
@@ -1273,6 +1296,11 @@ function applyComputerUse(ctx, backend, config) {
 						type: "array",
 						items: { type: "string" }
 					},
+					// 实际落点（物理像素）：down/up 用同一个坐标，落在这里才算这次点击没飘。
+					landed: {
+						type: "array",
+						items: { type: "number" }
+					},
 					...COORDINATE_FIELDS,
 					screens: SCREENS_FIELD,
 					foreground: FOREGROUND_FIELD
@@ -1294,7 +1322,7 @@ function applyComputerUse(ctx, backend, config) {
 			const modifiers = requireClickModifiers(args.modifiers);
 			return guiTurn(backend, exec, async () => {
 				const screen = requireScreen(await backend.listScreens(exec.signal), args.screen_index);
-				await backend.click({
+				const click = await backend.click({
 					screen,
 					position: hidPosition(exec, position),
 					button,
@@ -1308,6 +1336,7 @@ function applyComputerUse(ctx, backend, config) {
 					button,
 					count,
 					...modifiers === void 0 ? {} : { modifiers },
+					...click?.landed === void 0 ? {} : { landed: [click.landed.x, click.landed.y] },
 					...observedFields(sessionOf(exec), observation)
 				};
 			});
@@ -2208,13 +2237,14 @@ function desktopBackend(ctx, inner) {
 * @param config - optional tunables; omitted fields use schema defaults.
 */
 function apply(ctx, config = {}) {
+	const resolved = resolveComputerUseConfig(config);
 	const excludedRegionCapture = (input) => {
 		const capture = ctx.get("computerUseOverlayGuard")?.captureExcludedRegion;
 		if (capture === void 0) return Promise.reject(/* @__PURE__ */ new Error("dsh desktop: overlay-exclude capture is not attached"));
 		const { signal, ...region } = input;
 		return capture(region, signal);
 	};
-	applyComputerUse(ctx, desktopBackend(ctx, createPlatformBackend(process.platform, excludedRegionCapture)), resolveComputerUseConfig(config));
+	applyComputerUse(ctx, desktopBackend(ctx, createPlatformBackend(process.platform, excludedRegionCapture, observationConfigOf(resolved))), resolved);
 }
 //#endregion
 export { Config, FAKE_DESKTOP_PNG, FOCUS_FALLBACK_FOREGROUND, FOCUS_NOTE, PLUGIN_NAME, POLICY, POLICY_SECTION_ORDER, UNFOCUSED_WINDOW_NOTE, apply, applyComputerUse, createFakeDesktopBackend, createPlatformBackend, inject, name, resolveComputerUseConfig, wrapDesktopBackend };

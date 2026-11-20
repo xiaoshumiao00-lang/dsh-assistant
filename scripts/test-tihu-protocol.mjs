@@ -3056,26 +3056,43 @@ test('page：时钟只显示到分钟（HH:MM、24 小时制、零补齐），�
   assert.equal(/SCREEN\.clock|home\.clock/.test(source), false, '宿主帧里没有时钟字段可读')
 })
 
-test('page：连接图标接的是页面已有的那一份连接状态（绿/灰/红三档，断开只有颜色不写文字）', () => {
-  const source = pageSourceOf()
+test('page：连接图标接的是页面观测的真实链路信号（三档：满格绿/两格黄/一格红，断开只有格子没有文字）', () => {
   const html = pageHtmlOf()
-  // 三档颜色：已连上=绿、连接中/重连中=灰（柱条稍淡）、断开=红
-  assert.ok(/\.signal\.conn-online \.bar \{ background:#35d07f;/.test(html), '已连上宿主 → 绿')
-  assert.ok(/\.signal\.conn-connecting \.bar \{ background:#6b7785; opacity:\.\d+;/.test(html), '连接中/重连中 → 灰、柱条稍淡')
-  assert.ok(/\.signal\.conn-offline \.bar \{ background:var\(--err\);/.test(html), '断开 → 红')
+  const source = pageSourceOf()
+  // 三档格子（2026-11-15 语义）：亮格数＝档位，颜色＝状态；判定全走页面观测的真实信号。
+  assert.ok(/\.signal\.s-good \.bar \{ background:#35d07f;/.test(html), '正常连接 → 三格全绿')
+  assert.ok(/\.signal\.s-fair \.bar\.b1,/.test(html) && /background:var\(--warn\);/.test(html), '信号不稳 → 两格黄')
+  assert.ok(/\.signal\.s-poor \.bar\.b1,/.test(html), '较弱/一次心跳没回 → 一格黄')
+  assert.ok(/\.signal\.s-off \.bar\.b1 \{ background:var\(--err\);/.test(html), '未连接 → 一格红（其余格保持暗灰）')
+  assert.ok(/\.signal\.s-off \{ animation:tihu-sig-flash \.9s ease-out 1;/.test(html), '切入未连接时整组红闪一次（跑一次即止）')
+  assert.ok(/\.signal\.s-connecting \.bar \{ animation:tihu-sig-blink/.test(html), '正在连接/重连 → 黄格呼吸')
+  assert.equal(/\.signal\.conn-(online|connecting|offline)/.test(html), false, '旧三 class 全部退役')
   // 接同一份状态：#conn 那条 + ws.onopen/onclose 都要落到 setConnState
   assert.ok(html.includes("$('conn').textContent = '已连接'") && html.includes("$('conn').className = 'on'"), '屏外那条 conn 不动')
   assert.ok(html.includes("$('conn').textContent = '已断开'"), '断开事件仍走同一份状态（conn 元素）')
-  assert.ok(/ws\.onopen = function \(\)\s*\{[\s\S]{0,200}?setConnState\('online'\)/.test(html), 'onopen 置 online（绿）')
-  assert.ok(/ws\.onclose = function \(event\)\s*\{[\s\S]{0,200}?setConnState\('offline'\)/.test(html), 'onclose 置 offline（红）')
-  assert.ok(/function connect\(\)\s*\{[\s\S]{0,200}?setConnState\('connecting'\)/.test(html), '拨号中（含每 2 秒重连）置 connecting（灰）')
-  assert.ok(html.includes("setTimeout(connect, 2000)"), '断开后照旧自动重连（重连中该是灰）')
-  // 断开只靠颜色区分：屏内那一行不写「断开」/「离线」文字
+  // 三档阈值与滞回：800ms 满格、2.5s 两格黄、连续失败 2 次断开、连续 2 次良好才回满格
+  assert.ok(/var PONG_TIMEOUT_MS = 8000;/.test(source), '心跳超时窗口 8 秒')
+  assert.ok(/var RTT_EMA_GOOD_MS = 800;/.test(source) && /var RTT_EMA_FAIR_MS = 2500;/.test(source), 'RTT 阈值 800ms／2500ms')
+  assert.ok(/var GOOD_PONGS_FOR_GREEN = 2;/.test(source), '连续 2 次良好 pong 才满格（滞回）')
+  assert.ok(/var CONFIRM_PING_DELAY_MS = 3000;/.test(source), '第一个良好样本后 3 秒补发「确认 ping」（满格不用等满 25 秒）')
+  assert.ok(/state\.confirmTimer = setTimeout\(sendHeartbeat, CONFIRM_PING_DELAY_MS\)/.test(html) && /state\.goodPongs === 1/.test(html), '确认 ping 只在凑满第二个良好之前排一次，不无限加速')
+  assert.ok(/var LINK_SILENCE_MS = PING_INTERVAL_MS \+ PONG_TIMEOUT_MS \+ 5000;/.test(source), '下行静默 watchdog 阈值')
+  // 真实信号入口：onopen 立刻发一次心跳并武装超时；pong 量往返；连续 2 次没回主动断开
+  assert.ok(/ws\.onopen = function \(\)\s*\{[\s\S]{0,400}?setConnState\('connecting'\)/.test(html), '连上先当正在连接（等第一次往返才定档）')
+  assert.ok(/setInterval\(sendHeartbeat, PING_INTERVAL_MS\)/.test(html), '心跳按常量节奏发')
+  assert.ok(/state\.missedPongs >= 2/.test(html), '连续 2 次心跳无响应＝断开重连')
+  assert.ok(/function notePong\(payload\)/.test(html) && /case 'pong': notePong\(payload\)/.test(html), 'pong 回来量 RTT 并更新档位')
+  assert.ok(/function recomputeConnTier\(\)/.test(html), '档位由心跳统计重算（滞回在这里）')
+  assert.ok(/ws\.onclose = function \(event\)\s*\{[\s\S]{0,400}?setConnState\('off'\)/.test(html), 'onclose 置 off（一格红）')
+  assert.ok(/function connect\(\)\s*\{[\s\S]{0,200}?setConnState\('connecting'\)/.test(html), '拨号中（含每 2 秒重连）置 connecting（一格黄呼吸）')
+  assert.ok(html.includes("setTimeout(connect, 2000)"), '断开后照旧自动重连')
+  // 断开只靠格子区分：屏内那一行不写「断开」/「离线」文字
   assert.equal(homeTopDomOf(html).includes('断开'), false, '顶行不加「断开」文字')
   assert.equal(homeTopDomOf(html).includes('离线'), false, '顶行不加「离线」文字')
   assert.equal(html.includes("'离线 · '"), false, '旧的「离线 · 」前缀已去掉（那一行现在是时钟）')
-  // 不新增协议字段：连接状态只在页面内部转，不往 lane 发新消息
+  // 不新增协议字段：连接状态只在页面内部转，不往 lane 发新消息；信号柱给 title/aria-label 但没有第二行文字
   assert.equal(/send\('conn|send\('clock|send\('status/.test(html), false, '页面不上报连接状态（不新增协议字段）')
+  assert.ok(/id="homeSignal"[^>]*aria-label/.test(html), '信号柱有 aria-label（title 由 setConnState 写）')
   // 宿主侧不掺和时钟与连接：lane 里没有时钟、也没有连接状态
   const laneSource = readFileSync(new URL('../src/tihu/lane.ts', import.meta.url), 'utf8')
   assert.equal(/clockText|connState|getHours\(\)/.test(laneSource), false, '时钟与连接归页面侧，lane 不掺和')

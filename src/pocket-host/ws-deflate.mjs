@@ -278,8 +278,8 @@ export function negotiatePermessageDeflate(headerValue) {
  * The 101 response (including our extension header) must already be written.
  * @returns {{close: () => void, stats: () => object}}
  */
-export function attachWsDeflate({ client, upstream, onError = null, onFailure = null }) {
-  const stats = { downIn: 0, downOut: 0, upIn: 0, upOut: 0, messages: 0, failures: 0 };
+export function attachWsDeflate({ client, upstream, onError = null, onFailure = null, onUplinkText = null, compress = true }) {
+  const stats = { downIn: 0, downOut: 0, upIn: 0, upOut: 0, messages: 0, failures: 0, upTransformed: 0 };
   let closed = false;
 
   const fail = (err) => {
@@ -299,7 +299,7 @@ export function attachWsDeflate({ client, upstream, onError = null, onFailure = 
   // 编码（deflate / 不压缩回退）仍由同一个 DeflateQueue 串行做，保证 zlib 上下文顺序正确。
   const downlink = createDownlinkScheduler({
     encode: (text, op) => new Promise((resolve, reject) => {
-      if (text.length < MIN_COMPRESS_BYTES) {
+      if (!compress || text.length < MIN_COMPRESS_BYTES) {
         stats.downOut += text.length;
         resolve({ frame: encodeFrame({ fin: true, opcode: op, payload: text }), raw: true });
         return;
@@ -360,6 +360,18 @@ export function attachWsDeflate({ client, upstream, onError = null, onFailure = 
   let upParts = [];
   let upOpcode = 1;
   let upCompressed = false;
+  const transformUplink = (payload, opcode) => {
+    if (opcode !== 1 || typeof onUplinkText !== 'function') return payload;
+    try {
+      const result = onUplinkText(payload.toString('utf8'));
+      if (result?.changed !== true) return payload;
+      stats.upTransformed += 1;
+      return Buffer.isBuffer(result.text) ? result.text : Buffer.from(String(result.text), 'utf8');
+    } catch {
+      // 请求整形是可回退优化；任何意外都按原文发送，不能熔断实时连接。
+      return payload;
+    }
+  };
   const upParser = new WsFrameParser((frame) => {
     if (closed) return;
     const { fin, rsv1, opcode, payload } = frame;
@@ -381,7 +393,9 @@ export function attachWsDeflate({ client, upstream, onError = null, onFailure = 
     const writePlain = () => {
       if (closed) return;
       stats.upIn += whole.length;
-      try { upstream.write(encodeFrame({ fin: true, opcode: op, payload: whole, clientMask: true })); } catch (e) { fail(e); }
+      const outgoing = transformUplink(whole, op);
+      stats.upOut += outgoing.length;
+      try { upstream.write(encodeFrame({ fin: true, opcode: op, payload: outgoing, clientMask: true })); } catch (e) { fail(e); }
     };
     if (!upCompressed) {
       inflate.push(whole, { raw: true }, writePlain);
@@ -390,7 +404,9 @@ export function attachWsDeflate({ client, upstream, onError = null, onFailure = 
     inflate.push(whole, {}, (out) => {
       if (closed) return;
       stats.upIn += out.length;
-      try { upstream.write(encodeFrame({ fin: true, opcode: op, payload: out, clientMask: true })); } catch (e) { fail(e); }
+      const outgoing = transformUplink(out, op);
+      stats.upOut += outgoing.length;
+      try { upstream.write(encodeFrame({ fin: true, opcode: op, payload: outgoing, clientMask: true })); } catch (e) { fail(e); }
     });
   }, fail);
 
