@@ -21,6 +21,7 @@ import { registerAssistantHome } from './assistant-home'
 import { registerAssistantConfigRoutes } from './assistant-config'
 import { registerAssistantDiagnostics } from './assistant-diagnostics'
 import { registerAssistantArchive } from './assistant-archive'
+import { registerAssistantSecretary } from './assistant-secretary'
 import { assistantConfigTestSurface } from './assistant-config'
 import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -44,6 +45,7 @@ export { assistantConfigTestSurface } from './assistant-config'
 export { assistantMemoryTestSurface } from './assistant-memory'
 export { registerAssistantDiagnostics, assistantDiagnosticsTestSurface, redactText, renderDiagnosticsBundle, writeDiagnosticsBundle } from './assistant-diagnostics'
 export { registerAssistantArchive, assistantArchiveTestSurface, collectArchive, writeArchiveBundle, importArchiveBundle, ARCHIVE_FORMAT } from './assistant-archive'
+export { assistantSecretaryTestSurface } from './assistant-secretary'
 /** 目录 allowlist 与终端环境变量（供 scripts/test-path-guard.mjs 直接验） */
 export { expandHome, defaultAllowedRoots, createPathGuard, minimalTermEnv, isDirectory } from './path-guard'
 /** turn-guard 的判定与状态函数（供 scripts/test-turn-guard.mjs 直接验） */
@@ -377,6 +379,8 @@ export function apply(ctx: any, config: any = {}): () => void {
     disposers.push(registerAssistantDiagnostics(ctx))
     // 助手档案导出 / 导入（P1-B）：单一 JSON 清单，导入前先备份、按文件夹判重、不覆盖墓碑
     disposers.push(registerAssistantArchive(ctx))
+    // 个人秘书固定会话：宿主侧唯一 sessionId + 只读工具闸
+    disposers.push(registerAssistantSecretary(ctx))
   } catch {}
 
   void applyBall()

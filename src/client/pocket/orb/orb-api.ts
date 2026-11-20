@@ -249,6 +249,17 @@ export function makeOrbApi(ctx: any) {
     return out
   }
 
+  /** 读某会话当前的权限预设（permissions 投影）。读不到返回 null。 */
+  const permissionOf = (sessionId: string): string | null => {
+    try {
+      const face = ctx.sessions?.binding?.(sessionId)?.session?.projections?.faceOf?.('permissions')?.getSnapshot?.()
+      const value = face && typeof face === 'object' ? (face as any).currentValue : undefined
+      return typeof value === 'string' && value !== '' ? value : null
+    } catch {
+      return null
+    }
+  }
+
   /** 语音转写服务（官方 voice-input 插件挂载的 cordis 服务，服务名是 'remote.speech'）。
    * 不能用 ctx.remote.speech 直接取：那个命名空间是以**独立 Service** 注册的
    * （api-gateway 的 createNamespace 用 remoteServiceKey(name) 建了一个插件 fiber），
@@ -339,6 +350,25 @@ export function makeOrbApi(ctx: any) {
     /** 单条会话行（不走历史列表的空白过滤）：首屏列表还没刷出来时目标条也要有内容。 */
     sessionRow(sessionId: string): OrbSessionRow | null {
       return allRows().find((row) => row.sessionId === sessionId) ?? null
+    },
+
+    /** 会话是否真的还在（不能只信 allRows：归档/空白/列表尚未就绪都会被过滤）。 */
+    sessionExists(sessionId: string): boolean {
+      const id = String(sessionId ?? '').trim()
+      if (id === '') return false
+      try {
+        if (ctx.sessions.list.getSnapshot()?.byId?.[id] !== undefined) return true
+      } catch {}
+      try {
+        return ctx.sessions.binding?.(id)?.session?.sessionId === id
+      } catch {
+        return false
+      }
+    },
+
+    /** 会话列表是否已收到宿主第一版完整快照（固定会话判存前的等待条件）。 */
+    sessionListReady(): boolean {
+      try { return ctx.sessions.list.getSnapshot()?.phase === 'ready' } catch { return false }
     },
 
     /** 该目录下可复用的空白会话 id（没有则 null）。
@@ -621,6 +651,32 @@ export function makeOrbApi(ctx: any) {
     /** 官方模型选择器已经加载的共享目录（全局 catalog / 当前会话目录）。 */
     officialModelCatalog(sessionId?: string | null) {
       return officialCatalogOf(sessionId)
+    },
+
+    /** 读某会话当前权限预设；投影还没到达时返回 null。 */
+    permissionOf(sessionId: string): string | null {
+      return permissionOf(sessionId)
+    },
+
+    /**
+     * 把会话切到 read-only 并回读投影确认。
+     * 走宿主 /permission 命令（和输入框同一条写路径）；命令成功但投影还没到时短暂轮询，
+     * 绝不把“命令返回 200”当成已经只读。
+     */
+    async setReadOnly(sessionId: string): Promise<{ ok: boolean; current: string | null }> {
+      if (permissionOf(sessionId) === 'read-only') return { ok: true, current: 'read-only' }
+      try {
+        const result = await this.commandExecute(sessionId, '/permission read-only')
+        if (result.kind === 'error') return { ok: false, current: permissionOf(sessionId) }
+      } catch {
+        return { ok: false, current: permissionOf(sessionId) }
+      }
+      for (let i = 0; i < 20; i += 1) {
+        const current = permissionOf(sessionId)
+        if (current === 'read-only') return { ok: true, current }
+        await new Promise((resolve) => setTimeout(resolve, 75))
+      }
+      return { ok: false, current: permissionOf(sessionId) }
     },
 
     /** 选择模型（作用于该会话的后续消息）。 */

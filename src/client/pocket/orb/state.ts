@@ -24,6 +24,52 @@ export const orbStore = {
   },
 }
 
+/** 个人秘书页状态：固定会话 + 只读/托管状态 + 当前页是否展开。
+ *  会话 id 的真值在宿主（/api/assistant/secretary），这里只是给 UI 的同步快照。 */
+export interface SecretaryViewState {
+  open: boolean
+  sessionId: string
+  cwd: string
+  readOnly: boolean
+  tuoguanOff: boolean
+  persisted: boolean
+  warning: string
+}
+
+let secretaryView: SecretaryViewState = {
+  open: false,
+  sessionId: '',
+  cwd: '',
+  readOnly: false,
+  tuoguanOff: false,
+  persisted: false,
+  warning: '',
+}
+const secretaryListeners = new Set<() => void>()
+
+export const secretaryStore = {
+  subscribe(listener: () => void): () => void {
+    secretaryListeners.add(listener)
+    return () => { secretaryListeners.delete(listener) }
+  },
+  getSnapshot(): SecretaryViewState {
+    return secretaryView
+  },
+  open(info: Omit<SecretaryViewState, 'open'>): void {
+    secretaryView = { ...info, open: true }
+    for (const listener of [...secretaryListeners]) { try { listener() } catch {} }
+  },
+  update(patch: Partial<Omit<SecretaryViewState, 'open'>>): void {
+    secretaryView = { ...secretaryView, ...patch }
+    for (const listener of [...secretaryListeners]) { try { listener() } catch {} }
+  },
+  close(): void {
+    if (!secretaryView.open) return
+    secretaryView = { ...secretaryView, open: false }
+    for (const listener of [...secretaryListeners]) { try { listener() } catch {} }
+  },
+}
+
 const CWD_KEY = 'dsh-pocket.orb.cwd'
 
 /** 读上次使用的项目目录（空字符串 = 未设置，由调用方兜底 HOME）。 */

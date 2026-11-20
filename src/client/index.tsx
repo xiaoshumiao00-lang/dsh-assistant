@@ -16,8 +16,8 @@ import { POCKET_ENDPOINTS, POCKET_RPC_CHANNEL } from './pocket/api.js'
 import { ICON_CHOICES, resolveProjectIcon, pickUnusedIcon } from './projectIcons'
 import { focusSessionInHost, sessionFaceState, healBlankSessionIfStuck, type FocusResult } from './sessionFocus'
 import { archivableBlankRows, looksBlankWithoutFlag, normalizeFolderPath, projectClaims, transientVisibility, unownedSessionIds } from './sessionFolder'
-import { assistantHomeDir } from './assistant-entry'
-import { ASSISTANT_PROJECT_ID, ASSISTANT_CARD_NAME, ASSISTANT_CARD_ICON, shouldAddAssistantCard, withAssistantCard } from './assistant-card'
+import { assistantHomeDir, openAssistant, peekSecretarySessionId } from './assistant-entry'
+import { ASSISTANT_PROJECT_ID, ASSISTANT_CARD_NAME, ASSISTANT_CARD_ICON, SECRETARY_CARD_ID, SECRETARY_CARD_NAME, SECRETARY_CARD_ICON, shouldAddAssistantCard, withAssistantCard } from './assistant-card'
 import { hasPendingInteraction, sessionStatusSourceOf, pendingInteractionSignature } from './sessionStatus'
 import { sessionSnapshotIndexOf, invalidateSessionSnapshotIndex, sessionIdsUnderFolderOf } from './sessionIndex'
 import { createSessionFactStore, sessionFactSignatureOf, factTierOf, FACT_TTL_HOT_MS } from './sessionFactCache'
@@ -3108,6 +3108,29 @@ function WorktableSection(props: any) {
       if (Array.isArray(wsnap?.archivedSessionIds)) archived = new Set(wsnap.archivedSessionIds.map(String))
       if (Array.isArray(wsnap?.pinnedSessionIds)) pinned = new Set(wsnap.pinnedSessionIds.map(String))
     } catch {}
+    // 固定秘书卡：只列那一条固定会话，不做目录过滤。
+    if (pid === SECRETARY_CARD_ID) {
+      const sid = peekSecretarySessionId()
+      if (!sid) return []
+      const snap = sessionBridge?.list?.getSnapshot?.()
+      const row = snap?.byId?.[sid]
+      if (!row) return []
+      const current = currentSessionId(snap?.current ?? '')
+      return [{
+        id: sid,
+        title: (typeof row.displayTitle === 'string' && row.displayTitle)
+          || (typeof row.title === 'string' && row.title)
+          || SECRETARY_CARD_NAME,
+        rel: '',
+        current: sid === current,
+        running: row.running === true,
+        awaiting: false,
+        blank: row.blank === true,
+        updatedAt: typeof row.updatedAt === 'number' ? row.updatedAt : 0,
+        pinned: pinned.has(sid),
+        archived: archived.has(sid),
+      }]
+    }
     // 临时卡片：没有项目文件夹，列表直接取 getConsoleCards 刚算好的游离会话镜像
     if (pid === RUNNING_CARD_ID) {
       const snap = sessionBridge?.list?.getSnapshot?.()
@@ -3787,6 +3810,27 @@ function WorktableSection(props: any) {
       }
     }
     const cards: ConsoleCardData[] = []
+    // 固定「个人秘书」卡：永远第一张，不写 projects 状态，也不提供「＋新会话」。
+    // 单击进固定会话；新建会话仍走各项目卡的「＋ 新会话」。
+    const secretaryId = peekSecretarySessionId()
+    const secretaryRow = secretaryId ? byId[secretaryId] : null
+    const secretaryRunning = secretaryRow?.running === true
+    cards.push({
+      id: SECRETARY_CARD_ID,
+      name: SECRETARY_CARD_NAME,
+      icon: SECRETARY_CARD_ICON,
+      status: secretaryRunning ? 'busy' : 'idle',
+      runtimeMs: null,
+      kids: 0,
+      preview: secretaryId
+        ? (secretaryRunning ? '正在整理…' : '固定会话 · 只读')
+        : '点开创建固定会话',
+      live: secretaryRunning,
+      bound: Boolean(secretaryId),
+      canNewSession: false,
+      self: false,
+      glow: false,
+    })
     cards.push(make(CONSOLE_ID, t('console.name'), CONSOLE_ICON, true))
     if (transientCard) cards.push(transientCard)
     const ordered = projectDisplayOrder()
@@ -3948,6 +3992,11 @@ function WorktableSection(props: any) {
         },
         onAdd: () => { openAddPanel() },
         onOpen: (id) => {
+          if (id === SECRETARY_CARD_ID) {
+            controlRoomStore.setOpen(false)
+            void openAssistant()
+            return
+          }
           if (id === CONSOLE_ID) return
           if (id === RUNNING_CARD_ID) {
             const rows = transientRowsRef.current

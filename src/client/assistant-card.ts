@@ -19,6 +19,11 @@ export const ASSISTANT_PROJECT_ID = 'wt-assistant'
 export const ASSISTANT_CARD_NAME = '私人助手'
 export const ASSISTANT_CARD_ICON = '🤖'
 
+/** 个人秘书固定卡：不写 projects 状态，由 getConsoleCards 每次实时插到第一张。 */
+export const SECRETARY_CARD_ID = 'wt-secretary'
+export const SECRETARY_CARD_NAME = '个人秘书'
+export const SECRETARY_CARD_ICON = '📁'
+
 /** 只读投影：判重/判墓碑要用到的字段（真实项目状态字段更多，原样透传）。 */
 export interface AssistantCardState {
   layouts: { id: string }[]

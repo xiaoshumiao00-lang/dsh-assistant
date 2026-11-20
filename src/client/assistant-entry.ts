@@ -1,24 +1,35 @@
 /**
- * 私人助手的入口：每次打开**新开一条会话**，不再复用上一条。
+ * 个人秘书入口：打开**唯一一条固定会话**，不再每次新建。
  *
- * 为什么不是「一个常驻会话」：会话越长，上下文越大、越慢越贵，而且一旦 compaction 掉细节，
- * 助手反而忘事。真正让它「记得你」的是记忆（USER.md / MEMORY.md / assistant AGENTS.md / journal），
- * 不是那条会话的上下文。所以：
- *   - 每次进入 = 助手家目录里开一条**新会话**（同目录同模式的空白会话会被复用，不堆空白）；
- *   - 默认走 computer-use 模式（能看屏幕、点界面），不可用时退回标准模式；
- *   - 模型沿用**上一次这条会话实际在用的模型**，没有记录时退回本机上次选过的模型。
+ * 三条入口共用这一个动作（长按悬浮球 / 桌面全局热键 / 控制室「个人秘书」卡）。
+ * 固定会话 id 的宿主真值在 `/api/assistant/secretary`；localStorage 只做首屏缓存。
  *
- * 三条入口共用这一个动作（长按悬浮球 / 桌面全局热键 / 控制室顶栏按钮）。
+ * 安全边界：
+ *   - 会话切到 read-only（权限预设“仅可查看”）；
+ *   - 显式把会话托管关掉（托管会把审批自动答成 allowed-once，能绕过一次性升权）；
+ *   - 宿主侧 assistant-secretary 工具闸拒绝 write/edit/shell/Computer Use/子代理/派单工具；
+ *   - 页面上的「派活」创建独立会话，绝不走子代理（子代理会继承父会话的只读档）。
  */
 import { getAssistantApi, readModelPref, exitWorkspace } from './orb-bridge'
-import { sessionModel } from './pocket/orb/session-plan.ts'
+import { secretaryStore } from './pocket/orb/state.ts'
+import type { OrbApi } from './pocket/orb/orb-api.ts'
 
-/** 上次打开的助手会话 id（只用于记住模型，不再复用它开新会话）。 */
-const SESSION_KEY = 'dsh.assistant.sessionId'
-/** 助手家目录缓存（宿主路由每次都会确保目录存在）。 */
-const HOME_KEY = 'dsh.assistant.home'
-/** 默认模式：桌面 GUI（dsh-orb 注册的 computer-use 预设）。 */
-const ASSISTANT_PRESET = 'computer-use'
+export const SECRETARY_TITLE = '个人秘书'
+/** 标准模式（空 preset id）：秘书只靠只读权限和工具闸约束，不加载 Computer Use。 */
+export const ASSISTANT_AGENT_PRESET = ''
+const CACHE_KEY = 'dsh.assistant.secretary.sessionId'
+const LEGACY_SESSION_KEY = 'dsh.assistant.sessionId'
+const SECRETARY_ROUTE = '/api/assistant/secretary'
+const TUOGUAN_ROUTE = '/.dsh-tuoguan/state'
+
+export interface AssistantOpenResult {
+  sessionId: string
+  cwd: string
+  readOnly: boolean
+  tuoguanOff: boolean
+  persisted: boolean
+  warning: string
+}
 
 function readKey(key: string): string {
   try { return String(localStorage.getItem(key) ?? '') } catch { return '' }
@@ -31,23 +42,28 @@ function writeKey(key: string, value: string): void {
   } catch { /* 隐私模式/配额满：不阻塞打开 */ }
 }
 
-/** 已记住的助手会话 id（没有则空串）。 */
+/** 已缓存的固定会话 id（没有则空串）。只给卡片/首屏做同步提示，真值仍以宿主为准。 */
 export function readAssistantSessionId(): string {
-  return readKey(SESSION_KEY)
+  return readKey(CACHE_KEY)
+}
+
+/** 同 readAssistantSessionId 的语义化别名。 */
+export function peekSecretarySessionId(): string {
+  return readKey(CACHE_KEY)
 }
 
 let homeInflight: Promise<string> | null = null
 
 /** 助手家目录：先读缓存，没有就向宿主要一次（失败返回空串，调用方决定退让）。 */
 export async function assistantHomeDir(): Promise<string> {
-  const cached = readKey(HOME_KEY)
+  const cached = readKey('dsh.assistant.home')
   if (cached) return cached
   if (homeInflight !== null) return homeInflight
   homeInflight = fetch('/api/assistant/home', { cache: 'no-store' })
     .then((response) => response.json())
     .then((body: any) => {
       const dir = String(body?.dir ?? '').trim()
-      if (dir) writeKey(HOME_KEY, dir)
+      if (dir) writeKey('dsh.assistant.home', dir)
       return dir
     })
     .catch(() => '')
@@ -55,57 +71,198 @@ export async function assistantHomeDir(): Promise<string> {
   return homeInflight
 }
 
-let opening: Promise<boolean> | null = null
-
-/**
- * 打开私人助手（每次新会话）。
- * @param opts.forceNew - 连「同目录同模式的空白会话复用」也不要，强制建一条全新的。
- * @returns 是否已经把主界面切过去。
- */
-export async function openAssistant(opts: { forceNew?: boolean } = {}): Promise<boolean> {
-  if (opening !== null) return opening
-  const run = (async (): Promise<boolean> => {
-    const api = getAssistantApi()
-    if (!api) return false
-    // 0) 先退出项目分栏工作区：助手永远是「单一会话布局」。
-    //    用户先在论文写作模板项目里（流程窗格 + 对话列）时，只切会话是收不掉工作区的
-    //    （分栏的联动兜底也依赖同一时刻的会话快照，时序上更不可靠），这里显式收一次。
-    exitWorkspace()
-    const home = await assistantHomeDir()
-    if (!home) return false
-
-    // 1) 先从上一条助手会话读出「上一次实际用的模型」——比本地偏好更准：
-    //    用户可能直接在对话页的模型胶囊里换过，那个选择只落在会话上。
-    const previousId = readKey(SESSION_KEY)
-    const previousRow = previousId ? api.sessionRow(previousId) : null
-    const remembered = previousRow !== null ? sessionModel(previousRow) : null
-    const fallback = readModelPref('cu') ?? readModelPref('standard')
-    const wanted = remembered ?? fallback
-
-    // 2) 新会话：默认 computer-use；预设不存在（dsh-orb 被停用）时退回标准模式。
-    let created: { sessionId: string; appliedPreset: string | null; reused: boolean }
-    try {
-      created = await api.createSession(home, ASSISTANT_PRESET, { reuseBlank: opts.forceNew !== true })
-    } catch {
-      created = await api.createSession(home, undefined, { reuseBlank: opts.forceNew !== true })
+/** 宿主里的唯一 id；路由存在但返回 null 时清掉本地旧缓存。 */
+async function fetchStoredSecretaryId(): Promise<string> {
+  try {
+    const response = await fetch(SECRETARY_ROUTE, { cache: 'no-store', headers: { accept: 'application/json' } })
+    if (!response.ok) return readKey(CACHE_KEY)
+    const body = await response.json().catch(() => null)
+    const id = typeof body?.sessionId === 'string' ? body.sessionId.trim() : ''
+    if (id) {
+      writeKey(CACHE_KEY, id)
+      return id
     }
-    writeKey(SESSION_KEY, created.sessionId)
-
-    // 3) 把上次的模型落到新会话上：失败不阻塞打开（会话仍能用默认模型）。
-    if (wanted) {
-      try {
-        await api.selectModel(created.sessionId, { provider: wanted.provider, model: wanted.model })
-      } catch { /* 模型已下线/宿主拒绝：保持会话默认 */ }
-    }
-
-    const focused = await api.focusSession(created.sessionId)
-    return focused.opened
-  })()
-  opening = run.finally(() => { opening = null })
-  return opening
+    writeKey(CACHE_KEY, '')
+    return ''
+  } catch {
+    return readKey(CACHE_KEY)
+  }
 }
 
-/** URL 直达：…/?assistant=chat 打开私人助手（重开窗口/外部唤起时用）。 */
+/** 写宿主真值；失败仍保留本地缓存（旧宿主未重启时至少本次可用），并如实返回 false。 */
+async function persistSecretaryId(sessionId: string): Promise<boolean> {
+  writeKey(CACHE_KEY, sessionId)
+  try {
+    const response = await fetch(SECRETARY_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ sessionId }),
+    })
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
+/** 显式关闭某会话的托管，并回读宿主确认；读到 off[id] 才算成功。 */
+async function ensureTuoguanOff(sessionId: string): Promise<boolean> {
+  try {
+    const post = await fetch(TUOGUAN_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ sessionId, on: false }),
+    })
+    if (!post.ok) return false
+    const get = await fetch(TUOGUAN_ROUTE, { cache: 'no-store', headers: { accept: 'application/json' } })
+    if (!get.ok) return false
+    const state: any = await get.json().catch(() => null)
+    return state?.off?.[sessionId] === true
+  } catch {
+    return false
+  }
+}
+
+function isPhoneViewport(): boolean {
+  try { return window.matchMedia('(max-width: 640px), (pointer: coarse)').matches } catch { return false }
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+let opening: Promise<AssistantOpenResult | null> | null = null
+let lastOpen: AssistantOpenResult | null = null
+
+/** 最近一次成功打开的秘书信息（诊断/测试用）。 */
+export function lastAssistantOpen(): AssistantOpenResult | null {
+  return lastOpen
+}
+
+/**
+ * 打开或复用固定秘书会话。
+ * @param opts.surface - auto（手机走页面、桌面走宿主） / page（强制页面） / host（强制宿主会话）。
+ * @returns 是否已经把秘书送到用户面前。
+ */
+export async function openAssistant(opts: { surface?: 'auto' | 'page' | 'host' } = {}): Promise<boolean> {
+  if (opening !== null) {
+    const pending = await opening
+    return pending !== null
+  }
+  const run = (async (): Promise<AssistantOpenResult | null> => {
+    const api = getAssistantApi()
+    if (!api) return null
+    exitWorkspace()
+    const home = await assistantHomeDir()
+    if (!home) return null
+
+    const wantedPage = opts.surface === 'page' || (opts.surface !== 'host' && isPhoneViewport())
+    const stored = await fetchStoredSecretaryId()
+    let sessionId = ''
+
+    if (stored) {
+      // 列表还没到 ready 时不要急着判“会话不存在”，否则会在宿主冷启动时多建一条。
+      if (!api.sessionExists(stored)) {
+        for (let i = 0; i < 20 && !api.sessionListReady(); i += 1) await sleep(100)
+      }
+      if (api.sessionExists(stored)) sessionId = stored
+    }
+
+    const previousId = sessionId || stored || readKey(LEGACY_SESSION_KEY)
+    const previousRow = previousId ? api.sessionRow(previousId) : null
+    const remembered = previousRow ? sessionModelOf(previousRow) : null
+    const fallback = readModelPref('standard')
+
+    let created = false
+    if (sessionId === '') {
+      try {
+        const result = await api.createSession(home, undefined, { reuseBlank: false })
+        sessionId = result.sessionId
+        created = true
+      } catch (error) {
+        console.warn('[dsh-assistant] 创建个人秘书会话失败：', error)
+        return null
+      }
+    }
+
+    // 固定会话恢复：归档的会话先拉回列表，再置顶。失败不伪装成功。
+    try { await api.unarchiveSession(sessionId) } catch { /* 本来就没归档 */ }
+    try { await api.renameSession(sessionId, SECRETARY_TITLE) } catch { /* 标题不是功能依赖 */ }
+    let pinned = true
+    try { await api.pinSession(sessionId) } catch { pinned = false }
+
+    // 新会话才继承上次模型；已有固定会话不覆盖用户当前模型。
+    if (created) {
+      const wanted = remembered ?? fallback
+      if (wanted) {
+        try {
+          await api.selectModel(sessionId, { provider: wanted.provider, model: wanted.model })
+        } catch { /* 模型失效时保留宿主默认 */ }
+      }
+    }
+
+    const persisted = await persistSecretaryId(sessionId)
+    const tuoguanOff = await ensureTuoguanOff(sessionId)
+    const readOnlyResult = await api.setReadOnly(sessionId)
+    const readOnly = readOnlyResult.ok
+    const warnings: string[] = []
+    if (!persisted) warnings.push('固定会话 ID 未能写入宿主（重启后可能重新选一条）')
+    if (!pinned) warnings.push('会话置顶失败')
+    if (!readOnly) warnings.push(`只读权限未确认（当前：${readOnlyResult.current ?? '未知'}）`)
+    if (!tuoguanOff) warnings.push('托管未确认关闭，发送已禁用')
+
+    const result: AssistantOpenResult = {
+      sessionId,
+      cwd: home,
+      readOnly,
+      tuoguanOff,
+      persisted,
+      warning: warnings.join('；'),
+    }
+    lastOpen = result
+
+    if (wantedPage) {
+      secretaryStore.open({
+        sessionId: result.sessionId,
+        cwd: result.cwd,
+        readOnly: result.readOnly,
+        tuoguanOff: result.tuoguanOff,
+        persisted: result.persisted,
+        warning: result.warning,
+      })
+    } else {
+      secretaryStore.close()
+      secretaryStore.update({
+        sessionId: result.sessionId,
+        cwd: result.cwd,
+        readOnly: result.readOnly,
+        tuoguanOff: result.tuoguanOff,
+        persisted: result.persisted,
+        warning: result.warning,
+      })
+      const focused = await api.focusSession(sessionId)
+      if (!focused.opened) {
+        try { api.openSession(sessionId) } catch {}
+      }
+    }
+    return result
+  })()
+
+  opening = run
+  try {
+    const result = await run
+    return result !== null
+  } catch (error) {
+    console.warn('[dsh-assistant] 打开个人秘书失败：', error)
+    return false
+  } finally {
+    opening = null
+  }
+}
+
+function sessionModelOf(row: ReturnType<OrbApi['sessionRow']>): { provider: string; model: string } | null {
+  const selection = row?.modelSelection?.next ?? row?.modelSelection?.lastUsed ?? null
+  return selection === null ? null : { provider: selection.provider, model: selection.model }
+}
+
+/** URL 直达：…/?assistant=chat 打开个人秘书（重开窗口/外部唤起时用）。 */
 export function assistantUrlIntent(): boolean {
   try {
     const search = String(window.location?.search ?? '')
@@ -113,6 +270,3 @@ export function assistantUrlIntent(): boolean {
     return /[?&]assistant=chat(?:&|$)/.test(search) || hash === '#assistant'
   } catch { return false }
 }
-
-/** 助手会话默认预设（诊断/测试用）。 */
-export const ASSISTANT_AGENT_PRESET = ASSISTANT_PRESET

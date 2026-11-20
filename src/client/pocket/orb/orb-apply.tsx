@@ -3,8 +3,10 @@
 //   conversation.input.left → 登记官方附件写入面（不可见）
 // 手机抽屉底部不再注册旧「悬浮球」入口，避免误入已停用的旧操作流程。
 import { OrbOverlay } from './OrbOverlay.tsx'
+import { SecretaryOverlay } from './SecretaryOverlay.tsx'
 import { installBootGuard } from './boot-guard.ts'
 import { ORB_CSS } from './orb.css.ts'
+import { SECRETARY_CSS } from './secretary.css.ts'
 import { NS, zh, en, type OrbKey } from './locales.ts'
 import { makeOrbApi } from './orb-api.ts'
 import { PcFileCommandIcon, PcFileInputBridge, PcFilePickerOverlay, hasPcFileComposer, isPhoneComposerLayout, pcFilePickerStore } from './PcFileAttach.tsx'
@@ -22,7 +24,7 @@ export function orbApply(ctx: any): void {
   ctx.effect(() => {
     const tag = document.createElement('style')
     tag.dataset.plugin = 'dsh-pocket-orb'
-    tag.textContent = ORB_CSS
+    tag.textContent = `${ORB_CSS}\n${SECRETARY_CSS}`
     document.head.appendChild(tag)
     return () => {
       tag.remove()
@@ -127,6 +129,21 @@ export function orbApply(ctx: any): void {
         inject: () => ({ api }),
       },
       OrbOverlay,
+    ),
+  )
+
+  // 个人秘书全屏页：手机长按悬浮球 / 控制室秘书卡进来。关闭时组件返回 null，
+  // 不常驻挂任何会话列表。
+  ctx.slots.inject('shell.overlay', () =>
+    ctx.slots.register(
+      {
+        name: 'shell.overlay',
+        id: 'assistant-secretary-overlay',
+        order: 30,
+        locale: NS,
+        inject: () => ({ api }),
+      },
+      SecretaryOverlay,
     ),
   )
 
