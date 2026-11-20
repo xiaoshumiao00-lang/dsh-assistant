@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>主动助手预期效果图-手机电脑</title>
+<style>
+  /* ============ 真实样式来源（D:\dsh-assistant 源码 + 实机渲染取证） ============
+     配色/字号取自 src/client/pocket/mobile/mobile.css.ts 与 src/client/pocket/orb/orb.css.ts
+     的 --dsw-alias-* 令牌（含 fallback 值），并用 headless Chrome 打开 pocket 代理
+     (http://127.0.0.1:3081) 实测 computed style 校准。 */
+  :root {
+    --page-bg: #eef1f6;
+    --card-bg: #ffffff;
+    --ink: #0f1115;
+    --ink-2: #6b7280;
+    --ink-3: #8b93a1;
+    --line: #e5e7eb;
+    --line-1: rgba(0, 0, 0, .12);
+    --brand: #4f6ef7;
+    --tab-active: #4176e6;
+    --row-selected: rgba(38, 49, 72, .06);
+    --hover: rgba(0, 0, 0, .06);
+    --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page-bg); color: var(--ink); }
+  .canvas { width: 1600px; height: 1100px; padding: 26px 30px 22px; display: flex; flex-direction: column; gap: 18px; }
+
+  /* ---------- 顶部标题 ---------- */
+  .head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+  .head h1 { margin: 0; font-size: 30px; font-weight: 700; letter-spacing: .2px; }
+  .head .sub { font-size: 14px; color: var(--ink-2); }
+  .head .badge { font-size: 12px; color: var(--tab-active); background: #eaf1ff; border: 1px solid #d6e4ff; border-radius: 999px; padding: 4px 10px; }
+
+  .columns { flex: 1; display: grid; grid-template-columns: 430px 1fr; gap: 26px; min-height: 0; }
+  .col-label { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); margin-bottom: 8px; }
+  .col-label b { color: var(--ink); font-size: 14px; font-weight: 600; }
+  .col-label .tag { font-size: 11px; color: var(--ink-3); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; background: #fff; }
+
+  /* ================= 左：手机（pocket 390x844 真机版式） ================= */
+  .phone { width: 390px; height: 844px; background: #fff; border: 1px solid var(--line); border-radius: 30px; box-shadow: 0 12px 40px rgba(15, 23, 42, .16); overflow: hidden; display: flex; flex-direction: column; }
+  .statusbar { height: 26px; background: #fff; border-bottom: 1px solid #f2f3f5; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; font-size: 11px; color: var(--ink-3); }
+  /* 真实顶部栏：[class*="_logoRow"] padding 8px 0 8px 4px；hamburger 28x28 圆钮 */
+  .m-top { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  .m-icon { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: var(--ink-2); background: transparent; }
+  .m-icon:hover { background: var(--hover); }
+  .m-top .title { flex: 1; text-align: center; font-size: 14px; font-weight: 600; color: var(--ink); }
+  .chip { display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px; border: 1px solid var(--line); border-radius: 8px; font-size: 12px; color: var(--ink-2); background: #fff; }
+  .m-tabs { display: flex; gap: 18px; padding: 0 14px; border-bottom: 1px solid var(--line); }
+  .m-tab { font-size: 13px; padding: 9px 0 8px; color: var(--ink-3); }
+  .m-tab.on { color: var(--tab-active); font-weight: 600; box-shadow: inset 0 -2px 0 var(--tab-active); }
+
+  .conv { flex: 1; overflow: hidden; padding: 6px 12px 0; }
+  .load-more { display: block; margin: 0 auto 6px; font-size: 12px; color: #61666b; background: #f1f3f5; border: 0; border-radius: 8px; padding: 4px 12px; height: 24px; }
+  .done-row { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-3); border-bottom: 1px solid var(--line); padding-bottom: 4px; margin-bottom: 6px; }
+  .msg { padding: 0 0 6px; }
+  .msg .kicker { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #4176e6; background: rgba(65, 118, 230, .1); border: 0; border-radius: 999px; padding: 1px 8px; width: fit-content; margin-bottom: 5px; font-weight: 600; }
+  .msg .blk { background: #f9fafb; border-radius: 16px; padding: 10px 14px 12px; }
+  .msg .blk .blk-h { font-size: 11px; color: #61666b; padding: 0 0 6px 2px; }
+  .msg h3 { margin: 0 0 6px; font-size: 16px; line-height: 1.35; }
+  .msg p { margin: 0 0 5px; font-size: 13px; line-height: 1.5; }
+  .msg .em { font-weight: 700; }
+  code { font-family: var(--mono); font-size: 13px; background: #fafafa; border: 1px solid rgba(0, 0, 0, .04); border-radius: 8px; padding: 0 5px; color: var(--ink); }
+  .meta { display: flex; align-items: center; gap: 10px; color: var(--ink-3); font-size: 11px; }
+  .meta .acts { display: flex; gap: 9px; }
+  .meta .acts span { width: 13px; height: 13px; display: inline-block; border: 1px solid var(--line); border-radius: 4px; opacity: .55; }
+  /* 主动卡片：真实 .card 令牌 border:1px solid #e5e7eb; radius:12px; bg:#fff */
+  .card { border: 1px solid var(--line); border-radius: 12px; padding: 9px 10px 8px; background: #fff; }
+  .card + .card { margin-top: 8px; }
+  .card-h { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+  .card .kicker { margin: 0; }
+  .card .ttl { font-size: 13.5px; font-weight: 600; margin: 0; }
+  .card .body { font-size: 13px; line-height: 1.55; color: #24272d; }
+  .card .body p { margin: 0 0 4px; }
+  .card .row2 { margin-top: 8px; }
+  .card .mini { margin-top: 7px; font-size: 11.5px; color: var(--ink-3); }
+  .card .meta { margin-top: 8px; }
+  .row2 { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn { height: 30px; padding: 0 12px; border-radius: 10px; font-size: 13px; border: 1px solid var(--line-1); background: #fff; color: var(--ink); }
+  .btn.primary { background: #4176e6; border-color: #4176e6; color: #fff; }
+  .mini { font-size: 11.5px; color: var(--ink-3); margin-top: 6px; }
+
+  /* 真实输入框卡片：radius 28px + 三层 shadow */
+  .composer { margin: 0 10px; border-radius: 28px; background: #fff; box-shadow: rgba(0, 0, 0, .1) 0 0 0 .5px, rgba(0, 0, 0, .03) 0 4px 16px 0, rgba(0, 0, 0, .03) 0 0 24px 0; padding: 8px 10px 8px; }
+  .composer .ph { font-size: 16px; line-height: 26px; color: #9ca3af; padding: 2px 6px 8px; }
+  .c-row { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; }
+  .c-btn { width: 28px; height: 28px; border-radius: 50%; border: 1px solid var(--line); display: flex; align-items: center; justify-content: center; font-size: 15px; color: var(--ink); background: #fff; }
+  .pill { height: 28px; padding: 0 10px; border-radius: 999px; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; }
+  /* 实测 computed：托管胶囊 bg rgb(65,118,230) #4176e6 / radius 8 / h28 / 13px 500 */
+  .pill.dark { background: #4176e6; color: #fff; border-radius: 8px; height: 28px; padding: 0 10px; font-size: 13px; font-weight: 500; }
+  .send { margin-left: auto; width: 34px; height: 34px; border-radius: 50%; background: #b0c0f0; color: #fff; display: flex; align-items: center; justify-content: center; font-size: 17px; }
+  .stats { display: flex; gap: 14px; padding: 4px 14px 10px; font-size: 12px; color: var(--ink-3); }
+
+  /* 真实悬浮球/鹈鹕入口：60x60 圆 + 该渐变（src/desktop-ball.ts 实测）；头像用插件自带 orb-avatar.png */
+  .ball { width: 60px; height: 60px; border-radius: 50%; background: radial-gradient(circle at 32% 28%, #fff 0%, #eef2ff 24%, #c7d2fe 55%, #8b5cf6 100%) center / cover no-repeat; box-shadow: 0 6px 20px rgba(76, 29, 149, .45), 0 2px 6px rgba(0, 0, 0, .25), inset 0 2px 6px rgba(255, 255, 255, .9); display: flex; align-items: center; justify-content: center; font-size: 26px; }
+  .ball.avatar { background-image: url('orb-avatar.png'), radial-gradient(circle at 32% 28%, #fff 0%, #eef2ff 24%, #c7d2fe 55%, #8b5cf6 100%); background-size: cover, cover; }
+  /* 手机内的助手入口（实测 FAB：38x38 圆, border rgba(0,0,0,.12), shadow 0 2px 12px rgba(0,0,0,.18)）——真机上是鹈鹕头像 */
+  .phone { position: relative; }
+  .p-ball { position: absolute; right: 12px; bottom: 96px; width: 46px; height: 46px; border-radius: 50%; background: url('orb-avatar.png') center / cover no-repeat, radial-gradient(circle at 32% 28%, #fff 0%, #eef2ff 24%, #c7d2fe 55%, #8b5cf6 100%); border: 1px solid rgba(0, 0, 0, .12); box-shadow: 0 2px 12px rgba(0, 0, 0, .18); }
+  .side .foot .av { background-image: url('orb-avatar.png'), radial-gradient(circle at 32% 28%, #fff 0%, #eef2ff 24%, #c7d2fe 55%, #8b5cf6 100%); background-size: cover, cover; }
+
+  /* ================= 右：电脑（DSH Web 面板 1440x900 实拍 + 悬浮球） ================= */
+  .desk-wrap { position: relative; display: flex; flex-direction: column; min-width: 0; }
+  .desk { flex: 1; display: grid; grid-template-columns: 280px 1fr; background: #fff; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; box-shadow: 0 10px 30px rgba(15, 23, 42, .10); min-height: 0; }
+  /* 实测：_2H3hWW_root bg rgb(249,250,251) padding 6px 12px, width 280 */
+  .side { border-right: 1px solid var(--line); display: flex; flex-direction: column; padding: 6px 12px; gap: 2px; background: #f9fafb; }
+  .side .brand { display: flex; align-items: center; gap: 8px; padding: 4px 6px 10px; font-weight: 700; font-size: 15px; }
+  .side .brand .mark { width: 22px; height: 22px; border-radius: 6px; background: #0f1115; color: #fff; display: flex; align-items: center; justify-content: center; font-size: 12px; }
+  .side .brand .h { font-size: 10px; letter-spacing: 1px; background: #0f1115; color: #fff; border-radius: 4px; padding: 1px 5px; }
+  /* 实测：新会话钮 bg #fff / border rgba(0,0,0,.12) / radius 12 / h38 / 14px 500 */
+  .new-session { height: 38px; border: 1px solid rgba(0, 0, 0, .12); border-radius: 12px; background: #fff; display: flex; align-items: center; justify-content: center; gap: 6px; font-size: 14px; font-weight: 500; color: var(--ink); }
+  .panel-row { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 10px; border-radius: 10px; font-size: 13px; color: var(--ink); }
+  .panel-row .g { width: 16px; text-align: center; color: var(--ink-2); }
+  .sec-head { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: var(--ink-3); padding: 12px 8px 6px; }
+  .sec-head .ic { display: flex; gap: 10px; color: var(--ink-3); }
+  .ws-row { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 8px; border-radius: 12px; font-size: 13px; color: var(--ink); white-space: nowrap; overflow: hidden; }
+  .ws-row.on { background: var(--row-selected); }
+  .ws-row .f { color: var(--ink-3); }
+  .side .foot { margin-top: auto; display: flex; align-items: center; gap: 8px; padding: 8px 6px 2px; font-size: 13px; }
+  .side .foot .av { width: 24px; height: 24px; border-radius: 50%; background: radial-gradient(circle at 32% 28%, #fff 0%, #eef2ff 24%, #c7d2fe 55%, #8b5cf6 100%); border: 1px solid var(--line); }
+  .main { display: flex; flex-direction: column; min-width: 0; }
+  .d-top { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--line); font-size: 14px; }
+  .d-top .t { font-weight: 600; }
+  .d-top .sp { margin-left: auto; }
+  .d-tabs { display: flex; gap: 18px; padding: 0 16px; border-bottom: 1px solid var(--line); }
+  .d-tab { font-size: 13px; padding: 9px 0 8px; color: var(--ink-3); }
+  .d-tab.on { color: var(--tab-active); font-weight: 600; box-shadow: inset 0 -2px 0 var(--tab-active); }
+  .d-conv { flex: 1; overflow: hidden; padding: 14px 18px 0; }
+  .d-conv .wrap { max-width: 720px; margin: 0 auto; }
+  .d-msg { font-size: 14.5px; line-height: 1.72; margin-bottom: 12px; }
+  .d-msg .hl { background: #f2f3f5; border-radius: 6px; padding: 1px 6px; font-family: var(--mono); font-size: 12.5px; }
+  .d-composer { margin: 0 18px 6px; border-radius: 24px; background: #fff; box-shadow: rgba(0, 0, 0, .1) 0 0 0 .5px, rgba(0, 0, 0, .03) 0 4px 16px 0, rgba(0, 0, 0, .03) 0 0 24px 0; padding: 10px 14px; }
+  .d-composer .ph { font-size: 15px; color: #9ca3af; padding-bottom: 8px; }
+  .d-row { display: flex; align-items: center; gap: 10px; }
+  .seat { font-size: 12.5px; color: var(--ink-2); }
+  .d-stats { display: flex; gap: 18px; padding: 4px 20px 12px; font-size: 12px; color: var(--ink-3); }
+
+  /* 桌面悬浮球（Electron 72x72 置顶窗，实测 style） */
+  .desk-ball { position: absolute; right: 26px; bottom: 132px; }
+  .toast { position: absolute; right: 26px; bottom: 200px; width: 400px; background: #fff; border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 8px 24px rgba(15, 23, 42, .16); padding: 12px 14px; }
+  .toast .l { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 600; margin-bottom: 4px; }
+  .toast .dot { width: 8px; height: 8px; border-radius: 50%; background: #4176e6; flex: none; }
+  .toast .b { font-size: 12.5px; color: #24272d; line-height: 1.55; }
+  .toast .btns { display: flex; gap: 8px; margin-top: 9px; }
+  .toast .btn { height: 28px; font-size: 12.5px; }
+  .toast .ts { font-size: 11px; color: var(--ink-3); margin-top: 7px; }
+
+  .footnote { font-size: 12px; color: var(--ink-2); }
+  .footnote code { font-size: 11.5px; }
+</style>
+</head>
+<body>
+<div class="canvas">
+  <div class="head">
+    <div>
+      <h1>个人助手 · 主动服务（预期效果）· 基于现有插件界面</h1>
+      <div class="sub">左：手机 <code>dsh-pocket</code> 页面（390×844 实测）｜右：电脑 DSH Web 面板 + 桌面悬浮球</div>
+    </div>
+    <div class="badge">真实配色 · 令牌 --dsw-alias-*</div>
+  </div>
+
+  <div class="columns">
+    <!-- ================= 手机 ================= -->
+    <div>
+      <div class="col-label"><b>手机 · pocket</b><span class="tag">对话 / 轨迹</span><span class="tag">390×844</span></div>
+      <div class="phone">
+        <div class="statusbar"><span>21:26</span><span>武汉 · 66%</span></div>
+        <div class="m-top">
+          <div class="m-icon">☰</div>
+          <div class="title">个人助手</div>
+          <div class="chip">📁 <span style="color:#c9a227">▾</span></div>
+          <div class="m-icon">⋯</div>
+          <div class="m-icon">▐</div>
+        </div>
+        <div class="m-tabs"><div class="m-tab on">对话</div><div class="m-tab">轨迹</div></div>
+
+        <div class="conv">
+          <button class="load-more">加载更早</button>
+          <div class="done-row">已完成 <span style="font-size:12px">⌄</span></div>
+
+          <!-- 1 主动关心 -->
+          <div class="msg">
+            <div class="card">
+              <div class="card-h"><span class="kicker">🟢 主动小秘 · 主动关心</span><span class="ttl">明日武汉出差：天气 + 高铁</span></div>
+              <div class="body">
+                <p>武汉 <span class="em">8–14℃ 多云转小雨</span>，记得带伞；<code>G1545 孝感西 08:12 → 汉口 08:49</code>；10:30 <span class="em">华工·结构实验室</span> 开会，会前 40 分钟出发。</p>
+              </div>
+              <div class="meta"><div class="acts"><span></span><span></span><span></span><span></span></div><span>今天 07:40</span></div>
+            </div>
+          </div>
+
+          <!-- 2 任务完成汇报 -->
+          <div class="msg">
+            <div class="card">
+              <div class="card-h"><span class="kicker">✅ 主动小秘 · 任务完成</span><span class="ttl">文献综述已整理</span></div>
+              <div class="body"><p>41 篇（近 5 年 22 篇）按主题分组，GB/T 7714 已核对，落在 <code>综述.md</code>；缺口 3 处已标出。</p></div>
+              <div class="meta"><div class="acts"><span></span><span></span><span></span></div><span>今天 15:20 · 打开文件</span></div>
+            </div>
+          </div>
+
+          <!-- 3 主动探索推荐 -->
+          <div class="msg">
+            <div class="card">
+              <div class="card-h"><span class="kicker">🧭 主动小秘 · 主动探索</span><span class="ttl">武汉轰趴新需求 3 条</span></div>
+              <div class="body"><p>近 24h 有 3 条「求场地」帖：武昌 15 人、汉口带 KTV、光谷需投影；<code>XX轰趴</code> 场地费比记录低 18%。</p></div>
+              <div class="row2"><button class="btn primary">去需求表录入</button><button class="btn">看帖子原文</button></div>
+              <div class="mini">依据：你自己的需求表 + 小红书采集记录</div>
+            </div>
+          </div>
+
+          <!-- 4 征求授权 -->
+          <div class="msg">
+            <div class="card">
+              <div class="card-h"><span class="kicker">🔐 主动小秘 · 征求授权</span><span class="ttl">读取微信聊天文件与简历</span></div>
+              <div class="body"><p><code>微信聊天文件\11月</code> 里 6 个文件疑似与基金申报相关；<code>陈潘_简历.docx</code> 也需更新。</p></div>
+              <div class="row2">
+                <button class="btn primary">同意授权</button>
+                <button class="btn">暂不</button>
+              </div>
+              <div class="mini">只在本机读取 · 全程可见记录 · 今天 20:15</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="composer">
+          <div class="ph">发消息或创建任务，/ 调用指令，@ 文件</div>
+          <div class="c-row">
+            <div class="c-btn">＋</div>
+            <div class="c-btn" style="border-radius:10px;width:auto;padding:0 10px;font-size:12px">🛡 完全权限 <span style="color:#9ca3af">⌄</span></div>
+            <div class="pill dark">托管 ✓</div>
+            <div class="c-btn" style="width:auto;border-radius:10px;padding:0 8px;font-size:12px">🗄 ⌄</div>
+            <div class="send">↑</div>
+          </div>
+        </div>
+        <div class="stats"><span>◔ 4 轮 62 步…</span><span>🗨 21.4M tok …</span><span>◔ 34%</span></div>
+        <div class="p-ball"></div>
+      </div>
+    </div>
+
+    <!-- ================= 电脑 ================= -->
+    <div class="desk-wrap">
+      <div class="col-label"><b>电脑 · DSH Web 面板</b><span class="tag">侧边栏会话列表 + 会话窗口</span><span class="tag">桌面悬浮球 60×60</span></div>
+      <div class="desk">
+        <div class="side">
+          <div class="brand"><div class="mark">ds</div>deepseek <span class="h">HARNESS</span></div>
+          <div class="new-session">＋ 新会话</div>
+          <div class="panel-row"><span class="g">🧩</span>插件</div>
+          <div class="panel-row"><span class="g">📗</span>Skill/MCP</div>
+          <div class="panel-row"><span class="g">⏱</span>自动化任务</div>
+          <div class="panel-row"><span class="g">🧠</span>记忆系统</div>
+          <div class="sec-head"><span>工作区</span><span class="ic">🔍 ⤓ ＋</span></div>
+          <div class="ws-row on"><span class="f">📁</span>assistant（个人助手）</div>
+          <div class="ws-row"><span class="f">📁</span>主动型助手与微信误发防护</div>
+          <div class="ws-row"><span class="f">📁</span>Sci：高掺量磷石膏混凝土</div>
+          <div class="ws-row"><span class="f">📁</span>09-英文翻译</div>
+          <div class="ws-row"><span class="f">📁</span>03-基础数据</div>
+          <div class="ws-row"><span class="f">📁</span>02-框架与创新点</div>
+          <div class="ws-row"><span class="f">📁</span>GNN-dPINN 桁架桥算例</div>
+          <div class="ws-row"><span class="f">📁</span>轰趴需求表 · 每日采集</div>
+          <div class="foot"><div class="av"></div>陈潘</div>
+        </div>
+        <div class="main">
+          <div class="d-top"><span class="t">assistant · 个人助手</span><span class="chip">🗄 标准模式 ⌄</span><span class="chip">◔ 1 个后台任务运行中</span><span class="sp"></span><span class="chip">📁 ⌄</span><span class="m-icon">⋯</span><span class="m-icon">▐</span></div>
+          <div class="d-tabs"><div class="d-tab on">对话</div><div class="d-tab">轨迹</div></div>
+          <div class="d-conv">
+            <div class="wrap">
+              <button class="load-more">加载更早</button>
+              <div class="done-row">已完成 <span style="font-size:12px">⌄</span></div>
+              <div class="d-msg">✅ 已在今早 07:40 给手机发送「明日武汉出差」提醒：天气 + <span class="hl">G1545 高铁</span> + 会议时间，未发送任何微信消息。</div>
+              <div class="d-msg">🧭 主动探索完成：小红书近 24h 的 3 条求场地帖已入库，等你在手机侧确认是否录入。</div>
+              <div class="d-msg">🔐 待授权：<span class="hl">微信聊天文件\\11月</span> 与 <span class="hl">陈潘_简历.docx</span> — 已停在授权确认，未读取正文。</div>
+            </div>
+          </div>
+          <div class="d-composer">
+            <div class="ph">发消息或创建任务，/ 调用指令，@ 文件或对话</div>
+            <div class="d-row">
+              <div class="c-btn">＋</div>
+              <div class="chip">🛡 完全权限 ⌄</div>
+              <div class="pill dark">托管 ✓</div>
+              <span class="seat">DeepSeek-V4.1-Flash · High ⌄</span>
+              <div class="send" style="margin-left:auto">↑</div>
+            </div>
+          </div>
+          <div class="d-stats"><span>◔ 4 轮 192 步 · 219 tok/s</span><span>🗨 41.4M tok · 缓存命中 99.5%</span><span>◔ 31%</span></div>
+        </div>
+      </div>
+
+      <!-- 真实悬浮球样式（src/desktop-ball.ts 实测）＋ 主动通知 -->
+      <div class="desk-ball"><div class="ball avatar"></div></div>
+      <div class="toast">
+        <div class="l"><span class="dot"></span>主动小秘：明日武汉出差提醒已备好</div>
+        <div class="b">08:12 孝感西 → 武汉汉口（G1545），8–14℃ 多云转小雨，需带伞。10:30 华工交流，出发前 40 分钟提醒。</div>
+        <div class="btns"><button class="btn primary">查看执行</button><button class="btn">推迟到明早</button><button class="btn">以后再说</button></div>
+        <div class="ts">长按 600ms 悬浮球＝直接找助手干活 · 单击＝开控制室</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footnote">真实样式来源：<code>D:\\dsh-assistant\\src\\client\\pocket\\mobile\\mobile.css.ts</code> · <code>src\\client\\pocket\\orb\\orb.css.ts</code> · <code>src\\desktop-ball.ts</code>（悬浮球 60×60 渐变+阴影） · <code>src\\client\\tuoguan.tsx</code>（托管胶囊）｜取证截图：<code>ref-pocket.png</code> <code>ref-web.png</code></div>
+</div>
+</body>
+</html>

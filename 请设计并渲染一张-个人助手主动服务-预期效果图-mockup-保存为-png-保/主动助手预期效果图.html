@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>个人助手 · 主动服务模式（预期效果）</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1600px; height: 1000px; overflow: hidden; }
+  body {
+    font-family: "Microsoft YaHei", "Segoe UI", "PingFang SC", sans-serif;
+    background: linear-gradient(160deg, #f4f7fb 0%, #e9eef6 55%, #e4ebf5 100%);
+    color: #1f2937;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .title {
+    margin-top: 34px;
+    font-size: 34px;
+    font-weight: 800;
+    letter-spacing: 2px;
+    color: #111827;
+  }
+  .subtitle {
+    margin-top: 10px;
+    font-size: 15px;
+    color: #6b7280;
+    letter-spacing: 6px;
+  }
+  .stage {
+    flex: 1;
+    width: 1600px;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 110px;
+    padding-top: 30px;
+    padding-bottom: 60px;
+    position: relative;
+  }
+  .caption {
+    position: absolute;
+    bottom: 6px;
+    font-size: 15px;
+    color: #4b5563;
+    background: rgba(255,255,255,.75);
+    padding: 6px 22px;
+    border-radius: 999px;
+    box-shadow: 0 2px 10px rgba(30,60,120,.08);
+  }
+  .cap-phone { left: 300px; }
+  .cap-pc    { right: 250px; }
+
+  /* ============ 手机 ============ */
+  .phone {
+    width: 400px;
+    height: 840px;
+    background: #0d1220;
+    border-radius: 48px;
+    padding: 14px;
+    box-shadow: 0 30px 60px rgba(20,40,90,.28), 0 4px 12px rgba(20,40,90,.15);
+    position: relative;
+    flex-shrink: 0;
+  }
+  .phone-screen {
+    width: 100%;
+    height: 100%;
+    background: #f2f4f8;
+    border-radius: 36px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .phone-notch {
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #ffffff;
+  }
+  .notch-bar { width: 120px; height: 20px; background: #0d1220; border-radius: 12px; }
+  .phone-header {
+    background: #ffffff;
+    padding: 8px 18px 14px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    border-bottom: 1px solid #eef1f5;
+  }
+  .avatar {
+    width: 44px; height: 44px; border-radius: 50%;
+    background: linear-gradient(135deg, #4f7cff, #7b5cff);
+    color: #fff; font-size: 15px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .header-name { font-size: 17px; font-weight: 700; color: #111827; }
+  .header-status { font-size: 12px; color: #10b981; margin-top: 2px; display: flex; align-items: center; gap: 5px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #10b981; }
+  .chat {
+    flex: 1;
+    padding: 18px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    overflow: hidden;
+  }
+  .card {
+    background: #ffffff;
+    border-radius: 14px;
+    padding: 14px 16px;
+    box-shadow: 0 3px 12px rgba(40,70,140,.07);
+    border: 1px solid #eef1f6;
+  }
+  .card-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 3px 10px;
+    border-radius: 999px;
+    margin-bottom: 8px;
+    letter-spacing: .5px;
+  }
+  .tag-care  { background: #fff4e5; color: #d97706; }
+  .tag-task  { background: #e8f7ee; color: #059669; }
+  .tag-explore { background: #f0eaff; color: #7c3aed; }
+  .tag-ask   { background: #e8f1fe; color: #2563eb; }
+  .card-title { font-size: 15px; font-weight: 700; color: #111827; margin-bottom: 6px; }
+  .card-body { font-size: 13.5px; line-height: 1.75; color: #374151; }
+  .card-body b { color: #111827; }
+  .btn-row { display: flex; gap: 10px; margin-top: 12px; }
+  .btn {
+    flex: 1; text-align: center;
+    font-size: 13.5px; font-weight: 700;
+    padding: 9px 0;
+    border-radius: 10px;
+    cursor: default;
+  }
+  .btn-primary { background: linear-gradient(135deg,#4f7cff,#6a5cff); color: #fff; box-shadow: 0 4px 10px rgba(90,110,255,.35); }
+  .btn-ghost { background: #f3f4f6; color: #4b5563; border: 1px solid #e5e7eb; }
+  .phone-home {
+    height: 22px; background: #ffffff;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .home-bar { width: 110px; height: 5px; border-radius: 3px; background: #d1d5db; }
+
+  /* ============ 电脑显示器 ============ */
+  .monitor-wrap { display: flex; flex-direction: column; align-items: center; }
+  .monitor {
+    width: 760px;
+    background: #10141f;
+    border-radius: 22px;
+    padding: 16px;
+    box-shadow: 0 30px 60px rgba(20,40,90,.28);
+  }
+  .monitor-screen {
+    width: 100%;
+    height: 470px;
+    border-radius: 10px;
+    background: linear-gradient(150deg, #dfe7f3 0%, #cfdbe c 100%);
+    background: linear-gradient(150deg, #dfe7f3 0%, #ccd9ec 100%);
+    position: relative;
+    overflow: hidden;
+  }
+  /* 桌面壁纸装饰 */
+  .wallpaper-circle {
+    position: absolute; border-radius: 50%;
+  }
+  .wc1 { width: 420px; height: 420px; right: -120px; top: -160px; background: rgba(120,150,220,.18); }
+  .wc2 { width: 300px; height: 300px; left: -90px; bottom: -140px; background: rgba(140,120,230,.16); }
+  .wallpaper-grid {
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(90,120,180,.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(90,120,180,.05) 1px, transparent 1px);
+    background-size: 44px 44px;
+  }
+  /* 任务栏 */
+  .taskbar {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 44px;
+    background: rgba(255,255,255,.82);
+    backdrop-filter: blur(8px);
+    border-top: 1px solid rgba(255,255,255,.6);
+    display: flex; align-items: center;
+    padding: 0 18px; gap: 12px;
+  }
+  .tb-icon {
+    width: 26px; height: 26px; border-radius: 7px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 800; color: #fff;
+  }
+  .tb-clock { margin-left: auto; font-size: 12px; color: #374151; text-align: right; line-height: 1.3; }
+  /* 悬浮球 */
+  .orb {
+    position: absolute;
+    right: 42px; bottom: 70px;
+    width: 84px; height: 84px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 32% 30%, #8fb3ff 0%, #4f7cff 45%, #3557d6 100%);
+    box-shadow: 0 14px 30px rgba(60,90,220,.45), inset 0 2px 6px rgba(255,255,255,.5);
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 15px; font-weight: 800;
+    text-shadow: 0 1px 3px rgba(0,0,60,.3);
+  }
+  .orb::before { content: ""; position: absolute; width: 26px; height: 26px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #fff, #cfe0ff); opacity: .85; top: 10px; left: 14px; }
+  .orb-label { position: relative; z-index: 1; }
+  .badge {
+    position: absolute; top: -4px; right: -6px;
+    min-width: 26px; height: 26px; padding: 0 6px;
+    border-radius: 13px;
+    background: #ef4444; color: #fff;
+    font-size: 14px; font-weight: 800;
+    display: flex; align-items: center; justify-content: center;
+    border: 2.5px solid #eef2f9;
+    box-shadow: 0 3px 8px rgba(220,50,50,.4);
+    z-index: 2;
+  }
+  /* 通知卡片 */
+  .notify {
+    position: absolute;
+    right: 150px; bottom: 108px;
+    width: 380px;
+    background: #ffffff;
+    border-radius: 16px;
+    padding: 16px 18px;
+    box-shadow: 0 18px 42px rgba(25,50,110,.22);
+    border: 1px solid #e8edf5;
+  }
+  .notify::after {
+    content: ""; position: absolute;
+    right: -9px; bottom: 26px;
+    width: 18px; height: 18px;
+    background: #ffffff;
+    transform: rotate(45deg);
+    border-right: 1px solid #e8edf5;
+    border-top: 1px solid #e8edf5;
+  }
+  .notify-head { display: flex; align-items: center; gap: 9px; margin-bottom: 8px; }
+  .notify-avatar {
+    width: 30px; height: 30px; border-radius: 50%;
+    background: linear-gradient(135deg, #4f7cff, #7b5cff);
+    color: #fff; font-size: 12px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .notify-title { font-size: 15px; font-weight: 700; color: #111827; }
+  .notify-time { margin-left: auto; font-size: 11px; color: #9ca3af; flex-shrink: 0; }
+  .notify-body { font-size: 14px; line-height: 1.7; color: #374151; }
+  .notify-body b { color: #2563eb; font-weight: 700; }
+  .monitor-stand {
+    width: 130px; height: 70px;
+    background: linear-gradient(180deg, #2a3140, #1a1f2b);
+    clip-path: polygon(12% 0, 88% 0, 100% 100%, 0 100%);
+  }
+  .monitor-base {
+    width: 260px; height: 12px;
+    background: #1a1f2b;
+    border-radius: 6px;
+    box-shadow: 0 6px 14px rgba(20,30,60,.3);
+  }
+</style>
+</head>
+<body>
+  <div class="title">个人助手 · 主动服务模式（预期效果）</div>
+  <div class="subtitle">PROACTIVE PERSONAL ASSISTANT · MOCKUP</div>
+
+  <div class="stage">
+    <!-- 左侧：手机 -->
+    <div class="phone">
+      <div class="phone-screen">
+        <div class="phone-notch"><div class="notch-bar"></div></div>
+        <div class="phone-header">
+          <div class="avatar">小秘</div>
+          <div>
+            <div class="header-name">主动小秘</div>
+            <div class="header-status"><span class="dot"></span>在线 · 主动服务中</div>
+          </div>
+        </div>
+        <div class="chat">
+          <div class="card">
+            <span class="card-tag tag-care">☀️ 主动关心</span>
+            <div class="card-title">早上好！出差提醒已备好</div>
+            <div class="card-body">明早你要去<b>武汉</b>出差，我查了天气：<b>多云 17~25℃</b>，建议带件薄外套。高铁 <b>G678 08:12 孝感东→汉口</b>，我已帮你设好 <b>06:50</b> 的闹钟提醒。</div>
+          </div>
+          <div class="card">
+            <span class="card-tag tag-task">✅ 任务汇报</span>
+            <div class="card-title">文献综述整理完成</div>
+            <div class="card-body"><b>磷石膏混凝土文献综述</b>已整理好，<b>5 篇核心文献</b>已存入知识库，要点摘要见文档。</div>
+          </div>
+          <div class="card">
+            <span class="card-tag tag-explore">🔍 主动探索</span>
+            <div class="card-title">发现可能对你有用的攻略</div>
+            <div class="card-body">小红书上武汉本周<b>轰趴馆探店攻略 3 篇</b>，你在孝感的馆也快装修好了，或许有借鉴，链接已整理。</div>
+          </div>
+          <div class="card">
+            <span class="card-tag tag-ask">🔐 征求同意</span>
+            <div class="card-title">申请读取你的资料作为上下文</div>
+            <div class="card-body">为更了解你，我想读取微信聊天文件中的<b>简历和近期项目文档</b>作为上下文，可以吗？</div>
+            <div class="btn-row">
+              <div class="btn btn-primary">同意授权</div>
+              <div class="btn btn-ghost">暂不</div>
+            </div>
+          </div>
+        </div>
+        <div class="phone-home"><div class="home-bar"></div></div>
+      </div>
+    </div>
+    <div class="caption cap-phone">📱 pocket 手机端 · 主动小秘推送</div>
+
+    <!-- 右侧：电脑显示器 -->
+    <div class="monitor-wrap">
+      <div class="monitor">
+        <div class="monitor-screen">
+          <div class="wallpaper-grid"></div>
+          <div class="wallpaper-circle wc1"></div>
+          <div class="wallpaper-circle wc2"></div>
+          <div class="taskbar">
+            <div class="tb-icon" style="background:#4f7cff;">W</div>
+            <div class="tb-icon" style="background:#10b981;">F</div>
+            <div class="tb-icon" style="background:#f59e0b;">N</div>
+            <div class="tb-icon" style="background:#8b5cf6;">C</div>
+            <div class="tb-clock">11月20日 20:36<br>星期五</div>
+          </div>
+          <div class="notify">
+            <div class="notify-head">
+              <div class="notify-avatar">秘</div>
+              <div class="notify-title">主动小秘</div>
+              <div class="notify-time">现在</div>
+            </div>
+            <div class="notify-body"><b>主动小秘</b>：明日武汉出差提醒 + 天气已备好，<b>点击查看详情</b></div>
+          </div>
+          <div class="orb"><span class="orb-label">小秘</span><span class="badge">3</span></div>
+        </div>
+      </div>
+      <div class="monitor-stand"></div>
+      <div class="monitor-base"></div>
+    </div>
+    <div class="caption cap-pc">🖥️ 桌面端 · 悬浮球 + 主动通知</div>
+  </div>
+</body>
+</html>
