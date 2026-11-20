@@ -1,65 +1,71 @@
 /**
- * 手机端「不自动弹输入法」闸门（2026-11-05 起，2026-11-19 收紧口径）。
+ * 手机端「不自动弹输入法」闸门（2026-11-05 起，2026-11-20 定稿口径）。
  *
  * 【现象】
  *   1) 手机点进任意会话，光标立刻落进输入框，系统输入法跟着顶起来；
- *   2) 点输入框左侧那颗「＋」出命令菜单，输入法语境同时弹起来；
- *   3) 2026-11-19 在**有历史记录的会话**里点「＋」，输入法又弹了 —— 新开会话里
- *      第一次点「＋」是不弹的。
+ *   2) 点输入框左侧那颗「＋」出命令菜单（添加 / 指令 / 电脑文件 / 文件 / 反馈 /
+ *      压缩 / 权限 / 模型 / 下载日志），输入法同时弹起来；
+ *   3) 0.2.33 与 0.2.34 两轮「挡 focus()」都修不掉 —— 用户实测 0.2.34 仍然弹。
  *
- * 【根因（app.asar 取证，见 scripts/test-composer-focus-gate.mjs 的 2.6 段）】
- *   宿主 dsh-client-ui-conversation 把光标送回输入框的路子不止「挂载/切会话」那一条：
- *     - `useEffect(..., [locked, sessionId, editor]) → focusDraftEditor(editor, revealSelection)`
- *       （asar 24987689 定义 / 25018553 挂载与切会话）—— 历史会话的 `editor` 是尾快照
- *       加载完才造出来的，所以这条会在“会话早就开好了”的时刻再补一次；
- *     - 输入卡片自身的 mousedown 处理器（asar 25022700-25023287）：
- *       `target.closest("button, a, input, select, textarea, [role="button"],
- *       [contenteditable], [tabindex]")` 没命中就 `e.preventDefault()` 后
- *       `focusDraftEditor()` —— 落在工具行 / Tooltip 包层 / 胶囊容器这类**非控件容器**
- *       上，宿主就当「用户点进卡片了」；
- *     - 那颗「＋」自己（asar 25028800-25029100）：`onMouseDown: keepFocus` →
- *       `keepDraftFocus` → `editor?.getRootElement()?.focus({preventScroll:true})`，
- *       `onClick: onToggleCommandMenu` → `focusDraftEditor(...)` 又聚焦一次；
- *     - Lexical 的选区同步（asar 24613063/24613408）：`skip-selection-focus` 没设时
- *       `rootElement.focus({preventScroll:true})`，草稿恢复 / 尾快照 / 挑完命令都会走到。
- *   安卓 WebView 里 DOM focus 一落到 contenteditable 上就 `showSoftInput`，程序化聚焦
- *   不需要用户手势，键盘照弹。
+ * 【宿主代码（活代码取证：profile node_modules 里 @deepseek-ai/dsh-client-ui-conversation
+ *  /lib/client.js，2026-10-27 构建，未压缩，与 app.asar 同源）】
+ *   - focusDraftEditor(editor, reveal) → `editor.getRootElement()?.focus({preventScroll:true})`
+ *     再 `editor.focus(cb)`（lib 716067）；
+ *   - keepDraftFocus(event, editor) → `event.preventDefault()` 后同样 focus 一次（lib 719256）；
+ *   - 「＋」按钮：`onMouseDown: keepFocus`、`onClick: onToggleCommandMenu`（lib ~751516），
+ *     onToggleCommandMenu 里先 focusDraftEditor 再 toggleCommandMenu(caretSpan())；
+ *   - 输入卡片 onMouseDown：落点不是控件、也不在 overlay / scrollport 里时
+ *     `e.preventDefault()` + focusDraftEditor（同上）；
+ *   - `[data-composer-input]` 就是 Lexical 的 contenteditable 本体
+ *     （ComposerContentEditable.tsx:46），DOM focus 一落上去，安卓 WebView 就 showSoftInput。
  *
- * 【为什么新开会话看着是好的、历史会话就不好】
- *   hero（`sessionId === void 0`）变体的 composer 里，会话作用域那些座位全都不渲染
- *   （asar 25029886/25030098/25030589：`sessionId === void 0 ? null :
- *   renderSlot("conversation.input.permission" / "plan" / "left" / "right" / "model" / "activity")`，
- *   连 `conversation.input.dock` 的队列/目标/上行历史 chip 也是 `zone !== void 0` 才渲染，asar 24960746）。
- *   那一行于是只剩「＋」与发送钮，手指很容易命中 `button[aria-haspopup="listbox"]` 本体 →
- *   旧口径认成了「挑菜单」→ 挡。会话里那一行拥挤得多（权限/计划/模型/托管/麦克风 五个胶囊），
- *   360px 手机布局上点「＋」很容易落在按钮外面的 `_tools` 行、Tooltip 包层或某个胶囊容器上 ——
- *   旧口径把「输入区里的任意落点」都当成「要打字」，于是这一下把 1.2 s 放行窗口刷新活，
- *   上面那四条 focus 随便哪条都放行 → 键盘弹起。
+ * 【为什么「挡 focus()」两轮都没修好（Chromium 真页面实测，不是猜）】
+ *   用 Playwright（Chrome 156 / 390×844 / 触屏）打开真实 pocket 页面、进一条有历史记录的会话，
+ *   给 HTMLElement.prototype.focus / Selection.* / mousedown / focusin 都挂了探针：
+ *     · 点「＋」时宿主确实调了三次 focus({preventScroll:true})（mousedown 一次、click 两次），
+ *       全被闸门挡掉，且没有任何 Selection.* 调用、activeElement 始终是 body；
+ *     · 也就是说：**闸门挡的那条路本来就没让键盘弹起来**。真正弹键盘的前提是输入框在点「＋」
+ *       之前就已经持有 DOM 焦点 —— 宿主所有工具按钮的 mousedown 都 `preventDefault()` 把焦点
+ *       锁在输入框里（keepDraftFocus 的设计目的），用户先前点过输入框 / 打过一个字之后，
+ *       输入框一直是 activeElement；安卓把输入法收起来（返回键）之后，下一次手势落下时
+ *       WebView 会把仍然聚焦着的 contenteditable 的 IME 重新顶起来。挡「新聚焦」与
+ *       「已有焦点」互不相干，所以 0.2.33/0.2.34 都白挡。
+ *     · 同一份探针里把输入框 blur 掉再点「＋」：activeElement=body、命令菜单 5 行全在，
+ *       1.6 s 后仍然开着（菜单不依赖焦点，吃的是 caretSpan() 那一刻的草稿坐标）；
+ *       之后再点输入框、打字、发送都正常。
  *
- * 【口径（本轮收紧）】默认全挡 + 窄白名单：
- *   只有真实落点在下列元素上才算「用户要打字」，其余一律挡（菜单落点、容器空白、
- *   胶囊、面板、区外落点都算 block 落点，谁更晚就压住谁）：
- *     - 输入框本体：`[data-composer-input]` / `[data-lexical-editor="true"]` / `[contenteditable]`；
- *     - 发送与停止那颗：`[class$="_primary"]`；
- *     - 语音输入那颗：`[data-voice-activity]` / `[class$="_activity"]`；
- *     - 输入卡片里、控件行以外的空白（`[data-composer-card]` 内且不在 `_row/_tools/_modes/
- *       _trailing/_standardControls/_dock/[data-composer-overlay]/[data-trigger-menu]` 里，
- *       也不是控件）——这条保住「点卡片空白就能打字」的原有手感。
- *   时钟不可靠（`performance.now` 倒退或读不到）一律按挡处理：用户的手指落点本来就走
- *   浏览器原生聚焦，不经过这里的补丁，被挡的只是宿主自己那几次程序化 focus。
+ * 【口径（本轮定稿）】
+ *   A. 默认不聚焦 + 窄白名单：只有真实落点在输入框本体（`[data-composer-input]` /
+ *      `[data-lexical-editor]` / `[contenteditable]`）、卡片控件行以外的空白、发送/停止那颗、
+ *      语音那颗，才算「用户要打字」；落在「＋」本体与它所在的整组工具按钮（权限 / 计划 / 模型 /
+ *      托管胶囊、Tooltip 包层、_tools / _modes / _trailing / _standardControls / _row、
+ *      命令菜单与电脑文件面板所在的 `[data-composer-overlay]`、`[data-trigger-menu]` 选项行、
+ *      dock chips）或输入区之外（换会话、侧栏、悬浮球）一律是「挑东西」的落点。
+ *      「工具按钮那一组」不再只靠 _x 类名后缀认：**谁在 DOM 里包着那颗「＋」，谁就是工具按钮组**
+ *      （宿主换类名哈希也照样认得出来）。
+ *   B. 面板类落点把「已有焦点」收掉：pointerdown 那一刻如果输入框正持有焦点 → blur。
+ *      安卓上「不聚焦」才真等于「不弹输入法」，而且点「＋」出面板本来就不该继续挂着一个
+ *      会被手势重新顶起来的输入框（微信也是这个手感）。
+ *   C. 兜底反聚焦：任何**不经过 `.focus()`** 的聚焦（Lexical 的选区副作用 `setBaseAndExtent`、
+ *      宿主在别处直接摸 activeElement）都会走 focusin，闸门在 focusin 捕获阶段再 blur 一次；
+ *      `HTMLElement.prototype.focus` 的拦截保留（少一次闪一下的聚焦）。
+ *   D. 用户手指点输入框本体走的是浏览器原生聚焦，不经过这里，照常弹键盘、照常打字。
  *
- * 只挡 `[data-composer-input]` 这一个元素（宿主 Lexical 的 contenteditable 本体）。
- * 插件自己的输入框（`[data-pocket-orb="textarea"]`）、文件选择框、搜索框、重命名框
- * 一律不碰 —— 那些地方的自动聚焦是用户按出来的，本来就该弹键盘。
- * 闸门只在窄布局（手机端）装，桌面布局不受影响（接线在 mobile-apply.tsx）。
+ * 【真机取证】手机上看不到日志，所以留了两条信标（`~/.dsh/dsh-pocket/diagnostic.jsonl`
+ *  的 mobile-stage）：
+ *   · `composer-focus-blocked` / `composer-focus-blurred`：挡下 / 收掉焦点的次数；
+ *   · `composer-ime-open`：visualViewport 高度阶跃下跌 > 120px（= 输入法真的弹了）时报一条，
+ *    带当时的 activeElement 摘要与最近一次落点意图 —— 下次再复发，直接看这条就知道
+ *     是哪条路把键盘顶起来的（每次页面最多 3 条）。
+ *  详细判定日志仍可开：URL 加 `?composerFocusLog=1` / localStorage
+ *  `dsh-assistant.composerFocusLog` = '1' / `window.__DSH_COMPOSER_FOCUS_GATE_LOG = true`。
  *
- * 【取证开关（默认关）】手机侧看不到日志，所以留了一条决策记录：把 pocket 页面的 URL 加
- *   `?composerFocusLog=1`，或 `localStorage.setItem('dsh-assistant.composerFocusLog','1')`，
- *   或 `window.__DSH_COMPOSER_FOCUS_GATE_LOG = true`，开关一开，每次聚焦判定都会走
- *   `onDecision`（mobile-apply 拿它发 `mobile-stage` 信标，落进宿主 diag.jsonl）。
+ * 只碰宿主那一个 `[data-composer-input]`：插件自己的输入框（`data-pocket-orb`）、文件选择框、
+ * 搜索框、重命名框一律不动；闸门只在窄布局（手机端）装（接线在 mobile-apply.tsx）。
  *
  * 纯判定（createComposerFocusGate）与 DOM 挂载（installComposerFocusGate）分开，
- * 单测走假 DOM 直接验「挡 / 放行 / 卸载还原」，见 scripts/test-composer-focus-gate.mjs。
+ * 单测走假 DOM 直接验「挡 / 收焦点 / 兜底反聚焦 / 卸载还原」，
+ * 见 scripts/test-composer-focus-gate.mjs。
  */
 
 /** 宿主输入框本体：dsh-client-ui-conversation 的 ComposerContentEditable 渲染的 div。 */
@@ -110,70 +116,55 @@ export const COMPOSER_BLOCK_AREA_SELECTOR = [
   '[data-slot="conversation.input.attachments"]',
 ].join(', ')
 
-/** 宿主自己认定「不是要打字」的那一撮控件（照抄 app.asar 25022700 的 closest 列表，contenteditable 由本体那条放行）。 */
+/** 宿主自己认定「不是要打字」的那一撮控件（照抄活代码 lib 751516 那句 closest 列表，contenteditable 由本体那条放行）。 */
 export const COMPOSER_CONTROL_SELECTOR = 'button, a, input, select, textarea, [role="button"], [aria-haspopup], [aria-expanded], [tabindex]'
 
-/**
- * 「点过输入框」之后多久内的程序化聚焦仍算用户主动。
- * 发送后回填光标、按钮 mousedown 保焦点都发生在几毫秒内；1.2 s 足够宽，
- * 又不会宽到「点一下输入框、再切个会话」还被当成用户在打字。
- * 放行窗口只由「白名单落点」开启，任何 block 落点（菜单 / 容器 / 区外）都压过它。
- */
-export const SEAT_GRACE_MS = 1200
-
-/** 落点意图：只有 'typing' 会开启放行窗口，其余三种一律算 block 落点。 */
+/** 落点意图：只有 'typing' 放行聚焦，其余三种一律算「挑东西」。 */
 export type ComposerTapKind = 'typing' | 'menu' | 'other' | 'outside'
 
 /** 判定快照（单测 / 诊断用）。 */
 export interface ComposerGateSnapshot {
-  lastTypingTapAt: number | null
-  lastBlockTapAt: number | null
-  graceMs: number
+  /** 当前意图：'typing' 才允许输入框拿焦点。 */
+  intent: 'typing' | 'picker'
+  /** 最近一次落点的意图分类。 */
+  kind: ComposerTapKind
+  /** 为什么算这一类（白名单里的哪一条 / 哪一条阻断规则）。 */
+  reason: string
 }
 
 /**
- * 纯判定：没有 DOM、没有时钟，now 由调用方给（performance.now 标度）。
- * 默认全挡：只有最近一次 'typing' 落点（输入框本体 / 卡片空白 / 发送钮 / 麦克风）
- * 之后的那次聚焦才放行，且必须比最近一次 block 落点更晚、且还在窗口内。
+ * 纯判定：没有 DOM、没有时钟。
+ * 默认不聚焦；只有最近一次落点被判成 'typing' 才放行，下一次非 typing 落点立刻收回。
+ * 不再有「点过输入框后 N 毫秒内都算主动」的时间窗 —— 那种启发式正是 0.2.33/0.2.34
+ * 「偶尔放行、看不出为什么」的来源。
  */
 export interface ComposerFocusGate {
-  /** 记一次落点意图。区外落点也记账：换会话那一下不该借到上一次打字的放行窗口。 */
-  notePointer(kind: ComposerTapKind, now: number): void
-  /** now 时刻的这一次程序化聚焦要不要挡。 */
-  shouldBlock(now: number): boolean
+  /** 记一次落点意图。 */
+  notePointer(kind: ComposerTapKind, reason?: string): void
+  /** 这一次聚焦要不要挡。 */
+  shouldBlock(): boolean
+  /** 当前判定状态。 */
   inspect(): ComposerGateSnapshot
 }
 
 /**
- * @param graceMs - 放行窗口，非法值回落成 SEAT_GRACE_MS。
  * @returns 判定器。
  */
-export function createComposerFocusGate(graceMs: number = SEAT_GRACE_MS): ComposerFocusGate {
-  const grace = Number.isFinite(graceMs) && graceMs >= 0 ? graceMs : SEAT_GRACE_MS
-  let lastTypingTapAt: number | null = null
-  let lastBlockTapAt: number | null = null
+export function createComposerFocusGate(): ComposerFocusGate {
+  let intent: 'typing' | 'picker' = 'picker'
+  let lastKind: ComposerTapKind = 'outside'
+  let lastReason = 'no-tap'
   return {
-    notePointer(kind: ComposerTapKind, now: number): void {
-      if (!Number.isFinite(now)) return
-      if (kind === 'typing') {
-        lastTypingTapAt = now
-        return
-      }
-      lastBlockTapAt = now
+    notePointer(kind: ComposerTapKind, reason = ''): void {
+      lastKind = kind
+      lastReason = reason
+      intent = kind === 'typing' ? 'typing' : 'picker'
     },
-    shouldBlock(now: number): boolean {
-      if (!Number.isFinite(now)) return true
-      if (lastTypingTapAt === null) return true
-      // 谁更晚听谁的：菜单 / 容器 / 区外落点比输入落点更晚 → 这一次聚焦是顺手带出来的，挡。
-      if (lastBlockTapAt !== null && lastBlockTapAt >= lastTypingTapAt) return true
-      const elapsed = now - lastTypingTapAt
-      // 时钟倒退（页面被挂起过、或读不到 performance.now）一律挡：
-      // 用户真要点输入框，浏览器自己就会把焦点给过去，不经过这里。
-      if (elapsed < 0) return true
-      return elapsed > grace
+    shouldBlock(): boolean {
+      return intent !== 'typing'
     },
     inspect(): ComposerGateSnapshot {
-      return { lastTypingTapAt, lastBlockTapAt, graceMs: grace }
+      return { intent, kind: lastKind, reason: lastReason }
     },
   }
 }
@@ -186,20 +177,35 @@ export const COMPOSER_FOCUS_LOG_QUERY = 'composerFocusLog'
 export const COMPOSER_FOCUS_LOG_STORAGE = 'dsh-assistant.composerFocusLog'
 export const COMPOSER_FOCUS_LOG_WINDOW_FLAG = '__DSH_COMPOSER_FOCUS_GATE_LOG'
 
+/** 输入法观测：visualViewport 高度比基线矮这么多像素 = 软键盘弹起来了。 */
+export const IME_SHRINK_THRESHOLD_PX = 120
+
 /** 一次判定记录（取证用）。 */
 export interface ComposerFocusDecision {
   /** 判定发生的时刻。 */
   at: number
   /** 最近一次落点的意图。 */
   kind: ComposerTapKind
-  /** 为什么算这类落点（白名单里的哪一条）。 */
+  /** 为什么算这类落点。 */
   reason: string
-  /** 这一次程序化聚焦到底挡没挡。 */
-  blocked: boolean
+  /** 这一次聚焦是被挡下（'block'）、被反聚焦收掉（'blur'），还是放行（'allow'）。 */
+  action: 'block' | 'blur' | 'allow'
   /** 落点摘要：tag.class[attr] 形式，短字段纪律。 */
   target: string
-  /** 挡下的次数（累计）。 */
+  /** 同类动作的累计次数。 */
   count: number
+}
+
+/** 输入法弹起现场（visualViewport 观测）。 */
+export interface ComposerImeEvent {
+  /** 视口比基线矮了多少像素。 */
+  shrink: number
+  /** 那一刻输入框是否持有焦点（true = 就是它把键盘顶起来的）。 */
+  editorFocused: boolean
+  /** 那一刻 activeElement 的摘要。 */
+  active: string
+  /** 最近一次落点意图。 */
+  kind: ComposerTapKind
 }
 
 /** 安装器可注入的依赖（单测传假 DOM；真机全部走默认值）。 */
@@ -208,16 +214,19 @@ export interface ComposerFocusGateHost {
   document?: Document | null
   /** 默认 performance.now（拿不到回落 Date.now）。 */
   now?: () => number
-  /** 挡下时的回调（mobile-apply 拿它发一条诊断 beacon，便于在手机上远程确认生效）。 */
+  /** 挡下 / 收焦点时的回调（mobile-apply 拿它发一条诊断 beacon，便于在手机上远程确认生效）。 */
   onBlocked?: (count: number, decision: ComposerFocusDecision) => void
-  /** 决策记录回调：只有开关打开（见文件顶部的取证开关）才会被调，放行与挡下都报。 */
+  /** 决策记录回调：只有开关打开（见文件顶部的取证开关）才会被调，挡下 / 收焦点 / 放行都报。 */
   onDecision?: (decision: ComposerFocusDecision) => void
+  /** 输入法真的弹起来时回调（visualViewport 阶跃下跌）。 */
+  onImeOpen?: (event: ComposerImeEvent) => void
 }
 
 /**
- * 把「不是用户点进输入框」的程序化聚焦挡在宿主的 contenteditable 之外。
+ * 把「不是用户点进输入框」的聚焦挡在宿主的 contenteditable 之外，
+ * 并且把点面板那一刻仍然挂在输入框上的焦点收掉。
  * @param host - 可注入的 document / 时钟 / 打点回调。
- * @returns 卸载函数：还原 prototype.focus、摘掉 pointerdown 监听。
+ * @returns 卸载函数：还原 prototype.focus、摘掉 pointerdown / touchstart / focusin 监听。
  */
 export function installComposerFocusGate(host: ComposerFocusGateHost = {}): () => void {
   const doc = host.document ?? (typeof document === 'undefined' ? null : document)
@@ -254,6 +263,7 @@ export function installComposerFocusGate(host: ComposerFocusGateHost = {}): () =
 
   const originalFocus = proto.focus
   let blocked = 0
+  let blurred = 0
   let lastTap: { kind: ComposerTapKind; reason: string; target: string } = {
     kind: 'outside',
     reason: 'no-tap',
@@ -261,8 +271,9 @@ export function installComposerFocusGate(host: ComposerFocusGateHost = {}): () =
   }
 
   /** 落点元素（文本节点没有 `closest`，从 parentElement 起）。 */
-  const elementOf = (event: Event): Element | null => {
-    const target = event.target as (Element | (Node & { parentElement?: Element | null }) | null)
+  const elementOf = (event: Event | null): Element | null => {
+    if (event === null) return null
+    const target = (event as Event).target as (Element | (Node & { parentElement?: Element | null }) | null)
     if (target !== null && typeof (target as Element).closest === 'function') return target as Element
     const parent = (target as (Node & { parentElement?: Element | null }) | null)?.parentElement
     return typeof (parent as Element | null)?.closest === 'function' ? (parent as Element) : null
@@ -283,33 +294,69 @@ export function installComposerFocusGate(host: ComposerFocusGateHost = {}): () =
     return `${tag}.${cls.slice(0, 24)}[${keys.join(',')}]`
   }
 
+  const hits = (el: Element | null, selector: string): boolean => {
+    if (el === null) return false
+    try {
+      return el.closest(selector) !== null
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 工具按钮组：谁的 DOM 子树里包着那颗「＋」，谁就是「挑东西」的容器。
+   * 宿主每个构建都会改 CSS-module 的哈希前缀（`_7tt59G_` 之类），只认 `[class$="_tools"]`
+   * 这类后缀在换布局时就会漏；这条结构判据跟着「＋」自己走，与类名无关。
+   */
+  const insideCommandToolGroup = (el: Element | null): boolean => {
+    if (el === null) return false
+    try {
+      const card = el.closest(COMPOSER_CARD_SELECTOR)
+      if (card === null) return false
+      const plus = card.querySelector(COMPOSER_COMMAND_BUTTON_SELECTOR)
+      if (plus === null) return false
+      let node: Element | null = el
+      while (node !== null && node !== card) {
+        if (typeof node.contains === 'function' && node.contains(plus)) return true
+        node = node.parentElement
+      }
+    } catch {
+      /* 结构判据异常 → 交给类名那条 */
+    }
+    return false
+  }
+
   /** 这一次落点的意图：默认 'other'，只有白名单里的落点才算 'typing'。 */
   const classifyTap = (event: Event): { kind: ComposerTapKind; reason: string } => {
     const el = elementOf(event)
     if (el === null) return { kind: 'outside', reason: 'no-target' }
-    const hits = (selector: string): boolean => {
-      try {
-        return el.closest(selector) !== null
-      } catch {
-        return false
-      }
-    }
-    if (!hits(COMPOSER_SEAT_SELECTOR)) return { kind: 'outside', reason: 'out-of-seat' }
-    if (hits(COMPOSER_MENU_SELECTOR)) return { kind: 'menu', reason: 'menu-item' }
-    if (hits(COMPOSER_COMMAND_BUTTON_SELECTOR)) return { kind: 'menu', reason: 'command-button' }
-    if (hits(COMPOSER_OVERLAY_SELECTOR)) return { kind: 'menu', reason: 'composer-overlay' }
-    if (hits(COMPOSER_EDITOR_BODY_SELECTOR)) return { kind: 'typing', reason: 'editor-body' }
-    if (hits(COMPOSER_TYPING_CONTROL_SELECTOR)) return { kind: 'typing', reason: 'typing-control' }
-    if (hits(COMPOSER_BLOCK_AREA_SELECTOR)) return { kind: 'other', reason: 'controls-area' }
-    if (hits(COMPOSER_CONTROL_SELECTOR)) return { kind: 'other', reason: 'control' }
-    if (hits(COMPOSER_CARD_SELECTOR)) return { kind: 'typing', reason: 'card-whitespace' }
+    if (!hits(el, COMPOSER_SEAT_SELECTOR)) return { kind: 'outside', reason: 'out-of-seat' }
+    if (hits(el, COMPOSER_MENU_SELECTOR)) return { kind: 'menu', reason: 'menu-item' }
+    if (hits(el, COMPOSER_COMMAND_BUTTON_SELECTOR)) return { kind: 'menu', reason: 'command-button' }
+    if (hits(el, COMPOSER_OVERLAY_SELECTOR)) return { kind: 'menu', reason: 'composer-overlay' }
+    if (hits(el, COMPOSER_EDITOR_BODY_SELECTOR)) return { kind: 'typing', reason: 'editor-body' }
+    if (hits(el, COMPOSER_TYPING_CONTROL_SELECTOR)) return { kind: 'typing', reason: 'typing-control' }
+    if (hits(el, COMPOSER_BLOCK_AREA_SELECTOR)) return { kind: 'other', reason: 'controls-area' }
+    if (insideCommandToolGroup(el)) return { kind: 'other', reason: 'command-tool-group' }
+    if (hits(el, COMPOSER_CONTROL_SELECTOR)) return { kind: 'other', reason: 'control' }
+    if (hits(el, COMPOSER_CARD_SELECTOR)) return { kind: 'typing', reason: 'card-whitespace' }
     return { kind: 'other', reason: 'seat-not-card' }
   }
 
-  const onPointerDown = (event: Event): void => {
-    const { kind, reason } = classifyTap(event)
-    lastTap = { kind, reason, target: describe(elementOf(event)) }
-    gate.notePointer(kind, clock())
+  /** 输入框本体（焦点是不是落在它上面）。 */
+  const editorOf = (node: Element | null): Element | null => {
+    if (node === null || typeof node.closest !== 'function') return null
+    try {
+      return node.closest(COMPOSER_INPUT_SELECTOR)
+    } catch {
+      return null
+    }
+  }
+
+  /** 当前持有焦点的输入框（没有焦点 / 焦点在别处 → null）。 */
+  const activeEditor = (): Element | null => {
+    const active = (doc as Document).activeElement as Element | null
+    return editorOf(active)
   }
 
   const report = (decision: ComposerFocusDecision): void => {
@@ -319,6 +366,64 @@ export function installComposerFocusGate(host: ComposerFocusGateHost = {}): () =
     } catch {
       /* 取证不能反过来打断闸门 */
     }
+  }
+
+  /**
+   * 把输入框上的焦点收掉（blur 是安卓收输入法的唯一可靠手段）。
+   * @param action - 'block'（新的聚焦被挡）或 'blur'（已有焦点被收）。
+   * @returns 真的收掉了没有。
+   */
+  const dismissEditorFocus = (action: 'block' | 'blur'): boolean => {
+    const editor = activeEditor()
+    if (editor === null) return false
+    try {
+      (editor as HTMLElement).blur()
+    } catch {
+      return false
+    }
+    blurred += 1
+    const decision: ComposerFocusDecision = {
+      at: clock(),
+      kind: lastTap.kind,
+      reason: lastTap.reason,
+      action: 'blur',
+      target: describe(editor),
+      count: blurred,
+    }
+    report(decision)
+    // 每条都发 beacon 会刷爆 diag：第 1 次 + 之后每 10 次一条，够证明「真的收掉了」。
+    if (blurred === 1 || blurred % 10 === 0) {
+      try {
+        host.onBlocked?.(blurred, decision)
+      } catch {
+        /* 打点失败不影响收焦点 */
+      }
+    }
+    return true
+  }
+
+  const onPointerDown = (event: Event): void => {
+    const { kind, reason } = classifyTap(event)
+    lastTap = { kind, reason, target: describe(elementOf(event)) }
+    gate.notePointer(kind, reason)
+    if (kind === 'typing') return
+    // 菜单里的选项行不算「开面板」：宿主的 / 命令面板就是在输入框有焦点的情况下挑的，
+    // 挑完还要接着打字（插进来的命令参数），这时候把焦点收掉反而要用户再点一次输入框。
+    if (hits(elementOf(event), COMPOSER_MENU_SELECTOR)) return
+    // 面板类落点：输入框里如果还挂着焦点，这一下就收掉 —— 否则安卓会在这次手势里
+    // 把仍然聚焦的 contenteditable 的输入法重新顶起来（本轮根因）。
+    dismissEditorFocus('blur')
+  }
+
+  /**
+   * focusin 兜底：Lexical 提交 DOM 选区（`setBaseAndExtent`）时会给 contenteditable
+   * 附送一个焦点，这条路不经过 `prototype.focus`，只能在这里收掉。
+   */
+  const onFocusIn = (event: Event): void => {
+    if (!gate.shouldBlock()) return
+    const el = elementOf(event)
+    if (editorOf(el) === null) return
+    dismissEditorFocus('block')
   }
 
   const patchedFocus = function focus(this: HTMLElement, ...args: unknown[]): void {
@@ -334,19 +439,18 @@ export function installComposerFocusGate(host: ComposerFocusGateHost = {}): () =
     }
     if (isComposer) {
       const at = clock()
-      const shouldBlockNow = gate.shouldBlock(at)
-      if (shouldBlockNow) {
+      if (gate.shouldBlock()) {
         blocked += 1
         const decision: ComposerFocusDecision = {
           at,
           kind: lastTap.kind,
           reason: lastTap.reason,
-          blocked: true,
+          action: 'block',
           target: lastTap.target,
           count: blocked,
         }
         report(decision)
-        // 每条都发 beacon 会刷爆 diag：第 1 次 + 之后每 30 次一条，够证明「真的挡了」。
+        // 每条都发 beacon 会刷爆 diag：第 1 次 + 之后每 30 次一条。
         if (blocked === 1 || blocked % 30 === 0) {
           try {
             host.onBlocked?.(blocked, decision)
@@ -356,17 +460,54 @@ export function installComposerFocusGate(host: ComposerFocusGateHost = {}): () =
         }
         return
       }
-      report({ at, kind: lastTap.kind, reason: lastTap.reason, blocked: false, target: lastTap.target, count: blocked })
+      report({
+        at, kind: lastTap.kind, reason: lastTap.reason, action: 'allow', target: lastTap.target, count: blocked,
+      })
     }
     originalFocus.apply(this, args)
+  }
+
+  /**
+   * 输入法观测：安卓软键盘一弹，visualViewport 高度阶跃下跌。
+   * 这是手机上唯一能直接确认「键盘到底弹没弹、弹的那刻谁持有焦点」的信号。
+   */
+  const visualViewport = (view as unknown as {
+    visualViewport?: { height: number; addEventListener?: (type: string, fn: () => void) => void; removeEventListener?: (type: string, fn: () => void) => void }
+  } | null)?.visualViewport
+  let imeBaseline = typeof visualViewport?.height === 'number' ? visualViewport.height : 0
+  let imeReported = 0
+  const onViewportResize = (): void => {
+    const height = Number(visualViewport?.height)
+    if (!Number.isFinite(height) || height <= 0) return
+    if (height > imeBaseline) imeBaseline = height
+    const shrink = imeBaseline - height
+    if (shrink <= IME_SHRINK_THRESHOLD_PX || imeReported >= 3) return
+    imeReported += 1
+    imeBaseline = height
+    try {
+      host.onImeOpen?.({
+        shrink: Math.round(shrink),
+        editorFocused: activeEditor() !== null,
+        active: describe((doc as Document).activeElement as Element | null),
+        kind: lastTap.kind,
+      })
+    } catch {
+      /* 观测失败不影响闸门 */
+    }
   }
 
   proto.focus = patchedFocus as unknown as HTMLElement['focus']
   proto[INSTALLED_KEY] = true
   // pointerdown 是主路；老 WebView 没有 PointerEvent 时靠 touchstart 兜底
-  // （两者都收到也只是写同一个时间戳，无副作用）。
+  // （两者都收到也只是写同一个时间戳并复核一次焦点，无副作用）。
   doc.addEventListener('pointerdown', onPointerDown, { capture: true, passive: true })
   doc.addEventListener('touchstart', onPointerDown, { capture: true, passive: true })
+  doc.addEventListener('focusin', onFocusIn, true)
+  try {
+    visualViewport?.addEventListener?.('resize', onViewportResize)
+  } catch {
+    /* 老 WebView 没有 visualViewport → 少一条观测，闸门照常 */
+  }
 
   return (): void => {
     try {
@@ -382,6 +523,8 @@ export function installComposerFocusGate(host: ComposerFocusGateHost = {}): () =
     try {
       doc.removeEventListener('pointerdown', onPointerDown, true)
       doc.removeEventListener('touchstart', onPointerDown, true)
+      doc.removeEventListener('focusin', onFocusIn, true)
+      visualViewport?.removeEventListener?.('resize', onViewportResize)
     } catch {
       /* ignore */
     }

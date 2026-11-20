@@ -719,27 +719,48 @@ export function mobileApply(ctx): void {
     }
   }, 'dsh-mobile-nav: replace model-settings load error with mobile hint')
 
-  // 进入会话不再自动弹输入法（2026-11-05）+ 点「＋」命令菜单不再抢输入框焦点（2026-11-19，
-  // 同日收紧口径）：宿主 InputBar 有四条路把光标送回 `[data-composer-input]`（挂载/切会话
-  // 的 focusDraftEditor、卡片 mousedown 的 keepFocus 空白分支、「＋」的两道 focus、Lexical
-  // 选区同步），安卓 WebView 一拿到 DOM focus 就顶起输入法。现在按「默认全挡 + 窄白名单」判：
-  // 只有真实落点在输入框本体（contenteditable）、卡片控件行以外的空白、发送/停止那颗、语音那颗
-  // 这四类算「要打字」；「＋」按钮本体与它外面的 Tooltip 包层 / 工具行空白 / 权限·计划·模型·托管
-  // 胶囊 / 命令菜单与电脑文件面板 / dock chip / 输入区外的落点（换会话、侧栏、悬浮球）全都算
-  // block 落点，谁更晚压住谁 —— 有历史记录的会话里那一行最挤，点「＋」很容易落在按钮外面，
-  // 旧口径把这一下当成「要打字」，1.2 s 放行窗口就被刷活，键盘就弹了（本轮修的就是这条）。
-  // 取证开关默认关：pocket 页面 URL 加 ?composerFocusLog=1，或 localStorage 把
-  // 'dsh-assistant.composerFocusLog' 设成 '1'，才发决策记录到 diag.jsonl，方便手机上远程确认判定。
+  // 进入会话不再自动弹输入法（2026-11-05）+ 点「＋」/工具按钮不再弹输入法（2026-11-20 定稿）。
+  // 宿主的 InputBar 有四条路把光标送回 `[data-composer-input]`（挂载/切会话的 focusDraftEditor、
+  // 卡片 mousedown 的 keepFocus 空白分支、「＋」的 keepFocus + onToggleCommandMenu、
+  // Lexical 选区同步）。0.2.33/0.2.34 只挡 `HTMLElement.prototype.focus`，用户实测仍会弹：
+  // 真页面取证（Playwright + Chrome，390×844 触屏，探针挂在 focus/Selection/mousedown/focusin）
+  // 显示点「＋」时那三次 focus 全被挡掉、activeElement 一直是 body —— 真正弹键盘的前提是
+  // **输入框在点「＋」之前就已经持有 DOM 焦点**（宿主所有工具钮的 mousedown 都 preventDefault，
+  // 故意不让它们抢走输入框的焦点），安卓把输入法收起来之后，下一次手势会把仍然聚焦的
+  // contenteditable 的 IME 重新顶起来。所以现在三条一起上：
+  //   ① 默认不聚焦 + 窄白名单（输入框本体 / 卡片空白 / 发送 / 语音才放行，其余一律挡）；
+  //   ② 面板类落点（「＋」、它所在的工具按钮组、命令菜单、电脑文件面板、dock chip、
+  //      输入区外）那一刻把输入框的已有焦点收掉（blur）——不聚焦才真等于不弹；
+  //   ③ focusin 兜底反聚焦：Lexical 提交 DOM 选区时给 contenteditable 附送的焦点不经过
+  //      prototype.focus，只能在 focusin 里再收一次。
+  // 用户点输入框本体走浏览器原生聚焦，不经过这里，照常弹键盘、照常打字。
+  // 取证：默认发 composer-focus-blocked / composer-focus-blurred 计数，再加一条
+  // composer-ime-open（visualViewport 阶跃下跌 = 输入法真弹了，带当时的 activeElement），
+  // 下次复发看 diag.jsonl 一眼就知道是哪条路。详细判定日志：URL 加 ?composerFocusLog=1。
   safeEffect(() => {
     if (!narrow.matches) return () => {}
     const dispose = installComposerFocusGate({
-      // 真机证据走诊断信标（diag.jsonl 的 mobile-stage，stage=composer-focus-blocked）
-      onBlocked: (count) => reportMobileStage('composer-focus-blocked', { n: count }),
-      // 开关打开时才有：挡下 / 放行都各留一条，带落点意图与是哪条白名单放行的
+      // 真机证据走诊断信标（diag.jsonl 的 mobile-stage）
+      onBlocked: (count, decision) => reportMobileStage(
+        decision.action === 'blur' ? 'composer-focus-blurred' : 'composer-focus-blocked',
+        { n: count, k: decision.kind, r: decision.reason },
+      ),
+      // 开关打开时才有：挡下 / 收焦点 / 放行都各留一条，带落点意图与是哪条白名单放行的
       onDecision: (decision) => reportMobileStage(
-        decision.blocked ? 'composer-focus-blocked-decision' : 'composer-focus-allowed',
+        decision.action === 'blur'
+          ? 'composer-focus-blurred-decision'
+          : decision.action === 'block'
+            ? 'composer-focus-blocked-decision'
+            : 'composer-focus-allowed',
         { k: decision.kind, r: decision.reason, t: decision.target, n: decision.count },
       ),
+      // 输入法真弹起来的现场（这是手机上唯一能直接看到「键盘到底弹没弹」的信号）
+      onImeOpen: (event) => reportMobileStage('composer-ime-open', {
+        px: event.shrink,
+        f: event.editorFocused === true ? 1 : 0,
+        a: event.active,
+        k: event.kind,
+      }),
     })
     // 装上了就报一条（stage 名只有新版客户端才有）：手机刷新后对着
     // diagnostic.jsonl 一看就知道新 bundle 到底上没上，不用瞎猜缓存。
