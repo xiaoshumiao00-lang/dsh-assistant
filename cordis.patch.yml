@@ -1,4 +1,5 @@
 # dsh-assistant：控制室（/api/worktable/*）+ 手机访问代理（/dsh-pocket RPC）+ Computer Use 预设
+# 版本：0.2.34（与 package.json / dsh.plugin.json 同一版本源）
 #
 # Computer Use 预设与 GUI 工具已内嵌进本包（vendor/computer-use，源自 dsh-orb 的 MIT 代码，
 # 见 vendor/computer-use/LICENSE.dsh-orb），所以删掉 dsh-orb 后「＋ CU」新建的会话仍是
@@ -35,6 +36,7 @@
                 Continue a GUI action in this turn only when it does not need that result; otherwise end the turn.
                 Call code_agent_status or code_agent_stop when the user asks about or stops background work.
                 When a plugin notice reports that work finished, decide again: do remaining GUI, or call code_agent with that session_id for another stretch, then tell the user the short conclusion.
+                通知说后台会话还在跑后续轮次时，前台 GUI 现在就能接着做；跟那份工作无关的新片段就开一条新的 code_agent 会话，别排到 busy 的会话后面继续空等。
                 A running background Code agent can hand one GUI step back through a computer_use notice when it needs the screen. When that arrives, do only that GUI step in this chat: look at the screen first, act, verify, then reply in one or two sentences with the concrete result (what you did, what you saw, paths or values). Do not send that step to code_agent and do not write a report.
                 If the notice says the user stopped that background session, tell the user briefly and do not call code_agent for it again unless the user asks.
           - id: tool-bash
@@ -79,7 +81,14 @@
             name: 'dsh-assistant/computer-use'
             config:
               postActionWaitMs: 600
+              # 观察面截图长边上限（像素）：每步回喂的图越大，模型 prefill 越贵。0 = 不缩放。
+              captureMaxEdgePx: 1280
+              # 观察面 owner 的最小边长；助手自己的悬浮球与覆盖条带一律不当观察面。
+              ownerMinEdgePx: 64
+              # 额外的助手自身窗口标题标记（内置标记之外，可按需追加）：
+              # selfWindowTitles: ['dsh-assistant-control-room']
           - id: tool-code-agent
             name: 'dsh-assistant/computer-use/code-agent'
     - id: assistant-code-agent-registry
       name: 'dsh-assistant/computer-use/code-agent-registry'
+# reload-marker: 0.2.34 Computer Use 观察面加固（助手悬浮球/覆盖层窗口不再当观察面）+ 每步截图长边上限 1280 + code_agent 完成通知按轮回传；沿用 0.2.33 的 0.2.18 前台物理屏接线 2026-11-20T15:40+08:00

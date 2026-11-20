@@ -4,6 +4,26 @@
 控制室里的「更新公告」正文由 `npm run build` 从本文件里当前版本那一节抽出来（见 `build.mjs`），
 不再手写常量——改了代码就必须改这一节，公告与实现不会各说各话。
 
+## [0.2.34] - 2026-11-20
+
+🛠 Computer Use 三处 harness 侧耗时修复（对着 2026-11-20「录入店铺到轰趴后台」那次 60.5 分钟实录改的）
+
+【实测数字】12:49:27 派单、13:50:01 收尾。前台 Computer Use 会话 124 步 / 116 次工具调用，其中 **44 步的观察面是助手自己的悬浮球**（`<frontmost_window>dsh-assistant-ball`，那颗 72x72 的 `Chrome_WidgetWin_1`），11 次点击反复打在同一个位置；前台为等后台 Code 会话的空闲通知一共**空等 27.9 分钟（占全程 46%）**；每步回喂的观察截图 58 张、中位 157 KB 全尺寸 PNG。
+
+【1) 观察面不再被悬浮球劫持】
+- `vendor\computer-use\windows-native-B7Ig34Q0.js`：`stylesOf` 读 `WS_EX_TOPMOST` / `WS_EX_NOACTIVATE` / `WS_EX_TRANSPARENT`，`listWindows` 把这三项事实带进窗口记录（悬浮球正是这三件套：`alwaysOnTop: 'screen-saver'` + `focusable: false` + `transparent: true`）。
+- `vendor\computer-use\backend-18yEf5Jq.js`：`selectWindowsObservation` 改四轮挑选 —— ① 键盘前台窗口（跳覆盖层标记与不可激活窗口，恒置顶仍允许，用户可能真在操作它）② z 序第一个**不恒置顶**的窗口 ③ 允许恒置顶但继续跳覆盖层标记 ④ 旧行为兜底（桌面上只剩悬浮球时照样观察得到）。内置标题标记 `dsh-assistant-ball` / `-ribbon` / `-overlay` / `-pocket` / `dsh-orb`，可由 `selfWindowTitles` 追加。以前球抢在 z 序最前当上 owner，整张截图就只剩 72x72，模型每个 `position` 都按它换算 —— 这是 44 步白转的根因。
+
+【2) 每步截图降尺寸】`captureMaxEdgePx`（默认 1280，0 = 不缩放）：GDI 抓全尺寸 → 盒式平均缩一帧 → 再编 PNG。点击映射照旧走 `screen.bounds`，`0–1000` 坐标空间不变，只省回喂成本，不改点击语义。WeChat 那种 1644x773 面板现在按 1280x601 送进模型。
+
+【3) code_agent 完成通知按轮回传】`vendor\computer-use\code-agent-registry-DDJfS2Fl.js`：不再等 `code.whenIdle()`，改 `raceCompletionSignals` —— 本会话出现新的 `turn/end` 就回传，`whenIdle` 与 abort 照旧参与竞态（先到者赢）。通知文案区分「finished this task」与「completed the stretch you dispatched (its own turns are still running)」，并明确告诉前台现在就能接着做 GUI。带 goal 自动续跑的后台会话以前会把通知压住几分钟（实测白等 5.4 分钟）。`cordis.patch.yml` 的 persona 同步加一条：后台还在跑后续轮次时，无关的新片段别排到同一条会话后面。
+
+【接线】`vendor\computer-use\index.js` 的 `Config` 新增 `captureMaxEdgePx` / `selfWindowTitles` / `ownerMinEdgePx`，`resolveComputerUseConfig` 校验后由 `apply` 交给 `createPlatformBackend(platform, excludedRegionCapture, options)` → `createWindowsDesktopBackend(void 0, options)` → `production(options)` → `createProductionWindowsOps(options)`。backend 与 windows-native 各多导出内部挑选/缩放函数，方便单测直接喂合成窗口数据。
+
+【新增单测】`scripts\test-cu-observation-surface.mjs`（13 条：四轮挑选、transient 合并、多屏边界、tunable）、`scripts\test-cu-capture-scale.mjs`（8 条：`0` = 不缩放、宽高比、盒式平均、alpha 不被抹平）、`scripts\test-cu-code-agent-notice.mjs`（9 条：按轮回传、旧 `whenIdle` 路径、abort 不追通知、四种文案）。三个都进了 `npm test` 链（顺带把早就存在但没进链的 `test-cu-bridge.mjs` 也接上）。`npm run check` 现在也语法检查 `lib\computer-use*.js` 三份产物。全链 62 项 `npm test` 全绿。现场只读验证：`node scripts\verify-cu-observation-live.mjs` 枚举本机 681 个窗口，悬浮球 `hwnd=2359436 title="dsh-assistant-ball" 72x72 topmost=true`，四轮挑选后观察面是真实应用窗口（`360FileBrowser64「提交稿」1080x694 focused=true`），球既不当 owner 也不进 transient。
+
+【备份与生效】改动前的 6 份文件（3 个 vendor、1 个 vendor registry、2 个 lib 产物）都在 `backup-20261120-cu-harness-fix\`。改的是 `D:\dsh-assistant`（profile 的 `link:D:/dsh-assistant` junction 就指它）。已重跑 `node build.mjs` 生成 `lib\computer-use*.js`。Computer Use 与 code-agent 是宿主启动时载入的，**生效必须由用户从托盘重启 DSH 宿主**；本次改动没有重启也没有杀宿主。
+
 ## [0.2.33] - 2026-11-19
 
 🛑 弃用并移除 Computer Use 离屏隐形操作（0.2.19–0.2.32 那一串离屏改动）：Computer Use 行为回到 0.2.18，今后不再新增这个功能

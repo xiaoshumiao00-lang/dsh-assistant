@@ -19,6 +19,7 @@ import { appendDiagnostic, diagnosticSummary, readDiagnosticTail } from './diagn
 import { attachWsDeflate, negotiatePermessageDeflate } from './ws-deflate.mjs';
 import { optimizeMobileBoot } from './mobile-boot.mjs';
 import { createMobileBatchStore } from './mobile-batch.mjs';
+import { capMobileSessionFollowMessage } from './mobile-uplink-history.mjs';
 
 const DEFAULT_UPSTREAM = { host: '127.0.0.1', port: 3080 };
 
@@ -1430,15 +1431,21 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
       // （优雅 FIN），此时 teardown 的 destroy() 已无法强制关闭对方——上游只收
       // 到 FIN 进入 half-open 永不关闭（PR #56）。半关闭统一交给下面的 'end'
       // 监听 → teardown destroy（RST 强制关闭双方）。
-      if (wsDeflateValue && wsDeflate) {
-        // 压缩通道：由 ws-deflate 接管两条 socket 的 'data'（同样 end:false 语义）
+      const capOpeningHistory = wsPath === '/api/remote.mux';
+      if (wsDeflate && (wsDeflateValue || capOpeningHistory)) {
+        // 同一 WebSocket 解析边界处理压缩与明文；明文仅做帧解析，不向浏览器伪造 RSV1。
         const wsDef = wsDeflate({
           client: socket,
           upstream: proxySocket,
+          compress: Boolean(wsDeflateValue),
+          onUplinkText: capOpeningHistory ? capMobileSessionFollowMessage : null,
           onFailure: noteWsDeflateFailure,
           onError: (err) => log?.(`dsh-pocket: ws-deflate failed: ${err?.message ?? err}`),
         });
-        wsQueueStats = () => wsDef.stats().queue;
+        wsQueueStats = () => {
+          const current = wsDef.stats();
+          return { ...current.queue, historyCaps: current.upTransformed };
+        };
         socket.on('close', () => { try { wsDef.close(); } catch {} });
         proxySocket.on('close', () => { try { wsDef.close(); } catch {} });
       } else {

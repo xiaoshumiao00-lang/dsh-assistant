@@ -1347,13 +1347,63 @@ const SHELL_CLASSES = /* @__PURE__ */ new Set([
 * `#32768` is the system menu. `ComboLBox` is the combo dropdown.
 */
 const CROSS_PID_TRANSIENT_CLASSES = /* @__PURE__ */ new Set(["#32768", "ComboLBox"]);
+/** 助手自己的窗口标题标记：悬浮球、原生覆盖条带。它们永远不该变成观察面。 */
+const SELF_UI_TITLE_MARKERS = [
+	"dsh-assistant-ball",
+	"dsh-assistant-ribbon",
+	"dsh-assistant-overlay",
+	"dsh-assistant-pocket",
+	"dsh-orb"
+];
+/** 观察面 owner 的最小边长（像素）；悬浮球 72x72 走覆盖层标记，不靠这条。 */
+const DEFAULT_OWNER_MIN_EDGE_PX = 64;
+/** 配置里的标题列表，小写并去掉空值。 */
+function selfUiTitlePatterns(titles) {
+	const list = Array.isArray(titles) && titles.length > 0 ? titles : SELF_UI_TITLE_MARKERS;
+	return list.filter((title) => typeof title === "string" && title !== "").map((title) => title.toLowerCase());
+}
+/**
+ * 是否助手自己的窗口（按标题标记判定）。
+ * @param title - 窗口标题。
+ * @param patterns - 已小写的标记列表。
+ * @returns true 当标题含任一标记。
+ */
+function isSelfUiWindow(title, patterns) {
+	const lower = String(title ?? "").toLowerCase();
+	if (lower === "") return false;
+	return patterns.some((pattern) => lower.includes(pattern));
+}
 function excludeSet(ids) {
 	const exclude = /* @__PURE__ */ new Set();
-	for (const id of ids) if (Number.isInteger(id) && id > 0) exclude.add(id);
+	for (const id of ids ?? []) if (Number.isInteger(id) && id > 0) exclude.add(id);
 	return exclude;
 }
 function sameMonitor(left, right) {
 	return left.monitor.x === right.monitor.x && left.monitor.y === right.monitor.y && left.monitor.width === right.monitor.width && left.monitor.height === right.monitor.height;
+}
+/**
+ * 观察面/点击基准矩形：窗口 frame 与它所在显示器的工作区求交。
+ * 几何全部来自运行时查询（MonitorFromWindow + GetMonitorInfo 的 rcMonitor/rcWork、GetDpiForMonitor），
+ * 所以屏幕数量、原点是否为负、任务栏在哪一侧、单屏/多屏/跨屏都自适应；代码里没有任何具体分辨率常量。
+ * 窗口完全落在工作区外时退回窗口自身，交给上层按同一套分数映射。
+ * @param window - 顶层窗口事实（`frame` 物理像素，`workArea` 该显示器工作区）。
+ * @returns 求交后的物理像素矩形。
+ */
+function windowSurfaceRect(window) {
+	const frame = window.frame;
+	const work = window.workArea ?? window.monitor;
+	if (work === void 0) return frame;
+	const x = Math.max(frame.x, work.x);
+	const y = Math.max(frame.y, work.y);
+	const right = Math.min(frame.x + frame.width, work.x + work.width);
+	const bottom = Math.min(frame.y + frame.height, work.y + work.height);
+	if (!(right > x) || !(bottom > y)) return frame;
+	return {
+		x,
+		y,
+		width: right - x,
+		height: bottom - y
+	};
 }
 function intersects(left, right, pad) {
 	return left.x - pad < right.x + right.width && left.x + left.width + pad > right.x && left.y - pad < right.y + right.height && left.y + left.height + pad > right.y;
@@ -1379,11 +1429,30 @@ function ownedBy(byHwnd, candidate, ownerHwnd) {
 	}
 	return false;
 }
-function eligibleOwner(window, exclude) {
+/**
+* 一个窗口能否当观察面 owner。
+* tier 1 = 键盘前台窗口（恒置顶也允许，因为用户可能真的在操作它）；
+* tier 2 = z 序第一个不恒置顶的窗口；tier 3 = 允许恒置顶，但仍跳过覆盖层标记与不可激活窗口；
+* tier 4 = 旧行为兜底（桌面上只剩覆盖层窗口时仍然观察得到）。
+* @param window - 顶层窗口事实。
+* @param exclude - 宿主 cloak 给的覆盖层 id 集合。
+* @param tier - 选择轮次（1 前台、2 非顶置、3 允许顶置、4 原样）。
+* @param patterns - 已小写的助手自身窗口标题标记。
+* @param minEdge - owner 的最小边长像素。
+* @returns 是否可选为观察面 owner。
+*/
+function eligibleOwner(window, exclude, tier, patterns, minEdge) {
 	if (exclude.has(window.hwnd)) return false;
 	if (!window.visible || window.iconic || window.cloaked || window.toolWindow) return false;
 	if (SHELL_CLASSES.has(window.className) || CROSS_PID_TRANSIENT_CLASSES.has(window.className)) return false;
-	if (window.frame.width < 64 || window.frame.height < 64) return false;
+	if (window.frame.width < minEdge || window.frame.height < minEdge) return false;
+	if (tier < 4) {
+		// 助手悬浮球与覆盖条带：不可激活或带自身标题标记的窗口不是用户正在操作的应用窗口。
+		if (window.noActivate === true) return false;
+		if (isSelfUiWindow(window.title, patterns)) return false;
+		// 只有第二轮明确要求不恒置顶：第一轮是键盘前台窗口（用户可能真在操作一个顶置 app），第三轮起放开头顶置。
+		if (tier === 2 && window.topmost === true) return false;
+	}
 	return true;
 }
 function includeTransient(candidate, owner, byHwnd) {
@@ -1396,35 +1465,55 @@ function includeTransient(candidate, owner, byHwnd) {
 /**
 * Pick the foreground window, or the next eligible top-level window, and union same-monitor transients.
 * Overlay hwnds in `excludeWindowIds` are skipped. Shell classes and system menus are not owners.
+* 助手自己的窗口（悬浮球、覆盖条带：不可激活 / 恒置顶 / 带自身标题标记）在前三轮里一律跳过，
+* 否则那颗 72x72 的球就当上观察面，整张截图只剩球，模型每个点击都落进球里 —— 这是实测 44/114 步的根因。
 * Same-process windows join when they are owned by that window or are an intersecting popup.
 * Another process joins only for an intersecting system menu or combo dropdown.
 * `focused` is true only when the foreground hwnd is the owner or one of those transients.
 * @param snapshot - physical-pixel z-order snapshot.
 * @param excludeWindowIds - overlay hwnds from the capture cloak. Non-positive and non-integer ids are ignored.
+* @param options - 观察配置：`selfWindowTitles` 标题标记、`ownerMinEdgePx` 最小边长。
 * @returns the observation, or undefined when no operable window remains.
 */
-function selectWindowsObservation(snapshot, excludeWindowIds) {
+function selectWindowsObservation(snapshot, excludeWindowIds, options = {}) {
 	const exclude = excludeSet(excludeWindowIds);
+	const patterns = selfUiTitlePatterns(options.selfWindowTitles);
+	const minEdge = Number.isFinite(options.ownerMinEdgePx) && options.ownerMinEdgePx >= 1 ? Math.round(options.ownerMinEdgePx) : DEFAULT_OWNER_MIN_EDGE_PX;
 	const foreground = snapshot.windows.find((window) => window.hwnd === snapshot.foregroundHwnd);
-	const owner = foreground !== void 0 && eligibleOwner(foreground, exclude) ? foreground : snapshot.windows.find((window) => eligibleOwner(window, exclude));
+	// 三轮收紧的选择，最后一轮保持旧行为：桌面上只剩覆盖层窗口时仍然观察得到它。
+	const tiers = [
+		foreground === void 0 ? [] : [foreground],
+		snapshot.windows,
+		snapshot.windows,
+		snapshot.windows
+	];
+	let owner = void 0;
+	for (let tier = 1; tier <= tiers.length; tier += 1) {
+		owner = tiers[tier - 1].find((window) => eligibleOwner(window, exclude, tier, patterns, minEdge));
+		if (owner !== void 0) break;
+	}
 	if (owner === void 0) return void 0;
 	const byHwnd = new Map(snapshot.windows.map((window) => [window.hwnd, window]));
-	let minX = owner.frame.x;
-	let minY = owner.frame.y;
-	let maxX = owner.frame.x + owner.frame.width;
-	let maxY = owner.frame.y + owner.frame.height;
+	const ownerRect = windowSurfaceRect(owner);
+	let minX = ownerRect.x;
+	let minY = ownerRect.y;
+	let maxX = ownerRect.x + ownerRect.width;
+	let maxY = ownerRect.y + ownerRect.height;
 	const transientWindowIds = [];
 	for (const candidate of snapshot.windows) {
 		if (candidate.hwnd === owner.hwnd || exclude.has(candidate.hwnd)) continue;
 		if (!candidate.visible || candidate.iconic || candidate.cloaked) continue;
 		if (SHELL_CLASSES.has(candidate.className) || !positiveFrame(candidate.frame)) continue;
+		// 助手自己的悬浮球与条带即使与观察面相交也不并进来：把观察面撑大只会让坐标多算一块。
+		if (isSelfUiWindow(candidate.title, patterns)) continue;
 		if (!sameMonitor(candidate, owner)) continue;
 		if (!includeTransient(candidate, owner, byHwnd)) continue;
+		const candidateRect = windowSurfaceRect(candidate);
 		transientWindowIds.push(candidate.hwnd);
-		if (candidate.frame.x < minX) minX = candidate.frame.x;
-		if (candidate.frame.y < minY) minY = candidate.frame.y;
-		if (candidate.frame.x + candidate.frame.width > maxX) maxX = candidate.frame.x + candidate.frame.width;
-		if (candidate.frame.y + candidate.frame.height > maxY) maxY = candidate.frame.y + candidate.frame.height;
+		if (candidateRect.x < minX) minX = candidateRect.x;
+		if (candidateRect.y < minY) minY = candidateRect.y;
+		if (candidateRect.x + candidateRect.width > maxX) maxX = candidateRect.x + candidateRect.width;
+		if (candidateRect.y + candidateRect.height > maxY) maxY = candidateRect.y + candidateRect.height;
 	}
 	return {
 		appName: owner.appName,
@@ -1435,6 +1524,9 @@ function selectWindowsObservation(snapshot, excludeWindowIds) {
 			width: maxX - minX,
 			height: maxY - minY
 		},
+		// owner 自己的矩形（不含 transient union）：点击时用它判断"窗口有没有动过"，
+		// 没动就沿用截图那一刻的 bounds，保证截图基准与点击基准是同一个 rect。
+		windowRect: ownerRect,
 		scale: owner.monitorDpi > 0 ? owner.monitorDpi / 96 : 1,
 		windowId: owner.hwnd,
 		transientWindowIds,
@@ -1626,26 +1718,35 @@ function assertInput(ops) {
 /**
 * Move keyboard focus to the last `listScreens` window when it is not already foreground.
 * No-op when this backend has not listed a window, or when the foreground hwnd is that window or one of its transients.
+* 热键是发给**系统**的（Ctrl+Alt+W 由目标应用 RegisterHotKey 注册），抢不到前台也照旧发键：
+* 以前抢不到就抛错，实测把 Ctrl+Alt+W / Ctrl+N 整条路堵死，等于误伤。
+* 前台已经在观察面上时一个键都不按（连 Alt 都不发），先读 GetForegroundWindow 再决定要不要抢。
 * @param host - Win32 operations.
 * @param observed - selection from the latest `listScreens`, if any.
-* @throws when the window cannot become foreground. No keys are posted after that throw.
+* @returns true when the observed window is (now) foreground; false means the keys go wherever focus is.
 */
 function restoreObservedFocus(host, observed) {
 	if (observed === void 0) return;
 	const foreground = host.foregroundWindowId();
-	if (foreground === observed.windowId || observed.transientWindowIds.includes(foreground)) return;
-	if (host.focusWindow(observed.windowId)) return;
-	throw new Error(`computer-use: keyboard focus could not be moved to ${observed.appName}; click inside the window, then retry hotkey`);
+	if (foreground === observed.windowId || observed.transientWindowIds.includes(foreground)) return true;
+	return host.focusWindow(observed.windowId) === true;
 }
+/**
+ * 一次点击只算一次坐标：`movePointer` 摆一次位，按下与抬起都拿这同一个 `point`。
+ * 中间不移动、不重算坐标 —— down/up 换了坐标就是拖拽（窗口被搬走、正文被整段选中都是这条路径）。
+ * 按下前由后端（windows-native 的 `mouseButton`）再确认一次落点，抬起时绝不移动。
+ * @returns 点击后指针实际的位置（`ops.cursorPosition()` 回读），供调用方把落点写进结果自证。
+ */
 async function clickAt(ops, button, count, point, signal) {
 	ops.movePointer(point.x, point.y);
 	await delay(POINTER_MOVE_SETTLE_MS, signal);
 	for (let index = 0; index < count; index += 1) {
-		ops.mouseButton(button, true);
+		ops.mouseButton(button, true, point);
 		await delay(BUTTON_HOLD_MS, signal);
-		ops.mouseButton(button, false);
+		ops.mouseButton(button, false, point);
 		if (index + 1 < count) await delay(DOUBLE_CLICK_GAP_MS, signal);
 	}
+	return ops.cursorPosition?.();
 }
 async function chord(ops, keys, signal) {
 	const modifiers = keys.filter((key) => MODIFIER_VKS.has(key.vk));
@@ -1656,8 +1757,8 @@ async function chord(ops, keys, signal) {
 	for (const key of [...rest].reverse()) ops.key(key.vk, false, key.extended);
 	for (const key of [...modifiers].reverse()) ops.key(key.vk, false, key.extended);
 }
-function observationOf(ops) {
-	return selectWindowsObservation(ops.listWindows(), activeCaptureExcludeWindowIds());
+function observationOf(ops, options) {
+	return selectWindowsObservation(ops.listWindows(), activeCaptureExcludeWindowIds(), options);
 }
 function screenFromObservation(selected) {
 	return {
@@ -1665,33 +1766,85 @@ function screenFromObservation(selected) {
 		bounds: selected.bounds,
 		scale: selected.scale,
 		windowId: selected.windowId,
+		appName: selected.appName,
+		...selected.windowRect === void 0 ? {} : { windowRect: selected.windowRect },
 		...selected.transientWindowIds.length === 0 ? {} : { transientWindowIds: selected.transientWindowIds }
 	};
 }
+/** 两个物理像素矩形是否完全相同（截图基准与点击基准必须逐像素一致，不做容差）。 */
+function sameRect(left, right) {
+	return left !== void 0 && right !== void 0 && left.x === right.x && left.y === right.y && left.width === right.width && left.height === right.height;
+}
+/**
+ * 指针动作的基准面：**被截图的那个窗口**，而不是此刻的前台窗口。
+ * 0–1000 分数只对那张截图成立。若两次动作之间前台换了窗口（例如铺满主屏的宿主窗口、或用户在聊天），
+ * 按"当前前台"的 rect 换算就会把点击打到别的屏/别的位置 —— 实测分数 [387,900] 被打成 743,929 就是这么来的。
+ * 因此这里先认截图那个 hwnd，把它真正带到最前（SetForegroundWindow，必要时 AttachThreadInput /
+ * BringWindowToTop + SetWindowPos 不激活不移动），最后才映射分数。
+ *
+ * 映射基准只有一条规则：**截图基准就是点击基准**。
+ *  - owner 自己的矩形（`windowRect`，DWM 帧 ∩ 该屏工作区）与截图那一刻一致 → 直接沿用截图的 `bounds`；
+ *    这时 transient（气泡/下拉/同进程弹窗）多一个少一个都不影响落点，因为模型看的就是那张图。
+ *  - owner 真被动过（被 restore 拉回来、主人挪了窗）→ 按 hwnd 重新量一次 {@link windowSurfaceRect}，
+ *    因为截图已经过期，继续用旧 rect 才是"分数对、落点飘"（实测 [450,19] 本该 747,160，光标跑到 1009,40）。
+ * @param host - Win32 operations.
+ * @param capturedSurface - 产生当前截图的观察面（`capture` 记下来的），可缺省。
+ * @param listed - 本次动作重新枚举到的观察面，作为没有截图时的兜底。
+ * @param options - 观察配置。
+ * @returns 用于 0–1000 映射的观察面（`bounds` 与抓屏用的是同一个矩形）。
+ * @throws when the captured window cannot be brought to the front, so the click would land on a covering window.
+ */
+function surfaceForPointer(host, capturedSurface, listed, options) {
+	const target = capturedSurface ?? listed;
+	if (target === void 0 || target.windowId === void 0) return target;
+	if (host.foregroundWindowId() !== target.windowId && !host.focusWindow(target.windowId)) throw new Error(`computer-use: could not bring ${target.appName ?? "the target window"} to the front (target ${String(target.windowId)}, foreground ${String(host.foregroundWindowId())}), so the click would land on a covering window; refusing to click`);
+	const snapshot = host.listWindows();
+	const live = snapshot.windows.find((window) => window.hwnd === target.windowId);
+	if (live === void 0) return target;
+	const liveRect = windowSurfaceRect(live);
+	if (liveRect.width <= 0 || liveRect.height <= 0) return target;
+	if (target.windowRect === void 0 || sameRect(liveRect, target.windowRect)) return target;
+	return {
+		...target,
+		bounds: liveRect,
+		windowRect: liveRect
+	};
+}
 let productionOps;
-async function production() {
-	productionOps ??= (await import("./windows-native-B7Ig34Q0.js")).createProductionWindowsOps();
+async function production(options) {
+	productionOps ??= (await import("./windows-native-B7Ig34Q0.js")).createProductionWindowsOps(options);
 	return productionOps;
 }
 /**
 * Construct the Windows backend.
 * @param ops - injected host operations. Omit to use Win32 on the first call.
+* @param options - 观察与抓屏配置，透传给生产 Win32 操作。
 * @returns capture and HID input against the host desktop.
 */
-function createWindowsDesktopBackend(ops) {
-	const use = async () => ops ?? await production();
+function createWindowsDesktopBackend(ops, options = {}) {
+	const use = async () => ops ?? await production(options);
 	let observed;
+	let capturedSurface;
 	return {
 		withGuiTurn: (run) => run(),
 		async listScreens(signal) {
 			signal?.throwIfAborted();
-			const selected = observationOf(await use());
+			const host = await use();
+			const selected = observationOf(host, options);
 			observed = selected;
-			if (selected === void 0) return [];
-			return [screenFromObservation(selected)];
+			if (selected !== void 0) return [screenFromObservation(selected)];
+			// 一扇可操作窗口都没有时退回整块虚拟屏包围盒：几何仍来自运行时查询，单屏/多屏/负原点都自适应。
+			const bounds = host.virtualScreen?.();
+			if (bounds === void 0) return [];
+			return [{
+				index: 0,
+				bounds,
+				scale: 1
+			}];
 		},
 		async capture(screen, signal) {
 			signal?.throwIfAborted();
+			capturedSurface = screen;
 			try {
 				return {
 					data: (await use()).capturePng(screen.bounds),
@@ -1705,7 +1858,7 @@ function createWindowsDesktopBackend(ops) {
 		async inspectForeground(signal) {
 			signal?.throwIfAborted();
 			const host = await use();
-			const selected = observationOf(host);
+			const selected = observationOf(host, options);
 			if (selected === void 0) return FOCUS_FALLBACK_FOREGROUND;
 			const folder = selected.appName.toLowerCase() === "explorer" ? host.explorerFolder(selected.windowId) : void 0;
 			return {
@@ -1735,13 +1888,16 @@ function createWindowsDesktopBackend(ops) {
 		async click(input, signal) {
 			const host = await use();
 			assertInput(host);
-			await clickAt(host, input.button, input.count, pointOf(input.position, input.screen), liveSignal(signal));
+			const screen = surfaceForPointer(host, capturedSurface, input.screen, options);
+			const landed = await clickAt(host, input.button, input.count, pointOf(input.position, screen), liveSignal(signal));
+			return landed === void 0 ? void 0 : { landed };
 		},
 		async typeText(input, signal) {
 			const host = await use();
 			assertInput(host);
+			const screen = surfaceForPointer(host, capturedSurface, input.screen, options);
 			const abort = liveSignal(signal);
-			await clickAt(host, "left", 1, pointOf(input.position, input.screen), abort);
+			await clickAt(host, "left", 1, pointOf(input.position, screen), abort);
 			if (input.replace) await chord(host, [postedVk(17), postedVk(65)], abort);
 			const previous = host.readClipboardText();
 			try {
@@ -1760,7 +1916,7 @@ function createWindowsDesktopBackend(ops) {
 		async scroll(input, signal) {
 			const host = await use();
 			assertInput(host);
-			const point = pointOf(input.position, input.screen);
+			const point = pointOf(input.position, surfaceForPointer(host, capturedSurface, input.screen, options));
 			const abort = liveSignal(signal);
 			const step = (input.direction === "up" ? 1 : -1) * SCROLL_NOTCH;
 			for (let index = 0; index < input.scrollLevel; index += 1) {
@@ -1778,7 +1934,7 @@ function createWindowsDesktopBackend(ops) {
 		async longPress(input, signal) {
 			const host = await use();
 			assertInput(host);
-			const point = pointOf(input.position, input.screen);
+			const point = pointOf(input.position, surfaceForPointer(host, capturedSurface, input.screen, options));
 			const abort = liveSignal(signal);
 			host.movePointer(point.x, point.y);
 			await delay(POINTER_MOVE_SETTLE_MS, abort);
@@ -1792,8 +1948,9 @@ function createWindowsDesktopBackend(ops) {
 		async drag(input, signal) {
 			const host = await use();
 			assertInput(host);
-			const start = pointOf(input.startPosition, input.startScreen);
-			const end = pointOf(input.endPosition, input.endScreen);
+			const screen = surfaceForPointer(host, capturedSurface, input.startScreen, options);
+			const start = pointOf(input.startPosition, screen);
+			const end = pointOf(input.endPosition, input.endScreen === input.startScreen ? screen : surfaceForPointer(host, capturedSurface, input.endScreen, options));
 			const abort = liveSignal(signal);
 			host.movePointer(start.x, start.y);
 			await delay(POINTER_MOVE_SETTLE_MS, abort);
@@ -1840,12 +1997,13 @@ const FOCUS_FALLBACK_FOREGROUND = {
 * Construct the backend for a host platform.
 * @param platform - Node `process.platform` value; tests pass an explicit id.
 * @param excludedRegionCapture - Desktop overlay-exclude capture; CLI omits it and spawns the helper.
+* @param options - Windows 观察与抓屏配置（`selfWindowTitles`、`ownerMinEdgePx`、`captureMaxEdgePx`）。
 * @returns macOS capture/input on Darwin, Windows capture/input on Win32, otherwise a backend whose methods throw.
 */
-function createPlatformBackend(platform = process.platform, excludedRegionCapture) {
+function createPlatformBackend(platform = process.platform, excludedRegionCapture, options = {}) {
 	if (platform === "darwin") return createMacosDesktopBackend(void 0, excludedRegionCapture);
-	if (platform === "win32") return createWindowsDesktopBackend();
+	if (platform === "win32") return createWindowsDesktopBackend(void 0, options);
 	return createUnsupportedDesktopBackend();
 }
 //#endregion
-export { encodeBgraPng as a, modelPositionToHid as c, requirePixelPosition as d, runWithCaptureExcludeWindowIds as f, createPlatformBackend as i, requireClickModifiers as l, FOCUS_NOTE as n, delay as o, UNFOCUSED_WINDOW_NOTE as r, assertAllowedHotkey as s, FOCUS_FALLBACK_FOREGROUND as t, requireNormalizedPosition as u };
+export { encodeBgraPng as a, modelPositionToHid as c, requirePixelPosition as d, runWithCaptureExcludeWindowIds as f, createPlatformBackend as i, requireClickModifiers as l, FOCUS_NOTE as n, delay as o, UNFOCUSED_WINDOW_NOTE as r, assertAllowedHotkey as s, FOCUS_FALLBACK_FOREGROUND as t, requireNormalizedPosition as u, selectWindowsObservation, eligibleOwner, isSelfUiWindow, selfUiTitlePatterns, windowSurfaceRect, mapFractionToGlobal, createWindowsDesktopBackend };

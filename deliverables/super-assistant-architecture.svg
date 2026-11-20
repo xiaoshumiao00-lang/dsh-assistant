@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 980" width="1360" height="1960" role="img" aria-labelledby="title desc" font-family="'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC', 'Segoe UI', sans-serif">
+  <title id="title">超级个人助手目标架构总图</title>
+  <desc id="desc">统一入口连接轻量总管、记忆与项目中枢、多模式执行层、本地事实库和受控成长闭环。</desc>
+  <defs>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#185FA5" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="arrow-teal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#0F6E56" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="680" height="980" fill="#FFFFFF"/>
+  <rect x="24" y="20" width="632" height="940" rx="18" fill="#FFFFFF" stroke="#D3D1C7" stroke-width="0.5"/>
+
+  <text x="40" y="46" font-size="17" font-weight="500" fill="#042C53">超级个人助手：一个入口、一个事实源、专事专办、持续成长</text>
+  <text x="40" y="68" font-size="12" fill="#185FA5">在谁的电脑部署，就使用谁的本机档案；跨设备同步与外部采集均需明确授权</text>
+
+  <g>
+    <rect x="40" y="88" width="140" height="58" rx="10" fill="#F8FBFE" stroke="#185FA5" stroke-width="0.5"/>
+    <text x="110" y="109" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53">桌面助手</text>
+    <text x="110" y="130" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">文字 · 快捷键 · 悬浮球</text>
+    <rect x="190" y="88" width="140" height="58" rx="10" fill="#F8FBFE" stroke="#185FA5" stroke-width="0.5"/>
+    <text x="260" y="109" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53">语音对话</text>
+    <text x="260" y="130" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">唤醒 · 打断 · 实时播报</text>
+    <rect x="340" y="88" width="140" height="58" rx="10" fill="#F8FBFE" stroke="#185FA5" stroke-width="0.5"/>
+    <text x="410" y="109" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53">手机与鹈鹕</text>
+    <text x="410" y="130" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">同一助手的远程终端</text>
+    <rect x="490" y="88" width="140" height="58" rx="10" fill="#F8FBFE" stroke="#185FA5" stroke-width="0.5"/>
+    <text x="560" y="109" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53">事件与日程</text>
+    <text x="560" y="130" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">定时 · 文件 · 授权信息源</text>
+  </g>
+  <path d="M110 146V174" fill="none" stroke="#185FA5" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+  <path d="M260 146V174" fill="none" stroke="#185FA5" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+  <path d="M410 146V174" fill="none" stroke="#185FA5" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+  <path d="M560 146V174" fill="none" stroke="#185FA5" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+
+  <rect x="40" y="180" width="600" height="58" rx="12" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+  <text x="340" y="201" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53">统一助手入口与网关</text>
+  <text x="340" y="222" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">所有终端共享同一用户、任务和记忆；控制室只是投影，不是第二套助手</text>
+  <path d="M340 238V254" fill="none" stroke="#185FA5" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+
+  <rect x="40" y="260" width="600" height="174" rx="20" fill="#F4F8FC" stroke="#185FA5" stroke-width="0.5"/>
+  <text x="60" y="282" font-size="14" font-weight="500" fill="#042C53">轻量总管：理解、路由、组装上下文、汇报；不堆积执行正文</text>
+  <g>
+    <rect x="60" y="302" width="170" height="70" rx="10" fill="#FFFFFF" stroke="#185FA5" stroke-width="0.5"/>
+    <text x="145" y="325" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53">Router 路由</text>
+    <text x="145" y="348" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">规则快路 · 小模型慢路</text>
+    <rect x="255" y="302" width="170" height="70" rx="10" fill="#FFFFFF" stroke="#185FA5" stroke-width="0.5"/>
+    <text x="340" y="325" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53">上下文 broker</text>
+    <text x="340" y="348" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">按任务检索 · 控制 token</text>
+    <rect x="450" y="302" width="170" height="70" rx="10" fill="#FFFFFF" stroke="#185FA5" stroke-width="0.5"/>
+    <text x="535" y="325" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53">策略与审批</text>
+    <text x="535" y="348" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">隐私 · 授权 · 风险分级</text>
+  </g>
+  <rect x="60" y="388" width="560" height="30" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+  <text x="340" y="403" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#042C53">四种出口：立即回答 ｜ 续作旧任务 ｜ 新建专项任务 ｜ 只追问一个关键问题</text>
+  <path d="M340 434V450" fill="none" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#arrow-teal)"/>
+
+  <rect x="40" y="456" width="600" height="172" rx="20" fill="#EFF9F5" stroke="#0F6E56" stroke-width="0.5"/>
+  <text x="60" y="478" font-size="14" font-weight="500" fill="#04342C">统一记忆与项目中枢：有作用域、时间、来源、置信度和可纠正性</text>
+  <g>
+    <rect x="60" y="496" width="275" height="50" rx="9" fill="#FFFFFF" stroke="#0F6E56" stroke-width="0.5"/>
+    <text x="197.5" y="512" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#04342C">用户与语义记忆</text>
+    <text x="197.5" y="532" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">身份 · 偏好 · 稳定事实 · 冲突更新</text>
+    <rect x="345" y="496" width="275" height="50" rx="9" fill="#FFFFFF" stroke="#0F6E56" stroke-width="0.5"/>
+    <text x="482.5" y="512" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#04342C">项目与任务记忆</text>
+    <text x="482.5" y="532" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">进度 · 决策 · 路径 · 产物 · 下一步</text>
+    <rect x="60" y="560" width="275" height="50" rx="9" fill="#FFFFFF" stroke="#0F6E56" stroke-width="0.5"/>
+    <text x="197.5" y="576" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#04342C">电脑与文件地图</text>
+    <text x="197.5" y="596" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">授权索引 · 常用位置 · 数据新鲜度</text>
+    <rect x="345" y="560" width="275" height="50" rx="9" fill="#FFFFFF" stroke="#0F6E56" stroke-width="0.5"/>
+    <text x="482.5" y="576" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#04342C">目标与流程资产</text>
+    <text x="482.5" y="596" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">愿望 · 兴趣 · Playbook · 个人评测集</text>
+  </g>
+  <path d="M340 628V644" fill="none" stroke="#185FA5" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+
+  <g>
+    <rect x="40" y="650" width="140" height="66" rx="10" fill="#F8FBFE" stroke="#185FA5" stroke-width="0.5"/>
+    <text x="110" y="672" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53">即时应答</text>
+    <text x="110" y="695" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">缓存 · 本地命令 · 快模型</text>
+    <rect x="190" y="650" width="140" height="66" rx="10" fill="#F8FBFE" stroke="#185FA5" stroke-width="0.5"/>
+    <text x="260" y="672" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53">专项 Worker</text>
+    <text x="260" y="695" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">独立目录 · 会话 · 检查点</text>
+    <rect x="340" y="650" width="140" height="66" rx="10" fill="#F8FBFE" stroke="#185FA5" stroke-width="0.5"/>
+    <text x="410" y="672" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53">语音与音乐</text>
+    <text x="410" y="695" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">流式识别 · 播报稿 · 插话</text>
+    <rect x="490" y="650" width="140" height="66" rx="10" fill="#F8FBFE" stroke="#185FA5" stroke-width="0.5"/>
+    <text x="560" y="672" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53">人机协作 GUI</text>
+    <text x="560" y="695" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">API 优先 · 输入租约</text>
+  </g>
+  <path d="M340 716V732" fill="none" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#arrow-teal)"/>
+
+  <rect x="40" y="738" width="290" height="70" rx="12" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+  <text x="185" y="761" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#04342C">统一本地事实库</text>
+  <text x="185" y="783" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">SQLite · 版本迁移 · 快照 · 审计</text>
+  <text x="185" y="800" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0F6E56">原始项目文件留在原处，只保存引用与摘要</text>
+  <rect x="350" y="738" width="290" height="70" rx="12" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+  <text x="495" y="761" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#04342C">可插拔能力层</text>
+  <text x="495" y="783" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">本地与云模型 · 技能 · 连接器 · 沙箱</text>
+  <text x="495" y="800" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#0F6E56">能力可扩展，权限不随插件自动扩大</text>
+
+  <rect x="40" y="836" width="600" height="82" rx="16" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+  <text x="60" y="858" font-size="14" font-weight="500" fill="#042C53">后台成长闭环：主动服务与自我进化共用同一道审批门</text>
+  <text x="340" y="883" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#042C53">观察与触发 → 形成建议 → 评测或沙箱验证 → 用户批准 → 版本化执行 → 可回滚</text>
+  <text x="340" y="905" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">默认先观察、少打扰；高影响决策、对外动作、花钱和自我更新绝不自行拍板</text>
+
+  <line x1="40" y1="936" x2="640" y2="936" stroke="#D3D1C7" stroke-width="0.5"/>
+  <text x="340" y="954" text-anchor="middle" font-size="11" fill="#5F5E5A">核心原则：一个入口不等于一条会话；长期记忆不等于无限提示词；主动性不等于无限授权</text>
+</svg>

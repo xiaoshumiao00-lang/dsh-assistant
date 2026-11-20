@@ -11,21 +11,27 @@ export const MOBILE_OMITTABLE_MODULES = Object.freeze([
 
 const BOOT_SCRIPT_RE = /<script>globalThis\["__DSH_BOOT__"\] = ([\s\S]*?)<\/script>/
 
-// LPT 合包权重（实测 gzip 字节量级）。大包不能集中在同一路，否则其它两路早已完成、
-// 最后一路独占慢链路继续下载十几秒。未列出的中小模块按 10KB 估算。
+// LPT 合包权重（2026-11-17 本机真实 entry 字节量级）。大包不能集中在同一路，
+// 否则其它两路早已完成、最后一路独占慢链路继续下载十几秒。未列出的中小模块按 10KB 估算。
 const MODULE_BATCH_WEIGHT = {
-  'dsh-assistant': 663_932,
-  '@deepseek-ai/dsh-api-remotes': 146_543,
-  '@deepseek-ai/dsh-client-ui-conversation': 239_869,
-  '@deepseek-ai/dsh-client-ui-plugin-manager': 258_000,
-  '@deepseek-ai/dsh-client-ui-chat': 189_809,
-  '@deepseek-ai/dsh-cordis-client-runner': 78_041,
-  '@deepseek-ai/dsh-client-ui-trajectory': 11_640,
-  '@deepseek-ai/dsh-client-ui-sidebar-documentpreview': 18_000,
-  '@deepseek-ai/dsh-client-ui-workspace': 26_078,
-  '@deepseek-ai/dsh-client-ui-tool': 13_706,
-  '@deepseek-ai/dsh-client-ui-sidebar-right': 12_154,
-  '@deepseek-ai/dsh-api-session-controller': 51_123,
+  '@deepseek-ai/dsh-client-ui-settings-account': 3_417_762,
+  'dsh-assistant': 1_556_328,
+  '@deepseek-ai/dsh-api-remotes': 1_083_970,
+  'dsh-mnemon': 913_546,
+  '@deepseek-ai/dsh-client-ui-conversation': 799_490,
+  '@deepseek-ai/dsh-client-ui-plugin-manager': 626_502,
+  '@deepseek-ai/dsh-client-ui-chat': 622_931,
+  '@deepseek-ai/dsh-cordis-client-runner': 402_344,
+  '@deepseek-ai/dsh-client-ui-trajectory': 398_700,
+  '@deepseek-ai/dsh-client-ui-schedule': 328_499,
+  'dsh-mnemon-source-memory-spaces': 291_111,
+  '@deepseek-ai/dsh-client-ui-sidebar-documentpreview': 286_625,
+  'dsh-skill-mcp-panel': 238_501,
+  '@deepseek-ai/dsh-client-ui-workspace': 232_805,
+  '@deepseek-ai/dsh-client-ui-settings-models': 211_468,
+  '@deepseek-ai/dsh-client-ui-tool': 198_235,
+  '@deepseek-ai/dsh-client-ui-sidebar-right': 190_139,
+  '@deepseek-ai/dsh-api-session-controller': 166_697,
   '@deepseek-ai/dsh-client-ui-input-trigger': 64_775,
   '@deepseek-ai/dsh-client-ui-cordis': 54_310,
   '@deepseek-ai/dsh-client-ui-skill': 26_078,

@@ -38,7 +38,10 @@ function watchCodeAgentCompletion(watch) {
 async function runWatch(watch, signal) {
 	try {
 		if (await raceAbort(signal, waitUntilIntervalStarts(watch.code, watch.requestId, signal)) === "aborted") return;
-		if (await raceAbort(signal, watch.code.whenIdle()) === "aborted") return;
+		// 自己那一轮跑完就回传，不等整条 Code 会话把后续轮也跑完：后台带着 goal 续跑时 `whenIdle` 会压住几分钟，
+		// 前台 Computer Use 只能空等（实测一次任务白等 5.4 分钟）。`whenIdle` 先到的旧路径仍然生效。
+		if (await raceAbort(signal, raceCompletionSignals(watch.code, signal)) === "aborted") return;
+		const stillRunning = watch.code.status === "running";
 		const userStopped = lastTurnEndedUserAborted(watch.code);
 		const outcome = lastAssistantText(watch.code) ?? NO_ASSISTANT;
 		if (await raceAbort(signal, watch.caller.whenIdle()) === "aborted") return;
@@ -46,12 +49,12 @@ async function runWatch(watch, signal) {
 		watch.caller.followup(createUserMessage({
 			content: [{
 				type: "text",
-				text: completionNoticeText(watch.sessionId, watch.task, outcome, anotherComputerUseRunning(watch), userStopped)
+				text: completionNoticeText(watch.sessionId, watch.task, outcome, anotherComputerUseRunning(watch), userStopped, stillRunning)
 			}],
 			source: {
 				kind: "computer-use",
 				form: "notice",
-				summary: boundContextSummary(userStopped ? `Code agent ${watch.sessionId} stopped by the user` : `Code agent ${watch.sessionId} finished`)
+				summary: boundContextSummary(userStopped ? `Code agent ${watch.sessionId} stopped by the user` : `Code agent ${watch.sessionId} ${stillRunning ? "completed the dispatched stretch" : "finished"}`)
 			}
 		}));
 	} catch (error) {
@@ -110,6 +113,61 @@ async function raceAbort(signal, work) {
 		signal.removeEventListener("abort", onAbort);
 	}
 }
+/** 轮次结束轮询间隔。400 ms 比一整个 GUI 轮次细得多，比 1 s 松得多，两头都不空转。 */
+const TURN_END_POLL_MS = 400;
+/**
+ * 会话里最后一轮关闭的位置；没有 `snapshotEvents`（测试假 agent）读 -1。
+ * 日志只追加，所以新轮关闭时这个值必然变大。
+ */
+function lastTurnEndIndex(code) {
+	try {
+		const events = code.session?.snapshotEvents?.() ?? [];
+		for (let index = events.length - 1; index >= 0; index -= 1) if (asRecord(events[index])?.type === "turn/end") return index;
+		return -1;
+	} catch {
+		return -1;
+	}
+}
+function delayTick(ms, signal) {
+	return new Promise((resolve) => {
+		if (signal.aborted) {
+			resolve();
+			return;
+		}
+		const finish = () => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", finish);
+			resolve();
+		};
+		const timer = setTimeout(finish, ms);
+		signal.addEventListener("abort", finish, { once: true });
+	});
+}
+function abortPromise(signal) {
+	if (signal.aborted) return Promise.resolve();
+	return new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+}
+/**
+* 这一轮结束（出现新的 `turn/end`）或者会话空了， whichever settles first。
+* 带着 goal 自动续跑的会话不会很快 idle，所以按轮结束算才是快的那条路。
+* abort 时两条支路都 settle，留给 `whenIdle` 的 promise 不悬空。
+* @param code - 后台 Code agent。
+* @param signal - 这个 watch 的 abort。
+*/
+async function raceCompletionSignals(code, signal) {
+	const baseline = lastTurnEndIndex(code);
+	const turnWatch = (async () => {
+		while (!signal.aborted) {
+			if (lastTurnEndIndex(code) > baseline) return;
+			await delayTick(TURN_END_POLL_MS, signal);
+		}
+	})();
+	const idle = new Promise((resolve, reject) => {
+		signal.addEventListener("abort", resolve, { once: true });
+		code.whenIdle().then(resolve, reject);
+	});
+	await Promise.race([turnWatch, idle, abortPromise(signal)]);
+}
 /** Newest non-empty assistant text of the session, or undefined when none exists. */
 function lastAssistantText(code) {
 	const messages = code.session.deriveMessages();
@@ -156,9 +214,9 @@ function anotherComputerUseRunning(watch) {
 function presetOf(agent) {
 	return agent.session?.header?.agentPreset;
 }
-function completionNoticeText(sessionId, task, outcome, screenBusy, userStopped) {
-	const body = userStopped ? `The user stopped background Code agent session ${sessionId} from the main window:\n${task}\n\nLast output before it stopped:\n${outcome}` : `Background Code agent session ${sessionId} finished this task:\n${task}\n\n${outcome}`;
-	return `${body.length <= 4e3 ? body : `${body.slice(0, 3999)}…`}${userStopped ? "\n\nDo not restart this task and do not call code_agent for it again unless the user asks." : ""}${screenBusy ? `\n\n${SCREEN_BUSY_SUFFIX}` : ""}`;
+function completionNoticeText(sessionId, task, outcome, screenBusy, userStopped, stillRunning = false) {
+	const body = userStopped ? `The user stopped background Code agent session ${sessionId} from the main window:\n${task}\n\nLast output before it stopped:\n${outcome}` : `Background Code agent session ${sessionId} ${stillRunning ? "completed the stretch you dispatched (its own turns are still running)" : "finished this task"}:\n${task}\n\n${outcome}`;
+	return `${body.length <= 4e3 ? body : `${body.slice(0, 3999)}…`}${userStopped ? "\n\nDo not restart this task and do not call code_agent for it again unless the user asks." : stillRunning ? "\n\nThat Code session is still working on later rounds. Use this result to decide your next step now; call code_agent_status to check progress, and only dispatch another stretch to the same session_id when this one is not the answer you needed." : ""}${screenBusy ? `\n\n${SCREEN_BUSY_SUFFIX}` : ""}`;
 }
 //#endregion
 //#region src/code-agent-registry.ts
