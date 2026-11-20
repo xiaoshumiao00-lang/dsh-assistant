@@ -4,11 +4,23 @@
  * 三条入口共用这一个动作（长按悬浮球 / 桌面全局热键 / 控制室「个人秘书」卡）。
  * 固定会话 id 的宿主真值在 `/api/assistant/secretary`；localStorage 只做首屏缓存。
  *
+ * 2026-11-20 实测反馈：长按要等好几秒才出秘书页。根因是打开流程把
+ * 「校验固定会话 → 恢复归档 → 重命名 → 置顶 → 选模型 → 持久化 → 关托管 → 切只读（再串行轮询确认）→
+ * 打开页面」全部串起来，任何一步慢（尤其是只读确认的 20×75ms 轮询）都挡在页面出现之前。
+ *
+ * 现在的顺序：
+ *   1. **同步开页**：只用本地缓存（sessionId / 家目录 / 上次已知的只读与托管状态）渲染骨架屏，
+ *      0 个网络请求；
+ *   2. **后台并行维护**：校验 / 建会话 / 恢复归档 / 重命名 / 置顶 / 持久化 / 关托管 / 切只读
+ *      各自独立发出（不再互相等待），结果到了再增量 update 页面；
+ *   3. 任何一步失败都只记进 `lastAssistantOpen().warning`（诊断用）或后台重试，
+ *      **绝不阻塞页面打开**，也**不在页面上挂黄字横幅**；真发消息时再拦。
+ *
  * 安全边界：
  *   - 会话切到 read-only（权限预设“仅可查看”）；
  *   - 显式把会话托管关掉（托管会把审批自动答成 allowed-once，能绕过一次性升权）；
  *   - 宿主侧 assistant-secretary 工具闸拒绝 write/edit/shell/Computer Use/子代理/派单工具；
- *   - 页面上的「派活」创建独立会话，绝不走子代理（子代理会继承父会话的只读档）。
+ *   - 页面上的派活创建独立会话，绝不走子代理（子代理会继承父会话的只读档）。
  */
 import { getAssistantApi, readModelPref, exitWorkspace } from './orb-bridge'
 import { secretaryStore } from './pocket/orb/state.ts'
@@ -18,10 +30,12 @@ export const SECRETARY_TITLE = '个人秘书'
 /** 标准模式（空 preset id）：秘书只靠只读权限和工具闸约束，不加载 Computer Use。 */
 export const ASSISTANT_AGENT_PRESET = ''
 const CACHE_KEY = 'dsh.assistant.secretary.sessionId'
+const HOME_KEY = 'dsh.assistant.home'
 const LEGACY_SESSION_KEY = 'dsh.assistant.sessionId'
 const SECRETARY_ROUTE = '/api/assistant/secretary'
 const TUOGUAN_ROUTE = '/.dsh-tuoguan/state'
 
+/** 页面打开时拿到的秘书信息。readOnly / tuoguanOff 是"当前确认到的事实"，不是承诺。 */
 export interface AssistantOpenResult {
   sessionId: string
   cwd: string
@@ -29,6 +43,14 @@ export interface AssistantOpenResult {
   tuoguanOff: boolean
   persisted: boolean
   warning: string
+}
+
+/** 发送前闸门结果：ok=false 时页面必须阻止发送并提示原因。 */
+export interface AssistantSendGate {
+  ok: boolean
+  readOnly: boolean
+  tuoguanOff: boolean
+  reason: string
 }
 
 function readKey(key: string): string {
@@ -52,18 +74,23 @@ export function peekSecretarySessionId(): string {
   return readKey(CACHE_KEY)
 }
 
+/** 已缓存的助手家目录（首屏直接用，避免等一次 HTTP）。 */
+export function peekAssistantHome(): string {
+  return readKey(HOME_KEY)
+}
+
 let homeInflight: Promise<string> | null = null
 
 /** 助手家目录：先读缓存，没有就向宿主要一次（失败返回空串，调用方决定退让）。 */
 export async function assistantHomeDir(): Promise<string> {
-  const cached = readKey('dsh.assistant.home')
+  const cached = readKey(HOME_KEY)
   if (cached) return cached
   if (homeInflight !== null) return homeInflight
   homeInflight = fetch('/api/assistant/home', { cache: 'no-store' })
     .then((response) => response.json())
     .then((body: any) => {
       const dir = String(body?.dir ?? '').trim()
-      if (dir) writeKey('dsh.assistant.home', dir)
+      if (dir) writeKey(HOME_KEY, dir)
       return dir
     })
     .catch(() => '')
@@ -128,138 +155,231 @@ function isPhoneViewport(): boolean {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
-let opening: Promise<AssistantOpenResult | null> | null = null
 let lastOpen: AssistantOpenResult | null = null
-
 /** 最近一次成功打开的秘书信息（诊断/测试用）。 */
 export function lastAssistantOpen(): AssistantOpenResult | null {
   return lastOpen
 }
 
+/** 后台维护在途（重复长按不再叠第二条维护链）。 */
+let maintenance: Promise<AssistantOpenResult | null> | null = null
+
+function storeOpenFromCache(sessionId: string, cwd: string): void {
+  // 上一版页面（同一次会话里）确认过的状态可以先用，避免骨架屏闪一下"未确认"。
+  const previous = secretaryStore.getSnapshot()
+  secretaryStore.open({
+    sessionId,
+    cwd,
+    readOnly: previous.sessionId === sessionId ? previous.readOnly : false,
+    tuoguanOff: previous.sessionId === sessionId ? previous.tuoguanOff : false,
+    persisted: sessionId !== '',
+    warning: '',
+    phase: 'cache',
+  })
+}
+
 /**
  * 打开或复用固定秘书会话。
+ *
+ * **同步语义**：手机端在第一次 await 之前就已经把秘书页挂上（缓存渲染），
+ * 之后的校验全部在后台跑；调用方（长按/热键）不必等网络。
+ *
  * @param opts.surface - auto（手机走页面、桌面走宿主） / page（强制页面） / host（强制宿主会话）。
- * @returns 是否已经把秘书送到用户面前。
+ * @returns 是否已经把秘书送到用户面前（缓存也算送到）。
  */
-export async function openAssistant(opts: { surface?: 'auto' | 'page' | 'host' } = {}): Promise<boolean> {
-  if (opening !== null) {
-    const pending = await opening
-    return pending !== null
+export function openAssistant(opts: { surface?: 'auto' | 'page' | 'host' } = {}): Promise<boolean> {
+  const api = getAssistantApi()
+  if (!api) return Promise.resolve(false)
+  try { exitWorkspace() } catch { /* 收项目分栏失败不影响打开 */ }
+
+  const cachedId = peekSecretarySessionId()
+  const cachedHome = peekAssistantHome()
+  const wantedPage = opts.surface === 'page' || (opts.surface !== 'host' && isPhoneViewport())
+
+  if (wantedPage) {
+    // ① 先开页：0 请求、0 await
+    storeOpenFromCache(cachedId, cachedHome)
   }
-  const run = (async (): Promise<AssistantOpenResult | null> => {
-    const api = getAssistantApi()
-    if (!api) return null
-    exitWorkspace()
-    const home = await assistantHomeDir()
-    if (!home) return null
 
-    const wantedPage = opts.surface === 'page' || (opts.surface !== 'host' && isPhoneViewport())
-    const stored = await fetchStoredSecretaryId()
-    let sessionId = ''
-
-    if (stored) {
-      // 列表还没到 ready 时不要急着判“会话不存在”，否则会在宿主冷启动时多建一条。
-      if (!api.sessionExists(stored)) {
-        for (let i = 0; i < 20 && !api.sessionListReady(); i += 1) await sleep(100)
-      }
-      if (api.sessionExists(stored)) sessionId = stored
-    }
-
-    const previousId = sessionId || stored || readKey(LEGACY_SESSION_KEY)
-    const previousRow = previousId ? api.sessionRow(previousId) : null
-    const remembered = previousRow ? sessionModelOf(previousRow) : null
-    const fallback = readModelPref('standard')
-
-    let created = false
-    if (sessionId === '') {
-      try {
-        const result = await api.createSession(home, undefined, { reuseBlank: false })
-        sessionId = result.sessionId
-        created = true
-      } catch (error) {
-        console.warn('[dsh-assistant] 创建个人秘书会话失败：', error)
+  // ② 后台维护：单链、并行；结果到了增量写回 store
+  if (maintenance === null) {
+    maintenance = ensureSecretary(api, { wantedPage, cachedId, cachedHome })
+      .catch((error) => {
+        console.warn('[dsh-assistant] 个人秘书后台维护失败：', error)
         return null
-      }
+      })
+      .finally(() => { maintenance = null })
+  }
+  return Promise.resolve(true)
+}
+
+/** 后台维护：校验 / 建会话 / 置顶 / 只读 / 关托管 / 持久化。任一步失败都不阻塞页面。 */
+async function ensureSecretary(
+  api: OrbApi,
+  opts: { wantedPage: boolean; cachedId: string; cachedHome: string },
+): Promise<AssistantOpenResult | null> {
+  // ① 宿主真值与家目录并行取（两个独立 GET）
+  const [stored, home] = await Promise.all([fetchStoredSecretaryId(), assistantHomeDir()])
+  const cwd = home || opts.cachedHome
+  let sessionId = stored || opts.cachedId
+
+  // ② 列表未就绪时给一个有限等待（在后台，页面早已显示）；就绪后再判存
+  if (sessionId !== '' && !api.sessionExists(sessionId)) {
+    for (let i = 0; i < 12 && !api.sessionListReady(); i += 1) await sleep(100)
+  }
+  const listAuthoritative = api.sessionListReady()
+  const exists = sessionId !== '' && api.sessionExists(sessionId)
+
+  let created = false
+  // 列表已就绪、且里面确实没有这条会话（被删/被换）→ 才重建。
+  // 列表还没到就绪就先用手上的 id 打开：宁可这一次发送时报「会话不存在」，
+  // 也不能在后台多建出一条秘书会话（会长出两条固定会话，谁都不对）。
+  if (sessionId === '' || (listAuthoritative && !exists)) {
+    if (cwd === '') {
+      // 家目录都拿不到：页面留在骨架屏，不发消息也不乱建会话
+      secretaryStore.update({ warning: '助手家目录不可用（/api/assistant/home）', phase: 'ready' })
+      return null
     }
-
-    // 固定会话恢复：归档的会话先拉回列表，再置顶。失败不伪装成功。
-    try { await api.unarchiveSession(sessionId) } catch { /* 本来就没归档 */ }
-    try { await api.renameSession(sessionId, SECRETARY_TITLE) } catch { /* 标题不是功能依赖 */ }
-    let pinned = true
-    try { await api.pinSession(sessionId) } catch { pinned = false }
-
-    // 新会话才继承上次模型；已有固定会话不覆盖用户当前模型。
-    if (created) {
-      const wanted = remembered ?? fallback
-      if (wanted) {
-        try {
-          await api.selectModel(sessionId, { provider: wanted.provider, model: wanted.model })
-        } catch { /* 模型失效时保留宿主默认 */ }
-      }
+    try {
+      const result = await api.createSession(cwd, undefined, { reuseBlank: false })
+      sessionId = result.sessionId
+      created = true
+      writeKey(CACHE_KEY, sessionId)
+      secretaryStore.update({ sessionId, cwd })
+    } catch (error) {
+      console.warn('[dsh-assistant] 创建个人秘书会话失败：', error)
+      secretaryStore.update({ warning: '无法创建个人秘书会话', phase: 'ready' })
+      return null
     }
+  }
 
-    const persisted = await persistSecretaryId(sessionId)
-    const tuoguanOff = await ensureTuoguanOff(sessionId)
-    const readOnlyResult = await api.setReadOnly(sessionId)
-    const readOnly = readOnlyResult.ok
-    const warnings: string[] = []
-    if (!persisted) warnings.push('固定会话 ID 未能写入宿主（重启后可能重新选一条）')
-    if (!pinned) warnings.push('会话置顶失败')
-    if (!readOnly) warnings.push(`只读权限未确认（当前：${readOnlyResult.current ?? '未知'}）`)
-    if (!tuoguanOff) warnings.push('托管未确认关闭，发送已禁用')
+  // ③ 固定会话恢复：这四件事互不依赖 → 并行发出（以前是串行 await）
+  const pinTask = api.pinSession(sessionId).then(() => true, () => false)
+  const persistedTask = persistSecretaryId(sessionId)
+  const tuoguanTask = ensureTuoguanOff(sessionId)
+  const readOnlyTask = api.setReadOnly(sessionId)
+  // 恢复归档 / 重命名 / （新建时）继承模型：只为体验，失败无所谓，独立跑
+  void api.unarchiveSession(sessionId).catch(() => {})
+  void api.renameSession(sessionId, SECRETARY_TITLE).catch(() => {})
+  if (created) {
+    const remembered = sessionModelOfSafe(api, sessionId) ?? readModelPref('standard')
+    if (remembered) {
+      void api.selectModel(sessionId, { provider: remembered.provider, model: remembered.model }).catch(() => {})
+    }
+  }
 
-    const result: AssistantOpenResult = {
+  const [pinned, persisted, tuoguanOff, readOnlyResult] = await Promise.all([
+    pinTask,
+    persistedTask,
+    tuoguanTask,
+    readOnlyTask,
+  ])
+
+  let readOnly = readOnlyResult.ok
+  const warnings: string[] = []
+  if (!persisted) warnings.push('固定会话 ID 未能写入宿主（重启后可能重新选一条）')
+  if (!pinned) warnings.push('会话置顶失败')
+  if (!readOnly) warnings.push(`只读权限未确认（当前：${readOnlyResult.current ?? '未知'}）`)
+  if (!tuoguanOff) warnings.push('托管未确认关闭')
+
+  const result: AssistantOpenResult = {
+    sessionId,
+    cwd,
+    readOnly,
+    tuoguanOff,
+    persisted,
+    warning: warnings.join('；'),
+  }
+  lastOpen = result
+
+  if (opts.wantedPage) {
+    secretaryStore.update({
       sessionId,
-      cwd: home,
+      cwd,
       readOnly,
       tuoguanOff,
       persisted,
-      warning: warnings.join('；'),
+      warning: result.warning,
+      phase: 'ready',
+    })
+  } else {
+    secretaryStore.close()
+    secretaryStore.update({
+      sessionId,
+      cwd,
+      readOnly,
+      tuoguanOff,
+      persisted,
+      warning: result.warning,
+      phase: 'ready',
+    })
+    const focused = await api.focusSession(sessionId)
+    if (!focused.opened) {
+      try { api.openSession(sessionId) } catch {}
     }
-    lastOpen = result
+  }
 
-    if (wantedPage) {
-      secretaryStore.open({
-        sessionId: result.sessionId,
-        cwd: result.cwd,
-        readOnly: result.readOnly,
-        tuoguanOff: result.tuoguanOff,
-        persisted: result.persisted,
-        warning: result.warning,
-      })
-    } else {
-      secretaryStore.close()
-      secretaryStore.update({
-        sessionId: result.sessionId,
-        cwd: result.cwd,
-        readOnly: result.readOnly,
-        tuoguanOff: result.tuoguanOff,
-        persisted: result.persisted,
-        warning: result.warning,
-      })
-      const focused = await api.focusSession(sessionId)
-      if (!focused.opened) {
-        try { api.openSession(sessionId) } catch {}
-      }
-    }
-    return result
-  })()
+  // ④ 只读还没确认 → 后台退避重读（不挡任何交互）；页面不挂横幅，只在真发消息时拦
+  if (!readOnly) {
+    void api.confirmReadOnly(sessionId).then((confirmed) => {
+      if (!confirmed.ok) return
+      readOnly = true
+      if (lastOpen !== null && lastOpen.sessionId === sessionId) lastOpen = { ...lastOpen, readOnly: true, warning: '' }
+      secretaryStore.update({ readOnly: true })
+    })
+  }
+  return result
+}
 
-  opening = run
+/** 会话模型读取（API 形状变了也不让打开流程抛错）。 */
+function sessionModelOfSafe(api: OrbApi, sessionId: string): { provider: string; model: string } | null {
   try {
-    const result = await run
-    return result !== null
-  } catch (error) {
-    console.warn('[dsh-assistant] 打开个人秘书失败：', error)
-    return false
-  } finally {
-    opening = null
+    const row = api.sessionRow(sessionId)
+    const selection = row?.modelSelection?.next ?? row?.modelSelection?.lastUsed ?? null
+    return selection === null ? null : { provider: selection.provider, model: selection.model }
+  } catch {
+    return null
   }
 }
 
-function sessionModelOf(row: ReturnType<OrbApi['sessionRow']>): { provider: string; model: string } | null {
-  const selection = row?.modelSelection?.next ?? row?.modelSelection?.lastUsed ?? null
-  return selection === null ? null : { provider: selection.provider, model: selection.model }
+/**
+ * 发送前闸门：确认"只读 + 托管关闭"。
+ * 页面不显示任何"未确认"横幅；只有用户真的按了发送、而这里拿不到确认时才阻止并提示。
+ * @param sessionId - 固定秘书会话 id。
+ * @returns ok=false 时带上人话原因。
+ */
+export async function ensureSecretaryGate(sessionId: string): Promise<AssistantSendGate> {
+  const api = getAssistantApi()
+  const id = String(sessionId ?? '').trim()
+  if (!api || id === '') {
+    return { ok: false, readOnly: false, tuoguanOff: false, reason: '秘书会话还没就绪，稍等一下再发' }
+  }
+  // 两件事并行确认（都不依赖对方）
+  const [readOnlyResult, tuoguanOff] = await Promise.all([
+    api.permissionOf(id) === 'read-only'
+      ? Promise.resolve({ ok: true, current: 'read-only', applied: false })
+      : api.setReadOnly(id),
+    ensureTuoguanOff(id),
+  ])
+  const readOnly = readOnlyResult.ok
+  secretaryStore.update({ readOnly, tuoguanOff })
+  if (!readOnly) {
+    return {
+      ok: false,
+      readOnly,
+      tuoguanOff,
+      reason: '只读权限还没确认，先把这条消息拦下来了（后台会继续重试；确认后可直接再发）',
+    }
+  }
+  if (!tuoguanOff) {
+    return {
+      ok: false,
+      readOnly,
+      tuoguanOff,
+      reason: '托管没关掉，这时候发消息可能被自动审批绕过只读，先拦下来了',
+    }
+  }
+  return { ok: true, readOnly, tuoguanOff, reason: '' }
 }
 
 /** URL 直达：…/?assistant=chat 打开个人秘书（重开窗口/外部唤起时用）。 */
@@ -269,4 +389,9 @@ export function assistantUrlIntent(): boolean {
     const hash = String(window.location?.hash ?? '')
     return /[?&]assistant=chat(?:&|$)/.test(search) || hash === '#assistant'
   } catch { return false }
+}
+
+/** 旧版一起打开过的普通助手会话 id（仅兼容读取，不参与打开流程）。 */
+export function legacyAssistantSessionId(): string {
+  return readKey(LEGACY_SESSION_KEY)
 }

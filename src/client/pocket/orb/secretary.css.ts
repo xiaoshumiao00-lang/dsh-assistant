@@ -71,6 +71,28 @@ export const SECRETARY_CSS = `
   text-overflow: ellipsis;
 }
 [data-pocket-secretary="header-spacer"] { flex: 1; }
+[data-pocket-secretary="header-pill"] {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, .12));
+  border-radius: 999px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, #6b7280);
+  font-size: 10.5px;
+  line-height: 1;
+  white-space: nowrap;
+}
+[data-pocket-secretary="header-pill"][data-tone="calm"] {
+  border-color: var(--dsw-alias-state-success-primary, #16a34a);
+  color: var(--dsw-alias-state-success-primary, #16a34a);
+}
+[data-pocket-secretary="header-pill"][data-tone="busy"] {
+  border-color: var(--dsw-alias-border-l2, #e5e7eb);
+  color: var(--dsw-alias-label-tertiary, #8b93a1);
+}
 [data-pocket-secretary="header-state"] {
   flex: none;
   display: inline-flex;
@@ -80,6 +102,7 @@ export const SECRETARY_CSS = `
   font-size: 11px;
   font-weight: 500;
 }
+
 [data-pocket-secretary="header-state"]::before {
   content: "";
   width: 6px;
@@ -119,18 +142,6 @@ export const SECRETARY_CSS = `
   height: 2px;
   border-radius: 2px 2px 0 0;
   background: var(--dsw-alias-state-business-primary, #4f6ef7);
-}
-
-[data-pocket-secretary="warning"] {
-  flex: none;
-  margin: 8px 12px 0;
-  padding: 8px 10px;
-  border: 1px solid var(--dsw-alias-state-warn-primary, #b45309);
-  border-radius: 10px;
-  background: var(--dsw-alias-fill-l1, rgba(0, 0, 0, .03));
-  color: var(--dsw-alias-state-warn-primary, #b45309);
-  font-size: 11px;
-  line-height: 1.45;
 }
 
 [data-pocket-secretary="scroll"] {
@@ -299,126 +310,47 @@ export const SECRETARY_CSS = `
   overflow-wrap: anywhere;
 }
 
+/* 输入区由 pocket 页面已有的 Composer 渲染（data-pocket-orb=* 由 orb.css 供样式）；
+   这里只留容器：与 orb 页一致的内边距，输入框贴在底部状态行之上。 */
 [data-pocket-secretary="composer"] {
   flex: none;
   padding: 8px 12px 6px;
   border-top: 1px solid var(--dsw-alias-border-l2, #e5e7eb);
   background: var(--dsw-alias-bg-base, #ffffff);
 }
-[data-pocket-secretary="dispatch-row"] {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin: 0 2px 7px;
-  color: var(--dsw-alias-label-tertiary, #8b93a1);
-  font-size: 10.5px;
-}
-[data-pocket-secretary="dispatch-path"] {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--dsw-alias-label-secondary, #6b7280);
-}
-[data-pocket-secretary="mini-btn"] {
-  flex: none;
-  height: 22px;
-  padding: 0 8px;
-  border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, .12));
-  border-radius: 999px;
-  background: transparent;
-  color: var(--dsw-alias-label-secondary, #6b7280);
-  font: inherit;
-  font-size: 10.5px;
-  cursor: pointer;
-}
-[data-pocket-secretary="modes"] {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  margin: 0 1px 6px;
-}
-[data-pocket-secretary="mode"] {
-  height: 23px;
-  padding: 0 9px;
-  border: 1px solid var(--dsw-alias-border-l2, #e5e7eb);
-  border-radius: 999px;
-  background: transparent;
-  color: var(--dsw-alias-label-tertiary, #8b93a1);
-  font: inherit;
-  font-size: 10.5px;
-  cursor: pointer;
-}
-[data-pocket-secretary="mode"][data-active="1"] {
-  border-color: transparent;
-  background: var(--dsw-alias-fill-l1, rgba(0, 0, 0, .04));
-  color: var(--dsw-alias-label-primary, inherit);
-  font-weight: 600;
-}
-[data-pocket-secretary="input-row"] {
-  display: flex;
-  align-items: flex-end;
-  gap: 8px;
-  padding: 7px 8px 7px 12px;
-  border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, .12));
-  border-radius: 20px;
-  background: var(--dsw-alias-bg-layer-1, #ffffff);
-  box-shadow: 0 2px 10px rgba(0, 0, 0, .035);
-}
-[data-pocket-secretary="input"] {
-  flex: 1;
-  min-width: 0;
-  min-height: 26px;
-  max-height: 112px;
-  padding: 4px 0;
-  border: 0;
-  outline: 0;
-  resize: none;
-  background: transparent;
-  color: var(--dsw-alias-label-primary, inherit);
-  font: inherit;
-  font-size: 14px;
-  line-height: 1.45;
-}
-[data-pocket-secretary="input"]::placeholder { color: var(--dsw-alias-label-tertiary, #8b93a1); }
-[data-pocket-secretary="send"] {
-  flex: none;
-  width: 34px;
-  height: 34px;
-  border: 0;
-  border-radius: 50%;
-  background: var(--dsw-alias-state-business-primary, #4f6ef7);
-  color: var(--dsw-alias-label-primary-foreground, #fff);
-  font: inherit;
-  font-size: 19px;
-  font-weight: 500;
-  line-height: 1;
-  cursor: pointer;
-}
-[data-pocket-secretary="send"]:disabled {
-  background: var(--dsw-alias-fill-l1, rgba(0, 0, 0, .06));
-  color: var(--dsw-alias-label-tertiary, #8b93a1);
-  cursor: default;
-}
+[data-pocket-secretary="composer"] [data-pocket-orb="composer"] { border-top: 0; }
+
+/* 底部状态行：轮次 · tok/s · 总 token · 缓存命中 · 上下文占用（真实投影值，单行省略）。
+   不是自造的输入区，也不再放「只读未确认 / 托管未确认」这类黄字。 */
 [data-pocket-secretary="statusbar"] {
   flex: none;
   display: flex;
   align-items: center;
-  gap: 10px;
-  min-height: 25px;
-  padding: 0 14px 4px;
+  min-height: 24px;
+  padding: 0 14px calc(4px + env(safe-area-inset-bottom, 0px));
   color: var(--dsw-alias-label-tertiary, #8b93a1);
   font-size: 10px;
+  line-height: 1.4;
   white-space: nowrap;
-  overflow: hidden;
-}
-[data-pocket-secretary="statusbar"] span {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-[data-pocket-secretary="status-good"] { color: var(--dsw-alias-state-success-primary, #16a34a); }
-[data-pocket-secretary="status-warn"] { color: var(--dsw-alias-state-warn-primary, #b45309); }
+[data-pocket-secretary="statusbar"][data-state="empty"] { opacity: .55; }
+
+/* 首屏骨架：后台校验期间先把版面占住，别让用户对着空白等。 */
+[data-pocket-secretary="skeleton"] { display: grid; gap: 8px; padding: 12px 14px; }
+[data-pocket-secretary="skeleton"] i {
+  display: block;
+  height: 54px;
+  border-radius: 12px;
+  background: linear-gradient(100deg, var(--dsw-alias-fill-l1, rgba(0,0,0,.04)) 30%, var(--dsw-alias-fill-l2, rgba(0,0,0,.07)) 50%, var(--dsw-alias-fill-l1, rgba(0,0,0,.04)) 70%);
+  background-size: 220% 100%;
+  animation: dsh-secretary-skeleton 1.1s ease-in-out infinite;
+}
+[data-pocket-secretary="skeleton"] i:nth-child(2) { width: 88%; }
+[data-pocket-secretary="skeleton"] i:nth-child(3) { width: 74%; }
+@keyframes dsh-secretary-skeleton { from { background-position: 120% 0; } to { background-position: -80% 0; } }
+
 [data-pocket-secretary="toast"] {
   position: fixed;
   left: 50%;

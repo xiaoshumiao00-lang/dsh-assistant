@@ -195,7 +195,7 @@ export function registerAssistantSecretary(ctx: any): () => void {
       if (!secretaryToolDenied(tool)) return next()
       return {
         kind: 'deny',
-        reason: `个人秘书是只读会话，不执行任务、不派子代理（已拒绝 ${tool || '未知工具'}）。请在个人秘书页面用「派活」创建独立会话。`,
+        reason: `个人秘书是只读会话，不执行任务、不派子代理（已拒绝 ${tool || '未知工具'}）。要干活请在秘书页把任务发出去——页面会按项目相关性/复杂度自动派到合适的会话目录。`,
       }
     })
   } catch {

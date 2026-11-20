@@ -25,7 +25,8 @@ export const orbStore = {
 }
 
 /** 个人秘书页状态：固定会话 + 只读/托管状态 + 当前页是否展开。
- *  会话 id 的真值在宿主（/api/assistant/secretary），这里只是给 UI 的同步快照。 */
+ *  会话 id 的真值在宿主（/api/assistant/secretary），这里只是给 UI 的同步快照。
+ *  phase：'cache' = 用本地缓存先渲染（尚未校验），'ready' = 后台维护已跑完一轮。 */
 export interface SecretaryViewState {
   open: boolean
   sessionId: string
@@ -34,6 +35,7 @@ export interface SecretaryViewState {
   tuoguanOff: boolean
   persisted: boolean
   warning: string
+  phase: 'cache' | 'ready'
 }
 
 let secretaryView: SecretaryViewState = {
@@ -44,6 +46,7 @@ let secretaryView: SecretaryViewState = {
   tuoguanOff: false,
   persisted: false,
   warning: '',
+  phase: 'cache',
 }
 const secretaryListeners = new Set<() => void>()
 

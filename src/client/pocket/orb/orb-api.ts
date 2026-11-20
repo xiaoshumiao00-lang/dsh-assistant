@@ -85,6 +85,19 @@ export interface OrbModel {
   description?: string
 }
 
+/** 会话统计（页面底部状态行：轮次 · tok/s · 总 token · 缓存命中 · 上下文占用）。
+ *  一律取宿主投影的真实值；未知字段是 null（不拿 0 冒充）。 */
+export interface OrbSessionStats {
+  turns: number | null
+  steps: number | null
+  tokPerSec: number | null
+  totalTokens: number | null
+  /** 缓存命中占提示词计费侧输入的百分比（0–100，一位小数）。 */
+  cacheHitPercent: number | null
+  /** 上下文占用百分比（0–100 整数）。 */
+  contextPercent: number | null
+}
+
 /** 浏览器无 secure context（局域网 http）时 crypto.randomUUID 不可用，自备 RFC4122 v4。 */
 function newRequestId(): string {
   try {
@@ -249,16 +262,91 @@ export function makeOrbApi(ctx: any) {
     return out
   }
 
-  /** 读某会话当前的权限预设（permissions 投影）。读不到返回 null。 */
-  const permissionOf = (sessionId: string): string | null => {
+  /**
+   * 读某会话的一条投影值。**三个来源依次回退**（2026-11-20 修「只读权限未确认（当前：未知）」）：
+   *   1. 已物化会话的实时投影面（faceOf）——只有在当前客户端把这条会话开出来时才有；
+   *   2. 列表行的零 IO 投影缓存（byId[id].projectionValues）——冷会话也有值，这是关键来源；
+   *   3. 列表快照的 projectionsBySession[id].values——由显式基线读 / 控制帧填充。
+   * 旧实现只读第 1 条：秘书页并不打开会话，binding() 直接返回 undefined，
+   * 于是 `/permission read-only` 明明成功了，回读永远是 null → 被当成"未知"。
+   */
+  const projectionOf = (sessionId: string, key: string): unknown => {
+    const id = String(sessionId ?? '').trim()
+    if (id === '' || key === '') return undefined
     try {
-      const face = ctx.sessions?.binding?.(sessionId)?.session?.projections?.faceOf?.('permissions')?.getSnapshot?.()
-      const value = face && typeof face === 'object' ? (face as any).currentValue : undefined
-      return typeof value === 'string' && value !== '' ? value : null
-    } catch {
-      return null
+      const face = ctx.sessions?.binding?.(id)?.session?.projections?.faceOf?.(key)?.getSnapshot?.()
+      if (face !== undefined && face !== null) return face
+    } catch { /* 会话未物化 / 无该投影键 → 走缓存来源 */ }
+    try {
+      const snap: any = ctx.sessions?.list?.getSnapshot?.()
+      const row: any = snap?.byId?.[id]
+      const values: any = row?.projectionValues ?? row?.projections?.values
+      const cached = values?.[key]
+      if (cached !== undefined && cached !== null) return cached
+      const shared = snap?.projectionsBySession?.[id]?.values?.[key]
+      if (shared !== undefined && shared !== null) return shared
+    } catch { /* 宿主没有该快照形状 → 当作未知 */ }
+    return undefined
+  }
+
+  /** 主动向宿主拉一次该会话的权威投影（冷会话的补读），失败不抛。 */
+  const refreshProjections = async (sessionId: string): Promise<void> => {
+    try { await ctx.sessions?.refreshProjections?.(sessionId) } catch { /* 宿主旧版本没有这个方法 */ }
+  }
+
+  /** 读某会话当前的权限预设（permissions 投影：{ currentValue }）。读不到返回 null。 */
+  const permissionOf = (sessionId: string): string | null => {
+    const value: any = projectionOf(sessionId, 'permissions')
+    const current = value && typeof value === 'object' ? (value as any).currentValue : undefined
+    return typeof current === 'string' && current !== '' ? current : null
+  }
+
+  /** 权限预设 → 中文档位名（与官方权限选择器同一套中文）。 */
+  const permissionLabelOf = (preset: string | null): string => {
+    if (preset === 'read-only') return '仅可查看'
+    if (preset === 'workspace-write') return '工作区内修改'
+    if (preset === 'danger-full-access') return '完全权限'
+    if (preset === 'auto') return '自动审查'
+    if (preset === 'custom') return '自定义'
+    return ''
+  }
+
+  /**
+   * 会话统计（真实数据，来自宿主投影，页面底部状态行用它）：
+   *   sessionStats（轮次/步数/解码毫秒与 token）+ tokenUsage（用量桶）+ contextPressure（上下文占用）。
+   * 读不到的字段给 null，由页面决定隐藏，不用 0 冒充。
+   */
+  const statsOf = (sessionId: string): OrbSessionStats => {
+    const raw: any = projectionOf(sessionId, 'sessionStats')
+    const usage: any = projectionOf(sessionId, 'tokenUsage')
+    const pressure: any = projectionOf(sessionId, 'contextPressure')
+    const turns = Number(raw?.turns)
+    const steps = Number(raw?.steps)
+    const decodeMs = Number(raw?.decodeMs)
+    const decodeTokens = Number(raw?.decodeTokens)
+    const totals = usage?.totals ?? usage ?? null
+    const uncached = Number(totals?.uncachedInputTokens ?? totals?.inputTokens ?? 0)
+    const cacheRead = Number(totals?.cacheReadTokens ?? 0)
+    const cacheWrite = Number(totals?.cacheWriteTokens ?? 0)
+    const output = Number(totals?.outputTokens ?? 0)
+    const billedInput = uncached + cacheRead + cacheWrite
+    const totalTokens = billedInput + output
+    const usedTokens = Number(pressure?.projectedTokens ?? pressure?.pressureTokens)
+    const contextWindow = Number(pressure?.contextWindow)
+    return {
+      turns: Number.isFinite(turns) ? turns : null,
+      steps: Number.isFinite(steps) ? steps : null,
+      tokPerSec: Number.isFinite(decodeMs) && decodeMs > 0 && Number.isFinite(decodeTokens)
+        ? decodeTokens / (decodeMs / 1000)
+        : null,
+      totalTokens: totalTokens > 0 ? totalTokens : null,
+      cacheHitPercent: billedInput > 0 ? Math.min(100, Math.round(cacheRead / billedInput * 1000) / 10) : null,
+      contextPercent: Number.isFinite(usedTokens) && Number.isFinite(contextWindow) && contextWindow > 0
+        ? Math.min(100, Math.round(usedTokens / contextWindow * 100))
+        : null,
     }
   }
+
 
   /** 语音转写服务（官方 voice-input 插件挂载的 cordis 服务，服务名是 'remote.speech'）。
    * 不能用 ctx.remote.speech 直接取：那个命名空间是以**独立 Service** 注册的
@@ -653,31 +741,96 @@ export function makeOrbApi(ctx: any) {
       return officialCatalogOf(sessionId)
     },
 
-    /** 读某会话当前权限预设；投影还没到达时返回 null。 */
+    /** 读某会话当前权限预设；投影来源见 projectionOf（列表缓存也算数）。 */
     permissionOf(sessionId: string): string | null {
       return permissionOf(sessionId)
     },
 
+    /** 权限预设的中文档位名（空串 = 未知）。 */
+    permissionLabel(sessionId: string): string {
+      return permissionLabelOf(permissionOf(sessionId))
+    },
+
+    /** 会话统计（真实投影值，页面状态行用）。 */
+    sessionStats(sessionId: string): OrbSessionStats {
+      return statsOf(sessionId)
+    },
+
     /**
-     * 把会话切到 read-only 并回读投影确认。
-     * 走宿主 /permission 命令（和输入框同一条写路径）；命令成功但投影还没到时短暂轮询，
-     * 绝不把“命令返回 200”当成已经只读。
+     * 把会话切到 read-only 并回读确认。
+     * 走宿主 /permission 命令（和输入框同一条写路径）。回读顺序：
+     *   命令后立刻读第 1 遍 → 未知就主动向宿主拉一次权威投影（refreshProjections）再读，
+     *   之后在**后台**按 120/240/480ms 退避重试几次。
+     * 不再在打开流程里串行轮询 20×75ms —— 那是长按要等好几秒的主要来源。
      */
-    async setReadOnly(sessionId: string): Promise<{ ok: boolean; current: string | null }> {
-      if (permissionOf(sessionId) === 'read-only') return { ok: true, current: 'read-only' }
+    async setReadOnly(sessionId: string): Promise<{ ok: boolean; current: string | null; applied: boolean }> {
+      const before = permissionOf(sessionId)
+      if (before === 'read-only') return { ok: true, current: 'read-only', applied: false }
+      let applied = false
       try {
         const result = await this.commandExecute(sessionId, '/permission read-only')
-        if (result.kind === 'error') return { ok: false, current: permissionOf(sessionId) }
+        applied = result.kind === 'success'
+        if (result.kind === 'error') return { ok: false, current: permissionOf(sessionId), applied: false }
       } catch {
-        return { ok: false, current: permissionOf(sessionId) }
+        return { ok: false, current: permissionOf(sessionId), applied: false }
       }
-      for (let i = 0; i < 20; i += 1) {
+      const after = permissionOf(sessionId)
+      if (after === 'read-only') return { ok: true, current: after, applied }
+      await refreshProjections(sessionId)
+      const confirmed = permissionOf(sessionId)
+      if (confirmed === 'read-only') return { ok: true, current: confirmed, applied }
+      return { ok: false, current: confirmed, applied }
+    },
+
+    /** 后台确认（不阻塞页面）：命令已成功但投影还没到 → 退避重读几次。 */
+    async confirmReadOnly(sessionId: string, attempts = 4): Promise<{ ok: boolean; current: string | null }> {
+      let wait = 120
+      for (let i = 0; i < attempts; i += 1) {
         const current = permissionOf(sessionId)
         if (current === 'read-only') return { ok: true, current }
-        await new Promise((resolve) => setTimeout(resolve, 75))
+        await refreshProjections(sessionId)
+        const again = permissionOf(sessionId)
+        if (again === 'read-only') return { ok: true, current: again }
+        await new Promise((resolve) => setTimeout(resolve, wait))
+        wait *= 2
       }
       return { ok: false, current: permissionOf(sessionId) }
     },
+
+    /**
+     * 秘书派活：把一句话交给独立会话（绝不是子代理——子代理会继承只读档）。
+     * 目录由调用方用 secretary-dispatch 规则算好；这里只负责必要时建目录、建会话、发消息、命名。
+     */
+    async dispatchTask(input: {
+      text: string
+      cwd: string
+      title?: string
+      createFolder?: boolean
+      agentPreset?: string
+    }): Promise<{ sessionId: string; cwd: string }> {
+      const cwd = String(input.cwd ?? '').trim()
+      if (cwd === '') throw new Error('没有可用的派活目录')
+      if (input.createFolder === true) {
+        try {
+          const res = await fetch('/api/worktable/mkdir', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ path: cwd }),
+          })
+          if (!res.ok) throw new Error(`mkdir failed (${res.status})`)
+        } catch (err) {
+          throw new Error(`专项文件夹创建失败：${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+      const created = await this.createSession(cwd, input.agentPreset, { reuseBlank: false })
+      const title = String(input.title ?? '').trim()
+      if (title !== '') {
+        try { await this.renameSession(created.sessionId, title.slice(0, 40)) } catch { /* 标题不是功能依赖 */ }
+      }
+      await this.prompt(created.sessionId, [{ type: 'text', text: String(input.text ?? '') }], 'queue')
+      return { sessionId: created.sessionId, cwd }
+    },
+
 
     /** 选择模型（作用于该会话的后续消息）。 */
     async selectModel(sessionId: string, selection: { provider: string; model: string }): Promise<void> {
