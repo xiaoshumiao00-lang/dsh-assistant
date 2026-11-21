@@ -13,7 +13,7 @@ import { useEffect, useRef, useState } from 'react'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
 import {
   answerInlineTokens, collectTurnText, formatClock, latestReplyTurnNo, parseAnswerBody,
-  parseSessionRefs, stripSessionRefs, normalizeForSpeech,
+  parseSessionRefs, stripSessionRefs, normalizeForSpeech, CARD_KIND_ASSISTANT,
 } from './secretary-cards.ts'
 import { secretarySpeech } from './secretary-speech.ts'
 import { SecretarySpeakButton } from './SecretarySpeakButton.tsx'
@@ -65,7 +65,7 @@ async function copyAnswerText(text: string): Promise<boolean> {
   }
 }
 
-function CopyAnswerButton({ fullText }: { fullText: string }): any {
+export function CopyAnswerButton({ fullText, label = '复制完整回答' }: { fullText: string; label?: string }): any {
   const [status, setStatus] = useState<'idle' | 'ok' | 'fail'>('idle')
   const timerRef = useRef<number | null>(null)
 
@@ -82,10 +82,10 @@ function CopyAnswerButton({ fullText }: { fullText: string }): any {
     show(ok ? 'ok' : 'fail')
   }
 
-  const ariaLabel = status === 'ok' ? '已复制' : status === 'fail' ? '复制失败' : '复制完整回答'
+  const ariaLabel = status === 'ok' ? '已复制' : status === 'fail' ? '复制失败' : label
   return (
     <>
-      <button type="button" data-dsh-scard="copy" title="复制完整回答" aria-label={ariaLabel} onClick={() => void onCopy()}>
+      <button type="button" data-dsh-scard="copy" title={label} aria-label={ariaLabel} onClick={() => void onCopy()}>
         {status === 'ok' ? (
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M5 13l4 4L19 7" />
@@ -104,10 +104,10 @@ function CopyAnswerButton({ fullText }: { fullText: string }): any {
   )
 }
 
-function ExpandCollapseButton({ open, onToggle, overflow }: { open: boolean; onToggle: () => void; overflow: boolean }): any {
+export function ExpandCollapseButton({ open, onToggle, overflow, collapseTitle = '收起回答' }: { open: boolean; onToggle: () => void; overflow: boolean; collapseTitle?: string }): any {
   if (!overflow) return null
   return (
-    <button type="button" data-dsh-scard="expand" aria-expanded={open} onClick={onToggle} title={open ? '收起回答' : '展开全文'}>
+    <button type="button" data-dsh-scard="expand" aria-expanded={open} onClick={onToggle} title={open ? collapseTitle : '展开全文'}>
       <span data-dsh-scard="expand-text">{open ? '收起' : '展开全文'}</span>
       <svg data-dsh-scard="expand-arrow" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
         <path d="M6 9l6 6 6-6" />
@@ -187,7 +187,7 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
 
   if (!isSecretary) return null
   // 根节点必须无条件渲染（ref 要靠它定位轮次）；空壳由 CSS 整体隐藏（不输出占位条）
-  if (display === '') return <article ref={wrapRef as any} data-dsh-scard="card" data-empty="1" />
+  if (display === '') return <article ref={wrapRef as any} data-dsh-scard="card" data-dsh-scard-kind={CARD_KIND_ASSISTANT} data-empty="1" />
 
   const timeText = formatClock(turnEndTime(turn))
   const bodyStyle = open ? undefined : (collapsedMaxHeight === undefined ? undefined : { maxHeight: `${collapsedMaxHeight}px` })
@@ -196,13 +196,14 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
     <article
       ref={wrapRef as any}
       data-dsh-scard="card"
+      data-dsh-scard-kind={CARD_KIND_ASSISTANT}
       data-dsh-scard-turn={turnNo}
       data-empty="0"
       data-open={open ? '1' : '0'}
       data-overflow={overflow ? '1' : '0'}
     >
       <div data-dsh-scard="head">
-        <div data-dsh-scard="assistant">
+        <div data-dsh-scard="identity">
           <span data-dsh-scard="mark" aria-hidden="true">
             <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
               <path d="M12 3.8l1.9 5.7 5.7 1.9-5.7 1.9L12 19l-1.9-5.7L4.4 11.4l5.7-1.9L12 3.8z" />

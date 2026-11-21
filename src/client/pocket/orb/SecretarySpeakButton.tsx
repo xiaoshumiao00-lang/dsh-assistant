@@ -13,7 +13,7 @@ import { secretarySpeech } from './secretary-speech.ts'
 
 const LONG_PRESS_MS = 600
 
-export function SecretarySpeakButton({ speakKey, rawText }: { speakKey: string; rawText: string }): any {
+export function SecretarySpeakButton({ speakKey, rawText, labelBase = '朗读回答' }: { speakKey: string; rawText: string; labelBase?: string }): any {
   const lpTimer = useRef<number | null>(null)
   const lpFired = useRef(false)
   const state = useSyncExternalStore(secretarySpeech.subscribe, secretarySpeech.getSnapshot)
@@ -28,7 +28,7 @@ export function SecretarySpeakButton({ speakKey, rawText }: { speakKey: string; 
     : status === 'paused' ? '继续朗读'
       : status === 'loading' ? '朗读准备中…'
         : status === 'error' ? `朗读失败（${state.error}）`
-          : '朗读回答'
+          : labelBase
 
   const clearLp = (): void => { if (lpTimer.current !== null) { window.clearTimeout(lpTimer.current); lpTimer.current = null } }
   const onDown = (): void => {

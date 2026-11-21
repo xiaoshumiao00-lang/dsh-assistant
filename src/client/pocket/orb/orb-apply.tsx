@@ -8,6 +8,7 @@ import { ORB_CSS } from './orb.css.ts'
 import { FOLD_CARD_CSS } from './fold-card.css.ts'
 import { SECRETARY_CARD_CSS } from './secretary-cards.css.ts'
 import { SecretaryReplyCard } from './SecretaryReplyCard.tsx'
+import { SecretaryUserCards } from './SecretaryUserCard.tsx'
 import { currentSessionViaBridge } from '../../session-open.ts'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
 import { NS, zh, en, type OrbKey } from './locales.ts'
@@ -147,6 +148,22 @@ export function orbApply(ctx: any): void {
         inject: () => ({ api }),
       },
       SecretaryReplyCard,
+    ),
+  )
+
+  // 用户卡（2026-11-21 需求）：个人秘书页里真实用户消息做成一张卡（与秘书回复卡同规格、冷蓝主题）。
+  // 挂在 shell.overlay（整页常驻，与悬浮球同一层）：卡片用 React portal 挂进宿主那条用户行，
+  // 合成通知（系统通知 / [[session:…]] 引用行）由 collect 挡在外面，保持宿主原样。
+  ctx.slots.inject('shell.overlay', () =>
+    ctx.slots.register(
+      {
+        name: 'shell.overlay',
+        id: 'assistant-secretary-user-card',
+        order: 120,
+        locale: NS,
+        inject: () => ({}),
+      },
+      SecretaryUserCards,
     ),
   )
 

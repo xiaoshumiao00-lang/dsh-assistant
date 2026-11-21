@@ -404,14 +404,14 @@ try {
   check('秘书会话无主动服务尾巴卡', snapshot.tailCards === 0, `tailCards=${snapshot.tailCards}`)
 
   // ── 秘书回复卡片：这条会话还没有任何一轮时，真发一句等模型回完再验 ──
-  let cardOk = await page.waitForSelector('[data-dsh-scard="card"]:not([data-empty="1"])', { timeout: 6000 }).then(() => true).catch(() => false)
+  let cardOk = await page.waitForSelector('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])', { timeout: 6000 }).then(() => true).catch(() => false)
   if (!cardOk) {
     notes.push('会话暂无历史轮次：真实发送一条消息，等待模型回复（最多 120s）')
     await page.evaluate((id) => {
       const fn = window.__dshPromptIntoSession
       if (typeof fn === 'function') fn(id, '（冒烟测试）只回复两个字：收到')
     }, currentId)
-    cardOk = await page.waitForSelector('[data-dsh-scard="card"]:not([data-empty="1"])', { timeout: 120000 }).then(() => true).catch(() => false)
+    cardOk = await page.waitForSelector('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])', { timeout: 120000 }).then(() => true).catch(() => false)
   }
   check('秘书回复卡片渲染出来了', cardOk)
 
@@ -424,7 +424,7 @@ try {
   }, { id: currentId, text: cardFixturePrompt }).catch(() => false)
   if (fixtureSent) {
     await page.waitForFunction(() => {
-      const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
+      const cards = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])')]
       return cards.some((el) => (el.textContent ?? '').includes('答案折叠验收'))
     }, { timeout: 120000 }).catch(() => {})
   }
@@ -452,7 +452,7 @@ try {
   // ── 卡片规范 v1.0：最末样本卡 computed style，逐条验收第十三节清单 ──
   await page.waitForTimeout(1500) // body[data-dsh-secretary] 轮询 700ms，等标记落上
   const scard = await page.evaluate(() => {
-    const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
+    const cards = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])')]
     const fixtureCard = cards.find((el) => (el.textContent ?? '').includes('答案折叠验收')) ?? null
     const card = fixtureCard ?? cards[cards.length - 1] ?? null
     if (card === null) return { hasCard: false }
@@ -464,7 +464,7 @@ try {
       for (const sheet of document.styleSheets ?? []) {
         try {
           for (const rule of sheet.cssRules ?? []) {
-            if (rule.selectorText === selector) return rule.style?.getPropertyValue?.('border-top-width') || rule.style?.getPropertyValue?.('border') || ''
+            if (rule.selectorText === selector) return rule.style?.getPropertyValue?.('border-top-width') || rule.style?.getPropertyValue?.('border-top') || rule.style?.getPropertyValue?.('border-width') || rule.style?.getPropertyValue?.('border') || ''
           }
         } catch { /* 跨源/保护表跳过 */ }
       }
@@ -665,15 +665,106 @@ try {
       && scard.expandExists && scard.expandTitle !== '',
     JSON.stringify({ ariaPressed: scard.btnAriaPressed, status: scard.speakStatus, label: scard.btnAriaLabel, copy: scard.copyExists, expand: scard.expandExists }))
 
+  // 用户卡（真实用户消息 → 冷蓝卡）：与秘书卡同规格、主题必须不同；合成通知不伪装成用户卡。
+  const ucard = await page.evaluate(() => {
+    const readCard = (el) => {
+      const cs = getComputedStyle(el)
+      return {
+        surface: cs.getPropertyValue('--dsh-card-surface').trim(),
+        accent: cs.getPropertyValue('--dsh-card-accent').trim(),
+        accentDeep: cs.getPropertyValue('--dsh-card-accent-deep').trim(),
+        wash: cs.getPropertyValue('--dsh-card-accent-wash').trim(),
+        footSurface: cs.getPropertyValue('--dsh-card-foot-surface').trim(),
+        border: cs.getPropertyValue('--dsh-card-border').trim(),
+        text: cs.getPropertyValue('--dsh-card-text').trim(),
+        bg: cs.backgroundColor,
+        radius: cs.borderTopLeftRadius,
+        borderWidth: cs.borderTopWidth,
+        shadow: cs.boxShadow,
+        maxWidth: cs.maxWidth,
+        overflow: cs.overflow,
+      }
+    }
+    const assistantCards = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])')]
+    const assistant = assistantCards[assistantCards.length - 1] ?? null
+    const userCards = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="user"]')]
+    const user = userCards[userCards.length - 1] ?? null
+    const cardedRows = [...document.querySelectorAll('[data-chat-flow-kind="user"]')]
+      .filter((row) => row.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="user"]'))
+    const duplicated = cardedRows.filter((row) => {
+      const run = row.querySelector('[data-slot="conversation.user.text.node"]')
+      if (run === null) return false
+      return run.offsetParent !== null && (run.textContent ?? '').trim() !== ''
+    })
+    const noticeRows = [...document.querySelectorAll('[data-chat-flow-kind="user"]')]
+      .filter((row) => {
+        const run = row.querySelector('[data-slot="conversation.user.text.node"]')
+        return /系统通知/.test(run?.textContent ?? '') || /\[\[session:[^\]]*\]\]/.test(run?.textContent ?? '')
+      })
+    const noticeCarded = noticeRows.filter((row) => row.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="user"]'))
+    const foot = user?.querySelector('[data-dsh-scard="foot"]') ?? null
+    return {
+      userCount: userCards.length,
+      assistantCount: assistantCards.length,
+      assistantTheme: assistant ? readCard(assistant) : null,
+      userTheme: user ? readCard(user) : null,
+      userText: user?.querySelector('[data-dsh-scard="body"]')?.textContent ?? '',
+      userName: user?.querySelector('[data-dsh-scard="name"]')?.textContent ?? '',
+      userTag: user?.querySelector('[data-dsh-scard="tag"]')?.textContent ?? '',
+      userMarkColor: user ? getComputedStyle(user.querySelector('[data-dsh-scard="mark"]')).color : '',
+      userCopyTitle: user?.querySelector('[data-dsh-scard="copy"]')?.getAttribute('title') ?? '',
+      userSpeakTitle: user?.querySelector('[data-dsh-speak="button"]')?.getAttribute('title') ?? '',
+      userTimeText: user?.querySelector('[data-dsh-scard="time"]')?.textContent ?? '',
+      footOrder: foot ? [...foot.querySelectorAll('[data-dsh-scard="actions"] > *')].map((el) => el.getAttribute('data-dsh-scard') ?? '') : [],
+      footReadInUserCard: user ? user.querySelectorAll('[data-dsh-scard="foot"] [data-dsh-speak="button"]').length : -1,
+      duplicatedCount: duplicated.length,
+      noticeRowCount: noticeRows.length,
+      noticeCardedCount: noticeCarded.length,
+      userKeys: [...new Set([...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="user"]')]
+        .map((el) => el.getAttribute('data-dsh-scard-turn')))],
+    }
+  })
+  check('用户卡存在：真实用户消息已做成卡片（同时也有秘书卡）',
+    ucard.userCount >= 1 && ucard.assistantCount >= 1, JSON.stringify({ userCards: ucard.userCount, assistantCards: ucard.assistantCount }))
+  check('用户卡与秘书卡的主题变量与背景色不同',
+    ucard.assistantTheme !== null && ucard.userTheme !== null
+      && ucard.assistantTheme.surface !== ucard.userTheme.surface
+      && ucard.assistantTheme.accent !== ucard.userTheme.accent
+      && ucard.assistantTheme.wash !== ucard.userTheme.wash
+      && ucard.assistantTheme.footSurface !== ucard.userTheme.footSurface
+      && ucard.assistantTheme.bg !== ucard.userTheme.bg
+      && ucard.userTheme.surface === '#eef4ff' && ucard.userTheme.accent === '#184a80'
+      && ucard.assistantTheme.bg === 'rgb(255, 255, 255)' && ucard.userTheme.bg === 'rgb(238, 244, 255)',
+    JSON.stringify({ assistant: ucard.assistantTheme, user: ucard.userTheme }))
+  check('用户卡外壳与秘书卡同规格（16px 圆角、0.5px 边框、无阴影、620px、overflow hidden）',
+    ucard.userTheme !== null && ucard.assistantTheme !== null
+      && ucard.userTheme.radius === '16px' && ucard.userTheme.radius === ucard.assistantTheme.radius
+      && ucard.userTheme.borderWidth !== '0px' && ucard.userTheme.shadow === 'none'
+      && ucard.userTheme.maxWidth === '620px' && ucard.userTheme.maxWidth === ucard.assistantTheme.maxWidth
+      && ucard.userTheme.overflow === 'hidden' && ucard.userTheme.border === ucard.assistantTheme.border
+      && ucard.userTheme.text === ucard.assistantTheme.text,
+    JSON.stringify({ user: ucard.userTheme, assistant: ucard.assistantTheme }))
+  check('用户卡头部是你/用户消息（冷蓝标识）、脚部有时间与复制、正文是用户原话',
+    ucard.userName === '你' && ucard.userTag === '用户消息' && ucard.userMarkColor === 'rgb(24, 74, 128)'
+      && ucard.userCopyTitle === '复制这条消息' && ucard.userSpeakTitle === '朗读这条消息'
+      && /今天 \d{2}:\d{2}/.test(ucard.userTimeText) && ucard.footReadInUserCard === 0
+      && JSON.stringify(ucard.footOrder.slice(0, 1)) === JSON.stringify(['copy'])
+      && (ucard.userText.includes('冒烟测试') || ucard.userText.includes('答案折叠验收')),
+    JSON.stringify({ name: ucard.userName, tag: ucard.userTag, mark: ucard.userMarkColor, copy: ucard.userCopyTitle, speak: ucard.userSpeakTitle, time: ucard.userTimeText, foot: ucard.footOrder, text: ucard.userText.slice(0, 40) }))
+  check('系统通知不做成用户卡（通知行保持宿主样式）',
+    ucard.noticeCardedCount === 0, JSON.stringify({ noticeRows: ucard.noticeRowCount, noticeCarded: ucard.noticeCardedCount }))
+  check('卡片化用户行不留下重复文本（宿主气泡已收起）',
+    ucard.duplicatedCount === 0, JSON.stringify({ cardedDuplicated: ucard.duplicatedCount, keys: ucard.userKeys }))
+
   // 历史会话可能带着上一条合成通知留下的空白尾轮，旧卡不会再次自动朗读。
   // 此时必须真发一条新回复来验「新卡出现即自动读」，不能把手动点击算作自动请求。
   let autoReadObserved = ttsRequests >= 1
   if (!autoReadObserved) {
-    const beforeCards = await page.locator('[data-dsh-scard="card"]:not([data-empty="1"])').count()
+    const beforeCards = await page.locator('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])').count()
     const requestObserved = page.waitForRequest((req) => req.method() === 'POST' && /\/api\/assistant\/tts(?:\?|$)/.test(req.url()), { timeout: 120000 })
       .then(() => true).catch(() => false)
     await page.evaluate(async (id) => { await window.__dshPromptIntoSession?.(id, '（冒烟测试·自动朗读）只回复两个字：收到') }, currentId)
-    await page.waitForFunction((count) => document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])').length > count,
+    await page.waitForFunction((count) => document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])').length > count,
       beforeCards, { timeout: 120000 }).catch(() => {})
     autoReadObserved = await requestObserved
     notes.push('自动朗读：历史卡未重读，已新发一条真实回复验证新卡自动请求')
@@ -682,7 +773,7 @@ try {
 
   // 展开按钮仅在内容溢出时显示：短卡没有按钮，长样本卡有按钮；卡片本身不能承担点击展开职责。
   await page.evaluate(() => {
-    const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
+    const cards = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])')]
     window.__smokeCardOverflowProbe = cards.map((el) => ({
       hasExpand: el.querySelector('[data-dsh-scard="expand"]') !== null,
       dataOverflow: el.getAttribute('data-overflow') ?? '',
@@ -693,7 +784,7 @@ try {
     Array.isArray(overflowProbe) && overflowProbe.every((item) => item.dataOverflow === '1' ? item.hasExpand === true : item.hasExpand === false), JSON.stringify(overflowProbe))
 
   if (scard.expandExists) {
-    const expandCard = page.locator('[data-dsh-scard="card"]:not([data-empty="1"]):has([data-dsh-scard="expand"])').last()
+    const expandCard = page.locator('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"]):has([data-dsh-scard="expand"])').last()
     await expandCard.click({ position: { x: 120, y: 24 } }) // 卡片本体不应切换；这里只做负向回归：点空白处不改变状态
     const cardStillCollapsed = await expandCard.evaluate((el) => ({
       open: el.getAttribute('data-open'),
@@ -731,19 +822,20 @@ try {
     try { window.__smokeClipboard = navigator.clipboard } catch { /* ignore */ }
     try { Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: () => Promise.resolve() } }) } catch { /* ignore */ }
   })
-  await page.locator('[data-dsh-scard="copy"]').last().click()
-  const copied = await page.waitForFunction(() => {
-    const status = document.querySelector('[data-dsh-scard="copy-status"]')
+  const ASSISTANT_CARD = '[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]'
+  await page.locator(`${ASSISTANT_CARD}:not([data-empty="1"]) [data-dsh-scard="copy"]`).last().click()
+  const copied = await page.waitForFunction((selector) => {
+    const status = document.querySelector(selector)
     const text = status?.textContent ?? ''
     return text === '已复制' ? text : false
-  }, undefined, { timeout: 5000 }).then((handle) => handle.jsonValue()).catch(() => '')
+  }, `${ASSISTANT_CARD} [data-dsh-scard="copy-status"]`, { timeout: 5000 }).then((handle) => handle.jsonValue()).catch(() => '')
   check('复制成功有可见反馈（已复制）', copied === '已复制', `copyStatus=${copied}`)
   await page.evaluate(() => {
     try { Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: () => Promise.reject(new Error('blocked')) } }) } catch { /* ignore */ }
     // 真实失败路径：Clipboard API 拒绝 + 传统 execCommand 也不成功。
     try { Object.defineProperty(document, 'execCommand', { configurable: true, value: () => false }) } catch { /* ignore */ }
   })
-  const lastCopy = page.locator('[data-dsh-scard="copy"]').last()
+  const lastCopy = page.locator(`${ASSISTANT_CARD}:not([data-empty="1"]) [data-dsh-scard="copy"]`).last()
   await lastCopy.click()
   // 状态条是每张卡自己的：必须在这颗按钮的父节点里找，不能拿全页第一个
   // （前一张卡的「已复制」会先命中，失败反馈被它挡掉）。
@@ -767,13 +859,13 @@ try {
 
   // 键盘可访问性：Tab 顺序从朗读到复制，焦点环存在。
   const keyboard = await page.evaluate(async () => {
-    const card = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')].find((el) => (el.textContent ?? '').includes('答案折叠验收')) ?? null
+    const card = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])')].find((el) => (el.textContent ?? '').includes('答案折叠验收')) ?? null
     if (card === null) return { skip: true }
     const readBtn = card.querySelector('[data-dsh-speak="button"]')
     readBtn?.focus()
     return { tabIndex: readBtn?.tabIndex ?? null, activeIsRead: document.activeElement === readBtn }
   })
-  await page.locator('[data-dsh-speak="button"]').last().press('Tab')
+  await page.locator(`${ASSISTANT_CARD}:not([data-empty="1"]) [data-dsh-speak="button"]`).last().press('Tab')
   const focusRing = await page.evaluate(() => {
     const el = document.activeElement
     const cs = getComputedStyle(el)
@@ -786,7 +878,7 @@ try {
 
 
   // 朗读状态机：进播放态 → 单击暂停 → 单击继续 → 长按从头重读（回复卡上的那颗钮）
-  const speakBtn = page.locator('[data-dsh-scard="card"]:not([data-empty="1"]) [data-dsh-speak="button"]').last()
+  const speakBtn = page.locator(`${ASSISTANT_CARD}:not([data-empty="1"]) [data-dsh-speak="button"]`).last()
   let st = await speakBtn.getAttribute('data-status')
   if (st !== 'playing' && st !== 'loading') {
     // 自动朗读的 30s stub 可能已在长流程中播完：手动起播再验交互（状态机语义不变）
@@ -818,7 +910,7 @@ try {
 
   // ── 回归：点历史卡必须读历史卡自己的文本（2026-11-21 实测 bug：读成了最新一条） ──
   const hist = await page.evaluate(() => {
-    const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
+    const cards = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])')]
     if (cards.length < 2) return { skip: true }
     const first = cards[0]
     const last = cards[cards.length - 1]
@@ -834,7 +926,7 @@ try {
     const cjk = (s) => String(s).replace(/[^一-鿿]/g, '')
     const head = (s) => cjk(s).slice(0, 6)
     const before = ttsBodies.length
-    await page.locator('[data-dsh-scard="card"]:not([data-empty="1"])').first()
+    await page.locator('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])').first()
       .locator('[data-dsh-speak="button"]').click()
     await page.waitForTimeout(600)
     const sent = ttsBodies.slice(before).map((body) => { try { return JSON.parse(body)?.text ?? '' } catch { return '' } }).join(' ')
@@ -842,7 +934,7 @@ try {
       `sent=${sent.slice(0, 50)} want=${hist.firstTitle.slice(0, 14)}`)
     check('点历史卡朗读：绝不读最新一条', head(hist.lastTitle) === '' || !cjk(sent).includes(head(hist.lastTitle)),
       `last=${hist.lastTitle.slice(0, 14)}`)
-    await page.locator('[data-dsh-scard="card"]:not([data-empty="1"])').first()
+    await page.locator('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])').first()
       .locator('[data-dsh-speak="button"]').click().catch(() => {}) // 收尾停掉
   }
 
@@ -868,7 +960,7 @@ try {
   await page.waitForTimeout(12000)
   const alive = await page.evaluate(() => ({
     title: document.title,
-    cards: document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])').length,
+    cards: document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])').length,
     tailCards: document.querySelectorAll('[data-dsh-proactive="card"], [data-dsh-proactive="wrap"]').length,
     shell: document.querySelectorAll('[data-pocket-secretary]').length,
   }))
@@ -984,7 +1076,7 @@ try {
     } else {
       check('CU 完成通知落盘（宿主路由接受）', cuResponse.ok === true, JSON.stringify(cuResponse))
       const noticeCard = await page.waitForFunction((title) => {
-        const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
+        const cards = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])')]
         const hit = cards.find((el) => (el.textContent ?? '').includes(title))
         if (hit === undefined) return false
         const ref = hit.querySelector('[data-dsh-scard="ref"]')
@@ -992,7 +1084,7 @@ try {
       }, cuTitle, { timeout: 20000 }).then(() => true).catch(() => false)
       check('通知卡片含可点跳信息行（引用块带 CU 会话标题）', noticeCard)
       if (noticeCard) {
-        await page.locator('[data-dsh-scard="card"]:not([data-empty="1"])', { hasText: cuTitle })
+        await page.locator('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])', { hasText: cuTitle })
           .locator('[data-dsh-scard="ref"]').first().click()
         const jumped = await page.waitForFunction((want) => {
           try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') === want } catch { return false }
@@ -1027,7 +1119,7 @@ try {
       const secretaryId = String(secretaryMeta?.sessionId ?? '')
       const beforeQq = await readSessionRows()
       const beforeQqIds = beforeQq.map((row) => row.id)
-      const beforeQqCards = await page.locator('[data-dsh-scard="card"]:not([data-empty="1"])').count()
+      const beforeQqCards = await page.locator('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])').count()
       await page.evaluate(async ({ id, text }) => {
         if (typeof window.__dshPromptIntoSession !== 'function') throw new Error('缺少 __dshPromptIntoSession')
         await window.__dshPromptIntoSession(id, text)
@@ -1039,7 +1131,7 @@ try {
           const row = snap?.byId?.[id] ?? {}
           return { id: String(id), title: String(row?.title ?? ''), agentPreset: String(row?.agentPreset ?? row?.header?.agentPreset ?? '') }
         }).find((row) => !beforeIds.includes(row.id) && row.agentPreset === 'computer-use')
-        const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
+        const cards = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])')]
         const lastText = cards.length > beforeCards ? String(cards[cards.length - 1]?.textContent ?? '') : ''
         return created && /已派/.test(lastText) ? { ...created, reply: lastText } : false
       }, { beforeIds: beforeQqIds, beforeCards: beforeQqCards }, { timeout: 180000 })
@@ -1053,10 +1145,10 @@ try {
         notes.push(`默认派活实时模型段：QQ 原话新建 CU=${qqLive.id}，标题=${qqLive.title}`)
         const beforeDateRows = await readSessionRows()
         const beforeDateIds = beforeDateRows.map((row) => row.id)
-        const beforeDateCards = await page.locator('[data-dsh-scard="card"]:not([data-empty="1"])').count()
+        const beforeDateCards = await page.locator('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])').count()
         await page.evaluate(async ({ id, text }) => { await window.__dshPromptIntoSession(id, text) }, { id: secretaryId, text: DIRECT_QUESTION })
         const dateReply = await page.waitForFunction((beforeCards) => {
-          const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
+          const cards = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])')]
           if (cards.length <= beforeCards) return false
           const text = String(cards[cards.length - 1]?.textContent ?? '')
           const compact = text.replace(/\s+/g, '')

@@ -300,6 +300,7 @@ export function latestReplyTurnNo(doc: Document): string {
   let max = -1
   let out = ''
   for (const el of doc.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-turn]')) {
+    if (el.getAttribute('data-dsh-scard-kind') === CARD_KIND_USER) continue
     if (el.getAttribute('data-empty') === '1') continue
     const value = Number(el.getAttribute('data-dsh-scard-turn'))
     if (Number.isFinite(value) && value > max) { max = value; out = String(value) }
@@ -427,6 +428,82 @@ export function formatClock(input: unknown, now: Date = new Date()): string {
   return `${date.getMonth() + 1}月${date.getDate()}日 ${hm}`
 }
 
+/** ─────────────── 6. 用户卡（秘书页真实用户消息）纯函数 ─────────────── */
+
+/** 卡壳主题标识：秘书回复卡 kind=assistant（紫），用户卡 kind=user（冷蓝）。 */
+export const CARD_KIND_ASSISTANT = 'assistant'
+export const CARD_KIND_USER = 'user'
+
+/** 合成通知判据 ①：首行是「（系统通知，不是用户说的话）」（宽/半角括号、方括号写法都算）。 */
+const NOTICE_HEAD_LINE_RE = /^\s*[（(【\[]?\s*系统通知/
+/** 判据 ②：正文里带 `[[session:id|标题]]` 引用行（src/assistant-cu-watch.ts 注入格式）。 */
+const NOTICE_SESSION_REF_LINE_RE = /(^|\n)\s*(最后单独一行原样输出：)?\s*\[\[session:[^\]]*\]\]/
+
+/** 这条 user 角色正文是不是插件自己塞进来的合成通知（不该做成「用户卡」）。 */
+export function isSyntheticNoticeUserText(raw: string): boolean {
+  const text = String(raw ?? '')
+  const lines = text.split('\n').map((line) => line.trim()).filter((line) => line !== '')
+  if (lines.length === 0) return false
+  if (NOTICE_HEAD_LINE_RE.test(lines[0])) return true
+  return lines.some((line) => NOTICE_SESSION_REF_LINE_RE.test(`\n${line}`))
+}
+
+/** 用户卡正文：显示用户原文（不做标题化、不改写、不删行），按空行分段。 */
+export function parseUserCardBody(raw: string): string[] {
+  const text = String(raw ?? '').replace(/\r\n?/g, '\n').trim()
+  if (text === '') return []
+  return text.split(/\n{2,}/).map((block) => block.trim()).filter((block) => block !== '')
+}
+
+/** 朗读 key：每张用户卡自己的 key（按卡的所属文本，不串卡）。 */
+export function userCardSpeechKey(messageKey: string, turnNo = ''): string {
+  const key = String(messageKey ?? '').trim()
+  if (key !== '') return `user:${key}`
+  return `user:turn:${String(turnNo ?? '')}`
+}
+
+/** 底行时间：宿主操作行只给「HH:MM」（当天）→「今天 HH:MM」；已经是「昨天 …」/「11月20日 …」就原样用。 */
+export function formatUserCardClock(clockText: unknown): string {
+  const raw = String(clockText ?? '').replace(/\s+/g, ' ').trim()
+  if (raw === '') return ''
+  const match = raw.match(/^([01]?\d|2[0-3]):([0-5]\d)$/)
+  if (match !== null) return `今天 ${raw}`
+  return raw
+}
+
+export interface SecretaryUserRow {
+  /** 卡片要挂进的那条宿主用户行（portal 容器）。 */
+  element: Element
+  /** 稳定 key（宿主的 data-chat-node-key / data-chat-flow-key，含消息 id）。 */
+  key: string
+  turnNo: string
+  /** 用户原文（取自宿主纯文本 run）。 */
+  text: string
+  /** 宿主操作行上的时间文本（已按卡片规则格式化前）。 */
+  clockText: string
+}
+
+/**
+ * 收集秘书页对话流里**真实用户发的**那些用户行：
+ *   - 只认宿主稳定语义标记 `[data-chat-flow-kind="user"]`；
+ *   - 合成通知（系统通知 / `[[session:]]` 引用行）不进列表——保持宿主原样，不做成用户卡；
+ *   - 文本从 `[data-slot="conversation.user.text.node"]` 读，卡片自身挂在行上，不会把自己读回去。
+ */
+export function collectSecretaryUserRows(doc: Document): SecretaryUserRow[] {
+  const out: SecretaryUserRow[] = []
+  for (const row of doc.querySelectorAll('[data-chat-flow-kind="user"]')) {
+    const key = row.getAttribute('data-chat-node-key') ?? row.getAttribute('data-chat-flow-key') ?? ''
+    const turnNo = row.getAttribute('data-chat-turn') ?? ''
+    const textEl = row.querySelector('[data-slot="conversation.user.text.node"]')
+    const text = String(textEl?.textContent ?? '').trim()
+    if (text === '') continue
+    if (isSyntheticNoticeUserText(text)) continue
+    const clockEl = row.querySelector('[data-clock]')
+    out.push({ element: row, key, turnNo, text, clockText: String(clockEl?.textContent ?? '').trim() })
+  }
+  return out
+}
+
 /** 单测入口（node 直驱状态机与纯函数）。 */
 export const secretaryCardsTestSurface = {
   normalizeForSpeech,
@@ -445,4 +522,11 @@ export const secretaryCardsTestSurface = {
   parseAnswerBody,
   answerInlineTokens,
   formatClock,
+  CARD_KIND_ASSISTANT,
+  CARD_KIND_USER,
+  isSyntheticNoticeUserText,
+  parseUserCardBody,
+  userCardSpeechKey,
+  formatUserCardClock,
+  collectSecretaryUserRows,
 }

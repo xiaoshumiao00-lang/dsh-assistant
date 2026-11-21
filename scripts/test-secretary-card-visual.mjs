@@ -5,7 +5,8 @@
  * 拿不到宿主浏览器会话；本脚本把本次构建里真实的 SECRETARY_CARD_CSS 注入 Chromium，
  * 再用与 SecretaryReplyCard 相同的 DOM 结构逐项验 computed style。
  *
- * 通过 = 退出码 0；截图写到 tmp-secretary-card.png 与 tmp-secretary-card-desktop.png。
+ * 通过 = 退出码 0；截图写到 tmp-secretary-card.png、tmp-secretary-card-desktop.png
+ * 与 tmp-secretary-user-card.png（这张里同时有秘书卡与冷蓝用户卡）。
  */
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -17,6 +18,7 @@ const CHROME = process.env.DSH_CHROME_PATH || 'C:\\Program Files\\Google\\Chrome
 const BUNDLE = join(ROOT, 'lib', 'client.js')
 const SCREENSHOT_MOBILE = join(ROOT, 'tmp-secretary-card.png')
 const SCREENSHOT_DESKTOP = join(ROOT, 'tmp-secretary-card-desktop.png')
+const SCREENSHOT_DUAL = join(ROOT, 'tmp-secretary-user-card.png')
 
 const source = readFileSync(BUNDLE, 'utf8')
 const marker = 'body[data-dsh-secretary="1"] [data-chat-flow-kind="assistant-step"]'
@@ -50,13 +52,14 @@ const pageHtml = `<!doctype html>
 <style>
 html,body{margin:0;background:#F6F7F9}
 .answer-stage{padding:28px;background:#F6F7F9}
+.chat-stage{padding:0 28px 28px;background:#F6F7F9}
 ${cardCss}
 </style></head>
 <body data-dsh-secretary="1">
 <div class="answer-stage">
-<article data-dsh-scard="card" data-dsh-scard-turn="7" data-empty="0" data-open="0" data-overflow="1">
+<article data-dsh-scard="card" data-dsh-scard-kind="assistant" data-dsh-scard-turn="7" data-empty="0" data-open="0" data-overflow="1">
   <div data-dsh-scard="head">
-    <div data-dsh-scard="assistant">
+    <div data-dsh-scard="identity">
       <span data-dsh-scard="mark" aria-hidden="true">
         <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.8l1.9 5.7 5.7 1.9-5.7 1.9L12 19l-1.9-5.7L4.4 11.4l5.7-1.9L12 3.8z"/><path d="M4.6 4.6l2 2"/><path d="M17.4 19.4l2 2"/></svg>
       </span>
@@ -87,9 +90,65 @@ ${cardCss}
     </div>
   </div>
 </article>
+<div class="chat-stage">
+  <div data-chat-turn="8" data-chat-flow-kind="user" data-chat-node-key="13:input-message-user-01">
+    <div data-slot="conversation.chat.node">
+      <div class="host-user-row">
+        <div class="host-user-stack">
+          <div class="host-bubble">
+            <span data-slot="conversation.user.text.node"><span class="host-plain-run">你好，帮我把今天下午的安排理一遍</span></span>
+          </div>
+        </div>
+        <div class="host-actions" data-clock="start"><span>20:24</span></div>
+      </div>
+    </div>
+    <article data-dsh-scard="card" data-dsh-scard-kind="user" data-dsh-scard-turn="8" data-empty="0" data-open="0" data-overflow="0">
+      <div data-dsh-scard="head">
+        <div data-dsh-scard="identity">
+          <span data-dsh-scard="mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 12a4 4 0 1 0 0-6.5 4 4 0 0 0 0 6.5z"/><path d="M4.8 19.5a7.2 7.2 0 0 1 14.4 0"/></svg>
+          </span>
+          <span data-dsh-scard="name">你</span>
+          <span data-dsh-scard="tag">用户消息</span>
+        </div>
+        <button type="button" data-dsh-speak="button" data-status="idle" aria-pressed="false" aria-label="朗读这条消息" title="朗读这条消息">
+          <svg data-dsh-speak="icon" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5.5 6.5 9H3.5v6h3L11 18.5z"/><path d="M14.8 8.2a4 4 0 0 1 0 7.6"/><path d="M17.6 5.8a7 7 0 0 1 0 12.4"/></svg>
+        </button>
+      </div>
+      <div data-dsh-scard="body">
+        <div data-dsh-scard="content">
+          <p data-dsh-scard="para">你好，帮我把今天下午的安排理一遍</p>
+          <p data-dsh-scard="para">第二行也要原样显示出来，用户卡不许改写用户说的话。</p>
+        </div>
+      </div>
+      <div data-dsh-scard="foot">
+        <time data-dsh-scard="time">今天 20:24</time>
+        <div data-dsh-scard="actions">
+          <button type="button" data-dsh-scard="copy" title="复制这条消息" aria-label="复制这条消息">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="10" height="10" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2"/></svg>
+          </button>
+        </div>
+      </div>
+    </article>
+  </div>
+  <div data-chat-turn="9" data-chat-flow-kind="user" data-probe="notice-row">
+    <div data-slot="conversation.chat.node">
+      <div class="host-user-row">
+        <div class="host-user-stack">
+          <div class="host-bubble">
+            <span data-slot="conversation.user.text.node"><span class="host-plain-run">（系统通知，不是用户说的话）
+电脑操作会话「主动型助手与微信误发防护方案」这一轮已经完成。
+最后单独一行原样输出：[[session:session-demo|主动型助手与微信误发防护方案]]</span></span>
+          </div>
+        </div>
+        <div class="host-actions" data-clock="start"><span>20:20</span></div>
+      </div>
+    </div>
+  </div>
+</div>
 </div>
 <script>
-const card = document.querySelector('[data-dsh-scard="card"]')
+const card = document.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]')
 const content = card.querySelector('[data-dsh-scard="content"]')
 const expand = card.querySelector('[data-dsh-scard="expand"]')
 const expandText = card.querySelector('[data-dsh-scard="expand-text"]')
@@ -126,13 +185,17 @@ const pass = (name, ok, detail) => {
   if (!ok) failures.push(name)
 }
 const near = (value, want, tolerance = 0.6) => Number.isFinite(value) && Math.abs(value - want) <= tolerance
+const shellVarsEqual = (a, b) => {
+  const names = Object.keys(a)
+  return names.length === 5 && names.every((name) => a[name] !== '' && a[name] === b[name])
+}
 
 try {
   await page.setContent(pageHtml, { waitUntil: 'load' })
   await page.waitForTimeout(300)
 
   const info = await page.evaluate(() => {
-    const card = document.querySelector('[data-dsh-scard="card"]')
+    const card = document.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]')
     const title = card.querySelector('[data-dsh-scard="title"]')
     const para = card.querySelector('[data-dsh-scard="para"]')
     const strong = card.querySelector('strong[data-probe="strong"]')
@@ -152,7 +215,13 @@ try {
       for (const sheet of document.styleSheets) {
         try {
           for (const rule of sheet.cssRules) {
-            if (rule.selectorText === selector) return rule.style.getPropertyValue('border-top-width') || rule.style.getPropertyValue('border') || ''
+            if (rule.selectorText === selector) {
+              return rule.style.getPropertyValue('border-top-width')
+                || rule.style.getPropertyValue('border-top')
+                || rule.style.getPropertyValue('border-width')
+                || rule.style.getPropertyValue('border')
+                || ''
+            }
           }
         } catch { /* ignore */ }
       }
@@ -205,8 +274,121 @@ try {
   pass('移动端隐藏时间且不横向溢出', info.time.display === 'none' && info.overflowX <= 0, JSON.stringify({ time: info.time.display, overflowX: info.overflowX }))
   pass('页面级秘书标记存在', info.bodyFlag === '1', info.bodyFlag)
 
+  // 用户卡（真实用户消息）与秘书卡同规格、冷蓝主题；两种卡必须能一眼分辨。
+  const dual = await page.evaluate(() => {
+    const assistant = document.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]')
+    const user = document.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="user"]')
+    const themeVars = ['--dsh-card-surface', '--dsh-card-accent', '--dsh-card-accent-deep', '--dsh-card-accent-wash',
+      '--dsh-card-accent-wash-deep', '--dsh-card-accent-line', '--dsh-card-foot-surface', '--dsh-card-focus-ring']
+    const shellVars = ['--dsh-card-border', '--dsh-card-separator', '--dsh-card-text', '--dsh-card-text-soft', '--dsh-card-text-muted']
+    const readVars = (el, names) => {
+      const cs = getComputedStyle(el)
+      const out = {}
+      for (const name of names) out[name] = cs.getPropertyValue(name).trim()
+      return out
+    }
+    const userRow = document.querySelector('[data-chat-flow-kind="user"][data-chat-node-key="13:input-message-user-01"]')
+    const noticeRow = document.querySelector('[data-chat-flow-kind="user"][data-probe="notice-row"]')
+    const userCs = getComputedStyle(user)
+    const assistantCs = getComputedStyle(assistant)
+    return {
+      userExists: user !== null,
+      userKindCount: document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="user"]').length,
+      noticeHasCard: noticeRow.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="user"]') !== null,
+      noticeBubbleDisplay: getComputedStyle(noticeRow.querySelector('[data-slot="conversation.chat.node"]')).display,
+      userRowBubbleDisplay: userRow === null ? '' : getComputedStyle(userRow.querySelector('[data-slot="conversation.chat.node"]')).display,
+      userRowTextDisplay: userRow === null ? '' : getComputedStyle(userRow.querySelector('[data-slot="conversation.user.text.node"]')).display,
+      userHostRunDisplay: userRow === null ? '' : getComputedStyle(userRow.querySelector('.host-plain-run')).display,
+      assistantTheme: readVars(assistant, themeVars),
+      userTheme: readVars(user, themeVars),
+      assistantShell: readVars(assistant, shellVars),
+      userShell: readVars(user, shellVars),
+      userCardBg: userCs.backgroundColor,
+      assistantCardBg: assistantCs.backgroundColor,
+      shell: {
+        radius: userCs.borderTopLeftRadius, borderWidth: userCs.borderTopWidth, borderColor: userCs.borderTopColor,
+        borderStyle: userCs.borderTopStyle, shadow: userCs.boxShadow, overflow: userCs.overflow, maxWidth: userCs.maxWidth,
+        assistantMaxWidth: assistantCs.maxWidth, assistantRadius: assistantCs.borderTopLeftRadius,
+      },
+      userMark: {
+        color: getComputedStyle(user.querySelector('[data-dsh-scard="mark"]')).color,
+        bg: getComputedStyle(user.querySelector('[data-dsh-scard="mark"]')).backgroundColor,
+        w: user.querySelector('[data-dsh-scard="mark"]').getBoundingClientRect().width,
+        h: user.querySelector('[data-dsh-scard="mark"]').getBoundingClientRect().height,
+        radius: getComputedStyle(user.querySelector('[data-dsh-scard="mark"]')).borderRadius,
+        tagColor: getComputedStyle(user.querySelector('[data-dsh-scard="tag"]')).color,
+        tagBg: getComputedStyle(user.querySelector('[data-dsh-scard="tag"]')).backgroundColor,
+      },
+      userFoot: {
+        bg: getComputedStyle(user.querySelector('[data-dsh-scard="foot"]')).backgroundColor,
+        order: [...user.querySelector('[data-dsh-scard="actions"]').children].map((el) => el.getAttribute('data-dsh-scard') ?? '').filter(Boolean),
+        speakInFoot: user.querySelector('[data-dsh-scard="foot"] [data-dsh-speak="button"]') !== null,
+        timeText: user.querySelector('[data-dsh-scard="time"]')?.textContent ?? '',
+        timeDisplay: getComputedStyle(user.querySelector('[data-dsh-scard="time"]')).display,
+        copyTitle: user.querySelector('[data-dsh-scard="copy"]')?.getAttribute('title') ?? '',
+      },
+      userHead: {
+        nameText: user.querySelector('[data-dsh-scard="name"]')?.textContent ?? '',
+        tagText: user.querySelector('[data-dsh-scard="tag"]')?.textContent ?? '',
+        speakTitle: user.querySelector('[data-dsh-speak="button"]')?.getAttribute('title') ?? '',
+        speakW: user.querySelector('[data-dsh-speak="button"]').getBoundingClientRect().width,
+      },
+      paras: [...user.querySelectorAll('[data-dsh-scard="para"]')].map((el) => el.textContent),
+      paraStyle: {
+        size: getComputedStyle(user.querySelector('[data-dsh-scard="para"]')).fontSize,
+        line: getComputedStyle(user.querySelector('[data-dsh-scard="para"]')).lineHeight,
+        color: getComputedStyle(user.querySelector('[data-dsh-scard="para"]')).color,
+      },
+      expandInUserCard: user.querySelector('[data-dsh-scard="expand"]') !== null,
+      overflowX: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    }
+  })
+  pass('用户卡存在（秘书页真实用户消息做成卡，与秘书卡同时存在）',
+    dual.userExists && dual.userKindCount === 1 && dual.shell.assistantMaxWidth === dual.shell.maxWidth,
+    JSON.stringify({ userKindCount: dual.userKindCount, userExists: dual.userExists }))
+  pass('两种卡的 --dsh-card-* 主题变量必须不同',
+    Object.keys(dual.assistantTheme).length === 8 && Object.keys(dual.assistantTheme).every((name) =>
+      dual.assistantTheme[name] !== '' && dual.userTheme[name] !== '' && dual.assistantTheme[name] !== dual.userTheme[name]),
+    JSON.stringify({ assistant: dual.assistantTheme, user: dual.userTheme }))
+  pass('两种卡背景色不同（秘书卡白底、用户卡浅蓝底 #EEF4FF）',
+    dual.assistantCardBg === 'rgb(255, 255, 255)' && dual.userCardBg === 'rgb(238, 244, 255)',
+    JSON.stringify({ assistant: dual.assistantCardBg, user: dual.userCardBg }))
+  pass('两种卡共用同一套外壳规格变量（边框/分隔线/文字色一致）',
+    shellVarsEqual(dual.assistantShell, dual.userShell),
+    JSON.stringify({ assistant: dual.assistantShell, user: dual.userShell }))
+  pass('用户卡外壳与秘书卡同规格：16px 圆角、0.5px #E5E6EB、无阴影、overflow hidden、max-width 620px',
+    dual.shell.radius === '16px' && dual.shell.radius === dual.shell.assistantRadius && dual.shell.borderWidth !== '0px'
+      && dual.shell.borderStyle === 'solid' && dual.shell.borderColor === 'rgb(229, 230, 235)' && dual.shell.shadow === 'none'
+      && dual.shell.overflow === 'hidden' && dual.shell.maxWidth === '620px',
+    JSON.stringify(dual.shell))
+  pass('用户卡主题走冷蓝：强调 #184A80、浅蓝底芯片白底标识',
+    dual.userMark.color === 'rgb(24, 74, 128)' && near(dual.userMark.w, 32) && near(dual.userMark.h, 32)
+      && dual.userMark.radius === '10px' && dual.userMark.bg === 'rgb(255, 255, 255)'
+      && dual.userMark.tagColor === 'rgb(18, 57, 95)' && dual.userMark.tagBg === 'rgb(255, 255, 255)',
+    JSON.stringify(dual.userMark))
+  pass('用户卡头部是「你 / 用户消息」标识 + 右上角朗读按钮（34px，标题「朗读这条消息」）',
+    dual.userHead.nameText === '你' && dual.userHead.tagText === '用户消息'
+      && dual.userHead.speakTitle === '朗读这条消息' && near(dual.userHead.speakW, 34),
+    JSON.stringify(dual.userHead))
+  pass('用户卡脚部只有时间 + 复制，没有分隔线/展开全文/朗读按钮',
+    JSON.stringify(dual.userFoot.order) === JSON.stringify(['copy']) && !dual.userFoot.speakInFoot && !dual.expandInUserCard,
+    JSON.stringify(dual.userFoot))
+  pass('用户卡正文原样显示用户说的话（13px/1.8，不截断不改写）',
+    dual.paras.length === 2 && /帮我把今天下午的安排理一遍/.test(dual.paras[0]) && /用户卡不许改写/.test(dual.paras[1])
+      && dual.paraStyle.size === '13px' && dual.paraStyle.line === '23.4px' && dual.paraStyle.color === 'rgb(78, 89, 105)',
+    JSON.stringify({ paras: dual.paras, style: dual.paraStyle }))
+  pass('合成通知不做成用户卡：通知行保留宿主气泡、行里没有用户卡',
+    dual.noticeHasCard === false && dual.noticeBubbleDisplay !== 'none',
+    JSON.stringify({ noticeHasCard: dual.noticeHasCard, noticeBubbleDisplay: dual.noticeBubbleDisplay }))
+  pass('真实用户行做成卡片后宿主气泡收起来（不留重复文本）',
+    dual.userRowBubbleDisplay === 'none' && dual.userHostRunDisplay === 'none',
+    JSON.stringify({ bubble: dual.userRowBubbleDisplay, text: dual.userRowTextDisplay, run: dual.userHostRunDisplay }))
+  pass('移动端用户卡隐藏时间、页面不横向溢出',
+    dual.userFoot.timeDisplay === 'none' && dual.overflowX <= 0 && dual.userFoot.timeText === '今天 20:24',
+    JSON.stringify({ timeDisplay: dual.userFoot.timeDisplay, timeText: dual.userFoot.timeText, overflowX: dual.overflowX }))
+
   const focus = await page.evaluate(() => {
-    const card = document.querySelector('[data-dsh-scard="card"]')
+    const card = document.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]')
     const buttons = [...card.querySelectorAll('button')]
     const out = []
     for (const el of buttons) {
@@ -218,10 +400,10 @@ try {
   })
   pass('朗读→复制→展开均可用键盘聚焦，焦点环 2px #AFA9EC', focus.length === 3 && focus.every((item) => item.width === '2px' && item.color === 'rgb(175, 169, 236)' && item.offset === '2px'), JSON.stringify(focus))
 
-  await page.locator('[data-dsh-scard="expand"]').click()
+  await page.locator('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"] [data-dsh-scard="expand"]').click()
   await page.waitForTimeout(250)
   const expanded = await page.evaluate(() => {
-    const card = document.querySelector('[data-dsh-scard="card"]')
+    const card = document.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]')
     return {
       open: card.getAttribute('data-open'),
       aria: card.querySelector('[data-dsh-scard="expand"]').getAttribute('aria-expanded'),
@@ -231,22 +413,22 @@ try {
     }
   })
   pass('展开后文案「收起」、aria-expanded=true、箭头旋转、正文完整', expanded.open === '1' && expanded.aria === 'true' && expanded.text === '收起' && expanded.maxHeight === 'none' && expanded.transform.includes('-1'), JSON.stringify(expanded))
-  await page.locator('[data-dsh-scard="expand"]').click()
+  await page.locator('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"] [data-dsh-scard="expand"]').click()
   await page.waitForTimeout(250)
   const collapsed = await page.evaluate(() => ({
-    open: document.querySelector('[data-dsh-scard="card"]').getAttribute('data-open'),
+    open: document.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]').getAttribute('data-open'),
     aria: document.querySelector('[data-dsh-scard="expand"]').getAttribute('aria-expanded'),
     text: document.querySelector('[data-dsh-scard="expand-text"]').textContent,
   }))
   pass('再点恢复「展开全文」与 aria-expanded=false', collapsed.open === '0' && collapsed.aria === 'false' && collapsed.text === '展开全文', JSON.stringify(collapsed))
 
-  await page.locator('[data-dsh-scard="copy"]').click()
+  await page.locator('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"] [data-dsh-scard="copy"]').click()
   const copyOk = await page.evaluate(() => {
     const el = document.querySelector('[data-dsh-scard="copy-status"]')
     return { text: el?.textContent ?? '', visible: el ? getComputedStyle(el).display !== 'none' : false }
   })
   pass('复制成功显示可见「已复制」', copyOk.text === '已复制' && copyOk.visible === true, JSON.stringify(copyOk))
-  await page.locator('[data-dsh-scard="copy"]').click()
+  await page.locator('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"] [data-dsh-scard="copy"]').click()
   const copyFail = await page.evaluate(() => {
     const el = document.querySelector('[data-dsh-scard="copy-status"]')
     return { text: el?.textContent ?? '', visible: el ? getComputedStyle(el).display !== 'none' : false }
@@ -256,7 +438,7 @@ try {
   await page.setViewportSize({ width: 900, height: 900 })
   await page.waitForTimeout(250)
   const desktop = await page.evaluate(() => {
-    const card = document.querySelector('[data-dsh-scard="card"]')
+    const card = document.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]')
     return { width: card.getBoundingClientRect().width, time: getComputedStyle(card.querySelector('[data-dsh-scard="time"]')).display }
   })
   pass('桌面卡片宽度不超过 620px 且时间可见', desktop.width <= 620 && desktop.time !== 'none', JSON.stringify(desktop))
@@ -281,8 +463,16 @@ try {
   })
   await page.waitForTimeout(300)
   await page.screenshot({ path: SCREENSHOT_MOBILE, fullPage: true })
+  await page.setViewportSize({ width: 900, height: 1000 })
+  await page.waitForTimeout(250)
+  await page.evaluate(() => {
+    document.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"] [data-dsh-scard="copy-status"]')?.remove()
+  })
+  await page.waitForTimeout(200)
+  await page.screenshot({ path: SCREENSHOT_DUAL, fullPage: true })
   console.log(SCREENSHOT_DESKTOP)
   console.log(SCREENSHOT_MOBILE)
+  console.log(SCREENSHOT_DUAL)
 } finally {
   await browser.close().catch(() => {})
 }

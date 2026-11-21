@@ -1,10 +1,14 @@
 /**
- * 个人秘书回答卡片（设计规范 v1.0）：
- *   - 白卡、16px 圆角、0.5px 浅灰边、无阴影、overflow hidden；
- *   - 头部：32px 紫色助手标识 + 名称 + AI 助手标签，右端只有 34px 朗读按钮；
- *   - 正文：15px 标题、13px/1.8 正文、重点句主文字色、模型名浅紫等宽行内标签；
- *   - 底部：浅灰操作栏，左侧时间、右侧复制 / 分隔线 / 展开全文，朗读按钮不出现在底部；
- *   - ≤520px：卡片 100%，外层和内部间距按规范，时间隐藏，朗读按钮仍在右上角。
+ * 个人秘书卡片样式（设计规范 v1.0）——两种卡共用同一套外壳规格，主题色分开：
+ *   - 秘书回复卡（data-dsh-scard-kind="assistant"）：白底 + 紫色强调（#534AB7 / #3C3489 / #EEEDFE）；
+ *   - 用户卡（data-dsh-scard-kind="user"）：浅蓝底 #EEF4FF + 冷蓝强调 #184A80（标识与芯片同色系）。
+ * 主题全部走 `--dsh-card-*` 变量，视觉测试靠比对这两组变量确认两种卡不会同色。
+ *
+ *   - 卡片：宽 ≤620px、16px 圆角、0.5px 浅灰边 #E5E6EB、无阴影、overflow hidden；
+ *   - 头部：32px 标识 + 名称 + 身份标签，右端只有 34px 朗读按钮；
+ *   - 正文：15px 标题、13px/1.8 正文、重点句主文字色、模型名浅底等宽行内标签；
+ *   - 底部：操作栏左侧时间、右侧复制 / 分隔线 / 展开全文（用户卡也是同一套）；
+ *   - ≤520px：卡片 100%，时间隐藏，朗读按钮仍在右上角。
  *
  * 只对个人秘书固定会话生效：原始 markdown 气泡、过程信息行、消息操作行与空壳都被隐藏。
  */
@@ -32,17 +36,50 @@ body[data-dsh-secretary="1"] [data-dsh-speak="wrap"][data-empty="1"] {
   display: none !important;
 }
 
-/* ── 卡片外壳 ── */
+/* ── 用户卡接管宿主用户行 ──
+ * 真实用户消息被做成卡片后，那条气泡本身不再显示（时间/操作行也已在卡片底行里）。
+ * 带附件的行保留宿主气泡（附件芯片不能丢），只把纯文本 run 收起来。 */
+body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard="card"][data-dsh-scard-kind="user"]) > [data-slot="conversation.chat.node"]:not(:has(img)) {
+  display: none !important;
+}
+body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard="card"][data-dsh-scard-kind="user"]) [data-slot="conversation.user.text.node"] > span:not([data-dsh-scard]) {
+  display: none !important;
+}
+
+/* ── 卡片外壳 + 主题变量（秘书回复卡 = 紫；用户卡 = 冷蓝） ── */
 [data-dsh-scard="card"] {
+  --dsh-card-surface: #ffffff;
+  --dsh-card-accent: #534ab7;
+  --dsh-card-accent-deep: #3c3489;
+  --dsh-card-accent-wash: #eeedfe;
+  --dsh-card-accent-wash-deep: #e8e6fd;
+  --dsh-card-accent-line: #cecbf6;
+  --dsh-card-foot-surface: #fafafb;
+  --dsh-card-border: #e5e6eb;
+  --dsh-card-separator: #d5d8dd;
+  --dsh-card-text: #1f2329;
+  --dsh-card-text-soft: #4e5969;
+  --dsh-card-text-muted: #8a9099;
+  --dsh-card-focus-ring: #afa9ec;
   box-sizing: border-box;
   width: 100%;
   max-width: 620px;
   margin: 12px auto;
   overflow: hidden;
-  background: #ffffff;
-  border: 0.5px solid #e5e6eb;
+  background: var(--dsh-card-surface);
+  border: 0.5px solid var(--dsh-card-border);
   border-radius: 16px;
   box-shadow: none;
+}
+[data-dsh-scard="card"][data-dsh-scard-kind="user"] {
+  --dsh-card-surface: #eef4ff;
+  --dsh-card-accent: #184a80;
+  --dsh-card-accent-deep: #12395f;
+  --dsh-card-accent-wash: #ffffff;
+  --dsh-card-accent-wash-deep: #dfe9f7;
+  --dsh-card-accent-line: #c9dcf7;
+  --dsh-card-foot-surface: #e3edf9;
+  --dsh-card-focus-ring: #7fb0ee;
 }
 
 /* ── 头部 ── */
@@ -53,7 +90,7 @@ body[data-dsh-secretary="1"] [data-dsh-speak="wrap"][data-empty="1"] {
   gap: 12px;
   padding: 18px 20px 0;
 }
-[data-dsh-scard="assistant"] {
+[data-dsh-scard="identity"] {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -66,8 +103,8 @@ body[data-dsh-secretary="1"] [data-dsh-speak="wrap"][data-empty="1"] {
   flex: none;
   width: 32px;
   height: 32px;
-  color: #534ab7;
-  background: #eeedfe;
+  color: var(--dsh-card-accent);
+  background: var(--dsh-card-accent-wash);
   border-radius: 10px;
 }
 [data-dsh-scard="mark"] svg {
@@ -82,7 +119,7 @@ body[data-dsh-secretary="1"] [data-dsh-speak="wrap"][data-empty="1"] {
   font-size: 14px;
   font-weight: 500;
   line-height: 20px;
-  color: #1f2329;
+  color: var(--dsh-card-text);
 }
 [data-dsh-scard="tag"] {
   flex: none;
@@ -90,8 +127,8 @@ body[data-dsh-secretary="1"] [data-dsh-speak="wrap"][data-empty="1"] {
   padding: 0 7px;
   font-size: 11px;
   line-height: 18px;
-  color: #3c3489;
-  background: #eeedfe;
+  color: var(--dsh-card-accent-deep);
+  background: var(--dsh-card-accent-wash);
   border-radius: 6px;
 }
 
@@ -104,9 +141,9 @@ body[data-dsh-secretary="1"] [data-dsh-speak="wrap"][data-empty="1"] {
   width: 34px;
   height: 34px;
   padding: 0;
-  color: #4e5969;
-  background: #ffffff;
-  border: 0.5px solid #e5e6eb;
+  color: var(--dsh-card-text-soft);
+  background: var(--dsh-card-surface);
+  border: 0.5px solid var(--dsh-card-border);
   border-radius: 8px;
   cursor: pointer;
   transition: color 160ms ease, background-color 160ms ease, border-color 160ms ease;
@@ -116,14 +153,14 @@ body[data-dsh-secretary="1"] [data-dsh-speak="wrap"][data-empty="1"] {
 [data-dsh-speak="button"][data-status="playing"],
 [data-dsh-speak="button"][data-status="paused"],
 [data-dsh-speak="button"][aria-pressed="true"] {
-  color: #534ab7;
-  background: #eeedfe;
-  border-color: #cecbf6;
+  color: var(--dsh-card-accent);
+  background: var(--dsh-card-accent-wash);
+  border-color: var(--dsh-card-accent-line);
 }
 [data-dsh-speak="button"][data-status="loading"] {
-  color: #3c3489;
-  background: #eeedfe;
-  border-color: #cecbf6;
+  color: var(--dsh-card-accent-deep);
+  background: var(--dsh-card-accent-wash);
+  border-color: var(--dsh-card-accent-line);
 }
 [data-dsh-speak="button"][data-status="error"] {
   color: #b42318;
@@ -156,20 +193,20 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   font-size: 15px !important;
   font-weight: 500 !important;
   line-height: 1.5 !important;
-  color: #1f2329 !important;
+  color: var(--dsh-card-text) !important;
 }
 body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [data-dsh-scard="para"] {
   margin: 0;
   font-size: 13px !important;
   font-weight: 400 !important;
   line-height: 1.8 !important;
-  color: #4e5969 !important;
+  color: var(--dsh-card-text-soft) !important;
   white-space: pre-wrap;
   word-break: break-word;
 }
 body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [data-dsh-scard="para"] strong {
   font-weight: 500 !important;
-  color: #1f2329 !important;
+  color: var(--dsh-card-text) !important;
 }
 body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [data-dsh-scard="model-code"] {
   display: inline-block;
@@ -177,8 +214,8 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace !important;
   font-size: 12px !important;
   line-height: 18px !important;
-  color: #3c3489 !important;
-  background: #eeedfe;
+  color: var(--dsh-card-accent-deep) !important;
+  background: var(--dsh-card-accent-wash);
   border-radius: 5px;
 }
 [data-dsh-scard="ref"] {
@@ -189,13 +226,13 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   max-width: 100%;
   padding: 7px 10px;
   font-size: 12px;
-  color: #3c3489;
-  background: #eeedfe;
-  border: 0.5px solid #cecbf6;
+  color: var(--dsh-card-accent-deep);
+  background: var(--dsh-card-accent-wash);
+  border: 0.5px solid var(--dsh-card-accent-line);
   border-radius: 8px;
   cursor: pointer;
 }
-[data-dsh-scard="ref"]:hover { background: #e8e6fd; }
+[data-dsh-scard="ref"]:hover { background: var(--dsh-card-accent-wash-deep); }
 [data-dsh-scard="ref-icon"] { flex: none; }
 [data-dsh-scard="ref-title"] {
   overflow: hidden;
@@ -210,13 +247,13 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   justify-content: space-between;
   gap: 12px;
   padding: 10px 14px 10px 20px;
-  background: #fafafb;
-  border-top: 0.5px solid #e5e6eb;
+  background: var(--dsh-card-foot-surface);
+  border-top: 0.5px solid var(--dsh-card-border);
 }
 [data-dsh-scard="time"] {
   font-size: 11px;
   line-height: 16px;
-  color: #8a9099;
+  color: var(--dsh-card-text-muted);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
@@ -235,22 +272,22 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   width: 30px;
   height: 30px;
   padding: 0;
-  color: #8a9099;
+  color: var(--dsh-card-text-muted);
   background: transparent;
   border: 0;
   border-radius: 8px;
   cursor: pointer;
 }
 [data-dsh-scard="copy"]:hover {
-  color: #1f2329;
-  background: #ffffff;
+  color: var(--dsh-card-text);
+  background: var(--dsh-card-surface);
 }
 [data-dsh-scard="copy-status"] {
   flex: 1 1 auto;
   min-width: 0;
   font-size: 12px;
   line-height: 16px;
-  color: #8a9099;
+  color: var(--dsh-card-text-muted);
   white-space: nowrap;
 }
 [data-dsh-scard="separator"] {
@@ -258,7 +295,7 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   width: 0.5px;
   height: 14px;
   margin: 0 5px;
-  background: #d5d8dd;
+  background: var(--dsh-card-separator);
 }
 [data-dsh-scard="expand"] {
   display: inline-flex;
@@ -268,13 +305,13 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   height: 30px;
   padding: 0 7px;
   font-size: 12px;
-  color: #534ab7;
+  color: var(--dsh-card-accent);
   background: transparent;
   border: 0;
   cursor: pointer;
 }
 [data-dsh-scard="expand"]:hover {
-  color: #3c3489;
+  color: var(--dsh-card-accent-deep);
 }
 [data-dsh-scard="expand-text"] { white-space: nowrap; }
 [data-dsh-scard="expand-arrow"] {
@@ -288,7 +325,7 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
 /* 所有卡片内按钮的焦点环：键盘 Tab 可达，不移除浏览器默认 outline。 */
 [data-dsh-scard="card"] button:focus-visible,
 [data-dsh-speak="button"]:focus-visible {
-  outline: 2px solid #afa9ec;
+  outline: 2px solid var(--dsh-card-focus-ring);
   outline-offset: 2px;
 }
 
@@ -328,7 +365,7 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
 }
 
 @media (max-width: 360px) {
-  [data-dsh-scard="assistant"] {
+  [data-dsh-scard="identity"] {
     flex-wrap: wrap;
   }
   [data-dsh-scard="tag"] {

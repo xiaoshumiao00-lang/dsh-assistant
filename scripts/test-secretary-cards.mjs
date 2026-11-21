@@ -261,6 +261,45 @@ cases.push(['卡片正文保留宿主的重点句：<strong> 还原成 **…**',
   assert.deepEqual(surface.answerInlineTokens('型号 **重点**。').map((token) => token.kind), ['text', 'strong', 'text'])
 }])
 
+cases.push(['用户卡判据：合成通知不做成用户卡（系统通知首行 / 独立 [[session:…]] 引用行）', () => {
+  assert.equal(surface.isSyntheticNoticeUserText('（系统通知，不是用户说的话）\n电脑操作会话「备份」这一轮已经完成。\n最后单独一行原样输出：[[session:s1|备份]]'), true)
+  assert.equal(surface.isSyntheticNoticeUserText('[系统通知，不是用户说的话] 电脑操作会话已完成'), true)
+  assert.equal(surface.isSyntheticNoticeUserText('材料在\n[[session:s1|论文]]\n记得看'), true)
+  assert.equal(surface.isSyntheticNoticeUserText('帮我看看今天天气'), false)
+  assert.equal(surface.isSyntheticNoticeUserText('回复里引用了 [[session:s1|论文]] 这一行不用单独成行'), false)
+  assert.equal(surface.isSyntheticNoticeUserText(''), false)
+}])
+
+cases.push(['用户卡正文：显示用户原文（按空行分段，不截断不改写）', () => {
+  assert.deepEqual(surface.parseUserCardBody('你好，帮我把今天下午的安排理一遍'), ['你好，帮我把今天下午的安排理一遍'])
+  assert.deepEqual(surface.parseUserCardBody('第一行\n第二行\n\n第三段'), ['第一行\n第二行', '第三段'])
+  assert.deepEqual(surface.parseUserCardBody('   '), [])
+  assert.deepEqual(surface.parseUserCardBody('行一\r\n行二'), ['行一\n行二'])
+}])
+
+cases.push(['用户卡朗读 key：每张卡按自己那条消息，不与秘书卡串', () => {
+  assert.equal(surface.userCardSpeechKey('13:input-message-abc', '8'), 'user:13:input-message-abc')
+  assert.equal(surface.userCardSpeechKey('', '8'), 'user:turn:8')
+}])
+
+cases.push(['用户卡时间：宿主「HH:MM」补成「今天 HH:MM」，已是日期文本原样用', () => {
+  assert.equal(surface.formatUserCardClock('20:24'), '今天 20:24')
+  assert.equal(surface.formatUserCardClock('昨天 23:05'), '昨天 23:05')
+  assert.equal(surface.formatUserCardClock('11月18日 08:30'), '11月18日 08:30')
+  assert.equal(surface.formatUserCardClock(''), '')
+}])
+
+cases.push(['自动朗读目标只看秘书卡：用户卡不许挡住最近一条真实回复', () => {
+  const el = (turn, kind) => ({ getAttribute: (name) => (name === 'data-dsh-scard-turn' ? turn : name === 'data-dsh-scard-kind' ? kind : name === 'data-empty' ? '0' : null) })
+  const doc = { querySelectorAll: () => [el('8', 'assistant'), el('10', 'assistant'), el('11', 'user')] }
+  assert.equal(surface.latestReplyTurnNo(doc), '10')
+}])
+
+cases.push(['卡片 kind 常量：秘书卡 assistant / 用户卡 user', () => {
+  assert.equal(surface.CARD_KIND_ASSISTANT, 'assistant')
+  assert.equal(surface.CARD_KIND_USER, 'user')
+}])
+
 let failed = 0
 for (const [name, fn] of cases) {
   try {
