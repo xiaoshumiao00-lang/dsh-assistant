@@ -74,8 +74,8 @@ DeepSeek Harness 一体化助手插件：**悬浮球 → 控制室**，外加**�
 - **打开页不等待网络（2026-11-21 实测修复）**：单击后有缓存 id 就 0 请求直接切页，「校验 / 恢复归档 / 重命名 / 置顶 / 持久化 / 关托管 / 切只读」在后台并行跑且每步 12s 上限；任何一步慢或失败都只进诊断（`window.__dshAssistantOpenLog`），不挡打开、不挂黄字、不回退骨架屏。
 - **切页走「能真正切过去」的那条路**：客户端 ctx 是声明式注入门禁代理，`ctx.uiWorkspace` 在部分宿主上拿不到实例（真页面实测：openSession 静默失败 → 长按没反应）。现在统一用控制室那份会话桥（`src/client/session-open.ts`）切页，并校验 `selection.sessionId` 是否真落到目标会话，没落到就退避重试。
 - **主动服务卡片**：秘书的主动消息在会话页「本轮尾部」渲染成一张卡（标题 / 摘要 / 要点 / 时间 / 查看详情），挂在宿主槽位 `conversation.chat.turnTail`，只对固定秘书会话生效；卡片数据在宿主 `/api/assistant/proactive`（`src/assistant-proactive.ts`），首次启动种一张「明天武汉出差」示例卡。
-- **秘书是只读会话**：打开时切到「仅可查看」并显式关闭托管；宿主侧工具闸只放行只读/汇总工具（read/grep/web/mnemon/session_*），拒绝 shell、写文件、Computer Use、子代理和未知工具。
-- **派活目录由秘书模型决定（2026-11-21 起）**：秘书按系统提示里的三条规则（旧任务延续/相关项目 → 旧项目目录；不相关的大活 → 新建专项文件夹；日常杂活 → 个人助手目录）自己选目录，然后调用 `secretary_dispatch`（`src/assistant-dispatch.ts`）把 task + cwd 交出来，宿主才建目录/建会话/派活。原规则函数（`src/client/secretary-dispatch.ts`，单测 `scripts/test-secretary-dispatch.mjs`）降级为**兜底**：模型没给 cwd 或给了非法路径时才用它，并在结果里回报 `decided_by: 'rules'`。派活永远创建独立会话，不走子代理（子代理会继承只读）。
+- **秘书是只读会话，但只读不误拦派活**：打开时切到「仅可查看」并显式关闭托管；宿主侧工具闸拒绝 shell、写文件、直接 Computer Use、子代理和未知执行工具，本机 `read/grep/read_image` 与 `web_*` 也不交给秘书自己执行（这些请求必须派 CU）；同时把 `secretary_dispatch` 单列为硬放行项——建/续独立 CU 会话不属于在秘书会话里写文件或跑终端。
+- **默认派 Computer Use（2026-11-21 实测修正）**：只有「今天几号」这类纯知识、无需外部信息或动手的随口问题才由秘书直接答；看屏幕、看当前页面、操作应用、读本机文件、上网查证，以及裁图/翻译/润色/整理等动手活，一律先调 `secretary_dispatch`。已有项目文件夹（含旧任务延续）→ 续接该项目最近的 CU，没有才新建（B）；没有对应项目 → 新建专项文件夹 + CU（C），不再用「复杂专项」作派活门槛，也不再把简单杂活塞进个人助手目录。提示词明确禁止「我看不到 / 没有截图能力 / 无法直接确认」收工，派活成功后才回报「已派」。目录由秘书模型按 B/C 选择，`src/client/secretary-dispatch.ts` 只在模型未给合法目录时按同一套规则兜底（`decided_by:'rules'`）；派活不走子代理（子代理会继承只读）。
 - **只读/托管确认失败才拦**：`/permission read-only` 之后先从投影缓存回读、未知就 `refreshProjections` 再读并后台退避；页面上不显示「只读权限未确认」横幅。发送侧由宿主在**每一轮开始前**确认这条会话确实还在只读档（`agent/pre-step`），不在才拦下并说明原因。
 - **私人助手项目卡仍在**：图标 🤖、名称「私人助手」，排在那张固定秘书卡之后。状态灯（绿/黄/红/蓝）、中间实时进度、运行时长、子代理数、「会话列表」、「＋新建 / 对话」「＋新建 / 电脑操作」、重命名、换图标、隐藏、拖拽排序——与其他项目卡完全同一套逻辑，不是另写的卡片类型。
 - **助手会话不再混进「正在运行」临时卡片**：助手目录被认作项目文件夹后，该目录下的会话归这张卡；删卡后写 `removed` 墓碑，不再自动重建（用户删掉就是明确不要）。
@@ -88,7 +88,7 @@ DeepSeek Harness 一体化助手插件：**悬浮球 → 控制室**，外加**�
 - **目录边界**：内容窗与终端都走 allowlist（`src/path-guard.ts`）。默认允许根 = 助手目录 + 它的父目录、DSH 数据根、平台 Desktop、默认项目父目录、`skillRoot`、临时目录、插件仓库 cwd、用户主目录，加上配置里的 `allowedRoots`；越界一律 403 `outside-allowlist` 并带解析后的绝对路径。终端只带白名单环境变量（`termEnvAllow` 可追加），不再整包 `process.env`。要全盘放行只在配置里写 `"allowAllLocalPaths": true`。
 - **个人秘书每次打开都是同一条**：会话 ID 由宿主持久化，打开时校验、恢复归档、置顶、切只读、关托管；上下文增长由宿主 compaction 处理。「记得你」仍靠 USER/MEMORY/AGENTS/journal 这套记忆。私人助手项目卡的「＋新建」仍可创建普通会话。
 - **助手永远是单一会话布局（v0.2.10）**：打开助手前会先收起当前项目分栏工作区。此前在论文写作模板项目里长按悬浮球进助手，流程窗格 + 对话列一直挂着，看起来像「项目还在左右分屏」。
-- **个人秘书是标准模式 + 只读，不加载 Computer Use**；私人助手项目卡的「＋新建 / 电脑操作」仍会创建 computer-use 会话。
+- **个人秘书是标准模式 + 只读，不直接加载 Computer Use**；需要看屏或操作时由 `secretary_dispatch` 建/续独立的 computer-use 会话，私人助手项目卡的「＋新建 / 电脑操作」也仍会创建 computer-use 会话。
 - **新秘书会话沿用上一次的模型**：先读固定会话实际在用的模型，没有记录时退回本机上次选过的标准模式模型；已有固定会话不覆盖当前模型。
 - **记忆闭环**：热记忆（`USER.md` / `MEMORY.md` 每轮注入）+ 人设里的收工蒸馏（写 journal、更新记忆、纠正即覆盖）+ `mnemon` 检索；记忆真值在 `~/.mnemon/runtime/`。
 - **一键导出诊断包（脱敏）**：设置 →「个人助手」页底的「🧰 导出诊断包（脱敏）」按钮（`src/assistant-diagnostics.ts`）。包里放的是：插件/清单/Node 版本、`~/.dsh/dsh-assistant-focus.log` 尾部、`<profile>/dsh-assistant-ball/helper.log` 尾部、`$DSH_HOME/dsh-pocket/diagnostic.jsonl` 的摘要（只留计数与最近几条的关键字段，payload 不倒）、状态 json 的概要（revision / 项数，不带内容）、助手目录用量、目录 allowlist 的根列表。写盘前一律过脱敏：已知绝对根（主目录 / DSH 数据根 / profile / 助手目录 / Desktop / 临时目录 / `skillRoot` / `allowedRoots`）换成 `<HOME>` `<DSH>` `<PROFILE>` `<ROOT>` 之类标记，残留的 `X:\...`、`/Users/...`、`/home/...` 换成 `<PATH>`，`pin:` / `token=` / `password:` / `Bearer …` / 32 位以上十六进制串、以及 **JSON 字符串内部** 的 6–8 位数字串换成 `«已脱敏»`（数字字段本身不动，不然包会 invalid）。`dsh-pocket/settings.json` 整份都不进包（PIN / 隧道 Token / cloudflared 路径都在那里），包里还有一行 `notCollected` 明确写着「哪些东西故意不给」。落盘位置：`~/.dsh/assistant/outputs/diagnostics-<时间戳>.json`（尽力 0o600），按钮旁边显示真实路径、体积与「脱敏替换 N 处」，另有一份浏览器下载。

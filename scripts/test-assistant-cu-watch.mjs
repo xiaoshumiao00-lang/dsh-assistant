@@ -10,7 +10,7 @@
  *      同一轮只报一次；
  *   4. 通知正文含 [[session:<id>|<标题>]] 引用标记（渲染成可点跳信息行），口语简洁；
  *   5. 合成完成轮：turn 号接在现有最大 turn 后，五个事件按序落盘；
- *   6. 派活分层：A 简单杂活直接回答（工具拒绝 chat/assistant）；B 有 CU 会话续接最近的、
+ *   6. 派活分层：A 纯知识随口问直接回答；B 有 CU 会话续接最近的、
  *      无 CU 会话新建；C 新项目建文件夹；标准会话不作为续接候选；
  *   7. 项目卡片数据源合并：注册表条目给显示名、removed/hidden 排除、会话归并补集。
  */
@@ -117,6 +117,7 @@ cases.push(['合成轮：turn 接在最大 turn 后，五事件按序落盘', ()
   assert.equal(appended[0][1].turn, 5, 'turn = 现有最大 4 + 1')
   const message = appended[2][1].message
   assert.equal(message.role, 'assistant')
+  assert.deepEqual(appended[2][1].stream, [], '宿主 assistant/message 事件必须带 stream，即使合成通知没有流式分片')
   assert.ok(message.content[0].text.includes('[[session:cu-2|爬虫工程]]'))
   assert.equal(appended[4][1].reason.kind, 'completed')
   // 会话不可用 → false 不抛
@@ -141,7 +142,7 @@ cases.push(['分层 B：续接该项目最近的 CU 会话（标准会话/子代
   assert.equal(dispatch.pickCuSessionToContinue([{ sessionId: 'std-1', cwd: 'D:\\x', agentPreset: 'standard', updatedAt: 1 }], 'D:\\x'), null, '标准会话不作续接候选')
 }])
 
-cases.push(['分层 A：工具对 chat/assistant 一律拒绝（简单杂活直接回答、不建会话）', async () => {
+cases.push(['分层 A：只有纯知识随口问直接回答，不建会话', async () => {
   lib.assistantSecretaryTestSurface.secretarySessionRef.id = 'sec-1'
   const tool = dispatch.dispatchToolDefinition({
     sessionController: {
@@ -150,8 +151,8 @@ cases.push(['分层 A：工具对 chat/assistant 一律拒绝（简单杂活直�
     },
   })
   await assert.rejects(
-    () => tool.execute({ task: '帮我把桌面那张截图裁一下', kind: 'assistant' }, { agent: { session: { id: 'sec-1' } } }),
-    /分层 A.*直接.*回答|直接在秘书会话里回答/,
+    () => tool.execute({ task: '今天几号' }, { agent: { session: { id: 'sec-1' } } }),
+    /纯知识.*直接.*回答|只有纯知识/,
   )
 }])
 

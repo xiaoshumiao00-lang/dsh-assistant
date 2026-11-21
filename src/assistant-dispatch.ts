@@ -2,12 +2,11 @@
  * 个人秘书「派活分层」——A/B/C 三层，由秘书模型理解后决定（2026-11-21 用户新规则）。
  *
  * 分层（提示词与工具共用同一套文案，避免两处漂移）：
- *   A. 简单日常杂活 / 问话 / 闲聊 → 秘书页直接回答，**不建任何会话**（工具层对 chat/assistant
- *      一律拒绝，防止规则兜底把杂活又派出去）。
- *   B. 复杂专项任务且已有对应项目文件夹 → 在该项目文件夹下**续接最近的 Computer Use 会话**
- *      （该项目下没有 CU 会话时才新建 CU 会话）。
- *   C. 复杂专项任务且没有对应项目文件夹 → 在「新项目父目录」下建专项文件夹，并在其中
- *      新开 Computer Use 模式会话。
+ *   A. 纯知识性、无需动手的随口问题 / 闲聊 → 秘书页直接回答，**不建任何会话**。
+ *   B. 需要看屏幕、操作应用、读本机文件、上网查证或任何动手任务，且已有对应项目文件夹
+ *      → 在该项目文件夹下**续接最近的 Computer Use 会话**（没有 CU 会话时才新建）。
+ *   C. 同类任务但没有对应项目文件夹 → 在「新项目父目录」下建专项文件夹，并新开 CU 会话。
+ *      任务不再以「复杂专项」为派活门槛；裁图、翻译、润色、查资料也不能塞进 A 直接收工。
  *
  * 硬约束：
  *   - 派活目标**只许 computer-use 模式**（新建走 sessionController.create({cwd, agentPreset})
@@ -37,22 +36,22 @@ export const CU_AGENT_PRESET = 'computer-use'
 
 /** A/B/C 分层规则原文（提示词与工具描述共用）。 */
 export const DISPATCH_RULES = [
-  'A. 简单日常杂活（裁图、翻译一句、润色一段、查个东西、整理笔记）、问话、闲聊 → 直接在秘书会话里回答，绝不调用本工具、不建任何会话。',
-  'B. 复杂专项任务（多步骤 / 跨文件 / 建工程）、且与下面某个既有项目相关或是它的旧任务延续 → kind 填 existing，cwd 填那个项目的目录（原样照抄清单里的路径）；宿主会续接该项目下最近的 Computer Use 会话，没有才新建。',
-  'C. 复杂专项任务、但与任何既有项目都不相关 → kind 填 new-folder、cwd 留空；宿主在「新项目父目录」下建一个专项文件夹，并在其中新开 Computer Use 模式会话。',
+  'A. 只有纯知识性、无需动手的随口问题（例如「今天几号」「解释一个概念」）和简单闲聊，才直接在秘书会话里回答，不调用本工具、不建会话。翻译、润色、裁图、查资料、整理笔记都不是 A。',
+  'B. 凡需要看屏幕、看当前页面、操作应用、读本机文件、上网查证或任何需要动手的任务，若与下面某个既有项目相关或是旧任务延续 → kind 填 existing，cwd 填那个项目的目录（原样照抄清单里的路径）；宿主续接该项目最近的 Computer Use 会话，没有才新建。',
+  'C. 凡需要看屏幕、操作应用、读本机文件、上网查证或动手，但与任何既有项目都不相关 → kind 填 new-folder、cwd 留空；宿主新建专项文件夹 + Computer Use 模式会话。任务简单也照派，不许因「只是问一句」留在秘书页。',
 ].join('\n')
 
 /** 工具描述（模型看到的就是这段）。 */
 const DISPATCH_DESCRIPTION = [
-  '把一件复杂专项任务派给一条 Computer Use 模式会话（不是标准会话、不是子代理）。',
-  '你是只读的个人秘书：简单日常杂活、问话、闲聊（分层 A）直接在会话里回答，不要调用本工具、不要建会话。',
-  '只有复杂专项任务（多步骤 / 跨文件 / 建工程）才调用本工具：先在 cwd 里写清目标目录（绝对路径），再调用；',
-  '宿主只建/续 Computer Use 模式会话——已有该项目文件夹时续接其下最近的 CU 会话（B），没有项目文件夹时新建专项文件夹 + CU 会话（C）。',
-  '标准会话由 CU 会话在后台自行派发，不归你管，也不要给它们建卡片。',
+  '把需要外部信息或动手的任务派给一条 Computer Use 模式会话（不是标准会话、不是子代理）。默认派活；只有 A 类纯知识随口问题不派。',
+  '看屏幕、看当前打开的页面、操作应用、读本机文件、上网查证，以及裁图、翻译、润色、整理等动手任务，都必须调用本工具。',
+  '禁止用「我看不到」「没有截图能力」「无法直接确认」「我做不了」直接终答或收工。遇到自己做不到的事，第一步必须先调用本工具；成功后再回报「已派 Computer Use 会话处理」。',
+  '已有项目文件夹时 kind=existing 并填绝对路径 cwd（B）；没有对应项目时 kind=new-folder 且 cwd 留空（C）。不要再用 assistant 类型。',
+  '宿主只建/续 Computer Use 模式会话。标准会话由 CU 会话在后台自行派发，不归你管，也不要给它们建卡片。',
   '选目录按这三层规则：',
   DISPATCH_RULES,
   '判断「延续旧任务」时参考系统提示里给出的既有项目目录与最近会话标题。',
-  '只有在你确实无法判断时才省略 cwd：宿主会用旧规则兜底，但那样可能落错目录。',
+  '只有确实无法判断目录时才省略 cwd：宿主会按同一套「纯知识直接答，其余 B/C」规则兜底。',
 ].join('\n')
 
 /** 候选项目缓存：系统提示词每轮都要用，不能每轮打一次持久化列表。 */
@@ -265,7 +264,9 @@ export function resolveDispatchTarget(input: {
   const task = String(input.task ?? '').trim()
   const cwd = String(input.cwd ?? '').trim()
   const kind = String(input.kind ?? '').trim()
-  if (isUsableTargetDir(cwd)) {
+  // assistant 是旧版 A 类杂活目录，已废除。即便旧提示词仍传来 assistant + cwd，
+  // 也忽略该目录并重新走 B/C，绝不再把动手活丢回秘书直接回答。
+  if (isUsableTargetDir(cwd) && kind !== 'assistant') {
     const normalized = cwd.replace(/[\\/]+$/, '')
     const decided = kind === 'new-folder' || kind === 'assistant' || kind === 'existing' ? kind : 'existing'
     return { kind: decided, cwd: normalized, reason: '秘书模型指定目录', decidedBy: 'model' }
@@ -288,15 +289,20 @@ export function dispatchPromptSection(ctx: any, projects: DispatchProject[]): st
   const lines: string[] = []
   lines.push('# 派活分层（个人秘书）')
   lines.push('')
-  lines.push('你是只读的个人秘书。用户发来一件事时，按 A/B/C 三层处理：')
+  lines.push('你是只读的个人秘书，但只读只限制你自己写文件、跑终端和操作屏幕，不限制建会话与派活。默认派活，按 A/B/C 三层处理：')
   lines.push(DISPATCH_RULES)
   lines.push('')
-  lines.push(`分层 A 直接回答，不调用 ${SECRETARY_DISPATCH_TOOL}、不建会话。`)
-  lines.push(`分层 B/C 才调用 ${SECRETARY_DISPATCH_TOOL}，把用户原话放进 task；宿主只建/续 **Computer Use 模式**会话，绝不派进标准会话。`)
+  lines.push(`分层 A 直接回答，不调用 ${SECRETARY_DISPATCH_TOOL}、不建会话。只有纯知识性、无需看屏幕、读本机文件、上网查证或动手的随口问题才属于 A。`)
+  lines.push(`其余一律先调用 ${SECRETARY_DISPATCH_TOOL}，把用户原话原样放进 task；宿主只建/续 **Computer Use 模式**会话，绝不派进标准会话。`)
   lines.push('标准会话由 Computer Use 会话在后台自行派发，不归你管，也不要给它们建卡片。')
   lines.push('')
+  lines.push('禁止收工式回答：不得以「我看不到」「没有截图能力」「无法直接确认」「我做不了」作为终答，也不要先猜一个答案再结束。')
+  lines.push(`遇到自己做不到或需要外部信息的任务，必须先派 ${SECRETARY_DISPATCH_TOOL}，工具成功后再简短回报「已派 Computer Use 会话处理」；工具失败才如实说派活失败。`)
+  lines.push(`例：「你看我打开的 QQ 页面，他们说的 38 fn 指什么模型？」需要看当前屏幕，必须先调用 ${SECRETARY_DISPATCH_TOOL}，绝不能在秘书页回答看不到。`)
+  lines.push('例：「今天几号」是纯知识随口问，直接回答，不调用工具、不建会话。')
+  lines.push('')
   lines.push(`新项目父目录（分层 C 新建文件夹的位置）：${parent || '（未知）'}`)
-  if (home !== '') lines.push(`个人助手目录（仅供你理解环境，分层 A 不派活、不用它建会话）：${home}`)
+  if (home !== '') lines.push(`个人助手目录（仅供你理解环境；不再作为简单杂活的派活目标）：${home}`)
   lines.push('')
   if (projects.length > 0) {
     lines.push('既有项目目录（分层 B 的判断依据，与控制室项目卡片同一份数据；最近在用的排在前面）：')
@@ -305,10 +311,10 @@ export function dispatchPromptSection(ctx: any, projects: DispatchProject[]): st
       lines.push(`- ${project.dir}${project.name && project.name !== project.dir ? `（${project.name}）` : ''}${titles ? ` 最近会话：${titles}` : ''}`)
     }
   } else {
-    lines.push('既有项目目录：（暂时读不到，按分层 A/C 判断）')
+    lines.push('既有项目目录：（暂时读不到；纯知识问题走 A，其余一律走 C）')
   }
   lines.push('')
-  lines.push(`不是要动手的问话（聊天、问状态、问你是谁）就直接回答，不要调用 ${SECRETARY_DISPATCH_TOOL}。`)
+  lines.push(`再次强调：「今天几号」这类纯知识问题才直接答；只要需要外部信息或动手，就先调用 ${SECRETARY_DISPATCH_TOOL}，再说已派。`)
   void ctx
   return lines.join('\n')
 }
@@ -360,12 +366,12 @@ export function dispatchToolDefinition(ctx: any): any {
         },
         cwd: {
           type: 'string',
-          description: '你选定的目标目录（绝对路径）。按三条规则挑；实在判断不了才省略。',
+          description: '分层 B 的既有项目目录（绝对路径）；分层 C 必须留空。实在判断不了才省略，由宿主按 B/C 兜底。',
         },
         kind: {
           type: 'string',
-          enum: ['existing', 'new-folder', 'assistant'],
-          description: 'existing = 旧项目/旧任务延续；new-folder = 不相关的大活（宿主新建专项文件夹）；assistant = 日常杂活（个人助手目录）。',
+          enum: ['existing', 'new-folder'],
+          description: 'existing = 已有项目/旧任务延续（B）；new-folder = 没有对应项目，宿主新建专项文件夹 + CU 会话（C）。',
         },
       },
       required: ['task'],
@@ -410,9 +416,10 @@ export function dispatchToolDefinition(ctx: any): any {
         assistantHome,
         newFolderParent: parent,
       })
-      // 分层 A：简单杂活 / 聊天不建任何会话（含规则兜底把杂活判成 assistant 的情况）
+      // 只有纯知识随口问允许不派。看屏/读文件/联网/动手任务若被误分到这里，
+      // 返回可纠正错误，要求模型改用 B/C；绝不把「看不到」当终答。
       if (target.kind === 'chat' || target.kind === 'assistant' || target.cwd === '') {
-        throw new Error('分层 A：这条是简单日常杂活或问话，直接在秘书会话里回答，不要调用本工具、不要建会话。')
+        throw new Error(`只有纯知识性、无需动手的随口问题才直接在秘书会话里回答。若这句话需要看屏幕、操作应用、读本机文件、上网查证或动手，必须重新调用 ${SECRETARY_DISPATCH_TOOL}：已有项目用 kind=existing，没有项目用 kind=new-folder；禁止以「我看不到」收工。`)
       }
 
       let createdFolder = false

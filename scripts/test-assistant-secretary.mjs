@@ -67,6 +67,7 @@ cases.push(['GET 初始为空', async () => {
   const r = await call('GET')
   assert.equal(r.status, 200)
   assert.equal(r.json.sessionId, null)
+  assert.equal(r.json.dispatchPolicy, 'default-computer-use-v2')
 }])
 cases.push(['非法 sessionId 拒绝且不落盘', async () => {
   const r = await call('POST', { sessionId: '../escape' })
@@ -83,13 +84,28 @@ cases.push(['POST 原子持久化并回读', async () => {
   const g = await call('GET')
   assert.equal(g.json.sessionId, r.json.sessionId)
 }])
-cases.push(['工具闸：默认拒绝，只放行只读/汇总工具', async () => {
-  for (const name of ['write', 'edit', 'pwsh', 'bash', 'computer_use', 'code_agent', 'subagent', 'subagent_fork', 'send_message', 'mcp__desktop__click', 'some_future_tool']) {
+cases.push(['工具闸：默认拒绝执行/本机读取/联网，只放行汇总与派活', async () => {
+  for (const name of ['write', 'edit', 'pwsh', 'bash', 'computer_use', 'code_agent', 'subagent', 'subagent_fork', 'send_message', 'mcp__desktop__click', 'read', 'grep', 'glob', 'read_image', 'web_search', 'web_fetch', 'some_future_tool']) {
     assert.equal(surface.secretaryToolDenied(name), true, `${name} 应拒绝`)
   }
-  for (const name of ['read', 'grep', 'glob', 'web_search', 'web_fetch', 'ask_user_question', 'mnemon_recall', 'session_search']) {
+  for (const name of ['ask_user_question', 'mnemon_recall', 'session_search', 'secretary_dispatch']) {
     assert.equal(surface.secretaryToolDenied(name), false, `${name} 应放行`)
   }
+}])
+cases.push(['只读工具闸显式放行派活：secretary_dispatch 可建/续独立 CU 会话', async () => {
+  let allowed = false
+  const result = await preTool({
+    name: 'secretary_dispatch',
+    agent: { session: { id: 'session-11111111-2222-3333-4444-555555555555' } },
+  }, async () => { allowed = true; return { kind: 'allow' } })
+  assert.equal(allowed, true, '只读必须限制写文件/终端，不许误拦建会话与派活')
+  assert.equal(result.kind, 'allow')
+  const web = await preTool({
+    name: 'web_search',
+    agent: { session: { id: 'session-11111111-2222-3333-4444-555555555555' } },
+  }, async () => ({ kind: 'allow' }))
+  assert.equal(web.kind, 'deny', '上网查证必须派 CU，不能由秘书自己搜完')
+  assert.match(web.reason, /secretary_dispatch/)
 }])
 cases.push(['工具闸只对固定秘书会话生效', async () => {
   assert.equal(typeof preTool, 'function')

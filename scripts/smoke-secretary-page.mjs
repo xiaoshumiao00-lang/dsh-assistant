@@ -16,10 +16,16 @@
  *      分享/记忆/时间）渲染层隐藏、不留行高；普通会话不受影响；
  *   6. 主动服务「尾巴卡」已移除：对话流尾部不再出现主动卡节点（后端数据能力保留）；
  *   7. 重复进入复用同一条固定会话（不重载、不换 id）、30s 存活、手势不串、宿主 intent 落点。
+ *   8. DSH_SMOKE_REAL_CARD=1：用户 QQ 看屏原话必须派 computer-use，回执不得是「看不到」终答；
+ *      「今天几号」直接答、不建 CU。先验本次 lib 构建契约，宿主带 v2 提示词时再验真实模型。
  *
  * 退出码 0 = 全绿。任何断言失败都会打印现场事实。
  */
 import { chromium } from 'playwright'
+
+const REAL_CARD = process.env.DSH_SMOKE_REAL_CARD === '1'
+const QQ_SCREEN_QUESTION = '你看我打开的 QQ 页面，他们说的 38 fn 指什么模型？'
+const DIRECT_QUESTION = '今天几号'
 
 const BASE = process.env.DSH_POCKET_URL || 'http://127.0.0.1:3081'
 const TOKEN = process.env.DSH_POCKET_TOKEN || '96528673'
@@ -44,6 +50,64 @@ function check(name, ok, detail = '') {
   failures.push(`${name}${detail ? ` — ${detail}` : ''}`)
   console.error(`FAIL ${name}${detail ? ` — ${detail}` : ''}`)
   return false
+}
+
+// REAL_CARD 模式同时冒烟本次构建的派活契约。这里直接加载 lib/index.js（不是 src），
+// 防止「源码改了、构建产物没改」；真宿主已加载 v2 提示词时，文末还会跑真实模型问答段。
+if (REAL_CARD) {
+  const lib = await import('../lib/index.js')
+  const dispatch = lib.assistantDispatchTestSurface
+  const plan = dispatch.resolveDispatchTarget({
+    task: QQ_SCREEN_QUESTION,
+    projects: [],
+    assistantHome: 'C:\\Users\\<ACCOUNT>\\.dsh\\assistant',
+    newFolderParent: 'D:\\SmokeProjects',
+    now: new Date(2026, 10, 21, 14, 30),
+  })
+  check('派活冒烟：QQ 原话不属于直接终答的 A 类', plan.kind === 'new-folder' && plan.cwd !== '', JSON.stringify(plan))
+  const prompt = dispatch.dispatchPromptSection({}, [])
+  check('派活冒烟：提示词禁止「看不到」收工且要求先派再报',
+    /禁止.*看不到|不得.*看不到/.test(prompt) && /先派.*secretary_dispatch.*再.*已派/.test(prompt) && prompt.includes(DIRECT_QUESTION))
+
+  lib.assistantSecretaryTestSurface.secretarySessionRef.id = 'smoke-secretary'
+  const calls = []
+  const tool = dispatch.dispatchToolDefinition({
+    get: () => undefined,
+    sessionController: {
+      create: async (req) => { calls.push(['create', req]); return { sessionId: 'smoke-cu-qq', agentPreset: 'computer-use' } },
+      rename: async () => {},
+      prompt: async (req) => { calls.push(['prompt', req]) },
+    },
+  })
+  const dispatched = await tool.execute(
+    { task: QQ_SCREEN_QUESTION, cwd: 'D:\\SmokeProjects\\qq-screen', kind: 'existing' },
+    { agent: { session: { id: 'smoke-secretary' } } },
+  )
+  const receipt = tool.output.render({}, dispatched).map((part) => part.text ?? '').join('\n')
+  check('派活冒烟：QQ 原话产生 computer-use 派活并投递原话',
+    dispatched.agent_preset === 'computer-use' && calls.some(([kind, req]) => kind === 'prompt' && req.content?.[0]?.text === QQ_SCREEN_QUESTION),
+    JSON.stringify({ dispatched, calls }))
+  check('派活冒烟：派活回执是「已派」而非「看不到」终答',
+    /已派活/.test(receipt) && !/我看不到|没有截图能力|无法直接确认/.test(receipt), receipt)
+
+  let knowledgeWrites = 0
+  const knowledgeTool = dispatch.dispatchToolDefinition({
+    get: () => undefined,
+    sessionController: {
+      create: async () => { knowledgeWrites += 1; return { sessionId: 'must-not-create', agentPreset: 'computer-use' } },
+      prompt: async () => { knowledgeWrites += 1 },
+    },
+  })
+  let knowledgeStayedDirect = false
+  try {
+    await knowledgeTool.execute({ task: DIRECT_QUESTION }, { agent: { session: { id: 'smoke-secretary' } } })
+  } catch (error) {
+    knowledgeStayedDirect = /纯知识/.test(String(error))
+  }
+  check('派活冒烟：「今天几号」直接答，不建会话、不投 prompt', knowledgeStayedDirect && knowledgeWrites === 0)
+  check('派活冒烟：只读闸放行派活但拒绝终端/本机读取/联网代查',
+    lib.assistantSecretaryTestSurface.secretaryToolDenied('secretary_dispatch') === false &&
+    ['pwsh', 'read', 'web_search'].every((name) => lib.assistantSecretaryTestSurface.secretaryToolDenied(name) === true))
 }
 
 // 自动朗读要出声（哪怕是 stub 音频）：Chromium 默认禁无手势自动播放，这里放开。
@@ -71,7 +135,7 @@ const pageErrors = []
 const failedRequests = []
 /** 已知的宿主既有 4xx（与本次改动无关；项目卡片探测 widget-result.json 时本来就没有这个文件）。
  *  /api/assistant/cu-watch/notify 是 CU 通知段的能力探测：宿主未重载新代码时 404 属预期，
- *  路由生效后正常返回 200/409（409 落盘失败仍会被 CU 通知段的 ok 断言抓住）。 */
+ *  路由生效后正常返回 200；旧宿主缺 stream 的 409 会按能力未加载跳过，v2 宿主的 409 仍算失败。 */
 const IGNORED_FAILED_URL = /\/api\/worktable\/file\?|\/api\/assistant\/cu-watch\/notify/
 page.on('console', (message) => {
   if (message.type() !== 'error') return
@@ -119,9 +183,24 @@ await page.route('**/api/assistant/tts**', (route) => {
   route.fulfill({ status: 200, contentType: 'audio/mpeg', body: stubWav })
 })
 
-const readHostSecretaryId = () => page.evaluate(async () => {
-  const body = await fetch('/api/assistant/secretary', { cache: 'no-store' }).then((res) => res.json()).catch(() => null)
-  return String(body?.sessionId ?? '')
+const readHostSecretaryMeta = () => page.evaluate(async () => {
+  return await fetch('/api/assistant/secretary', { cache: 'no-store' }).then((res) => res.json()).catch(() => null)
+})
+const readHostSecretaryId = async () => String((await readHostSecretaryMeta())?.sessionId ?? '')
+const readSessionRows = () => page.evaluate(() => {
+  try {
+    const snap = window.__dshSessions?.list?.getSnapshot?.() ?? null
+    const ids = Array.isArray(snap?.ids) ? snap.ids : []
+    return ids.map((id) => {
+      const row = snap?.byId?.[id] ?? {}
+      return {
+        id: String(id),
+        title: String(row?.title ?? ''),
+        agentPreset: String(row?.agentPreset ?? row?.header?.agentPreset ?? ''),
+        updatedAt: Number(row?.updatedAt ?? 0),
+      }
+    })
+  } catch { return [] }
 })
 const readCurrentSessionId = () => page.evaluate(() => {
   try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') } catch { return '' }
@@ -191,7 +270,8 @@ try {
         .slice(0, 3)
         .map((row) => row.id)
     } catch { return [] }
-  })
+  }).then((ids) => ids.filter((id) => id !== String(process.env.DSH_SESSION_ID ?? '')))
+  // 合成通知会往秘书会话追加事件，绝不能拿当前正在执行本冒烟的后台会话当跳转目标。
   notes.push(`普通会话抽查候选 = ${refCandidates.join(', ') || '(未找到)'}`)
 
   const hostIdBefore = await readHostSecretaryId()
@@ -335,7 +415,20 @@ try {
   check('朗读按钮在卡片第一行最右（head 末子元素、右缘贴合）',
     scard.hasButton && scard.btnIsLast && scard.btnVertInHead && scard.btnRightGap >= 8 && scard.btnRightGap <= 40,
     JSON.stringify({ hasButton: scard.hasButton, btnIsLast: scard.btnIsLast, gap: scard.btnRightGap, vert: scard.btnVertInHead }))
-  check('自动朗读已发起（唯一自动请求方 = 回复卡，TTS 已有请求）', ttsRequests >= 1, `requests=${ttsRequests}`)
+  // 历史会话可能带着上一条合成通知留下的空白尾轮，旧卡不会再次自动朗读。
+  // 此时必须真发一条新回复来验「新卡出现即自动读」，不能把手动点击算作自动请求。
+  let autoReadObserved = ttsRequests >= 1
+  if (!autoReadObserved) {
+    const beforeCards = await page.locator('[data-dsh-scard="card"]:not([data-empty="1"])').count()
+    const requestObserved = page.waitForRequest((req) => req.method() === 'POST' && /\/api\/assistant\/tts(?:\?|$)/.test(req.url()), { timeout: 120000 })
+      .then(() => true).catch(() => false)
+    await page.evaluate(async (id) => { await window.__dshPromptIntoSession?.(id, '（冒烟测试·自动朗读）只回复两个字：收到') }, currentId)
+    await page.waitForFunction((count) => document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])').length > count,
+      beforeCards, { timeout: 120000 }).catch(() => {})
+    autoReadObserved = await requestObserved
+    notes.push('自动朗读：历史卡未重读，已新发一条真实回复验证新卡自动请求')
+  }
+  check('自动朗读已发起（唯一自动请求方 = 回复卡，TTS 已有请求）', autoReadObserved, `requests=${ttsRequests}`)
 
   // ── 回复卡固定高度 + 点击展开/折叠（与主动卡共用 fold-card.css.ts 实现） ──
   const fold = await page.evaluate(() => {
@@ -428,16 +521,17 @@ try {
   if (hist.skip === true) {
     notes.push('历史卡朗读回归：会话不足两轮，跳过')
   } else {
-    // 只比汉字（规范化会在数字/汉字间补空格，避免误判）
-    const cjk = (s) => String(s).replace(/[^一-鿿]/g, '').slice(0, 6)
+    // 两边都先去标点再比前 6 个汉字；TTS 规范化会改动标点，不能只清洗标题。
+    const cjk = (s) => String(s).replace(/[^一-鿿]/g, '')
+    const head = (s) => cjk(s).slice(0, 6)
     const before = ttsBodies.length
     await page.locator('[data-dsh-scard="card"]:not([data-empty="1"])').first()
       .locator('[data-dsh-speak="button"]').click()
     await page.waitForTimeout(600)
     const sent = ttsBodies.slice(before).map((body) => { try { return JSON.parse(body)?.text ?? '' } catch { return '' } }).join(' ')
-    check('点历史卡朗读：TTS 收到的是该卡自己的文本', cjk(hist.firstTitle) !== '' && sent.includes(cjk(hist.firstTitle)),
+    check('点历史卡朗读：TTS 收到的是该卡自己的文本', head(hist.firstTitle) !== '' && cjk(sent).includes(head(hist.firstTitle)),
       `sent=${sent.slice(0, 50)} want=${hist.firstTitle.slice(0, 14)}`)
-    check('点历史卡朗读：绝不读最新一条', cjk(hist.lastTitle) === '' || !sent.includes(cjk(hist.lastTitle)),
+    check('点历史卡朗读：绝不读最新一条', head(hist.lastTitle) === '' || !cjk(sent).includes(head(hist.lastTitle)),
       `last=${hist.lastTitle.slice(0, 14)}`)
     await page.locator('[data-dsh-scard="card"]:not([data-empty="1"])').first()
       .locator('[data-dsh-speak="button"]').click().catch(() => {}) // 收尾停掉
@@ -527,6 +621,7 @@ try {
   // ── 普通会话不受影响：切到一条普通会话，消息操作行必须仍然可见 ──
   let normalChecked = false
   for (const candidate of refCandidates) {
+    if (candidate === idBeforeLongPress) continue // 固定秘书在本地 id 写入前就被列进候选，不能拿它验普通会话
     await page.evaluate((id) => {
       try { window.__dshOpenSession?.(id) } catch { /* 切页失败由下方断言兜底 */ }
     }, candidate)
@@ -574,8 +669,9 @@ try {
         return { status: res.status, ...(await res.json()), unavailable: false }
       } catch (error) { return { status: 0, ok: false, unavailable: true, error: String(error) } }
     }, { token: TOKEN, sessionId: cuTarget, title: cuTitle })
-    if (cuResponse.unavailable === true || cuResponse.status === 404) {
-      notes.push('CU 通知段：宿主未重载新代码（/api/assistant/cu-watch/notify 不可用），跳过——重启宿主后自动生效')
+    if (cuResponse.unavailable === true || cuResponse.status === 404 ||
+      (cuResponse.status === 409 && (await readHostSecretaryMeta())?.dispatchPolicy !== 'default-computer-use-v2')) {
+      notes.push('CU 通知段：宿主未加载 v2 合成消息修复（路由 404 或旧实现 409），跳过——重启后自动验完整通知链路')
     } else {
       check('CU 完成通知落盘（宿主路由接受）', cuResponse.ok === true, JSON.stringify(cuResponse))
       const noticeCard = await page.waitForFunction((title) => {
@@ -605,6 +701,61 @@ try {
     }
   } else {
     notes.push('CU 通知段：没有可用目标会话，跳过')
+  }
+
+  // ── 默认派活实时回归（仅 REAL_CARD；宿主必须已加载 default-computer-use-v2）──
+  // 构建产物契约在本脚本开头已跑。下面这段在宿主重启后进一步让真模型回答用户原话，
+  // 同时观察会话注册表：QQ 看屏问话必须新建 CU，纯知识日期问话不得新建任何 CU。
+  if (REAL_CARD) {
+    const secretaryMeta = await readHostSecretaryMeta()
+    if (secretaryMeta?.dispatchPolicy !== 'default-computer-use-v2') {
+      notes.push('默认派活实时模型段：宿主尚未加载 default-computer-use-v2（本轮按要求不重启），跳过；构建产物派活契约已在本脚本开头逐项断言')
+    } else {
+      const secretaryId = String(secretaryMeta?.sessionId ?? '')
+      const beforeQq = await readSessionRows()
+      const beforeQqIds = beforeQq.map((row) => row.id)
+      const beforeQqCards = await page.locator('[data-dsh-scard="card"]:not([data-empty="1"])').count()
+      await page.evaluate(async ({ id, text }) => {
+        if (typeof window.__dshPromptIntoSession !== 'function') throw new Error('缺少 __dshPromptIntoSession')
+        await window.__dshPromptIntoSession(id, text)
+      }, { id: secretaryId, text: QQ_SCREEN_QUESTION })
+      const qqLive = await page.waitForFunction(({ beforeIds, beforeCards }) => {
+        const snap = window.__dshSessions?.list?.getSnapshot?.() ?? null
+        const ids = Array.isArray(snap?.ids) ? snap.ids : []
+        const created = ids.map((id) => {
+          const row = snap?.byId?.[id] ?? {}
+          return { id: String(id), title: String(row?.title ?? ''), agentPreset: String(row?.agentPreset ?? row?.header?.agentPreset ?? '') }
+        }).find((row) => !beforeIds.includes(row.id) && row.agentPreset === 'computer-use')
+        const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
+        const lastText = cards.length > beforeCards ? String(cards[cards.length - 1]?.textContent ?? '') : ''
+        return created && /已派/.test(lastText) ? { ...created, reply: lastText } : false
+      }, { beforeIds: beforeQqIds, beforeCards: beforeQqCards }, { timeout: 180000 })
+        .then((handle) => handle.jsonValue()).catch(() => null)
+      check('实时模型：QQ 原话产生 computer-use 派活，秘书回报已派', qqLive !== null, JSON.stringify(qqLive))
+      check('实时模型：QQ 原话没有「看不到/没有截图能力/无法确认」收工式终答',
+        qqLive !== null && !/我看不到|没有截图能力|无法直接确认|没法直接确认/.test(qqLive.reply),
+        String(qqLive?.reply ?? '(未等到回复)').slice(0, 240))
+
+      if (qqLive !== null) {
+        notes.push(`默认派活实时模型段：QQ 原话新建 CU=${qqLive.id}，标题=${qqLive.title}`)
+        const beforeDateRows = await readSessionRows()
+        const beforeDateIds = beforeDateRows.map((row) => row.id)
+        const beforeDateCards = await page.locator('[data-dsh-scard="card"]:not([data-empty="1"])').count()
+        await page.evaluate(async ({ id, text }) => { await window.__dshPromptIntoSession(id, text) }, { id: secretaryId, text: DIRECT_QUESTION })
+        const dateReply = await page.waitForFunction((beforeCards) => {
+          const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
+          if (cards.length <= beforeCards) return false
+          const text = String(cards[cards.length - 1]?.textContent ?? '')
+          const compact = text.replace(/\s+/g, '')
+          return /11月21日|十一月二十一日/.test(compact) ? text : false
+        }, beforeDateCards, { timeout: 120000 }).then((handle) => handle.jsonValue()).catch(() => null)
+        check('实时模型：「今天几号」仍由秘书直接回答', typeof dateReply === 'string' && dateReply !== '', String(dateReply ?? '(未等到日期回复)').slice(0, 160))
+        await page.waitForTimeout(800)
+        const afterDateRows = await readSessionRows()
+        const dateCreatedCu = afterDateRows.filter((row) => !beforeDateIds.includes(row.id) && row.agentPreset === 'computer-use')
+        check('实时模型：「今天几号」不派活、不新建 CU 会话', dateCreatedCu.length === 0, JSON.stringify(dateCreatedCu))
+      }
+    }
   }
 
   check('无未捕获异常', pageErrors.length === 0, JSON.stringify(pageErrors.slice(0, 3)))

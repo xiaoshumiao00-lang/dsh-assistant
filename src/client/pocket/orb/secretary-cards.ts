@@ -270,6 +270,21 @@ export function latestTurnNo(doc: Document): string {
   return out
 }
 
+/**
+ * 最近一条**有正文的回复卡**轮次。合成通知若异常留下空白尾轮，
+ * 自动朗读仍应读最后一条真实回复，不能被最大的 data-chat-turn 永久挡住。
+ */
+export function latestReplyTurnNo(doc: Document): string {
+  let max = -1
+  let out = ''
+  for (const el of doc.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-turn]')) {
+    if (el.getAttribute('data-empty') === '1') continue
+    const value = Number(el.getAttribute('data-dsh-scard-turn'))
+    if (Number.isFinite(value) && value > max) { max = value; out = String(value) }
+  }
+  return out
+}
+
 /** ────────────────────────── 5. 卡片呈现纯函数（node 可单测） ────────────────────────── */
 
 /**
@@ -337,6 +352,7 @@ export const secretaryCardsTestSurface = {
   createSpeechController,
   SPEECH_IDLE,
   latestTurnNo,
+  latestReplyTurnNo,
   badgeTone,
   splitItemPrefix,
   itemIcon,

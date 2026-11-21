@@ -219,7 +219,7 @@ export function postSecretaryNotice(session: any, notice: { sessionId: string; t
   try {
     session.append('turn/start', { turn })
     session.append('step/start', { turn, step })
-    session.append('assistant/message', { turn, step, message })
+    session.append('assistant/message', { turn, step, message, stream: [] })
     session.append('step/end', { turn, step })
     session.append('turn/end', { turn, reason: { kind: 'completed' } })
     return true

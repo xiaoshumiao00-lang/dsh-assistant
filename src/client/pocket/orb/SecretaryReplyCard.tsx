@@ -24,7 +24,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
 import {
-  collectTurnText, formatClock, latestTurnNo, parseSessionRefs,
+  collectTurnText, formatClock, latestReplyTurnNo, parseSessionRefs,
   stripSessionRefs, summarize, normalizeForSpeech,
 } from './secretary-cards.ts'
 import { secretarySpeech } from './secretary-speech.ts'
@@ -77,7 +77,7 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
   // 自动朗读：只读最末一轮，每轮一次
   useEffect(() => {
     if (!isSecretary || turnNo === '' || speechText === '') return
-    if (turnNo !== latestTurnNo(document)) return
+    if (turnNo !== latestReplyTurnNo(document)) return
     if (autoReadKeys.has(key)) return
     autoReadKeys.add(key)
     secretarySpeech.request(key, speechText)

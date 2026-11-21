@@ -239,6 +239,12 @@ cases.push(['卡片时间：今天/昨天/更早与非法输入', () => {
   assert.equal(surface.formatClock('', now), '')
 }])
 
+cases.push(['自动朗读目标：空白合成尾轮不能挡住最近一条真实回复', () => {
+  const el = (turn, empty = '0') => ({ getAttribute: (name) => name === 'data-dsh-scard-turn' ? turn : name === 'data-empty' ? empty : null })
+  const doc = { querySelectorAll: () => [el('8'), el('10'), el('11', '1')] }
+  assert.equal(surface.latestReplyTurnNo(doc), '10')
+}])
+
 let failed = 0
 for (const [name, fn] of cases) {
   try {

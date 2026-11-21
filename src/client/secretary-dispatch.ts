@@ -1,11 +1,12 @@
 /**
  * 个人秘书「派活目录」自动判断（纯函数，无 react / 无网络，可 node 单测）。
  *
- * 规则（与用户 2026-11-20 的实测反馈一致）：
- *   1. 只是聊天/问话          → `chat`：不派活，消息发给固定秘书会话，由秘书自己答。
- *   2. 任务与既有项目相关，或旧任务延续 → `existing`：派到该旧项目目录。
- *   3. 不相关且复杂（多步骤 / 跨文件 / 建工程） → `new-folder`：在默认项目父目录下新建专项文件夹。
- *   4. 其余日常杂活            → `assistant`：派到个人助手目录（宿主下发的 assistantHome）。
+ * 规则（2026-11-21 用户实测修正）：
+ *   1. 纯知识性、无需动手的随口问题 / 闲聊 → `chat`：秘书直接答。
+ *   2. 其余任务与既有项目相关，或旧任务延续 → `existing`：续接/新建该项目下的 CU 会话。
+ *   3. 其余任务没有既有项目 → `new-folder`：新建专项文件夹 + CU 会话。
+ *      看屏幕、操作应用、读本机文件、上网查证，以及裁图/翻译/润色等动手活，一律不留在秘书页。
+ *      `assistant` 仅为兼容旧持久化数据保留，新决策不再返回。
  *
  * 为什么是"规则"而不是"模型判断"：目录选错会让工作落到错误文件夹、事后很难搬；
  * 这里把判定写成可断言的分支，谁改都能先跑 scripts/test-secretary-dispatch.mjs 看行为。
@@ -27,7 +28,7 @@ export interface DispatchProject {
 export interface DispatchInput {
   text: string
   projects?: DispatchProject[]
-  /** 个人助手目录（日常杂活）。空串 = 无法派活到助手目录。 */
+  /** 个人助手目录；不再直接接杂活，只在未配置新项目父目录时用于推导其父目录。 */
   assistantHome: string
   /** 新建专项文件夹的父目录；空串时退回 assistantHome 的父目录。 */
   newFolderParent?: string
@@ -101,22 +102,47 @@ export function dispatchSignals(text: string): string[] {
   return hits
 }
 
+/**
+ * 这句话是否依赖秘书会话之外的能力。命中时，即使是问句也必须先派 CU，
+ * 不能被「吗/呢/是什么」等聊天收尾词吞掉。
+ */
+export function requiresComputerUse(text: string): boolean {
+  const raw = String(text ?? '').trim()
+  if (raw === '') return false
+  const lower = raw.toLowerCase()
+  // 当前屏幕 / 已打开的页面或应用：典型的「你看我打开的 QQ 页面……」。
+  if (/(看|查看|识别|读取|操作|点击|截图|截屏).{0,18}(屏幕|页面|窗口|桌面|qq|微信|浏览器|应用|软件)/i.test(raw)) return true
+  if (/(我|你|当前|现在|这个|那个|已|已经).{0,12}(打开|开着|显示|切到).{0,18}(屏幕|页面|窗口|桌面|qq|微信|浏览器|应用|软件)/i.test(raw)) return true
+  if (/(打开|启动|切换|点击|输入|发送|操作).{0,16}(qq|微信|chrome|edge|浏览器|应用|软件|窗口)/i.test(raw)) return true
+  // 本机文件 / 明确路径。
+  if (/(本机|本地|电脑里|桌面上|磁盘)/i.test(raw) && /(文件|文件夹|目录|文档|截图|图片|word|excel|ppt|pdf|读|看|找|打开)/i.test(raw)) return true
+  if (/(读|打开|查看|查找|检查|修改|整理|分析|总结|转换|导出|上传|下载).{0,18}(文件|文件夹|目录|文档|word|excel|ppt|pdf)/i.test(raw)) return true
+  if (/(?:[A-Za-z]:[\\/]|\\\\[^\\\s]+\\|\/(?:[\w.-]+\/)+[\w.-]+)/.test(raw)) return true
+  // 必须联网才能查证 / 获取的当前信息。
+  if (/(上网|联网|网上|网页|网站|搜索一下|搜一下|在线查|查证|核验|核实|官方来源|最新资料)/i.test(raw)) return true
+  if (/(最新|实时|今天|明天|现在|当前).{0,12}(天气|新闻|汇率|股价|价格|航班|车次|动态)/i.test(raw)) return true
+  // 常见 GUI 名称即使夹在英文大小写混合输入里也能识别。
+  if (/\b(computer use|screenshot|screen|desktop)\b/i.test(lower) && /(看|查看|打开|操作|截图|什么|哪)/i.test(raw)) return true
+  return false
+}
+
 /** 是否表达了"要我去做点什么"的意图。 */
 export function hasTaskIntent(text: string): boolean {
   const raw = String(text ?? '').trim()
   if (raw === '') return false
+  if (requiresComputerUse(raw)) return true
   const hasVerb = TASK_VERBS.some((word) => raw.toLowerCase().includes(word))
   if (!hasVerb) return false
   const tailQuestion = CHAT_TAILS.some((word) => raw.endsWith(word))
-  // 「帮我看看这是为什么？」这类问句即使带动作词也当聊天：
-  // 秘书本身有 read/grep/web 这些只读工具，能自己查。
+  // 没有外部能力线索、也没有明确改写/执行动作的尾问句，才按纯知识随口问处理；
+  // read/web 已在只读闸中禁用，不能再以「秘书自己查」为由留在本会话。
   if (tailQuestion && !dispatchSignals(raw).length && !/(把|将).{0,20}(改|写|做|建|跑|生成)/.test(raw)) return false
   return true
 }
 
 /**
  * 复杂度：多步骤 / 跨文件 / 建工程 任一命中即算复杂（用户口径把这三条并列成「复杂」）。
- * 简单活（翻译一句、润色一段、裁张图）不该为它单开工程目录。
+ * 复杂度只用于解释与诊断信号，不再决定要不要派活：简单动手活同样走 C 新建专项文件夹。
  */
 export function complexityOf(text: string): { level: 'simple' | 'complex'; signals: string[] } {
   const signals = dispatchSignals(text)
@@ -268,28 +294,23 @@ export function decideDispatchTarget(input: DispatchInput): DispatchDecision {
   const complexity = complexityOf(text)
   const fallbackParent = String(input.newFolderParent ?? '').trim()
   const parent = fallbackParent || (assistantHome ? dirnameOf(assistantHome) : '')
-  if (complexity.level === 'complex' && parent !== '') {
+  if (parent !== '') {
     const folderName = uniqueFolderName(slugFolderName(text, input.now), input.existingFolders)
+    const signals = [...complexity.signals]
+    if (requiresComputerUse(text)) signals.push('requires-computer-use')
     return {
       kind: 'new-folder',
       cwd: joinPath(parent, folderName),
       folderName,
-      signals: complexity.signals,
-      reason: `不相关的新活，且复杂（${complexity.signals.join('、')}）→ 新建专项文件夹`,
+      signals,
+      reason: complexity.level === 'complex'
+        ? `不相关的新活，且复杂（${complexity.signals.join('、')}）→ 新建专项文件夹 + Computer Use`
+        : '没有对应项目文件夹的动手任务 → 新建专项文件夹 + Computer Use',
     }
   }
 
-  if (assistantHome !== '') {
-    return {
-      kind: 'assistant',
-      cwd: assistantHome,
-      signals: complexity.signals,
-      reason: '日常杂活 → 个人助手目录',
-    }
-  }
-
-  // 助手目录不可用（宿主还没下发）→ 只能留在秘书会话里，别乱建目录
-  return { kind: 'chat', cwd: '', reason: '没有可用的派活目录，交给秘书本人回答' }
+  // 目录配置不可用时才留在秘书会话；这不是「纯知识问题」分类结果。
+  return { kind: 'chat', cwd: '', reason: '没有可用的派活目录，无法创建 Computer Use 会话' }
 }
 
 /** 取父目录（不引 node:path，客户端也能用）。 */

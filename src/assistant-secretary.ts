@@ -6,7 +6,8 @@
  *      手机/电脑也不能共享，所以真值必须在宿主）；
  *   2. 给秘书会话装一道工具闸：只读权限仍然带着 shell / 写文件 / Computer Use /
  *      子代理这些工具，子代理还会继承父会话的只读档，所以秘书会话在工具入口
- *      直接 deny 所有“替主人干活”的能力。派活由客户端页面创建独立会话完成。
+ *      deny 自己执行任务的能力；`secretary_dispatch` 必须显式放行，由它创建或续接
+ *      独立的 Computer Use 会话。只读限制写文件/终端，绝不能把建会话与派活一起禁掉。
  *
  * 路由：
  *   GET    /api/assistant/secretary  → { ok, sessionId, updatedAt }
@@ -18,6 +19,7 @@ import { dirname, join } from 'node:path'
 import { manageWebRoutes } from './web-routes'
 
 export const ASSISTANT_SECRETARY_ROUTE = '/api/assistant/secretary'
+export const SECRETARY_DISPATCH_POLICY = 'default-computer-use-v2'
 const STATE_FILENAME = 'dsh-assistant-secretary.json'
 const MAX_BODY_BYTES = 4096
 const SESSION_ID_RE = /^[A-Za-z0-9._:-]{1,256}$/
@@ -58,23 +60,29 @@ export function normalizeSecretaryState(raw: unknown): SecretaryState | null {
 }
 
 /**
- * 秘书会话的工具白名单。秘书只做理解、汇总和派活；
- * 任何未知工具（包括第三方 MCP、未来新增的执行工具）默认拒绝，避免用黑名单追不上新工具。
- * `secretary_dispatch` / `proactive_card` 是本插件自己注册的两个「秘书专用」工具：
- * 前者由模型挑目录后建独立会话派活，后者把主动消息落成卡片。
+ * 只读闸的硬放行项：建/续独立 CU 会话不属于在秘书会话里写文件或跑终端。
+ * 单列并优先判断，防止以后收紧白名单时又把派活能力一起 deny。
+ */
+const SECRETARY_DELEGATION_TOOLS = new Set([
+  'secretary_dispatch',
+])
+
+/**
+ * 秘书会话的其它只读/汇总工具白名单；未知执行工具默认拒绝。
+ * read/grep/read_image/web_* 不在这里：需要读本机文件或上网查证时，必须由 CU 会话执行，
+ * 否则模型会绕过「默认派活」在秘书页自己查完。会话/记忆摘要仍可按前缀放行。
  */
 const SECRETARY_ALLOWED_TOOLS = new Set([
-  'read', 'grep', 'glob', 'read_image',
-  'web_search', 'web_fetch',
   'ask_user_question', 'present', 'skill',
   'todo_write', 'get_goal',
   'list_agents', 'job_list', 'job_output',
-  'secretary_dispatch', 'proactive_card',
+  'proactive_card',
 ])
 
 export function secretaryToolDenied(toolName: string): boolean {
   const name = String(toolName ?? '').trim().toLowerCase()
   if (name === '') return false
+  if (SECRETARY_DELEGATION_TOOLS.has(name)) return false
   if (SECRETARY_ALLOWED_TOOLS.has(name)) return false
   // 会话查询是只读历史工具，未来装上时直接放行；mnemon_* 是记忆读写，不是任务执行。
   if (name.startsWith('session_')) return false
@@ -168,6 +176,7 @@ export function registerAssistantSecretary(ctx: any): () => void {
             ok: true,
             sessionId: state?.sessionId ?? null,
             updatedAt: state?.updatedAt ?? '',
+            dispatchPolicy: SECRETARY_DISPATCH_POLICY,
           })
           return
         }
@@ -207,7 +216,7 @@ export function registerAssistantSecretary(ctx: any): () => void {
       if (!secretaryToolDenied(tool)) return next()
       return {
         kind: 'deny',
-        reason: `个人秘书是只读会话，不执行任务、不派子代理（已拒绝 ${tool || '未知工具'}）。要干活请调用 secretary_dispatch：目标目录由你按「旧项目 / 新建专项文件夹 / 个人助手目录」三条规则判断后填进 cwd。`,
+        reason: `个人秘书只读闸已拒绝 ${tool || '未知工具'}（写文件/终端/直接操作屏幕不能在秘书会话执行）。这不是收工理由：必须立即调用 secretary_dispatch，已有项目用 kind=existing + cwd，没有项目用 kind=new-folder；派活成功后再回报已派 Computer Use 会话处理。`,
       }
     })
   } catch {
@@ -295,6 +304,7 @@ export const SECRETARY_SPEECH_STYLE_TEXT = [
 /** 单测入口：不启动宿主也能验路由、归一与工具闸。 */
 export const assistantSecretaryTestSurface = {
   ASSISTANT_SECRETARY_ROUTE,
+  SECRETARY_DISPATCH_POLICY,
   normalizeSecretaryState,
   secretaryToolDenied,
   registerAssistantSecretary,

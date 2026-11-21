@@ -1,8 +1,8 @@
 /**
  * 个人秘书「派活目录」规则单测（纯函数，不启动 DSH、不碰真实目录）：
  *   node scripts/test-secretary-dispatch.mjs
- * 规则来源：用户 2026-11-20 实测反馈——
- *   相关项目 / 旧任务延续 → 该项目目录；不相关且复杂 → 新建专项文件夹；日常杂活 → 个人助手目录。
+ * 规则来源：用户 2026-11-21 实测反馈——
+ *   纯知识随口问直接答；其余任务：相关项目 / 旧任务延续 → 该项目目录；没有项目 → 新建专项文件夹 + CU。
  */
 import assert from 'node:assert/strict'
 import {
@@ -19,6 +19,7 @@ import { basenameOf } from '../src/client/pathutil.ts'
 const ASSISTANT = 'C:\\Users\\<ACCOUNT>\\.dsh\\assistant'
 const PARENT = 'D:\\Projects'
 const NOW = new Date(2026, 10, 20, 23, 30)
+const QQ_SCREEN_QUESTION = '你看我打开的 QQ 页面，他们说的 38 fn 指什么模型？'
 
 const projects = [
   { dir: 'D:\\hpg', name: 'hpg 小程序', titles: ['修店铺详情页白屏'], lastUsedAt: 3 },
@@ -37,11 +38,17 @@ const decide = (text, extra = {}) => decideDispatchTarget({
 
 const cases = []
 
-cases.push(['聊天/问句不派活', () => {
+cases.push(['纯知识/闲聊不派活；看屏问话必须派活', () => {
   assert.equal(decide('个人秘书是干什么的').kind, 'chat')
   assert.equal(decide('为什么只读权限没确认？').kind, 'chat')
-  assert.equal(decide('帮我看看这是为什么？').kind, 'chat')
+  assert.equal(decide('今天几号').kind, 'chat')
   assert.equal(hasTaskIntent('今天几号'), false)
+  assert.equal(hasTaskIntent(QQ_SCREEN_QUESTION), true, '看当前 QQ 页面不是纯知识随口问')
+  const screen = decide(QQ_SCREEN_QUESTION)
+  assert.notEqual(screen.kind, 'chat', '不许把看屏问题交给秘书直接终答')
+  assert.notEqual(screen.kind, 'assistant', '看屏问题不能落入会被工具拒绝的旧 A 类杂活')
+  assert.equal(screen.kind, 'new-folder')
+  assert.match(screen.cwd, /^D:\\Projects\\/)
 }])
 
 cases.push(['与既有项目相关 → 派到旧项目目录', () => {
@@ -84,11 +91,17 @@ cases.push(['复杂关键词判定', () => {
   assert.equal(complexityOf('把报告润色一下').level, 'simple')
 }])
 
-cases.push(['日常杂活 → 个人助手目录', () => {
+cases.push(['简单动手杂活也走分层 C：新建专项文件夹 + CU', () => {
   const r = decide('帮我把桌面那张截图裁一下')
-  assert.equal(r.kind, 'assistant')
-  assert.equal(r.cwd, ASSISTANT)
-  assert.match(r.reason, /日常杂活/)
+  assert.equal(r.kind, 'new-folder')
+  assert.match(r.cwd, /^D:\\Projects\\/)
+  assert.match(r.reason, /动手|新建专项文件夹|看屏|本机/)
+}])
+
+cases.push(['上网查证不是秘书页直接回答', () => {
+  const r = decide('帮我上网查证一下这个模型的官方名称')
+  assert.equal(r.kind, 'new-folder')
+  assert.match(r.cwd, /^D:\\Projects\\/)
 }])
 
 cases.push(['没给新项目父目录 → 用助手目录的父目录', () => {
@@ -97,8 +110,8 @@ cases.push(['没给新项目父目录 → 用助手目录的父目录', () => {
   assert.equal(r.cwd, 'C:\\Users\\<ACCOUNT>\\.dsh\\' + r.folderName)
 }])
 
-cases.push(['助手目录缺失时不乱建目录', () => {
-  const r = decide('帮我把桌面那张截图裁一下', { assistantHome: '' })
+cases.push(['纯知识问题不依赖派活目录', () => {
+  const r = decide('今天几号', { assistantHome: '', newFolderParent: '' })
   assert.equal(r.kind, 'chat')
   assert.equal(r.cwd, '')
 }])
