@@ -70,14 +70,19 @@ const SECRETARY_DELEGATION_TOOLS = new Set([
 
 /**
  * 秘书会话的其它只读/汇总工具白名单；未知执行工具默认拒绝。
- * read/grep/read_image/web_* 不在这里：需要读本机文件或上网查证时，必须由 CU 会话执行，
- * 否则模型会绕过「默认派活」在秘书页自己查完。会话/记忆摘要仍可按前缀放行。
+ *
+ * 只读限制的对象是「会改本机或动屏幕」的动作：写文件、终端、直接 Computer Use、派子代理。
+ * 只读查询（web_search / web_fetch）不在此列——「明天天气」这类轻量问题必须能由秘书
+ * 自己联网查完，否则会退化成「查不了 → 也没法派活」的死路（2026-11-21 用户实测）。
+ * read/grep/read_image 仍不在这里：读本机文件按分层规则应由 CU 会话执行。
+ * 会话/记忆摘要仍可按前缀放行。
  */
 const SECRETARY_ALLOWED_TOOLS = new Set([
   'ask_user_question', 'present', 'skill',
   'todo_write', 'get_goal',
   'list_agents', 'job_list', 'job_output',
   'proactive_card',
+  'web_search', 'web_fetch',
 ])
 
 export function secretaryToolDenied(toolName: string): boolean {
@@ -85,6 +90,8 @@ export function secretaryToolDenied(toolName: string): boolean {
   if (name === '') return false
   if (SECRETARY_DELEGATION_TOOLS.has(name)) return false
   if (SECRETARY_ALLOWED_TOOLS.has(name)) return false
+  // 宿主以后新增的 web 读工具（如 web_extract）同样是只读查询，按前缀放行。
+  if (name.startsWith('web_')) return false
   // 会话查询是只读历史工具，未来装上时直接放行；mnemon_* 是记忆读写，不是任务执行。
   if (name.startsWith('session_')) return false
   if (name.startsWith('mnemon_')) return false
@@ -217,7 +224,7 @@ export function registerAssistantSecretary(ctx: any): () => void {
       if (!secretaryToolDenied(tool)) return next()
       return {
         kind: 'deny',
-        reason: `个人秘书只读闸已拒绝 ${tool || '未知工具'}（写文件/终端/直接操作屏幕不能在秘书会话执行）。这不是收工理由：必须立即调用 secretary_dispatch，已有项目用 kind=existing + cwd，没有项目用 kind=new-folder；派活成功后再回报已派 Computer Use 会话处理。`,
+        reason: `个人秘书只读闸已拒绝 ${tool || '未知工具'}（写文件/终端/直接操作屏幕/派子代理不能在秘书会话执行；只读联网查询 web_search、web_fetch 是放行的）。这不是收工理由：必须立即调用 secretary_dispatch，已有项目用 kind=existing + cwd，没有项目用 kind=new-folder；派活成功后再回报已派 Computer Use 会话处理。`,
       }
     })
   } catch {

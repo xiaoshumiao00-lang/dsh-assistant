@@ -3,10 +3,12 @@
  *
  * 分层（提示词与工具共用同一套文案，避免两处漂移）：
  *   A. 纯知识性、无需动手的随口问题 / 闲聊 → 秘书页直接回答，**不建任何会话**。
- *   B. 需要看屏幕、操作应用、读本机文件、上网查证或任何动手任务，且已有对应项目文件夹
+ *   B. 需要看屏幕、操作应用、读写本机文件、保存下载或动手的任务，且已有对应项目文件夹
  *      → 在该项目文件夹下**续接最近的 Computer Use 会话**（没有 CU 会话时才新建）。
  *   C. 同类任务但没有对应项目文件夹 → 在「新项目父目录」下建专项文件夹，并新开 CU 会话。
- *      任务不再以「复杂专项」为派活门槛；裁图、翻译、润色、查资料也不能塞进 A 直接收工。
+ *      任务不再以「复杂专项」为派活门槛；裁图、翻译、润色、整理文件也不能塞进 A 直接收工。
+ *   只读联网查询（web_search / web_fetch）属于 A 的延伸：天气、新闻这类轻量事实由秘书直接查，
+ *   不为了「上网」本身派活；联网后要登录、下载、保存、点页面才算动手。
  *
  * 硬约束：
  *   - 派活目标**只许 computer-use 模式**（新建走 sessionController.create({cwd, agentPreset})
@@ -36,15 +38,14 @@ export const CU_AGENT_PRESET = 'computer-use'
 
 /** A/B/C 分层规则原文（提示词与工具描述共用）。 */
 export const DISPATCH_RULES = [
-  'A. 只有纯知识性、无需动手的随口问题（例如「今天几号」「解释一个概念」）和简单闲聊，才直接在秘书会话里回答，不调用本工具、不建会话。翻译、润色、裁图、查资料、整理笔记都不是 A。',
-  'B. 凡需要看屏幕、看当前页面、操作应用、读本机文件、上网查证或任何需要动手的任务，若与下面某个既有项目相关或是旧任务延续 → kind 填 existing，cwd 填那个项目的目录（原样照抄清单里的路径）；宿主续接该项目最近的 Computer Use 会话，没有才新建。',
-  'C. 凡需要看屏幕、操作应用、读本机文件、上网查证或动手，但与任何既有项目都不相关 → kind 填 new-folder、cwd 留空；宿主新建专项文件夹 + Computer Use 模式会话。任务简单也照派，不许因「只是问一句」留在秘书页。',
+  'A. 只有纯知识、无需动手的随口问题（例如「今天几号」「解释一个概念」），以及用只读联网工具 web_search / web_fetch 一查就能答的轻量事实（天气、气温、新闻、汇率、路线时间等），才直接在秘书会话里回答，不调用本工具、不建会话。只读限制只限制写文件、跑终端、直接操作屏幕和派子代理；联网搜索/抓取是只读查询，允许秘书自己做。翻译、润色、裁图、整理文件仍然不是 A。',
+  'B. 凡需要看屏幕、看当前页面、操作应用、读写本机文件、保存/下载/整理文件，或需要动手执行（跑命令、改文件、点应用）的任务，若与下面某个既有项目相关或是旧任务延续 → kind 填 existing，cwd 填那个项目的目录（原样照抄清单里的路径）；宿主续接该项目最近的 Computer Use 会话，没有才新建。',
+  'C. 凡需要看屏幕、操作应用、读写本机文件、保存/下载或动手，但与任何既有项目都不相关 → kind 填 new-folder、cwd 留空；宿主新建专项文件夹 + Computer Use 模式会话。任务简单也照派，不许因「只是问一句」留在秘书页。',
 ].join('\n')
 
 /** 工具描述（模型看到的就是这段）。 */
 const DISPATCH_DESCRIPTION = [
-  '把需要外部信息或动手的任务派给一条 Computer Use 模式会话（不是标准会话、不是子代理）。默认派活；只有 A 类纯知识随口问题不派。',
-  '看屏幕、看当前打开的页面、操作应用、读本机文件、上网查证，以及裁图、翻译、润色、整理等动手任务，都必须调用本工具。',
+  '把需要外部动手能力的任务派给一条 Computer Use 模式会话（不是标准会话、不是子代理）。需要看屏幕、操作应用、读写本机文件、保存/下载/整理文件时必须调用本工具；纯知识随口问题和只读联网一查就能答的轻量事实（如「明天天气」）不要调用，直接用 web_search / web_fetch 回答。',
   '禁止用「我看不到」「没有截图能力」「无法直接确认」「我做不了」直接终答或收工。遇到自己做不到的事，第一步必须先调用本工具；成功后再回报「已派 Computer Use 会话处理」。',
   '已有项目文件夹时 kind=existing 并填绝对路径 cwd（B）；没有对应项目时 kind=new-folder 且 cwd 留空（C）。不要再用 assistant 类型。',
   '宿主只建/续 Computer Use 模式会话。标准会话由 CU 会话在后台自行派发，不归你管，也不要给它们建卡片。',
@@ -289,16 +290,17 @@ export function dispatchPromptSection(ctx: any, projects: DispatchProject[]): st
   const lines: string[] = []
   lines.push('# 派活分层（个人秘书）')
   lines.push('')
-  lines.push('你是只读的个人秘书，但只读只限制你自己写文件、跑终端和操作屏幕，不限制建会话与派活。默认派活，按 A/B/C 三层处理：')
+  lines.push('你是只读的个人秘书：只读限制你自己写文件、跑终端、直接操作屏幕和派子代理，不限制建会话与派活，也不限制只读联网查询。按 A/B/C 三层处理：')
   lines.push(DISPATCH_RULES)
   lines.push('')
-  lines.push(`分层 A 直接回答，不调用 ${SECRETARY_DISPATCH_TOOL}、不建会话。只有纯知识性、无需看屏幕、读本机文件、上网查证或动手的随口问题才属于 A。`)
-  lines.push(`其余一律先调用 ${SECRETARY_DISPATCH_TOOL}，把用户原话原样放进 task；宿主只建/续 **Computer Use 模式**会话，绝不派进标准会话。`)
+  lines.push(`分层 A 直接回答，不调用 ${SECRETARY_DISPATCH_TOOL}、不建会话。纯知识问题，以及只读联网一查就能答的轻量事实（例如「明天天气」直接用 web_search 查），都属于 A。`)
+  lines.push(`其余需要看屏幕、操作应用、读写本机文件、保存/下载/整理文件或动手的任务，一律先调用 ${SECRETARY_DISPATCH_TOOL}，把用户原话原样放进 task；宿主只建/续 **Computer Use 模式**会话，绝不派进标准会话。`)
   lines.push('标准会话由 Computer Use 会话在后台自行派发，不归你管，也不要给它们建卡片。')
   lines.push('')
-  lines.push('禁止收工式回答：不得以「我看不到」「没有截图能力」「无法直接确认」「我做不了」作为终答，也不要先猜一个答案再结束。')
-  lines.push(`遇到自己做不到或需要外部信息的任务，必须先派 ${SECRETARY_DISPATCH_TOOL}，工具成功后再简短回报「已派 Computer Use 会话处理」；工具失败才如实说派活失败。`)
+  lines.push('禁止收工式回答：不得以「我看不到」「没有截图能力」「无法直接确认」「我做不了」作为终答，也不要先猜一个答案再结束；不得用「工具清单里没有派活工具」当终答。')
+  lines.push(`遇到自己做不到或需要动手的任务，必须先派 ${SECRETARY_DISPATCH_TOOL}，工具成功后再简短回报「已派 Computer Use 会话处理」；工具失败才如实说派活失败。`)
   lines.push(`例：「你看我打开的 QQ 页面，他们说的 38 fn 指什么模型？」需要看当前屏幕，必须先调用 ${SECRETARY_DISPATCH_TOOL}，绝不能在秘书页回答看不到。`)
+  lines.push('例：「明天天气」是只读联网可查的轻量问题，直接用 web_search / web_fetch 查并给出结果；万一联网工具不可用，再派活，不能直接说没办成。')
   lines.push('例：「今天几号」是纯知识随口问，直接回答，不调用工具、不建会话。')
   lines.push('')
   lines.push(`新项目父目录（分层 C 新建文件夹的位置）：${parent || '（未知）'}`)
@@ -314,7 +316,7 @@ export function dispatchPromptSection(ctx: any, projects: DispatchProject[]): st
     lines.push('既有项目目录：（暂时读不到；纯知识问题走 A，其余一律走 C）')
   }
   lines.push('')
-  lines.push(`再次强调：「今天几号」这类纯知识问题才直接答；只要需要外部信息或动手，就先调用 ${SECRETARY_DISPATCH_TOOL}，再说已派。`)
+  lines.push(`再次强调：「今天几号」「明天天气」这类纯知识或只读联网可查的问题直接答（天气用 web_search / web_fetch）；只要需要看屏幕、动手或操作本机，就先调用 ${SECRETARY_DISPATCH_TOOL}，再说已派。`)
   void ctx
   return lines.join('\n')
 }
@@ -419,7 +421,7 @@ export function dispatchToolDefinition(ctx: any): any {
       // 只有纯知识随口问允许不派。看屏/读文件/联网/动手任务若被误分到这里，
       // 返回可纠正错误，要求模型改用 B/C；绝不把「看不到」当终答。
       if (target.kind === 'chat' || target.kind === 'assistant' || target.cwd === '') {
-        throw new Error(`只有纯知识性、无需动手的随口问题才直接在秘书会话里回答。若这句话需要看屏幕、操作应用、读本机文件、上网查证或动手，必须重新调用 ${SECRETARY_DISPATCH_TOOL}：已有项目用 kind=existing，没有项目用 kind=new-folder；禁止以「我看不到」收工。`)
+        throw new Error(`只有纯知识性、无需动手的随口问题（以及只读联网一查就能答的轻量事实，直接用 web_search / web_fetch）才直接在秘书会话里回答。若这句话需要看屏幕、操作应用、读写本机文件、保存下载或动手，必须重新调用 ${SECRETARY_DISPATCH_TOOL}：已有项目用 kind=existing，没有项目用 kind=new-folder；禁止以「我看不到」收工。`)
       }
 
       let createdFolder = false
@@ -432,7 +434,11 @@ export function dispatchToolDefinition(ctx: any): any {
         }
       }
 
-      const sessionController = ctx?.sessionController
+      // ctx.get 不受 inject 约束：插件没把 sessionController 声明成硬依赖时也能取到。
+      let sessionController: any
+      try {
+        sessionController = (typeof ctx?.get === 'function' ? ctx.get('sessionController') : undefined) ?? ctx?.sessionController
+      } catch { sessionController = undefined }
       if (sessionController === undefined || typeof sessionController.create !== 'function') {
         throw new Error('宿主没有会话服务，无法派活')
       }
@@ -508,13 +514,36 @@ export function registerAssistantDispatch(ctx: any): () => void {
     }
   } catch { /* 拿不到就走 DSH_HOME 兜底 */ }
   const tool = dispatchToolDefinition(ctx)
-  try {
-    if (ctx?.tools && typeof ctx.tools.register === 'function') {
-      const off = ctx.tools.register(tool)
+  // 宿主工具注册：必须真正落到 ctx.tools 上，否则模型那回合的工具清单里就没有
+  // secretary_dispatch（2026-11-21「明天天气」实测：清单 50 个工具里没有它）。
+  // 插件 inject 已声明 'tools'；这里再做一层防呆——tools 服务若晚于本插件就绪，
+  // 用 ctx.inject 等它出现再注册，绝不在它缺席时静默跳过。
+  const registerTool = (tools: any): void => {
+    if (!tools || typeof tools.register !== 'function') return
+    try {
+      const off = tools.register(tool)
       if (typeof off === 'function') disposers.push(off)
+    } catch (error) {
+      ctx?.logger?.warn?.(`[dsh-assistant] secretary_dispatch 工具注册失败：${String((error as Error)?.message ?? error)}`)
     }
-  } catch (error) {
-    ctx?.logger?.warn?.(`[dsh-assistant] secretary_dispatch 工具注册失败：${String((error as Error)?.message ?? error)}`)
+  }
+  let tools: any
+  try { tools = typeof ctx?.get === 'function' ? ctx.get('tools') : undefined } catch { tools = undefined }
+  if (tools && typeof tools.register === 'function') {
+    registerTool(tools)
+  } else {
+    let deferred = false
+    try {
+      if (typeof ctx?.inject === 'function') {
+        ctx.inject(['tools'], (scope: any) => { registerTool(scope?.tools) })
+        deferred = true
+      }
+    } catch { deferred = false }
+    if (!deferred) {
+      try { registerTool(ctx?.tools) } catch (error) {
+        ctx?.logger?.warn?.(`[dsh-assistant] secretary_dispatch 工具注册失败：${String((error as Error)?.message ?? error)}`)
+      }
+    }
   }
 
   // 系统提示词：只对固定秘书会话生效（其它会话返回空串，等于没加这段）。

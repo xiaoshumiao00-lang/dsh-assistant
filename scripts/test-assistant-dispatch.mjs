@@ -128,28 +128,77 @@ cases.push(['工具定义：名字/schema/渲染齐全', () => {
   assert.match(text, /D:\\hpg/)
   assert.match(text, /Computer Use/)
   // 工具描述里必须带 A/B/C 分层与「只派 Computer Use 会话」
-  assert.match(tool.description, /默认派活/)
+  assert.match(tool.description, /默认|必须调用本工具/)
   assert.match(tool.description, /新建专项文件夹|new-folder/)
   assert.match(tool.description, /Computer Use/)
   assert.match(tool.description, /看屏幕|看当前.*页面/)
-  assert.match(tool.description, /上网查证/)
+  assert.match(tool.description, /只读联网|web_search|联网/)
+  assert.match(tool.description, /天气/)
   assert.match(tool.description, /看不到.*(?:收工|终答|做不了)|(?:收工|终答|做不了).*看不到/)
+}])
+
+cases.push(['宿主注册：secretary_dispatch 真的注册进工具清单', () => {
+  const registered = []
+  const ctx = {
+    get: () => undefined,
+    tools: { register(definition) { registered.push(definition.name); return () => {} } },
+    on: () => () => {},
+    logger: { warn() {} },
+  }
+  const dispose = surface.registerAssistantDispatch(ctx)
+  assert.ok(registered.includes('secretary_dispatch'), '秘书回合的工具清单里必须有 secretary_dispatch')
+  dispose()
+}])
+
+cases.push(['tools 服务晚就绪：延迟注册，不静默跳过', () => {
+  const registered = []
+  const scope = { tools: { register(definition) { registered.push(definition.name); return () => {} } } }
+  let injected = []
+  const ctx = {
+    get: () => undefined,
+    inject(deps, callback) { injected = deps; callback(scope); return {} },
+    on: () => () => {},
+    logger: { warn() {} },
+  }
+  const dispose = surface.registerAssistantDispatch(ctx)
+  assert.deepEqual(injected, ['tools'], '必须等 tools 服务就绪再注册')
+  assert.ok(registered.includes('secretary_dispatch'))
+  dispose()
+}])
+
+cases.push(['用户原话「明天天气」：派活兜底也能成功建 CU 会话', async () => {
+  lib.assistantSecretaryTestSurface.secretarySessionRef.id = 'sec-1'
+  const calls = []
+  const tool = surface.dispatchToolDefinition({
+    get: () => undefined,
+    sessionController: {
+      create: async (req) => { calls.push(['create', req]); return { sessionId: 'cu-weather', agentPreset: 'computer-use' } },
+      rename: async () => {},
+      prompt: async (req) => { calls.push(['prompt', req]) },
+    },
+  })
+  const out = await tool.execute({ task: '明天天气' }, { agent: { session: { id: 'sec-1' } } })
+  assert.equal(out.session_id, 'cu-weather')
+  assert.equal(out.agent_preset, 'computer-use')
+  assert.equal(calls.find(([kind]) => kind === 'prompt')?.[1]?.content?.[0]?.text, '明天天气')
 }])
 
 cases.push(['提示词段落：A/B/C 分层 + 新项目父目录 + 项目清单', () => {
   const text = surface.dispatchPromptSection({}, projects)
   assert.match(text, /派活分层/)
   assert.match(text, /secretary_dispatch/)
-  assert.match(text, /默认派活/)
+  assert.match(text, /纯知识/)
   assert.match(text, /new-folder/)
   assert.doesNotMatch(text, /简单日常杂活.*直接/)
   assert.match(text, /D:\\hpg/)
   assert.match(text, /Computer Use/)
-  assert.match(text, /只有纯知识/)
   assert.match(text, /看屏幕/)
   assert.match(text, /操作应用/)
-  assert.match(text, /读本机文件/)
-  assert.match(text, /上网查证/)
+  assert.match(text, /读.*本机文件/)
+  // 只读联网查询由秘书直接做；联网不等于必须派活
+  assert.match(text, /web_search/)
+  assert.match(text, /web_fetch|只读联网/)
+  assert.match(text, /天气/)
   assert.match(text, /禁止.*看不到|不得.*看不到/)
   assert.match(text, /先.*secretary_dispatch.*再.*已派|先派.*再.*已派/)
 }])

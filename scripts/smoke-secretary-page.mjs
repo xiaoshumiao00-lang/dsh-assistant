@@ -22,8 +22,10 @@
  * 退出码 0 = 全绿。任何断言失败都会打印现场事实。
  */
 import { chromium } from 'playwright'
+import { readFileSync } from 'node:fs'
 
 const REAL_CARD = process.env.DSH_SMOKE_REAL_CARD === '1'
+const LOCAL_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 const QQ_SCREEN_QUESTION = '你看我打开的 QQ 页面，他们说的 38 fn 指什么模型？'
 const DIRECT_QUESTION = '今天几号'
 
@@ -105,9 +107,32 @@ if (REAL_CARD) {
     knowledgeStayedDirect = /纯知识/.test(String(error))
   }
   check('派活冒烟：「今天几号」直接答，不建会话、不投 prompt', knowledgeStayedDirect && knowledgeWrites === 0)
-  check('派活冒烟：只读闸放行派活但拒绝终端/本机读取/联网代查',
+  check('派活冒烟：只读闸放行派活与只读联网，拒绝终端/本机读取',
+    lib.inject.includes('tools') &&
     lib.assistantSecretaryTestSurface.secretaryToolDenied('secretary_dispatch') === false &&
-    ['pwsh', 'read', 'web_search'].every((name) => lib.assistantSecretaryTestSurface.secretaryToolDenied(name) === true))
+    ['web_search', 'web_fetch'].every((name) => lib.assistantSecretaryTestSurface.secretaryToolDenied(name) === false) &&
+    ['pwsh', 'write', 'read'].every((name) => lib.assistantSecretaryTestSurface.secretaryToolDenied(name) === true))
+
+  // 用户原话「明天天气」：两条路都必须通——直连 web_search 放行，或派活成功。
+  const weatherCalls = []
+  const weatherTool = dispatch.dispatchToolDefinition({
+    get: () => undefined,
+    sessionController: {
+      create: async (req) => { weatherCalls.push(['create', req]); return { sessionId: 'smoke-cu-weather', agentPreset: 'computer-use' } },
+      rename: async () => {},
+      prompt: async (req) => { weatherCalls.push(['prompt', req]) },
+    },
+  })
+  let weatherDispatched = null
+  try {
+    weatherDispatched = await weatherTool.execute({ task: '明天天气' }, { agent: { session: { id: 'smoke-secretary' } } })
+  } catch (error) {
+    weatherDispatched = { error: String(error) }
+  }
+  check('派活冒烟：「明天天气」不再死路，派活兜底能建 CU 并投递原话',
+    weatherDispatched?.session_id === 'smoke-cu-weather' &&
+    weatherCalls.some(([kind, req]) => kind === 'prompt' && req.content?.[0]?.text === '明天天气'),
+    JSON.stringify(weatherDispatched))
 }
 
 // 自动朗读要出声（哪怕是 stub 音频）：Chromium 默认禁无手势自动播放，这里放开。
@@ -492,7 +517,9 @@ try {
       dataOpen: card.getAttribute('data-open'),
       dataOverflow: card.getAttribute('data-overflow') ?? '',
       cardHeight: cardRect.height,
-      cardCenterDelta: parentRect ? Math.abs(((cardRect.left + cardRect.right) / 2) - ((parentRect.left + parentRect.right) / 2)) : -1,
+      // 卡片可能挂在一个 0 尺寸的 portal 包装层里，拿父容器算偏心会误报 206px；
+      // 规范要的是「相对视口水平居中」。
+      cardCenterDelta: Math.abs(((cardRect.left + cardRect.right) / 2) - (window.innerWidth / 2)),
       borderRadius: cs(card).borderTopLeftRadius,
       borderWidth: cs(card).borderTopWidth,
       borderStyle: cs(card).borderTopStyle,
@@ -502,6 +529,7 @@ try {
       boxShadow: cs(card).boxShadow,
       backgroundImage: cs(card).backgroundImage,
       background: cs(card).background,
+      backgroundColor: cs(card).backgroundColor,
       overflow: cs(card).overflow,
       maxWidth: cs(card).maxWidth,
       marginLeft: cs(card).marginLeft,
@@ -586,8 +614,8 @@ try {
   check('卡片使用 16px 圆角、0.5px 浅灰边框，没有阴影，白底无渐变',
     scard.borderRadius === '16px' && /0\.5px/.test(scard.declaredCardBorder) && scard.borderWidth !== '0px'
       && scard.borderStyle === 'solid' && scard.borderColor === 'rgb(229, 230, 235)' && scard.boxShadow === 'none'
-      && scard.background === 'rgb(255, 255, 255)' && scard.backgroundImage === 'none', JSON.stringify({
-      borderRadius: scard.borderRadius, declared: scard.declaredCardBorder, computed: scard.borderWidth, borderColor: scard.borderColor, boxShadow: scard.boxShadow, background: scard.background, backgroundImage: scard.backgroundImage }))
+      && scard.backgroundColor === 'rgb(255, 255, 255)' && scard.backgroundImage === 'none', JSON.stringify({
+      borderRadius: scard.borderRadius, declared: scard.declaredCardBorder, computed: scard.borderWidth, borderColor: scard.borderColor, boxShadow: scard.boxShadow, background: scard.backgroundColor, backgroundImage: scard.backgroundImage }))
   check('卡片最大宽度 620px、水平居中、无旧固定高度/无 data-dsh-fold',
     scard.maxWidth === '620px' && scard.cardCenterDelta >= 0 && scard.cardCenterDelta <= 2 && scard.foldAttr === null
       && scard.cardHeight > 0 && Math.abs(scard.cardHeight - 212) > 2 && Math.abs(scard.cardHeight - 226) > 2,
@@ -712,16 +740,28 @@ try {
   check('复制成功有可见反馈（已复制）', copied === '已复制', `copyStatus=${copied}`)
   await page.evaluate(() => {
     try { Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: () => Promise.reject(new Error('blocked')) } }) } catch { /* ignore */ }
+    // 真实失败路径：Clipboard API 拒绝 + 传统 execCommand 也不成功。
+    try { Object.defineProperty(document, 'execCommand', { configurable: true, value: () => false }) } catch { /* ignore */ }
   })
-  await page.locator('[data-dsh-scard="copy"]').last().click()
-  const failed = await page.waitForFunction(() => {
-    const status = document.querySelector('[data-dsh-scard="copy-status"]')
-    const text = status?.textContent ?? ''
-    return /复制失败|手动选择/.test(text) ? text : false
-  }, undefined, { timeout: 5000 }).then((handle) => handle.jsonValue()).catch(() => '')
+  const lastCopy = page.locator('[data-dsh-scard="copy"]').last()
+  await lastCopy.click()
+  // 状态条是每张卡自己的：必须在这颗按钮的父节点里找，不能拿全页第一个
+  // （前一张卡的「已复制」会先命中，失败反馈被它挡掉）。
+  const failed = await lastCopy.evaluate((btn) => new Promise((resolve) => {
+    const started = Date.now()
+    const tick = () => {
+      const status = btn.parentElement?.querySelector('[data-dsh-scard="copy-status"]')
+      const text = status?.textContent ?? ''
+      if (/复制失败|手动选择/.test(text)) return resolve(text)
+      if (Date.now() - started > 5000) return resolve(text)
+      setTimeout(tick, 80)
+    }
+    tick()
+  }))
   check('复制失败有可见反馈（不静默失败）', /复制失败|手动选择/.test(failed), `copyStatus=${failed}`)
   await page.evaluate(() => {
     try { Object.defineProperty(navigator, 'clipboard', { configurable: true, value: window.__smokeClipboard }) } catch { /* ignore */ }
+    try { Reflect.deleteProperty(document, 'execCommand') } catch { /* ignore */ }
   })
   await page.waitForTimeout(1600) // 已复制反馈按 1.5s 后消失
 
@@ -977,8 +1017,12 @@ try {
   // 同时观察会话注册表：QQ 看屏问话必须新建 CU，纯知识日期问话不得新建任何 CU。
   if (REAL_CARD) {
     const secretaryMeta = await readHostSecretaryMeta()
-    if (secretaryMeta?.dispatchPolicy !== 'default-computer-use-v2') {
-      notes.push('默认派活实时模型段：宿主尚未加载 default-computer-use-v2（本轮按要求不重启），跳过；构建产物派活契约已在本脚本开头逐项断言')
+    const hostVersion = await page.evaluate(async () => {
+      const health = await fetch('/api/worktable/health', { cache: 'no-store' }).then((res) => res.json()).catch(() => null)
+      return String(health?.version ?? '')
+    })
+    if (secretaryMeta?.dispatchPolicy !== 'default-computer-use-v2' || hostVersion !== LOCAL_VERSION) {
+      notes.push(`默认派活实时模型段：宿主运行 ${hostVersion || '未知版本'}，本次构建 ${LOCAL_VERSION}——不是同一份代码（按要求本轮不重启宿主），跳过实时模型段；构建产物派活契约已在本脚本开头逐项断言`)
     } else {
       const secretaryId = String(secretaryMeta?.sessionId ?? '')
       const beforeQq = await readSessionRows()

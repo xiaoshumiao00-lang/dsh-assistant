@@ -64,14 +64,29 @@ export { expandHome, defaultAllowedRoots, createPathGuard, minimalTermEnv, isDir
 /** turn-guard 的判定与状态函数（供 scripts/test-turn-guard.mjs 直接验） */
 export { turnGuardTestSurface } from './turn-guard'
 
-/** 工作台要 webServer/sessions，托管与设置路由要 webServer；手机访问由独立入口注入 connection。 */
-export const inject = ['webServer', 'sessions']
+/**
+ * 工作台要 webServer/sessions，托管与设置路由要 webServer；手机访问由独立入口注入 connection。
+ * `tools` 必须显式声明：Cordis 里未 inject 的服务在服务尚未挂载时读取会抛
+ * "cannot get property tools without inject"，秘书派活工具就会整块注册不上
+ * （2026-11-21「明天天气」实测：工具清单 50 个里没有 secretary_dispatch 的根因）。
+ */
+export const inject = ['webServer', 'sessions', 'tools']
 
 export function apply(ctx: any, config: any = {}): () => void {
   const disposers: Array<() => void> = []
   const routes = manageWebRoutes(ctx.webServer)
   const webServer = routes.webServer
   disposers.push(routes.dispose)
+
+  /** 单个半部注册失败不能连累后面的半部（尤其是秘书派活工具）。 */
+  const registerPiece = (label: string, fn: () => any): void => {
+    try {
+      const dispose = fn()
+      if (typeof dispose === 'function') disposers.push(dispose)
+    } catch (err) {
+      try { ctx.logger?.('dsh-assistant')?.error?.(`${label} failed: %s`, String(err)) } catch {}
+    }
+  }
 
   // ── 工作台半部 ──
   try {
@@ -217,6 +232,21 @@ export function apply(ctx: any, config: any = {}): () => void {
     req.on('end', () => { try { resolve(JSON.parse(raw || '{}')) } catch { resolve({}) } })
     req.on('error', () => resolve({}))
   })
+  // ── 个人秘书链路：必须在其它路由之前单独注册、各自 try ──
+  // 2026-11-21 实测 bug：这些半部原来塞在下面的大 try 里，任何一处路由异常都会把
+  // 「秘书固定会话 + secretary_dispatch 工具 + 主动卡片」一起跳过；同时插件 inject
+  // 没声明 tools，ctx.tools 取不到时派活工具又会被静默忽略。
+  // 固定秘书会话：宿主侧唯一 sessionId + 只读工具闸（web_search/web_fetch 放行）
+  registerPiece('assistant secretary', () => registerAssistantSecretary(ctx))
+  // 派活分层 A/B/C：secretary_dispatch 工具 + 分层提示词
+  registerPiece('assistant dispatch', () => registerAssistantDispatch(ctx))
+  // CU 会话完成 → 秘书会话收可点跳的卡片消息
+  registerPiece('assistant cu watch', () => registerAssistantCuWatch(ctx))
+  // 主动服务卡片：卡组存储 + 路由 + proactive_card 工具
+  registerPiece('assistant proactive', () => registerAssistantProactive(ctx))
+  // 秘书卡片朗读：POST /api/assistant/tts
+  registerPiece('assistant tts', () => registerAssistantTts(ctx))
+
   // 外部打开控制室的一次性信号（不依赖悬浮球/桌面小窗）：
   //   POST（或 GET）http://127.0.0.1:<web端口>/api/assistant/open-console
   // 置位后由页面下一次轮询 /api/assistant/ball-click 取走并打开控制室。
@@ -400,16 +430,7 @@ export function apply(ctx: any, config: any = {}): () => void {
     disposers.push(registerAssistantDiagnostics(ctx))
     // 助手档案导出 / 导入（P1-B）：单一 JSON 清单，导入前先备份、按文件夹判重、不覆盖墓碑
     disposers.push(registerAssistantArchive(ctx))
-    // 个人秘书固定会话：宿主侧唯一 sessionId + 只读工具闸
-    disposers.push(registerAssistantSecretary(ctx))
-    // 派活分层 A/B/C：秘书只建/续 Computer Use 模式会话（工具 secretary_dispatch + 分层提示词）
-    disposers.push(registerAssistantDispatch(ctx))
-    // CU 会话完成 → 秘书会话收可点跳的卡片消息（只监听 computer-use 模式，标准会话不汇报）
-    disposers.push(registerAssistantCuWatch(ctx))
-    // 主动服务卡片：卡组存储 + 路由 + proactive_card 工具 + 首次示例卡
-    disposers.push(registerAssistantProactive(ctx))
-    // 秘书卡片朗读：POST /api/assistant/tts（微软 edge-tts，MP3），无 fallback
-    disposers.push(registerAssistantTts(ctx))
+    // 个人秘书 / 派活 / 主动卡片 / 朗读在 apply 顶部单独注册（不随这段大 try 一起被跳过）
   } catch {}
 
   void applyBall()

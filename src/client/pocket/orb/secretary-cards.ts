@@ -246,14 +246,36 @@ export function createSpeechController(factory: SpeechPlayerFactory) {
 /**
  * 收集「某一轮」的秘书回复正文：同一 data-chat-turn 下、非 reasoning 的 assistant-step 文本。
  * 返回原文（未做朗读规范化；卡片展示用原文，朗读走 normalizeForSpeech）。
+ *
+ * 宿主已把 markdown 渲染成 DOM：`**重点**` 在页面上是 `<strong>重点</strong>`，直接读
+ * textContent 会把星号丢掉，卡片就永远还原不出重点句。这里按节点序列化，把 strong/b
+ * 重新包成 `**…**`，交给卡片自己的行内渲染（2026-11-21 卡片规范冒烟实测）。
  */
+function stepTextWithEmphasis(el: any): string {
+  const nodes = el?.childNodes ?? null
+  if (nodes === null || nodes.length === 0) return String(el?.textContent ?? '')
+  let out = ''
+  for (const node of nodes) {
+    if (node?.nodeType === 3) {
+      out += String(node.textContent ?? '')
+    } else if (node?.nodeType === 1) {
+      const tag = String(node.tagName ?? '').toLowerCase()
+      const inner = stepTextWithEmphasis(node)
+      if (tag === 'strong' || tag === 'b') out += `**${inner}**`
+      else if (tag === 'br') out += '\n'
+      else out += inner
+    }
+  }
+  return out
+}
+
 export function collectTurnText(doc: Document, turn: string): string {
   const out: string[] = []
   const turnNo = String(turn ?? '').trim()
   if (turnNo === '') return ''
   for (const el of doc.querySelectorAll(`[data-chat-turn="${turnNo}"][data-chat-flow-kind="assistant-step"]`)) {
     if (el.getAttribute('data-chat-group-part') === 'reasoning') continue
-    const text = (el.textContent ?? '').trim()
+    const text = stepTextWithEmphasis(el).trim()
     if (text !== '') out.push(text)
   }
   return out.join('\n').trim()
@@ -415,6 +437,7 @@ export const secretaryCardsTestSurface = {
   SPEECH_IDLE,
   latestTurnNo,
   latestReplyTurnNo,
+  collectTurnText,
   badgeTone,
   splitItemPrefix,
   itemIcon,

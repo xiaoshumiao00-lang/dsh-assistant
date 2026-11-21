@@ -245,6 +245,22 @@ cases.push(['自动朗读目标：空白合成尾轮不能挡住最近一条真�
   assert.equal(surface.latestReplyTurnNo(doc), '10')
 }])
 
+cases.push(['卡片正文保留宿主的重点句：<strong> 还原成 **…**', () => {
+  const step = {
+    nodeType: 1,
+    tagName: 'P',
+    getAttribute: () => null,
+    childNodes: [
+      { nodeType: 3, textContent: '型号 ' },
+      { nodeType: 1, tagName: 'STRONG', childNodes: [{ nodeType: 3, textContent: '重点' }] },
+      { nodeType: 3, textContent: '。' },
+    ],
+  }
+  const doc = { querySelectorAll: () => [step] }
+  assert.equal(surface.collectTurnText(doc, '3'), '型号 **重点**。')
+  assert.deepEqual(surface.answerInlineTokens('型号 **重点**。').map((token) => token.kind), ['text', 'strong', 'text'])
+}])
+
 let failed = 0
 for (const [name, fn] of cases) {
   try {

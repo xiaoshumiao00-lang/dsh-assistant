@@ -4,6 +4,10 @@
 控制室里的「更新公告」正文由 `npm run build` 从本文件里当前版本那一节抽出来（见 `build.mjs`），
 不再手写常量——改了代码就必须改这一节，公告与实现不会各说各话。
 
+## [0.2.36] - 2026-11-21
+
+🌤 【秘书「明天天气」死路修复：工具清单里真的没有派活工具，只读闸又拦了联网】用户实测原话只有「明天天气」，秘书答复「这回合的工具清单里没有派活工具，只有通用联网和本地工具」，转去联网又被只读闸拒绝，最后只能回「没办成」。宿主会话日志（`session.v4.jsonl.zstd`）取证：该轮 `request/header.tools` 共 50 个工具，`secretary_dispatch` 与 `proactive_card` 都不在其中，而 `web_search` / `web_fetch` 在。根因有两条：① 插件入口 `src/assistant.ts` 的 `inject` 只声明了 `webServer` / `sessions`，没声明 `tools`；Cordis 对未 inject 的服务在尚未挂载时读取会抛 `cannot get property "tools" without inject`，`src/assistant-dispatch.ts` 的工具注册被 `try/catch` 吞成一条 warn，工具从未注册进宿主，模型自然看不到；② `src/assistant-secretary.ts` 的只读白名单把 `web_search` / `web_fetch` 一起拒了，联网这条退路也被堵死。修复：`inject` 补 `tools`；秘书/派活/主动卡片/朗读四个半部从大 `try` 里拆出来各自注册（任何一处路由异常不再连累派活）；派活工具加「tools 晚就绪就 `ctx.inject` 延迟注册」的防呆；`sessionController` 改用 `ctx.get` 读取；只读白名单放行 `web_*` 只读查询，仍拒绝写文件/终端/本机 read/子代理；提示词与工具描述同步改为「天气这类只读联网可查的轻量问题直接答，看屏/动手才派活」，并禁止拿「工具清单里没有派活工具」当终答。回归：`test-assistant-secretary` 断言 `inject` 含 `tools`、web 读工具放行、「明天天气」联网路径可执行；`test-assistant-dispatch` 断言工具真实注册、tools 晚到会延迟注册、「明天天气」派活兜底能建 CU；REAL_CARD 冒烟加同一契约。**宿主侧改动，需重启 DSH Desktop 生效。**
+
 ## [0.2.35] - 2026-11-20
 
 🤖 【个人秘书默认派 Computer Use，禁止「我看不到」收工】实测「你看我打开的 QQ 页面，他们说的 38 fn 指什么模型？」时，秘书没有调用工具，直接回复没有截图能力。根因不是只读闸拒绝了派活（`secretary_dispatch` 原本就在白名单），而是 A 类把所有问话和简单杂活都留给秘书，规则兜底又把这句看屏问话判成 `chat`。现在 A 只含纯知识、无需动手的随口问题；看屏幕、操作应用、读本机文件、上网查证和任何动手活默认走 B/C：已有项目续接/新建 CU，无项目新建专项文件夹 + CU。提示词与工具描述明确禁止收工式终答，要求先派再报「已派」；只读工具闸把派活单列硬放行，同时拒绝秘书自己调用本机 read/web 代查，旧 `assistant` 参数也会重走 B/C。回归覆盖用户 QQ 原话与「今天几号」，包括构建产物工具执行、真实页面冒烟契约，以及宿主加载 `default-computer-use-v2` 后的实时模型断言。
