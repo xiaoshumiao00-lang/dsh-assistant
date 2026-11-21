@@ -10,8 +10,12 @@
  *      独立的 Computer Use 会话。只读限制写文件/终端，绝不能把建会话与派活一起禁掉。
  *
  * 路由：
- *   GET    /api/assistant/secretary  → { ok, sessionId, updatedAt }
- *   POST   /api/assistant/secretary  body { sessionId } → 覆盖
+ *   GET    /api/assistant/secretary            → { ok, sessionId, updatedAt }
+ *   GET    /api/assistant/secretary?verify=1   → 加 { exists }：这条固定会话还在不在宿主会话表
+ *   GET    /api/assistant/secretary?verify=1&sessionId=<id>
+ *                                            → 问**指定候选 id**（用于「新建出来的会话到底 retain 得住吗」，
+ *                                              答 `<id>` 的真值，不用先把 state 写过去；回 `queried`）
+ *   POST   /api/assistant/secretary  body { sessionId } → 覆盖；同一个 id 不再写盘（去抖，防多客户端互相覆盖）
  *   DELETE /api/assistant/secretary  → 清空（测试/重置用）
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
@@ -29,6 +33,21 @@ const SESSION_ID_RE = /^[A-Za-z0-9._:-]{1,256}$/
 /** `?verify=1`：客户端问「这条固定会话还在不在宿主的会话表里」；会话表两千多行，答案缓存 30s。 */
 const EXISTENCE_TTL_MS = 30_000
 let existenceCache: { id: string; value: boolean; at: number } | null = null
+
+/**
+ * 从请求 URL 里取「要问的那条 id」与「要不要 verify」。
+ * 只认 `verify=1` 与 `sessionId=<session id>`；没有 sessionId 就问 state 里当前挂着的那条。
+ */
+export function parseSecretaryRequestQuery(rawUrl: string): { wantsVerify: boolean; requestedId: string } {
+  const url = String(rawUrl ?? '')
+  const queryIndex = url.indexOf('?')
+  const query = queryIndex === -1 ? '' : url.slice(queryIndex + 1)
+  const wantsVerify = /(?:^|&)verify=1(?:&|$)/.test(query)
+  const match = query.match(/(?:^|&)session(?:Id)?=([^&]*)/)
+  const raw = match === null ? '' : decodeURIComponent(match[1])
+  const trimmed = raw.trim()
+  return { wantsVerify, requestedId: SESSION_ID_RE.test(trimmed) ? trimmed : '' }
+}
 
 /**
  * 宿主权威版：这条 sessionId 还在不在宿主的会话表里。
@@ -260,19 +279,24 @@ export function registerAssistantSecretary(ctx: any): () => void {
       const current = state?.sessionId ?? ''
       try {
         if (method === 'GET' || method === 'HEAD') {
-          const wantsVerify = /[?&]verify=1(?:&|$)/.test(String(req.url ?? ''))
-          const exists = wantsVerify
-            ? (current === '' ? false : await secretarySessionExistsOnHost(ctx, current))
+          const query = parseSecretaryRequestQuery(String(req.url ?? ''))
+          // 显式问某条候选 id（客户端「新建出来的会话 retain 得住吗」预确认，不写 state 就问）；
+          // 没带 sessionId 才问 state 里当前挂着的那条
+          const askedId = query.requestedId !== '' ? query.requestedId : current
+          const exists = query.wantsVerify
+            ? (askedId === '' ? false : await secretarySessionExistsOnHost(ctx, askedId))
             : undefined
-          if (wantsVerify && exists !== true) {
-            appendOpenDiag({ step: 'host-secretary-verify', sessionId: current, exists })
+          if (query.wantsVerify && exists !== true) {
+            appendOpenDiag({ step: 'host-secretary-verify', sessionId: askedId, exists })
           }
           sendJson(res, 200, {
             ok: true,
             sessionId: current || null,
             updatedAt: state?.updatedAt ?? '',
             dispatchPolicy: SECRETARY_DISPATCH_POLICY,
-            ...(wantsVerify ? { exists } : {}),
+            ...(query.wantsVerify
+              ? { exists, ...(query.requestedId !== '' ? { queried: query.requestedId } : {}) }
+              : {}),
           })
           return
         }
@@ -282,6 +306,13 @@ export function registerAssistantSecretary(ctx: any): () => void {
           const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : ''
           if (!SESSION_ID_RE.test(sessionId)) {
             sendJson(res, 400, { ok: false, error: 'invalid-session-id' })
+            return
+          }
+          // 去抖：宿主 state 里已经是这条 id 就不重写盘、不重刷 updatedAt——
+          // 多客户端 / 重复点击反复 POST 同一个 id 不会互相覆盖、也不会刷日志。
+          if (sessionId === current && state !== null) {
+            appendOpenDiag({ step: 'host-state-skip-unchanged', sessionId })
+            sendJson(res, 200, { ok: true, sessionId, updatedAt: state.updatedAt, unchanged: true })
             return
           }
           const next = await writeState(sessionId)
@@ -634,4 +665,5 @@ export const assistantSecretaryTestSurface = {
   repairSecretaryLogText,
   compressSessionLogText,
   decompressSessionLogBytes,
+  parseSecretaryRequestQuery,
 }

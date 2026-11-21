@@ -251,6 +251,82 @@ cases.push(['坏文件/坏字段按空处理', async () => {
   assert.equal(surface.normalizeSecretaryState({ sessionId: 'a'.repeat(257) }), null)
   assert.equal(surface.normalizeSecretaryState({ sessionId: 'session-ok' }).sessionId, 'session-ok')
 }])
+cases.push(['parseSecretaryRequestQuery：verify 标记 / 候选 id / 非法 id 拒收', async () => {
+  const parse = surface.parseSecretaryRequestQuery
+  assert.deepEqual(parse('/api/assistant/secretary'), { wantsVerify: false, requestedId: '' })
+  assert.deepEqual(parse('/api/assistant/secretary?verify=1'), { wantsVerify: true, requestedId: '' })
+  assert.deepEqual(parse('/api/assistant/secretary?verify=1&sessionId=session-abc-1'), { wantsVerify: true, requestedId: 'session-abc-1' })
+  assert.deepEqual(parse('/api/assistant/secretary?verify=1&sessionId=..%2Fescape'), { wantsVerify: true, requestedId: '' }, '非法 id 必须拒收')
+  assert.deepEqual(parse('/api/assistant/secretary?sessionId=session-abc-1'), { wantsVerify: false, requestedId: 'session-abc-1' })
+}])
+cases.push(['?verify=1&sessionId=<候选>：不问 state 当前值，直接问候选（重建预确认用）', async () => {
+  const sessionRoot = mkdtempSync(join(tmpdir(), 'assistant-secretary-queried-'))
+  const server = fakeServer()
+  const ctx = {
+    webServer: server,
+    get(name) { return name === 'profileContext' ? { dir: sessionRoot } : undefined },
+    sessions: { list: () => [{ id: 'session-alive-1', header: { id: 'session-alive-1' } }] },
+    on() { return () => void 0 },
+  }
+  const disposeExtra = surface.registerAssistantSecretary(ctx)
+  const extraRoute = server.exact.get(surface.ASSISTANT_SECRETARY_ROUTE)
+  const call = async (method, payload, urlSuffix = '') => {
+    const res = fakeRes()
+    const req = fakeReq(method, payload === undefined ? undefined : JSON.stringify(payload))
+    req.url = `${surface.ASSISTANT_SECRETARY_ROUTE}${urlSuffix}`
+    await extraRoute.handler(req, res)
+    return JSON.parse(res.body)
+  }
+  try {
+    // state 故意指向另一条；候选 id 的存在性必须独立回答
+    await call('POST', { sessionId: 'session-state-other' }, '')
+    const hit = await call('GET', undefined, '?verify=1&sessionId=session-alive-1')
+    assert.equal(hit.queried, 'session-alive-1')
+    assert.equal(hit.exists, true, '候选在活会话表里 → true（不管 state 指向谁）')
+    assert.equal(hit.sessionId, 'session-state-other', 'state 当前值原样带回')
+    const miss = await call('GET', undefined, '?verify=1&sessionId=session-candidate-dead')
+    assert.equal(miss.queried, 'session-candidate-dead')
+    assert.equal(miss.exists, false, '候选不在表里 → false（客户端据此不写 state）')
+  } finally {
+    try { disposeExtra() } catch {}
+    rmSync(sessionRoot, { recursive: true, force: true })
+  }
+}])
+cases.push(['POST 同一个 id 去抖：不重写盘、不重刷 updatedAt（多客户端不互相覆盖）', async () => {
+  const dupRoot = mkdtempSync(join(tmpdir(), 'assistant-secretary-dup-'))
+  const server = fakeServer()
+  const ctx = {
+    webServer: server,
+    get(name) { return name === 'profileContext' ? { dir: dupRoot } : undefined },
+    on() { return () => void 0 },
+  }
+  const disposeExtra = surface.registerAssistantSecretary(ctx)
+  const extraRoute = server.exact.get(surface.ASSISTANT_SECRETARY_ROUTE)
+  const call = async (method, payload) => {
+    const res = fakeRes()
+    const req = fakeReq(method, payload === undefined ? undefined : JSON.stringify(payload))
+    await extraRoute.handler(req, res)
+    return JSON.parse(res.body)
+  }
+  try {
+    const first = await call('POST', { sessionId: 'session-dup-1' })
+    assert.equal(first.unchanged, undefined)
+    const file = join(dupRoot, 'dsh-assistant-secretary.json')
+    const bytesBefore = readFileSync(file, 'utf8')
+    const second = await call('POST', { sessionId: 'session-dup-1' })
+    assert.equal(second.ok, true)
+    assert.equal(second.unchanged, true, '同 id 重复 POST 必须回 unchanged=true')
+    assert.equal(second.updatedAt, first.updatedAt, 'updatedAt 不许被重刷')
+    assert.equal(readFileSync(file, 'utf8'), bytesBefore, '文件内容不许被重写')
+    // 换一个 id 仍然正常写
+    const third = await call('POST', { sessionId: 'session-dup-2' })
+    assert.equal(third.sessionId, 'session-dup-2')
+    assert.notEqual(third.unchanged, true)
+  } finally {
+    try { disposeExtra() } catch {}
+    rmSync(dupRoot, { recursive: true, force: true })
+  }
+}])
 
 let failed = 0
 for (const [name, fn] of cases) {

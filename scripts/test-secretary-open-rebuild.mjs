@@ -14,6 +14,7 @@
 import assert from 'node:assert/strict'
 
 const DEAD = 'session-33044545-4737-4e86-960d-43f57b357dea'
+const ALIVE = 'session-83bca3e3-bcd1-49f0-8b3c-2ec9edae14e3'
 const SECRETARY_ROUTE = '/api/assistant/secretary'
 const HOME_ROUTE = '/api/assistant/home'
 const TUOGUAN_ROUTE = '/.dsh-tuoguan/state'
@@ -84,6 +85,9 @@ globalThis.fetch = async (rawUrl, init = {}) => {
   host.secretaries.calls.push({ method, path, url })
   if (path === SECRETARY_ROUTE) {
     const wantsVerify = /[?&]verify=1(?:&|$)/.test(url)
+    // 新宿主语义：?verify=1&sessionId=<候选 id> → 回 queried + 该候选的 exists（不问 state 当前值）
+    const idParamMatch = url.match(/[?&]sessionId=([^&]*)/)
+    const queried = idParamMatch !== null ? decodeURIComponent(idParamMatch[1]) : ''
     if (method === 'GET' || method === 'HEAD') {
       const payload = {
         ok: true,
@@ -91,7 +95,11 @@ globalThis.fetch = async (rawUrl, init = {}) => {
         updatedAt: '2026-11-21T10:57:28.613Z',
         dispatchPolicy: 'default-computer-use-v2',
       }
-      if (wantsVerify) payload.exists = host.secretaries.id !== '' && host.hostTable.has(host.secretaries.id)
+      if (wantsVerify) {
+        const asked = queried !== '' ? queried : (host.secretaries.id || '')
+        payload.exists = asked !== '' && host.hostTable.has(asked)
+        if (queried !== '') payload.queried = queried
+      }
       return jsonResponse(payload)
     }
     if (method === 'DELETE') {
@@ -136,6 +144,7 @@ function makeApi(options = {}) {
     pinned: [],
     renamed: [],
     readOnlyApplied: [],
+    openedIds: [],
   }
   const requireKnown = (id) => {
     // 客户端列表里没有这条 → 宿主 session-controller 就是这么报的
@@ -145,15 +154,21 @@ function makeApi(options = {}) {
     currentSessionId: () => state.current,
     openSession: (id) => {
       requireKnown(id)
+      state.openedIds.push(id)
       state.current = id
     },
     focusSession: async (id) => {
       requireKnown(id)
+      state.openedIds.push(id)
       state.current = id
     },
     pinSession: async (id) => {
       requireKnown(id)
       state.pinned.push(id)
+      if (options.pinHijacksCurrent === true) {
+        // 微任务里把面板顶走：时序上在开页完成之后、落地断言之前（同步体会抢在开页前面）
+        void Promise.resolve().then(() => { state.current = 'session-hijack' })
+      }
     },
     unarchiveSession: async (id) => { requireKnown(id) },
     renameSession: async (id) => { state.renamed.push(id) },
@@ -169,8 +184,8 @@ function makeApi(options = {}) {
       if (options.createFails) throw new Error('host refused: 宿主不能建会话')
       state.createCount += 1
       const id = `session-new-${String(state.createCount)}`
-      host.hostTable.add(id)
-      host.clientTable.add(id)
+      if (options.createUnregistered !== true) host.hostTable.add(id)
+      if (options.createUnopenable !== true) host.clientTable.add(id)
       state.created.push({ cwd, id })
       return { sessionId: id }
     },
@@ -185,6 +200,8 @@ function resetFixture() {
   windowState.__dshAssistantOpenLog = []
   controlRoomStore.setOpen(false)
   resetSecretaryOpenGuardForTests()
+  // 看门狗用 setTimeout(45s)，测试桩会把任意延压到 1ms 导致看门狗抢先结算：回归测试里禁用
+  entry.setOpenChainWatchdogForTests(false)
 }
 
 function toastTexts() {
@@ -257,7 +274,10 @@ cases.push(['宿主确认会话还在：绝不新建，多等一轮后兜底控�
   assert.equal(controlRoomStore.getSnapshot(), true, '至少切到控制室，不许点了没反应')
   const texts = toastTexts().join('\n')
   assert.ok(texts.includes('控制室'), '必须给用户看到兜底原因')
+  // 宿主说「还在」= 冷启动列表没下发完：允许退避重试用完（retry-exhausted），
+  // 但绝不能走「真死 id 立即弃用」分支（openSession-dropped-dead-id 只该出现在宿主确认不存在时）
   assert.ok(diagSteps().includes('retry-exhausted'), '重试用完要落诊断')
+  assert.ok(!diagSteps().includes('openSession-dropped-dead-id'), '宿主说「还在」时不许按死 id 弃用')
   assert.ok(diagSteps().includes('fallback-console'), '兜底要落诊断')
 }])
 
@@ -293,6 +313,107 @@ cases.push(['诊断链路把「点击意图」也写进宿主日志（host-click
   await new Promise((resolve) => realSetTimeout(resolve, 20))
   assert.ok(host.diag.some((item) => item.step === 'ball-intent' && item.intent === 'assistant'))
   assert.equal(controlRoomStore.getSnapshot(), false, '只是诊断，不许顺带开控制室')
+}])
+
+// ---- 2026-11-21 第三次实测（单击悬浮球仍打不开）的回归断言 --------------------
+
+cases.push(['打开目标以宿主真值为准：缓存里的死 id 一个 openSession 都不许有', async () => {
+  resetFixture()
+  host.secretaries.id = ALIVE
+  host.hostTable.add(ALIVE)
+  host.clientTable.add(ALIVE)
+  store.set('dsh.assistant.secretary.sessionId', DEAD) // 本地缓存是死 id（实测现场）
+  const { api, state } = makeApi()
+  setAssistantApi(api)
+
+  const opened = await openAssistant()
+  assert.equal(opened, true, '宿主 state 是好的就必须开成功')
+  assert.equal(state.current, ALIVE, '主面板必须停在宿主指的那条会话上')
+  assert.equal(state.createCount, 0, '宿主有真值时绝不允许新建')
+  assert.ok(!state.openedIds.includes(DEAD), '死缓存 id 绝不允许被 openSession 尝试')
+  assert.ok(diagSteps().includes('cache-realigned'), '缓存与宿主不一致必须落诊断')
+  assert.equal(store.get('dsh.assistant.secretary.sessionId'), ALIVE, '本地缓存必须被宿主真值覆盖')
+}])
+
+cases.push(['宿主确认不存在的死 id：立即弃用，绝不重试满 8 次', async () => {
+  resetFixture()
+  host.secretaries.id = DEAD // 宿主 state 也指向死 id
+  store.set('dsh.assistant.secretary.sessionId', DEAD)
+  const { api, state } = makeApi()
+  setAssistantApi(api)
+
+  const opened = await openAssistant()
+  assert.equal(opened, true, '死 id 被弃用后必须重建并落地')
+  assert.equal(state.createCount, 1)
+  const dropped = host.diag.filter((item) => item.step === 'openSession-dropped-dead-id')
+  assert.equal(dropped.length, 1, '死 id 只允许被弃用一次')
+  assert.ok(Number(dropped[0].attempts) <= 1, `不许重试满 8 次，实际 attempts=${dropped[0].attempts}`)
+  assert.ok(!diagSteps().includes('retry-exhausted'), '真死 id 不许烧到 retry-exhausted')
+}])
+
+cases.push(['重建确认失败（新会话没注册进宿主会话表）：不写 state，切控制室显示原因', async () => {
+  resetFixture()
+  host.secretaries.id = DEAD
+  store.set('dsh.assistant.secretary.sessionId', DEAD)
+  const { api, state } = makeApi({ createUnregistered: true }) // createSession 给了 id 但没真注册
+  setAssistantApi(api)
+
+  const opened = await openAssistant()
+  assert.equal(opened, false)
+  assert.equal(controlRoomStore.getSnapshot(), true, '确认失败必须切控制室')
+  assert.equal(host.secretaries.id, '', '确认失败绝不允许写 state（DELETE 后必须保持空）')
+  const postCalls = host.secretaries.calls.filter((call) => call.method === 'POST' && call.path === SECRETARY_ROUTE)
+  assert.equal(postCalls.length, 0, `确认失败绝不允许 POST 新 id，实际=${postCalls.length}`)
+  assert.ok(diagSteps().includes('rebuild-unconfirmed'), '确认失败必须落诊断')
+}])
+
+cases.push(['同一次点击并发触发：共享一条链路，绝不重复重建', async () => {
+  resetFixture()
+  host.secretaries.id = DEAD
+  store.set('dsh.assistant.secretary.sessionId', DEAD)
+  const { api, state } = makeApi()
+  setAssistantApi(api)
+
+  const [first, second] = await Promise.all([openAssistant(), openAssistant()])
+  assert.equal(first, true)
+  assert.equal(second, true)
+  assert.equal(state.createCount, 1, '并发点击绝不允许各造一条秘书会话')
+  assert.equal(lastAssistantOpen()?.sessionId, state.created[0]?.id)
+}])
+
+cases.push(['宿主 state 已是目标 id：跳过重复 POST（多客户端不互相覆盖）', async () => {
+  resetFixture()
+  host.secretaries.id = ALIVE
+  host.hostTable.add(ALIVE)
+  host.clientTable.add(ALIVE)
+  store.set('dsh.assistant.secretary.sessionId', ALIVE)
+  const { api } = makeApi()
+  setAssistantApi(api)
+
+  const opened = await openAssistant()
+  assert.equal(opened, true)
+  const postCalls = host.secretaries.calls.filter((call) => call.method === 'POST' && call.path === SECRETARY_ROUTE)
+  assert.equal(postCalls.length, 0, `宿主已有同 id 就不许再 POST，实际=${postCalls.length}`)
+  assert.ok(diagSteps().includes('persist-skip-unchanged'), '跳过写必须落诊断')
+}])
+
+cases.push(['落地断言：面板被顶走（当前会话 ≠ 秘书会话）必须切控制室显示原因', async () => {
+  resetFixture()
+  host.secretaries.id = ALIVE
+  host.hostTable.add(ALIVE)
+  host.clientTable.add(ALIVE)
+  store.set('dsh.assistant.secretary.sessionId', ALIVE)
+  const { api } = makeApi({ pinHijacksCurrent: true }) // 置顶动作把主面板顶到别的会话
+  setAssistantApi(api)
+
+  const opened = await openAssistant()
+  assert.equal(opened, false, '落地断言失败不许当成功')
+  assert.equal(controlRoomStore.getSnapshot(), true)
+  const assertEntry = host.diag.find((item) => item.step === 'open-landed-assert')
+  assert.ok(assertEntry !== undefined, '落地断言必须落诊断')
+  assert.equal(assertEntry.landed, false)
+  const texts = toastTexts().join('\n')
+  assert.ok(texts.includes('控制室'), '必须告诉用户切到了控制室')
 }])
 
 let failed = 0
