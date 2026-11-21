@@ -160,12 +160,16 @@ const pageErrors = []
 const failedRequests = []
 /** 已读卡持久化：客户端问/写宿主 /api/assistant/secretary-read 的全部请求（宿主真值优先，答不上走本地缓存） */
 const readRouteRequests = []
-/** 已知的宿主既有 4xx（与本次改动无关；项目卡片探测 widget-result.json 时本来就没有这个文件）。
+/** 分页取数：客户端问宿主 /api/assistant/secretary/history 的全部请求与响应原文（报告要贴这两条）。 */
+const historyRouteRequests = []
+const historyRouteResponses = []
+/** 已知既有 4xx（与本次改动无关；项目卡片探测 widget-result.json 时本来就没有这个文件）。
  *  /api/assistant/cu-watch/notify 是 CU 通知段的能力探测：宿主未重载新代码时 404 属预期，
  *  路由生效后正常返回 200；旧宿主缺 stream 的 409 会按能力未加载跳过，v2 宿主的 409 仍算失败。
- *  /api/assistant/secretary-read 同理：跑着旧构建的宿主上没这条路由 → 401/404 是**预期降级**
- *  （客户端必须改用本地缓存继续渲染、不许崩、不许阻塞），宿主重载后自动变 200。 */
-const IGNORED_FAILED_URL = /\/api\/worktable\/file\?|\/api\/assistant\/cu-watch\/notify|\/api\/assistant\/secretary-read/
+ *  /api/assistant/secretary-read、/api/assistant/secretary-history、/api/assistant/secretary-context
+ *  同理：跑着旧构建的宿主上没这些路由 → 401/404 是**预期降级**
+ *  （客户端必须改用本地缓存 / DOM 顺序分页继续渲染、不许崩、不许阻塞），宿主重载后自动变 200。 */
+const IGNORED_FAILED_URL = /\/api\/worktable\/file\?|\/api\/assistant\/cu-watch\/notify|\/api\/assistant\/secretary-read|\/api\/assistant\/secretary\/history|\/api\/assistant\/secretary-context/
 page.on('console', (message) => {
   if (message.type() !== 'error') return
   const text = String(message.text())
@@ -176,12 +180,24 @@ page.on('console', (message) => {
 })
 page.on('pageerror', (error) => pageErrors.push(String(error).slice(0, 300)))
 page.on('request', (request) => {
-  if (!request.url().includes('/api/assistant/secretary-read')) return
-  readRouteRequests.push(`${request.method()} ${request.url().replace(/^https?:\/\/[^/]+/, '')} ${String(request.postData() ?? '').slice(0, 160)}`)
+  const path = request.url().replace(/^https?:\/\/[^/]+/, '')
+  if (request.url().includes('/api/assistant/secretary-read')) {
+    readRouteRequests.push(`${request.method()} ${path} ${String(request.postData() ?? '').slice(0, 160)}`)
+  }
+  if (request.url().includes('/api/assistant/secretary/history')) {
+    historyRouteRequests.push(`${request.method()} ${path}`)
+  }
 })
 page.on('response', (response) => {
-  if (response.status() < 400) return
   const url = response.url()
+  if (url.includes('/api/assistant/secretary/history')) {
+    void response.text().then(
+      (body) => { historyRouteResponses.push(`${response.status()} ${url.replace(/^https?:\/\/[^/]+/, '')} ${String(body).slice(0, 300)}`) },
+      () => { historyRouteResponses.push(`${response.status()} ${url.replace(/^https?:\/\/[^/]+/, '')} （读不到响应体）`) },
+    )
+    return
+  }
+  if (response.status() < 400) return
   if (IGNORED_FAILED_URL.test(url)) return
   failedRequests.push(`${response.status()} ${url.slice(0, 200)}`)
 })
@@ -1411,6 +1427,141 @@ try {
       }
     }
   }
+
+  // ── 第四批需求 A：卡片分页（≤30 张 / 折叠行 / 上滚才取回 / 刷新不回填 / 120 上限就停）──
+  const pagerProbe = () => page.evaluate(() => {
+    const full = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
+    const collapsed = [...document.querySelectorAll('[data-dsh-scard="collapsed-row"]')]
+    const scroll = document.querySelector('[data-conversation-scroll]')
+    return {
+      fullTotal: full.length,
+      fullAssistant: full.filter((el) => el.getAttribute('data-dsh-scard-kind') === 'assistant').length,
+      fullUser: full.filter((el) => el.getAttribute('data-dsh-scard-kind') === 'user').length,
+      fullNotice: full.filter((el) => el.getAttribute('data-dsh-scard-kind') === 'notice').length,
+      collapsedTotal: collapsed.length,
+      collapsedSample: collapsed.slice(0, 3).map((el) => ({
+        kind: el.getAttribute('data-dsh-scard-kind') ?? '',
+        time: el.querySelector('[data-dsh-scard="collapse-time"]')?.textContent ?? '',
+        title: el.querySelector('[data-dsh-scard="collapse-title"]')?.textContent ?? '',
+        rowHeight: Math.round(el.querySelector('[data-dsh-scard="collapse-row"]')?.getBoundingClientRect().height ?? 0),
+      })),
+      hint: document.querySelector('[data-dsh-scard="earlier-hint"] [data-dsh-scard="earlier-hint-text"]')?.textContent ?? '',
+      scrollTop: scroll ? Math.round(scroll.scrollTop) : -1,
+      scrollHeight: scroll ? Math.round(scroll.scrollHeight) : -1,
+      hasScrollHost: scroll !== null,
+      domNodes: document.querySelectorAll('*').length,
+    }
+  })
+
+  const firstWindow = await pagerProbe()
+  check('分页：一次渲染的卡片数 ≤30（秘书卡/用户卡/通知卡都计入）', firstWindow.fullTotal <= 30 && firstWindow.fullTotal > 0,
+    JSON.stringify({ fullTotal: firstWindow.fullTotal, assistant: firstWindow.fullAssistant, user: firstWindow.fullUser, notice: firstWindow.fullNotice }))
+  check('分页：窗口外才有折叠行（宿主挂出的卡多于窗口时必须有折叠行）',
+    firstWindow.fullTotal >= 30 ? firstWindow.collapsedTotal > 0 : true,
+    JSON.stringify({ fullTotal: firstWindow.fullTotal, collapsedTotal: firstWindow.collapsedTotal }))
+  check('分页：折叠行只有一行（时间 + 24 字内短标题，一行量级高度）', firstWindow.collapsedTotal === 0 || firstWindow.collapsedSample.every((item) => item.title !== '' && !item.title.includes('\n') && [...item.title].length <= 25 && item.rowHeight > 0 && item.rowHeight <= 60),
+    JSON.stringify(firstWindow.collapsedSample))
+  const noBackfillOnLoad = historyRouteRequests.filter((line) => line.includes('before=')).length === 0
+  check('分页：进页面/刷新不自动回填老卡（初始只有「最近那一段」的取数，没有 before 游标）', noBackfillOnLoad,
+    JSON.stringify({ requests: historyRouteRequests.slice(0, 4), responses: historyRouteResponses.slice(0, 2) }))
+  check('分页：取数一律按 30 张一段（客户端不许为了分页把整条会话读回来）', historyRouteRequests.every((line) => !/[?&]limit=(?!30)\d+/.test(line)),
+    JSON.stringify(historyRouteRequests.slice(0, 3)))
+  check('分页：宿主分页接口在现网按预期降级（旧宿主没这条路由时客户端不许崩）', pageErrors.length === 0, JSON.stringify({ requests: historyRouteRequests.length }))
+
+  // 折叠行点击：只开本地原文预览，不许把整张老卡拉回渲染
+  const collapseClick = await (async () => {
+    const before = await pagerProbe()
+    const row = page.locator('[data-dsh-scard="collapsed-row"]').first()
+    if (await page.locator('[data-dsh-scard="collapsed-row"]').count() === 0) return { skipped: true, before }
+    await row.locator('[data-dsh-scard="collapse-row"]').click()
+    await page.waitForTimeout(400)
+    const preview = await page.locator('[data-dsh-scard="collapse-preview"]').first().textContent().catch(() => '')
+    return { skipped: false, before, preview: String(preview ?? '').slice(0, 120), after: await pagerProbe() }
+  })()
+  if (collapseClick.skipped !== true) {
+    check('分页：折叠行点击只开原始文本预览，不把老卡拉回渲染',
+      collapseClick.after.fullTotal === collapseClick.before.fullTotal && collapseClick.preview !== '',
+      JSON.stringify({ fullTotal: collapseClick.after.fullTotal, before: collapseClick.before.fullTotal, previewHead: collapseClick.preview.slice(0, 40) }))
+    await page.locator('[data-dsh-scard="collapsed-row"]').first().locator('[data-dsh-scard="collapse-row"]').click()
+  } else {
+    notes.push('折叠行点击回归：页面上没有折叠行，跳过）')
+  }
+
+  // 上滚才取回下一段（带 scroll-anchoring）
+  const scroller = await page.evaluate(() => {
+    const el = document.querySelector('[data-conversation-scroll]')
+    if (el === null) return null
+    const beforeTop = Math.round(el.scrollTop)
+    const beforeHeight = Math.round(el.scrollHeight)
+    el.scrollTop = 0
+    el.dispatchEvent(new Event('scroll'))
+    return { beforeTop, beforeHeight }
+  })
+  if (scroller !== null) {
+    // 真滚轮（宿主自己会边滚边加载更旧的轮次）：到达顶部阈值才让客户端取下一段
+    for (let attempt = 0; attempt < 3; attempt += 1) { await page.mouse.wheel(0, -1200); await page.waitForTimeout(400) }
+    await page.evaluate(() => {
+      const el = document.querySelector('[data-conversation-scroll]')
+      if (el === null) return
+      el.scrollTop = 0
+      el.dispatchEvent(new Event('scroll'))
+    })
+    await page.waitForTimeout(900)
+    const afterScroll = await pagerProbe()
+    check('分页：上滚最多只取回下一段（≤60 张，且绝不把整条会话塞进 DOM）',
+      afterScroll.fullTotal <= 60 && afterScroll.fullTotal >= firstWindow.fullTotal && afterScroll.domNodes < 20000,
+      JSON.stringify({ before: firstWindow.fullTotal, after: afterScroll.fullTotal, collapsed: afterScroll.collapsedTotal, domNodes: afterScroll.domNodes }))
+    if (afterScroll.fullTotal > firstWindow.fullTotal) {
+      check('分页：取回后保持原滚动位置不跳（scroll-anchoring 补回 scrollTop）',
+      afterScroll.scrollTop > 0 && afterScroll.scrollHeight > scroller.beforeHeight,
+      JSON.stringify({ scrollTop: afterScroll.scrollTop, scrollHeight: afterScroll.scrollHeight, beforeHeight: scroller.beforeHeight }))
+    } else {
+      notes.push(`分页锚点：现网没有取回新段（窗口内仍只有 ${afterScroll.fullTotal} 张），scrollTop 硬断言由 scripts/test-secretary-pagination-dom.mjs 代做`)
+    }
+    // 一路滚到 120 张上限：必须停住并显示提示行
+    let capped = { ...afterScroll }
+    for (let attempt = 0; attempt < 6 && !capped.hint; attempt += 1) {
+      await page.evaluate(() => {
+        const el = document.querySelector('[data-conversation-scroll]')
+        if (el === null) return
+        el.scrollTop = 0
+        el.dispatchEvent(new Event('scroll'))
+      })
+      await page.waitForTimeout(900)
+      capped = await pagerProbe()
+    }
+    check('分页：累计渲染上限 120 张就停（现网窗口不越界）', capped.fullTotal <= 120,
+      JSON.stringify({ fullTotal: capped.fullTotal, collapsed: capped.collapsedTotal, domNodes: capped.domNodes }))
+    if (capped.hint !== '') {
+      check('分页：到上限后显示「更早的内容请到轨迹/搜索里看」', capped.hint === '更早的内容请到轨迹/搜索里看', JSON.stringify({ hint: capped.hint }))
+    } else {
+      notes.push(`分页上限提示：现网只渲染到 ${capped.fullTotal} 张（宿主自己没给到 120 张窗口），提示行硬断言由 scripts/test-secretary-pagination-dom.mjs 代做`)
+    }
+    check('分页：上限后继续上滚不再涨渲染卡数', historyRouteRequests.filter((line) => line.includes('before=')).length <= 5,
+      JSON.stringify({ historyRequests: historyRouteRequests.length }))
+    await page.screenshot({ path: 'tmp-secretary-pager-capped.png' })
+    notes.push('截图: tmp-secretary-pager-capped.png')
+  } else {
+    notes.push('分页上滚回归：页面没有 [data-conversation-scroll]，跳过）')
+  }
+
+  // 刷新后不自动回填：reload 回秘书页应仍只渲染最近 30 张
+  const requestsBeforeReload = historyRouteRequests.length
+  await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {})
+  await page.waitForTimeout(3500)
+  const reloaded = await pagerProbe()
+  if (reloaded.fullTotal === 0 && reloaded.collapsedTotal === 0) {
+    notes.push('分页刷新回归：刷新后没回到秘书卡片区，跳过刷新断言）')
+  } else {
+    check('分页：刷新后仍然只渲染最近 30 张（不自动回填老卡）', reloaded.fullTotal <= 30 && (reloaded.fullTotal < 30 || reloaded.collapsedTotal > 0),
+      JSON.stringify({ fullTotal: reloaded.fullTotal, collapsed: reloaded.collapsedTotal, domNodes: reloaded.domNodes }))
+    const newRequests = historyRouteRequests.slice(requestsBeforeReload)
+    check('分页：刷新只问最近那一段（新取的请求不带 before 游标）', newRequests.every((line) => !line.includes('before=')),
+      JSON.stringify(newRequests.slice(0, 3)))
+    await page.screenshot({ path: 'tmp-secretary-pager-reload.png' })
+    notes.push('截图: tmp-secretary-pager-reload.png')
+  }
+  notes.push(`分页现场：${JSON.stringify({ firstWindow: { fullTotal: firstWindow.fullTotal, collapsedTotal: firstWindow.collapsedTotal, hint: firstWindow.hint }, historyRequests: historyRouteRequests.slice(0, 3), historyResponses: historyRouteResponses.slice(0, 2) })}`)
 
   check('无未捕获异常', pageErrors.length === 0, JSON.stringify(pageErrors.slice(0, 3)))
   check('无（非既有噪声的）console error', consoleErrors.length === 0, JSON.stringify(consoleErrors.slice(0, 3)))
