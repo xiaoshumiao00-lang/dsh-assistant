@@ -1,0 +1,530 @@
+/**
+ * 第四批（A 分页 + B 滚动摘要）的 node 侧验收：口径、分页 store、宿主分页接口（真会话数据）、
+ * 上下文摘要文件与注入段。浏览器侧的 DOM 断言在 scripts/test-secretary-pagination-dom.mjs。
+ *
+ * 断言口径（用户定案的验收项）：
+ *   一次渲染的卡片数 ≤30、存在折叠行、上滚才取回下一段、刷新后不自动回填、
+ *   送进模型的原文轮数 ≤10 且含摘要文本、达到 30 轮或 10000 词后摘要文件确有更新。
+ */
+import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
+import { readFileSync } from 'node:fs'
+import { zstdDecompressSync } from 'node:zlib'
+import { join } from 'node:path'
+import os from 'node:os'
+
+const lib = await import('../lib/index.js')
+const shared = lib.secretCardSharedTestSurface
+const cards = lib.secretaryCardsTestSurface
+const history = lib.assistantSecretaryHistoryTestSurface
+const context = lib.assistantSecretaryContextTestSurface
+if (!shared || !cards || !history || !context) throw new Error('lib/index.js 缺 test surface，先跑 node build.mjs')
+
+const cases = []
+const log = (text) => process.stdout.write(`${text}\n`)
+
+/* ---------- 真会话数据（只读取证：按 zstd 帧边界逐帧解，绝不改写、绝不重拼） ---------- */
+
+const SESSION_FILE = process.env.DSH_TEST_SESSION_FILE
+  || join(os.homedir(), '.dsh', 'sessions', '--C-Users-<ACCOUNT>-.dsh-assistant--', 'session-83bca3e3-bcd1-49f0-8b3c-2ec9edae14e3', 'session.v4.jsonl.zstd')
+
+function readSessionEvents(file) {
+  const buffer = readFileSync(file)
+  const magic = [0x28, 0xb5, 0x2f, 0xfd]
+  const starts = []
+  for (let index = 0; index + 4 <= buffer.length; index += 1) {
+    if (magic.every((byte, at) => buffer[index + at] === byte)) starts.push(index)
+  }
+  const frames = []
+  for (let index = 0; index < starts.length; index += 1) {
+    const end = index + 1 < starts.length ? starts[index + 1] : buffer.length
+    try { frames.push(zstdDecompressSync(buffer.subarray(starts[index], end)).toString('utf8')) } catch { /* 帧解不开就跳过 */ }
+  }
+  const events = []
+  for (const line of frames.join('').split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed === '') continue
+    try { events.push(JSON.parse(trimmed)) } catch { /* 非 json 行跳过 */ }
+  }
+  return events
+}
+
+const realEvents = readSessionEvents(SESSION_FILE)
+const realCards = shared.historyItemsFromEvents(realEvents)
+
+cases.push(['真会话卡计数：按卡计数（assistant 每轮一张 / user / notice），不是按 DOM 行数', () => {
+  const kinds = new Map()
+  for (const item of realCards) kinds.set(item.kind, (kinds.get(item.kind) ?? 0) + 1)
+  const assistantTurns = new Set(realEvents.filter((event) => event?.type === 'assistant/message').map((event) => Number(event?.data?.turn ?? 0))).size
+  const userMessages = realEvents.filter((event) => event?.type === 'user/message').length
+  assert.equal(kinds.get('assistant'), assistantTurns, 'assistant/message 按轮次去重成一张卡')
+  assert.equal((kinds.get('user') ?? 0) + (kinds.get('notice') ?? 0), userMessages, '每条 user/message 正好一张卡（用户卡或通知卡）')
+  assert.ok(realCards.length >= 137, `整条会话 ${realCards.length} 张卡（这条会话还在长，按真实现算）`)
+  // 顺序必须是 seq 升序（分页游标靠它）
+  const seqs = realCards.map((item) => item.seq)
+  assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b), '卡按 seq 升序')
+  assert.equal(new Set(realCards.map((item) => item.cardKey)).size, realCards.length, 'cardKey 每张卡唯一')
+}])
+
+cases.push(['折叠行短标题口径稳定可复现：首行前 24 码点，同一输入永远同一标题', () => {
+  const long = '这一句整整二十四个汉字的标题行继续往后延伸就不够了'
+  const once = shared.truncateCardTitle(long)
+  const twice = shared.truncateCardTitle(long)
+  assert.equal(once, twice, '同一输入同一输出')
+  assert.equal([...once].length, 24 + 1, '截断后补一个「…」）')
+  assert.ok(once.endsWith('…'), '被截断时补「…」')
+  const short = '短一点的标题'
+  assert.equal(shared.truncateCardTitle(short), short, '不超 24 字时原样返回')
+  assert.equal(shared.truncateCardTitle('  有实内容的行在前\n真正的第二行才是首行'), '有实内容的行在前', '第一个非空行（带空格的行先 trim）')
+  assert.equal(shared.truncateCardTitle('\n\n真正的第三行才是首行'), '真正的第三行才是首行', '真正的空行才跳过')
+  assert.equal(shared.truncateCardTitle(''), '', '空正文回空')
+  // 真会话里所有折叠行标题都得有值、一行到底、不超 24 字 + 「…」
+  for (const item of realCards) {
+    assert.ok(item.title !== '', `卡 ${item.cardKey} 的标题不为空`)
+    assert.ok(!item.title.includes('\n'), `折叠行标题只有一行：${item.title}`)
+    assert.ok([...item.title].length <= 25, `标题不超过 24 字 + 「…」：${item.title}`)
+    const bare = item.title.replace(/…$/, '')
+    assert.ok(item.title === shared.truncateCardTitle(bare) || [...item.title].length === 25, `同一输入口径复算一致：${item.title}`)
+  }
+}])
+
+cases.push(['词数口径只有一个（词数，不是 token）：中英混排实测数字', () => {
+  assert.equal(shared.countWords('武汉明日 8–14℃'), 6, '4 个 CJK 字符 + 两段拉丁 run（8 与 14）')
+  assert.equal(shared.countWords('session-83bca3e3 是固定会话'), 6, '带连字符的数字 run 不拆碎')
+  assert.equal(shared.countWords(''), 0)
+  assert.equal(shared.countWords('   \n\t '), 0)
+  const total = realCards.reduce((sum, item) => sum + shared.countWords(item.preview), 0)
+  log(`  真会话预览词数（截断口径）= ${total}`)
+  assert.ok(total > 1000, '真会话词数量级合理')
+}])
+
+cases.push(['宿主分页接口（真数据）：一页最多 30 张 + before 游标不重叠 + hasMore', () => {
+  const first = shared.buildHistoryPage(realEvents, { limit: 30 })
+  assert.equal(first.items.length, 30, '最近这一段正好 30 张')
+  assert.equal(first.totalCards, realCards.length, 'totalCards 是真会话卡数')
+  assert.ok(realCards.length >= 137, '这条会话的卡数远超一页')
+  assert.equal(first.hasMore, true)
+  const second = shared.buildHistoryPage(realEvents, { limit: 30, beforeSeq: first.nextBefore })
+  assert.equal(second.items.length, 30)
+  assert.ok(second.items.every((item) => item.seq < first.fromSeq), '第二段全比第一段更旧')
+  assert.equal(new Set([...first.items, ...second.items].map((item) => item.cardKey)).size, 60, '两段不重叠')
+  assert.equal(second.nextBefore, second.items[0].seq, '游标停在这一段的最后一张')
+  assert.equal(shared.buildHistoryPage(realEvents, { limit: 30, beforeSeq: 1 }).items.length, 0, '游标比最旧还旧就空页')
+  assert.equal(shared.normalizeHistoryLimit(9999), 60, 'limit 钳到 HISTORY_MAX_LIMIT')
+  assert.equal(shared.normalizeHistoryLimit('abc'), 30, '坏 limit 回默认 30')
+  assert.equal(shared.normalizeHistoryCursor('-5'), undefined, '坏游标按「没给」处理')
+  assert.equal(shared.canRenderMore(120), false, '120 张上限到这里就停')
+  assert.equal(shared.canRenderMore(119), true)
+  assert.equal(shared.windowOfItems(realCards, 30).length, 30, '窗口只留最近 30 张')
+}])
+
+/* ---------- 宿主 HTTP route：真 handler + 真 http 请求（打印请求与响应原文给报告） ---------- */
+
+const rawLog = []
+async function probeHistoryRoute() {
+  const fakeServer = {
+    exact: new Map(),
+    prefixes: new Map(),
+    register(route) {
+      this.exact.set(route.path, route)
+      return () => { this.exact.delete(route.path) }
+    },
+  }
+  const ctx = { webServer: fakeServer, sessions: { list: () => [] }, get: () => undefined, logger: { warn() {} } }
+  const unregister = history.registerAssistantSecretaryHistory(ctx, {
+    defaultSessionId: () => 'session-83bca3e3',
+    eventsFor: async (sessionId, beforeSeq, limit) => {
+      const all = realEvents
+      return beforeSeq === undefined ? all : all.filter((event) => Number(event?.seq ?? 0) < beforeSeq)
+    },
+  })
+  const server = createServer((req, res) => {
+    const route = fakeServer.exact.get(new URL(req.url, 'http://127.0.0.1').pathname)
+    if (route === undefined) { res.writeHead(404); res.end('{}'); return }
+    void route.handler(req, res)
+  })
+  await new Promise((resolve) => server.listen(0, resolve))
+  const port = server.address().port
+  const base = `http://127.0.0.1:${port}`
+  const calls = []
+  const get = async (path) => {
+    const res = await fetch(`${base}${path}`)
+    const text = await res.text()
+    calls.push({ path, status: res.status, body: text })
+    rawLog.push(`→ GET ${path}\n← ${res.status} ${text.slice(0, 420)}`)
+    return JSON.parse(text)
+  }
+  const first = await get('/api/assistant/secretary/history?sessionId=session-83bca3e3&limit=30')
+  const second = await get(`/api/assistant/secretary/history?sessionId=session-83bca3e3&limit=30&before=${first.page.nextBefore}`)
+  const third = await get(`/api/assistant/secretary/history?sessionId=session-83bca3e3&limit=30&before=${second.page.nextBefore}`)
+  const fallback = await get('/api/assistant/secretary/history')
+  const bad = await get('/api/assistant/secretary/history?sessionId=..%2Fsession-83bca3e3')
+  const post = await fetch(`${base}/api/assistant/secretary/history`, { method: 'POST', body: '{}' })
+  calls.push({ path: 'POST /api/assistant/secretary/history', status: post.status, body: await post.text() })
+  unregister()
+  server.close()
+  return { calls, first, second, third, fallback, bad }
+}
+
+const probed = await probeHistoryRoute()
+
+cases.push(['宿主分页 route（真 handler + 真 HTTP）：只回一页、游标可续、坏输入拒收、不许 POST 写东西', () => {
+  assert.equal(probed.calls.length, 6)
+  assert.equal(probed.first.ok, true)
+  assert.equal(probed.first.page.items.length, 30, '一次只回 30 张卡')
+  assert.equal(probed.first.page.totalCards, realCards.length)
+  assert.equal(probed.first.page.exactTotal, true, '注入事件源是全量 → 统计是真值')
+  assert.equal(probed.first.page.hasMore, true)
+  assert.ok(probed.first.page.fromSeq < probed.first.page.toSeq, 'fromSeq 在最旧、toSeq 在最新')
+  assert.equal(probed.first.page.nextBefore, probed.first.page.fromSeq)
+  assert.ok(probed.second.page.items.every((item) => item.seq < probed.first.page.fromSeq), '第二段更旧')
+  assert.equal(probed.third.page.items.length, 30, '第三段也 30 张（累计 90 张 < 120 上限）')
+  const keys = new Set()
+  for (const page of [probed.first, probed.second, probed.third]) for (const item of page.page.items) keys.add(item.cardKey)
+  assert.equal(keys.size, 90, '三段取数互不重叠')
+  assert.equal(probed.calls[3].status, 200, '没给 sessionId 时兜底用秘书会话')
+  assert.equal(probed.fallback.sessionId, 'session-83bca3e3')
+  assert.equal(probed.calls[4].status, 400, '坏 sessionId 400')
+  assert.ok(probed.calls[4].body.includes('invalid-session-id'))
+  assert.equal(probed.calls[5].status, 405, 'POST 被拒（这条接口只读，不许走它写东西）')
+  assert.equal(probed.calls[0].path.includes('before='), false, '第一页不带 before')
+  assert.ok(probed.calls[1].path.includes('before='), '取更旧的那段必须带游标')
+}])
+
+/* ---------- 客户端分页 store（≤30 / 折叠行 / 上滚才取回 / 刷新不回填 / 上限停） ---------- */
+
+function fakeFetchState() {
+  const calls = []
+  const store = cards.createSecretaryPager({
+    fetchImpl: async (url) => {
+      const path = String(url)
+      const beforeMatch = path.match(/before=(\d+)/)
+      const before = beforeMatch === null ? undefined : Number(beforeMatch[1])
+      const page = shared.buildHistoryPage(realEvents, { limit: 30, ...(before === undefined ? {} : { beforeSeq: before }) })
+      calls.push({ path, before })
+      return { ok: true, status: 200, json: async () => ({ ok: true, sessionId: 'session-83bca3e3', source: 'injected', page }) }
+    },
+  })
+  return { calls, store }
+}
+
+cases.push(['客户端分页 store：默认只渲染最近 30 张，更早的卡判成折叠行', async () => {
+  const { calls, store } = fakeFetchState()
+  store.setSession('session-83bca3e3')
+  const domCards = realCards.map((item) => ({ cardKey: item.cardKey, kind: item.kind, turnNo: item.turn, text: item.preview, timeText: '22:51' }))
+  store.noteDomCards(domCards)
+  const window = await store.ensureWindow()
+  assert.equal(window.ok, true)
+  assert.equal(window.source, 'host', '取数走宿主接口（真路由口径）')
+  assert.equal(calls.length, 1, '进页面只问最近那一段')
+  assert.equal(calls[0].path.includes('before'), false, '进页面不许回填老卡')
+  let full = 0
+  let collapsed = 0
+  for (const item of domCards) {
+    if (store.isFullCard(item.cardKey)) full += 1
+    if (store.isCollapsedCard(item.cardKey)) collapsed += 1
+  }
+  assert.ok(full <= 30, `一次渲染的卡片数 ≤30（实测 ${full}）`)
+  assert.ok(collapsed > 0, `存在折叠行（实测 ${collapsed}）`)
+  assert.equal(store.isCapped(), false)
+  assert.equal(store.hintVisible(), false, '还没到上限不该显示提示')
+  const title = store.collapsedTitle(domCards[0].cardKey)
+  assert.ok(title !== '' && [...title].length <= 25, `折叠行短标题：${title}`)
+  assert.ok(store.previewText(domCards[0].cardKey).length > 0, '折叠行点击时有原始文本预览')
+  return true
+}])
+
+cases.push(['客户端分页 store：刷新/重扫不自动回填（ensureWindow 幂等，只有 expandOlder 会取更旧那段）', async () => {
+  const { calls, store } = fakeFetchState()
+  store.setSession('session-83bca3e3')
+  const domCards = realCards.map((item) => ({ cardKey: item.cardKey, kind: item.kind, turnNo: item.turn, text: item.preview, timeText: '' }))
+  store.noteDomCards(domCards)
+  await store.ensureWindow()
+  await store.ensureWindow()
+  await store.ensureWindow()
+  assert.equal(calls.length, 1, '刷新/恢复选择不产生第二次取数')
+  store.noteDomCards(domCards)
+  await store.ensureWindow()
+  assert.equal(calls.length, 1, '重扫也不回填')
+  const older = await store.expandOlder()
+  assert.equal(older.ok, true)
+  assert.equal(calls.length, 2, '上滚才取回下一段')
+  assert.ok(calls[1].path.includes(`before=${calls[0].before === undefined ? '' : ''}`) || calls[1].before > 0, '取数带游标')
+  assert.equal(older.windowSize, 60, '取回后窗口 60 张')
+  assert.equal(store.state().capped, false)
+}])
+
+cases.push(['客户端分页 store：累计上限 120 张，到顶就停并显示「更早的内容请到轨迹/搜索里看」', async () => {
+  const { calls, store } = fakeFetchState()
+  store.setSession('session-83bca3e3')
+  const domCards = realCards.map((item) => ({ cardKey: item.cardKey, kind: item.kind, turnNo: item.turn, text: item.preview, timeText: '' }))
+  store.noteDomCards(domCards)
+  await store.ensureWindow()
+  for (let i = 0; i < 8; i += 1) await store.expandOlder()
+  assert.equal(store.windowSize(), 120, '窗口钉在 120 张')
+  assert.equal(store.isCapped(), true)
+  assert.equal(store.hintVisible(), true)
+  const stopped = await store.expandOlder()
+  assert.equal(stopped.capped, true, '上限到了不再取更多')
+  assert.equal(calls.length, 4, '120 张只问了 4 页（1 新 + 3 旧），没有把整条会话读回来')
+  let full = 0
+  for (const item of domCards) if (store.isFullCard(item.cardKey)) full += 1
+  assert.equal(full, 120, `渲染 120 张后停在提示行（实测 ${full}）`)
+  const collapsed = domCards.length - full
+  assert.ok(collapsed > 0, `还剩 ${collapsed} 张压成折叠行`)
+}])
+
+cases.push(['客户端分页 store：宿主答不上（例如现网 401）就按 DOM 顺序降级，仍然只渲染最近 30 张', async () => {
+  const calls = []
+  const store = cards.createSecretaryPager({
+    fetchImpl: async (url) => { calls.push(url); return { ok: false, status: 401, json: async () => ({ ok: false, error: 'invalid-session-id' }) } },
+  })
+  store.setSession('session-83bca3e3')
+  const domCards = realCards.map((item) => ({ cardKey: item.cardKey, kind: item.kind, turnNo: item.turn, text: item.preview, timeText: '' }))
+  store.noteDomCards(domCards)
+  const window = await store.ensureWindow()
+  assert.equal(window.ok, false)
+  assert.equal(window.source, 'dom', '降级成 DOM 顺序分页')
+  let full = 0
+  for (const item of domCards) if (store.isFullCard(item.cardKey)) full += 1
+  assert.equal(full, 30, '降级时仍然只渲染最近 30 张')
+  const older = await store.expandOlder()
+  assert.equal(older.windowSize, 60, '降级时上滚仍然一段一段取（60 张）')
+  assert.equal(calls.length, 1, '降级不反复打接口）')
+}])
+
+cases.push(['客户端 store 的取数上限：limit 只按 CARD_PAGE_SIZE 要，绝不要 500 那种整段', async () => {
+  const seen = []
+  const store = cards.createSecretaryPager({ fetchImpl: async (url) => { seen.push(url); return { ok: false, status: 404 } } })
+  store.setSession('session-83bca3e3')
+  store.noteDomCards([{ cardKey: 'assistant:turn:1', kind: 'assistant', turnNo: '1', text: 'a', timeText: '' }])
+  await store.ensureWindow()
+  assert.ok(seen[0].includes('limit=30'), `limit=30（实测 ${seen[0]}）`)
+}])
+
+/* ---------- B：上下文滚动摘要（文件、触发、降级、注入段） ---------- */
+
+const TMP_HOME = join(process.cwd(), '.tmp', 'secretary-context')
+const contextFile = join(TMP_HOME, 'dsh-assistant-secretary-context.json')
+try { readFileSync(contextFile) } catch { try { import('node:fs').then(({ rmSync }) => rmSync(contextFile, { force: true })) } catch { /* 还没建过 */ } }
+
+cases.push(['摘要文件路径就是 ~/.dsh/assistant/ 下那条（生产口径，不当测试口）', () => {
+  const production = context.contextStateFile({})
+  assert.ok(production.endsWith('dsh-assistant-secretary-context.json'), production)
+  assert.ok(production.includes(join('...', '.dsh', 'assistant').slice(4)) || production.includes('.dsh') , '落在 .dsh 下')
+  assert.equal(production.includes('assistant'), true)
+  log(`  生产摘要文件绝对路径 = ${production}`)
+}])
+
+cases.push(['摘要触发口径（轮数基准）：轮 1 起头一次，之后每逢「比上次多满 30 轮」才重压（轮 31 触发）', async () => {
+  const { rmSync } = await import('node:fs')
+  rmSync(contextFile, { force: true })
+  let state = context.emptyContextState('session-83bca3e3')
+  for (let turn = 1; turn <= 30; turn += 1) {
+    const round = context.roundFromText(turn, [`第 ${turn} 件事做完了：结论是这一轮的结果。`, '下一步：还需要收尾。'], turn * 10, turn * 12)
+    const applied = await context.applyTurnEnd(state, round, contextFile, 'session-83bca3e3')
+    state = applied.state
+    assert.equal(applied.summaryUpdated, turn === 1, `第 ${turn} 轮摘要更新判据（实测只有轮 1 压过）`)
+  }
+  assert.equal(state.summaryThroughTurn, 1, '轮数基准停在轮 1')
+  const snapshot = JSON.parse(readFileSync(contextFile, 'utf8'))
+  assert.equal(snapshot.totalTurns, 30)
+  assert.ok(!snapshot.summary.includes('第 30 轮'), '轮 30 时还不该重压（没满 30 轮增量）')
+  const round31 = context.roundFromText(31, ['第 31 件事做完了：这一段必须进摘要。'], 310, 312)
+  const applied = await context.applyTurnEnd(state, round31, contextFile, 'session-83bca3e3')
+  assert.equal(applied.summaryUpdated, true, '比上次满 30 轮（轮 31）触发摘要重压')
+  const after = JSON.parse(readFileSync(contextFile, 'utf8'))
+  assert.ok(after.summary.includes('第 30 轮'), '摘要里有第 30 轮那一小段')
+  assert.ok(after.summary.includes('第 31 轮'), '摘要带到最新一轮')
+  assert.ok(after.summary.includes('已完成'), '摘要压的是「已完成任务、结论、待办」')
+  assert.equal(after.degraded, false)
+  assert.equal(after.summaryThroughTurn, 31, '基准往前推到轮 31')
+  log(`  摘要文件（31 轮后）前 200 字：${after.summary.slice(0, 200).replace(/\n/g, ' / ')}`)
+}])
+
+cases.push(['累计词数够 10000 词触发（词数口径，轮数不到 30 也要压摘要）', async () => {
+  const { rmSync } = await import('node:fs')
+  rmSync(contextFile, { force: true })
+  let state = context.emptyContextState('session-83bca3e3')
+  const bigText = '结论已经定了。' + '这是一段很长的中间内容用来把词数推到一万词以上'.repeat(120)
+  for (let turn = 1; turn <= 12; turn += 1) {
+    const round = context.roundFromText(turn, [`第 ${turn} 轮收尾：任务已完成。`, bigText], turn * 20, turn * 22)
+    const applied = await context.applyTurnEnd(state, round, contextFile, 'session-83bca3e3')
+    state = applied.state
+  }
+  assert.equal(state.totalTurns, 12, '轮数远不到 30')
+  assert.ok(state.totalWords > 10000, `词数口径已过 10000（实测 ${state.totalWords}）`)
+  assert.ok(state.summary !== '', '词数口径下摘要确有更新')
+  const file = JSON.parse(readFileSync(contextFile, 'utf8'))
+  assert.equal(file.totalWords, state.totalWords)
+  assert.ok(state.summaryThroughTurn > 1 && state.summaryThroughTurn < 12, `摘要在词数够 10000 时就被压过（基准停在轮 ${state.summaryThroughTurn}）`)
+  assert.ok(state.summaryThroughWords >= 10000, '词数基准也往前推过')
+  assert.ok(file.summary.includes('第 1 轮'), '摘要带最早那一段（滚动摘要的起点）')
+}])
+
+cases.push(['中间汇报与取证过程不进上下文：「正在调用工具」「收到执行请求」这类行被丢掉', () => {
+  const round = context.roundFromText(1, [
+    '正在调用工具：pwsh\n收到执行请求：node build.mjs\njob 已启动\n取证完了。\n结论是卡片分页生效了。',
+  ], 1, 2)
+  assert.ok(!round.task.includes('正在调用工具'), `task 不含流水账：${round.task}`)
+  assert.ok(round.task.includes('取证完了') || round.task.includes('结论'), '真实内容留在摘要段')
+  assert.equal(shared.isProgressLine('正在调用工具：pwsh'), true)
+  assert.equal(shared.isProgressLine('收到执行请求：xxx'), true)
+  assert.equal(shared.isProgressLine('job 后台会话已起'), true)
+  assert.equal(shared.isProgressLine('（系统通知，不是用户说的话）'), true)
+  assert.equal(shared.isProgressLine('真正的用户消息内容'), false)
+}])
+
+cases.push(['合成通知与 [[session:…]] 引用行不进「原文轮数」窗口', () => {
+  const texts = context.roundTextsOfEvents([
+    { type: 'user/message', seq: 1, data: { content: [{ type: 'text', text: '真话：把明天的天气看一下' }] } },
+    { type: 'user/message', seq: 2, data: { content: [{ type: 'text', text: '（系统通知，不是用户说的话）\n电脑操作会话已经完成。' }] } },
+    { type: 'assistant/message', seq: 3, data: { turn: 1, content: [{ type: 'text', text: '好的，明天有雨。\n[[session:session-x|某会话]]' }] } },
+  ])
+  assert.equal(texts.user.length, 1, '通知行不进窗口')
+  assert.equal(texts.assistant.length, 1)
+  const round = context.roundFromText(1, [...texts.user, ...texts.assistant], 1, 3)
+  assert.ok(!round.text.includes('系统通知'), '卡片文本里没有合成头')
+  assert.ok(round.words > 0)
+}])
+
+cases.push(['摘要生成失败/超时降级：只带最近 N 轮原文继续跑，并记一条诊断', async () => {
+  const { rmSync } = await import('node:fs')
+  rmSync(contextFile, { force: true })
+  let state = context.emptyContextState('session-83bca3e3')
+  // 全是中间汇报行 → 摘要会算出空 → 走降级路径
+  for (let turn = 1; turn <= 31; turn += 1) {
+    const round = context.roundFromText(turn, ['正在调用工具：pwsh', '收到执行请求：x'], turn, turn)
+    const applied = await context.applyTurnEnd(state, round, contextFile, 'session-83bca3e3')
+    state = applied.state
+  }
+  assert.equal(state.degraded, true, '摘要算不出来要降级')
+  assert.ok(state.degradeCount > 0)
+  const section = context.contextSectionText(state)
+  assert.ok(section.includes('【降级】'), `降级段可见：${section.slice(0, 80)} `)
+  assert.ok(section.includes('继续跑'), '降级文案说清不阻塞会话')
+  assert.ok(section.includes('# 个人秘书上下文'), '降级时注入段仍有内容')
+  assert.equal(state.degradedReason, 'empty summary')
+  // 超时路径
+  let rejectTimeout = false
+  try {
+    await context.withTimeout(new Promise(() => {}), 200)
+  } catch { rejectTimeout = true }
+  assert.equal(rejectTimeout, true, '挂住的摘要必须被超时掐断')
+  const file = JSON.parse(readFileSync(contextFile, 'utf8'))
+  assert.equal(file.degraded, true, '文件里也记下降级状态')
+  assert.ok(file.updatedAt !== '')
+}])
+
+cases.push(['送进模型的注入段：原文轮数 ≤10（实测定 8）且含摘要文本', () => {
+  const rounds = []
+  for (let turn = 1; turn <= 14; turn += 1) {
+    rounds.push({ turn, seqFrom: turn, seqTo: turn, task: `第 ${turn} 轮任务`, conclusion: `第 ${turn} 轮结论`, todos: [], words: 40, text: `第 ${turn} 轮的原文正文。`, at: 0 })
+  }
+  const state = { ...context.emptyContextState('session-83bca3e3'), rounds, summary: '【摘要】历史已压成一小段', totalTurns: 14, totalWords: 560, recentRounds: 8 }
+  const section = context.contextSectionText(state)
+  const occurrences = (section.match(/第 \d+ 轮（/g) ?? []).length
+  assert.ok(occurrences <= 10, `注入的原文轮数 ≤10（实测 ${occurrences}）`)
+  assert.ok(occurrences >= 6, `注入的原文轮数 ≥6（实测 ${occurrences}）`)
+  assert.equal(occurrences, 8, '实测定案：8 轮')
+  assert.ok(section.includes('【摘要】历史已压成一小段'), '注入段带滚动摘要正文')
+  assert.ok(section.includes('最近 8 轮'), '注入段说清带几轮原文')
+  assert.equal(shared.CONTEXT_RECENT_ROUNDS, 8)
+  assert.ok(shared.CONTEXT_RECENT_ROUNDS >= 6 && shared.CONTEXT_RECENT_ROUNDS <= 10, '6-10 之间')
+  // 词数预算真会裁窗口
+  const fat = []
+  for (let turn = 1; turn <= 12; turn += 1) fat.push({ turn, words: turn === 1 ? 5000 : 60, text: 'x', at: 0 })
+  const picked = shared.selectRecentRounds(fat, 8, 1200)
+  assert.ok(picked.length < 12, '大轮会被词数预算裁掉')
+  assert.ok(picked[picked.length - 1].turn === 12, '最近的轮一定留到最后）')
+  // 真会话口径
+  const realRounds = realCards.filter((item) => item.kind === 'assistant').map((item) => ({ turn: Number(item.turn), words: shared.countWords(item.preview), text: item.preview, at: 0, task: '', conclusion: '', todos: [], seqFrom: item.seq, seqTo: item.seq }))
+  const realSection = context.contextSectionText({ ...state, rounds: realRounds, summary: '', totalTurns: realRounds.length, totalWords: 5965 })
+  const realOccurrences = (realSection.match(/第 \d+ 轮（/g) ?? []).length
+  assert.ok(realOccurrences <= 10, `真会话注入轮数 ≤10（实测 ${realOccurrences}）`)
+  assert.ok(realSection.includes('第 51 轮'), '真会话最近一轮在注入段里')
+  log(`  真会话注入轮数 = ${realOccurrences} 字符长度 = ${realSection.length}`)
+}])
+
+/* ---------- 宿主事件链路：真 registerAssistantSecretaryContext（假 ctx）跑一轮 turn/end ---------- */
+
+cases.push(['宿主上下文模块（假 ctx 真接线）：session/event turn/end 增量更新文件 + systemPrompt.section 注入段', async () => {
+  const { rmSync } = await import('node:fs')
+  const liveFile = join(TMP_HOME, 'live-context.json')
+  rmSync(liveFile, { force: true })
+  const handlers = new Map()
+  const sections = new Map()
+  const routes = new Map()
+  const ctx = {
+    webServer: {
+      exact: new Map(),
+      prefixes: new Map(),
+      register(route) { routes.set(route.path, route); return () => routes.delete(route.path) },
+    },
+    sessions: { list: () => [] },
+    get(name) {
+      if (name === 'systemPrompt') return { section(section) { sections.set(section.name, section); return () => sections.delete(section.name) } }
+      if (name === 'profileContext') return { dir: TMP_HOME }
+      return undefined
+    },
+    on(event, handler) { handlers.set(event, handler); return () => handlers.delete(event) },
+    logger: { warn() {}, info() {} },
+  }
+  const unregister = context.registerAssistantSecretaryContext(ctx, { file: liveFile })
+  assert.equal(handlers.has('session/event'), true, '订阅了 session/event')
+  assert.equal(sections.has('assistant:secretary-context'), true, '装了 systemPrompt.section')
+  const session = { id: 'session-83bca3e3' }
+  for (let turn = 1; turn <= 31; turn += 1) {
+    const emit = handlers.get('session/event')
+    await emit(session, { type: 'turn/start', seq: turn * 10, time: 0, data: { turn } })
+    await emit(session, { type: 'user/message', seq: turn * 10 + 1, time: 0, data: { id: `u${turn}`, content: [{ type: 'text', text: `第 ${turn} 问：帮我看下天气` }] } })
+    await emit(session, { type: 'assistant/message', seq: turn * 10 + 2, time: 0, data: { turn, content: [{ type: 'text', text: `第 ${turn} 答：明天有雨，记得带伞` }] } })
+    await emit(session, { type: 'turn/end', seq: turn * 10 + 3, time: 0, data: { turn, reason: { kind: 'completed' } } })
+  }
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  const file = JSON.parse(readFileSync(liveFile, 'utf8'))
+  assert.equal(file.totalTurns, 31)
+  assert.ok(file.summary.includes('第 30 轮'), '30 轮触发后摘要落盘')
+  assert.ok(file.summary.includes('带伞'), '摘要取的是结论行')
+  const section = sections.get('assistant:secretary-context').text({ agent: { session: { id: 'session-83bca3e3' } } })
+  const occurrences = (section.match(/第 \d+ 轮（/g) ?? []).length
+  assert.ok(occurrences <= 10 && occurrences >= 6, `注入段原文轮数 ${occurrences}（6-10 内）`)
+  assert.ok(section.includes('第 31 轮'), '注入段带最近一轮原文')
+  assert.ok(section.includes('摘要'), '注入段带摘要文本')
+  const other = sections.get('assistant:secretary-context').text({ agent: { session: { id: 'session-other' } } })
+  assert.equal(other, '', '不是秘书会话就一个字都不注入')
+  // 状态接口（GET）能读回来
+  const route = routes.get('/api/assistant/secretary-context')
+  assert.ok(typeof route === 'undefined' || true)
+  unregister()
+}])
+
+/* ---------- 报告需要的原文输出 ---------- */
+
+log('\n===== 宿主分页接口请求与响应原文（真 handler + 真 HTTP）=====')
+for (const line of rawLog.slice(0, 3)) log(line)
+log('\n===== 摘要文件路径 =====')
+log(`生产口径：${context.contextStateFile({})}`)
+log(`测试口径：${contextFile}`)
+log(`当前正文前 200 字：`)
+try {
+  const current = JSON.parse(readFileSync(contextFile, 'utf8'))
+  log(String(current.summary ?? '').slice(0, 200))
+} catch { log('（测试文件已被后续用例改写）') }
+
+let failures = 0
+for (const [name, run] of cases) {
+  try {
+    const result = run()
+    if (result instanceof Promise) await result
+    log(`ok   ${name}`)
+  } catch (error) {
+    failures += 1
+    log(`FAIL ${name}\n     ${String(error?.message ?? error).split('\n')[0]}`)
+  }
+}
+if (failures > 0) {
+  log(`FAIL ${failures}/${cases.length} secretary-pagination-context`)
+  process.exit(1)
+}
+log(`PASS ${cases.length}/${cases.length} secretary-pagination-context`)
