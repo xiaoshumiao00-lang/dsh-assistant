@@ -1,13 +1,11 @@
 /**
- * 秘书卡片「朗读气泡」：小圆形按钮，放在卡片标题行最右。
+ * 卡片规范 v1.0 的头部朗读按钮：34px 右上角线性扬声器，不显示「...」或别的功能入口。
  *
- * 交互（与需求逐条对应，状态机不变）：
+ * TTS 状态机保持不变（与需求逐条对应）：
  *   - 单击：暂停 / 继续；
  *   - 长按 600ms：从头重读；
  *   - 换卡片（换 key request）：全局唯一 controller 先停上一条；
  *   - 只用宿主 /api/assistant/tts（微软 edge-tts），不用 speechSynthesis。
- *
- * 回复卡与主动服务卡共用这一个按钮；自动朗读只由回复卡（最末一轮）发起。
  */
 import { useEffect, useRef, useSyncExternalStore } from 'react'
 import { normalizeForSpeech } from './secretary-cards.ts'
@@ -25,8 +23,12 @@ export function SecretarySpeakButton({ speakKey, rawText }: { speakKey: string; 
 
   const mine = state.key === speakKey
   const status = mine ? state.status : 'idle'
-  const label = status === 'playing' ? '暂停朗读' : status === 'paused' ? '继续朗读'
-    : status === 'loading' ? '朗读中…' : status === 'error' ? `朗读失败（${state.error}）` : '朗读本条'
+  const active = mine && (status === 'playing' || status === 'paused')
+  const label = status === 'playing' ? '停止朗读'
+    : status === 'paused' ? '继续朗读'
+      : status === 'loading' ? '朗读准备中…'
+        : status === 'error' ? `朗读失败（${state.error}）`
+          : '朗读回答'
 
   const clearLp = (): void => { if (lpTimer.current !== null) { window.clearTimeout(lpTimer.current); lpTimer.current = null } }
   const onDown = (): void => {
@@ -45,8 +47,9 @@ export function SecretarySpeakButton({ speakKey, rawText }: { speakKey: string; 
       type="button"
       data-dsh-speak="button"
       data-status={status}
+      aria-pressed={active ? 'true' : 'false'}
       aria-label={label}
-      title={`${label}（长按从头重读）`}
+      title={label}
       onPointerDown={(event: any) => { event.stopPropagation(); onDown() }}
       onPointerUp={(event: any) => { event.stopPropagation(); onUp() }}
       onPointerLeave={clearLp}
@@ -55,7 +58,11 @@ export function SecretarySpeakButton({ speakKey, rawText }: { speakKey: string; 
         if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); secretarySpeech.toggle(speakKey, speechText) }
       }}
     >
-      {status === 'playing' ? '⏸' : status === 'paused' ? '▶' : status === 'loading' ? '…' : '🔊'}
+      <svg data-dsh-speak="icon" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d="M11 5.5 6.5 9H3.5v6h3L11 18.5z" />
+        <path d="M14.8 8.2a4 4 0 0 1 0 7.6" />
+        <path d="M17.6 5.8a7 7 0 0 1 0 12.4" />
+      </svg>
     </button>
   )
 }

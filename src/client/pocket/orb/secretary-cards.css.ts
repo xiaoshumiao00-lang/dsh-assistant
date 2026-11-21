@@ -1,14 +1,12 @@
 /**
- * 秘书回复卡片 + 朗读气泡样式（只对个人秘书固定会话生效，2026-11-21 按手机实测反馈重做）。
+ * 个人秘书回答卡片（设计规范 v1.0）：
+ *   - 白卡、16px 圆角、0.5px 浅灰边、无阴影、overflow hidden；
+ *   - 头部：32px 紫色助手标识 + 名称 + AI 助手标签，右端只有 34px 朗读按钮；
+ *   - 正文：15px 标题、13px/1.8 正文、重点句主文字色、模型名浅紫等宽行内标签；
+ *   - 底部：浅灰操作栏，左侧时间、右侧复制 / 分隔线 / 展开全文，朗读按钮不出现在底部；
+ *   - ≤520px：卡片 100%，外层和内部间距按规范，时间隐藏，朗读按钮仍在右上角。
  *
- * 层次：标题行（图标 +「个人秘书」标签 + 一句话摘要 + 最右朗读钮）→ 正文分段 →
- * 引用块（左细竖线 + 淡底 + 可点跳会话）→ 底部 meta（12px 灰、时间）。
- * 卡片：内边距 16、圆角 16、柔和浅蓝灰底、1px 极浅描边、轻微投影。
- *
- * 秘书会话里原始 markdown 气泡、过程信息行（turn-process / model-retry /
- * turn-error / turn-max-tokens / compaction）与空占位壳都由
- * body[data-dsh-secretary="1"] 在渲染层隐藏（display:none，不生成盒、不进 innerText）；
- * 其它会话这些选择器一律不命中，外观零变化。
+ * 只对个人秘书固定会话生效：原始 markdown 气泡、过程信息行、消息操作行与空壳都被隐藏。
  */
 export const SECRETARY_CARD_CSS = `
 /* 原始 markdown 气泡：秘书回复统一走卡片 */
@@ -24,7 +22,7 @@ body[data-dsh-secretary="1"] [data-chat-flow-kind="compaction"] {
   display: none !important;
 }
 /* 消息下方原生操作行（复制/赞/踩/分享/记忆/时间，宿主 MessageIconActions 根节点带 data-clock）：
- * 渲染层隐藏、不留行高；时间已在卡片底行 meta 里，不重复显示 */
+ * 渲染层隐藏、不留行高；时间已在卡片底行里，不重复显示 */
 body[data-dsh-secretary="1"] [data-clock] {
   display: none !important;
 }
@@ -34,142 +32,310 @@ body[data-dsh-secretary="1"] [data-dsh-speak="wrap"][data-empty="1"] {
   display: none !important;
 }
 
-/* ── 秘书回复卡片 ── */
+/* ── 卡片外壳 ── */
 [data-dsh-scard="card"] {
-  --fold-bg: #f7f9fc;
-  background: #f7f9fc;
-  border: 1px solid #e9edf3;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 620px;
+  margin: 12px auto;
+  overflow: hidden;
+  background: #ffffff;
+  border: 0.5px solid #e5e6eb;
   border-radius: 16px;
-  padding: 16px;
-  margin: 8px 0 4px;
-  gap: 10px;
-  box-shadow: 0 1px 3px rgba(30, 41, 59, .05);
+  box-shadow: none;
 }
+
+/* ── 头部 ── */
 [data-dsh-scard="head"] {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 20px 0;
+}
+[data-dsh-scard="assistant"] {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   min-width: 0;
 }
-[data-dsh-scard="icon"] {
+[data-dsh-scard="mark"] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex: none;
-  font-size: 13px;
-  line-height: 1;
-  color: #7c8db0;
+  width: 32px;
+  height: 32px;
+  color: #534ab7;
+  background: #eeedfe;
+  border-radius: 10px;
 }
-[data-dsh-scard="badge"] {
-  flex: none;
-  font-size: 11px;
-  line-height: 1;
-  padding: 4px 9px;
-  border-radius: 999px;
+[data-dsh-scard="mark"] svg {
+  display: block;
+  width: 24px;
+  height: 24px;
+}
+[data-dsh-scard="name"] {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-size: 14px;
   font-weight: 500;
-  color: #5b7fc0;
-  background: #eef3fb;
-  border: 1px solid #d4e0f3;
+  line-height: 20px;
+  color: #1f2329;
 }
-[data-dsh-scard="title"] {
-  flex: 1 1 auto;
-  min-width: 0;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--dsw-alias-label-primary, #232838);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+[data-dsh-scard="tag"] {
+  flex: none;
+  margin-left: 2px;
+  padding: 0 7px;
+  font-size: 11px;
+  line-height: 18px;
+  color: #3c3489;
+  background: #eeedfe;
+  border-radius: 6px;
 }
+
+/* ── 头部右端的朗读按钮（卡片内唯一朗读入口） ── */
+[data-dsh-speak="button"] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  color: #4e5969;
+  background: #ffffff;
+  border: 0.5px solid #e5e6eb;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: color 160ms ease, background-color 160ms ease, border-color 160ms ease;
+}
+[data-dsh-speak="button"]:hover,
+[data-dsh-speak="button"]:focus-visible,
+[data-dsh-speak="button"][data-status="playing"],
+[data-dsh-speak="button"][data-status="paused"],
+[data-dsh-speak="button"][aria-pressed="true"] {
+  color: #534ab7;
+  background: #eeedfe;
+  border-color: #cecbf6;
+}
+[data-dsh-speak="button"][data-status="loading"] {
+  color: #3c3489;
+  background: #eeedfe;
+  border-color: #cecbf6;
+}
+[data-dsh-speak="button"][data-status="error"] {
+  color: #b42318;
+  background: #fff1f0;
+  border-color: #f1c3c1;
+}
+[data-dsh-speak="icon"] {
+  display: block;
+  width: 17px;
+  height: 17px;
+}
+
+/* ── 正文 ── */
 [data-dsh-scard="body"] {
+  padding: 16px 20px 20px;
+}
+[data-dsh-scard="content"] {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 10px;
+  overflow: hidden;
+  transition: max-height 160ms ease;
 }
-/* 正文段落：宿主手机布局对滚动区内 p/li 有 (0,3,3) 且 !important 的 15px 规则，
- * 这里挂 body 标记 + 卡片/正文两层属性把优先级抬到 (0,4,1) 压过它 */
+[data-dsh-scard="card"][data-open="1"] [data-dsh-scard="content"] {
+  max-height: none !important;
+  overflow: visible;
+}
+body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [data-dsh-scard="title"] {
+  margin: 0;
+  font-size: 15px !important;
+  font-weight: 500 !important;
+  line-height: 1.5 !important;
+  color: #1f2329 !important;
+}
 body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [data-dsh-scard="para"] {
   margin: 0;
-  font-size: 14px !important;
-  line-height: 1.6 !important;
-  color: #3d4451 !important;
+  font-size: 13px !important;
+  font-weight: 400 !important;
+  line-height: 1.8 !important;
+  color: #4e5969 !important;
   white-space: pre-wrap;
   word-break: break-word;
+}
+body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [data-dsh-scard="para"] strong {
+  font-weight: 500 !important;
+  color: #1f2329 !important;
+}
+body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [data-dsh-scard="model-code"] {
+  display: inline-block;
+  padding: 2px 5px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace !important;
+  font-size: 12px !important;
+  line-height: 18px !important;
+  color: #3c3489 !important;
+  background: #eeedfe;
+  border-radius: 5px;
 }
 [data-dsh-scard="ref"] {
   align-self: flex-start;
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  border: 1px solid #e9edf3;
-  border-left: 3px solid #9db4d8;
-  background: #ffffff;
-  border-radius: 8px;
-  padding: 6px 10px;
-  font-size: 12px;
-  color: var(--dsw-alias-label-secondary, #5b6472);
-  cursor: pointer;
   max-width: 100%;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: #3c3489;
+  background: #eeedfe;
+  border: 0.5px solid #cecbf6;
+  border-radius: 8px;
+  cursor: pointer;
 }
-[data-dsh-scard="ref"]:active { background: #f2f5fa; }
+[data-dsh-scard="ref"]:hover { background: #e8e6fd; }
 [data-dsh-scard="ref-icon"] { flex: none; }
 [data-dsh-scard="ref-title"] {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-[data-dsh-scard="main"] {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-[data-dsh-scard="meta"] {
+
+/* ── 底部操作栏 ── */
+[data-dsh-scard="foot"] {
   display: flex;
   align-items: center;
-  justify-content: flex-start;
-  gap: 8px;
-  padding-top: 6px;
-  border-top: 1px solid #eef1f5;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px 10px 20px;
+  background: #fafafb;
+  border-top: 0.5px solid #e5e6eb;
 }
 [data-dsh-scard="time"] {
-  font-size: 12px;
-  color: var(--dsw-alias-label-tertiary, #9aa2af);
+  font-size: 11px;
+  line-height: 16px;
+  color: #8a9099;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
-/* 展开/收起轻提示：非按钮文本，跟在底行时间右侧（整张卡片可点，不新增操作按钮行） */
-[data-dsh-scard="hint"] {
-  margin-left: auto;
-  font-size: 12px;
-  color: #5b7fc0;
+[data-dsh-scard="actions"] {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex-wrap: nowrap;
+  min-width: 0;
 }
-
-/* ── 朗读气泡（回复卡与主动服务卡共用：小圆形、淡描边、最右） ── */
-[data-dsh-speak="button"] {
-  flex: none;
-  width: 30px;
-  height: 30px;
-  margin-left: auto;
-  border-radius: 999px;
-  border: 1px solid #dfe5ee;
-  background: #ffffff;
-  color: #7c8db0;
-  font-size: 13px;
-  line-height: 1;
-  cursor: pointer;
+[data-dsh-scard="copy"] {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
   padding: 0;
+  color: #8a9099;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
 }
-[data-dsh-speak="button"]:active { background: #eef2f8; }
-[data-dsh-speak="button"][data-status="playing"] {
-  color: #5b7fc0;
-  border-color: #c3d5ef;
-  background: #eef3fb;
+[data-dsh-scard="copy"]:hover {
+  color: #1f2329;
+  background: #ffffff;
 }
-[data-dsh-speak="button"][data-status="error"] {
-  color: #dc2626;
-  border-color: #fecaca;
-  background: #fef2f2;
+[data-dsh-scard="copy-status"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 16px;
+  color: #8a9099;
+  white-space: nowrap;
 }
-@media (max-width: 640px) {
-  [data-dsh-scard="card"] { padding: 14px; }
+[data-dsh-scard="separator"] {
+  flex: none;
+  width: 0.5px;
+  height: 14px;
+  margin: 0 5px;
+  background: #d5d8dd;
+}
+[data-dsh-scard="expand"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  height: 30px;
+  padding: 0 7px;
+  font-size: 12px;
+  color: #534ab7;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+[data-dsh-scard="expand"]:hover {
+  color: #3c3489;
+}
+[data-dsh-scard="expand-text"] { white-space: nowrap; }
+[data-dsh-scard="expand-arrow"] {
+  flex: none;
+  transition: transform 160ms ease;
+}
+[data-dsh-scard="card"][data-open="1"] [data-dsh-scard="expand-arrow"] {
+  transform: rotate(180deg);
+}
+
+/* 所有卡片内按钮的焦点环：键盘 Tab 可达，不移除浏览器默认 outline。 */
+[data-dsh-scard="card"] button:focus-visible,
+[data-dsh-speak="button"]:focus-visible {
+  outline: 2px solid #afa9ec;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-dsh-scard="content"],
+  [data-dsh-speak="button"],
+  [data-dsh-scard="expand-arrow"] {
+    transition: none !important;
+  }
+}
+
+@media (max-width: 520px) {
+  [data-dsh-scard="card"] {
+    width: 100%;
+    max-width: 620px;
+    border-radius: 16px;
+  }
+  [data-dsh-scard="head"] {
+    padding: 16px 16px 0;
+  }
+  [data-dsh-scard="body"] {
+    padding: 14px 16px 18px;
+  }
+  [data-dsh-scard="foot"] {
+    padding: 10px 12px 10px 16px;
+  }
+  [data-dsh-scard="time"] {
+    display: none;
+  }
+  [data-dsh-speak="button"] {
+    width: 34px;
+    height: 34px;
+  }
+  [data-dsh-scard="actions"] {
+    flex-wrap: nowrap;
+  }
+}
+
+@media (max-width: 360px) {
+  [data-dsh-scard="assistant"] {
+    flex-wrap: wrap;
+  }
+  [data-dsh-scard="tag"] {
+    margin-left: 0;
+  }
+  [data-dsh-scard="expand-text"] {
+    white-space: normal;
+  }
 }
 `

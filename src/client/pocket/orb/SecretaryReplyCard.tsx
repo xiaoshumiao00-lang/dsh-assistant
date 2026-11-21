@@ -1,31 +1,19 @@
 /**
- * 秘书回复卡片：秘书会话里**每一条**模型回复渲染成一张层次分明的卡片。
+ * 秘书回复卡片（设计规范 v1.0）：白卡 + 头部助手标识/朗读按钮 + 正文标题段落 + 底部操作栏。
  *
- * 结构（自上而下，2026-11-21 按用户手机实测反馈重做）：
- *   1. 标题行：小图标 +「个人秘书」标签 + 一句话摘要 + 最右朗读气泡（小圆形、淡描边）；
- *   2. 正文主区：14px、行高 1.6、按空行分段；[[session:<id>|<标题>]] 渲染成
- *      「左细竖线 + 淡底」的可点引用块（点击跳进对应会话，不触发折叠）；
- *   3. 底部信息行：12px 灰回复时间（从宿主 Turn 对象取）+ 右侧展开/收起轻提示。
+ * 结构（自上而下）：
+ *   1. 头部：左 32px 紫色四角星助手标识、名称「个人秘书」、身份标签「AI 助手」；右只有一个 34px 朗读按钮；
+ *   2. 正文：15px 结论标题 + 13px/1.8 正文段落；模型名自动渲染成浅紫等宽行内标签；
+ *   3. 底部操作栏：左侧时间，右侧复制 → 0.5px 分隔线 → 「展开全文」（仅溢出时）；
+ *   4. 朗读按钮只出现在头部，不出现在底部；整张卡片不再承担点击展开职责。
  *
- * 固定高度 + 点击展开/折叠与主动服务卡共用 fold-card.css.ts 的实现
- * （data-dsh-fold="card|main|foot"；折叠 226/212px，超出的正文被底部渐隐遮罩盖住，
- * 不出现半个字；点整张卡片切换，展开态底部提示「点击收起」）。
- *
- * 实现方式（不碰其它会话）：
- *   - 挂在 conversation.chat.turnTail（每轮一个），只对固定秘书会话渲染；
- *   - 正文从同一轮的 DOM 里取（[data-chat-turn] 下非 reasoning 的 assistant-step），
- *     所以读到的就是模型真实回复，TTS 与展示同源；
- *   - CSS 在秘书会话里把原始 markdown 气泡、过程信息行、消息操作行隐藏
- *     （body[data-dsh-secretary="1"]）；其它会话这些选择器一律不命中。
- *
- * 朗读（需求①）：标题行最右的气泡，单击暂停/继续、长按 600ms 从头重读、
- * 换卡片停上一条（全局唯一 controller）；最末一轮的卡片出现后自动朗读一次。
+ * TTS 状态机不变：换卡停上一条、单击暂停/继续、长按 600ms 从头重读；本组件只改按钮呈现与可访问性。
  */
 import { useEffect, useRef, useState } from 'react'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
 import {
-  collectTurnText, formatClock, latestReplyTurnNo, parseSessionRefs,
-  stripSessionRefs, summarize, normalizeForSpeech,
+  answerInlineTokens, collectTurnText, formatClock, latestReplyTurnNo, parseAnswerBody,
+  parseSessionRefs, stripSessionRefs, normalizeForSpeech,
 } from './secretary-cards.ts'
 import { secretarySpeech } from './secretary-speech.ts'
 import { SecretarySpeakButton } from './SecretarySpeakButton.tsx'
@@ -43,6 +31,91 @@ function turnEndTime(turn: any): string {
   } catch { return '' }
 }
 
+function inlineAnswerText(text: string): any {
+  const tokens = answerInlineTokens(String(text ?? ''))
+  return tokens.map((token, index) => {
+    const key = `${token.kind}:${index}`
+    if (token.kind === 'strong') return <strong key={key}>{token.value}</strong>
+    if (token.kind === 'model') return <span key={key} data-dsh-scard="model-code">{token.value}</span>
+    return <span key={key}>{token.value}</span>
+  })
+}
+
+async function copyAnswerText(text: string): Promise<boolean> {
+  const value = String(text ?? '')
+  if (value === '') return false
+  try {
+    if (typeof navigator?.clipboard?.writeText === 'function') {
+      await navigator.clipboard.writeText(value)
+      return true
+    }
+  } catch { /* 继续走传统剪贴板 */ }
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = value
+    textarea.setAttribute('readonly', '')
+    textarea.style.cssText = 'position:fixed;top:-10000px;left:-10000px;opacity:0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    const ok = document.execCommand('copy')
+    textarea.remove()
+    return ok === true
+  } catch {
+    return false
+  }
+}
+
+function CopyAnswerButton({ fullText }: { fullText: string }): any {
+  const [status, setStatus] = useState<'idle' | 'ok' | 'fail'>('idle')
+  const timerRef = useRef<number | null>(null)
+
+  useEffect(() => () => { if (timerRef.current !== null) window.clearTimeout(timerRef.current) }, [])
+
+  const show = (next: 'ok' | 'fail'): void => {
+    setStatus(next)
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current)
+    timerRef.current = window.setTimeout(() => setStatus('idle'), next === 'ok' ? 1500 : 4000)
+  }
+
+  const onCopy = async (): Promise<void> => {
+    const ok = await copyAnswerText(fullText)
+    show(ok ? 'ok' : 'fail')
+  }
+
+  const ariaLabel = status === 'ok' ? '已复制' : status === 'fail' ? '复制失败' : '复制完整回答'
+  return (
+    <>
+      <button type="button" data-dsh-scard="copy" title="复制完整回答" aria-label={ariaLabel} onClick={() => void onCopy()}>
+        {status === 'ok' ? (
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M5 13l4 4L19 7" />
+          </svg>
+        ) : (
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <rect x="8" y="8" width="10" height="10" rx="2" />
+            <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2" />
+          </svg>
+        )}
+      </button>
+      {status !== 'idle' && (
+        <span data-dsh-scard="copy-status" aria-live="polite">{status === 'ok' ? '已复制' : '复制失败，请手动选择文本'}</span>
+      )}
+    </>
+  )
+}
+
+function ExpandCollapseButton({ open, onToggle, overflow }: { open: boolean; onToggle: () => void; overflow: boolean }): any {
+  if (!overflow) return null
+  return (
+    <button type="button" data-dsh-scard="expand" aria-expanded={open} onClick={onToggle} title={open ? '收起回答' : '展开全文'}>
+      <span data-dsh-scard="expand-text">{open ? '收起' : '展开全文'}</span>
+      <svg data-dsh-scard="expand-arrow" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d="M6 9l6 6 6-6" />
+      </svg>
+    </button>
+  )
+}
+
 export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: string; turn?: any; api?: OrbApi }): any {
   const id = String(sessionId ?? '')
   const isSecretary = id !== '' && id === peekSecretarySessionId()
@@ -52,6 +125,7 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
   const [body, setBody] = useState('')
   const [open, setOpen] = useState(false)
   const [overflow, setOverflow] = useState(false)
+  const [collapsedMaxHeight, setCollapsedMaxHeight] = useState<number | undefined>(undefined)
 
   useEffect(() => {
     if (!isSecretary) return
@@ -73,6 +147,10 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
   const key = `turn:${turnNo}`
   const display = stripSessionRefs(body).trim()
   const speechText = normalizeForSpeech(body)
+  const { title, paragraphs } = parseAnswerBody(display)
+  const refs = parseSessionRefs(body)
+  const contentBlocks = paragraphs.length + refs.length
+  const collapsedBlockCount = Math.min(3, contentBlocks)
 
   // 自动朗读：只读最末一轮，每轮一次
   useEffect(() => {
@@ -83,73 +161,91 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
     secretarySpeech.request(key, speechText)
   }, [isSecretary, turnNo, speechText, key])
 
-  // 折叠态才需要测溢出：正文超出固定高度 → 底行右侧给出「点击展开全文」提示
+  // 折叠态只显示前 3 个内容块；实际溢出的判断用 scrollHeight 对 clientHeight，未溢出则不渲染展开全文。
   useEffect(() => {
-    if (open) return
+    if (!isSecretary || display === '' || open) return
     const el = mainRef.current
     if (el === null) return
-    const measure = (): void => { setOverflow(el.scrollHeight > el.clientHeight + 1) }
+    const measure = (): void => {
+      const titleEl = el.querySelector('[data-dsh-scard="title"]') as HTMLElement | null
+      const blockEls = [...el.querySelectorAll('[data-dsh-scard="para"], [data-dsh-scard="ref"]')] as HTMLElement[]
+      const visible = blockEls.slice(0, collapsedBlockCount)
+      const titleHeight = titleEl?.offsetHeight ?? 0
+      const blockHeight = visible.reduce((sum, item) => sum + item.offsetHeight, 0)
+      const gap = 10
+      const collapsedHeight = titleHeight + blockHeight + visible.length * gap
+      setCollapsedMaxHeight(collapsedHeight)
+      const hasMoreBlocks = blockEls.length > collapsedBlockCount
+      setOverflow(hasMoreBlocks || el.scrollHeight > collapsedHeight + 1)
+    }
     measure()
     const timer = window.setTimeout(measure, 400)
-    return () => { window.clearTimeout(timer) }
-  }, [display, open])
+    const onResize = (): void => measure()
+    window.addEventListener('resize', onResize)
+    return () => { window.clearTimeout(timer); window.removeEventListener('resize', onResize) }
+  }, [collapsedBlockCount, display, isSecretary, open, paragraphs.length, refs.length])
 
   if (!isSecretary) return null
   // 根节点必须无条件渲染（ref 要靠它定位轮次）；空壳由 CSS 整体隐藏（不输出占位条）
   if (display === '') return <article ref={wrapRef as any} data-dsh-scard="card" data-empty="1" />
 
-  const refs = parseSessionRefs(body)
-  const paragraphs = display.split(/\n{2,}|\n/).map((line) => line.trim()).filter((line) => line !== '')
   const timeText = formatClock(turnEndTime(turn))
+  const bodyStyle = open ? undefined : (collapsedMaxHeight === undefined ? undefined : { maxHeight: `${collapsedMaxHeight}px` })
 
   return (
     <article
       ref={wrapRef as any}
       data-dsh-scard="card"
-      data-dsh-fold="card"
       data-dsh-scard-turn={turnNo}
       data-empty="0"
       data-open={open ? '1' : '0'}
-      role="button"
-      tabIndex={0}
-      aria-expanded={open}
-      onClick={() => setOpen((value) => !value)}
-      onKeyDown={(event: any) => {
-        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setOpen((value) => !value) }
-      }}
+      data-overflow={overflow ? '1' : '0'}
     >
       <div data-dsh-scard="head">
-        <span data-dsh-scard="icon" aria-hidden="true">✦</span>
-        <span data-dsh-scard="badge">个人秘书</span>
-        <span data-dsh-scard="title">{summarize(display)}</span>
+        <div data-dsh-scard="assistant">
+          <span data-dsh-scard="mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 3.8l1.9 5.7 5.7 1.9-5.7 1.9L12 19l-1.9-5.7L4.4 11.4l5.7-1.9L12 3.8z" />
+              <path d="M4.6 4.6l2 2" />
+              <path d="M17.4 19.4l2 2" />
+              <path d="M19.4 4.6l-2 2" />
+              <path d="M4.6 19.4l2-2" />
+            </svg>
+          </span>
+          <span data-dsh-scard="name">个人秘书</span>
+          <span data-dsh-scard="tag">AI 助手</span>
+        </div>
         <SecretarySpeakButton speakKey={key} rawText={body} />
       </div>
-      <div data-dsh-scard="main" data-dsh-fold="main" ref={mainRef}>
-        <div data-dsh-scard="body">
-          {paragraphs.map((line, index) => (<p key={index} data-dsh-scard="para">{line}</p>))}
+      <div data-dsh-scard="body">
+        <div data-dsh-scard="content" ref={mainRef} style={bodyStyle}>
+          <h1 data-dsh-scard="title">{inlineAnswerText(title)}</h1>
+          {paragraphs.map((line, index) => (<p key={`para:${index}`} data-dsh-scard="para">{inlineAnswerText(line)}</p>))}
+          {refs.map((ref) => (
+            <button
+              key={ref.sessionId}
+              type="button"
+              data-dsh-scard="ref"
+              title={`打开会话：${ref.title}`}
+              onClick={(event: any) => {
+                event.stopPropagation()
+                try { api?.openSession?.(ref.sessionId) } catch { /* 交给 focusSession 兜底 */ }
+                void api?.focusSession?.(ref.sessionId).catch(() => {})
+              }}
+            >
+              <span data-dsh-scard="ref-icon" aria-hidden="true">↗</span>
+              <span data-dsh-scard="ref-title">{ref.title}</span>
+            </button>
+          ))}
         </div>
-        {refs.map((ref) => (
-          <button
-            key={ref.sessionId}
-            type="button"
-            data-dsh-scard="ref"
-            title={`打开会话：${ref.title}`}
-            onClick={(event: any) => {
-              event.stopPropagation()
-              try { api?.openSession?.(ref.sessionId) } catch { /* 交给 focusSession 兜底 */ }
-              void api?.focusSession?.(ref.sessionId).catch(() => {})
-            }}
-          >
-            <span data-dsh-scard="ref-icon" aria-hidden="true">↗</span>
-            <span data-dsh-scard="ref-title">{ref.title}</span>
-          </button>
-        ))}
       </div>
-      <div data-dsh-scard="meta" data-dsh-fold="foot">
-        <span data-dsh-scard="time">{timeText}</span>
-        {overflow && (
-          <span data-dsh-scard="hint">{open ? '点击收起' : '点击展开全文'}</span>
-        )}
+      <div data-dsh-scard="foot">
+        <time data-dsh-scard="time">{timeText}</time>
+        <div data-dsh-scard="actions">
+          <CopyAnswerButton fullText={display} />
+          {overflow && <span data-dsh-scard="separator" aria-hidden="true" />}
+          <ExpandCollapseButton open={open} overflow={overflow} onToggle={() => setOpen((value) => !value)} />
+        </div>
       </div>
     </article>
   )

@@ -72,14 +72,23 @@ export function summarizeCompletion(text: string): string {
   return first.length > 120 ? `${first.slice(0, 120)}…` : first
 }
 
-/** 秘书会话现有事件里最大的 turn 号（没有 = 0）。 */
-export function nextTurnOf(events: readonly any[]): number {
-  let max = 0
+/** 宿主关系状态：当前是否有未关闭轮，以及关闭后该开第几轮。 */
+export function secretaryTurnState(events: readonly any[]): { openTurn: number; nextTurn: number } {
+  let maxTurn = 0
+  let openTurn = 0
   for (const event of events ?? []) {
     const turn = Number(event?.data?.turn)
-    if (Number.isFinite(turn) && turn > max) max = turn
+    if (!Number.isFinite(turn) || turn < 1) continue
+    if (turn > maxTurn) maxTurn = turn
+    if (event?.type === 'turn/start') openTurn = turn
+    if (event?.type === 'turn/end' && turn === openTurn) openTurn = 0
   }
-  return max + 1
+  return { openTurn, nextTurn: maxTurn + 1 }
+}
+
+/** 秘书会话关闭态下下一条该开的轮号。 */
+export function nextTurnOf(events: readonly any[]): number {
+  return secretaryTurnState(events).nextTurn
 }
 
 /* ---------- 事件控制器（收集文本 + 完成触发，依赖全注入） ---------- */
@@ -207,7 +216,9 @@ export function createCuWatch(deps: CuWatchDeps) {
 export function postSecretaryNotice(session: any, notice: { sessionId: string; title: string; summary: string }): boolean {
   if (session === null || session === undefined) return false
   if (typeof session.append !== 'function' || typeof session.snapshotEvents !== 'function') return false
-  const turn = nextTurnOf(session.snapshotEvents())
+  const state = secretaryTurnState(session.snapshotEvents())
+  if (state.openTurn !== 0) return false
+  const turn = state.nextTurn
   const step = 1
   const text = buildCompletionNotice(notice)
   const message = {
@@ -219,7 +230,7 @@ export function postSecretaryNotice(session: any, notice: { sessionId: string; t
   try {
     session.append('turn/start', { turn })
     session.append('step/start', { turn, step })
-    session.append('assistant/message', { turn, step, message, stream: [] })
+    session.append('assistant/message', { turn, step, message, stream: [] }, { surfaceOp: 'append' })
     session.append('step/end', { turn, step })
     session.append('turn/end', { turn, reason: { kind: 'completed' } })
     return true
@@ -378,6 +389,7 @@ export const assistantCuWatchTestSurface = {
   buildCompletionNotice,
   summarizeCompletion,
   nextTurnOf,
+  secretaryTurnState,
   createCuWatch,
   postSecretaryNotice,
   sessionPresetOf,

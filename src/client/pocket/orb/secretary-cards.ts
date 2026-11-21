@@ -321,11 +321,73 @@ export function itemIcon(text: string): string {
   return '·'
 }
 
-/** 一句话摘要：取首行、截断加省略号（标题行用）。 */
+/** 一句话摘要：取首行、截断加省略号（旧主动卡仍可用）。 */
 export function summarize(text: string, max = 22): string {
   const line = String(text ?? '').split('\n').map((s) => s.trim()).find((s) => s !== '') ?? ''
   const clean = line.replace(/\s+/g, ' ')
   return clean.length > max ? `${clean.slice(0, max)}…` : clean
+}
+
+export type AnswerTokenKind = 'text' | 'strong' | 'model'
+export interface AnswerToken {
+  kind: AnswerTokenKind
+  value: string
+}
+
+const MODEL_NAME_RE = /\b(?:qwen[A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*|deepseek[A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*|glm(?:[-_.][A-Za-z0-9]+)*|kimi[A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*|llama[A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*|mistral[A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*|phi[A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*|gpt[A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*|claude[A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*|gemini[A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*|grok[A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*|IQ[1-9]_[A-Z][A-Z0-9]*|fp[1-9]\d*)\b/gi
+
+/** 卡片正文解析：第一行做结论标题，其后按段落渲染；长首句退化为一句标题。 */
+export function parseAnswerBody(text: string): { title: string; paragraphs: string[] } {
+  const lines = String(text ?? '').split(/\n{2,}|\n/).map((line) => line.trim()).filter((line) => line !== '')
+  if (lines.length === 0) return { title: '', paragraphs: [] }
+  let [title, ...paragraphs] = lines
+  if (title.length > 48) {
+    const match = title.match(/^([\s\S]{1,48}?[。！？!?.])([\s\S]*)$/)
+    if (match !== null) {
+      title = match[1].trim()
+      const rest = match[2].trim()
+      if (rest !== '') paragraphs = [rest, ...paragraphs]
+    }
+  }
+  return { title, paragraphs }
+}
+
+function splitStrongSegments(text: string): Array<{ kind: 'text' | 'strong'; value: string }> {
+  const raw = String(text ?? '')
+  const parts: Array<{ kind: 'text' | 'strong'; value: string }> = []
+  const pattern = /\*\*([^*]+)\*\*/g
+  let cursor = 0
+  let match: RegExpExecArray | null
+  while ((match = pattern.exec(raw)) !== null) {
+    if (match.index > cursor) parts.push({ kind: 'text', value: raw.slice(cursor, match.index) })
+    if (match[1] !== '') parts.push({ kind: 'strong', value: match[1] })
+    cursor = match.index + match[0].length
+  }
+  if (cursor < raw.length) parts.push({ kind: 'text', value: raw.slice(cursor) })
+  return parts
+}
+
+function splitModelTokens(text: string): AnswerToken[] {
+  const raw = String(text ?? '')
+  const tokens: AnswerToken[] = []
+  const pattern = new RegExp(MODEL_NAME_RE.source, MODEL_NAME_RE.flags)
+  let cursor = 0
+  let match: RegExpExecArray | null
+  while ((match = pattern.exec(raw)) !== null) {
+    if (match.index > cursor) tokens.push({ kind: 'text', value: raw.slice(cursor, match.index) })
+    tokens.push({ kind: 'model', value: match[0] })
+    cursor = match.index + match[0].length
+    if (match[0] === '') pattern.lastIndex += 1
+  }
+  if (cursor < raw.length) tokens.push({ kind: 'text', value: raw.slice(cursor) })
+  return tokens
+}
+
+/** 行内渲染计划：重点句用 strong，模型名/量化版本用 model-code 标签。 */
+export function answerInlineTokens(text: string): AnswerToken[] {
+  return splitStrongSegments(text).flatMap((segment) => (
+    segment.kind === 'strong' ? [{ kind: 'strong' as const, value: segment.value }] : splitModelTokens(segment.value)
+  )).filter((token) => token.value !== '')
 }
 
 /** ISO/时间戳 → 「今天 HH:MM」/「昨天 HH:MM」/「M月d日 HH:MM」；解析不了回空串。 */
@@ -357,5 +419,7 @@ export const secretaryCardsTestSurface = {
   splitItemPrefix,
   itemIcon,
   summarize,
+  parseAnswerBody,
+  answerInlineTokens,
   formatClock,
 }

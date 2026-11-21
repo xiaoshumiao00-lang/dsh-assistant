@@ -16,6 +16,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import zlib from 'node:zlib'
 import { manageWebRoutes } from './web-routes'
 
 export const ASSISTANT_SECRETARY_ROUTE = '/api/assistant/secretary'
@@ -301,6 +302,189 @@ export const SECRETARY_SPEECH_STYLE_TEXT = [
   '三、引用某条会话时用 [[session:会话id|会话标题]] 一行一个（会话 id 从上下文里取），卡片会把它渲染成可点击的引用块。',
 ].join('\n')
 
+/* ---------- v4 日志修复（纯函数，不依赖宿主实例） ---------- */
+
+type LogEventRecord = Record<string, any>
+
+const REFERENCE_ARRAY_KEYS = new Set(['sourceEventSeqs', 'messageSeqs'])
+const REFERENCE_SCALAR_KEYS = new Set(['sourceEventSeq', 'headerSeq'])
+const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+
+interface SecretaryLogRepairResult {
+  lines: string[]
+  droppedOldSeqs: number[]
+  staleReferences: number
+}
+
+function isPositiveNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+}
+
+function parseLogEventLine(line: string): LogEventRecord | null {
+  const raw = String(line ?? '')
+  if (raw.trim() === '') return null
+  try {
+    const event = JSON.parse(raw) as unknown
+    if (event === null || typeof event !== 'object' || Array.isArray(event)) return null
+    return event as LogEventRecord
+  } catch {
+    return null
+  }
+}
+
+function rewriteEventReferences(event: LogEventRecord, oldToNew: Map<number, number>): { staleReferences: number } {
+  let staleReferences = 0
+  const seen = new WeakSet<object>()
+
+  const rewriteArray = (value: unknown[], key: string): unknown[] => {
+    const out: unknown[] = []
+    for (const item of value) {
+      if (REFERENCE_ARRAY_KEYS.has(key) && typeof item === 'number' && Number.isFinite(item)) {
+        const mapped = oldToNew.get(item)
+        if (mapped === undefined) { staleReferences += 1; continue }
+        out.push(mapped)
+      } else {
+        out.push(visit(item, key))
+      }
+    }
+    if (REFERENCE_ARRAY_KEYS.has(key)) {
+      const numbers = out.filter((item): item is number => typeof item === 'number')
+      return Array.from(new Set(numbers)).sort((a, b) => a - b)
+    }
+    return out
+  }
+
+  const visit = (value: unknown, parentKey = ''): unknown => {
+    if (Array.isArray(value)) return rewriteArray(value, parentKey)
+    if (value === null || typeof value !== 'object' || seen.has(value)) return value
+    seen.add(value)
+    const record = value as LogEventRecord
+    for (const key of Object.keys(record)) {
+      if (REFERENCE_ARRAY_KEYS.has(key) && Array.isArray(record[key])) {
+        record[key] = rewriteArray(record[key] as unknown[], key)
+      } else if (REFERENCE_SCALAR_KEYS.has(key) && typeof record[key] === 'number') {
+        const mapped = oldToNew.get(record[key])
+        if (mapped === undefined) staleReferences += 1
+        else record[key] = mapped
+      } else {
+        record[key] = visit(record[key], key)
+      }
+    }
+    return record
+  }
+
+  visit(event, '')
+  return { staleReferences }
+}
+
+/** 修复半截合成轮留下的坏状态：跳过不合法的轮/步开合事件，保留合法真实轮，并重编号与重映射引用。 */
+export function repairSecretaryLogLines(input: readonly string[]): SecretaryLogRepairResult {
+  const lines = Array.from(input ?? [], (line) => String(line ?? ''))
+  const header = lines[0] ?? ''
+  const kept: LogEventRecord[] = []
+  const droppedOldSeqs: number[] = []
+  const oldToNew = new Map<number, number>()
+  let staleReferences = 0
+  let openTurn = 0
+  let openStep = 0
+  let nextTurn = 1
+  let nextStep = 1
+
+  for (const raw of lines.slice(1)) {
+    const event = parseLogEventLine(raw)
+    if (event === null) {
+      const seq = Number(event?.seq)
+      if (Number.isFinite(seq)) droppedOldSeqs.push(seq)
+      continue
+    }
+
+    const data = (event.data ?? {}) as LogEventRecord
+    const type = String(event.type ?? '')
+    const turn = Number(data.turn)
+    const step = Number(data.step)
+    let keep = true
+
+    if (type === 'turn/start') {
+      if (openTurn !== 0 || !isPositiveNumber(turn) || turn !== nextTurn) keep = false
+      else {
+        openTurn = turn
+        openStep = 0
+        nextStep = 1
+      }
+    } else if (type === 'step/start') {
+      if (openTurn === 0 || openStep !== 0 || !isPositiveNumber(turn) || turn !== openTurn || !isPositiveNumber(step) || step !== nextStep) keep = false
+      else openStep = step
+    } else if (type === 'step/end') {
+      if (openTurn === 0 || !isPositiveNumber(turn) || turn !== openTurn || !isPositiveNumber(step) || openStep !== step) keep = false
+      else {
+        openStep = 0
+        nextStep = step + 1
+      }
+    } else if (type === 'turn/end') {
+      if (openTurn === 0 || !isPositiveNumber(turn) || turn !== openTurn || openStep !== 0) keep = false
+      else {
+        openTurn = 0
+        nextTurn = turn + 1
+        nextStep = 1
+      }
+    } else if (type === 'assistant/message' || type === 'assistant/attempt' || type === 'tool/call' || type === 'tool/result') {
+      if (openTurn === 0 || !isPositiveNumber(turn) || turn !== openTurn || !isPositiveNumber(step) || step !== openStep) keep = false
+    } else if (isPositiveNumber(turn) && turn !== openTurn) {
+      keep = false
+    }
+
+    if (!keep) {
+      const oldSeq = Number(event.seq)
+      if (Number.isFinite(oldSeq)) droppedOldSeqs.push(oldSeq)
+      continue
+    }
+
+    const oldSeq = Number(event.seq)
+    const newSeq = kept.length
+    if (Number.isFinite(oldSeq)) oldToNew.set(oldSeq, newSeq)
+    kept.push(event)
+  }
+
+  const serialized = kept.map((event, index) => {
+    staleReferences += rewriteEventReferences(event, oldToNew).staleReferences
+    event.seq = index
+    return JSON.stringify(event)
+  })
+
+  return { lines: [header, ...serialized], droppedOldSeqs, staleReferences }
+}
+
+export function repairSecretaryLogText(text: string): string {
+  const raw = String(text ?? '')
+  const result = repairSecretaryLogLines(raw.split(/\r?\n/))
+  return `${result.lines.join('\n')}\n`
+}
+
+export function compressSessionLogText(text: string): Buffer {
+  const zlib2 = zlib as any
+  if (typeof zlib2.zstdCompressSync !== 'function') throw new Error('zstdCompressSync not available')
+  return Buffer.from(zlib2.zstdCompressSync(Buffer.from(String(text ?? ''), 'utf8')))
+}
+
+export function decompressSessionLogBytes(data: Uint8Array | Buffer): string {
+  const zlib2 = zlib as any
+  if (typeof zlib2.zstdDecompressSync !== 'function') throw new Error('zstdDecompressSync not available')
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data)
+  const first = buffer.indexOf(ZSTD_MAGIC)
+  if (first === -1) {
+    if (buffer.length === 0) return ''
+    return Buffer.from(zlib2.zstdDecompressSync(buffer)).toString('utf8')
+  }
+  const chunks: string[] = []
+  for (let cursor = first; cursor < buffer.length; ) {
+    const next = buffer.indexOf(ZSTD_MAGIC, cursor + ZSTD_MAGIC.length)
+    const end = next === -1 ? buffer.length : next
+    chunks.push(Buffer.from(zlib2.zstdDecompressSync(buffer.subarray(cursor, end))).toString('utf8'))
+    cursor = end
+  }
+  return chunks.join('')
+}
+
 /** 单测入口：不启动宿主也能验路由、归一与工具闸。 */
 export const assistantSecretaryTestSurface = {
   ASSISTANT_SECRETARY_ROUTE,
@@ -310,4 +494,8 @@ export const assistantSecretaryTestSurface = {
   registerAssistantSecretary,
   secretarySessionRef,
   SECRETARY_SPEECH_STYLE_TEXT,
+  repairSecretaryLogLines,
+  repairSecretaryLogText,
+  compressSessionLogText,
+  decompressSessionLogBytes,
 }
