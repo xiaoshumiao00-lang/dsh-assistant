@@ -22,6 +22,8 @@ import { registerAssistantConfigRoutes } from './assistant-config'
 import { registerAssistantDiagnostics } from './assistant-diagnostics'
 import { registerAssistantArchive } from './assistant-archive'
 import { registerAssistantSecretary } from './assistant-secretary'
+import { registerAssistantSecretaryHistory, ASSISTANT_SECRETARY_HISTORY_ROUTE } from './assistant-secretary-history'
+import { registerAssistantSecretaryContext, ASSISTANT_SECRETARY_CONTEXT_ROUTE } from './assistant-secretary-context'
 import { registerAssistantDispatch } from './assistant-dispatch'
 import { registerAssistantCuWatch } from './assistant-cu-watch'
 import { registerAssistantProactive } from './assistant-proactive'
@@ -52,6 +54,10 @@ export { assistantMemoryTestSurface } from './assistant-memory'
 export { registerAssistantDiagnostics, assistantDiagnosticsTestSurface, redactText, renderDiagnosticsBundle, writeDiagnosticsBundle } from './assistant-diagnostics'
 export { registerAssistantArchive, assistantArchiveTestSurface, collectArchive, writeArchiveBundle, importArchiveBundle, ARCHIVE_FORMAT } from './assistant-archive'
 export { assistantSecretaryTestSurface } from './assistant-secretary'
+export { assistantSecretaryHistoryTestSurface } from './assistant-secretary-history'
+export { assistantSecretaryContextTestSurface } from './assistant-secretary-context'
+import { secretCardSharedTestSurface as cardSharedSurface } from './secretary-card-shared'
+export { cardSharedSurface as secretCardSharedTestSurface }
 export { assistantDispatchTestSurface } from './assistant-dispatch'
 export { assistantCuWatchTestSurface } from './assistant-cu-watch'
 /** v4 会话日志事务化改写：宿主真实解析器 dry-run + 写入后回读 + 失败回滚 */
@@ -255,6 +261,10 @@ export function apply(ctx: any, config: any = {}): () => void {
   // 没声明 tools，ctx.tools 取不到时派活工具又会被静默忽略。
   // 固定秘书会话：宿主侧唯一 sessionId + 只读工具闸（web_search/web_fetch 放行）
   registerPiece('assistant secretary', () => registerAssistantSecretary(ctx))
+  // 第四批需求 A：秘书页卡片分页（宿主只读分页接口，只回一页，绝不全量下发）
+  registerPiece('assistant secretary history', () => registerAssistantSecretaryHistory(ctx))
+  // 第四批需求 B：模型上下文滚动摘要（最近 8 轮原文 + 摘要，落 ~/.dsh/assistant/dsh-assistant-secretary-context.json）
+  registerPiece('assistant secretary context', () => registerAssistantSecretaryContext(ctx))
   // 派活分层 A/B/C：secretary_dispatch 工具 + 分层提示词
   registerPiece('assistant dispatch', () => registerAssistantDispatch(ctx))
   // CU 会话完成 → 秘书会话收可点跳的卡片消息

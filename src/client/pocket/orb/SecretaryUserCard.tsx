@@ -22,11 +22,13 @@ import {
   CopyAnswerButton, ExpandCollapseButton, inlineAnswerText, measureFoldClip, turnEndTime, useCardFoldRegion,
   useSecretaryReadState,
 } from './SecretaryReplyCard.tsx'
+import { CollapsedSecretaryCard, useSecretaryCardWindow, useSecretaryPagerVersion } from './SecretaryCollapsedCard.tsx'
 import { SecretarySpeakButton } from './SecretarySpeakButton.tsx'
 import {
-  assistantCardSpeechKey, CARD_KIND_NOTICE, CARD_KIND_USER, collectSecretaryCardRows, formatClock, noticeCardSpeechKey,
-  parseNoticeCardBody, parseSessionRefs, parseUserCardBody, stripSessionRefs, userCardSpeechKey,
-  type SecretaryCardRow,
+  assistantCardSpeechKey, buildSecretaryPagerCards, CARD_KIND_NOTICE, CARD_KIND_USER, collectSecretaryCardRows, formatClock,
+  noticeCardSpeechKey, parseNoticeCardBody, parseSessionRefs, parseUserCardBody, secretaryPager, stripSessionRefs,
+  userCardSpeechKey, EARLIER_HINT_TEXT, SCROLL_TOP_THRESHOLD_PX, scrollAnchorTopPatch, shouldExpandOnScroll,
+  type PagerDomCard, type SecretaryCardRow,
 } from './secretary-cards.ts'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
 import { currentSessionViaBridge } from '../../session-open.ts'
@@ -98,6 +100,8 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
   const speechKey = notice ? noticeCardSpeechKey(row.key, row.turnNo) : userCardSpeechKey(row.key, row.turnNo)
   const readKey = notice ? speechKey : ''
   const readState = useSecretaryReadState(secretarySessionId())
+  // 分页窗口：这张用户卡/通知卡完整渲染还是压成一行折叠行（hooks 一律在条件 return 之前）
+  const windowState = useSecretaryCardWindow(speechKey)
   const blocks = notice ? parseNoticeCardBody(row.text) : { title: '', paragraphs: parseUserCardBody(row.text) }
   const refs = notice ? parseSessionRefs(row.text) : []
   // 复制拿的永远是这条消息的原文（用户卡不许改写；通知卡复制去掉内部合成标记，方便粘出去用）
@@ -142,6 +146,19 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
   const { foldProps } = useCardFoldRegion(open, overflow, toggle)
 
   if (!hasBody && refs.length === 0) return null
+  // 分页窗口外（比最近 30 张更旧）：这张卡压成一行折叠行，绝不把整张老卡拉回渲染
+  if (windowState.collapsed) {
+    return (
+      <CollapsedSecretaryCard
+        cardKey={speechKey}
+        kind={notice ? CARD_KIND_NOTICE : CARD_KIND_USER}
+        turnNo={row.turnNo}
+        timeText={timeText}
+        fallbackTitle={blocks.title}
+        fallbackText={row.text}
+      />
+    )
+  }
   const bodyStyle = open ? undefined : (collapsedMaxHeight === undefined ? undefined : { maxHeight: `${collapsedMaxHeight}px` })
 
   return (
@@ -224,14 +241,93 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
   )
 }
 
+/** 行里是不是已经挂了我们自己的卡（完整卡或折叠行都算：折叠切换不该引起反复重挂）。 */
+function rowHasCard(row: Element): boolean {
+  return row.querySelector('[data-dsh-scard="card"], [data-dsh-scard="collapsed-row"]') !== null
+}
+
+/**
+ * 对话流的滚动宿主：优先宿主自己标在 scrollport 上的 `[data-conversation-scroll]`，
+ * 退路是从卡片往上找第一个真能滚的元素（宿主换标记了也不会瞎）。
+ */
+export function findConversationScrollHost(doc: Document): HTMLElement | null {
+  const marked = doc.querySelector('[data-conversation-scroll]')
+  if (marked instanceof HTMLElement) return marked
+  const card = doc.querySelector('[data-dsh-scard="card"], [data-dsh-scard="collapsed-row"]')
+  let node: Element | null = card?.parentElement ?? null
+  while (node !== null) {
+    if (node.scrollHeight > node.clientHeight + 8) return node as HTMLElement
+    node = node.parentElement
+  }
+  const scrolling = doc.scrollingElement
+  if (scrolling instanceof HTMLElement) return scrolling
+  return doc.documentElement instanceof HTMLElement ? doc.documentElement : null
+}
+
+/** 等 DOM 真的长够了再补 scrollTop：连续量到 scrollHeight 不再变为止（最多 16 轮 rAF）。 */
+function settleScrollHeight(el: HTMLElement): Promise<void> {
+  return new Promise((resolve) => {
+    let attempts = 0
+    let previous = -1
+    let stable = 0
+  const step = (): void => {
+      const current = el.scrollHeight
+      stable = current === previous ? stable + 1 : 0
+      previous = current
+      attempts += 1
+      if ((stable >= 2 && attempts >= 3) || attempts >= 16) { resolve(); return }
+      window.requestAnimationFrame(step)
+    }
+    window.requestAnimationFrame(step)
+  })
+}
+
+/**
+ * 渲染上限用完（或宿主说没有更旧的了）时显示的那一行提示。
+ * 直接插在渲染区前面（不用 React portal）：宿主重画对话流时扫描层会再补一次，幂等。
+ */
+export function syncEarlierHint(doc: Document, visible: boolean): void {
+  const existing = doc.querySelector('[data-dsh-scard="earlier-hint"]')
+  if (!visible) {
+    try { existing?.parentNode?.removeChild(existing) } catch { /* 已经被宿主重画掉了 */ }
+    return
+  }
+  const cards = doc.querySelectorAll('[data-dsh-scard="card"], [data-dsh-scard="collapsed-row"]')
+  const first = cards[0]
+  const container = first?.parentElement
+  if (container === null || container === undefined) {
+    try { existing?.parentNode?.removeChild(existing) } catch { /* 没地方放就先不放在 */ }
+    return
+  }
+  if (existing !== null && existing.parentNode === container && container.firstChild === existing) return
+  try { existing?.parentNode?.removeChild(existing) } catch { /* 挪位置：先摘掉再插到最前 */ }
+  const hint = doc.createElement('div')
+  hint.setAttribute('data-dsh-scard', 'earlier-hint')
+  hint.setAttribute('data-dsh-scard-kind', 'notice')
+  const text = doc.createElement('span')
+  text.setAttribute('data-dsh-scard', 'earlier-hint-text')
+  text.textContent = EARLIER_HINT_TEXT
+  hint.appendChild(text)
+  container.insertBefore(hint, container.firstChild ?? null)
+}
+
 /**
  * 挂载层（挂在 shell.overlay，整页常驻）：扫对话流里的 user 角色行，
  * 真实用户行 portal 一张冷蓝用户卡、合成通知行 portal 一张灰底通知卡；
  * 行被宿主重画、卡片被外间改动抹掉时靠 MutationObserver 自愈。
+ *
+ * 分页（第四批需求 A）：这一层是唯一持有分页 store 的地方——
+ *   - 每次扫描把页面上已有的卡（完整卡 + 折叠行）按 document 顺序送进 pager；
+ *   - 进页面/刷新/恢复选择只取最近一段（ensureWindow），绝不自动回填老卡；
+ *   - 只有滚动到达顶部阈值才 expandOlder 取下一段，取回后用 scroll-anchoring 补回 scrollTop，位置不跳；
+ *   - 到 CARD_RENDER_CAP 就停，并把「更早的内容请到轨迹/搜索里看」插在渲染区前面。
  */
 export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
   const [rows, setRows] = useState<SecretaryCardRow[]>([])
   const [rev, setRev] = useState(0)
+  const pager = secretaryPager()
+  const pagerVersion = useSecretaryPagerVersion()
+  const expandingRef = useRef(false)
 
   useEffect(() => {
     let alive = true
@@ -240,10 +336,16 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
       if (!alive) return
       if (!secretaryPageActive()) {
         setRows((prev) => (prev.length === 0 ? prev : []))
+        syncEarlierHint(document, false)
         return
       }
       const next = collectSecretaryCardRows(document)
-      const missing = next.some((row) => row.element.querySelector('[data-dsh-scard="card"]') === null)
+      const domCards: PagerDomCard[] = buildSecretaryPagerCards(document)
+      pager.setSession(secretarySessionId())
+      pager.noteDomCards(domCards)
+      // 只取最近一段（幂等）：绝不在这里回填更旧的卡
+      void pager.ensureWindow()
+      const missing = next.some((row) => !rowHasCard(row.element))
       setRows((prev) => (sameRows(prev, next) ? prev : next))
       if (missing) setRev((value) => value + 1)
     }
@@ -267,6 +369,59 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
       if (timer !== null) window.clearTimeout(timer)
     }
   }, [])
+
+  // 上滚才取回下一段：只有 scrollTop 到达顶部阈值才触发，别的滚法一概不取
+  useEffect(() => {
+    let attached: HTMLElement | null = null
+    let frame = 0
+    const onScroll = (): void => {
+      const el = attached
+      if (el === null) return
+      const state = pager.state()
+      // 唯一判据（口径在 secretary-card-shared.ts）：到顶部阈值、有更旧的、没到上限、没在取数、没在扩段
+      if (!shouldExpandOnScroll({
+        scrollTop: el.scrollTop,
+        threshold: SCROLL_TOP_THRESHOLD_PX,
+        hasMore: state.hasMore,
+        capped: state.capped,
+        loading: state.loading,
+        alreadyExpanding: expandingRef.current,
+      })) return
+      expandingRef.current = true
+      const beforeTop = el.scrollTop
+      const beforeHeight = el.scrollHeight
+      void Promise.resolve(pager.expandOlder()).then(async () => {
+        await settleScrollHeight(el)
+        const delta = scrollAnchorTopPatch(beforeHeight, el.scrollHeight)
+        if (delta > 0) el.scrollTop = beforeTop + delta
+        expandingRef.current = false
+      }, () => { expandingRef.current = false })
+    }
+    const attach = (): void => {
+      const el = findConversationScrollHost(document)
+      if (el === attached) return
+      if (attached !== null) attached.removeEventListener('scroll', onScroll)
+      attached = el
+      if (el !== null) el.addEventListener('scroll', onScroll, { passive: true })
+    }
+    attach()
+    const observer = new MutationObserver(() => {
+      if (frame !== 0) return
+      frame = window.requestAnimationFrame(() => { frame = 0; attach() })
+    })
+    observer.observe(document.body, { childList: true, subtree: true })
+    return () => {
+      observer.disconnect()
+      if (frame !== 0) window.cancelAnimationFrame(frame)
+      if (attached !== null) attached.removeEventListener('scroll', onScroll)
+    }
+  }, [pager])
+
+  useEffect(() => {
+    syncEarlierHint(document, pager.hintVisible())
+  }, [pager, pagerVersion, rows.length, rev])
+
+  useEffect(() => () => { try { syncEarlierHint(document, false) } catch { /* 卸载时的 DOM 已经没了 */ } }, [])
 
   if (rows.length === 0) return null
   return (

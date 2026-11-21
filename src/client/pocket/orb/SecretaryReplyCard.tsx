@@ -24,6 +24,7 @@ import {
 } from './secretary-cards.ts'
 import { secretarySpeech } from './secretary-speech.ts'
 import { SecretarySpeakButton } from './SecretarySpeakButton.tsx'
+import { CollapsedSecretaryCard, useSecretaryCardWindow } from './SecretaryCollapsedCard.tsx'
 import type { OrbApi } from './orb-api.ts'
 
 /** 已经自动朗读过的轮次 key（防止重挂载后反复自动读）。 */
@@ -250,6 +251,8 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
 
   const key = assistantCardSpeechKey(turnNo)
   const readState = useSecretaryReadState(id)
+  // 分页窗口：这张秘书回复卡是完整渲染还是压成一行折叠行（hooks 全部在此之前，条件 return 之后不能再有 hook）
+  const windowState = useSecretaryCardWindow(key)
   const display = stripSessionRefs(body).trim()
   const speechText = normalizeForSpeech(body)
   const { title, paragraphs } = parseAnswerBody(display)
@@ -313,6 +316,19 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
   // 根节点必须无条件渲染（ref 要靠它定位轮次）；空壳由 CSS 整体隐藏（不输出占位条）
   if (display === '') return <article ref={wrapRef as any} data-dsh-scard="card" data-dsh-scard-kind={CARD_KIND_ASSISTANT} data-empty="1" />
 
+  // 分页窗口外（比最近 30 张更旧）：压成一行折叠行，绝不把整张老卡拉回渲染
+  if (windowState.collapsed) {
+    return (
+      <CollapsedSecretaryCard
+        cardKey={key}
+        kind={CARD_KIND_ASSISTANT}
+        turnNo={turnNo}
+        timeText={timeText}
+        fallbackTitle={title}
+        fallbackText={display}
+      />
+    )
+  }
 
   return (
     <article

@@ -18,7 +18,59 @@
  *   7. 已读卡集合（未读红点）：cardKey 沿用朗读 key（`assistant:` / `notice:` 前缀那套），
  *      真值落宿主 `/api/assistant/secretary-read` → dsh-assistant-secretary-read.json，
  *      localStorage 只是首屏缓存与降级兜底（见 createSecretaryReadStore）。
+ *   8. 卡片分页（2026-11-21 第四批）：默认只渲染最近 30 张卡，更早的压成一行折叠行
+ *      （时间 + 首行前 24 字短标题），上滚到达顶部阈值才取回下一段 30 张，累计上限 120 张
+ *      后停在「更早的内容请到轨迹/搜索里看」。取数走宿主 `GET /api/assistant/secretary/history`，
+ *      客户端绝不为分页把整条会话读回来（见 createSecretaryPager）。卡计数口径、24 字标题口径、
+ *      词数口径都在 src/secretary-card-shared.ts，宿主与客户端共用。
  */
+
+import {
+  CARD_WINDOW_DEFAULT,
+  CARD_PAGE_SIZE,
+  CARD_RENDER_CAP,
+  EARLIER_HINT_TEXT,
+  SCROLL_TOP_THRESHOLD_PX,
+  NOTICE_HEAD_LINE_RE,
+  NOTICE_SESSION_REF_LINE_RE,
+  assistantCardSpeechKey,
+  canRenderMore,
+  shouldExpandOnScroll,
+  countWords,
+  historyItemsFromEvents,
+  isSyntheticNoticeUserText,
+  noticeCardSpeechKey,
+  normalizeHistoryCursor,
+  normalizeHistoryLimit,
+  stripNoticeSyntheticHead,
+  truncateCardTitle,
+  truncatePreview,
+  userCardSpeechKey,
+  windowOfItems,
+} from '../../../secretary-card-shared'
+
+export {
+  CARD_WINDOW_DEFAULT,
+  CARD_PAGE_SIZE,
+  CARD_RENDER_CAP,
+  EARLIER_HINT_TEXT,
+  SCROLL_TOP_THRESHOLD_PX,
+  NOTICE_HEAD_LINE_RE,
+  NOTICE_SESSION_REF_LINE_RE,
+  assistantCardSpeechKey,
+  canRenderMore,
+  shouldExpandOnScroll,
+  countWords,
+  historyItemsFromEvents,
+  isSyntheticNoticeUserText,
+  noticeCardSpeechKey,
+  normalizeHistoryCursor,
+  normalizeHistoryLimit,
+  stripNoticeSyntheticHead,
+  truncateCardTitle,
+  userCardSpeechKey,
+  windowOfItems,
+}
 
 /** ────────────────────────── 1. 朗读文本规范化 ────────────────────────── */
 
@@ -517,19 +569,8 @@ export function foldClipFromBlocks(input: {
 }
 
 
-/** 合成通知判据 ①：首行是「（系统通知，不是用户说的话）」（宽/半角括号、方括号写法都算）。 */
-const NOTICE_HEAD_LINE_RE = /^\s*[（(【\[]?\s*系统通知/
-/** 判据 ②：正文里带 `[[session:id|标题]]` 引用行（src/assistant-cu-watch.ts 注入格式）。 */
-const NOTICE_SESSION_REF_LINE_RE = /(^|\n)\s*(最后单独一行原样输出：)?\s*\[\[session:[^\]]*\]\]/
-
-/** 这条 user 角色正文是不是插件自己塞进来的合成通知（不该做成「用户卡」）。 */
-export function isSyntheticNoticeUserText(raw: string): boolean {
-  const text = String(raw ?? '')
-  const lines = text.split('\n').map((line) => line.trim()).filter((line) => line !== '')
-  if (lines.length === 0) return false
-  if (NOTICE_HEAD_LINE_RE.test(lines[0])) return true
-  return lines.some((line) => NOTICE_SESSION_REF_LINE_RE.test(`\n${line}`))
-}
+// 合成通知判据（NOTICE_HEAD_LINE_RE / NOTICE_SESSION_REF_LINE_RE / isSyntheticNoticeUserText）
+// 与卡片 key 口径都在 src/secretary-card-shared.ts：宿主分页路由与客户端必须算出同一张卡。
 
 /** 用户卡正文：显示用户原文（不做标题化、不改写、不删行），按空行分段。 */
 export function parseUserCardBody(raw: string): string[] {
@@ -538,39 +579,8 @@ export function parseUserCardBody(raw: string): string[] {
   return text.split(/\n{2,}/).map((block) => block.trim()).filter((block) => block !== '')
 }
 
-/** 朗读 key：每张用户卡自己的 key（按卡的所属文本，不串卡）。 */
-export function userCardSpeechKey(messageKey: string, turnNo = ''): string {
-  const key = String(messageKey ?? '').trim()
-  if (key !== '') return `user:${key}`
-  const turn = String(turnNo ?? '').trim()
-  return turn === '' ? '' : `user:turn:${turn}`
-}
-
-/** 通知卡朗读 key：`notice:` 前缀 + 宿主那条消息的稳定 key（同一张卡跨端一致）。 */
-export function noticeCardSpeechKey(messageKey: string, turnNo = ''): string {
-  const key = String(messageKey ?? '').trim()
-  if (key !== '') return `notice:${key}`
-  const turn = String(turnNo ?? '').trim()
-  return turn === '' ? '' : `notice:turn:${turn}`
-}
-
-/** 秘书回复卡朗读 key（2026-11-21 加 `assistant:` 前缀：既是朗读 key，也是已读 cardKey）。 */
-export function assistantCardSpeechKey(turnNo: string): string {
-  const turn = String(turnNo ?? '').trim()
-  return turn === '' ? '' : `assistant:turn:${turn}`
-}
-
-/** 通知卡正文：把「系统通知」合成行里的真实内容挑出来（第一行合成标记与「最后单独一行原样输出：」前缀不进卡片正文）。 */
-export function stripNoticeSyntheticHead(raw: string): string {
-  let text = String(raw ?? '').replace(/\r\n?/g, '\n').trim()
-  if (text === '') return ''
-  const lines = text.split('\n')
-  while (lines.length > 0 && NOTICE_HEAD_LINE_RE.test(lines[0])) lines.shift()
-  const cleaned = lines.map((line) => line
-    .replace(/^\s*最后单独一行原样输出[：:]\s*/, '')
-    .trim())
-  return cleaned.filter((line) => line !== '').join('\n')
-}
+/** 朗读 key（userCardSpeechKey / noticeCardSpeechKey / assistantCardSpeechKey）与
+ *  通知卡正文剥头（stripNoticeSyntheticHead）都在 src/secretary-card-shared.ts，从那儿 re-export 上来。 */
 
 /** 通知卡正文解析：与秘书回复卡同一套（首行做标题、其余段落），引用标记单独成 chip。 */
 export function parseNoticeCardBody(raw: string): { title: string; paragraphs: string[] } {
@@ -631,6 +641,36 @@ export function collectSecretaryUserRows(doc: Document): SecretaryUserRow[] {
   return collectSecretaryCardRows(doc).filter((row) => row.kind === CARD_KIND_USER)
 }
 
+/**
+ * 扫描层：把页面上**已经挂出来的三种卡**（完整卡或折叠行）按 document 顺序送回来。
+ * document 顺序就是宿主对话流的时间顺序；分页窗口（最近 N 张）与折叠行都靠它算，
+ * 一张卡从完整卡换成折叠行不会改变顺序（同一张卡带同一个 key）。
+ */
+export interface SecretaryScannedCard extends PagerDomCard {
+  element: Element
+}
+
+export function collectSecretaryCardElements(doc: Document): SecretaryScannedCard[] {
+  const out: SecretaryScannedCard[] = []
+  for (const element of doc.querySelectorAll('[data-dsh-scard="card"], [data-dsh-scard="collapsed-row"]')) {
+    const cardKey = String(element.getAttribute('data-dsh-scard-key') ?? '').trim()
+    const kind = String(element.getAttribute('data-dsh-scard-kind') ?? '').trim()
+    const turnNo = String(element.getAttribute('data-dsh-scard-turn') ?? '').trim()
+    if (cardKey === '' || kind === '') continue
+    let text = ''
+    let timeText = ''
+    if (kind === CARD_KIND_USER || kind === CARD_KIND_NOTICE) {
+      const row = element.closest('[data-chat-flow-kind="user"]') ?? element
+      text = String(row.querySelector('[data-slot="conversation.user.text.node"]')?.textContent ?? '').trim()
+      timeText = formatUserCardClock(row.querySelector('[data-clock]')?.textContent ?? '')
+    } else {
+      text = collectTurnText(doc, turnNo)
+    }
+    out.push({ element, cardKey, kind, turnNo, text, timeText })
+  }
+  return out
+}
+
 /** ─────────────── 7. 已读卡集合（未读红点的持久化） ─────────────── */
 
 /** 宿主侧「已读卡」路由（服务端 src/assistant-secretary.ts 注册同一字符串）。 */
@@ -640,6 +680,60 @@ export const READ_STORAGE_PREFIX = 'dsh.assistant.secretary.read:'
 /** 每个会话最多记多少条已读 cardKey（去噪：写满就把最旧的一条丢掉）。 */
 export const MAX_READ_KEYS = 400
 const CARD_KEY_RE = /^[A-Za-z0-9:._#-]{1,200}$/
+
+/**
+ * 扫描层（分页窗口用）：把「这条会话里会挂出来的卡」按时间顺序登记进 store。
+ * 用户/通知卡来自宿主用户行，秘书卡来自宿主轮次（`[data-chat-turn]` 顺序 + 本轮真有正文的才算一张卡）；
+ * 轮内顺序固定：用户/通知卡在前、秘书回复卡在尾（turnTail 就是这个位置）。
+ * 首帧就把窗口算全，避免「先渲染 137 张完整卡、400ms 后才压成折叠行」的 DOM 抖动。
+ */
+export function buildSecretaryPagerCards(doc: Document): PagerDomCard[] {
+  const rows = collectSecretaryCardRows(doc).map((row) => ({
+    cardKey: row.kind === CARD_KIND_NOTICE ? noticeCardSpeechKey(row.key, row.turnNo) : userCardSpeechKey(row.key, row.turnNo),
+    kind: row.kind,
+    turnNo: row.turnNo,
+    text: row.text,
+    timeText: formatUserCardClock(row.clockText),
+  }))
+  const mountedAssistant = collectSecretaryCardElements(doc).filter((card) => card.kind === CARD_KIND_ASSISTANT)
+  const turnOrder: string[] = []
+  for (const element of doc.querySelectorAll('[data-chat-turn]')) {
+    const turnNo = String(element.getAttribute('data-chat-turn') ?? '')
+    if (turnNo === '' || turnOrder.includes(turnNo)) continue
+    turnOrder.push(turnNo)
+  }
+  const out: PagerDomCard[] = []
+  const used = new Set<string>()
+  for (const turnNo of turnOrder) {
+    for (const card of rows.filter((row) => row.turnNo === turnNo)) {
+      if (used.has(card.cardKey)) continue
+      used.add(card.cardKey)
+      out.push(card)
+    }
+    const mounted = mountedAssistant.find((card) => card.turnNo === turnNo)
+    if (mounted !== undefined) {
+      if (!used.has(mounted.cardKey)) { used.add(mounted.cardKey); out.push({ cardKey: mounted.cardKey, kind: mounted.kind, turnNo: mounted.turnNo, text: mounted.text, timeText: mounted.timeText }) }
+      continue
+    }
+    const text = collectTurnText(doc, turnNo)
+    if (text === '') continue
+    const key = assistantCardSpeechKey(turnNo)
+    if (used.has(key)) continue
+    used.add(key)
+    out.push({ cardKey: key, kind: CARD_KIND_ASSISTANT, turnNo, text, timeText: '' })
+  }
+  for (const card of rows) {
+    if (used.has(card.cardKey)) continue
+    used.add(card.cardKey)
+    out.push(card)
+  }
+  for (const card of mountedAssistant) {
+    if (used.has(card.cardKey)) continue
+    used.add(card.cardKey)
+    out.push({ cardKey: card.cardKey, kind: card.kind, turnNo: card.turnNo, text: card.text, timeText: card.timeText })
+  }
+  return out
+}
 
 /** 归一一条 cardKey：只接受 key 形态，别的（空、超长、带空格）一律判坏。 */
 export function normalizeCardKey(raw: unknown): string {
@@ -801,6 +895,303 @@ export function secretaryReadStore(): SecretaryReadStore {
 }
 
 /** 单测入口（node 直驱状态机与纯函数）。 */
+/* ────────────────────────── 8. 卡片分页（第四批需求 A） ────────────────────────── */
+
+/** 分页取数只走这条宿主接口（客户端绝不为分页把整条会话读回来）。 */
+export const ASSISTANT_SECRETARY_HISTORY_ROUTE = '/api/assistant/secretary/history'
+
+/** 宿主一页里给回来的卡片元数据（seq 是游标，preview 给折叠行点击时的原始文本预览）。 */
+export interface PagerCardMeta {
+  cardKey: string
+  seq: number
+  kind: string
+  turnNo: string
+  title: string
+  preview: string
+  time: number
+}
+
+/** DOM 扫描送来的卡（旧→新顺序，扫描层自己算）。 */
+export interface PagerDomCard {
+  cardKey: string
+  kind: string
+  turnNo: string
+  text: string
+  timeText: string
+}
+
+export interface SecretaryPagerDeps {
+  /** 浏览器里是 window.fetch；单测里是假实现。缺 → 走 DOM 顺序降级，仍然只渲染有上限的一段。 */
+  fetchImpl?: (url: string, init?: any) => Promise<any>
+  windowSize?: number
+  pageSize?: number
+  cap?: number
+}
+
+export interface SecretaryPagerSnapshot {
+  sessionId: string
+  source: string
+  windowSize: number
+  renderedCount: number
+  capped: boolean
+  hasMore: boolean
+  loading: boolean
+  windowInitialized: boolean
+  cursorSeq: number
+  expandedBatches: number
+}
+
+/** 折叠行的短标题：同一输入永远得到同一标题（口径在 shared，宿主分页也算同一个）。 */
+export function collapsedCardTitle(domText: string, hostTitle = ''): string {
+  const fromHost = String(hostTitle ?? '').trim()
+  if (fromHost !== '') return fromHost
+  return truncateCardTitle(domText)
+}
+
+/** 上滚后保持原滚动位置不跳：新渲染把更旧的内容插到顶部，就要把 scrollTop 补回增量。 */
+export function scrollAnchorTopPatch(beforeScrollHeight: number, afterScrollHeight: number): number {
+  const delta = Math.round(Number(afterScrollHeight) - Number(beforeScrollHeight))
+  return delta > 0 ? delta : 0
+}
+
+export function createSecretaryPager(deps: SecretaryPagerDeps = {}): SecretaryPagerStore {
+  const baseWindowSize = Math.max(1, Number(deps.windowSize) || CARD_WINDOW_DEFAULT)
+  const pageSize = Math.max(1, Number(deps.pageSize) || CARD_PAGE_SIZE)
+  const cap = Math.max(baseWindowSize, Number(deps.cap) || CARD_RENDER_CAP)
+
+  const listeners = new Set<() => void>()
+  let version = 0
+  let sessionId = ''
+  let domOrder: string[] = []
+  const domCards = new Map<string, PagerDomCard>()
+  const metas = new Map<string, PagerCardMeta>()
+  let windowSize = baseWindowSize
+  let windowInitialized = false
+  let cursorSeq = 0
+  let hasMore = true
+  let loadingCall: Promise<any> | null = null
+  let source = 'dom'
+  let expandedBatches = 0
+  let capped = false
+
+  const emit = (): void => { for (const listener of [...listeners]) { try { listener() } catch { /* 单个订阅者出错不影响别的 */ } } }
+  const bump = (): void => { version += 1; emit() }
+
+  const rankFromNewest = (cardKey: string): number => {
+    const index = domOrder.indexOf(cardKey)
+    if (index === -1) return -1
+    return domOrder.length - 1 - index
+  }
+
+  const isCappedNow = (): boolean => windowSize >= cap || !canRenderMore(windowSize)
+
+  const applyPage = (page: any, oldestSide: boolean): number => {
+    const items: PagerCardMeta[] = []
+    const rawItems = Array.isArray(page?.items) ? page.items : []
+    for (const raw of rawItems) {
+      const cardKey = String(raw?.cardKey ?? '').trim()
+      if (cardKey === '') continue
+      const meta: PagerCardMeta = {
+        cardKey,
+        seq: Number(raw?.seq) || 0,
+        kind: String(raw?.kind ?? ''),
+        turnNo: String(raw?.turn ?? ''),
+        title: String(raw?.title ?? ''),
+        preview: String(raw?.preview ?? ''),
+        time: Number(raw?.time) || 0,
+      }
+      metas.set(cardKey, meta)
+      items.push(meta)
+    }
+    const reportedCursor = Number(page?.nextBefore) || 0
+    if (oldestSide && reportedCursor > 0) cursorSeq = reportedCursor
+    else if (items.length > 0) {
+      const oldest = Math.min(...items.map((item) => item.seq))
+      if (oldest > 0) cursorSeq = oldest
+    }
+    if (typeof page?.hasMore === 'boolean') hasMore = page.hasMore
+    return items.length
+  }
+
+  const fetchPage = async (before: number | undefined): Promise<{ ok: boolean; error: string; page: any }> => {
+    const fetchImpl = deps.fetchImpl
+    if (typeof fetchImpl !== 'function' || sessionId === '') return { ok: false, error: 'no fetch', page: null }
+    const params = [`sessionId=${encodeURIComponent(sessionId)}`, `limit=${normalizeHistoryLimit(pageSize)}`]
+    if (before !== undefined) params.push(`before=${encodeURIComponent(String(before))}`)
+    const url = `${ASSISTANT_SECRETARY_HISTORY_ROUTE}?${params.join('&')}`
+    try {
+      const res = await fetchImpl(url, { cache: 'no-store' })
+      if (res?.ok !== true) return { ok: false, error: `status:${res?.status ?? 'unknown'}`, page: null }
+      const payload = await res.json()
+      if (payload?.ok !== true) return { ok: false, error: 'payload-not-ok', page: null }
+      return { ok: true, error: '', page: payload.page ?? null }
+    } catch (error: unknown) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error), page: null }
+    }
+  }
+
+  return {
+    session: () => sessionId,
+    setSession(next: string): void {
+      const id = String(next ?? '').trim()
+      if (id === sessionId) return
+      sessionId = id
+      windowInitialized = false
+      windowSize = baseWindowSize
+      domOrder = []
+      domCards.clear()
+      metas.clear()
+      cursorSeq = 0
+      hasMore = true
+      expandedBatches = 0
+      capped = false
+      loadingCall = null
+      source = 'dom'
+      bump()
+    },
+    subscribe(listener: () => void): () => void {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
+    getVersion(): number { return version },
+    ensureWindow(): Promise<{ ok: boolean; source: string; cards: number; backfilled: boolean; error: string }> {
+      if (loadingCall !== null) return loadingCall as any
+      const run = async (): Promise<{ ok: boolean; source: string; cards: number; backfilled: boolean; error: string }> => {
+        if (windowInitialized) return { ok: true, source, cards: windowSize, backfilled: false, error: '' }
+        const fetched = await fetchPage(undefined)
+        if (fetched.ok) {
+          const cards = applyPage(fetched.page, false)
+          source = 'host'
+          windowInitialized = true
+          bump()
+          return { ok: true, source, cards, backfilled: false, error: '' }
+        }
+        // 宿主答不上（例如 401/404）也照样分页：按 DOM 顺序只渲染最近 windowSize 张，不去读整条会话
+        source = 'dom'
+        windowInitialized = true
+        hasMore = domOrder.length > windowSize
+        bump()
+        return { ok: false, source, cards: 0, backfilled: false, error: fetched.error }
+      }
+      loadingCall = run().then((result) => { loadingCall = null; return result }, () => { loadingCall = null; return { ok: false, source: 'dom', cards: 0, backfilled: false, error: 'fetch-failed' } })
+      return loadingCall as any
+    },
+    noteDomCards(cards: readonly PagerDomCard[]): void {
+      let changed = false
+      const order: string[] = []
+      for (const card of cards) {
+        const key = String(card?.cardKey ?? '').trim()
+        if (key === '') continue
+        order.push(key)
+        const previous = domCards.get(key)
+        if (previous === undefined || previous.text !== card.text || previous.timeText !== card.timeText || previous.kind !== card.kind) {
+          domCards.set(key, { cardKey: key, kind: card.kind, turnNo: card.turnNo, text: card.text, timeText: card.timeText })
+          changed = true
+        }
+      }
+      if (order.join('|') !== domOrder.join('|')) { domOrder = order; changed = true }
+      if (changed) bump()
+      if (!windowInitialized && loadingCall === null && domOrder.length > 0) void this.ensureWindow()
+    },
+    windowSize(): number { return windowSize },
+    isFullCard(cardKey: string): boolean {
+      const rank = rankFromNewest(cardKey)
+      if (rank === -1) return true
+      return rank < windowSize
+    },
+    isCollapsedCard(cardKey: string): boolean {
+      const rank = rankFromNewest(cardKey)
+      if (rank === -1) return false
+      return rank >= windowSize
+    },
+    collapsedTitle(cardKey: string): string {
+      const meta = metas.get(cardKey)
+      return collapsedCardTitle(domCards.get(cardKey)?.text ?? '', meta?.title ?? '')
+    },
+    previewText(cardKey: string): string {
+      const meta = metas.get(cardKey)
+      if (meta !== undefined && meta.preview !== '') return meta.preview
+      return truncatePreview(domCards.get(cardKey)?.text ?? '')
+    },
+    expandOlder(): Promise<{ ok: boolean; added: number; capped: boolean; hasMore: boolean; source: string; windowSize: number }> {
+      if (loadingCall !== null) return loadingCall as any
+      if (isCappedNow()) {
+        capped = true
+        bump()
+        return Promise.resolve({ ok: false, added: 0, capped: true, hasMore, source, windowSize })
+      }
+      const run = async (): Promise<{ ok: boolean; added: number; capped: boolean; hasMore: boolean; source: string; windowSize: number }> => {
+        let added = 0
+        let ok = false
+        if (source === 'host' && cursorSeq > 0) {
+          const fetched = await fetchPage(cursorSeq)
+          if (fetched.ok) {
+            ok = true
+            added = applyPage(fetched.page, true)
+          } else {
+            hasMore = domOrder.length > windowSize
+          }
+        } else {
+          // 没有宿主游标（宿主不通或还没拿到第一页）：只把 DOM 里更旧的这一段展开，不读全量
+          ok = false
+          hasMore = domOrder.length > windowSize
+        }
+        const next = Math.min(cap, windowSize + pageSize)
+        added = Math.max(added, Math.min(pageSize, Math.max(0, domOrder.length - windowSize)))
+        windowSize = next
+        expandedBatches += 1
+        capped = isCappedNow()
+        if (capped) hasMore = false
+        bump()
+        return { ok, added, capped, hasMore, source, windowSize }
+      }
+      loadingCall = run().then((result) => { loadingCall = null; return result }, () => { loadingCall = null; return { ok: false, added: 0, capped, hasMore, source, windowSize } })
+      return loadingCall as any
+    },
+    renderedCount(): number {
+      const known = domOrder.length === 0 ? windowSize : Math.min(windowSize, domOrder.length)
+      return Math.max(0, Math.min(known, cap))
+    },
+    isCapped(): boolean { return capped },
+    hintVisible(): boolean { return capped || (!hasMore && domOrder.length > windowSize) },
+    loading(): boolean { return loadingCall !== null },
+    state(): SecretaryPagerSnapshot {
+      return {
+        sessionId,
+        source,
+        windowSize,
+        renderedCount: this.renderedCount(),
+        capped,
+        hasMore,
+        loading: loadingCall !== null,
+        windowInitialized,
+        cursorSeq,
+        expandedBatches,
+      }
+    },
+    reset(): void {
+      windowInitialized = false
+      windowSize = baseWindowSize
+      cursorSeq = 0
+      hasMore = true
+      expandedBatches = 0
+      capped = false
+      loadingCall = null
+      bump()
+    },
+  }
+}
+
+/** 组件共用的**进程内分页 store**（懒创建）：node 环境（没有 fetch）也会工作，只按 DOM 顺序分页。 */
+let cardPager: SecretaryPagerStore | null = null
+export function secretaryPager(): SecretaryPagerStore {
+  if (cardPager !== null) return cardPager
+  const g: any = globalThis as any
+  const fetchImpl = typeof g.fetch === 'function' ? (url: string, init?: any) => g.fetch(url, init) : undefined
+  cardPager = createSecretaryPager({ fetchImpl })
+  return cardPager
+}
+
 export const secretaryCardsTestSurface = {
   normalizeForSpeech,
   stripSessionRefs,
@@ -833,6 +1224,7 @@ export const secretaryCardsTestSurface = {
   formatUserCardClock,
   collectSecretaryUserRows,
   collectSecretaryCardRows,
+  collectSecretaryCardElements,
   foldClipFromBlocks,
   ASSISTANT_SECRETARY_READ_ROUTE,
   READ_STORAGE_PREFIX,
@@ -841,4 +1233,20 @@ export const secretaryCardsTestSurface = {
   normalizeReadKeys,
   createSecretaryReadStore,
   secretaryReadStore,
+  ASSISTANT_SECRETARY_HISTORY_ROUTE,
+  createSecretaryPager,
+  secretaryPager,
+  collapsedCardTitle,
+  scrollAnchorTopPatch,
+  CARD_WINDOW_DEFAULT,
+  CARD_PAGE_SIZE,
+  CARD_RENDER_CAP,
+  EARLIER_HINT_TEXT,
+  SCROLL_TOP_THRESHOLD_PX,
+  truncateCardTitle,
+  truncatePreview,
+  countWords,
+  windowOfItems,
+  canRenderMore,
+  shouldExpandOnScroll,
 }

@@ -42,11 +42,12 @@ body[data-dsh-secretary="1"] [data-dsh-speak="wrap"][data-empty="1"] {
 
 /* ── 用户卡 / 通知卡接管宿主用户行 ──
  * 真实用户消息与合成通知被做成卡片后，那条气泡本身不再显示（时间/操作行也已在卡片底行里）。
- * 带附件的行保留宿主气泡（附件芯片不能丢），只把纯文本 run 收起来。 */
-body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard="card"][data-dsh-scard-kind="user"], > [data-dsh-scard="card"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"]:not(:has(img)) {
+ * 带附件的行保留宿主气泡（附件芯片不能丢），只把纯文本 run 收起来。
+ * 分页窗口外的那一行（折叠行）也接管气泡：老卡压成一行时同样不许冒原文。 */
+body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard="card"][data-dsh-scard-kind="user"], > [data-dsh-scard="card"][data-dsh-scard-kind="notice"], > [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="user"], > [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"]:not(:has(img)) {
   display: none !important;
 }
-body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard="card"][data-dsh-scard-kind="user"], > [data-dsh-scard="card"][data-dsh-scard-kind="notice"]) [data-slot="conversation.user.text.node"] > span:not([data-dsh-scard]) {
+body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard="card"][data-dsh-scard-kind="user"], > [data-dsh-scard="card"][data-dsh-scard-kind="notice"], > [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="user"], > [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="notice"]) [data-slot="conversation.user.text.node"] > span:not([data-dsh-scard]) {
   display: none !important;
 }
 
@@ -385,6 +386,83 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
 [data-dsh-speak="button"]:focus-visible {
   outline: 2px solid var(--dsh-card-focus-ring);
   outline-offset: 2px;
+}
+
+/* ── 折叠行（第四批需求 A：分页窗口之外的老卡压成一行）──
+ * 一行只有时间 + 该条首行前 24 字短标题；点它只开本地原文预览，不会把整张老卡拉回渲染。 */
+[data-dsh-scard="collapsed-row"] {
+  display: block;
+  width: 100%;
+  max-width: 620px;
+  margin: 0 auto;
+  border: 0;
+  border-bottom: 0.5px solid #e5e6eb;
+  background: transparent;
+}
+[data-dsh-scard="collapse-row"] {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 34px;
+  margin: 0;
+  padding: 6px 12px;
+  border: 0;
+  background: transparent;
+  color: #4b5561;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+[data-dsh-scard="collapse-row"]:hover {
+  background: #f6f7f9;
+}
+[data-dsh-scard="collapse-time"] {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: #9aa1ab;
+}
+[data-dsh-scard="collapse-title"] {
+  flex: 1 1 auto;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #4b5561;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-dsh-scard="collapse-caret"] {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: #b4bac3;
+}
+[data-dsh-scard="collapse-preview"] {
+  display: block;
+  width: 100%;
+  max-width: 620px;
+  margin: 0 auto;
+  padding: 8px 12px 12px;
+  border-radius: 10px;
+  background: #f6f7f9;
+  color: #5c6470;
+  font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+[data-dsh-scard="earlier-hint"] {
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  max-width: 620px;
+  margin: 0 auto;
+  padding: 8px 12px;
+}
+[data-dsh-scard="earlier-hint-text"] {
+  font-size: 12px;
+  color: #9aa1ab;
 }
 
 @media (prefers-reduced-motion: reduce) {
