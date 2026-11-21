@@ -253,6 +253,75 @@ export function collectTurnText(doc: Document, turn: string): string {
   return out.join('\n').trim()
 }
 
+/** 当前 DOM 里最大的轮次号（= 最末一轮；自动朗读只读它）。 */
+export function latestTurnNo(doc: Document): string {
+  let max = -1
+  let out = ''
+  for (const el of doc.querySelectorAll('[data-chat-turn]')) {
+    const value = Number(el.getAttribute('data-chat-turn'))
+    if (Number.isFinite(value) && value > max) { max = value; out = String(value) }
+  }
+  return out
+}
+
+/** ────────────────────────── 5. 卡片呈现纯函数（node 可单测） ────────────────────────── */
+
+/**
+ * 主动卡胶囊色调：按 badge / 标题里的类型词归类，同类卡配色一致。
+ *   主动关心 → care（暖橙）｜任务完成 → done（蓝）｜主动探索 → explore（紫）
+ *   征求授权 → auth（红）｜默认主动服务 → serve（绿）
+ */
+export type BadgeTone = 'serve' | 'care' | 'done' | 'explore' | 'auth'
+export function badgeTone(badge: string, title: string = ''): BadgeTone {
+  const text = `${String(badge ?? '')} ${String(title ?? '')}`
+  if (/授权|批准|确认/.test(text)) return 'auth'
+  if (/完成|搞定|办结|交付/.test(text)) return 'done'
+  if (/探索|发现|调研|找找|搜索/.test(text)) return 'explore'
+  if (/关心|提醒|注意|建议|注意身体|出行|天气/.test(text)) return 'care'
+  return 'serve'
+}
+
+/** 要点行拆分：「天气：武汉明日…」→ { prefix: '天气：', rest: '武汉明日…' }。
+ *  前缀必须以汉字开头、不含数字（「10:30」这类时间不会被拆成前缀）。 */
+export function splitItemPrefix(text: string): { prefix: string; rest: string } {
+  const raw = String(text ?? '').trim()
+  const match = raw.match(/^([一-鿿][^：:，,\d]{0,7}[：:])([\s\S]*)$/)
+  if (match === null) return { prefix: '', rest: raw }
+  return { prefix: match[1], rest: match[2].trim() }
+}
+
+/** 要点行小图标：按关键词给emoji（天气/车次/地点/时间），默认小圆点。 */
+export function itemIcon(text: string): string {
+  const raw = String(text ?? '')
+  if (/天气|温度|气温|雨|雪|晴|阴|风/.test(raw)) return '🌤'
+  if (/车|高铁|火车|航班|飞机|站|行程|出发|到达/.test(raw)) return '🚄'
+  if (/地点|地址|会场|实验室|家里|公司|武汉|孝感/.test(raw)) return '📍'
+  if (/时间|点钟|会议|截止|提醒|日程|安排/.test(raw)) return '🕐'
+  return '·'
+}
+
+/** 一句话摘要：取首行、截断加省略号（标题行用）。 */
+export function summarize(text: string, max = 22): string {
+  const line = String(text ?? '').split('\n').map((s) => s.trim()).find((s) => s !== '') ?? ''
+  const clean = line.replace(/\s+/g, ' ')
+  return clean.length > max ? `${clean.slice(0, max)}…` : clean
+}
+
+/** ISO/时间戳 → 「今天 HH:MM」/「昨天 HH:MM」/「M月d日 HH:MM」；解析不了回空串。 */
+export function formatClock(input: unknown, now: Date = new Date()): string {
+  const raw = String(input ?? '').trim()
+  if (raw === '') return ''
+  const date = /^\d+$/.test(raw) ? new Date(Number(raw)) : new Date(raw)
+  if (Number.isNaN(date.getTime())) return ''
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  const hm = `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  const startOf = (d: Date): number => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+  const dayDiff = Math.round((startOf(now) - startOf(date)) / 86400000)
+  if (dayDiff <= 0) return `今天 ${hm}`
+  if (dayDiff === 1) return `昨天 ${hm}`
+  return `${date.getMonth() + 1}月${date.getDate()}日 ${hm}`
+}
+
 /** 单测入口（node 直驱状态机与纯函数）。 */
 export const secretaryCardsTestSurface = {
   normalizeForSpeech,
@@ -261,4 +330,10 @@ export const secretaryCardsTestSurface = {
   reduceSpeech,
   createSpeechController,
   SPEECH_IDLE,
+  latestTurnNo,
+  badgeTone,
+  splitItemPrefix,
+  itemIcon,
+  summarize,
+  formatClock,
 }

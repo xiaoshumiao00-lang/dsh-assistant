@@ -9,7 +9,6 @@ import { PROACTIVE_CSS } from './proactive-card.css.ts'
 import { SECRETARY_CARD_CSS } from './secretary-cards.css.ts'
 import { ProactiveCardTail } from './ProactiveCardTail.tsx'
 import { SecretaryReplyCard } from './SecretaryReplyCard.tsx'
-import { SecretaryActions } from './SecretaryActions.tsx'
 import { currentSessionViaBridge } from '../../session-open.ts'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
 import { NS, zh, en, type OrbKey } from './locales.ts'
@@ -165,21 +164,6 @@ export function orbApply(ctx: any): void {
         inject: () => ({ api }),
       },
       SecretaryReplyCard,
-    ),
-  )
-
-  // 秘书卡片的右侧操作区：朗读按钮气泡（暂停/继续/长按重读）+ 会话引用块。
-  // 宿主渲染在每条助理消息的图标行动作区里；其它会话返回 null。
-  ctx.slots.inject('conversation.chat.assistant-actions', () =>
-    ctx.slots.register(
-      {
-        name: 'conversation.chat.assistant-actions',
-        id: 'assistant-secretary-speak',
-        order: 25,
-        locale: NS,
-        inject: () => ({ api }),
-      },
-      SecretaryActions,
     ),
   )
 

@@ -209,6 +209,20 @@ try {
   demoRef.title = refPick.title === '' ? '被引用的会话' : refPick.title
   notes.push(`引用跳转目标 = ${demoRef.sessionId || '(未找到，跳过)'}`)
 
+  // 真实卡模式：宿主卡里未必带引用——把示例卡（内容不变 + 引用目标）写进宿主卡组，
+  // 让「引用块可点跳」在真实数据下也能验收。同 id 覆盖，幂等。
+  if (REAL_CARD && demoRef.sessionId !== '') {
+    const put = await page.evaluate(async ({ card, sessionId, title, token }) => {
+      const res = await fetch(`/api/assistant/proactive?token=${encodeURIComponent(token)}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...card, refSessionId: sessionId, refTitle: title }),
+      })
+      return res.ok
+    }, { card: DEMO_CARD, sessionId: demoRef.sessionId, title: demoRef.title, token: TOKEN })
+    notes.push(`真实卡写入引用字段: ${put ? 'ok' : '失败'}`)
+  }
+
   const hostIdBefore = await readHostSecretaryId()
   notes.push(`宿主固定会话 id（单击前）= ${hostIdBefore || '(空)'}`)
 
@@ -286,16 +300,66 @@ try {
   }
   check('主动服务卡片渲染出来了', cardOk)
   if (cardOk) {
-    const cardText = await page.$eval('[data-dsh-proactive="card"]', (el) => el.textContent || '')
-    check('卡片标题正确', cardText.includes('主动关心 · 明日武汉出差'), cardText.slice(0, 60))
+    const collapsed = await page.$eval('[data-dsh-proactive="card"]', (el) => {
+      const head = el.querySelector('[data-dsh-proactive="head"]')
+      const badge = el.querySelector('[data-dsh-proactive="badge"]')
+      const title = el.querySelector('[data-dsh-proactive="title"]')
+      const btn = el.querySelector('[data-dsh-speak="button"]')
+      const headRect = head?.getBoundingClientRect()
+      const btnRect = btn?.getBoundingClientRect()
+      const cardRect = el.getBoundingClientRect()
+      const prefix = el.querySelector('[data-dsh-proactive="item-prefix"]')
+      const time = el.querySelector('[data-dsh-proactive="time"]')
+      return {
+        open: el.getAttribute('data-open'),
+        height: el.getBoundingClientRect().height,
+        titleText: title?.textContent ?? '',
+        badgeText: badge?.textContent ?? '',
+        tone: badge?.getAttribute('data-tone') ?? '',
+        // 朗读钮在标题行最右：必须是 head 的最后一个子元素，且右缘贴近卡片右缘
+        btnInHead: btn !== null && btn.parentElement === head,
+        btnIsLast: btn !== null && head?.lastElementChild === btn,
+        btnRightGap: btnRect && cardRect ? Math.round(cardRect.right - btnRect.right) : -1,
+        btnVertInHead: btnRect && headRect ? btnRect.top >= headRect.top - 2 && btnRect.bottom <= headRect.bottom + 2 : false,
+        prefixText: prefix?.textContent ?? '',
+        timeText: time?.textContent ?? '',
+        summaryFontSize: getComputedStyle(el.querySelector('[data-dsh-proactive="summary"]') ?? el).fontSize,
+      }
+    })
+    check('卡片标题正确', collapsed.titleText.includes('主动关心 · 明日武汉出差'), collapsed.titleText.slice(0, 60))
+    check('折叠态卡片高度固定（200–240px，不随内容撑高）', collapsed.height >= 200 && collapsed.height <= 240, `height=${collapsed.height}`)
+    check('类型胶囊按类型换色（主动关心→care 暖橙）', collapsed.badgeText.includes('主动服务') && collapsed.tone === 'care', `badge=${collapsed.badgeText} tone=${collapsed.tone}`)
+    check('要点前缀词加粗（天气：）', collapsed.prefixText === '天气：', `prefix=${collapsed.prefixText}`)
+    check('底行有时间（12px 浅灰）', collapsed.timeText !== '', `time=${collapsed.timeText}`)
+    check('朗读钮在卡片第一行最右（head 末子元素、右缘贴合）',
+      collapsed.btnInHead && collapsed.btnIsLast && collapsed.btnRightGap >= 8 && collapsed.btnRightGap <= 40 && collapsed.btnVertInHead,
+      JSON.stringify({ btnInHead: collapsed.btnInHead, btnIsLast: collapsed.btnIsLast, gap: collapsed.btnRightGap, vert: collapsed.btnVertInHead }))
+
+    // 固定高度截断 + 「查看详情」就地展开 → 展开后可收起
+    const collapsedHeight = collapsed.height
     await page.click('[data-dsh-proactive="toggle"]')
     await page.waitForTimeout(400)
     const expanded = await page.evaluate(() => {
       const card = document.querySelector('[data-dsh-proactive="card"]')
       const details = document.querySelector('[data-dsh-proactive="details"]')
-      return { open: card?.getAttribute('data-open') === '1', details: (details?.textContent || '').includes('G1545') }
+      const toggle = document.querySelector('[data-dsh-proactive="toggle"]')
+      return {
+        open: card?.getAttribute('data-open') === '1',
+        height: card?.getBoundingClientRect().height ?? 0,
+        details: (details?.textContent || '').includes('G1545'),
+        toggleText: toggle?.textContent ?? '',
+      }
     })
-    check('卡片可点开查看详情', expanded.open && expanded.details, JSON.stringify(expanded))
+    check('点「查看详情」就地展开（data-open=1、details 含 G1545、按钮变收起）',
+      expanded.open && expanded.details && expanded.toggleText === '收起', JSON.stringify(expanded))
+    check('展开后高度大于折叠态（内容完整放出）', expanded.height > collapsedHeight, `${collapsedHeight} → ${expanded.height}`)
+    await page.click('[data-dsh-proactive="toggle"]')
+    await page.waitForTimeout(400)
+    const reCollapsed = await page.evaluate(() => {
+      const card = document.querySelector('[data-dsh-proactive="card"]')
+      return { open: card?.getAttribute('data-open'), height: card?.getBoundingClientRect().height ?? 0 }
+    })
+    check('展开后可收起（回到固定高度）', reCollapsed.open === '0' && Math.abs(reCollapsed.height - collapsedHeight) < 2, JSON.stringify(reCollapsed))
     // 卡片是会话级常驻信息：turnTail 每轮都会渲染一次，必须只在最末一轮出现（不能每轮一张）
     const single = await page.waitForFunction(
       () => document.querySelectorAll('[data-dsh-proactive="wrap"]').length === 1
@@ -310,35 +374,70 @@ try {
     check('主动服务卡只在最末一轮出现一次（不重复）', single, JSON.stringify(groups))
   }
 
-  // ── 秘书回复卡片 + 朗读（需求①②⑤） ──
+  // ── 过程信息行（需求②）：渲染层真正不输出 ──
+  const PROCESS_NOISE = [/已完成，用时/, /处理失败/, /已重试模型请求/, /正在重试模型请求/, /本轮运行失败/, /等待重试模型请求/]
+  const pageTextNow = (await page.evaluate(() => document.body.innerText || '')) + '\n' + (snapshot.texts || []).join('\n')
+  const leakedNoise = PROCESS_NOISE.filter((pattern) => pattern.test(pageTextNow)).map(String)
+  check('无过程信息行（已完成/用时/处理失败/重试/本轮运行失败）', leakedNoise.length === 0, `leaked=${leakedNoise.join(',')}`)
+
+  // ── 秘书回复卡片 + 朗读（需求①②⑤）：只看最末一轮（querySelector 取 DOM 里最后一张） ──
   await page.waitForTimeout(1500) // body[data-dsh-secretary] 轮询 700ms，等标记落上
   const scard = await page.evaluate(() => {
-    const card = document.querySelector('[data-dsh-scard="card"]:not([data-empty="1"])')
+    const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
+    const card = cards[cards.length - 1] ?? null // 最末一轮的回复卡
     const step = [...document.querySelectorAll('[data-chat-flow-kind="assistant-step"]')]
       .find((el) => el.getAttribute('data-chat-group-part') !== 'reasoning')
-    const buttons = [...document.querySelectorAll('[data-dsh-speak="button"]')]
-    const button = buttons[buttons.length - 1] ?? null // 最末一轮的朗读键
+    const head = card?.querySelector('[data-dsh-scard="head"]')
+    const btn = head?.querySelector('[data-dsh-speak="button"]') ?? null
+    const headRect = head?.getBoundingClientRect()
+    const btnRect = btn?.getBoundingClientRect()
+    const cardRect = card?.getBoundingClientRect()
     return {
+      cardCount: cards.length,
       hasCard: card !== null,
       badge: card?.querySelector('[data-dsh-scard="badge"]')?.textContent ?? '',
-      body: (card?.querySelector('[data-dsh-scard="body"]')?.textContent ?? '').trim().slice(0, 60),
+      title: card?.querySelector('[data-dsh-scard="title"]')?.textContent ?? '',
+      hasIcon: card?.querySelector('[data-dsh-scard="icon"]') !== null,
+      paras: card?.querySelectorAll('[data-dsh-scard="para"]').length ?? 0,
+      bodyFontSize: getComputedStyle(card?.querySelector('[data-dsh-scard="para"]') ?? card ?? document.body).fontSize,
+      hasMeta: card?.querySelector('[data-dsh-scard="meta"]') !== null,
+      metaTime: card?.querySelector('[data-dsh-scard="time"]')?.textContent ?? '',
       stepDisplay: step ? getComputedStyle(step).display : '(无 step)',
-      hasButton: button !== null,
-      speakStatus: button?.getAttribute('data-status') ?? '',
+      hasButton: btn !== null,
+      // 朗读钮在标题行最右：head 的最后一个子元素、垂直落在首行内、右缘贴近卡片右缘
+      btnIsLast: btn !== null && head?.lastElementChild === btn,
+      btnVertInHead: btnRect && headRect ? btnRect.top >= headRect.top - 2 && btnRect.bottom <= headRect.bottom + 2 : false,
+      btnRightGap: btnRect && cardRect ? Math.round(cardRect.right - btnRect.right) : -1,
+      speakStatus: btn?.getAttribute('data-status') ?? '',
       bodyFlag: document.body.dataset.dshSecretary ?? '',
     }
   })
-  check('秘书回复渲染成卡片（标题行+正文，柔和浅色）', scard.hasCard && scard.badge === '个人秘书' && scard.body !== '', JSON.stringify(scard))
+  check('秘书回复渲染成卡片（图标+「个人秘书」标签+一句话摘要）',
+    scard.hasCard && scard.badge === '个人秘书' && scard.title !== '' && scard.hasIcon, JSON.stringify(scard))
+  check('正文分段清晰（14px，至少一段）', scard.paras >= 1 && scard.bodyFontSize === '14px',
+    `paras=${scard.paras} font=${scard.bodyFontSize}`)
+  check('底部 meta 行（12px 灰、时间）', scard.hasMeta && /今天|昨天|月.+日/.test(scard.metaTime), `metaTime=${scard.metaTime}`)
   check('原始 markdown 气泡已隐藏（秘书会话专属）', scard.stepDisplay === 'none', `display=${scard.stepDisplay}`)
   check('页面级秘书标记 body[data-dsh-secretary="1"]', scard.bodyFlag === '1')
-  check('朗读按钮出现且自动朗读已发起', scard.hasButton && ['loading', 'playing', 'paused'].includes(scard.speakStatus), `status=${scard.speakStatus}`)
-  check('TTS 只走宿主 /api/assistant/tts（微软 edge-tts，无 fallback）', ttsRequests >= 1, `requests=${ttsRequests}`)
+  check('朗读按钮在卡片第一行最右（head 末子元素、右缘贴合）',
+    scard.hasButton && scard.btnIsLast && scard.btnVertInHead && scard.btnRightGap >= 8 && scard.btnRightGap <= 40,
+    JSON.stringify({ hasButton: scard.hasButton, btnIsLast: scard.btnIsLast, gap: scard.btnRightGap, vert: scard.btnVertInHead }))
+  check('自动朗读已发起（唯一自动请求方 = 回复卡，TTS 已有请求）', ttsRequests >= 1, `requests=${ttsRequests}`)
 
-  // 朗读状态机：单击暂停 → 单击继续 → 长按从头重读
-  const speakBtn = page.locator('[data-dsh-speak="button"]').last()
+  // 朗读状态机：进播放态 → 单击暂停 → 单击继续 → 长按从头重读（回复卡上的那颗钮）
+  const speakBtn = page.locator('[data-dsh-scard="card"]:not([data-empty="1"]) [data-dsh-speak="button"]').last()
+  let st = await speakBtn.getAttribute('data-status')
+  if (st !== 'playing' && st !== 'loading') {
+    // 自动朗读的 30s stub 可能已在长流程中播完：手动起播再验交互（状态机语义不变）
+    await speakBtn.click()
+    await page.waitForTimeout(600)
+    st = await speakBtn.getAttribute('data-status')
+  }
+  check('朗读进入播放态（自动或手动起播）', st === 'playing' || st === 'loading', `status=${st}`)
+  await page.waitForTimeout(400)
   await speakBtn.click()
   await page.waitForTimeout(400)
-  let st = await speakBtn.getAttribute('data-status')
+  st = await speakBtn.getAttribute('data-status')
   check('单击朗读按钮 = 暂停', st === 'paused', `status=${st}`)
   await speakBtn.click()
   await page.waitForTimeout(400)

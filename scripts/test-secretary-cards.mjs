@@ -160,6 +160,44 @@ cases.push(['控制器：长按重读 → loading → onPlaying 回到 playing',
   assert.equal(ctl.getSnapshot().key, 't1')
 }])
 
+cases.push(['胶囊色调：按类型词归类（关心/完成/探索/授权/默认服务）', () => {
+  assert.equal(surface.badgeTone('主动服务', '主动关心 · 明日武汉出差'), 'care')
+  assert.equal(surface.badgeTone('主动服务', '任务完成 · 备份已归档'), 'done')
+  assert.equal(surface.badgeTone('主动服务', '主动探索 · 新文献'), 'explore')
+  assert.equal(surface.badgeTone('征求授权', '需要你确认'), 'auth')
+  assert.equal(surface.badgeTone('主动服务', '每日汇总'), 'serve')
+  assert.equal(surface.badgeTone('', ''), 'serve')
+}])
+
+cases.push(['要点拆分：「天气：…」前缀加粗，无冒号整行是值', () => {
+  assert.deepEqual(surface.splitItemPrefix('天气：武汉明日 8–14℃'), { prefix: '天气：', rest: '武汉明日 8–14℃' })
+  assert.deepEqual(surface.splitItemPrefix('10:30 实验室开会'), { prefix: '', rest: '10:30 实验室开会' })
+  assert.deepEqual(surface.splitItemPrefix(''), { prefix: '', rest: '' })
+}])
+
+cases.push(['要点图标：天气/车次/时间/地点关键词，默认小圆点', () => {
+  assert.equal(surface.itemIcon('天气：多云'), '🌤')
+  assert.equal(surface.itemIcon('车次：G1545'), '🚄')
+  assert.equal(surface.itemIcon('时间：10:30'), '🕐')
+  assert.equal(surface.itemIcon('地点：华工'), '📍')
+  assert.equal(surface.itemIcon('建议带伞'), '·')
+}])
+
+cases.push(['一句话摘要：首行截断加省略号', () => {
+  assert.equal(surface.summarize('明天去武汉开会。\n第二段'), '明天去武汉开会。')
+  assert.equal(surface.summarize('一二三四五六七八九〇一二三四五六七八九〇一二三四五六七八九〇'), '一二三四五六七八九〇一二三四五六七八九〇一二…')
+  assert.equal(surface.summarize(''), '')
+}])
+
+cases.push(['卡片时间：今天/昨天/更早与非法输入', () => {
+  const now = new Date(2026, 10, 21, 12, 0)
+  assert.equal(surface.formatClock('2026-11-21T07:40:00', now), '今天 07:40')
+  assert.equal(surface.formatClock('2026-11-20T23:05:00', now), '昨天 23:05')
+  assert.equal(surface.formatClock('2026-11-18T08:30:00', now), '11月18日 08:30')
+  assert.equal(surface.formatClock('not-a-date', now), '')
+  assert.equal(surface.formatClock('', now), '')
+}])
+
 let failed = 0
 for (const [name, fn] of cases) {
   try {

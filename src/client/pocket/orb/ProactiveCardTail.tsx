@@ -7,10 +7,15 @@
  *     的卡片就用它），所以卡片长在消息流里、外观完全是原生会话页的一部分。
  *   - 只对「个人秘书固定会话」渲染，其它会话返回 null —— 普通会话外观一个像素都不变。
  *
- * 通用性：卡片内容来自宿主 /api/assistant/proactive 的卡组，字段固定
- *   { id, title, summary?, items?, details?, time?, badge? }
- * 秘书以后每条主动消息只要按这个形状落卡，渲染出来就是同一张卡（本组件没有
- * 「明日武汉出差」之类的硬编码）。
+ * 卡片结构（2026-11-21 按用户给的效果图重做）：
+ *   1. 标题行：小图标 + 类型胶囊（按类型换色换字：主动服务/主动关心/任务完成/
+ *      主动探索/征求授权）+ 粗体标题 + 最右朗读气泡（复用秘书朗读状态机）；
+ *   2. 正文：一段自然语言（15px、深灰、行高 1.6）；
+ *   3. 要点区：每行小图标/圆点开头，「前缀词：」加粗、值正常字重，2–4 条；
+ *   4. 底行：左侧 12px 浅灰时间，右侧「查看详情 / 收起」。
+ *
+ * 固定高度：折叠态高度恒定（约 210–230px，视视口），内容超出不撑高、直接截断；
+ * 点「查看详情」就地展开完整内容（含 details），展开后可收起。
  *
  * 稳定态守卫（防闪烁）：
  *   1. 首屏用模块缓存同步给到已渲染内容（有缓存就不会出现空态）；
@@ -19,6 +24,8 @@
  */
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
+import { badgeTone, itemIcon, splitItemPrefix } from './secretary-cards.ts'
+import { SecretarySpeakButton } from './SecretarySpeakButton.tsx'
 import type { OrbApi } from './orb-api.ts'
 
 export interface ProactiveCard {
@@ -32,6 +39,16 @@ export interface ProactiveCard {
   /** 引用的会话（可选）：渲染成可点引用块。 */
   refSessionId?: string
   refTitle?: string
+}
+
+/** 胶囊色调 → 图标（CSS 里按色调给配色，全部柔和浅色系）。 */
+const TONE_ICON: Record<string, string> = {
+  serve: '🌿', care: '🧡', done: '✅', explore: '🔎', auth: '🔔',
+}
+
+/** 卡片朗读文本：标题 + 摘要 + 要点（details 太长，不进朗读）。 */
+function speakableText(card: ProactiveCard): string {
+  return [card.title, card.summary ?? '', ...(card.items ?? [])].filter((line) => line !== '').join('\n')
 }
 
 interface CachedCards {
@@ -234,11 +251,13 @@ export function ProactiveCardTail({ sessionId, turn, seq, api }: { sessionId?: s
       {cards.map((card) => {
         const open = expanded.has(card.id)
         const items = card.items ?? []
+        const tone = badgeTone(card.badge ?? '', card.title)
         return (
           <article
             key={card.id}
             data-dsh-proactive="card"
             data-open={open ? '1' : '0'}
+            data-tone={tone}
             role="button"
             tabIndex={0}
             aria-expanded={open}
@@ -251,47 +270,59 @@ export function ProactiveCardTail({ sessionId, turn, seq, api }: { sessionId?: s
             }}
           >
             <div data-dsh-proactive="head">
-              <span data-dsh-proactive="badge">{card.badge || '主动服务'}</span>
+              <span data-dsh-proactive="badge" data-tone={tone}>
+                <span data-dsh-proactive="badge-icon" aria-hidden="true">{TONE_ICON[tone] ?? '🌿'}</span>
+                {card.badge || '主动服务'}
+              </span>
               <span data-dsh-proactive="title" title={card.title}>{card.title}</span>
+              <SecretarySpeakButton speakKey={`card:${card.id}`} rawText={speakableText(card)} />
             </div>
-            {card.summary !== undefined && card.summary !== '' && (
-              <p data-dsh-proactive="summary">{card.summary}</p>
-            )}
-            {items.length > 0 && (
-              <ul data-dsh-proactive="items">
-                {(open ? items : items.slice(0, 2)).map((item) => (
-                  <li key={item} data-dsh-proactive="item">{item}</li>
-                ))}
-              </ul>
-            )}
-            {open && card.details !== undefined && card.details !== '' && (
-              <div data-dsh-proactive="details">{card.details}</div>
-            )}
-            <div data-dsh-proactive="foot">
-              <span data-dsh-proactive="time">{card.time ?? ''}</span>
-              <span data-dsh-proactive="foot-actions">
-                {card.refSessionId !== undefined && (
-                  <button
-                    type="button"
-                    data-dsh-proactive="ref"
-                    title={`打开会话：${card.refTitle ?? card.refSessionId}`}
-                    onClick={(event: any) => {
-                      event.stopPropagation()
-                      try { api?.openSession?.(card.refSessionId ?? '') } catch { /* 交给 focusSession 兜底 */ }
-                      void api?.focusSession?.(card.refSessionId ?? '').catch(() => {})
-                    }}
-                  >
-                    ↗ {card.refTitle ?? card.refSessionId}
-                  </button>
-                )}
+            <div data-dsh-proactive="main">
+              {card.summary !== undefined && card.summary !== '' && (
+                <p data-dsh-proactive="summary">{card.summary}</p>
+              )}
+              {items.length > 0 && (
+                <ul data-dsh-proactive="items">
+                  {(open ? items : items.slice(0, 4)).map((item) => {
+                    const { prefix, rest } = splitItemPrefix(item)
+                    return (
+                      <li key={item} data-dsh-proactive="item">
+                        <span data-dsh-proactive="item-icon" aria-hidden="true">{itemIcon(item)}</span>
+                        {prefix !== '' && <b data-dsh-proactive="item-prefix">{prefix}</b>}
+                        <span data-dsh-proactive="item-text">{rest}</span>
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
+              {open && card.details !== undefined && card.details !== '' && (
+                <div data-dsh-proactive="details">{card.details}</div>
+              )}
+              {card.refSessionId !== undefined && (
                 <button
                   type="button"
-                  data-dsh-proactive="toggle"
-                  onClick={(event: any) => { event.stopPropagation(); toggle(card.id) }}
+                  data-dsh-proactive="ref"
+                  title={`打开会话：${card.refTitle ?? card.refSessionId}`}
+                  onClick={(event: any) => {
+                    event.stopPropagation()
+                    try { api?.openSession?.(card.refSessionId ?? '') } catch { /* 交给 focusSession 兜底 */ }
+                    void api?.focusSession?.(card.refSessionId ?? '').catch(() => {})
+                  }}
                 >
-                  {open ? '收起' : '查看详情'}
+                  <span data-dsh-proactive="ref-icon" aria-hidden="true">↗</span>
+                  <span data-dsh-proactive="ref-title">{card.refTitle ?? card.refSessionId}</span>
                 </button>
-              </span>
+              )}
+            </div>
+            <div data-dsh-proactive="foot">
+              <span data-dsh-proactive="time">{card.time ?? ''}</span>
+              <button
+                type="button"
+                data-dsh-proactive="toggle"
+                onClick={(event: any) => { event.stopPropagation(); toggle(card.id) }}
+              >
+                {open ? '收起' : '查看详情'}
+              </button>
             </div>
           </article>
         )
