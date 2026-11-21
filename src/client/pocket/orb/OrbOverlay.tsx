@@ -45,7 +45,8 @@ export function OrbOverlay({ api, t }: OrbOverlayProps) {
   // 打开期间只把层级抬到控制室之上（见 BALL_Z_RAISED），否则会被全屏控制室盖住。
   const controlRoomOpen = useSyncExternalStore(controlRoomStore.subscribe, controlRoomStore.getSnapshot)
   // 个人助手设置里的「启用悬浮球 / 悬浮球头像」：改完页内球实时跟随。
-  // 桌面端现在**同时**保留界面内这颗球与窗口外的原生球（两者功能相同：点一下打开控制室）；
+  // 桌面端现在**同时**保留界面内这颗球与窗口外的原生球，两颗球的两种手势完全一致
+  // （2026-11-21 对调：单击 = 个人秘书，长按 = 控制室）。
   // 不再因为存在原生球而隐藏界面内这颗——用户希望界面里也有一个入口。
   const ballConfig = useSyncExternalStore(ballConfigStore.subscribe, ballConfigStore.getSnapshot)
   // 惰性挂载：悬浮球页首次打开前不渲染（哪怕只是 display:none）——
@@ -64,14 +65,15 @@ export function OrbOverlay({ api, t }: OrbOverlayProps) {
           avatar={ballConfig.avatar || DEFAULT_ORB_AVATAR}
           raised={controlRoomOpen}
           onToggle={() => {
-            // 悬浮球 = 控制室开关（手机/电脑一致）：没开就打开，开着就关闭。
-            // 快捷输入页仍可从抽屉入口打开。
-            controlRoomStore.setOpen(!controlRoomOpen)
-          }}
-          onLongPress={() => {
-            // 长按 = 私人助手：单击进控制室的行为完全不变，助手走这条独立入口。
+            // 单击悬浮球 = 直接进个人秘书固定会话（2026-11-21 与桌面球一起对调；原单击是控制室）。
+            // 控制室开着时，点球仍是「收起控制室」——球就是它的开关，不然打开后点一下会没反应。
+            if (controlRoomOpen) { controlRoomStore.setOpen(false); return }
             controlRoomStore.setOpen(false)
             void openAssistant()
+          }}
+          onLongPress={() => {
+            // 长按 600ms = 控制室（原单击行为）；个人秘书改走单击。
+            controlRoomStore.setOpen(true)
           }}
         />
       )}
@@ -88,7 +90,7 @@ const BALL_EDGE = 8
 const BALL_Z_RAISED = 10080
 /** 判定为「拖拽」而非「点击」的位移阈值（px）。 */
 const DRAG_THRESHOLD = 6
-/** 长按判定时长（ms）：按住不动到这个时长 = 私人助手；移动超过阈值即取消。 */
+/** 长按判定时长（ms）：按住不动到这个时长 = 控制室；移动超过阈值即取消。 */
 const LONG_PRESS_MS = 600
 
 /** 把球位置夹在视口内（含安全边距）。 */
@@ -113,12 +115,12 @@ function defaultBall(): BallPoint {
 }
 
 /**
- * 可拖动悬浮球：按住拖到任意位置（松手记住位置），轻点开/关控制室，
- * **长按 600ms 打开私人助手**（单击行为保持不变）。
+ * 可拖动悬浮球：按住拖到任意位置（松手记住位置），
+ * **轻点直接进个人秘书固定会话**，**长按 600ms 打开控制室**（2026-11-21 对调，与桌面球一致）。
  * Pointer Events + setPointerCapture，触屏/鼠标通用；拖动时不让页面滚动。
  * @param raised - 控制室正开着（此时球要压在控制室之上，点一下是「关闭」）
- * @param onToggle - 轻点：取反控制室的开关状态
- * @param onLongPress - 长按：打开私人助手（不经过任何项目卡片）
+ * @param onToggle - 轻点：进个人秘书（控制室开着时改为收起它）
+ * @param onLongPress - 长按：打开控制室
  */
 function OrbBall({ label, avatar, raised = false, onToggle, onLongPress }: {
   label: string

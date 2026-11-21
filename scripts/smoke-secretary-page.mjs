@@ -110,6 +110,15 @@ const readHostSecretaryId = () => page.evaluate(async () => {
 const readCurrentSessionId = () => page.evaluate(() => {
   try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') } catch { return '' }
 })
+/** 单击（短按松手、不拖动）：2026-11-21 起 = 直接进个人秘书。 */
+const clickBall = async () => {
+  const ball = await page.$('button[data-pocket-orb="ball"]')
+  if (!ball) return false
+  const box = await ball.boundingBox()
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
+  return true
+}
+/** 长按 600ms（按住不动）：2026-11-21 起 = 打开控制室。 */
 const longPressBall = async () => {
   const ball = await page.$('button[data-pocket-orb="ball"]')
   if (!ball) return false
@@ -145,7 +154,7 @@ try {
   check('宿主下发的客户端 bundle 是本次构建', bundle.found && bundle.hasProactive && bundle.hasTurnDedup, JSON.stringify(bundle))
 
   const hostIdBefore = await readHostSecretaryId()
-  notes.push(`宿主固定会话 id（长按前）= ${hostIdBefore || '(空)'}`)
+  notes.push(`宿主固定会话 id（单击前）= ${hostIdBefore || '(空)'}`)
 
   // ── 观察窗口：DOM 变更计数 + 每 100ms 文本采样 ──
   await page.evaluate(() => {
@@ -159,7 +168,7 @@ try {
     }, 100)
   })
 
-  check('长按悬浮球', await longPressBall())
+  check('单击悬浮球', await clickBall())
 
   // 等主面板切到固定秘书会话：selection.sessionId == 宿主 id
   const hostIdNow = await readHostSecretaryId()
@@ -182,13 +191,16 @@ try {
     skeleton: document.querySelectorAll('[data-pocket-secretary="skeleton"], [data-dsh-proactive="skeleton"]').length,
     composer: !!document.querySelector('[contenteditable="true"], textarea'),
     cards: document.querySelectorAll('[data-dsh-proactive="card"]').length,
+    controlRoom: document.querySelectorAll('.dsh-assistant-cr').length,
     texts: window.__smokeTexts || [],
     // 采样只留前 500 字（卡片在上半屏时看不到底部状态行），这里单独取一次完整文本
     fullText: (document.body.innerText || '').slice(-3000),
   }))
-  notes.push(`切换结果: ${JSON.stringify(switched)}；宿主 id（长按后）= ${hostIdAfter}；selection = ${currentId}`)
+  notes.push(`切换结果: ${JSON.stringify(switched)}；宿主 id（单击后）= ${hostIdAfter}；selection = ${currentId}`)
 
-  check('长按 600ms 后主面板切到固定秘书会话', currentId !== '' && currentId === (hostIdAfter || ''), `selection=${currentId} host=${hostIdAfter}`)
+  check('单击悬浮球后主面板切到固定秘书会话', currentId !== '' && currentId === (hostIdAfter || ''), `selection=${currentId} host=${hostIdAfter}`)
+  // 2026-11-21 手势对调：单击进秘书，**不能**顺手把控制室也打开（两者不串）
+  check('单击没有打开控制室（手势不串）', snapshot.controlRoom === 0, `控制室节点=${snapshot.controlRoom}`)
   check('没有新建会话（宿主 id 没被换掉）', hostIdBefore === '' || hostIdAfter === hostIdBefore, `${hostIdBefore} → ${hostIdAfter}`)
   check('没有自制秘书外壳（data-pocket-secretary）', snapshot.customShell === 0, `count=${snapshot.customShell}`)
   check('没有骨架条', snapshot.skeleton === 0, `count=${snapshot.skeleton}`)
@@ -242,12 +254,12 @@ try {
     check('主动服务卡只在最末一轮出现一次（不重复）', single, JSON.stringify(groups))
   }
 
-  // ── 第二次长按：复用同一条会话、页面不重载 ──
+  // ── 第二次单击：复用同一条会话、页面不重载 ──
   const beforeSecond = await page.evaluate(() => ({
     stamp: window.__smokeStamp,
     local: String(localStorage.getItem('dsh.assistant.secretary.sessionId') || ''),
   }))
-  const pressed = await longPressBall()
+  const pressed = await clickBall()
   if (pressed) await page.waitForTimeout(3500)
   const afterSecond = await page.evaluate(async () => ({
     stamp: window.__smokeStamp,
@@ -255,7 +267,7 @@ try {
     host: String((await fetch('/api/assistant/secretary', { cache: 'no-store' }).then((res) => res.json()).catch(() => null))?.sessionId ?? ''),
     current: (() => { try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') } catch { return '' } })(),
   }))
-  check('重复长按没有重载页面', afterSecond.stamp === beforeSecond.stamp, `${beforeSecond.stamp} → ${afterSecond.stamp}`)
+  check('重复单击没有重载页面', afterSecond.stamp === beforeSecond.stamp, `${beforeSecond.stamp} → ${afterSecond.stamp}`)
   check('重复进入仍是同一条固定会话',
     afterSecond.local === beforeSecond.local && afterSecond.host === beforeSecond.local && afterSecond.current === afterSecond.host,
     JSON.stringify({ before: beforeSecond.local, after: afterSecond.local, host: afterSecond.host, current: afterSecond.current }))
@@ -270,6 +282,24 @@ try {
   check('页面 30s 内没崩', alive.title.includes('DeepSeek Harness') || alive.title.includes('个人秘书'), `title=${alive.title}`)
   check('30s 后卡片仍在（没有闪没）', !cardOk || alive.cards >= 1, `cards=${alive.cards}`)
   check('30s 后仍无自制外壳', alive.shell === 0)
+
+  // ── 长按 600ms：打开控制室，且**不能**走秘书入口（手势对调后的另一半，两者不串） ──
+  const logBefore = await page.evaluate(() => (window.__dshAssistantOpenLog || []).length)
+  const idBeforeLongPress = await readCurrentSessionId()
+  const longPressed = await longPressBall()
+  const controlRoomOpened = await page.waitForSelector('.dsh-assistant-cr', { timeout: 8000 }).then(() => true).catch(() => false)
+  await page.waitForTimeout(800)
+  const afterLongPress = await page.evaluate(() => ({
+    rooms: document.querySelectorAll('.dsh-assistant-cr').length,
+    current: (() => { try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') } catch { return '' } })(),
+    openLog: (window.__dshAssistantOpenLog || []).length,
+  }))
+  check('长按 600ms 打开控制室（手势对调）', longPressed && controlRoomOpened && afterLongPress.rooms > 0, `控制室节点=${afterLongPress.rooms}`)
+  check('长按没有走秘书入口（打开日志无新增）', afterLongPress.openLog === logBefore && afterLongPress.current === idBeforeLongPress,
+    `log ${logBefore} → ${afterLongPress.openLog}；selection ${idBeforeLongPress} → ${afterLongPress.current}`)
+  // 收起控制室，让截图仍是标准会话页
+  await page.click('.dsh-assistant-crClose', { timeout: 3000 }).catch(() => {})
+  await page.waitForTimeout(600)
 
   check('无未捕获异常', pageErrors.length === 0, JSON.stringify(pageErrors.slice(0, 3)))
   check('无（非既有噪声的）console error', consoleErrors.length === 0, JSON.stringify(consoleErrors.slice(0, 3)))

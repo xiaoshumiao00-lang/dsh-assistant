@@ -279,7 +279,7 @@ function ComputerUsePanel() {
         <div style={row}>
           <div>
             <div style={title}>启用悬浮球</div>
-            <p style={desc}>关闭后界面内悬浮球与桌面外悬浮球一起隐藏（控制室仍可从设置页或 ?assistant=console 打开）。桌面端默认窗口内、窗口外各一颗，点击都打开控制室。</p>
+            <p style={desc}>关闭后界面内悬浮球与桌面外悬浮球一起隐藏（控制室仍可从设置页或 ?assistant=console 打开）。桌面端默认窗口内、窗口外各一颗，两颗手势相同：<b>单击进个人秘书</b>，<b>长按 600ms 打开控制室</b>，Ctrl+Alt+A 也进个人秘书；按住可拖动位置，移动中不触发点击。</p>
           </div>
           <Toggle checked={ball.enabled} label="启用悬浮球" onChange={(enabled) => ballConfigStore.set({ enabled })} />
         </div>

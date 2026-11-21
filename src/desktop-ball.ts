@@ -17,6 +17,40 @@ import { focusDesktopMainWindow } from './desktop-focus'
 const DESKTOP_BALL_SINGLETON = '__dshAssistantDesktopBallSingleton'
 type DesktopBallSingleton = { generation: number; handle: DesktopBallHandle | null }
 
+/** 桌面球的手势。短按 = 松手时没拖动；长按 = 按住 600ms 且没拖动；hotkey = Ctrl+Alt+A。 */
+export type BallGesture = 'short-press' | 'long-press' | 'hotkey'
+/** 一次唤起要开哪块：'assistant' = 个人秘书固定会话，'console' = 控制室。 */
+export type BallIntent = 'console' | 'assistant'
+
+/**
+ * **手势 → 意图的唯一真值**（2026-11-21 用户要求对调）：
+ *   单击悬浮球 = 直接进个人秘书；长按 600ms = 进控制室；Ctrl+Alt+A 仍进秘书。
+ * 生成 helper 的代码与宿主 /api/assistant/ball 回报的映射都从这里取，避免两处漂移。
+ */
+export const BALL_GESTURE_INTENT: Record<BallGesture, BallIntent> = {
+  'short-press': 'assistant',
+  'long-press': 'console',
+  hotkey: 'assistant',
+}
+
+/** 取某个手势对应的意图。 */
+export function ballIntentFor(gesture: BallGesture): BallIntent {
+  return BALL_GESTURE_INTENT[gesture]
+}
+
+/**
+ * 桌面 helper 走 socket 上行的一行文本 → 意图（不认识返回 null）。
+ * 兼容旧 helper：旧版把单击发成 'click'（当年 = 控制室），这里仍按控制室处理；
+ * 新 helper 直接发 'console' / 'assistant' 两个意图名，避免「click 到底指哪块」的歧义。
+ */
+export function socketBallIntent(text: string): BallIntent | null {
+  const value = String(text ?? '').trim()
+  if (value === 'console' || value === 'click') return 'console'
+  if (value === 'assistant') return 'assistant'
+  return null
+}
+
+
 /** 插件热重载会创建新模块实例；注册表放在 globalThis 上，确保新实例接管前停掉旧桌面球。 */
 function desktopBallSingleton(): DesktopBallSingleton {
   const root = globalThis as any
@@ -74,7 +108,7 @@ b.addEventListener('mousedown', (e) => {
   if (e.button !== 0) return
   down = true; moved = 0; sx = e.screenX; sy = e.screenY; lpFired = false
   ipcRenderer.send('ball-down', { x: sx, y: sy })
-  // 长按 600ms = 私人助手；移动超过阈值即取消（拖动优先）。
+  // 长按 600ms = 控制室（单击松手 = 个人秘书，映射在宿主 HELPER_MAIN 里）；移动超过阈值即取消（拖动优先）。
   clearLp()
   lpTimer = setTimeout(() => { lpTimer = null; if (moved >= 6) return; lpFired = true; ipcRenderer.send('ball-long-press') }, 600)
 })
@@ -148,13 +182,13 @@ app.whenReady().then(() => {
   })
   ipcMain.on('ball-up', (_e, p) => {
     const moved = Number(p && p.moved) || 0
-    if (moved < 5) send('click')
+    if (moved < 5) send('${BALL_GESTURE_INTENT['short-press']}')
   })
-  // 长按球 = 私人助手：和轻点（控制室）走不同的意图。
-  ipcMain.on('ball-long-press', () => { send('assistant') })
-  // 桌面全局热键：窗口不在前台也能唤起助手。
+  // 长按球 = 控制室（和短按相反；映射见 BALL_GESTURE_INTENT，改一处即可）。
+  ipcMain.on('ball-long-press', () => { send('${BALL_GESTURE_INTENT['long-press']}') })
+  // 桌面全局热键：窗口不在前台也能唤起个人秘书（与单击同向）。
   try {
-    globalShortcut.register('Control+Alt+A', () => { send('assistant') })
+    globalShortcut.register('Control+Alt+A', () => { send('${BALL_GESTURE_INTENT.hotkey}') })
   } catch {}
   connect()
 })
@@ -164,7 +198,7 @@ app.on('will-quit', () => { try { globalShortcut.unregisterAll() } catch {} })
 
 export interface DesktopBallHandle {
   dispose: () => void
-  /** 取走一次待处理意图：轻点 = console，长按/热键 = assistant；没有则 null。 */
+  /** 取走一次待处理意图：单击 = assistant（个人秘书），长按 = console（控制室）；没有则 null。 */
   takeClick: () => 'console' | 'assistant' | null
   /** 意图发生时即时唤醒长轮询；pendingIntent 仍保留，兼顾尚未等待的客户端。 */
   onClick: (listener: (intent: 'console' | 'assistant') => void) => () => void
@@ -202,7 +236,7 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
   }
 
   const token = randomBytes(16).toString('hex')
-  /** 桌面球送来的意图：轻点 = console，长按 / 全局热键 = assistant。 */
+  /** 桌面球送来的意图：单击 = assistant（个人秘书），长按 = console（控制室），热键 = assistant。 */
   let pendingIntent: 'console' | 'assistant' | null = null
   const clickListeners = new Set<(intent: 'console' | 'assistant') => void>()
   let child: any = null
@@ -225,10 +259,10 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
           else { try { sock.destroy() } catch {} }
           continue
         }
-        if (text === 'click' || text === 'assistant') {
+        const intent = socketBallIntent(text)
+        if (intent !== null) {
           // 先让长轮询把意图送到页面，再在下一拍恢复主窗焦点；
           // 即使 Win32 聚焦调用很慢，也不会把这次点击卡在宿主事件循环里。
-          const intent = text === 'assistant' ? 'assistant' : 'console'
           pendingIntent = intent
           for (const listener of [...clickListeners]) { try { listener(intent) } catch {} }
           setImmediate(() => { try { focusDesktopMainWindow() } catch {} })
@@ -302,4 +336,13 @@ export async function startDesktopBall(ctx: any, opts: { avatar?: string } = {})
   return handle
 }
 
-export { BALL_HTML }
+export { BALL_HTML, HELPER_MAIN }
+
+/** 单测入口：手势映射与「真正写进 helper 的那段代码」同源，避免只测常量、不测生成结果。 */
+export const desktopBallTestSurface = {
+  BALL_GESTURE_INTENT,
+  ballIntentFor,
+  socketBallIntent,
+  helperMain: (): string => HELPER_MAIN,
+  ballHtml: (): string => BALL_HTML,
+}

@@ -14,7 +14,7 @@ import * as turnGuard from './turn-guard'
 import { registerAssistantState } from './assistant-store'
 import { registerCoordinateMode } from './coordinate-mode'
 import { CONSOLE_SEA01_ROUTE, serveConsoleSea01 } from './consoleAsset'
-import { startDesktopBall, ballProfileDir } from './desktop-ball'
+import { startDesktopBall, ballProfileDir, BALL_GESTURE_INTENT } from './desktop-ball'
 import { nativeFocusAvailability } from './desktop-focus'
 import { manageWebRoutes } from './web-routes'
 import { registerAssistantHome } from './assistant-home'
@@ -50,6 +50,8 @@ export { registerAssistantArchive, assistantArchiveTestSurface, collectArchive, 
 export { assistantSecretaryTestSurface } from './assistant-secretary'
 export { assistantDispatchTestSurface } from './assistant-dispatch'
 export { assistantProactiveTestSurface } from './assistant-proactive'
+/** 桌面球手势 → 意图的映射与生成出来的 helper 代码（供 scripts/test-desktop-ball-gestures.mjs） */
+export { desktopBallTestSurface } from './desktop-ball'
 /** 目录 allowlist 与终端环境变量（供 scripts/test-path-guard.mjs 直接验） */
 export { expandHome, defaultAllowedRoots, createPathGuard, minimalTermEnv, isDirectory } from './path-guard'
 /** turn-guard 的判定与状态函数（供 scripts/test-turn-guard.mjs 直接验） */
@@ -118,7 +120,8 @@ export function apply(ctx: any, config: any = {}): () => void {
 
   // 点击事件用长轮询推给页面：有等待者时立刻响应，没有时仍保留一次性 pending。
   // 与旧的 1.2s 定时轮询相比，点击延迟不再取决于下一次轮询何时发生。
-  // intent 区分这次唤起要开哪块：'console' = 控制室（轻点球），'assistant' = 私人助手（长按球 / 全局热键）。
+  // intent 区分这次唤起要开哪块：'assistant' = 个人秘书固定会话（单击球 / Ctrl+Alt+A），
+  // 'console' = 控制室（长按球）。手势 → 意图的唯一真值在 desktop-ball.ts 的 BALL_GESTURE_INTENT。
   type Intent = 'console' | 'assistant'
   let pendingOpen: Intent | null = null
   type ClickWaiter = { res: any; timer: ReturnType<typeof setTimeout> | null; done: boolean }
@@ -227,7 +230,14 @@ export function apply(ctx: any, config: any = {}): () => void {
           })
           return
         }
-        const payload = JSON.stringify({ native: nativeBall, enabled: ballState.enabled, hasAvatar: !!ballState.avatar })
+        // gestures：桌面球当前的手势映射（单击 → 个人秘书 / 长按 → 控制室 / 热键 → 个人秘书）。
+        // 页面冒烟与设置页都读这一份，避免「代码改了、说明没改」。
+        const gestures = {
+          shortPress: BALL_GESTURE_INTENT['short-press'],
+          longPress: BALL_GESTURE_INTENT['long-press'],
+          hotkey: BALL_GESTURE_INTENT.hotkey,
+        }
+        const payload = JSON.stringify({ native: nativeBall, enabled: ballState.enabled, hasAvatar: !!ballState.avatar, gestures })
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
         res.end(payload)
       },

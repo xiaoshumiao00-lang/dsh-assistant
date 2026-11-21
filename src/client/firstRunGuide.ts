@@ -31,16 +31,16 @@ const ZH: GuideText[] = [
     body: [
       '球 = 你的助手入口，不是聊天窗。它背后是同一个常驻会话（家目录 ~/.dsh/assistant）。',
       '会话里有固定人设（AGENTS.md）、按天日志（journal/）、长期档案（notes/）、杂物间（outputs/）。',
-      '长按 600ms 或 Ctrl+Alt+A 才是找助手做事；单击球只是开控制室。',
+      '单击球 或 Ctrl+Alt+A 直接进个人秘书做事；长按 600ms 打开控制室。',
     ],
     primary: '下一步', secondary: '后一跳', skip: '关闭',
   },
   {
     id: 'click',
-    title: '单击球 = 控制室，长按球 = 助手',
+    title: '单击球 = 个人秘书，长按球 = 控制室',
     body: [
-      '单击：控制室（项目卡片、会话、模板流程、新建会话）。',
-      '长按 600ms：直接进助手会话；控制室顶栏也有「🤖 私人助手」按钮，网页地址加 ?assistant=chat 也能直达。',
+      '单击：直接进个人秘书固定会话（会话、角色、记忆都在那儿）。',
+      '长按 600ms：控制室（项目卡片、会话、模板流程、新建会话）；Ctrl+Alt+A 随时进个人秘书，网页地址加 ?assistant=chat 也能直达。',
       '助手在控制室里就是一张普通项目卡（排在最前）；你删了它不会再自动重建（尊重你的删除）。',
     ],
     primary: '下一步', secondary: '后一跳', skip: '关闭',
@@ -64,16 +64,16 @@ const EN: GuideText[] = [
     body: [
       'The ball is your assistant entry point, not a chat window. Behind it sits one resident session (home directory ~/.dsh/assistant).',
       'That session has a fixed persona (AGENTS.md), a per-day log (journal/), long-term notes (notes/) and a scratch bin (outputs/).',
-      'Press and hold 600ms (or Ctrl+Alt+A) to work with the assistant; a plain click just opens the control room.',
+      'A plain click (or Ctrl+Alt+A) goes straight to the personal secretary; press and hold 600ms opens the control room.',
     ],
     primary: 'Next', secondary: 'Do it later', skip: 'Close',
   },
   {
     id: 'click',
-    title: 'Click = control room, press and hold = assistant',
+    title: 'Click = personal secretary, press and hold = control room',
     body: [
-      'Click: control room (project cards, sessions, template flows, new session).',
-      'Press and hold 600ms: straight into the assistant session. The control room top bar has a "🤖 Private assistant" button, and ?assistant=chat in the address bar goes there directly.',
+      'Click: straight into the fixed personal-secretary session (sessions, persona and memory live there).',
+      'Press and hold 600ms: control room (project cards, sessions, template flows, new session). Ctrl+Alt+A always opens the personal secretary, and ?assistant=chat works too.',
       'In the control room the assistant is just a normal project card (first in the list). If you delete it, it will not be rebuilt (your delete is respected).',
     ],
     primary: 'Next', secondary: 'Do it later', skip: 'Close',

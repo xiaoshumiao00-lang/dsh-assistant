@@ -70,8 +70,8 @@ DeepSeek Harness 一体化助手插件：**悬浮球 → 控制室**，外加**�
 
 不用开项目卡片，直接找「会记得你做过什么」的助手。
 
-- **个人秘书就是一条普通会话（2026-11-21 起）**：控制室第一张固定卡「📁 个人秘书」，手机长按悬浮球 600ms、桌面 Ctrl+Alt+A，都直接在**主面板打开这条固定会话**——外观 100% 是 pocket 现成的会话页（☰ / 标题 / 对话·轨迹 / 气泡 / 头像 / 点赞行 / composer / 底部统计），插件不再有自己的顶栏、卡片瀑布、自制输入框或只读·托管状态条。ID 存在宿主 `<profile>/dsh-assistant-secretary.json`，**不会因为列表里一时看不到就新建**；目录固定 `~/.dsh/assistant/`，并自动置顶。
-- **打开页不等待网络（2026-11-21 实测修复）**：长按后有缓存 id 就 0 请求直接切页，「校验 / 恢复归档 / 重命名 / 置顶 / 持久化 / 关托管 / 切只读」在后台并行跑且每步 12s 上限；任何一步慢或失败都只进诊断（`window.__dshAssistantOpenLog`），不挡打开、不挂黄字、不回退骨架屏。
+- **个人秘书就是一条普通会话（2026-11-21 起）**：控制室第一张固定卡「📁 个人秘书」，单击悬浮球、桌面 Ctrl+Alt+A，都直接在**主面板打开这条固定会话**——外观 100% 是 pocket 现成的会话页（☰ / 标题 / 对话·轨迹 / 气泡 / 头像 / 点赞行 / composer / 底部统计），插件不再有自己的顶栏、卡片瀑布、自制输入框或只读·托管状态条。ID 存在宿主 `<profile>/dsh-assistant-secretary.json`，**不会因为列表里一时看不到就新建**；目录固定 `~/.dsh/assistant/`，并自动置顶。
+- **打开页不等待网络（2026-11-21 实测修复）**：单击后有缓存 id 就 0 请求直接切页，「校验 / 恢复归档 / 重命名 / 置顶 / 持久化 / 关托管 / 切只读」在后台并行跑且每步 12s 上限；任何一步慢或失败都只进诊断（`window.__dshAssistantOpenLog`），不挡打开、不挂黄字、不回退骨架屏。
 - **切页走「能真正切过去」的那条路**：客户端 ctx 是声明式注入门禁代理，`ctx.uiWorkspace` 在部分宿主上拿不到实例（真页面实测：openSession 静默失败 → 长按没反应）。现在统一用控制室那份会话桥（`src/client/session-open.ts`）切页，并校验 `selection.sessionId` 是否真落到目标会话，没落到就退避重试。
 - **主动服务卡片**：秘书的主动消息在会话页「本轮尾部」渲染成一张卡（标题 / 摘要 / 要点 / 时间 / 查看详情），挂在宿主槽位 `conversation.chat.turnTail`，只对固定秘书会话生效；卡片数据在宿主 `/api/assistant/proactive`（`src/assistant-proactive.ts`），首次启动种一张「明天武汉出差」示例卡。
 - **秘书是只读会话**：打开时切到「仅可查看」并显式关闭托管；宿主侧工具闸只放行只读/汇总工具（read/grep/web/mnemon/session_*），拒绝 shell、写文件、Computer Use、子代理和未知工具。
@@ -80,7 +80,7 @@ DeepSeek Harness 一体化助手插件：**悬浮球 → 控制室**，外加**�
 - **私人助手项目卡仍在**：图标 🤖、名称「私人助手」，排在那张固定秘书卡之后。状态灯（绿/黄/红/蓝）、中间实时进度、运行时长、子代理数、「会话列表」、「＋新建 / 对话」「＋新建 / 电脑操作」、重命名、换图标、隐藏、拖拽排序——与其他项目卡完全同一套逻辑，不是另写的卡片类型。
 - **助手会话不再混进「正在运行」临时卡片**：助手目录被认作项目文件夹后，该目录下的会话归这张卡；删卡后写 `removed` 墓碑，不再自动重建（用户删掉就是明确不要）。
 - **建卡时机**：首次同步（宿主状态覆盖本地）之后才建，且按 `layouts/removed` 变化重试最多 6 次——避免「建好又被采纳覆盖吃掉」。
-- **入口不止三个**：轻点悬浮球仍是控制室（行为没改）；**长按悬浮球 600ms** 进个人秘书；电脑上 **Ctrl+Alt+A** 全局热键；控制室第一张「个人秘书」卡；控制室顶栏右侧的「🤖 私人助手」按钮；卡片本体的「会话列表」；页面地址 `?assistant=chat` / `#assistant`；宿主路由 `POST /api/assistant/open-assistant`（外部唤起）。单击球永远只开控制室。
+- **入口不止三个（手势 2026-11-21 对调）**：**单击悬浮球直接进个人秘书**；**长按悬浮球 600ms** 打开控制室；电脑上 **Ctrl+Alt+A** 全局热键；控制室第一张「个人秘书」卡；控制室顶栏右侧的「🤖 私人助手」按钮；卡片本体的「会话列表」；页面地址 `?assistant=chat` / `#assistant`；宿主路由 `POST /api/assistant/open-assistant`（外部唤起）。界面内那颗球与窗口外那颗球手势一致；按住拖动只移动位置、不触发任何点击。旧行为（单击=控制室、长按=秘书）已不再适用。
 - **助手住在固定目录** `~/.dsh/assistant/`：`AGENTS.md`（人设 + 「什么时候直接做、什么时候建卡」+ 记忆与归档规矩，只在缺失时写入，不覆盖手改）、`journal/YYYY-MM-DD.md`（收工日志）、`notes/`（长期档案）、`outputs/`（杂物间）、`archive/`（搬走的老资料）。
 - **家目录不会越用越臃肿**：会话日志根本不在这个目录（DSH 存在 `~/.dsh/sessions/<目录编码>/`），这里只有记忆资产 + 临时产物。每 6 小时（以及 `POST /api/assistant/tidy`）自动收一次：`outputs/` 里超过 **14 天**的文件直接删；`journal/` 满 **90 天**、或文件数超过 180 份的，搬进 `archive/journal/<年份>/`；`notes/` 总量超过 **8MB** 的搬进 `archive/notes/`；`archive/` 只搬不删（软上限 32MB 时面板上报告到顶了）。数量与是否到上限都显示在记忆面板里。
 - **记忆面板**：设置 →「个人助手」→「🧠 它记下了什么」。逐条看 / 复制 / 删（先备份，`restartRequired` 明说）、整侧清空（要连点两次 + `DELETE-ALL`）、导出 `.md`；助手目录各区的文件数与体积、上限与「已到上限」都在这页。热记忆真值 `~/.mnemon/runtime/memories.json` 由插件直接改（写入前先备份成 `*.dsh-assistant-backup-<时间戳>`），改完要重启 DSH Desktop。
@@ -95,7 +95,7 @@ DeepSeek Harness 一体化助手插件：**悬浮球 → 控制室**，外加**�
 - **助手档案导出 / 导入**：页底的「📦 导出助手档案」与「📥 导入助手档案」（`src/assistant-archive.ts`）。导出是**单一 JSON 清单**（仓库里没有压缩库，也不为此新引一个 devDependency）：AGENTS.md、`journal/`、`notes/`、`archive/`、`config.json`、`USER.md` / `MEMORY.md` / `memories.json`、跨端状态 json；每项带相对路径、字节数与 SHA-256，整包带 `checksum`、文件数与总体积。导出的文件落 `~/.dsh/assistant/exports/archive-<时间戳>.json`（`exports/` 不在 `outputs/` 的 14 天自动清范围里，不会被悄悄删掉）。导入按 `?` 规则走：先校验 `checksum`（对不上整包拒绝，一个文件都不落）、把现有 AGENTS.md / journal / notes 现状备份到 `archive/import-backup-<时间戳>/`、按文件夹判重（内容 hash 一样 → 跳过）、内容不一样 →【不覆盖】，另存成 `<原名>.imported-<时间戳>.<后缀>`；`state` 区一律拒收（删除墓碑不写回，报告里 `tombstonesIgnored` 说明数量）；包里的相对路径不许跳出该区目录（`../` 与绝对路径都拒）。本机没有的预设 / 模板 id 不静默：报告 `missingPresets` 列表。UI 上直接打印「导入了什么、跳过了什么、冲突另存成哪、备份目录在哪、墓碑没写回」。`dryRun:true` 只报告不落盘。
 - 宿主路由：`GET /api/assistant/home`（含 usage/limits/文件清单）、`GET /api/assistant/memory`、`POST /api/assistant/memory-entry-delete`、`POST /api/assistant/memory-clear`（要 `confirm:'DELETE-ALL'`）、`GET|POST /api/assistant/tidy`（收 + 归档）、`GET /api/assistant/config`、`GET|POST /api/assistant/state`、`GET|POST /api/assistant/secretary`（固定秘书 ID）、`GET|POST|DELETE /api/assistant/proactive`（主动服务卡片；首次启动种一张示例卡）、`GET|POST /api/assistant/open-assistant`（热键/外部唤起，带 intent 复用悬浮球长轮询）、`GET /api/assistant/diagnostics` + `POST /api/assistant/diagnostics/export`（一键诊断包，见下）、`GET /api/assistant/archive` + `POST /api/assistant/archive/export` + `POST /api/assistant/archive/import`（助手档案导出/导入，见下）。
 - 直达：`…/?assistant=chat` 或 `…/#assistant`。
-- **升级后需重启一次 DSH Desktop**：宿主新增的路由、全局热键与桌面球长按都要宿主重启才生效（只刷新页面只能拿到新客户端）。v0.2.10 改的全是客户端，刷新页面即可生效；**只要动过宿主侧代码（路由 / 热键 / 服务），就必须重启 DSH Desktop**。
+- **升级后需重启一次 DSH Desktop**：宿主新增的路由、全局热键与桌面球手势映射都要宿主重启才生效（只刷新页面只能拿到新客户端）。v0.2.10 改的全是客户端，刷新页面即可生效；**只要动过宿主侧代码（路由 / 热键 / 服务 / 桌面球 helper），就必须重启 DSH Desktop**。
 
 ### 手机访问（原 dsh-pocket 全套）
 
