@@ -1,107 +1,76 @@
 /**
- * 个人秘书 v4 日志修复 CLI：
- *   node scripts/repair-secretary-session-log.mjs [--dry-run] <session-dir-or-jsonl-zstd>
- * 默认目标来自环境变量 DSH_ASSISTANT_SECRETARY_SESSION_DIR（或 DSH_ASSISTANT_SESSION_DIR），脚本本身不写死个人目录。
+ * 个人秘书 v4 日志修复 CLI（宿主真实解析器校验版）。
+ *
+ *   node scripts/repair-secretary-session-log.mjs [--dry-run] [--parser <宿主解析器 lib/index.js>] <session 目录 | session.v4.jsonl.zstd>
+ *
+ * 纪律（2026-11-21 事故后重写）：
+ *   1. **不再自己写简化校验器**：合并/重编号后用宿主同一套解析器
+ *      `@deepseek-ai/dsh-session-format-v3-to-v4` 的 restoreReleasedV4Artifact 做 dry-run；
+ *   2. 写入前先备份 `<file>.bak-<时间戳>`，原子写（tmp + rename）；
+ *   3. 写入后再解压回读、再用同一解析器校验一遍；
+ *   4. 任何一步失败立即回滚到备份，绝不留下半截轮；
+ *   5. 找不到宿主解析器就直接拒绝写入（fail closed），不做"看着差不多"的放行。
+ *
+ * 解析器位置：--parser > 环境变量 DSH_HOST_PARSER > 本机已知检出目录。
+ * 事件词表：环境变量 DSH_HOST_SESSION_MODULE > 由解析器位置推出（packages/core/session/lib/index.js）。
  */
 import { createRequire } from 'node:module'
-import { renameSync, writeFileSync, readFileSync, existsSync, statSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { existsSync, readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const require = createRequire(fileURLToPath(import.meta.url))
 const lib = require('../lib/index.js')
 const surface = lib.assistantSecretaryTestSurface
 
-const args = process.argv.slice(2).filter((arg) => !arg.startsWith('--'))
-const target = args[0] ?? process.env.DSH_ASSISTANT_SECRETARY_SESSION_DIR ?? process.env.DSH_ASSISTANT_SESSION_DIR ?? ''
-if (target === '') throw new Error('usage: node scripts/repair-secretary-session-log.mjs [--dry-run] <session-dir-or-jsonl-zstd>')
-const dryRun = process.argv.includes('--dry-run')
-const logPath = existsSync(target) && statSync(target).isDirectory() ? join(target, 'session.v4.jsonl.zstd') : target
-const dir = dirname(logPath)
-
-const original = readFileSync(logPath)
-const decompressed = surface.decompressSessionLogBytes(original)
-const repaired = surface.repairSecretaryLogText(decompressed)
-const compressed = surface.compressSessionLogText(repaired)
-const roundtrip = surface.decompressSessionLogBytes(compressed)
-if (roundtrip !== repaired) throw new Error('round trip mismatch')
-
-function validate(text) {
-  let openTurn = 0
-  let openStep = 0
-  let nextTurn = 1
-  let nextStep = 1
-  let seq = 0
-  let sawHeader = false
-  for (const line of text.trimEnd().split(/\r?\n/)) {
-    if (line.trim() === '') continue
-    const event = JSON.parse(line)
-    if (!sawHeader) {
-      if (event.type !== 'session' || event.seq !== undefined) throw new Error('missing v4 header line')
-      sawHeader = true
-      seq = -1
-      continue
-    }
-    if (Number(event.seq) !== ++seq) throw new Error(`event ${event.type} has bad seq ${event.seq}, expected ${seq}`)
-    const data = event.data ?? {}
-    const turn = Number(data.turn ?? 0)
-    const step = Number(data.step ?? 0)
-    if (event.type === 'turn/start') {
-      if (openTurn !== 0 || turn !== nextTurn) throw new Error(`turn/start ${event.seq} opens ${turn} but expects ${nextTurn} open=${openTurn}`)
-      openTurn = turn
-      openStep = 0
-      nextStep = 1
-    }
-    if (event.type === 'step/start') {
-      if (openTurn === 0 || openTurn !== turn || openStep !== 0 || step !== nextStep) throw new Error(`step/start ${event.seq} invalid open=${openTurn}/${openStep} step=${step} expected=${nextStep}`)
-      openStep = step
-    }
-    if (event.type === 'step/end') {
-      if (openTurn === 0 || openTurn !== turn || openStep !== step) throw new Error(`step/end ${event.seq} invalid open=${openTurn}/${openStep}`)
-      openStep = 0
-      nextStep = step + 1
-    }
-    if (event.type === 'turn/end') {
-      if (openTurn === 0 || openTurn !== turn || openStep !== 0) throw new Error(`turn/end ${event.seq} invalid open=${openTurn}/${openStep}`)
-      openTurn = 0
-      nextTurn = turn + 1
-      nextStep = 1
-    }
-    if (['assistant/message', 'assistant/attempt', 'tool/call', 'tool/result'].includes(event.type)) {
-      if (openTurn === 0 || openTurn !== turn || openStep !== step) throw new Error(`${event.type} ${event.seq} invalid open=${openTurn}/${openStep}`)
-    }
+const argv = process.argv.slice(2)
+const dryRun = argv.includes('--dry-run')
+const parserIndex = argv.indexOf('--parser')
+const parserPath = parserIndex >= 0 ? String(argv[parserIndex + 1] ?? '') : ''
+const positional = []
+for (let index = 0; index < argv.length; index += 1) {
+  const arg = argv[index]
+  if (arg.startsWith('--')) {
+    if (arg === '--parser') index += 1
+    continue
   }
-  if (!sawHeader) throw new Error('empty repaired log')
-  if (openTurn !== 0 || openStep !== 0) throw new Error('repaired log ends with open turn/step')
+  positional.push(arg)
 }
+const target = positional[0]
+  ?? process.env.DSH_ASSISTANT_SECRETARY_SESSION_DIR
+  ?? process.env.DSH_ASSISTANT_SESSION_DIR
+  ?? ''
+if (target === '') {
+  throw new Error('usage: node scripts/repair-secretary-session-log.mjs [--dry-run] [--parser <lib/index.js>] <session-dir-or-jsonl-zstd>')
+}
+const logPath = existsSync(target) && statSync(target).isDirectory() ? join(target, 'session.v4.jsonl.zstd') : target
+if (!existsSync(logPath)) throw new Error(`找不到会话日志：${logPath}`)
 
-validate(roundtrip)
-const repairedLines = repaired.trimEnd().split(/\r?\n/)
-const originalLines = decompressed.trimEnd().split(/\r?\n/)
-const result = surface.repairSecretaryLogLines(originalLines)
+// fail closed：解析器拿不到就不写。
+const parser = lib.loadHostLogParser(parserPath)
+
+const originalText = lib.decompressLogBytes(readFileSync(logPath))
+const details = surface.repairSecretaryLogLines(originalText.split(/\r?\n/))
+
+const report = lib.rewriteSessionLogFileSync({
+  file: logPath,
+  parser,
+  dryRun,
+  transform: (text) => surface.repairSecretaryLogText(text),
+})
+
 console.log(JSON.stringify({
   target: logPath,
-  dryRun,
-  originalBytes: original.length,
-  originalLines: originalLines.length,
-  repairedLines: repairedLines.length,
-  droppedOldSeqs: result.droppedOldSeqs,
-  staleReferences: result.staleReferences,
+  dryRun: report.dryRun,
+  parser: parser.source,
+  vocabulary: parser.vocabulary,
+  beforeEvents: report.beforeEvents,
+  afterEvents: report.afterEvents,
+  beforeBytes: report.beforeBytes,
+  afterBytes: report.afterBytes,
+  backupPath: report.backupPath || null,
+  droppedOldSeqs: details.droppedOldSeqs,
+  staleReferences: details.staleReferences,
+  verifiedBy: 'restoreReleasedV4Artifact（宿主解析器，写入前 dry-run + 写入后回读）',
 }, null, 2))
-
-if (dryRun) {
-  const out = join(dir, 'session.v4.jsonl.zstd.repaired-preview.jsonl')
-  writeFileSync(out, repaired, 'utf8')
-  const outZstd = join(dir, 'session.v4.jsonl.zstd.repaired-preview.jsonl.zstd')
-  writeFileSync(outZstd, compressed)
-  console.log('preview:', out)
-  console.log('preview:', outZstd)
-} else {
-  const tmp = join(dir, `session.v4.jsonl.zstd.repairing-${Date.now()}`)
-  writeFileSync(tmp, compressed)
-  validate(surface.decompressSessionLogBytes(readFileSync(tmp)))
-  renameSync(tmp, logPath)
-  const decompressedOut = join(dir, 'session.v4.jsonl.zstd.decompressed.jsonl')
-  if (existsSync(decompressedOut)) writeFileSync(decompressedOut, repaired, 'utf8')
-  console.log('replaced:', logPath)
-}
+console.log(dryRun ? 'dry-run：只校验，没有写盘' : `replaced: ${logPath}`)

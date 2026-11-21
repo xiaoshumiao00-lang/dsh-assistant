@@ -12,20 +12,22 @@
  *   3. 完成内容 = 同一 turn 的 `assistant/message` 事件里 message.content 的 text 块；
  *      本模块在事件流上顺手收集，不另开历史读取通道。
  *
- * 卡片消息 = 往秘书固定会话追加一条**合成完成轮**（turn/start → step/start →
- * assistant/message → step/end → turn/end completed，与宿主 agent 落盘的事件序列同形）。
- * 秘书页的回复卡片（SecretaryReplyCard）据此渲染：正文是简洁口语摘要，末尾
- * `[[session:<cuSessionId>|<标题>]]` 渲染成可点引用块（左竖线 + 淡底），点击按会话 id
- * 跳进那条 CU 会话详情；卡片同时被自动朗读，所以正文按朗读友好规范写。
+ * 卡片消息 = 把一条说明「CU 会话完成了」的系统通知**交给宿主官方 prompt 通道**
+ * （`agent.followup`），由宿主自己开轮、自己编号、自己落盘；插件不再拼任何 turn/step
+ * 事件（旧写法会把 turn 号写成宿主的重复轮，直接把会话日志写坏，详见 postSecretaryNotice）。
+ * 秘书页的回复卡片（SecretaryReplyCard）据此渲染：正文是秘书口语汇报，模型按通知里的
+ * 要求把 `[[session:<cuSessionId>|<标题>]]` 原样留在末尾，渲染成可点引用块（左竖线 + 淡底），
+ * 点击按会话 id 跳进那条 CU 会话详情；卡片同时被自动朗读。
  *
  * 纪律：
  *   - 只听 CU 模式会话；标准会话（包括 CU 后台 code_agent 派出的标准会话）不汇报；
  *   - 子代理会话（origin=subagent / delegationDepth>0）不汇报；秘书会话自身不汇报；
- *   - 同一 (sessionId, turn) 只报一次（内存去重；重启后只监听新事件，不会重报旧轮）。
+ *   - 同一 (sessionId, turn) 只报一次（内存去重；重启后只监听新事件，不会重报旧轮）；
+ *   - 通知回合的工具由 assistant-secretary.ts 全禁，避免「通知 → 再派活 → 再通知」的回路。
  */
 import { randomUUID } from 'node:crypto'
 import { manageWebRoutes } from './web-routes'
-import { secretarySessionRef } from './assistant-secretary'
+import { registerNoticeMessageId, secretarySessionRef } from './assistant-secretary'
 
 export const CU_PRESET = 'computer-use'
 export const CU_NOTIFY_ROUTE = '/api/assistant/cu-watch/notify'
@@ -55,13 +57,37 @@ export function shouldReportCompletion(input: {
   return true
 }
 
-/** 通知正文：简洁口语 + 末尾会话引用标记（渲染成可点跳引用块，朗读时剔除）。 */
+/* ---------- 通知投递：走宿主官方 prompt 通道，插件不再自己写任何日志事件 ---------- */
+
+/**
+ * 汇报消息正文。**这是发给秘书模型的一条系统通知**（角色是 user，宿主的 prompt 通道
+ * 只接受这个角色），所以开头必须自我说明，结尾必须把会话引用原样留给卡片渲染。
+ */
 export function buildCompletionNotice(input: { sessionId: string; title: string; summary: string }): string {
   const title = String(input.title ?? '').trim() || '电脑上的任务'
   const summary = String(input.summary ?? '').trim()
-  const head = `电脑操作会话「${title}」这一轮跑完了。`
-  const body = summary !== '' ? summary : '具体结果那条会话里有，点下面引用就能过去看。'
-  return `${head}${body}\n[[session:${input.sessionId}|${title}]]`
+  return [
+    '（系统通知，不是用户说的话）',
+    `电脑操作会话「${title}」这一轮已经完成。`,
+    summary !== '' ? `它最后一句结果：${summary}` : '它没有留下文字结果。',
+    '请用一两句口语向用户汇报这件事；这一回合工具已全部禁用，不要尝试派活或查询。',
+    `最后单独一行原样输出：[[session:${input.sessionId}|${title}]]`,
+  ].join('\n')
+}
+
+/** 一条交给宿主 prompt 通道的 user 消息（形状与宿主 createUserMessage 一致）。 */
+export function buildNoticeMessage(input: { sessionId: string; title: string; summary: string }): {
+  id: string
+  role: 'user'
+  content: Array<{ type: 'text'; text: string }>
+  source: { kind: 'user' }
+} {
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text: buildCompletionNotice(input) }],
+    source: { kind: 'user' },
+  }
 }
 
 /** 摘要取最后一条回复的首句，截断到 120 字（朗读友好）。 */
@@ -70,25 +96,6 @@ export function summarizeCompletion(text: string): string {
   if (clean === '') return ''
   const first = clean.split(/(?<=[。！？!?])\s*/)[0] ?? clean
   return first.length > 120 ? `${first.slice(0, 120)}…` : first
-}
-
-/** 宿主关系状态：当前是否有未关闭轮，以及关闭后该开第几轮。 */
-export function secretaryTurnState(events: readonly any[]): { openTurn: number; nextTurn: number } {
-  let maxTurn = 0
-  let openTurn = 0
-  for (const event of events ?? []) {
-    const turn = Number(event?.data?.turn)
-    if (!Number.isFinite(turn) || turn < 1) continue
-    if (turn > maxTurn) maxTurn = turn
-    if (event?.type === 'turn/start') openTurn = turn
-    if (event?.type === 'turn/end' && turn === openTurn) openTurn = 0
-  }
-  return { openTurn, nextTurn: maxTurn + 1 }
-}
-
-/** 秘书会话关闭态下下一条该开的轮号。 */
-export function nextTurnOf(events: readonly any[]): number {
-  return secretaryTurnState(events).nextTurn
 }
 
 /* ---------- 事件控制器（收集文本 + 完成触发，依赖全注入） ---------- */
@@ -204,35 +211,32 @@ export function createCuWatch(deps: CuWatchDeps) {
   }
 }
 
-/* ---------- 通知落盘：往秘书会话追加一条合成完成轮 ---------- */
+/* ---------- 通知投递：宿主官方 prompt 通道（agent.followup） ---------- */
 
 /**
- * 往秘书固定会话追加一条「助手主动汇报」的完成轮。五个 append 在同一拍内同步做完，
- * turn 号取现有最大 turn + 1（snapshotEvents 读一次，不与模型运行并发交错——JS 单线程，
- * agent 自己的 append 发生在别的拍上）。
+ * 以前这里写的是「往秘书会话追加一条合成完成轮」：自己拼
+ * turn/start → step/start → assistant/message → step/end → turn/end，turn 号取
+ * 日志里最大 turn + 1。**这条路已经彻底删掉**，原因是它必然写坏日志：
  *
- * @returns true = 五个事件都写进去了；false = 会话不可用 / 写入失败（调用方记日志）。
+ *   宿主的 turn 号来自 AgentLoop 的内存计数器（agent.ts: `const turn = phase.turn + 1`），
+ *   它不读日志、也不知道插件塞进去的外来轮。插件先写 turn 7，宿主下一轮照样开 turn 7，
+ *   v4 恢复器要求 turn/start == nextTurn，重复立即抛
+ *   `SessionFormatError: turn/start does not open the expected turn`，整个会话打不开。
+ *   （2026-11-21 实测：session-33044545 的 seq 103/127/149 三处正是这种重复轮。）
+ *
+ * 现在的做法：只构造一条 user 消息，交给宿主自己的 prompt 通道
+ * `agent.followup(message)` —— 入队、开轮、编号、写 user/step/assistant/turn 事件全由宿主完成，
+ * 插件一个事件都不写。宿主负责落在合法位置上，插件再也没有写坏日志的能力。
+ *
+ * @returns true = 宿主已接受这条消息（不代表模型已经答完）；false = 秘书会话没有活的 agent。
  */
-export function postSecretaryNotice(session: any, notice: { sessionId: string; title: string; summary: string }): boolean {
-  if (session === null || session === undefined) return false
-  if (typeof session.append !== 'function' || typeof session.snapshotEvents !== 'function') return false
-  const state = secretaryTurnState(session.snapshotEvents())
-  if (state.openTurn !== 0) return false
-  const turn = state.nextTurn
-  const step = 1
-  const text = buildCompletionNotice(notice)
-  const message = {
-    id: randomUUID(),
-    role: 'assistant',
-    content: [{ type: 'text', text }],
-    source: { kind: 'model', provider: 'dsh-assistant', model: 'cu-watch' },
-  }
+export function postSecretaryNotice(agent: any, notice: { sessionId: string; title: string; summary: string }): boolean {
+  if (agent === null || agent === undefined) return false
+  if (typeof agent.followup !== 'function') return false
+  const message = buildNoticeMessage(notice)
   try {
-    session.append('turn/start', { turn })
-    session.append('step/start', { turn, step })
-    session.append('assistant/message', { turn, step, message, stream: [] }, { surfaceOp: 'append' })
-    session.append('step/end', { turn, step })
-    session.append('turn/end', { turn, reason: { kind: 'completed' } })
+    registerNoticeMessageId(message.id)
+    agent.followup(message)
     return true
   } catch {
     return false
@@ -279,34 +283,47 @@ function sessionTitleOf(ctx: any, session: any): string {
   return header !== '' ? header : '未命名任务'
 }
 
-/** 取秘书会话的 Session 对象（活会话 store → agent 注册表兜底）。 */
+/**
+ * 取秘书会话的 **Agent**（不是 Session）：通知只走 `agent.followup()` 这一条官方通道，
+ * 它自带 inbox 落盘 + 唤醒驱动 + 宿主自己编号开轮。拿不到活 agent 就不发，
+ * 绝不再退回"自己往日志里写事件"的老路。
+ */
+export function secretaryAgentOf(ctx: any): any {
+  const id = secretarySessionRef.id
+  if (id === '') return null
+  try {
+    const agents = optionalService(ctx, 'agents')
+    const agent = typeof agents?.get === 'function' ? agents.get(id) : undefined
+    if (agent !== undefined && agent !== null && typeof agent.followup === 'function') return agent
+  } catch { /* 没有就是 null */ }
+  return null
+}
+
+/** 取秘书会话的 Session 对象（诊断/只读用途）。 */
 export function secretarySessionOf(ctx: any): any {
+  const agent = secretaryAgentOf(ctx)
+  if (agent?.session !== undefined && agent.session !== null) return agent.session
   const id = secretarySessionRef.id
   if (id === '') return null
   try {
     const sessions = optionalService(ctx, 'sessions') ?? ctx?.sessions
     const live = typeof sessions?.get === 'function' ? sessions.get(id) : undefined
     if (live !== undefined && live !== null) return live
-  } catch { /* 继续试 agent */ }
-  try {
-    const agents = optionalService(ctx, 'agents')
-    const agent = agents?.get?.(id)
-    if (agent?.session !== undefined && agent.session !== null) return agent.session
   } catch { /* 没有就是 null */ }
   return null
 }
 
-/** 发送一条通知（路由与事件监听共用）。返回是否落盘成功。 */
+/** 发送一条通知（路由与事件监听共用）。返回宿主是否已接受这条消息。 */
 export function notifySecretary(ctx: any, notice: { sessionId: string; title: string; summary: string }, log: (line: string) => void): boolean {
   if (secretarySessionRef.id === '') {
     log('CU 完成通知：秘书固定会话还没就绪，这条先不发')
     return false
   }
-  const session = secretarySessionOf(ctx)
-  const ok = postSecretaryNotice(session, notice)
+  const agent = secretaryAgentOf(ctx)
+  const ok = postSecretaryNotice(agent, notice)
   log(ok
-    ? `CU 完成通知已发到秘书会话：${notice.sessionId}「${notice.title}」`
-    : `CU 完成通知落盘失败：秘书会话对象不可用或 append 失败（${notice.sessionId}）`)
+    ? `CU 完成通知已交给宿主 prompt 通道（agent.followup）：${notice.sessionId}「${notice.title}」`
+    : `CU 完成通知没发出去：秘书会话没有活的 agent（宿主未提供 agent.followup），已跳过而不是自己写日志（${notice.sessionId}）`)
   return ok
 }
 
@@ -387,12 +404,12 @@ export const assistantCuWatchTestSurface = {
   presetOfSource,
   shouldReportCompletion,
   buildCompletionNotice,
+  buildNoticeMessage,
   summarizeCompletion,
-  nextTurnOf,
-  secretaryTurnState,
   createCuWatch,
   postSecretaryNotice,
   sessionPresetOf,
+  secretaryAgentOf,
   secretarySessionOf,
   notifySecretary,
   registerAssistantCuWatch,

@@ -69,6 +69,41 @@ const SECRETARY_DELEGATION_TOOLS = new Set([
 ])
 
 /**
+ * 「系统通知回合」的消息 id 登记表。
+ *
+ * CU 完成汇报不再拼日志事件，而是把一条 user 消息交给宿主官方 prompt 通道
+ * （`agent.followup`），由宿主自己开轮、自己编号、自己落盘（见 assistant-cu-watch.ts）。
+ * 代价是这一轮真的会跑模型，所以必须钉死两件事：
+ *   1. 这一轮的工具全部禁用——否则模型可能又去派活，派活 → CU 完成 → 通知 → 再派活，
+ *      形成没有出口的回路；
+ *   2. 只有这一轮禁用，用户正常发起的回合完全不受影响。
+ */
+const NOTICE_MESSAGE_IDS = new Set<string>()
+const NOTICE_ID_LIMIT = 400
+
+/** 登记一条"系统通知"消息 id（CU 完成汇报专用）。 */
+export function registerNoticeMessageId(id: string): void {
+  const value = String(id ?? '').trim()
+  if (value === '') return
+  NOTICE_MESSAGE_IDS.add(value)
+  if (NOTICE_MESSAGE_IDS.size > NOTICE_ID_LIMIT) {
+    const oldest = NOTICE_MESSAGE_IDS.values().next().value
+    if (typeof oldest === 'string') NOTICE_MESSAGE_IDS.delete(oldest)
+  }
+}
+
+/** 这条消息是不是宿主正在处理的那条系统通知。 */
+export function isNoticeMessageId(id: unknown): boolean {
+  const value = typeof id === 'string' ? id.trim() : ''
+  return value !== '' && NOTICE_MESSAGE_IDS.has(value)
+}
+
+/** 单测用：清空登记表。 */
+export function clearNoticeMessageIds(): void {
+  NOTICE_MESSAGE_IDS.clear()
+}
+
+/**
  * 秘书会话的其它只读/汇总工具白名单；未知执行工具默认拒绝。
  *
  * 只读限制的对象是「会改本机或动屏幕」的动作：写文件、终端、直接 Computer Use、派子代理。
@@ -213,6 +248,27 @@ export function registerAssistantSecretary(ctx: any): () => void {
     },
   })
 
+  // 「系统通知回合」标记：由 agent/pre-step 里声明的那批消息判定，turn/end 或下一批真实
+  // 用户消息到达时清掉；10 分钟兜底过期，绝不让一次异常把秘书的工具永久锁死。
+  let noticeTurn = false
+  let noticeTurnAt = 0
+  const NOTICE_TURN_TTL_MS = 10 * 60 * 1000
+  const noticeTurnActive = (): boolean => {
+    if (!noticeTurn) return false
+    if (Date.now() - noticeTurnAt > NOTICE_TURN_TTL_MS) { noticeTurn = false; return false }
+    return true
+  }
+  let offNoticeReset: (() => void) | undefined
+  try {
+    const off = ctx.on?.('session/event', (session: any, event: any) => {
+      if (String(session?.id ?? '') !== activeSessionId) return
+      if (String(event?.type ?? '') === 'turn/end') { noticeTurn = false; noticeTurnAt = 0 }
+    })
+    if (typeof off === 'function') offNoticeReset = off
+  } catch {
+    offNoticeReset = undefined
+  }
+
   // 只拦秘书会话。其它会话/子代理完全不受影响。
   let offToolGate: (() => void) | undefined
   try {
@@ -221,6 +277,13 @@ export function registerAssistantSecretary(ctx: any): () => void {
       const caller = String(exec?.agent?.session?.id ?? exec?.session?.id ?? exec?.sessionId ?? '')
       if (caller !== activeSessionId) return next()
       const tool = String(exec?.name ?? '')
+      // 系统通知回合：工具全禁。这一轮只允许把结果念给用户，不允许再派活/再查/再写。
+      if (noticeTurnActive()) {
+        return {
+          kind: 'deny',
+          reason: '这一轮是插件自动送来的「电脑操作会话完成」系统通知，不是用户的要求：工具已全部禁用。请直接用一两句口语把结果汇报给用户，不要调用任何工具。',
+        }
+      }
       if (!secretaryToolDenied(tool)) return next()
       return {
         kind: 'deny',
@@ -244,6 +307,13 @@ export function registerAssistantSecretary(ctx: any): () => void {
       const session = payload?.agent?.session ?? payload?.session ?? null
       const sessionId = String(session?.id ?? '')
       if (sessionId !== activeSessionId) return next()
+      // 这一批被 claim 的消息里有没有系统通知：有 → 本轮工具全禁；有真实用户消息 → 解除。
+      const claimed = Array.isArray(payload?.messages) ? payload.messages : []
+      if (claimed.length > 0) {
+        const notice = claimed.some((message: any) => isNoticeMessageId(message?.id))
+        noticeTurn = notice
+        noticeTurnAt = notice ? Date.now() : 0
+      }
       let mode = ''
       try {
         const policy = typeof ctx?.get === 'function' ? ctx.get('sandboxPolicy') : undefined
@@ -291,6 +361,7 @@ export function registerAssistantSecretary(ctx: any): () => void {
 
   return () => {
     try { offToolGate?.() } catch {}
+    try { offNoticeReset?.() } catch {}
     try { offStepGate?.() } catch {}
     try { if (typeof offSpeechStyle === 'function') offSpeechStyle() } catch {}
     try { routes.dispose() } catch {}
@@ -500,6 +571,9 @@ export const assistantSecretaryTestSurface = {
   secretaryToolDenied,
   registerAssistantSecretary,
   secretarySessionRef,
+  registerNoticeMessageId,
+  isNoticeMessageId,
+  clearNoticeMessageIds,
   SECRETARY_SPEECH_STYLE_TEXT,
   repairSecretaryLogLines,
   repairSecretaryLogText,

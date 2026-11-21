@@ -37,7 +37,7 @@ function fakeRes() {
 
 const root = mkdtempSync(join(tmpdir(), 'assistant-secretary-'))
 const server = fakeServer()
-let preTool = null
+const hooks = new Map()
 const ctx = {
   webServer: server,
   get(name) {
@@ -45,12 +45,14 @@ const ctx = {
     return undefined
   },
   on(name, fn) {
-    if (name === 'tools/pre-execute') preTool = fn
-    return () => { preTool = null }
+    hooks.set(name, fn)
+    return () => { if (hooks.get(name) === fn) hooks.delete(name) }
   },
 }
-
+let preTool = null
 const dispose = surface.registerAssistantSecretary(ctx)
+preTool = hooks.get('tools/pre-execute')
+assert.equal(typeof preTool, 'function', '没注册 tools/pre-execute')
 const route = server.exact.get(surface.ASSISTANT_SECRETARY_ROUTE)
 assert.ok(route, '没有注册 /api/assistant/secretary')
 

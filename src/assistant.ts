@@ -52,6 +52,16 @@ export { registerAssistantArchive, assistantArchiveTestSurface, collectArchive, 
 export { assistantSecretaryTestSurface } from './assistant-secretary'
 export { assistantDispatchTestSurface } from './assistant-dispatch'
 export { assistantCuWatchTestSurface } from './assistant-cu-watch'
+/** v4 会话日志事务化改写：宿主真实解析器 dry-run + 写入后回读 + 失败回滚 */
+export {
+  loadHostLogParser,
+  rewriteSessionLogFileSync,
+  assertSessionLogFileAccepted,
+  parseLogText,
+  decompressLogBytes,
+  compressLogText,
+  defaultHostParserPaths,
+} from './session-log-guard'
 export { assistantProactiveTestSurface } from './assistant-proactive'
 /** 桌面球手势 → 意图的映射与生成出来的 helper 代码（供 scripts/test-desktop-ball-gestures.mjs） */
 export { desktopBallTestSurface } from './desktop-ball'

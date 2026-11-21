@@ -94,35 +94,28 @@ cases.push(['控制器：标准会话完成 → 不收集、不汇报；子代�
 cases.push(['通知正文：口语 + 末尾可点跳引用标记 [[session:id|title]]', () => {
   const text = watch.buildCompletionNotice({ sessionId: 'cu-9', title: '门店详情页', summary: '白屏修好了。' })
   assert.match(text, /门店详情页/)
-  assert.match(text, /跑完了/)
+  assert.match(text, /这一轮已经完成/)
   assert.ok(text.includes('[[session:cu-9|门店详情页]]'), '含会话引用标记（卡片渲染成跳转信息行）')
   const bare = watch.buildCompletionNotice({ sessionId: 'cu-1', title: '', summary: '' })
   assert.ok(bare.includes('[[session:cu-1|电脑上的任务]]'))
   assert.equal(watch.summarizeCompletion('第一句完成了。第二句细节。'), '第一句完成了。')
 }])
 
-/* ---------- 5. 合成完成轮 ---------- */
-cases.push(['合成轮：turn 接在最大 turn 后，五事件按序落盘', () => {
+/* ---------- 5. 通知投递 ---------- */
+cases.push(['投递：只走宿主 agent.followup，不自己写 turn/step 事件', () => {
   const appended = []
-  const session = {
-    snapshotEvents: () => [
-      { type: 'turn/start', data: { turn: 4 } },
-      { type: 'turn/end', data: { turn: 4, reason: { kind: 'completed' } } },
-    ],
-    append: (type, data) => { appended.push([type, data]) },
-  }
-  const ok = watch.postSecretaryNotice(session, { sessionId: 'cu-2', title: '爬虫工程', summary: '抓完了。' })
+  const followups = []
+  const session = { id: 'sec-1', append: (...args) => { appended.push(args); throw new Error('插件不该写会话日志') } }
+  const agent = { session, followup: (message) => { followups.push(message) } }
+  const ok = watch.postSecretaryNotice(agent, { sessionId: 'cu-2', title: '爬虫工程', summary: '抓完了。' })
   assert.equal(ok, true)
-  assert.deepEqual(appended.map(([type]) => type), ['turn/start', 'step/start', 'assistant/message', 'step/end', 'turn/end'])
-  assert.equal(appended[0][1].turn, 5, 'turn = 现有最大 4 + 1')
-  const message = appended[2][1].message
-  assert.equal(message.role, 'assistant')
-  assert.deepEqual(appended[2][1].stream, [], '宿主 assistant/message 事件必须带 stream，即使合成通知没有流式分片')
-  assert.ok(message.content[0].text.includes('[[session:cu-2|爬虫工程]]'))
-  assert.equal(appended[4][1].reason.kind, 'completed')
-  // 会话不可用 → false 不抛
+  assert.equal(appended.length, 0, 'turn 号由宿主 AgentLoop 分配，插件自己拼会撞号写坏日志')
+  assert.equal(followups.length, 1)
+  assert.equal(followups[0].role, 'user')
+  assert.ok(followups[0].content[0].text.includes('[[session:cu-2|爬虫工程]]'))
+  // 没有官方通道 → false，不抛、不写
   assert.equal(watch.postSecretaryNotice(null, { sessionId: 'x', title: '', summary: '' }), false)
-  assert.equal(watch.nextTurnOf([]), 1)
+  assert.equal(watch.postSecretaryNotice({ session }, { sessionId: 'x', title: '', summary: '' }), false)
 }])
 
 /* ---------- 6. 派活分层 A/B/C ---------- */
