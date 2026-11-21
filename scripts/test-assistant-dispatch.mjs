@@ -112,24 +112,25 @@ cases.push(['工具定义：名字/schema/渲染齐全', () => {
   assert.equal(typeof tool.execute, 'function')
   assert.equal(typeof tool.output.render, 'function')
   assert.equal(tool.output.schema.type, 'object')
-  const text = tool.output.render({}, { session_id: 's1', cwd: 'D:\\hpg', kind: 'existing', reason: 'r', decided_by: 'model', created_folder: false })[0].text
+  const text = tool.output.render({}, { session_id: 's1', cwd: 'D:\\hpg', kind: 'existing', reason: 'r', decided_by: 'model', created_folder: false, continued: true, agent_preset: 'computer-use' })[0].text
   assert.match(text, /秘书模型判断/)
   assert.match(text, /D:\\hpg/)
-  // 工具描述里必须带三条规则（提示词的一部分）
-  assert.match(tool.description, /延续旧任务/)
+  assert.match(text, /Computer Use/)
+  // 工具描述里必须带 A/B/C 分层与「只派 Computer Use 会话」
+  assert.match(tool.description, /复杂专项任务/)
   assert.match(tool.description, /新建专项文件夹|new-folder/)
-  assert.match(tool.description, /个人助手目录/)
+  assert.match(tool.description, /Computer Use/)
 }])
 
-cases.push(['提示词段落：三条规则 + 助手目录 + 项目清单', () => {
+cases.push(['提示词段落：A/B/C 分层 + 新项目父目录 + 项目清单', () => {
   const text = surface.dispatchPromptSection({}, projects)
-  assert.match(text, /派活目录/)
+  assert.match(text, /派活分层/)
   assert.match(text, /secretary_dispatch/)
-  assert.match(text, /延续旧任务/)
+  assert.match(text, /复杂专项任务/)
   assert.match(text, /new-folder/)
-  assert.match(text, /日常杂活/)
+  assert.match(text, /简单日常杂活/)
   assert.match(text, /D:\\hpg/)
-  assert.match(text, /个人助手目录/)
+  assert.match(text, /Computer Use/)
 }])
 
 cases.push(['工具执行：非秘书会话调用被拒', async () => {

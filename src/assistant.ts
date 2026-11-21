@@ -23,6 +23,7 @@ import { registerAssistantDiagnostics } from './assistant-diagnostics'
 import { registerAssistantArchive } from './assistant-archive'
 import { registerAssistantSecretary } from './assistant-secretary'
 import { registerAssistantDispatch } from './assistant-dispatch'
+import { registerAssistantCuWatch } from './assistant-cu-watch'
 import { registerAssistantProactive } from './assistant-proactive'
 import { registerAssistantTts } from './assistant-tts'
 import { assistantConfigTestSurface } from './assistant-config'
@@ -50,6 +51,7 @@ export { registerAssistantDiagnostics, assistantDiagnosticsTestSurface, redactTe
 export { registerAssistantArchive, assistantArchiveTestSurface, collectArchive, writeArchiveBundle, importArchiveBundle, ARCHIVE_FORMAT } from './assistant-archive'
 export { assistantSecretaryTestSurface } from './assistant-secretary'
 export { assistantDispatchTestSurface } from './assistant-dispatch'
+export { assistantCuWatchTestSurface } from './assistant-cu-watch'
 export { assistantProactiveTestSurface } from './assistant-proactive'
 /** 桌面球手势 → 意图的映射与生成出来的 helper 代码（供 scripts/test-desktop-ball-gestures.mjs） */
 export { desktopBallTestSurface } from './desktop-ball'
@@ -400,8 +402,10 @@ export function apply(ctx: any, config: any = {}): () => void {
     disposers.push(registerAssistantArchive(ctx))
     // 个人秘书固定会话：宿主侧唯一 sessionId + 只读工具闸
     disposers.push(registerAssistantSecretary(ctx))
-    // 派活目录由秘书模型决定（工具 secretary_dispatch + 提示词三条规则 + 规则兜底）
+    // 派活分层 A/B/C：秘书只建/续 Computer Use 模式会话（工具 secretary_dispatch + 分层提示词）
     disposers.push(registerAssistantDispatch(ctx))
+    // CU 会话完成 → 秘书会话收可点跳的卡片消息（只监听 computer-use 模式，标准会话不汇报）
+    disposers.push(registerAssistantCuWatch(ctx))
     // 主动服务卡片：卡组存储 + 路由 + proactive_card 工具 + 首次示例卡
     disposers.push(registerAssistantProactive(ctx))
     // 秘书卡片朗读：POST /api/assistant/tts（微软 edge-tts，MP3），无 fallback

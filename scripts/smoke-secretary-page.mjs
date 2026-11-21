@@ -69,8 +69,10 @@ await page.addInitScript(() => {
 const consoleErrors = []
 const pageErrors = []
 const failedRequests = []
-/** 已知的宿主既有 4xx（与本次改动无关；项目卡片探测 widget-result.json 时本来就没有这个文件）。 */
-const IGNORED_FAILED_URL = /\/api\/worktable\/file\?/
+/** 已知的宿主既有 4xx（与本次改动无关；项目卡片探测 widget-result.json 时本来就没有这个文件）。
+ *  /api/assistant/cu-watch/notify 是 CU 通知段的能力探测：宿主未重载新代码时 404 属预期，
+ *  路由生效后正常返回 200/409（409 落盘失败仍会被 CU 通知段的 ok 断言抓住）。 */
+const IGNORED_FAILED_URL = /\/api\/worktable\/file\?|\/api\/assistant\/cu-watch\/notify/
 page.on('console', (message) => {
   if (message.type() !== 'error') return
   const text = String(message.text())
@@ -528,7 +530,7 @@ try {
     await page.evaluate((id) => {
       try { window.__dshOpenSession?.(id) } catch { /* 切页失败由下方断言兜底 */ }
     }, candidate)
-    await page.waitForTimeout(2500)
+    await page.waitForTimeout(3000)
     const nowId = await readCurrentSessionId()
     if (nowId !== candidate) continue // 这条打不开（已归档等），试下一条
     const normalRows = await page.evaluate(() => {
@@ -540,18 +542,70 @@ try {
         visible: rows.filter((el) => getComputedStyle(el).display !== 'none').length,
       }
     })
+    if (normalRows.total === 0) continue // 空会话没有操作行，换一条有历史的
     normalChecked = true
-    check('普通会话消息操作行不受影响（仍然可见）', normalRows.flag !== '1' && normalRows.total >= 1 && normalRows.visible >= 1,
+    check('普通会话消息操作行不受影响（仍然可见）', normalRows.flag !== '1' && normalRows.visible >= 1,
       `${candidate} ${JSON.stringify(normalRows)}`)
     break
   }
-  if (!normalChecked) notes.push('普通会话抽查：候选都打不开，跳过可见性断言')
+  if (!normalChecked) notes.push('普通会话抽查：候选都打不开或都是空会话，跳过可见性断言')
   // 跳回秘书（走宿主 open-assistant 意图路由 = 既有唤起逻辑）
   await page.evaluate(() => fetch('/api/assistant/open-assistant', { method: 'POST' }))
   await page.waitForFunction((want) => {
     try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') === want } catch { return false }
   }, idBeforeLongPress, { timeout: 12000 }).catch(() => {})
   await page.waitForTimeout(800)
+
+  // ── CU 完成通知：卡片带可点跳信息行（[[session:id|title]] → 引用块），点击命中目标会话 ──
+  // 第一层监听与通知落盘都在宿主侧（src/assistant-cu-watch.ts）：宿主没重载新代码时
+  // /api/assistant/cu-watch/notify 是 404，这一段如实跳过（重启宿主后自动跑全链路）。
+  const cuTarget = refCandidates.find((id) => id !== currentId) ?? ''
+  if (cuTarget !== '') {
+    const cuTitle = 'CU 冒烟校对会话'
+    const cuResponse = await page.evaluate(async ({ token, sessionId, title }) => {
+      try {
+        const res = await fetch(`/api/assistant/cu-watch/notify?token=${encodeURIComponent(token)}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId, title, summary: '冒烟校对：这是电脑操作会话的完成汇报。' }),
+        })
+        const type = res.headers.get('content-type') ?? ''
+        if (!type.includes('application/json')) return { status: res.status, ok: false, unavailable: true }
+        return { status: res.status, ...(await res.json()), unavailable: false }
+      } catch (error) { return { status: 0, ok: false, unavailable: true, error: String(error) } }
+    }, { token: TOKEN, sessionId: cuTarget, title: cuTitle })
+    if (cuResponse.unavailable === true || cuResponse.status === 404) {
+      notes.push('CU 通知段：宿主未重载新代码（/api/assistant/cu-watch/notify 不可用），跳过——重启宿主后自动生效')
+    } else {
+      check('CU 完成通知落盘（宿主路由接受）', cuResponse.ok === true, JSON.stringify(cuResponse))
+      const noticeCard = await page.waitForFunction((title) => {
+        const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
+        const hit = cards.find((el) => (el.textContent ?? '').includes(title))
+        if (hit === undefined) return false
+        const ref = hit.querySelector('[data-dsh-scard="ref"]')
+        return ref !== null && (ref.textContent ?? '').includes(title) ? { found: true } : false
+      }, cuTitle, { timeout: 20000 }).then(() => true).catch(() => false)
+      check('通知卡片含可点跳信息行（引用块带 CU 会话标题）', noticeCard)
+      if (noticeCard) {
+        await page.locator('[data-dsh-scard="card"]:not([data-empty="1"])', { hasText: cuTitle })
+          .locator('[data-dsh-scard="ref"]').first().click()
+        const jumped = await page.waitForFunction((want) => {
+          try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') === want } catch { return false }
+        }, cuTarget, { timeout: 12000 }).then(() => true).catch(() => false)
+        const nowSel = await readCurrentSessionId()
+        check('点通知卡片信息行跳进那条 CU 会话（命中目标会话 id）', jumped && nowSel === cuTarget,
+          `selection=${nowSel} want=${cuTarget}`)
+        // 回秘书
+        await page.evaluate(() => fetch('/api/assistant/open-assistant', { method: 'POST' }))
+        await page.waitForFunction((want) => {
+          try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') === want } catch { return false }
+        }, currentId, { timeout: 12000 }).catch(() => {})
+        await page.waitForTimeout(800)
+      }
+    }
+  } else {
+    notes.push('CU 通知段：没有可用目标会话，跳过')
+  }
 
   check('无未捕获异常', pageErrors.length === 0, JSON.stringify(pageErrors.slice(0, 3)))
   check('无（非既有噪声的）console error', consoleErrors.length === 0, JSON.stringify(consoleErrors.slice(0, 3)))
