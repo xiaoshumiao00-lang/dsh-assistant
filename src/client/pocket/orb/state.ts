@@ -24,54 +24,9 @@ export const orbStore = {
   },
 }
 
-/** 个人秘书页状态：固定会话 + 只读/托管状态 + 当前页是否展开。
- *  会话 id 的真值在宿主（/api/assistant/secretary），这里只是给 UI 的同步快照。
- *  phase：'cache' = 用本地缓存先渲染（尚未校验），'ready' = 后台维护已跑完一轮。 */
-export interface SecretaryViewState {
-  open: boolean
-  sessionId: string
-  cwd: string
-  readOnly: boolean
-  tuoguanOff: boolean
-  persisted: boolean
-  warning: string
-  phase: 'cache' | 'ready'
-}
-
-let secretaryView: SecretaryViewState = {
-  open: false,
-  sessionId: '',
-  cwd: '',
-  readOnly: false,
-  tuoguanOff: false,
-  persisted: false,
-  warning: '',
-  phase: 'cache',
-}
-const secretaryListeners = new Set<() => void>()
-
-export const secretaryStore = {
-  subscribe(listener: () => void): () => void {
-    secretaryListeners.add(listener)
-    return () => { secretaryListeners.delete(listener) }
-  },
-  getSnapshot(): SecretaryViewState {
-    return secretaryView
-  },
-  open(info: Omit<SecretaryViewState, 'open'>): void {
-    secretaryView = { ...info, open: true }
-    for (const listener of [...secretaryListeners]) { try { listener() } catch {} }
-  },
-  update(patch: Partial<Omit<SecretaryViewState, 'open'>>): void {
-    secretaryView = { ...secretaryView, ...patch }
-    for (const listener of [...secretaryListeners]) { try { listener() } catch {} }
-  },
-  close(): void {
-    if (!secretaryView.open) return
-    secretaryView = { ...secretaryView, open: false }
-    for (const listener of [...secretaryListeners]) { try { listener() } catch {} }
-  },
-}
+/** 个人秘书不再有独立页面：长按悬浮球直接在主面板打开固定会话（标准会话页）。
+ *  固定会话 id 的真值在宿主（/api/assistant/secretary），客户端只留 localStorage 首屏缓存，
+ *  见 client/assistant-entry.ts。这里保留原来那段注释位置，避免其他地方误以为还有秘书页状态。 */
 
 const CWD_KEY = 'dsh-pocket.orb.cwd'
 

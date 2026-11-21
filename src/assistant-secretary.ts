@@ -27,6 +27,12 @@ export interface SecretaryState {
   updatedAt: string
 }
 
+/**
+ * 当前固定秘书会话 id 的**进程内共享引用**（只读消费方：派活工具 / 主动卡片 / 提示词段）。
+ * 真值仍在 dsh-assistant-secretary.json；这里只是让同进程的其它半部不用各自去读盘。
+ */
+export const secretarySessionRef: { id: string } = { id: '' }
+
 function profileDir(ctx: any): string {
   try {
     const p = ctx?.get?.('profileContext')
@@ -52,8 +58,10 @@ export function normalizeSecretaryState(raw: unknown): SecretaryState | null {
 }
 
 /**
- * 秘书会话的工具白名单。秘书只做理解、汇总和页面上的独立派活；
+ * 秘书会话的工具白名单。秘书只做理解、汇总和派活；
  * 任何未知工具（包括第三方 MCP、未来新增的执行工具）默认拒绝，避免用黑名单追不上新工具。
+ * `secretary_dispatch` / `proactive_card` 是本插件自己注册的两个「秘书专用」工具：
+ * 前者由模型挑目录后建独立会话派活，后者把主动消息落成卡片。
  */
 const SECRETARY_ALLOWED_TOOLS = new Set([
   'read', 'grep', 'glob', 'read_image',
@@ -61,6 +69,7 @@ const SECRETARY_ALLOWED_TOOLS = new Set([
   'ask_user_question', 'present', 'skill',
   'todo_write', 'get_goal',
   'list_agents', 'job_list', 'job_output',
+  'secretary_dispatch', 'proactive_card',
 ])
 
 export function secretaryToolDenied(toolName: string): boolean {
@@ -116,6 +125,7 @@ export function registerAssistantSecretary(ctx: any): () => void {
   const file = join(profileDir(ctx), STATE_FILENAME)
   let state: SecretaryState | null = readFileState(file)
   let activeSessionId = state?.sessionId ?? ''
+  secretarySessionRef.id = activeSessionId
   let chain: Promise<unknown> = Promise.resolve()
 
   const writeState = (sessionId: string): Promise<SecretaryState> => {
@@ -127,6 +137,7 @@ export function registerAssistantSecretary(ctx: any): () => void {
       renameSync(tmp, file)
       state = next
       activeSessionId = next.sessionId
+      secretarySessionRef.id = next.sessionId
       return next
     }
     const run = chain.then(task, task)
@@ -139,6 +150,7 @@ export function registerAssistantSecretary(ctx: any): () => void {
       try { if (existsSync(file)) rmSync(file, { force: true }) } catch {}
       state = null
       activeSessionId = ''
+      secretarySessionRef.id = ''
     }
     const run = chain.then(task, task)
     chain = run.then(() => void 0, () => void 0)
@@ -195,15 +207,54 @@ export function registerAssistantSecretary(ctx: any): () => void {
       if (!secretaryToolDenied(tool)) return next()
       return {
         kind: 'deny',
-        reason: `个人秘书是只读会话，不执行任务、不派子代理（已拒绝 ${tool || '未知工具'}）。要干活请在秘书页把任务发出去——页面会按项目相关性/复杂度自动派到合适的会话目录。`,
+        reason: `个人秘书是只读会话，不执行任务、不派子代理（已拒绝 ${tool || '未知工具'}）。要干活请调用 secretary_dispatch：目标目录由你按「旧项目 / 新建专项文件夹 / 个人助手目录」三条规则判断后填进 cwd。`,
       }
     })
   } catch {
     offToolGate = undefined
   }
 
+  // 「发送时的权限闸」：标准会话页的发送由宿主处理，插件不能像以前那样在组件里拦消息，
+  // 所以在**每一轮开始前**（agent/pre-step）确认这条会话真的还在只读档：
+  //   - 读得到策略且确实 read-only → 放行；
+  //   - 读得到策略但不是 read-only → 拦下这一轮，并给出人话原因（= 权限确认失败才阻止）；
+  //   - 宿主没有 sandboxPolicy 服务（找不到判据）→ 放行并告警一次，绝不因为探测失败把秘书锁死。
+  let offStepGate: (() => void) | undefined
+  let warnedNoPolicy = false
+  try {
+    offStepGate = ctx.on?.('agent/pre-step', async (payload: any, next: () => Promise<any>) => {
+      if (activeSessionId === '') return next()
+      const session = payload?.agent?.session ?? payload?.session ?? null
+      const sessionId = String(session?.id ?? '')
+      if (sessionId !== activeSessionId) return next()
+      let mode = ''
+      try {
+        const policy = typeof ctx?.get === 'function' ? ctx.get('sandboxPolicy') : undefined
+        const resolved = policy && typeof policy.resolve === 'function' ? policy.resolve({ session }) : null
+        mode = String(resolved?.mode ?? '')
+      } catch {
+        mode = ''
+      }
+      if (mode === '') {
+        if (!warnedNoPolicy) {
+          warnedNoPolicy = true
+          ctx?.logger?.warn?.('[dsh-assistant] 读不到 sandboxPolicy：秘书会话的只读确认这一轮跳过（不会因此锁死）')
+        }
+        return next()
+      }
+      if (mode === 'read-only' || mode === 'readonly') return next()
+      return {
+        kind: 'deny',
+        reason: `个人秘书会话没在只读档（当前 ${mode}），这条消息先拦下了。后台会继续把它切回「仅可查看」，确认后再发即可。`,
+      }
+    })
+  } catch {
+    offStepGate = undefined
+  }
+
   return () => {
     try { offToolGate?.() } catch {}
+    try { offStepGate?.() } catch {}
     try { routes.dispose() } catch {}
   }
 }
@@ -214,4 +265,5 @@ export const assistantSecretaryTestSurface = {
   normalizeSecretaryState,
   secretaryToolDenied,
   registerAssistantSecretary,
+  secretarySessionRef,
 }

@@ -6,11 +6,34 @@
 import { POCKET_RPC_CHANNEL, POCKET_ENDPOINTS } from '../api.js'
 import { cwdKey, findReusableBlank, presetKey, visibleHistory } from './session-plan.ts'
 import { focusSessionInHost } from '../../sessionFocus.ts'
+import { currentSessionViaBridge, openSessionViaBridge, sessionBridgeRef } from '../../session-open.ts'
 import { createTailCache } from '../../sessionTailCache.ts'
 import { perfBump, perfNowMs, perfObserveMs } from '../../perfCounters.ts'
 
 /** 尾快照短缓存（900 ms + 在途去重）：同一轮里卡片 / 提醒表 / 待决表各要一次时只开一条 follow 流。 */
 const sessionTailCache = createTailCache()
+
+/**
+ * 取宿主「当前会话选择器」服务（0.2 起叫 uiWorkspace）。
+ *
+ * 客户端 ctx 是「声明式注入门禁」代理：没在 inject 里声明过的服务，`ctx.<name>` 直读会抛错，
+ * 只有 `ctx.get(name)` 是免声明查找。2026-11-21 真页面实测：上一版 openSession 写的是
+ * `ctx.uiWorkspace?.openSession?.(id)`，属性访问直接抛错被吞掉 → 长按之后**页面根本没切过去**
+ * （固定在别的会话上），而 `window.__dshOpenSession` 走模块作用域的 ctx 却是好的。
+ * 所以这里统一「先 get、失败再直读」，两条路都拿不到才交给调用方兜底。
+ */
+function workspaceOf(ctx: any): any {
+  // ① 控制室那份「能真正切页」的桥（真页面实测唯一稳定生效的入口）
+  try {
+    const bridge = sessionBridgeRef()
+    if (bridge?.uiWorkspace) return bridge.uiWorkspace
+  } catch { /* 桥还没装：继续往下找 */ }
+  try {
+    const found = ctx?.get?.('uiWorkspace')
+    if (found) return found
+  } catch { /* get 不可用：退回直读 */ }
+  try { return ctx?.uiWorkspace ?? null } catch { return null }
+}
 
 /** 创建中的会话（按目录去重）。模块级：悬浮球页面即使被重复挂载出多个实例，
  * 同一目录的并发创建也共用同一个在途请求，不会叠出成串的空白会话。 */
@@ -883,15 +906,38 @@ export function makeOrbApi(ctx: any) {
 
     /** 把主界面切到该会话（与点侧栏会话行等效）。 */
     openSession(sessionId: string): void {
-      ctx.uiWorkspace?.openSession?.(sessionId)
+      if (openSessionViaBridge(sessionId)) return
+      const uw = workspaceOf(ctx)
+      if (uw && typeof uw.openSession === 'function') {
+        uw.openSession(sessionId)
+        return
+      }
+      // 0.1.x 退路：ctx.sessions.open
+      try { (ctx as any).sessions?.open?.(sessionId) } catch { /* 两路都不可用：交给 focusSession */ }
+    },
+
+    /** 主面板当前会话 id（读不到返回空串）。用于「打开后确认真的切过去了」。 */
+    currentSessionId(): string {
+      const viaBridge = currentSessionViaBridge()
+      if (viaBridge !== '') return viaBridge
+      const uw = workspaceOf(ctx)
+      try {
+        return String(uw?.selection?.getSnapshot?.()?.sessionId ?? '')
+      } catch { return '' }
     },
 
     /** 稳健版「切过去」：刚建出来的会话在宿主列表里可能还差一拍，
      *  直接 openSession 会抛 unknown session。走 sessionFocus 的重试/重拉/resync 链路。 */
     async focusSession(sessionId: string): Promise<{ opened: boolean; inList: boolean }> {
-      let uw: any = null
-      try { uw = ctx.uiWorkspace ?? ctx.get?.('uiWorkspace') ?? null } catch { uw = null }
-      const result = await focusSessionInHost({ sessions: ctx.sessions, list: ctx.sessions?.list, uiWorkspace: uw }, sessionId)
+      const bridge = sessionBridgeRef()
+      const result = await focusSessionInHost(
+        {
+          sessions: bridge?.sessions ?? ctx.sessions,
+          list: bridge?.list ?? ctx.sessions?.list,
+          uiWorkspace: workspaceOf(ctx),
+        },
+        sessionId,
+      )
       return { opened: result.opened === true, inList: result.inList === true }
     },
 

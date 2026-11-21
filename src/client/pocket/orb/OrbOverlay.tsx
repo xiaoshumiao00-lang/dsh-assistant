@@ -10,7 +10,7 @@ import { PathBrowser } from './PathBrowser.tsx'
 import { arm as armClickGuard } from './click-guard.ts'
 import type { OrbApi, OrbCommand, OrbModel, OrbSessionRow, OrbSkill } from './orb-api.ts'
 import type { OrbKey } from './locales.ts'
-import { orbStore, secretaryStore, clearLastModel, readLastBall, readLastCwd, readLastModel, readLastBackgroundModel, readLastPreset, readLastTargetId, writeLastBall, writeLastCwd, writeLastModel, writeLastBackgroundModel, writeLastPreset, writeLastTargetId } from './state.ts'
+import { orbStore, clearLastModel, readLastBall, readLastCwd, readLastModel, readLastBackgroundModel, readLastPreset, readLastTargetId, writeLastBall, writeLastCwd, writeLastModel, writeLastBackgroundModel, writeLastPreset, writeLastTargetId } from './state.ts'
 import { noteOpenSession, noteOrbSwallow } from './diag.ts'
 import { isStandardPreset, presetKey, sessionModel, templateFromSession } from './session-plan.ts'
 import type { BallPoint } from './state.ts'
@@ -41,7 +41,6 @@ export interface OrbOverlayProps {
 /** 开关门面：关闭时右下角悬浮球按钮（可拖动）+ 页面隐藏（不卸载，草稿保住）。 */
 export function OrbOverlay({ api, t }: OrbOverlayProps) {
   const open = useSyncExternalStore(orbStore.subscribe, orbStore.getSnapshot)
-  const secretaryOpen = useSyncExternalStore(secretaryStore.subscribe, () => secretaryStore.getSnapshot().open)
   // 控制室打开时球**不收起**：球自己就是控制室的开/关按钮（点一下开、再点一下关），
   // 打开期间只把层级抬到控制室之上（见 BALL_Z_RAISED），否则会被全屏控制室盖住。
   const controlRoomOpen = useSyncExternalStore(controlRoomStore.subscribe, controlRoomStore.getSnapshot)
@@ -59,7 +58,7 @@ export function OrbOverlay({ api, t }: OrbOverlayProps) {
   if (open) mountedRef.current = true
   return (
     <>
-      {!open && !secretaryOpen && ballConfig.enabled && (
+      {!open && ballConfig.enabled && (
         <OrbBall
           label={t('open')}
           avatar={ballConfig.avatar || DEFAULT_ORB_AVATAR}

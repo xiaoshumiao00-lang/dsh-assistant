@@ -10,6 +10,7 @@ import { VerifyScheduler, composeDiagnosisTask } from './verifyLoop'
 import { defaultProjectFolder, defaultProjectName, isAutoProjectFolder, projectFolderBrowseStart } from './newProjectDefault'
 import { ProjectFolderSheet } from './projectFolderSheet'
 import { showToast } from './toast.ts'
+import { setSessionBridge } from './session-open.ts'
 import type { FsBrowserApi } from './pocket/orb/PathBrowser.tsx'
 import { NS as ORB_NS, zh as ORB_ZH, type OrbKey } from './pocket/orb/locales.ts'
 import { POCKET_ENDPOINTS, POCKET_RPC_CHANNEL } from './pocket/api.js'
@@ -7549,7 +7550,10 @@ export function apply(ctx: any) {
     ;(window as any).__dshPendingSource = findPendingInteractions()
   } catch {}
   try {
-    (window as any).__dshOpenSession = (id: string) => openSessionInHost(id); (window as any).__dshSessions = ctx.sessions; (window as any).__dshPromptIntoSession = (id: string, text: string) => promptIntoSession(id, text); (window as any).__dshWorkspaces = ctx.workspaces; (window as any).__dshBuildWindowTaskText = buildWindowTaskText; (window as any).__dshSyncSessionScope = () => syncSessionScope(sessionBridge?.list) } catch {}
+    (window as any).__dshOpenSession = (id: string) => openSessionInHost(id); (window as any).__dshSessions = ctx.sessions; (window as any).__dshPromptIntoSession = (id: string, text: string) => promptIntoSession(id, text); (window as any).__dshWorkspaces = ctx.workspaces; (window as any).__dshBuildWindowTaskText = buildWindowTaskText; (window as any).__dshSyncSessionScope = () => syncSessionScope(sessionBridge?.list); (window as any).__dshUiWorkspace = (() => { try { return sessionBridge?.uiWorkspace ?? ctx.get('uiWorkspace') ?? null } catch { return null } })() } catch {}
+  // 把「能真正切页」的宿主会话桥共享给插件其它半部（悬浮球 / 个人秘书入口）：
+  // 它们手里的 ctx 拿不到可用的 uiWorkspace，openSession 会静默失败（真页面实测过）。
+  try { setSessionBridge(() => sessionBridge) } catch {}
   // 宿主工作区归档集合变化（会话被删除/归档、外部侧边栏操作）→ 刷新控制室卡片与「会话列表」浮层数据源
   try {
     const wl = ctx.workspaces?.list

@@ -22,6 +22,8 @@ import { registerAssistantConfigRoutes } from './assistant-config'
 import { registerAssistantDiagnostics } from './assistant-diagnostics'
 import { registerAssistantArchive } from './assistant-archive'
 import { registerAssistantSecretary } from './assistant-secretary'
+import { registerAssistantDispatch } from './assistant-dispatch'
+import { registerAssistantProactive } from './assistant-proactive'
 import { assistantConfigTestSurface } from './assistant-config'
 import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -46,6 +48,8 @@ export { assistantMemoryTestSurface } from './assistant-memory'
 export { registerAssistantDiagnostics, assistantDiagnosticsTestSurface, redactText, renderDiagnosticsBundle, writeDiagnosticsBundle } from './assistant-diagnostics'
 export { registerAssistantArchive, assistantArchiveTestSurface, collectArchive, writeArchiveBundle, importArchiveBundle, ARCHIVE_FORMAT } from './assistant-archive'
 export { assistantSecretaryTestSurface } from './assistant-secretary'
+export { assistantDispatchTestSurface } from './assistant-dispatch'
+export { assistantProactiveTestSurface } from './assistant-proactive'
 /** 目录 allowlist 与终端环境变量（供 scripts/test-path-guard.mjs 直接验） */
 export { expandHome, defaultAllowedRoots, createPathGuard, minimalTermEnv, isDirectory } from './path-guard'
 /** turn-guard 的判定与状态函数（供 scripts/test-turn-guard.mjs 直接验） */
@@ -381,6 +385,10 @@ export function apply(ctx: any, config: any = {}): () => void {
     disposers.push(registerAssistantArchive(ctx))
     // 个人秘书固定会话：宿主侧唯一 sessionId + 只读工具闸
     disposers.push(registerAssistantSecretary(ctx))
+    // 派活目录由秘书模型决定（工具 secretary_dispatch + 提示词三条规则 + 规则兜底）
+    disposers.push(registerAssistantDispatch(ctx))
+    // 主动服务卡片：卡组存储 + 路由 + proactive_card 工具 + 首次示例卡
+    disposers.push(registerAssistantProactive(ctx))
   } catch {}
 
   void applyBall()
