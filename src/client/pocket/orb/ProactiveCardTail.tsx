@@ -17,7 +17,7 @@
  *   2. 拉到数据后**只在内容真的变了才 setState**（按内容签名比较）；
  *   3. 没有骨架屏、没有 loading 态、失败就保持原样，也不会重试到渲染震荡。
  */
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
 
 export interface ProactiveCard {
@@ -38,6 +38,43 @@ interface CachedCards {
 
 const cache = new Map<string, CachedCards>()
 const inflight = new Map<string, Promise<void>>()
+
+/**
+ * 「同一批卡只在会话最末一轮显示一次」。
+ *
+ * turnTail 槽位是**每一轮**都会渲染一次的（实测 2 轮就出现 2 张一模一样的卡）。
+ * 主动服务卡是会话级的常驻信息，不是某一轮的产出，所以只挂在最末一轮尾部：
+ * 这里登记当前已挂载的各轮次序号，取最大值，只有「我这一轮 == 最大轮次」的实例渲染卡片。
+ * 新的一轮挂上来时老实例自动让位（退订时重算），不需要任何轮询。
+ */
+const activeTurns = new Map<number, number>()
+let latestTurn = -1
+const turnListeners = new Set<() => void>()
+
+function recomputeLatestTurn(): void {
+  let max = -1
+  for (const turn of activeTurns.keys()) if (turn > max) max = turn
+  if (max === latestTurn) return
+  latestTurn = max
+  for (const listener of [...turnListeners]) {
+    try { listener() } catch { /* 订阅者异常不影响其它实例 */ }
+  }
+}
+
+function subscribeLatestTurn(listener: () => void): () => void {
+  turnListeners.add(listener)
+  return () => { turnListeners.delete(listener) }
+}
+
+function latestTurnSnapshot(): number {
+  return latestTurn
+}
+
+/** 测试用：清空轮次登记。 */
+export function resetTurnRegistryForTests(): void {
+  activeTurns.clear()
+  latestTurn = -1
+}
 
 /** 测试用：清空缓存。 */
 export function resetProactiveCardCacheForTests(): void {
@@ -117,10 +154,18 @@ export async function fetchProactiveCards(sessionId: string): Promise<ProactiveC
   return cache.get(id)?.cards ?? []
 }
 
-/** 组件 props：会话作用域槽位会带 sessionId（宿主 SessionStandardProps）。 */
-export function ProactiveCardTail({ sessionId }: { sessionId?: string }): any {
+/** 组件 props：会话作用域槽位会带 sessionId（宿主 SessionStandardProps）；
+ *  turnTail 槽位另外带 turn / seq（当前是第几轮），用来把卡片只挂在最末一轮。 */
+export function ProactiveCardTail({ sessionId, turn, seq }: { sessionId?: string; turn?: number; seq?: number }): any {
   const id = String(sessionId ?? '')
   const isSecretary = id !== '' && id === peekSecretarySessionId()
+  // 宿主 turnTail 的 props 是 sessionId / turn（Turn **对象**，不是序号）/ seq（该轮关闭节点的序号，数字）。
+  // 实测（真页面 DOM 采样）：Number(turn) 恒为 NaN，所以「第几轮」的身份键只能用 seq；
+  // 同一轮在不同渲染位置共享同一个 seq，可直接当去重键。seq 缺失时才退回数字型 turn。
+  const turnNo = Number.isFinite(Number(seq))
+    ? Number(seq)
+    : (Number.isFinite(Number(turn)) ? Number(turn) : 0)
+  const latest = useSyncExternalStore(subscribeLatestTurn, latestTurnSnapshot, () => 0)
   const [tick, setTick] = useState(0)
   const [cards, setCards] = useState<ProactiveCard[]>(() => cache.get(id)?.cards ?? [])
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
@@ -130,6 +175,18 @@ export function ProactiveCardTail({ sessionId }: { sessionId?: string }): any {
     aliveRef.current = true
     return () => { aliveRef.current = false }
   }, [])
+
+  // 登记「我这一轮还挂着」：新的一轮进来后，老实例自动让位（卡片只出现在最末一轮）。
+  useEffect(() => {
+    activeTurns.set(turnNo, (activeTurns.get(turnNo) ?? 0) + 1)
+    recomputeLatestTurn()
+    return () => {
+      const left = (activeTurns.get(turnNo) ?? 1) - 1
+      if (left <= 0) activeTurns.delete(turnNo)
+      else activeTurns.set(turnNo, left)
+      recomputeLatestTurn()
+    }
+  }, [turnNo])
 
   // 会话变了（或在秘书会话挂载）：同步缓存内容，再按需拉一次；只在内容真变时 setState。
   useEffect(() => {
@@ -160,10 +217,12 @@ export function ProactiveCardTail({ sessionId }: { sessionId?: string }): any {
   }, [id])
   void reload
 
-  if (!isSecretary || cards.length === 0) return null
+  // 只在「会话最末一轮」显示（latest<=0 = 还没登记到任何轮次，按首屏先显示一次）
+  const isLastTurn = latest <= 0 || turnNo === latest
+  if (!isSecretary || !isLastTurn || cards.length === 0) return null
 
   return (
-    <div data-dsh-proactive="wrap">
+    <div data-dsh-proactive="wrap" data-dsh-proactive-turn={String(turnNo)}>
       {cards.map((card) => {
         const open = expanded.has(card.id)
         const items = card.items ?? []

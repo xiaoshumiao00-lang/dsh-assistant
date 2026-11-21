@@ -133,11 +133,16 @@ try {
   const bundle = await page.evaluate(async () => {
     const urls = performance.getEntriesByType('resource').map((entry) => entry.name)
     const hit = urls.find((url) => url.includes('dsh-assistant/client.js'))
-    if (!hit) return { found: false, hasProactive: false }
+    if (!hit) return { found: false, hasProactive: false, hasTurnDedup: false }
     const text = await fetch(hit, { cache: 'no-store' }).then((res) => res.text())
-    return { found: true, hasProactive: text.includes('dsh-proactive'), length: text.length }
+    return {
+      found: true,
+      hasProactive: text.includes('dsh-proactive'),
+      hasTurnDedup: text.includes('dsh-proactive-turn'),
+      length: text.length,
+    }
   })
-  check('宿主下发的客户端 bundle 是本次构建', bundle.found && bundle.hasProactive, JSON.stringify(bundle))
+  check('宿主下发的客户端 bundle 是本次构建', bundle.found && bundle.hasProactive && bundle.hasTurnDedup, JSON.stringify(bundle))
 
   const hostIdBefore = await readHostSecretaryId()
   notes.push(`宿主固定会话 id（长按前）= ${hostIdBefore || '(空)'}`)
@@ -178,6 +183,8 @@ try {
     composer: !!document.querySelector('[contenteditable="true"], textarea'),
     cards: document.querySelectorAll('[data-dsh-proactive="card"]').length,
     texts: window.__smokeTexts || [],
+    // 采样只留前 500 字（卡片在上半屏时看不到底部状态行），这里单独取一次完整文本
+    fullText: (document.body.innerText || '').slice(-3000),
   }))
   notes.push(`切换结果: ${JSON.stringify(switched)}；宿主 id（长按后）= ${hostIdAfter}；selection = ${currentId}`)
 
@@ -190,6 +197,12 @@ try {
   check('不再出现「个人秘书已就位」空态', !sawOldEmpty)
   const sawOldSections = snapshot.texts.some((text) => /主动服务\s*\n.*条动态/.test(text))
   check('不再出现旧卡片瀑布的分区标题', !sawOldSections)
+  // 验收：页面上不许出现「只读权限未确认」横幅（只读拦截发生在宿主侧，页面不挂黄字）
+  const sawReadOnlyBanner = snapshot.texts.some((text) => text.includes('只读权限未确认'))
+  check('没有「只读权限未确认」横幅', !sawReadOnlyBanner)
+  // 验收：底部必须是标准会话页的轮次 / token 状态行
+  const sawStatusLine = /\btok\b/i.test(snapshot.fullText) && /轮/.test(snapshot.fullText)
+  check('底部有标准轮次与 token 状态行', sawStatusLine, `tail=${snapshot.fullText.slice(-160).replace(/\n+/g, ' / ')}`)
   check('打开后 6 秒内 DOM 变更次数有限（不震荡）', snapshot.mutations < 4000, `mutations=${snapshot.mutations}`)
 
   // ── 主动服务卡片 ──
@@ -215,6 +228,18 @@ try {
       return { open: card?.getAttribute('data-open') === '1', details: (details?.textContent || '').includes('G1545') }
     })
     check('卡片可点开查看详情', expanded.open && expanded.details, JSON.stringify(expanded))
+    // 卡片是会话级常驻信息：turnTail 每轮都会渲染一次，必须只在最末一轮出现（不能每轮一张）
+    const single = await page.waitForFunction(
+      () => document.querySelectorAll('[data-dsh-proactive="wrap"]').length === 1
+        && document.querySelectorAll('[data-dsh-proactive="card"]').length === 1,
+      undefined,
+      { timeout: 6000 },
+    ).then(() => true).catch(() => false)
+    const groups = await page.evaluate(() => ({
+      wraps: document.querySelectorAll('[data-dsh-proactive="wrap"]').length,
+      cards: document.querySelectorAll('[data-dsh-proactive="card"]').length,
+    }))
+    check('主动服务卡只在最末一轮出现一次（不重复）', single, JSON.stringify(groups))
   }
 
   // ── 第二次长按：复用同一条会话、页面不重载 ──
