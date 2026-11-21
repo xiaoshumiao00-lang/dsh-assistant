@@ -17,6 +17,11 @@
  *                                              答 `<id>` 的真值，不用先把 state 写过去；回 `queried`）
  *   POST   /api/assistant/secretary  body { sessionId } → 覆盖；同一个 id 不再写盘（去抖，防多客户端互相覆盖）
  *   DELETE /api/assistant/secretary  → 清空（测试/重置用）
+ *
+ * 已读卡集合（未读红点，2026-11-21 第三批需求）另落 dsh-assistant-secretary-read.json：
+ *   GET    /api/assistant/secretary-read?sessionId=<id>            → { ok, sessionId, cards, count }
+ *   POST   /api/assistant/secretary-read  { sessionId, cardKey, mark:'read' } → { ok, cardKey, read, count }
+ *   DELETE /api/assistant/secretary-read?sessionId=<id>            → 清空该会话的已读集合
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -231,6 +236,60 @@ function readFileState(file: string): SecretaryState | null {
   }
 }
 
+/** ── 已读卡集合（未读红点的宿主真值）───────────────────────────────
+ *  只落 profile 文件，不写会话日志、不拼 turn 事件：
+ *  GET  /api/assistant/secretary-read?sessionId=<id>            → { ok, sessionId, cards, count }
+ *  POST /api/assistant/secretary-read  { sessionId, cardKey, mark:'read' } → { ok, sessionId, cardKey, read, count }
+ *  DELETE /api/assistant/secretary-read?sessionId=<id>          → 清空那条会话的已读集合（测试/重置）
+ */
+export const ASSISTANT_SECRETARY_READ_ROUTE = '/api/assistant/secretary-read'
+const READ_STATE_FILENAME = 'dsh-assistant-secretary-read.json'
+/** 每个会话最多记这么多 cardKey（超过就把最旧的一批丢掉，防文件无限长）。 */
+export const READ_MAX_KEYS = 400
+const READ_CARD_KEY_RE = /^[A-Za-z0-9:._#-]{1,200}$/
+
+export function normalizeReadCardKey(raw: unknown): string {
+  const value = String(raw ?? '').trim()
+  return READ_CARD_KEY_RE.test(value) ? value : ''
+}
+
+/** 归一一个会话的 cardKey 列表：坏值丢掉、按序去重、截到上限（保留最新的）。 */
+export function normalizeReadCardKeys(raw: unknown): string[] {
+  const list = Array.isArray(raw) ? raw : []
+  const out: string[] = []
+  for (const item of list) {
+    const key = normalizeReadCardKey(item)
+    if (key === '' || out.includes(key)) continue
+    out.push(key)
+  }
+  return out.length > READ_MAX_KEYS ? out.slice(out.length - READ_MAX_KEYS) : out
+}
+
+/** 归一「sessionId → cardKey 列表」的存储：坏 sessionId 丢掉、坏 key 丢掉、每会话截到上限。 */
+export function normalizeSecretaryReadState(raw: unknown): Record<string, string[]> {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  const out: Record<string, string[]> = {}
+  for (const [sessionId, value] of Object.entries(source)) {
+    if (!SESSION_ID_RE.test(String(sessionId ?? ''))) continue
+    const keys = normalizeReadCardKeys(value)
+    if (keys.length > 0) out[sessionId] = keys
+  }
+  return out
+}
+
+/** 往已读集合里加一条 cardKey（幂等、按插入顺序、超出上限丢最旧）。返回该会话现在的已读条数。 */
+export function addReadCardKey(state: Record<string, string[]>, sessionId: string, cardKey: string): number {
+  const key = normalizeReadCardKey(cardKey)
+  if (key === '') return 0
+  const list = Array.isArray(state[sessionId]) ? state[sessionId] : []
+  if (!list.includes(key)) {
+    list.push(key)
+    while (list.length > READ_MAX_KEYS) list.shift()
+  }
+  state[sessionId] = list
+  return list.length
+}
+
 export function registerAssistantSecretary(ctx: any): () => void {
   const server = ctx?.webServer
   if (!server || typeof server.register !== 'function') return () => void 0
@@ -324,6 +383,80 @@ export function registerAssistantSecretary(ctx: any): () => void {
           appendOpenDiag({ step: 'host-state-clear', sessionId: current })
           await clearState()
           sendJson(res, 200, { ok: true, sessionId: null, updatedAt: '' })
+          return
+        }
+        res.writeHead(405, { allow: 'GET, HEAD, POST, PUT, DELETE' })
+        res.end()
+      } catch (err: any) {
+        sendJson(res, 500, { ok: false, error: 'internal', message: String(err?.message ?? err) })
+      }
+    },
+  })
+
+  // ── 已读卡集合（未读红点的宿主真值）───────────────────────────────
+  // 落 dsh-assistant-secretary-read.json（按 sessionId 存已读 cardKey 集合）：
+  // 不写会话日志、不拼 turn 事件，纯文件读写，写盘走同一条 chain 防并发覆盖。
+  const readStateFile = join(profileDir(ctx), READ_STATE_FILENAME)
+  const readState: Record<string, string[]> = (() => {
+    try {
+      return normalizeSecretaryReadState(JSON.parse(readFileSync(readStateFile, 'utf8')))
+    } catch {
+      return {}
+    }
+  })()
+  let readUpdatedAt = ''
+
+  const persistReadState = (): Promise<void> => {
+    const task = async (): Promise<void> => {
+      mkdirSync(dirname(readStateFile), { recursive: true })
+      const tmp = `${readStateFile}.${process.pid}.tmp`
+      const payload = { version: 1, updatedAt: new Date().toISOString(), bySession: readState }
+      writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8')
+      renameSync(tmp, readStateFile)
+      readUpdatedAt = payload.updatedAt
+    }
+    const run = chain.then(task, task)
+    chain = run.then(() => void 0, () => void 0)
+    return run
+  }
+
+  webServer.register({
+    kind: 'exact',
+    path: ASSISTANT_SECRETARY_READ_ROUTE,
+    handler: async (req: any, res: any) => {
+      const method = String(req.method ?? 'GET').toUpperCase()
+      try {
+        if (method === 'POST' || method === 'PUT') {
+          const body = await readJsonBody(req)
+          if (body?.__tooLarge === true) { sendJson(res, 413, { ok: false, error: 'too-large' }); return }
+          const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : ''
+          const cardKey = normalizeReadCardKey(body?.cardKey)
+          const mark = typeof body?.mark === 'string' ? body.mark.trim() : ''
+          if (!SESSION_ID_RE.test(sessionId)) { sendJson(res, 400, { ok: false, error: 'invalid-session-id' }); return }
+          if (cardKey === '') { sendJson(res, 400, { ok: false, error: 'invalid-card-key' }); return }
+          if (mark !== 'read') { sendJson(res, 400, { ok: false, error: 'invalid-mark' }); return }
+          const already = (readState[sessionId] ?? []).includes(cardKey)
+          const count = addReadCardKey(readState, sessionId, cardKey)
+          if (!already) await persistReadState()
+          sendJson(res, 200, { ok: true, sessionId, cardKey, read: true, unchanged: already, count, updatedAt: readUpdatedAt })
+          return
+        }
+        const query = parseSecretaryRequestQuery(String(req.url ?? ''))
+        const askedId = query.requestedId !== '' ? query.requestedId : (state?.sessionId ?? '')
+        if (askedId === '' || !SESSION_ID_RE.test(askedId)) {
+          sendJson(res, 400, { ok: false, error: 'invalid-session-id' })
+          return
+        }
+        if (method === 'GET' || method === 'HEAD') {
+          const cards = readState[askedId] ?? []
+          sendJson(res, 200, { ok: true, sessionId: askedId, cards, count: cards.length, updatedAt: readUpdatedAt })
+          return
+        }
+        if (method === 'DELETE') {
+          const had = Array.isArray(readState[askedId])
+          delete readState[askedId]
+          if (had) await persistReadState()
+          sendJson(res, 200, { ok: true, sessionId: askedId, cards: [], count: 0, cleared: had })
           return
         }
         res.writeHead(405, { allow: 'GET, HEAD, POST, PUT, DELETE' })
@@ -652,6 +785,12 @@ export function decompressSessionLogBytes(data: Uint8Array | Buffer): string {
 /** 单测入口：不启动宿主也能验路由、归一与工具闸。 */
 export const assistantSecretaryTestSurface = {
   ASSISTANT_SECRETARY_ROUTE,
+  ASSISTANT_SECRETARY_READ_ROUTE,
+  READ_MAX_KEYS,
+  normalizeReadCardKey,
+  normalizeReadCardKeys,
+  normalizeSecretaryReadState,
+  addReadCardKey,
   SECRETARY_DISPATCH_POLICY,
   normalizeSecretaryState,
   secretaryToolDenied,

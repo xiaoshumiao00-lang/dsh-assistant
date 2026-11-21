@@ -8,16 +8,18 @@
  *   - 只用宿主 /api/assistant/tts（微软 edge-tts），不用 speechSynthesis。
  */
 import { useEffect, useRef, useSyncExternalStore } from 'react'
-import { normalizeForSpeech } from './secretary-cards.ts'
+import { normalizeForSpeech, secretaryReadStore } from './secretary-cards.ts'
 import { secretarySpeech } from './secretary-speech.ts'
 
 const LONG_PRESS_MS = 600
 
-export function SecretarySpeakButton({ speakKey, rawText, labelBase = '朗读回答' }: { speakKey: string; rawText: string; labelBase?: string }): any {
+export function SecretarySpeakButton({ speakKey, rawText, labelBase = '朗读回答', readKey }: { speakKey: string; rawText: string; labelBase?: string; readKey?: string }): any {
   const lpTimer = useRef<number | null>(null)
   const lpFired = useRef(false)
   const state = useSyncExternalStore(secretarySpeech.subscribe, secretarySpeech.getSnapshot)
   const speechText = normalizeForSpeech(rawText)
+  /** 朗读过（成功或被中断）就是把这条卡已读；用户卡不传 readKey，不参与已读集合。 */
+  const markRead = (): void => { const key = String(readKey ?? ''); if (key !== '') secretaryReadStore().markRead(key) }
 
   useEffect(() => () => { if (lpTimer.current !== null) window.clearTimeout(lpTimer.current) }, [])
 
@@ -34,11 +36,12 @@ export function SecretarySpeakButton({ speakKey, rawText, labelBase = '朗读回
   const onDown = (): void => {
     lpFired.current = false
     clearLp()
-    lpTimer.current = window.setTimeout(() => { lpTimer.current = null; lpFired.current = true; secretarySpeech.restart(speakKey, speechText) }, LONG_PRESS_MS)
+    lpTimer.current = window.setTimeout(() => { lpTimer.current = null; lpFired.current = true; markRead(); secretarySpeech.restart(speakKey, speechText) }, LONG_PRESS_MS)
   }
   const onUp = (): void => {
     clearLp()
     if (lpFired.current) { lpFired.current = false; return }
+    markRead()
     secretarySpeech.toggle(speakKey, speechText)
   }
 
@@ -55,7 +58,7 @@ export function SecretarySpeakButton({ speakKey, rawText, labelBase = '朗读回
       onPointerLeave={clearLp}
       onClick={(event: any) => { event.stopPropagation() }}
       onKeyDown={(event: any) => {
-        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); secretarySpeech.toggle(speakKey, speechText) }
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); markRead(); secretarySpeech.toggle(speakKey, speechText) }
       }}
     >
       <svg data-dsh-speak="icon" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
