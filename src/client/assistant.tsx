@@ -19,7 +19,7 @@ import { NS as POCKET_NS } from './pocket/pocket-locales.js'
 import { NS as WORKTABLE_NS } from './locales.ts'
 import { installComposerMenuToggle } from './composerMenu'
 import { installCompositionGate } from './compositionGate'
-import { openAssistant, assistantUrlIntent } from './assistant-entry.ts'
+import { assistantUrlIntent, noteAssistantIntent, openAssistant } from './assistant-entry.ts'
 import { loadAssistantConfig } from './assistant-config.ts'
 import { applyPersonalTerms } from './pocket/orb/asr-terms.ts'
 import { shouldAutoShow, showFirstRunGuide } from './firstRunGuide.ts'
@@ -181,9 +181,15 @@ export function apply(ctx: any): void {
           if (stopped) break
           if (d?.open === true) {
             // 宿主会在响应里带上这次唤起的意图：控制室 / 私人助手
-            if (String(d?.intent ?? 'console') === 'assistant') {
+            const intent = String(d?.intent ?? 'console')
+            noteAssistantIntent(intent, 'ball-click')
+            if (intent === 'assistant') {
               controlRoomStore.setOpen(false)
-              void openAssistant()
+              void openAssistant().then((opened) => {
+                if (opened) return
+                // 走到这里说明连兜底都没成（页面没拿到 API）：至少把控制室亮出来，别留个没反应的点击
+                controlRoomStore.setOpen(true)
+              })
             } else {
               controlRoomStore.setOpen(true)
             }

@@ -25,7 +25,7 @@
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { dirname, join, resolve as resolvePath } from 'node:path'
+import { dirname, join, basename, resolve as resolvePath } from 'node:path'
 import zlib from 'node:zlib'
 
 const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
@@ -60,11 +60,95 @@ export function decompressLogBytes(data: Uint8Array | Buffer): string {
   return chunks.join('')
 }
 
-/** 压缩成单帧 zstd（宿主多帧读取器接受单帧）。 */
+/**
+ * 压缩成**宿主同款帧格式**（单帧 + 校验和）。
+ * 宿主写日志用的是 `CHECKSUM_OPTIONS = { params: { [ZSTD_c_checksumFlag]: 1 } }`
+ * （packages/session/session-persistence-jsonl 里的 compressZstdFrame）。
+ * 2026-11-21 那次插件用 Node 默认参数重写秘书会话日志（无校验和的单帧），宿主持久化层的
+ * 帧校验认不出来 → `listArtifacts` 把 metadata 变 undefined → 整条会话被跳过 →
+ * 重启后固定秘书会话不在会话表里 → 单击悬浮球撞 `sessions.retain: unknown session`。
+ * 所以插件必须按宿主的帧参数写；拿不到这个参数就拒绝写入（fail closed）。
+ */
 export function compressLogText(text: string): Buffer {
   const zlib2 = zlib as any
   if (typeof zlib2.zstdCompressSync !== 'function') throw new Error('zstdCompressSync not available')
-  return Buffer.from(zlib2.zstdCompressSync(Buffer.from(String(text ?? ''), 'utf8')))
+  const checksumFlag = zlib2.constants?.ZSTD_c_checksumFlag
+  if (typeof checksumFlag !== 'number') {
+    throw new Error('zlib.constants.ZSTD_c_checksumFlag 不可用：这个 Node 给不出 zstd 校验和参数，不能按宿主的帧格式写，拒绝改写')
+  }
+  return Buffer.from(zlib2.zstdCompressSync(Buffer.from(String(text ?? ''), 'utf8'), { params: { [checksumFlag]: 1 } }))
+}
+
+export interface ZstdFrameRange { start: number; end: number }
+
+/**
+ * 逐位照抄宿主的 `scanZstdFrames`（帧魔数、帧头描述字节、保留位、块头链、校验和尾巴）。
+ * 用途：宿主读不懂的东西，插件一律不许写进会话目录。
+ */
+export function scanHostZstdFrames(buffer: Buffer, maxFrames = Number.POSITIVE_INFINITY): { frames: ZstdFrameRange[]; tornStart: number | null } {
+  const frames: ZstdFrameRange[] = []
+  const magic = buffer.length >= 4 ? ZSTD_MAGIC.readUInt32LE(0) : 0
+  let offset = 0
+  while (offset < buffer.length) {
+    const start = offset
+    if (buffer.length - offset < 4) return { frames, tornStart: start }
+    if (buffer.readUInt32LE(offset) !== magic) throw new Error(`zstd 产物在 byte ${offset} 处帧魔数不对`)
+    offset += 4
+    if (offset === buffer.length) return { frames, tornStart: start }
+    const descriptor = buffer.readUInt8(offset)
+    offset += 1
+    if ((descriptor & 24) !== 0) throw new Error(`zstd 产物在 byte ${offset - 1} 处保留位被置上了`)
+    const singleSegment = (descriptor & 32) !== 0
+    const checksum = (descriptor & 4) !== 0
+    const dictionaryFlag = descriptor & 3
+    const contentSizeFlag = descriptor >>> 6
+    const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag
+    const contentSizeBytes = contentSizeFlag === 0 ? (singleSegment ? 1 : 0) : 1 << contentSizeFlag
+    const remainingHeaderBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes
+    if (buffer.length - offset < remainingHeaderBytes) return { frames, tornStart: start }
+    offset += remainingHeaderBytes
+    for (;;) {
+      if (buffer.length - offset < 3) return { frames, tornStart: start }
+      const blockHeader = buffer.readUIntLE(offset, 3)
+      offset += 3
+      const lastBlock = (blockHeader & 1) !== 0
+      const blockType = blockHeader >>> 1 & 3
+      const blockSize = blockHeader >>> 3
+      if (blockType === 3) throw new Error(`zstd 产物在 byte ${offset - 3} 处有保留块类型`)
+      const payloadBytes = blockType === 1 ? 1 : blockSize
+      if (buffer.length - offset < payloadBytes) return { frames, tornStart: start }
+      offset += payloadBytes
+      if (lastBlock) break
+    }
+    if (checksum) {
+      if (buffer.length - offset < 4) return { frames, tornStart: start }
+      offset += 4
+    }
+    frames.push({ start, end: offset })
+    if (frames.length === maxFrames) return { frames, tornStart: null }
+  }
+  return { frames, tornStart: null }
+}
+
+/** 「宿主能不能读回这份产物」的硬校验：帧扫描走完整个文件、每帧带校验和、每帧能独立解压。 */
+export function assertHostReadableArtifact(bytes: Uint8Array | Buffer): { frames: number; bytes: number } {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes)
+  const { frames, tornStart } = scanHostZstdFrames(buffer)
+  if (tornStart !== null) throw new Error(`zstd 产物在 byte ${tornStart} 处有没写完的帧`)
+  if (frames.length === 0) throw new Error('zstd 产物里没有完整帧')
+  const zlib2 = zlib as any
+  for (const frame of frames) {
+    const descriptor = buffer.readUInt8(frame.start + 4)
+    if ((descriptor & 4) === 0) {
+      throw new Error(`zstd 帧（byte ${frame.start}）没有校验和：宿主持久化层按 CHECKSUM_OPTIONS 写日志，插件必须写同款帧，否则重启后这条会话读不回来`)
+    }
+    try {
+      Buffer.from(zlib2.zstdDecompressSync(buffer.subarray(frame.start, frame.end)))
+    } catch (error: unknown) {
+      throw new Error(`zstd 帧（byte ${frame.start}）解压失败：${String((error as Error)?.message ?? error)}`)
+    }
+  }
+  return { frames: frames.length, bytes: buffer.length }
 }
 
 /** 把日志文本解析成宿主 artifact 形状（header 去掉物理行里的 type 字段）。 */
@@ -208,6 +292,19 @@ function stamp(): string {
 }
 
 /**
+ * 备份不落进会话目录：宿主的 `CANONICAL_LOG_FILENAME` 只认 `session.v4.jsonl.zstd`（带版本号），
+ * 目录里多出来的 `.bak-*` / `.decompressed.jsonl` 全是噪声，还会让人误以为「日志被写坏了」。
+ * 所以备份统一挪到 ~/.dsh/sessions-backup/<会话目录名>-backup-<时间戳>。
+ */
+export function defaultSessionLogBackupPath(file: string): string {
+  const sessionDir = basename(dirname(String(file ?? '')))
+  const env = (globalThis as any).process?.env ?? {}
+  const home = String(env.DSH_ASSISTANT_BACKUP_HOME ?? (env.USERPROFILE ?? env.HOME ?? '')).trim()
+  const root = home !== '' ? join(home, '.dsh', 'sessions-backup') : join(dirname(String(file ?? '')), 'sessions-backup')
+  return join(root, `${sessionDir === '' ? 'session' : sessionDir}-backup-${stamp()}`)
+}
+
+/**
  * 事务化改写：宿主解析器 dry-run → 备份 → 原子写 → 回读再校验 → 失败回滚。
  * 任一步失败都会抛错；写入后的失败会先把备份还原回去再抛，绝不留下半截轮。
  */
@@ -228,7 +325,7 @@ export function rewriteSessionLogFileSync(options: SessionLogRewriteOptions): Se
   // ① 写入前：宿主同一套解析器 dry-run。不合法 → 直接抛，文件一个字节都没动。
   parser.assertAccepted(candidate)
   const afterEvents = parseLogText(candidate).events.length
-  const backupPath = String(options.backupPath ?? '').trim() || `${file}.bak-${stamp()}`
+  const backupPath = String(options.backupPath ?? '').trim() || defaultSessionLogBackupPath(file)
   const report: SessionLogRewriteReport = {
     ok: true,
     dryRun,
@@ -249,9 +346,13 @@ export function rewriteSessionLogFileSync(options: SessionLogRewriteOptions): Se
   if (decompressLogBytes(compressed) !== candidate) {
     throw new Error('压缩回环不一致，已放弃写入（原文件未改动）')
   }
+  // 帧格式必须宿主读得懂（实测根因：无校验和的 Node 默认单帧会让宿主持久化层整条会话跳过）
+  assertHostReadableArtifact(compressed)
 
   // ② 备份（备份失败就不写）。
   mkdirSync(dirname(file), { recursive: true })
+  // 备份目录先造出来（备份落在 ~/.dsh/sessions-backup，不在会话目录里塞旁支文件）
+  mkdirSync(dirname(backupPath), { recursive: true })
   copyFileSync(file, backupPath)
   if (!readFileSync(backupPath).equals(original)) {
     throw new Error(`备份校验失败（${backupPath}），已放弃写入`)

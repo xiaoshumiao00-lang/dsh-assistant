@@ -6,7 +6,11 @@
  * 纪律（2026-11-21 事故后重写）：
  *   1. **不再自己写简化校验器**：合并/重编号后用宿主同一套解析器
  *      `@deepseek-ai/dsh-session-format-v3-to-v4` 的 restoreReleasedV4Artifact 做 dry-run；
- *   2. 写入前先备份 `<file>.bak-<时间戳>`，原子写（tmp + rename）；
+ *   2. 写入前先备份到 ~/.dsh/sessions-backup/<会话目录名>-backup-<时间戳>（不往会话目录里塞
+ *      `.bak-*` / `.decompressed.jsonl`：宿主的 CANONICAL_LOG_FILENAME 只认 session.v4.jsonl.zstd，
+ *      旁支文件留在会话目录里就是噪声），原子写（tmp + rename）；
+ *   2.5 压缩必须按宿主的帧参数写（带校验和的单帧）：无校验和的 Node 默认单帧会让
+ *      宿主持久化层读不回 header，整条会话被跳过（重启后就再也打不开）——守卫直接拒写。
  *   3. 写入后再解压回读、再用同一解析器校验一遍；
  *   4. 任何一步失败立即回滚到备份，绝不留下半截轮；
  *   5. 找不到宿主解析器就直接拒绝写入（fail closed），不做"看着差不多"的放行。

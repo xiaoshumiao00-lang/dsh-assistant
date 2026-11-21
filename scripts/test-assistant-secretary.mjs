@@ -153,6 +153,98 @@ cases.push(['DELETE 清空并删除文件', async () => {
   const g = await call('GET')
   assert.equal(g.json.sessionId, null)
 }])
+const callVerify = async (method, urlSuffix) => {
+  const res = fakeRes()
+  const req = fakeReq(method, undefined)
+  req.url = `${surface.ASSISTANT_SECRETARY_ROUTE}${urlSuffix}`
+  await route.handler(req, res)
+  let json = null
+  try { json = JSON.parse(res.body) } catch { json = null }
+  return { status: res.status, json }
+}
+
+cases.push(['普通 GET 不带 exists（首屏不该去翻两千多行会话表）', async () => {
+  const g = await callVerify('GET', '')
+  assert.equal(g.status, 200)
+  assert.equal('exists' in g.json, false, `普通 GET 不该带 exists：${JSON.stringify(g.json)}`)
+}])
+cases.push(['?verify=1 但没有固定会话 → exists=false（不会静默说「在」）', async () => {
+  const r = await callVerify('GET', '?verify=1')
+  assert.equal(r.json.sessionId, null)
+  assert.equal(r.json.exists, false)
+}])
+cases.push(['?verify=1 有固定会话、宿主两路都问不出 → exists=null（客户端按「不新建」处理）', async () => {
+  await call('POST', { sessionId: 'session-22222222-2222-3222-4444-555555555555' })
+  const r = await callVerify('GET', '?verify=1')
+  assert.equal(r.json.sessionId, 'session-22222222-2222-3222-4444-555555555555')
+  assert.equal(r.json.exists, null, `这份 ctx 没有会话表：必须回 null，实际=${JSON.stringify(r.json)}`)
+  await call('DELETE')
+}])
+cases.push(['?verify=1 用宿主活会话表回答存在与否（实测根因的权威判定）', async () => {
+  const sessionRoot = mkdtempSync(join(tmpdir(), 'assistant-secretary-exists-'))
+  const server = fakeServer()
+  const ctx = {
+    webServer: server,
+    get(name) { return name === 'profileContext' ? { dir: sessionRoot } : undefined },
+    sessions: { list: () => [{ id: 'session-alive-1', header: { id: 'session-alive-1' } }] },
+    on() { return () => void 0 },
+  }
+  const disposeExtra = surface.registerAssistantSecretary(ctx)
+  const extraRoute = server.exact.get(surface.ASSISTANT_SECRETARY_ROUTE)
+  const call = async (method, payload, urlSuffix = '') => {
+    const res = fakeRes()
+    const req = fakeReq(method, payload === undefined ? undefined : JSON.stringify(payload))
+    req.url = `${surface.ASSISTANT_SECRETARY_ROUTE}${urlSuffix}`
+    await extraRoute.handler(req, res)
+    return JSON.parse(res.body)
+  }
+  try {
+    await call('POST', { sessionId: 'session-alive-1' }, '')
+    const hit = await call('GET', undefined, '?verify=1')
+    assert.equal(hit.exists, true, '活会话表里有这条 → 必须回 true')
+    await call('POST', { sessionId: 'session-33044545-4737-4e86-960d-43f57b357dea' }, '')
+    const miss = await call('GET', undefined, '?verify=1')
+    assert.equal(miss.exists, false, 'state 指向已消失的会话（2026-11-21 实测形状）→ 必须回 false')
+  } finally {
+    try { disposeExtra() } catch {}
+    rmSync(sessionRoot, { recursive: true, force: true })
+  }
+}])
+cases.push(['?verify=1 只剩持久化清单（ctx 没给 sessions.list）也能回答', async () => {
+  const queryRoot = mkdtempSync(join(tmpdir(), 'assistant-secretary-query-'))
+  const server = fakeServer()
+  const ctx = {
+    webServer: server,
+    get(name) {
+      if (name === 'profileContext') return { dir: queryRoot }
+      if (name === 'sessionQuery') {
+        return { listSessions: async () => [{ header: { id: 'session-from-query' } }] }
+      }
+      return undefined
+    },
+    on() { return () => void 0 },
+  }
+  const disposeExtra = surface.registerAssistantSecretary(ctx)
+  const routeExtra = server.exact.get(surface.ASSISTANT_SECRETARY_ROUTE)
+  const call = async (method, payload, urlSuffix = '') => {
+    const res = fakeRes()
+    const req = fakeReq(method, payload === undefined ? undefined : JSON.stringify(payload))
+    req.url = `${surface.ASSISTANT_SECRETARY_ROUTE}${urlSuffix}`
+    await routeExtra.handler(req, res)
+    return JSON.parse(res.body)
+  }
+  try {
+    await call('POST', { sessionId: 'session-from-query' }, '')
+    const hit = await call('GET', undefined, '?verify=1')
+    assert.equal(hit.exists, true, '持久化清单里有这条 → 必须回 true')
+    await call('POST', { sessionId: 'session-not-in-list' }, '')
+    const miss = await call('GET', undefined, '?verify=1')
+    assert.equal(miss.exists, false, '清单里没有 → 必须回 false（客户端据此重建）')
+  } finally {
+    try { disposeExtra() } catch {}
+    rmSync(queryRoot, { recursive: true, force: true })
+  }
+}])
 cases.push(['坏文件/坏字段按空处理', async () => {
   assert.equal(surface.normalizeSecretaryState(null), null)
   assert.equal(surface.normalizeSecretaryState({ sessionId: '' }), null)

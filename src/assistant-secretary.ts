@@ -18,12 +18,56 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { dirname, join } from 'node:path'
 import zlib from 'node:zlib'
 import { manageWebRoutes } from './web-routes'
+import { appendOpenDiag } from './assistant-open-diag'
 
 export const ASSISTANT_SECRETARY_ROUTE = '/api/assistant/secretary'
 export const SECRETARY_DISPATCH_POLICY = 'default-computer-use-v2'
 const STATE_FILENAME = 'dsh-assistant-secretary.json'
 const MAX_BODY_BYTES = 4096
 const SESSION_ID_RE = /^[A-Za-z0-9._:-]{1,256}$/
+
+/** `?verify=1`：客户端问「这条固定会话还在不在宿主的会话表里」；会话表两千多行，答案缓存 30s。 */
+const EXISTENCE_TTL_MS = 30_000
+let existenceCache: { id: string; value: boolean; at: number } | null = null
+
+/**
+ * 宿主权威版：这条 sessionId 还在不在宿主的会话表里。
+ *   true  = 在（内存活会话或持久化清单里找到了）
+ *   false = 不在（问到过结果，没有）
+ *   null  = 问不出结果（宿主既没给 sessions.list 也没给 sessionQuery）——调用方必须按「不新建」处理
+ */
+async function secretarySessionExistsOnHost(ctx: any, sessionId: string): Promise<boolean | null> {
+  const id = String(sessionId ?? '').trim()
+  if (id === '') return false
+  const now = Date.now()
+  if (existenceCache && existenceCache.id === id && now - existenceCache.at < EXISTENCE_TTL_MS) return existenceCache.value
+  let asked = false
+  try {
+    const live = Array.isArray(ctx?.sessions?.list?.()) ? ctx.sessions.list() : null
+    if (live !== null) {
+      asked = true
+      if (live.some((session: any) => String(session?.header?.id ?? session?.id ?? '') === id)) {
+        existenceCache = { id, value: true, at: Date.now() }
+        return true
+      }
+    }
+  } catch { /* 没有 sessions.list：只剩持久化清单那条 */ }
+  try {
+    const query = ctx?.get?.('sessionQuery')
+    if (query && typeof query.listSessions === 'function') {
+      const list = await query.listSessions(undefined)
+      asked = true
+      const found = Array.isArray(list)
+        ? list.some((record: any) => String(record?.header?.id ?? record?.sessionId ?? '') === id)
+        : false
+      existenceCache = { id, value: found, at: Date.now() }
+      return found
+    }
+  } catch { /* 问不出结果 */ }
+  if (!asked) return null
+  existenceCache = { id, value: false, at: Date.now() }
+  return false
+}
 
 export interface SecretaryState {
   sessionId: string
@@ -213,13 +257,22 @@ export function registerAssistantSecretary(ctx: any): () => void {
     path: ASSISTANT_SECRETARY_ROUTE,
     handler: async (req: any, res: any) => {
       const method = String(req.method ?? 'GET').toUpperCase()
+      const current = state?.sessionId ?? ''
       try {
         if (method === 'GET' || method === 'HEAD') {
+          const wantsVerify = /[?&]verify=1(?:&|$)/.test(String(req.url ?? ''))
+          const exists = wantsVerify
+            ? (current === '' ? false : await secretarySessionExistsOnHost(ctx, current))
+            : undefined
+          if (wantsVerify && exists !== true) {
+            appendOpenDiag({ step: 'host-secretary-verify', sessionId: current, exists })
+          }
           sendJson(res, 200, {
             ok: true,
-            sessionId: state?.sessionId ?? null,
+            sessionId: current || null,
             updatedAt: state?.updatedAt ?? '',
             dispatchPolicy: SECRETARY_DISPATCH_POLICY,
+            ...(wantsVerify ? { exists } : {}),
           })
           return
         }
@@ -232,10 +285,12 @@ export function registerAssistantSecretary(ctx: any): () => void {
             return
           }
           const next = await writeState(sessionId)
+          appendOpenDiag({ step: 'host-state-write', sessionId, previous: current })
           sendJson(res, 200, { ok: true, sessionId: next.sessionId, updatedAt: next.updatedAt })
           return
         }
         if (method === 'DELETE') {
+          appendOpenDiag({ step: 'host-state-clear', sessionId: current })
           await clearState()
           sendJson(res, 200, { ok: true, sessionId: null, updatedAt: '' })
           return

@@ -27,6 +27,7 @@ import { registerAssistantCuWatch } from './assistant-cu-watch'
 import { registerAssistantProactive } from './assistant-proactive'
 import { registerAssistantTts } from './assistant-tts'
 import { assistantConfigTestSurface } from './assistant-config'
+import { appendOpenDiag, registerAssistantOpenDiagRoute } from './assistant-open-diag'
 import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join as joinPathNode } from 'node:path'
@@ -45,6 +46,7 @@ export const name = 'dsh-assistant'
 
 /** 供测试直接验证路由：仅导出注册函数，不改变插件行为。 */
 export { registerAssistantHome } from './assistant-home'
+export { appendOpenDiag, readOpenDiagTail, handleOpenDiag, registerAssistantOpenDiagRoute, OPEN_DIAG_PATH } from './assistant-open-diag'
 export { assistantConfigTestSurface } from './assistant-config'
 export { assistantMemoryTestSurface } from './assistant-memory'
 export { registerAssistantDiagnostics, assistantDiagnosticsTestSurface, redactText, renderDiagnosticsBundle, writeDiagnosticsBundle } from './assistant-diagnostics'
@@ -60,6 +62,9 @@ export {
   parseLogText,
   decompressLogBytes,
   compressLogText,
+  assertHostReadableArtifact,
+  scanHostZstdFrames,
+  defaultSessionLogBackupPath,
   defaultHostParserPaths,
 } from './session-log-guard'
 export { assistantProactiveTestSurface } from './assistant-proactive'
@@ -183,6 +188,8 @@ export function apply(ctx: any, config: any = {}): () => void {
     if (clickWaiters.size === 0) return
     const intent = takeOpenClick()
     if (intent === null) return
+    // 诊断：桌面球/热键把意图交给页面时先在这里留痕（单击=assistant，长按=console）
+    appendOpenDiag({ step: 'host-click-intent', intent, waiters: clickWaiters.size, source: 'desktop-ball' })
     // 点击要广播给所有正在等待的页面。页面重载/插件 HMR 可能短暂留下旧等待者；
     // 旧逻辑只交给第一个等待者，旧连接把点击“取走”后，真正可见的页面就收不到，
     // 表现为“偶尔点了悬浮球却停在会话详情”。
@@ -356,6 +363,7 @@ export function apply(ctx: any, config: any = {}): () => void {
       kind: 'exact',
       path: '/api/assistant/open-console',
       handler: (_req: any, res: any) => {
+        appendOpenDiag({ step: 'host-open-request', intent: 'console', source: 'open-console' })
         pendingOpen = 'console'
         wakeClickWaiters()
         const payload = JSON.stringify({ ok: true, opened: true })
@@ -368,6 +376,7 @@ export function apply(ctx: any, config: any = {}): () => void {
       kind: 'exact',
       path: '/api/assistant/open-assistant',
       handler: (_req: any, res: any) => {
+        appendOpenDiag({ step: 'host-open-request', intent: 'assistant', source: 'open-assistant' })
         pendingOpen = 'assistant'
         wakeClickWaiters()
         const payload = JSON.stringify({ ok: true, opened: true, intent: 'assistant' })
@@ -398,12 +407,19 @@ export function apply(ctx: any, config: any = {}): () => void {
         }
       },
     })
+    // 个人秘书打开链路诊断：页面 POST 落盘，GET 读回（~/.dsh/dsh-assistant-open.log）
+    registerAssistantOpenDiagRoute(webServer)
     webServer.register({
       kind: 'exact',
       path: '/api/assistant/ball-click',
       handler: (req: any, res: any) => {
         const pending = takeOpenClick()
-        if (pending !== null) { sendClick(res, pending); return }
+        if (pending !== null) {
+          // 诊断：页面从宿主取走了一次唤起意图（原生球的点击也可能在这里被取走）
+          appendOpenDiag({ step: 'host-click-pull', intent: pending, source: 'ball-click' })
+          sendClick(res, pending)
+          return
+        }
         const wantsWait = /[?&]wait=1(?:&|$)/.test(String(req.url ?? ''))
         if (!wantsWait) { sendClick(res, null); return }
         const waiter: ClickWaiter = { res, timer: null, done: false }

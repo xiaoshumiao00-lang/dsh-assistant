@@ -81,6 +81,8 @@ function logText(header, events) {
 
 const cases = []
 const root = mkdtempSync(join(tmpdir(), 'secretary-log-write-'))
+// 默认备份路径必须能指到临时目录（测试不许往用户真实的 ~/.dsh 里写）
+process.env.DSH_ASSISTANT_BACKUP_HOME = root
 
 function writeLog(name, text) {
   const file = join(root, name)
@@ -123,7 +125,54 @@ cases.push(['修复后落盘，回读仍被宿主解析器接受（写入后再�
     && events.filter((other) => other.type === 'turn/start' && other.data.turn === 2).length > 1), '不再有重复轮')
 }])
 
-/* ---------- 3. 校验拦截 → 不留半截轮 ---------- */
+/* ---------- 3. 帧格式必须宿主读得懂（2026-11-21 实测根因的守卫） ---------- */
+cases.push(['改写产物必须是带校验和的 zstd 帧：宿主帧扫描走完整个文件、每帧能独立解压', () => {
+  const corrupt = logText(HEADER, corruptEvents())
+  const file = writeLog('frames.v4.jsonl.zstd', corrupt)
+  const report = lib.rewriteSessionLogFileSync({
+    file,
+    parser,
+    transform: (text) => surface.repairSecretaryLogText(text),
+  })
+  assert.equal(report.ok, true)
+  const bytes = readFileSync(file)
+  const scan = lib.scanHostZstdFrames(bytes)
+  assert.equal(scan.tornStart, null, '帧扫描必须走完整个文件（没写完的帧 = 宿主会认为是撕裂尾帧）')
+  assert.ok(scan.frames.length >= 1)
+  const descriptor = bytes.readUInt8(scan.frames[0].start + 4)
+  assert.notEqual(descriptor & 4, 0, '帧头描述字节必须带校验和位（宿主 CHECKSUM_OPTIONS 同款）')
+  assert.deepEqual(lib.assertHostReadableArtifact(bytes), { frames: scan.frames.length, bytes: bytes.length })
+}])
+
+cases.push(['无校验和的 Node 默认单帧必须被拒（这正是上次会话被宿主丢掉的那 shapes）', () => {
+  const zlib2 = require('node:zlib')
+  const legacy = Buffer.from(zlib2.zstdCompressSync(Buffer.from('{"x":1}\n', 'utf8')))
+  const descriptor = legacy.length > 4 ? legacy.readUInt8(4) : 0
+  if ((descriptor & 4) === 0) {
+    assert.throws(() => lib.assertHostReadableArtifact(legacy), /没有校验和/, '旧写法必须被守卫拦下')
+  }
+  const good = lib.compressLogText('hello\n')
+  assert.doesNotThrow(() => lib.assertHostReadableArtifact(good))
+  // 写坏的产物：帧没走完 → 拒绝
+  const torn = Buffer.concat([Buffer.from([0x28, 0xb5, 0x2f, 0xfd]), Buffer.from([0x90, 0x00, 0x00])]
+)
+  assert.throws(() => lib.assertHostReadableArtifact(torn))
+}])
+
+cases.push(['备份不落进会话目录：默认走 sessions-backup（宿主只认 session.v4.jsonl.zstd，旁支文件是噪声）', () => {
+  const corrupt = logText(HEADER, corruptEvents())
+  const sessionDir = join(root, 'session-near-miss')
+  const nested = join(sessionDir, 'session.v4.jsonl.zstd')
+  require('node:fs').mkdirSync(sessionDir, { recursive: true })
+  writeFileSync(nested, lib.compressLogText(corrupt))
+  const report = lib.rewriteSessionLogFileSync({ file: nested, parser, transform: (text) => surface.repairSecretaryLogText(text) })
+  assert.ok(report.backupPath.includes('sessions-backup'), `备份必须落 sessions-backup，实际=${report.backupPath}`)
+  assert.ok(!report.backupPath.startsWith(sessionDir), '备份不许落在会话目录里面')
+  const strays = require('node:fs').readdirSync(sessionDir)
+  assert.deepEqual(strays, ['session.v4.jsonl.zstd'], `会话目录里不许留旁支文件，实际=${strays.join(', ')}`)
+}])
+
+/* ---------- 4. 校验拦截 → 不留半截轮 ---------- */
 cases.push(['候选日志不合法 → 写入被拦下，目标文件与备份都不产生', () => {
   const corrupt = logText(HEADER, corruptEvents())
   const file = writeLog('blocked.v4.jsonl.zstd', corrupt)
