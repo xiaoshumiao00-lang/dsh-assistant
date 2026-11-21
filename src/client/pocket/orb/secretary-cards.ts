@@ -11,6 +11,13 @@
  *      idle → loading → playing ⇄ paused；restart/切换/播完/失败都收拢到唯一出口。
  *      默认每条卡片出现后自动朗读；单击暂停/继续；长按从头重读；换卡片停上一条。
  *      **只用宿主 /api/assistant/tts（微软 edge-tts），不用 speechSynthesis。**
+ *   4. 卡片脚部时间（2026-11-21 改动）：只写时间（`9:08`），不再带「今天」字样。
+ *   5. 折叠预算：折叠态正文最多 **3 行**（见 FOLD_BODY_LINE_BUDGET，三种卡共用一套）。
+ *   6. 秘书页 user 角色行分类：真实用户输入 → 冷蓝用户卡；插件塞进来的合成通知 → 灰底通知卡
+ *      （见 collectSecretaryCardRows / parseNoticeCardBody）。
+ *   7. 已读卡集合（未读红点）：cardKey 沿用朗读 key（`assistant:` / `notice:` 前缀那套），
+ *      真值落宿主 `/api/assistant/secretary-read` → dsh-assistant-secretary-read.json，
+ *      localStorage 只是首屏缓存与降级兜底（见 createSecretaryReadStore）。
  */
 
 /** ────────────────────────── 1. 朗读文本规范化 ────────────────────────── */
@@ -413,26 +420,102 @@ export function answerInlineTokens(text: string): AnswerToken[] {
   )).filter((token) => token.value !== '')
 }
 
-/** ISO/时间戳 → 「今天 HH:MM」/「昨天 HH:MM」/「M月d日 HH:MM」；解析不了回空串。 */
+/** ISO/时间戳 → 卡片脚部时间（2026-11-21 用户改需求）：**只写时间**，不再带「今天」字样。
+ *  当天 → `H:MM`（例 9:08，小时不补零、分钟补零）；昨天 → `昨天 H:MM`；更早 → `M月d日 H:MM`。
+ *  解析不了回空串（脚部就不显示时间）。 */
 export function formatClock(input: unknown, now: Date = new Date()): string {
   const raw = String(input ?? '').trim()
   if (raw === '') return ''
   const date = /^\d+$/.test(raw) ? new Date(Number(raw)) : new Date(raw)
   if (Number.isNaN(date.getTime())) return ''
-  const pad = (n: number): string => String(n).padStart(2, '0')
-  const hm = `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  const hm = `${date.getHours()}:${String(date.getMinutes()).padStart(2, '0')}`
   const startOf = (d: Date): number => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
   const dayDiff = Math.round((startOf(now) - startOf(date)) / 86400000)
-  if (dayDiff <= 0) return `今天 ${hm}`
+  if (dayDiff <= 0) return hm
   if (dayDiff === 1) return `昨天 ${hm}`
   return `${date.getMonth() + 1}月${date.getDate()}日 ${hm}`
 }
 
 /** ─────────────── 6. 用户卡（秘书页真实用户消息）纯函数 ─────────────── */
 
-/** 卡壳主题标识：秘书回复卡 kind=assistant（紫），用户卡 kind=user（冷蓝）。 */
+/** 卡壳主题标识：秘书回复卡 kind=assistant（紫）、用户卡 kind=user（冷蓝）、通知卡 kind=notice（中性灰）。 */
 export const CARD_KIND_ASSISTANT = 'assistant'
 export const CARD_KIND_USER = 'user'
+export const CARD_KIND_NOTICE = 'notice'
+
+/**
+ * 折叠态正文预算（2026-11-21 用户改需求）：三种卡共用，折叠态最多 **3 行正文**（不是 3 个内容块）。
+ * 卡标题（17px）与要点行里的行内标签不占这 3 行的预算，正文按行高切，超出部分打省略标记。
+ */
+export const FOLD_BODY_LINE_BUDGET = 3
+/** 卡片内正文块之间的距离（与 CSS 的 content gap 一致）。 */
+export const FOLD_BLOCK_GAP = 10
+
+/** 一个正文块在卡片正文里的位置（offsetTop）与高度（offsetHeight）——浏览器量的，纯函数只管算术。 */
+export interface FoldBlockBox {
+  /** title = 卡标题（17px，不占正文行数预算、永远露出）；para = 正文段落；ref = 会话引用 chip。 */
+  kind: 'title' | 'para' | 'ref'
+  top: number
+  height: number
+}
+
+export interface FoldGeometryOut {
+  /** 折叠态正文的 max-height（px）；不溢出就是 undefined（正文自然高度）。 */
+  collapsedMaxHeight: number | undefined
+  /** 正文是不是被 `budget` 行切掉了（决定「…」省略标记与「展开全文」入口）。 */
+  overflow: boolean
+  /** 折叠态实际露出的正文行数（<= budget）。 */
+  bodyLines: number
+  /** 切掉的行箱落点（px）；未溢出时 = 自然高度。 */
+  clip: number
+}
+
+/**
+ * 折叠几何（三种卡共用一套算术，浏览器只负责量块的位置，算法在这里）：
+ *   - 卡标题不参与 3 行预算、永远露出；
+ *   - 段落按行高累加，落点正好停在第 `budget` 行的行尾，绝不切出半行字；
+ *   - 引用 chip 算一整块（不可切一半）；
+ *   - 块与块之间的距离按 top 天然算进高度。
+ */
+export function foldClipFromBlocks(input: {
+  blocks: readonly FoldBlockBox[]
+  naturalHeight: number
+  lineHeight: number
+  budget?: number
+}): FoldGeometryOut {
+  const budget = Math.max(1, Number(input.budget ?? FOLD_BODY_LINE_BUDGET))
+  const lineHeight = Number(input.lineHeight)
+  const natural = Math.max(1, Math.round(Number(input.naturalHeight) || 1))
+  if (!Number.isFinite(lineHeight) || lineHeight <= 0) {
+    return { collapsedMaxHeight: undefined, overflow: false, bodyLines: 0, clip: natural }
+  }
+  const bodyBlocks = input.blocks.filter((block) => block.kind !== 'title')
+  if (bodyBlocks.length === 0) return { collapsedMaxHeight: undefined, overflow: false, bodyLines: 0, clip: natural }
+
+  let running = 0
+  let lastBottom = 0
+  let clip: number | undefined
+  for (const block of bodyBlocks) {
+    const top = Math.max(0, Math.round(block.top))
+    const height = Math.max(1, Math.round(block.height || lineHeight))
+    const lines = block.kind === 'ref' ? 1 : Math.max(1, Math.round(height / lineHeight))
+    const remaining = budget - running
+    if (remaining <= 0) { clip = lastBottom; break }
+    if (lines <= remaining) {
+      running += lines
+      lastBottom = top + height
+      continue
+    }
+    clip = top + remaining * lineHeight
+    running = budget
+    break
+  }
+  if (clip === undefined) return { collapsedMaxHeight: undefined, overflow: false, bodyLines: running, clip: natural }
+  const maxHeight = Math.max(1, Math.min(Math.round(clip), natural))
+  const overflow = maxHeight < natural - 1
+  return { collapsedMaxHeight: overflow ? maxHeight : undefined, overflow, bodyLines: running, clip: maxHeight }
+}
+
 
 /** 合成通知判据 ①：首行是「（系统通知，不是用户说的话）」（宽/半角括号、方括号写法都算）。 */
 const NOTICE_HEAD_LINE_RE = /^\s*[（(【\[]?\s*系统通知/
@@ -459,16 +542,48 @@ export function parseUserCardBody(raw: string): string[] {
 export function userCardSpeechKey(messageKey: string, turnNo = ''): string {
   const key = String(messageKey ?? '').trim()
   if (key !== '') return `user:${key}`
-  return `user:turn:${String(turnNo ?? '')}`
+  const turn = String(turnNo ?? '').trim()
+  return turn === '' ? '' : `user:turn:${turn}`
 }
 
-/** 底行时间：宿主操作行只给「HH:MM」（当天）→「今天 HH:MM」；已经是「昨天 …」/「11月20日 …」就原样用。 */
+/** 通知卡朗读 key：`notice:` 前缀 + 宿主那条消息的稳定 key（同一张卡跨端一致）。 */
+export function noticeCardSpeechKey(messageKey: string, turnNo = ''): string {
+  const key = String(messageKey ?? '').trim()
+  if (key !== '') return `notice:${key}`
+  const turn = String(turnNo ?? '').trim()
+  return turn === '' ? '' : `notice:turn:${turn}`
+}
+
+/** 秘书回复卡朗读 key（2026-11-21 加 `assistant:` 前缀：既是朗读 key，也是已读 cardKey）。 */
+export function assistantCardSpeechKey(turnNo: string): string {
+  const turn = String(turnNo ?? '').trim()
+  return turn === '' ? '' : `assistant:turn:${turn}`
+}
+
+/** 通知卡正文：把「系统通知」合成行里的真实内容挑出来（第一行合成标记与「最后单独一行原样输出：」前缀不进卡片正文）。 */
+export function stripNoticeSyntheticHead(raw: string): string {
+  let text = String(raw ?? '').replace(/\r\n?/g, '\n').trim()
+  if (text === '') return ''
+  const lines = text.split('\n')
+  while (lines.length > 0 && NOTICE_HEAD_LINE_RE.test(lines[0])) lines.shift()
+  const cleaned = lines.map((line) => line
+    .replace(/^\s*最后单独一行原样输出[：:]\s*/, '')
+    .trim())
+  return cleaned.filter((line) => line !== '').join('\n')
+}
+
+/** 通知卡正文解析：与秘书回复卡同一套（首行做标题、其余段落），引用标记单独成 chip。 */
+export function parseNoticeCardBody(raw: string): { title: string; paragraphs: string[] } {
+  return parseAnswerBody(stripNoticeSyntheticHead(raw))
+}
+
+/** 底行时间：宿主操作行的时间文本 → 卡片脚部只写时间（去掉「今天」字样；已是「昨天 …」/「11月20日 …」原样用）。 */
 export function formatUserCardClock(clockText: unknown): string {
   const raw = String(clockText ?? '').replace(/\s+/g, ' ').trim()
   if (raw === '') return ''
-  const match = raw.match(/^([01]?\d|2[0-3]):([0-5]\d)$/)
-  if (match !== null) return `今天 ${raw}`
-  return raw
+  const stripped = raw.replace(/^今天\s+/, '')
+  const match = stripped.match(/^([01]?\d|2[0-3]):([0-5]\d)$/)
+  return match === null ? stripped : stripped
 }
 
 export interface SecretaryUserRow {
@@ -483,25 +598,206 @@ export interface SecretaryUserRow {
   clockText: string
 }
 
+/** 秘书页里那些「user 角色」行的分类：真实用户输入 → 冷蓝用户卡；插件塞进来的合成通知 → 灰底通知卡。 */
+export type SecretaryCardKind = typeof CARD_KIND_USER | typeof CARD_KIND_NOTICE
+export interface SecretaryCardRow extends SecretaryUserRow {
+  kind: SecretaryCardKind
+}
+
 /**
- * 收集秘书页对话流里**真实用户发的**那些用户行：
+ * 收集秘书页对话流里**所有 user 角色的行**并分类：
  *   - 只认宿主稳定语义标记 `[data-chat-flow-kind="user"]`；
- *   - 合成通知（系统通知 / `[[session:]]` 引用行）不进列表——保持宿主原样，不做成用户卡；
+ *   - 合成通知（系统通知 / `[[session:]]` 引用行）标成 notice（灰底通知卡，带可点引用 chip）；
+ *   - 真实用户消息标成 user（冷蓝用户卡）；
  *   - 文本从 `[data-slot="conversation.user.text.node"]` 读，卡片自身挂在行上，不会把自己读回去。
  */
-export function collectSecretaryUserRows(doc: Document): SecretaryUserRow[] {
-  const out: SecretaryUserRow[] = []
+export function collectSecretaryCardRows(doc: Document): SecretaryCardRow[] {
+  const out: SecretaryCardRow[] = []
   for (const row of doc.querySelectorAll('[data-chat-flow-kind="user"]')) {
     const key = row.getAttribute('data-chat-node-key') ?? row.getAttribute('data-chat-flow-key') ?? ''
     const turnNo = row.getAttribute('data-chat-turn') ?? ''
     const textEl = row.querySelector('[data-slot="conversation.user.text.node"]')
     const text = String(textEl?.textContent ?? '').trim()
     if (text === '') continue
-    if (isSyntheticNoticeUserText(text)) continue
     const clockEl = row.querySelector('[data-clock]')
-    out.push({ element: row, key, turnNo, text, clockText: String(clockEl?.textContent ?? '').trim() })
+    const kind: SecretaryCardKind = isSyntheticNoticeUserText(text) ? CARD_KIND_NOTICE : CARD_KIND_USER
+    out.push({ element: row, key, turnNo, text, clockText: String(clockEl?.textContent ?? '').trim(), kind })
   }
   return out
+}
+
+/** 只取真实用户行（冷蓝用户卡用）；判据与 collectSecretaryCardRows 同一套，防止三条路径串味。 */
+export function collectSecretaryUserRows(doc: Document): SecretaryUserRow[] {
+  return collectSecretaryCardRows(doc).filter((row) => row.kind === CARD_KIND_USER)
+}
+
+/** ─────────────── 7. 已读卡集合（未读红点的持久化） ─────────────── */
+
+/** 宿主侧「已读卡」路由（服务端 src/assistant-secretary.ts 注册同一字符串）。 */
+export const ASSISTANT_SECRETARY_READ_ROUTE = '/api/assistant/secretary-read'
+/** 本地缓存键前缀（真值仍在宿主，localStorage 只是宿主答不上时的降级缓存）。 */
+export const READ_STORAGE_PREFIX = 'dsh.assistant.secretary.read:'
+/** 每个会话最多记多少条已读 cardKey（去噪：写满就把最旧的一条丢掉）。 */
+export const MAX_READ_KEYS = 400
+const CARD_KEY_RE = /^[A-Za-z0-9:._#-]{1,200}$/
+
+/** 归一一条 cardKey：只接受 key 形态，别的（空、超长、带空格）一律判坏。 */
+export function normalizeCardKey(raw: unknown): string {
+  const value = String(raw ?? '').trim()
+  return CARD_KEY_RE.test(value) ? value : ''
+}
+
+/** 归一宿主/缓存送来的已读集合：坏值丢掉，按序去重，截到上限（保留最新的）。 */
+export function normalizeReadKeys(raw: unknown): string[] {
+  const list = Array.isArray(raw) ? raw : []
+  const out: string[] = []
+  for (const item of list) {
+    const key = normalizeCardKey(item)
+    if (key === '' || out.includes(key)) continue
+    out.push(key)
+  }
+  return out.length > MAX_READ_KEYS ? out.slice(out.length - MAX_READ_KEYS) : out
+}
+
+export interface SecretaryReadDeps {
+  /** 浏览器里是 window.fetch；单测里是假实现。缺 → 按「宿主答不上」降级。 */
+  fetchImpl?: (url: string, init?: any) => Promise<any>
+  /** 本地兜底缓存（宿主答不上时还能立刻知道已读）；缺 → 只用心跳集合。 */
+  storage?: { getItem(key: string): string | null; setItem(key: string, value: string): void } | null
+}
+
+export interface SecretaryReadStore {
+  session(): string
+  setSession(sessionId: string): void
+  isRead(cardKey: string): boolean
+  /** 标记已读：立刻本地生效（红点当场消失），再写缓存 + 落宿主；宿主失败不阻塞。 */
+  markRead(cardKey: string): boolean
+  /** 取宿主已读集合（先宿主、再叠本地缓存）；宿主答不上时按本地缓存继续。 */
+  hydrate(): Promise<{ ok: boolean; hostOk: boolean; count: number }>
+  subscribe(listener: () => void): () => void
+  /** useSyncExternalStore 的快照：一个版本号（卡片用它订阅，再问 isRead）。 */
+  getVersion(): number
+  keys(): string[]
+}
+
+export function createSecretaryReadStore(deps: SecretaryReadDeps = {}): SecretaryReadStore {
+  const read = new Set<string>()
+  const order: string[] = []
+  const listeners = new Set<() => void>()
+  const storageKey = READ_STORAGE_PREFIX
+  let session = ''
+  let version = 0
+  let hydrateCall: Promise<{ ok: boolean; hostOk: boolean; count: number }> | null = null
+  /** 宿主没答上过（404/网络失败）就别再反复打；本地缓存仍是权威兜底。 */
+  let hostBroken = false
+
+  const emit = (): void => { for (const listener of [...listeners]) { try { listener() } catch { /* 单个订阅者出错不影响别的 */ } } }
+  const bump = (): void => { version += 1; emit() }
+  const add = (cardKey: string): boolean => {
+    const key = normalizeCardKey(cardKey)
+    if (key === '' || read.has(key)) return false
+    read.add(key)
+    order.push(key)
+    while (order.length > MAX_READ_KEYS) {
+      const oldest = order.shift() ?? ''
+      if (oldest !== '') read.delete(oldest)
+    }
+    return true
+  }
+  const addAll = (keys: readonly string[]): number => {
+    let added = 0
+    for (const key of keys) if (add(key)) added += 1
+    if (added > 0) bump()
+    return added
+  }
+  const storage = deps.storage ?? null
+  const readCache = (): string[] => {
+    if (storage === null || session === '') return []
+    try { return normalizeReadKeys(JSON.parse(String(storage.getItem(`${storageKey}${session}`) ?? '[]')) as unknown) } catch { return [] }
+  }
+  const writeCache = (): void => {
+    if (storage === null || session === '') return
+    try { storage.setItem(`${storageKey}${session}`, JSON.stringify(order.slice(-MAX_READ_KEYS))) } catch { /* 缓存写不进去就靠集合内存 */ }
+  }
+  const postRead = (cardKey: string): void => {
+    const fetchImpl = deps.fetchImpl
+    if (hostBroken || typeof fetchImpl !== 'function' || session === '') return
+    void Promise.resolve(fetchImpl(ASSISTANT_SECRETARY_READ_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: session, cardKey, mark: 'read' }),
+    })).then((res: any) => {
+      if (res?.ok !== true) { hostBroken = true; return }
+      return res.json?.().then((payload: any) => { if (payload?.ok !== true) hostBroken = true })
+    }).catch(() => { hostBroken = true })
+  }
+
+  return {
+    session: () => session,
+    setSession(sessionId: string): void {
+      const id = String(sessionId ?? '').trim()
+      if (id === session) return
+      session = id
+      hydrateCall = null
+      addAll(readCache())
+    },
+    isRead(cardKey: string): boolean {
+      const key = normalizeCardKey(cardKey)
+      return key !== '' && read.has(key)
+    },
+    markRead(cardKey: string): boolean {
+      const key = normalizeCardKey(cardKey)
+      if (key === '') return false
+      if (read.has(key)) return true
+      add(key)
+      bump()
+      writeCache()
+      postRead(key)
+      return true
+    },
+    hydrate(): Promise<{ ok: boolean; hostOk: boolean; count: number }> {
+      if (hydrateCall !== null) return hydrateCall
+      hydrateCall = (async (): Promise<{ ok: boolean; hostOk: boolean; count: number }> => {
+        addAll(readCache())
+        const fetchImpl = deps.fetchImpl
+        if (hostBroken || session === '' || typeof fetchImpl !== 'function') {
+          return { ok: true, hostOk: false, count: order.length }
+        }
+        try {
+          const res = await fetchImpl(`${ASSISTANT_SECRETARY_READ_ROUTE}?sessionId=${encodeURIComponent(session)}`, { cache: 'no-store' })
+          if (res?.ok !== true) { hostBroken = true; return { ok: true, hostOk: false, count: order.length } }
+          const payload = await res.json()
+          const hostKeys = normalizeReadKeys((payload as any)?.cards)
+          if ((payload as any)?.ok !== true) { hostBroken = true; return { ok: true, hostOk: false, count: order.length } }
+          addAll(hostKeys)
+          writeCache()
+          return { ok: true, hostOk: true, count: order.length }
+        } catch {
+          hostBroken = true
+          return { ok: true, hostOk: false, count: order.length }
+        }
+      })()
+      return hydrateCall
+    },
+    subscribe(listener: () => void): () => void { listeners.add(listener); return () => { listeners.delete(listener) } },
+    getVersion(): number { return version },
+    keys(): string[] { return [...order] },
+  }
+}
+
+/**
+ * 卡片组件共用的**进程内已读 store**（懒创建）：真值在宿主 `/api/assistant/secretary-read`，
+ * localStorage 只是首屏缓存与宿主答不上时的兜底；node 环境（没有 fetch/localStorage）不会去要。
+ */
+let cardReadStore: SecretaryReadStore | null = null
+export function secretaryReadStore(): SecretaryReadStore {
+  if (cardReadStore !== null) return cardReadStore
+  const g: any = globalThis as any
+  const fetchImpl = typeof g.fetch === 'function' ? (url: string, init?: any) => g.fetch(url, init) : undefined
+  let storage: SecretaryReadDeps['storage'] = null
+  try { if (g.localStorage && typeof g.localStorage.getItem === 'function') storage = g.localStorage } catch { storage = null }
+  cardReadStore = createSecretaryReadStore({ fetchImpl, storage })
+  return cardReadStore
 }
 
 /** 单测入口（node 直驱状态机与纯函数）。 */
@@ -524,9 +820,25 @@ export const secretaryCardsTestSurface = {
   formatClock,
   CARD_KIND_ASSISTANT,
   CARD_KIND_USER,
+  CARD_KIND_NOTICE,
+  FOLD_BODY_LINE_BUDGET,
+  FOLD_BLOCK_GAP,
   isSyntheticNoticeUserText,
+  stripNoticeSyntheticHead,
+  parseNoticeCardBody,
   parseUserCardBody,
   userCardSpeechKey,
+  noticeCardSpeechKey,
+  assistantCardSpeechKey,
   formatUserCardClock,
   collectSecretaryUserRows,
+  collectSecretaryCardRows,
+  foldClipFromBlocks,
+  ASSISTANT_SECRETARY_READ_ROUTE,
+  READ_STORAGE_PREFIX,
+  MAX_READ_KEYS,
+  normalizeCardKey,
+  normalizeReadKeys,
+  createSecretaryReadStore,
+  secretaryReadStore,
 }

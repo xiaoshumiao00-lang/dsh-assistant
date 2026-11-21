@@ -230,13 +230,17 @@ cases.push(['一句话摘要：首行截断加省略号', () => {
   assert.equal(surface.summarize(''), '')
 }])
 
-cases.push(['卡片时间：今天/昨天/更早与非法输入', () => {
+cases.push(['卡片时间：卡脚只写 HH:MM（去「今天」字样）、昨天/更早仍带日期、非法输入为空', () => {
   const now = new Date(2026, 10, 21, 12, 0)
-  assert.equal(surface.formatClock('2026-11-21T07:40:00', now), '今天 07:40')
+  assert.equal(surface.formatClock('2026-11-21T07:40:00', now), '7:40')
+  assert.equal(surface.formatClock('2026-11-21T09:08:00', now), '9:08')
   assert.equal(surface.formatClock('2026-11-20T23:05:00', now), '昨天 23:05')
-  assert.equal(surface.formatClock('2026-11-18T08:30:00', now), '11月18日 08:30')
+  assert.equal(surface.formatClock('2026-11-18T08:30:00', now), '11月18日 8:30')
   assert.equal(surface.formatClock('not-a-date', now), '')
   assert.equal(surface.formatClock('', now), '')
+  assert.equal(surface.formatClock(null, now), '')
+  // 组件送的是 epoch 字符串（SecretaryReplyCard 用它量 turn 结束时间）
+  assert.equal(surface.formatClock(String(new Date(2026, 10, 21, 9, 8).getTime()), now), '9:08')
 }])
 
 cases.push(['自动朗读目标：空白合成尾轮不能挡住最近一条真实回复', () => {
@@ -282,8 +286,10 @@ cases.push(['用户卡朗读 key：每张卡按自己那条消息，不与秘书
   assert.equal(surface.userCardSpeechKey('', '8'), 'user:turn:8')
 }])
 
-cases.push(['用户卡时间：宿主「HH:MM」补成「今天 HH:MM」，已是日期文本原样用', () => {
-  assert.equal(surface.formatUserCardClock('20:24'), '今天 20:24')
+cases.push(['用户卡时间：宿主「今天 20:24」/「20:24」都收成「20:24」，昨天/日期形式原样用', () => {
+  assert.equal(surface.formatUserCardClock('20:24'), '20:24')
+  assert.equal(surface.formatUserCardClock('今天 20:24'), '20:24')
+  assert.equal(surface.formatUserCardClock('今天 9:08'), '9:08')
   assert.equal(surface.formatUserCardClock('昨天 23:05'), '昨天 23:05')
   assert.equal(surface.formatUserCardClock('11月18日 08:30'), '11月18日 08:30')
   assert.equal(surface.formatUserCardClock(''), '')
@@ -295,9 +301,171 @@ cases.push(['自动朗读目标只看秘书卡：用户卡不许挡住最近一�
   assert.equal(surface.latestReplyTurnNo(doc), '10')
 }])
 
-cases.push(['卡片 kind 常量：秘书卡 assistant / 用户卡 user', () => {
+cases.push(['卡片 kind 常量：秘书卡 assistant / 用户卡 user / 通知卡 notice（三种卡互不串味）', () => {
   assert.equal(surface.CARD_KIND_ASSISTANT, 'assistant')
   assert.equal(surface.CARD_KIND_USER, 'user')
+  assert.equal(surface.CARD_KIND_NOTICE, 'notice')
+  assert.equal(surface.FOLD_BODY_LINE_BUDGET, 3)
+  assert.equal(surface.FOLD_BLOCK_GAP, 10)
+}])
+
+cases.push(['通知卡正文：剥掉合成头（「（系统通知…）」与「最后单独一行原样输出：」），首行做标题、其余成段落', () => {
+  const raw = '（系统通知，不是用户说的话）\n电脑操作会话「备份」这一轮已经完成。\n最后单独一行原样输出：[[session:s1|备份]]'
+  assert.equal(surface.stripNoticeSyntheticHead(raw), '电脑操作会话「备份」这一轮已经完成。\n[[session:s1|备份]]')
+  assert.equal(surface.stripNoticeSyntheticHead('（系统通知，不是用户说的话）\n[系统通知，不是用户说的话] 已完成\n最后单独一行原样输出：[[session:s2|会话]]'), '[[session:s2|会话]]')
+  assert.equal(surface.stripNoticeSyntheticHead(''), '')
+  const parsed = surface.parseNoticeCardBody('（系统通知，不是用户说的话）\n这一轮已经完成。\n第二段正文。')
+  assert.equal(parsed.title, '这一轮已经完成。')
+  assert.deepEqual(parsed.paragraphs, ['第二段正文。'])
+  assert.deepEqual(surface.parseNoticeCardBody('（系统通知，不是用户说的话）\n\n\n').paragraphs, [])
+}])
+
+cases.push(['三种行分类不串味：真实用户行=user、合成通知行=notice、助手回答行不是用户行', () => {
+  function fakeRow(text, kind) {
+    return {
+      getAttribute: (name) => (name === 'data-chat-flow-kind' ? kind
+        : name === 'data-clock' ? '20:24'
+          : name === 'data-chat-turn' ? '7'
+            : name === 'data-chat-node-key' ? `13:${text.slice(0, 4)}` : null),
+      textContent: text,
+      querySelector: (sel) => (sel === '[data-slot="conversation.user.text.node"]'
+        ? { querySelectorAll: () => [{ nodeType: 3, textContent: text }], textContent: text }
+        : sel === '[data-clock]' ? { textContent: '20:24' } : null),
+    }
+  }
+  const doc = { querySelectorAll: (sel) => (sel.includes('data-chat-flow-kind="user"')
+    ? [
+      fakeRow('你好，帮我看看今天下午', 'user'),
+      fakeRow('（系统通知，不是用户说的话）\n电脑操作会话「备份」这一轮已经完成。', 'user'),
+    ]
+    : [fakeRow('秘书自己的回答不应该进用户卡', 'assistant-step')]) }
+  const cardRows = surface.collectSecretaryCardRows(doc)
+  assert.equal(cardRows.length, 2)
+  assert.equal(cardRows[0].kind, surface.CARD_KIND_USER)
+  assert.equal(cardRows[1].kind, surface.CARD_KIND_NOTICE)
+  assert.equal(cardRows[0].clockText, '20:24')
+  const userOnly = surface.collectSecretaryUserRows(doc)
+  assert.equal(userOnly.length, 1)
+  assert.equal(userOnly[0].kind, surface.CARD_KIND_USER)
+}])
+
+cases.push(['卡片 key：秘书卡 assistant:turn:N，通知卡 notice:<消息 key> / notice:turn:N，互不撞', () => {
+  assert.equal(surface.assistantCardSpeechKey('7'), 'assistant:turn:7')
+  assert.equal(surface.assistantCardSpeechKey(''), '')
+  assert.equal(surface.noticeCardSpeechKey('14:input-message-cu-01', '9'), 'notice:14:input-message-cu-01')
+  assert.equal(surface.noticeCardSpeechKey('', '9'), 'notice:turn:9')
+  assert.notEqual(surface.noticeCardSpeechKey('14:input-message-cu-01', '9'), surface.userCardSpeechKey('14:input-message-cu-01', '9'))
+}])
+
+cases.push(['折叠几何（三种卡共用一套算术）：卡标题不吃预算、正文最多 3 行、落点不切半行', () => {
+  const lineHeight = 27
+  const blocks = [
+    { kind: 'title', top: 0, height: 26 },
+    { kind: 'para', top: 36, height: 54 },   // 2 行
+    { kind: 'para', top: 100, height: 81 },  // 3 行
+    { kind: 'para', top: 191, height: 54 },
+  ]
+  const natural = 245
+  const out = surface.foldClipFromBlocks({ blocks, naturalHeight: natural, lineHeight })
+  // 预算 3 行：第一个块 2 行（bottom 90），第二个块只切 1 行 → 100 + 27 = 127
+  assert.equal(out.collapsedMaxHeight, 127)
+  assert.equal(out.overflow, true)
+  assert.equal(out.bodyLines, 3)
+  assert.equal(out.clip, 127)
+  // 不溢出：正文只有 3 行 → 不截断，collapsedMaxHeight 为 undefined（自然高度）
+  const short = surface.foldClipFromBlocks({ blocks: [{ kind: 'para', top: 0, height: 81 }], naturalHeight: 81, lineHeight })
+  assert.equal(short.collapsedMaxHeight, undefined)
+  assert.equal(short.overflow, false)
+  assert.equal(short.bodyLines, 3)
+  // 只有标题：没有正文块 → 不折叠
+  assert.deepEqual(surface.foldClipFromBlocks({ blocks: [{ kind: 'title', top: 0, height: 26 }], naturalHeight: 26, lineHeight }).collapsedMaxHeight, undefined)
+  // 引用 chip 整块不可切一半（chip 算 1 行）
+  const withRef = surface.foldClipFromBlocks({ blocks: [{ kind: 'para', top: 0, height: 27 }, { kind: 'ref', top: 37, height: 36 }], naturalHeight: 100, lineHeight })
+  assert.equal(withRef.collapsedMaxHeight, undefined)
+  assert.equal(withRef.bodyLines, 2)
+  // 坏行高不塌陷成 0（回自然高度）
+  const bad = surface.foldClipFromBlocks({ blocks, naturalHeight: natural, lineHeight: 0 })
+  assert.equal(bad.collapsedMaxHeight, undefined)
+  assert.equal(bad.overflow, false)
+}])
+
+cases.push(['已读集合：cardKey 归一（坏值丢掉、去重、截上限）', () => {
+  assert.equal(surface.normalizeCardKey(' assistant:turn:7 '), 'assistant:turn:7')
+  assert.equal(surface.normalizeCardKey('带 空格 的 key'), '')
+  assert.equal(surface.normalizeCardKey(''), '')
+  assert.deepEqual(surface.normalizeReadKeys(['a:1', 'a:1', '', '坏 值', 'b:2']), ['a:1', 'b:2'])
+  const many = Array.from({ length: surface.MAX_READ_KEYS + 20 }, (_, i) => `k${i}`)
+  const capped = surface.normalizeReadKeys(many)
+  assert.equal(capped.length, surface.MAX_READ_KEYS)
+  assert.equal(capped[capped.length - 1], 'k419')
+}])
+
+cases.push(['已读 store：宿主真值优先、宿主答不上降级 localStorage、不阻塞渲染', async () => {
+  const seen = []
+  const hostCards = new Map()
+  const fetchImpl = async (url, init) => {
+    seen.push({ url, init })
+    const route = url.split('?')[0]
+    if (route !== surface.ASSISTANT_SECRETARY_READ_ROUTE) return { ok: false }
+    if (init?.method === 'POST') {
+      const body = JSON.parse(init.body)
+      const list = hostCards.get(body.sessionId) ?? []
+      if (!list.includes(body.cardKey)) list.push(body.cardKey)
+      hostCards.set(body.sessionId, list)
+      return { ok: true, json: async () => ({ ok: true, sessionId: body.sessionId, cards: list.slice(), count: list.length }) }
+    }
+    const sessionId = new URL(`http://x${url}`).searchParams.get('sessionId') ?? ''
+    const cards = hostCards.get(sessionId) ?? []
+    return { ok: true, json: async () => ({ ok: true, sessionId, cards: cards.slice(), count: cards.length }) }
+  }
+  const store = surface.createSecretaryReadStore({ fetchImpl, storage: null })
+  store.setSession('session-1')
+  assert.equal(store.isRead('assistant:turn:7'), false)
+  store.markRead('assistant:turn:7')
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(store.isRead('assistant:turn:7'), true)
+  assert.equal(store.markRead(''), false, '空 key 不许污染集合')
+  const post = seen.find((item) => item.init?.method === 'POST')
+  assert.equal(post !== undefined, true, '已读必须发给宿主，不能只靠 localStorage')
+  assert.equal(post.url, surface.ASSISTANT_SECRETARY_READ_ROUTE)
+  assert.deepEqual(JSON.parse(post.init.body), { sessionId: 'session-1', cardKey: 'assistant:turn:7', mark: 'read' })
+
+  // 刷新页面 = 新的 store（宿主 GET 送集合）→ 已读卡不再未读
+  const again = surface.createSecretaryReadStore({ fetchImpl, storage: null })
+  again.setSession('session-1')
+  const hydrated = await again.hydrate()
+  assert.equal(hydrated.hostOk, true)
+  assert.equal(hydrated.count >= 1, true)
+  const got = seen.find((item) => item.init?.method === undefined)
+  assert.equal(got !== undefined, true, 'hydrate 必须先问宿主拿真值集合')
+  assert.equal(got.url, `${surface.ASSISTANT_SECRETARY_READ_ROUTE}?sessionId=session-1`)
+  assert.equal(again.isRead('assistant:turn:7'), true)
+  assert.equal(again.isRead('assistant:turn:8'), false)
+
+  // 宿主 404（route 不在当前构建的宿主上）→ 降级用 localStorage 缓存，且不许阻塞
+  const cache = new Map()
+  const storage = { getItem: (key) => cache.get(key) ?? null, setItem: (key, value) => { cache.set(key, value) } }
+  storage.setItem(surface.READ_STORAGE_PREFIX + 'session-2', JSON.stringify(['notice:turn:9']))
+  const degraded = surface.createSecretaryReadStore({ fetchImpl: async () => ({ ok: false }), storage })
+  degraded.setSession('session-2')
+  const degradedHydrated = await degraded.hydrate()
+  assert.equal(degradedHydrated.ok, true)
+  assert.equal(degradedHydrated.hostOk, false)
+  assert.equal(degraded.isRead('notice:turn:9'), true)
+  const throwingStore = surface.createSecretaryReadStore({ fetchImpl: async () => { throw new Error('网络断了') }, storage })
+  throwingStore.setSession('session-2')
+  const thrown = await throwingStore.hydrate()
+  assert.equal(thrown.ok, true, '宿主答不上不许阻塞渲染')
+  assert.equal(thrown.hostOk, false)
+  assert.equal(throwingStore.isRead('notice:turn:9'), true)
+
+  // 没有 fetch（非浏览器环境）也只是不查宿主，不抛
+  const none = surface.createSecretaryReadStore({ fetchImpl: null, storage: null })
+  none.setSession('session-3')
+  none.markRead('assistant:turn:1')
+  const noneHydrated = await none.hydrate()
+  assert.equal(noneHydrated.hostOk, false)
+  assert.equal(none.isRead('assistant:turn:1'), true)
 }])
 
 let failed = 0

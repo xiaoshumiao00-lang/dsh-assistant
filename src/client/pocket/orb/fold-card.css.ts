@@ -1,18 +1,18 @@
 /**
- * 秘书卡片「固定高度 + 点击展开/折叠」共享实现（回复卡与主动服务卡共用，别写两份）。
+ * 卡片「固定高度 + 点击展开/折叠」共享实现（与秘书三种卡同一套语义，别写两份）。
  *
- * 约定（两类卡片都遵守）：
- *   卡片根节点挂  data-dsh-fold="card"  data-open="0|1"   --fold-bg 变量 = 卡片底色（渐隐遮罩用）
- *   内容主区挂    data-dsh-fold="main"   （flex:1、超出截断、底部渐隐遮罩盖住半行字）
+ * 约定（各类卡片都遵守）：
+ *   卡片根节点挂  data-dsh-fold="card"  data-open="0|1"   data-overflow="1" 表示真被切掉
+ *   内容主区挂    data-dsh-fold="main"   （flex:1、超出截断）
  *   底部信息行挂  data-dsh-fold="foot"   （flex:none，恒贴在卡片底部）
  *
- * 折叠态高度恒定：桌面 226px / 手机（≤640px）212px；展开态 height:auto 放全文。
- * 点整张卡片切换展开/折叠由各卡片的 React 组件各自挂 onClick（状态语义一致）。
+ * 折叠态：正文最多 3 行（预算与落点由 SecretaryReplyCard.tsx 的 measureFoldClip 算出来挂成 max-height）；
+ * 被切掉的行末尾打「…」省略标记（2026-11-21 改动：**不再用底部渐变遮罩**），展开态 height:auto 放全文。
  */
 export const FOLD_CARD_CSS = `
 [data-dsh-fold="card"] {
   box-sizing: border-box;
-  height: 226px;
+  position: relative;
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -31,21 +31,20 @@ export const FOLD_CARD_CSS = `
 [data-dsh-fold="card"][data-open="1"] [data-dsh-fold="main"] {
   overflow: visible;
 }
-/* 折叠态底部渐隐遮罩：盖掉被截断的半行字（颜色取卡片底色变量） */
-[data-dsh-fold="card"]:not([data-open="1"]) [data-dsh-fold="main"]::after {
-  content: "";
+/* 折叠态末尾的省略标记：贴在最后一行的行尾右侧，背景跟卡面同色把残字盖掉（不是渐变遮罩） */
+[data-dsh-fold="card"]:not([data-open="1"])[data-overflow="1"] [data-dsh-fold="main"]::after {
+  content: "…";
   position: absolute;
-  left: 0;
   right: 0;
   bottom: 0;
-  height: 30px;
-  background: linear-gradient(to bottom, transparent, var(--fold-bg, #ffffff));
+  padding: 0 4px 0 6px;
+  font-size: 15px;
+  line-height: 27px;
+  color: var(--dsh-card-text-muted, #8a9099);
+  background: var(--fold-bg, var(--dsh-card-surface, #ffffff));
   pointer-events: none;
 }
 [data-dsh-fold="foot"] {
   flex: none;
-}
-@media (max-width: 640px) {
-  [data-dsh-fold="card"] { height: 212px; }
 }
 `
