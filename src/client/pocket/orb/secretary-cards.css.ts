@@ -23,6 +23,11 @@ body[data-dsh-secretary="1"] [data-chat-flow-kind="turn-max-tokens"],
 body[data-dsh-secretary="1"] [data-chat-flow-kind="compaction"] {
   display: none !important;
 }
+/* 消息下方原生操作行（复制/赞/踩/分享/记忆/时间，宿主 MessageIconActions 根节点带 data-clock）：
+ * 渲染层隐藏、不留行高；时间已在卡片底行 meta 里，不重复显示 */
+body[data-dsh-secretary="1"] [data-clock] {
+  display: none !important;
+}
 /* 空占位条：卡片/操作区的空壳不生成盒子 */
 body[data-dsh-secretary="1"] [data-dsh-scard="card"][data-empty="1"],
 body[data-dsh-secretary="1"] [data-dsh-speak="wrap"][data-empty="1"] {
@@ -31,13 +36,12 @@ body[data-dsh-secretary="1"] [data-dsh-speak="wrap"][data-empty="1"] {
 
 /* ── 秘书回复卡片 ── */
 [data-dsh-scard="card"] {
+  --fold-bg: #f7f9fc;
   background: #f7f9fc;
   border: 1px solid #e9edf3;
   border-radius: 16px;
   padding: 16px;
   margin: 8px 0 4px;
-  display: flex;
-  flex-direction: column;
   gap: 10px;
   box-shadow: 0 1px 3px rgba(30, 41, 59, .05);
 }
@@ -111,17 +115,29 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+[data-dsh-scard="main"] {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
 [data-dsh-scard="meta"] {
   display: flex;
   align-items: center;
   justify-content: flex-start;
-  padding-top: 2px;
+  gap: 8px;
+  padding-top: 6px;
   border-top: 1px solid #eef1f5;
 }
 [data-dsh-scard="time"] {
   font-size: 12px;
   color: var(--dsw-alias-label-tertiary, #9aa2af);
   font-variant-numeric: tabular-nums;
+}
+/* 展开/收起轻提示：非按钮文本，跟在底行时间右侧（整张卡片可点，不新增操作按钮行） */
+[data-dsh-scard="hint"] {
+  margin-left: auto;
+  font-size: 12px;
+  color: #5b7fc0;
 }
 
 /* ── 朗读气泡（回复卡与主动服务卡共用：小圆形、淡描边、最右） ── */

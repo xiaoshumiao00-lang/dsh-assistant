@@ -4,15 +4,18 @@
  *   DSH_POCKET_URL=http://127.0.0.1:3081 DSH_POCKET_TOKEN=… node scripts/smoke-secretary-page.mjs
  *
  * 为什么要这一层：前几轮都是「build + 单测全绿，用户重启后照样报错」。这个脚本把 pocket
- * 页面真开到浏览器里，用真实指针手势长按悬浮球 600ms，然后检查：
+ * 页面真开到浏览器里，单击悬浮球进入固定秘书会话，然后检查：
  *   1. 加载与交互期没有未捕获异常；console error 只剩已知的宿主既有噪声（见 IGNORED_CONSOLE）；
- *   2. 长按后**主面板真的切到固定秘书会话**（__dshUiWorkspace.selection = 宿主记录的 sessionId），
- *      且页面是标准会话页：没有自制外壳（data-pocket-secretary）、没有骨架条、没有旧空态文案；
- *   3. 重复长按复用同一条固定会话（宿主 id 与 localStorage 都不变、页面没被重载）；
- *   4. 中间显示区不震荡：打开后 6s 内 DOM 变更次数有上限，且采样不到骨架/空态；
- *   5. 主动服务卡片：拦截 /api/assistant/proactive 返回示例卡 → 卡片必须渲染、可展开；
- *      会话还没有任何一轮时，用插件自己的 __dshPromptIntoSession 真发一句、等模型回完再验
- *      （这同时验证「真发一条消息能收到回复」这条端到端链路）。
+ *   2. 主面板真的切到固定秘书会话（selection = 宿主记录的 sessionId），页面是标准会话页：
+ *      没有自制外壳（data-pocket-secretary）、没有骨架条、没有旧空态文案；
+ *   3. 回复卡片：标题行（图标+「个人秘书」标签+一句话摘要+最右朗读钮）、正文 14px 分段、
+ *      底部 meta（12px 灰、时间）；固定高度折叠（200–232px）+ 点击展开/收起 + 渐隐截断；
+ *   4. 朗读：自动朗读最末一轮；单击暂停/继续、长按 600ms 从头重读；**点哪张卡读哪张卡**
+ *      （历史卡点击绝不允许读成最新一条）；
+ *   5. 过程信息行（已完成/用时/处理失败/重试/本轮运行失败）与消息操作行（复制/赞/踩/
+ *      分享/记忆/时间）渲染层隐藏、不留行高；普通会话不受影响；
+ *   6. 主动服务「尾巴卡」已移除：对话流尾部不再出现主动卡节点（后端数据能力保留）；
+ *   7. 重复进入复用同一条固定会话（不重载、不换 id）、30s 存活、手势不串、宿主 intent 落点。
  *
  * 退出码 0 = 全绿。任何断言失败都会打印现场事实。
  */
@@ -26,23 +29,10 @@ const CHROME = process.env.DSH_CHROME_PATH || 'C:\\Program Files\\Google\\Chrome
 const IGNORED_CONSOLE = [
   /worktable\/file/, // 项目卡片探测 widget-result.json：404/403 是项目里本来就没有这个文件
   /deepseek-account.*account read failed/, // 余额读取失败（未登录平台账号）
+  // 普通会话抽查时会试探性打开侧栏里的历史会话，个别已归档的打不开、宿主告警一行；
+  // 与本插件代码无关（抽查循环会继续试下一条，最终断言仍要求落到一条真打开的会话）
+  /Sidebar Session opening failed/,
 ]
-
-const DEMO_CARD = {
-  id: 'demo-wuhan-trip',
-  sessionId: '',
-  title: '主动关心 · 明日武汉出差',
-  summary: '明天去武汉开会，行程、车次和天气都替你核过了。',
-  items: [
-    '天气：武汉明日 8–14℃，多云转小雨，带伞和薄外套',
-    '车次：G1545 孝感东 08:12 → 汉口 08:49',
-    '10:30 华工·结构实验室开会（材料已放进 notes/）',
-    '建议 07:30 从家出发，留 40 分钟进站',
-  ],
-  details: '一、天气\n武汉全天 8–14℃，多云转小雨。\n\n二、行程\n· 08:12 G1545 孝感东 → 08:49 汉口\n· 10:30 华工结构实验室开会',
-  time: '今天 07:40',
-  badge: '主动服务',
-}
 
 const failures = []
 const notes = []
@@ -97,24 +87,10 @@ page.on('response', (response) => {
   failedRequests.push(`${response.status()} ${url.slice(0, 200)}`)
 })
 
-// 主动服务卡片：默认拦下宿主路由返回示例卡（宿主侧代码要重启才进内存，客户端渲染这一层随时能验）。
-// DSH_SMOKE_REAL_CARD=1 时不拦，直接验宿主真实卡组（宿主已经带 /api/assistant/proactive 时用）。
-const REAL_CARD = process.env.DSH_SMOKE_REAL_CARD === '1'
-/** 示例卡引用的目标会话（在页面加载后、点开秘书前填入，引用块跳转测试用）。 */
-const demoRef = { sessionId: '', title: '' }
-if (!REAL_CARD) {
-  await page.route('**/api/assistant/proactive**', (route) => route.fulfill({
-    status: 200,
-    contentType: 'application/json',
-    body: JSON.stringify({
-      ok: true,
-      cards: [{ ...DEMO_CARD, refSessionId: demoRef.sessionId || undefined, refTitle: demoRef.title || undefined }],
-    }),
-  }))
-}
-
 // 朗读 stub：30 秒静音 WAV（8kHz/mono/16bit）——撑住整个断言窗口不被播完。
+// ttsBodies 记录每次请求的 body ——「点哪张卡就读哪张卡」回归断言要用。
 let ttsRequests = 0
+const ttsBodies = []
 const stubWav = (() => {
   const rate = 8000
   const seconds = 30
@@ -137,6 +113,7 @@ const stubWav = (() => {
 })()
 await page.route('**/api/assistant/tts**', (route) => {
   ttsRequests += 1
+  try { ttsBodies.push(String(route.request().postData() ?? '')) } catch { /* 取不到 body 不阻断 */ }
   route.fulfill({ status: 200, contentType: 'audio/mpeg', body: stubWav })
 })
 
@@ -173,55 +150,47 @@ try {
 
   await page.waitForSelector('button[data-pocket-orb="ball"]', { timeout: 30000 })
   // 等宿主自己把「上次打开的会话」恢复完（冷启动时页面会先把主面板切到一条空白会话），
-  // 这样长按测的是用户真实场景（页面已经稳定后再按），而不是抢在启动竞态里。
+  // 这样测的是用户真实场景（页面已经稳定后再进秘书），而不是抢在启动竞态里。
   await page.waitForTimeout(9000)
 
   const bundle = await page.evaluate(async () => {
     const urls = performance.getEntriesByType('resource').map((entry) => entry.name)
     const hit = urls.find((url) => url.includes('dsh-assistant/client.js'))
-    if (!hit) return { found: false, hasProactive: false, hasTurnDedup: false }
+    if (!hit) return { found: false, hasScard: false, hasFold: false }
     const text = await fetch(hit, { cache: 'no-store' }).then((res) => res.text())
     return {
       found: true,
-      hasProactive: text.includes('dsh-proactive'),
-      hasTurnDedup: text.includes('dsh-proactive-turn'),
       hasScard: text.includes('dsh-scard'),
+      // 折叠卡共享实现（固定高度/展开收起）必须打进 bundle
+      hasFold: text.includes('dsh-fold'),
+      // 主动服务尾巴卡已删除：bundle 里不应再有它的轮次去重标记
+      hasTailCard: text.includes('dsh-proactive-turn'),
       // 需求④：禁用浏览器 speechSynthesis 兜底 —— bundle 里根本不应出现这个 API
       hasSpeechSynth: text.includes('speechSynthesis'),
       length: text.length,
     }
   })
-  check('宿主下发的客户端 bundle 是本次构建', bundle.found && bundle.hasProactive && bundle.hasTurnDedup && bundle.hasScard, JSON.stringify(bundle))
+  check('宿主下发的客户端 bundle 是本次构建', bundle.found && bundle.hasScard && bundle.hasFold, JSON.stringify(bundle))
+  check('主动服务尾巴卡已不在 bundle 里', bundle.hasTailCard === false)
   check('无浏览器 speechSynthesis 兜底（只用微软 TTS）', bundle.hasSpeechSynth === false)
 
-  // 给示例卡挑一个真实存在的引用目标（非秘书会话），引用块跳转测试用
-  const refPick = await page.evaluate(() => {
+  // 挑若干条真实存在的普通会话（非秘书，最近更新优先），「普通会话不受影响」断言用：
+  // 个别历史会话可能已归档打不开，循环试到下一条真打开为止。
+  const refCandidates = await page.evaluate(() => {
     try {
       const snap = window.__dshSessions?.list?.getSnapshot?.() ?? null
       const ids = Array.isArray(snap?.ids) ? snap.ids : []
       const sec = String(localStorage.getItem('dsh.assistant.secretary.sessionId') || '')
       // 只挑真实侧栏会话（session-*）：mnemon-task 等引用不是可打开的会话
-      const other = ids.find((id) => String(id) !== sec && String(id).startsWith('session-'))
-      return { id: other ? String(other) : '', title: other ? String(snap?.byId?.[other]?.title ?? other).slice(0, 20) : '' }
-    } catch { return { id: '', title: '' } }
+      return ids
+        .filter((id) => String(id) !== sec && String(id).startsWith('session-'))
+        .map((id) => ({ id: String(id), updatedAt: Number(snap?.byId?.[id]?.updatedAt ?? 0) }))
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, 3)
+        .map((row) => row.id)
+    } catch { return [] }
   })
-  demoRef.sessionId = refPick.id
-  demoRef.title = refPick.title === '' ? '被引用的会话' : refPick.title
-  notes.push(`引用跳转目标 = ${demoRef.sessionId || '(未找到，跳过)'}`)
-
-  // 真实卡模式：宿主卡里未必带引用——把示例卡（内容不变 + 引用目标）写进宿主卡组，
-  // 让「引用块可点跳」在真实数据下也能验收。同 id 覆盖，幂等。
-  if (REAL_CARD && demoRef.sessionId !== '') {
-    const put = await page.evaluate(async ({ card, sessionId, title, token }) => {
-      const res = await fetch(`/api/assistant/proactive?token=${encodeURIComponent(token)}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ ...card, refSessionId: sessionId, refTitle: title }),
-      })
-      return res.ok
-    }, { card: DEMO_CARD, sessionId: demoRef.sessionId, title: demoRef.title, token: TOKEN })
-    notes.push(`真实卡写入引用字段: ${put ? 'ok' : '失败'}`)
-  }
+  notes.push(`普通会话抽查候选 = ${refCandidates.join(', ') || '(未找到)'}`)
 
   const hostIdBefore = await readHostSecretaryId()
   notes.push(`宿主固定会话 id（单击前）= ${hostIdBefore || '(空)'}`)
@@ -258,9 +227,9 @@ try {
     title: document.title,
     mutations: window.__smokeMutations,
     customShell: document.querySelectorAll('[data-pocket-secretary]').length,
-    skeleton: document.querySelectorAll('[data-pocket-secretary="skeleton"], [data-dsh-proactive="skeleton"]').length,
+    skeleton: document.querySelectorAll('[data-pocket-secretary="skeleton"]').length,
     composer: !!document.querySelector('[contenteditable="true"], textarea'),
-    cards: document.querySelectorAll('[data-dsh-proactive="card"]').length,
+    tailCards: document.querySelectorAll('[data-dsh-proactive="card"], [data-dsh-proactive="wrap"]').length,
     controlRoom: document.querySelectorAll('.dsh-assistant-cr').length,
     texts: window.__smokeTexts || [],
     // 采样只留前 500 字（卡片在上半屏时看不到底部状态行），这里单独取一次完整文本
@@ -287,92 +256,20 @@ try {
   check('底部有标准轮次与 token 状态行', sawStatusLine, `tail=${snapshot.fullText.slice(-160).replace(/\n+/g, ' / ')}`)
   check('打开后 6 秒内 DOM 变更次数有限（不震荡）', snapshot.mutations < 4000, `mutations=${snapshot.mutations}`)
 
-  // ── 主动服务卡片 ──
-  let cardOk = await page.waitForSelector('[data-dsh-proactive="card"]', { timeout: 6000 }).then(() => true).catch(() => false)
+  // ── 主动服务「尾巴卡」已移除：对话流尾部不再塞主动卡（后端数据能力保留，只删前端渲染） ──
+  check('秘书会话无主动服务尾巴卡', snapshot.tailCards === 0, `tailCards=${snapshot.tailCards}`)
+
+  // ── 秘书回复卡片：这条会话还没有任何一轮时，真发一句等模型回完再验 ──
+  let cardOk = await page.waitForSelector('[data-dsh-scard="card"]:not([data-empty="1"])', { timeout: 6000 }).then(() => true).catch(() => false)
   if (!cardOk) {
-    // 这条会话还没有任何一轮 → 真发一句（插件自己的调试入口），等模型回完再验卡片。
     notes.push('会话暂无历史轮次：真实发送一条消息，等待模型回复（最多 120s）')
     await page.evaluate((id) => {
       const fn = window.__dshPromptIntoSession
       if (typeof fn === 'function') fn(id, '（冒烟测试）只回复两个字：收到')
     }, currentId)
-    cardOk = await page.waitForSelector('[data-dsh-proactive="card"]', { timeout: 120000 }).then(() => true).catch(() => false)
+    cardOk = await page.waitForSelector('[data-dsh-scard="card"]:not([data-empty="1"])', { timeout: 120000 }).then(() => true).catch(() => false)
   }
-  check('主动服务卡片渲染出来了', cardOk)
-  if (cardOk) {
-    const collapsed = await page.$eval('[data-dsh-proactive="card"]', (el) => {
-      const head = el.querySelector('[data-dsh-proactive="head"]')
-      const badge = el.querySelector('[data-dsh-proactive="badge"]')
-      const title = el.querySelector('[data-dsh-proactive="title"]')
-      const btn = el.querySelector('[data-dsh-speak="button"]')
-      const headRect = head?.getBoundingClientRect()
-      const btnRect = btn?.getBoundingClientRect()
-      const cardRect = el.getBoundingClientRect()
-      const prefix = el.querySelector('[data-dsh-proactive="item-prefix"]')
-      const time = el.querySelector('[data-dsh-proactive="time"]')
-      return {
-        open: el.getAttribute('data-open'),
-        height: el.getBoundingClientRect().height,
-        titleText: title?.textContent ?? '',
-        badgeText: badge?.textContent ?? '',
-        tone: badge?.getAttribute('data-tone') ?? '',
-        // 朗读钮在标题行最右：必须是 head 的最后一个子元素，且右缘贴近卡片右缘
-        btnInHead: btn !== null && btn.parentElement === head,
-        btnIsLast: btn !== null && head?.lastElementChild === btn,
-        btnRightGap: btnRect && cardRect ? Math.round(cardRect.right - btnRect.right) : -1,
-        btnVertInHead: btnRect && headRect ? btnRect.top >= headRect.top - 2 && btnRect.bottom <= headRect.bottom + 2 : false,
-        prefixText: prefix?.textContent ?? '',
-        timeText: time?.textContent ?? '',
-        summaryFontSize: getComputedStyle(el.querySelector('[data-dsh-proactive="summary"]') ?? el).fontSize,
-      }
-    })
-    check('卡片标题正确', collapsed.titleText.includes('主动关心 · 明日武汉出差'), collapsed.titleText.slice(0, 60))
-    check('折叠态卡片高度固定（200–240px，不随内容撑高）', collapsed.height >= 200 && collapsed.height <= 240, `height=${collapsed.height}`)
-    check('类型胶囊按类型换色（主动关心→care 暖橙）', collapsed.badgeText.includes('主动服务') && collapsed.tone === 'care', `badge=${collapsed.badgeText} tone=${collapsed.tone}`)
-    check('要点前缀词加粗（天气：）', collapsed.prefixText === '天气：', `prefix=${collapsed.prefixText}`)
-    check('底行有时间（12px 浅灰）', collapsed.timeText !== '', `time=${collapsed.timeText}`)
-    check('朗读钮在卡片第一行最右（head 末子元素、右缘贴合）',
-      collapsed.btnInHead && collapsed.btnIsLast && collapsed.btnRightGap >= 8 && collapsed.btnRightGap <= 40 && collapsed.btnVertInHead,
-      JSON.stringify({ btnInHead: collapsed.btnInHead, btnIsLast: collapsed.btnIsLast, gap: collapsed.btnRightGap, vert: collapsed.btnVertInHead }))
-
-    // 固定高度截断 + 「查看详情」就地展开 → 展开后可收起
-    const collapsedHeight = collapsed.height
-    await page.click('[data-dsh-proactive="toggle"]')
-    await page.waitForTimeout(400)
-    const expanded = await page.evaluate(() => {
-      const card = document.querySelector('[data-dsh-proactive="card"]')
-      const details = document.querySelector('[data-dsh-proactive="details"]')
-      const toggle = document.querySelector('[data-dsh-proactive="toggle"]')
-      return {
-        open: card?.getAttribute('data-open') === '1',
-        height: card?.getBoundingClientRect().height ?? 0,
-        details: (details?.textContent || '').includes('G1545'),
-        toggleText: toggle?.textContent ?? '',
-      }
-    })
-    check('点「查看详情」就地展开（data-open=1、details 含 G1545、按钮变收起）',
-      expanded.open && expanded.details && expanded.toggleText === '收起', JSON.stringify(expanded))
-    check('展开后高度大于折叠态（内容完整放出）', expanded.height > collapsedHeight, `${collapsedHeight} → ${expanded.height}`)
-    await page.click('[data-dsh-proactive="toggle"]')
-    await page.waitForTimeout(400)
-    const reCollapsed = await page.evaluate(() => {
-      const card = document.querySelector('[data-dsh-proactive="card"]')
-      return { open: card?.getAttribute('data-open'), height: card?.getBoundingClientRect().height ?? 0 }
-    })
-    check('展开后可收起（回到固定高度）', reCollapsed.open === '0' && Math.abs(reCollapsed.height - collapsedHeight) < 2, JSON.stringify(reCollapsed))
-    // 卡片是会话级常驻信息：turnTail 每轮都会渲染一次，必须只在最末一轮出现（不能每轮一张）
-    const single = await page.waitForFunction(
-      () => document.querySelectorAll('[data-dsh-proactive="wrap"]').length === 1
-        && document.querySelectorAll('[data-dsh-proactive="card"]').length === 1,
-      undefined,
-      { timeout: 6000 },
-    ).then(() => true).catch(() => false)
-    const groups = await page.evaluate(() => ({
-      wraps: document.querySelectorAll('[data-dsh-proactive="wrap"]').length,
-      cards: document.querySelectorAll('[data-dsh-proactive="card"]').length,
-    }))
-    check('主动服务卡只在最末一轮出现一次（不重复）', single, JSON.stringify(groups))
-  }
+  check('秘书回复卡片渲染出来了', cardOk)
 
   // ── 过程信息行（需求②）：渲染层真正不输出 ──
   const PROCESS_NOISE = [/已完成，用时/, /处理失败/, /已重试模型请求/, /正在重试模型请求/, /本轮运行失败/, /等待重试模型请求/]
@@ -380,7 +277,21 @@ try {
   const leakedNoise = PROCESS_NOISE.filter((pattern) => pattern.test(pageTextNow)).map(String)
   check('无过程信息行（已完成/用时/处理失败/重试/本轮运行失败）', leakedNoise.length === 0, `leaked=${leakedNoise.join(',')}`)
 
-  // ── 秘书回复卡片 + 朗读（需求①②⑤）：只看最末一轮（querySelector 取 DOM 里最后一张） ──
+  // ── 消息操作行（复制/赞/踩/分享/记忆/时间）：秘书会话渲染层隐藏、不留行高 ──
+  const actionRows = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll('[data-clock]')]
+    return {
+      total: rows.length,
+      hidden: rows.filter((el) => getComputedStyle(el).display === 'none').length,
+      zeroBox: rows.filter((el) => el.getBoundingClientRect().height === 0).length,
+      visible: rows.filter((el) => getComputedStyle(el).display !== 'none').length,
+    }
+  })
+  check('秘书会话消息操作行已隐藏（display:none、不占高度）',
+    actionRows.total >= 1 && actionRows.hidden === actionRows.total && actionRows.visible === 0 && actionRows.zeroBox === actionRows.total,
+    JSON.stringify(actionRows))
+
+  // ── 秘书回复卡片结构 + 朗读（看最末一轮；querySelector 取 DOM 里最后一张） ──
   await page.waitForTimeout(1500) // body[data-dsh-secretary] 轮询 700ms，等标记落上
   const scard = await page.evaluate(() => {
     const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
@@ -424,6 +335,54 @@ try {
     JSON.stringify({ hasButton: scard.hasButton, btnIsLast: scard.btnIsLast, gap: scard.btnRightGap, vert: scard.btnVertInHead }))
   check('自动朗读已发起（唯一自动请求方 = 回复卡，TTS 已有请求）', ttsRequests >= 1, `requests=${ttsRequests}`)
 
+  // ── 回复卡固定高度 + 点击展开/折叠（与主动卡共用 fold-card.css.ts 实现） ──
+  const fold = await page.evaluate(() => {
+    const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
+    // 找一张内容真的超出固定高度的卡（短回复不溢出则跳过展开断言）
+    const overflowing = cards.find((el) => {
+      const main = el.querySelector('[data-dsh-fold="main"]')
+      return main !== null && main.scrollHeight > main.clientHeight + 1
+    }) ?? null
+    if (overflowing === null) return { skip: true, cardCount: cards.length }
+    const main = overflowing.querySelector('[data-dsh-fold="main"]')
+    return {
+      skip: false,
+      height: overflowing.getBoundingClientRect().height,
+      open: overflowing.getAttribute('data-open'),
+      mainOverflow: getComputedStyle(main).overflow,
+      mainTruncated: main.scrollHeight > main.clientHeight + 1,
+      hint: overflowing.querySelector('[data-dsh-scard="hint"]')?.textContent ?? '',
+    }
+  })
+  if (fold.skip === true) {
+    notes.push(`回复卡折叠回归：${fold.cardCount} 张卡内容都偏短、无溢出，跳过展开断言`)
+  } else {
+    check('回复卡折叠高度固定（200–232px，不随内容撑高）', fold.height >= 200 && fold.height <= 232, `height=${fold.height}`)
+    check('超长正文被截断（main overflow:hidden 且 scrollHeight>clientHeight）',
+      fold.mainOverflow === 'hidden' && fold.mainTruncated, JSON.stringify({ overflow: fold.mainOverflow, truncated: fold.mainTruncated }))
+    check('折叠态有展开提示（底行右侧「点击展开全文」）', fold.hint === '点击展开全文', `hint=${fold.hint}`)
+    const foldCard = page.locator('[data-dsh-scard="card"]:not([data-empty="1"])')
+      .filter({ has: page.locator('[data-dsh-scard="hint"]') }).first()
+    const collapsedHeight = fold.height
+    await foldCard.click({ position: { x: 120, y: 24 } }) // 点标题区（避开朗读钮）
+    await page.waitForTimeout(400)
+    const expanded = await foldCard.evaluate((el) => ({
+      open: el.getAttribute('data-open'),
+      height: el.getBoundingClientRect().height,
+      hint: el.querySelector('[data-dsh-scard="hint"]')?.textContent ?? '',
+    }))
+    check('点卡片展开（data-open=1、高度明显变大、提示变「点击收起」）',
+      expanded.open === '1' && expanded.height > collapsedHeight + 40 && expanded.hint === '点击收起',
+      JSON.stringify(expanded))
+    await foldCard.click({ position: { x: 120, y: 24 } })
+    await page.waitForTimeout(400)
+    const reCollapsed = await foldCard.evaluate((el) => ({
+      open: el.getAttribute('data-open'),
+      height: el.getBoundingClientRect().height,
+    }))
+    check('再点收回默认高度', reCollapsed.open === '0' && Math.abs(reCollapsed.height - collapsedHeight) < 2, JSON.stringify(reCollapsed))
+  }
+
   // 朗读状态机：进播放态 → 单击暂停 → 单击继续 → 长按从头重读（回复卡上的那颗钮）
   const speakBtn = page.locator('[data-dsh-scard="card"]:not([data-empty="1"]) [data-dsh-speak="button"]').last()
   let st = await speakBtn.getAttribute('data-status')
@@ -453,6 +412,35 @@ try {
   check('长按 600ms = 从头重读（回到播放）', st === 'playing', `status=${st}`)
   await speakBtn.click().catch(() => {}) // 收尾停掉声音
 
+  // ── 回归：点历史卡必须读历史卡自己的文本（2026-11-21 实测 bug：读成了最新一条） ──
+  const hist = await page.evaluate(() => {
+    const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')]
+    if (cards.length < 2) return { skip: true }
+    const first = cards[0]
+    const last = cards[cards.length - 1]
+    return {
+      firstTitle: first.querySelector('[data-dsh-scard="title"]')?.textContent ?? '',
+      lastTitle: last.querySelector('[data-dsh-scard="title"]')?.textContent ?? '',
+    }
+  })
+  if (hist.skip === true) {
+    notes.push('历史卡朗读回归：会话不足两轮，跳过')
+  } else {
+    // 只比汉字（规范化会在数字/汉字间补空格，避免误判）
+    const cjk = (s) => String(s).replace(/[^一-鿿]/g, '').slice(0, 6)
+    const before = ttsBodies.length
+    await page.locator('[data-dsh-scard="card"]:not([data-empty="1"])').first()
+      .locator('[data-dsh-speak="button"]').click()
+    await page.waitForTimeout(600)
+    const sent = ttsBodies.slice(before).map((body) => { try { return JSON.parse(body)?.text ?? '' } catch { return '' } }).join(' ')
+    check('点历史卡朗读：TTS 收到的是该卡自己的文本', cjk(hist.firstTitle) !== '' && sent.includes(cjk(hist.firstTitle)),
+      `sent=${sent.slice(0, 50)} want=${hist.firstTitle.slice(0, 14)}`)
+    check('点历史卡朗读：绝不读最新一条', cjk(hist.lastTitle) === '' || !sent.includes(cjk(hist.lastTitle)),
+      `last=${hist.lastTitle.slice(0, 14)}`)
+    await page.locator('[data-dsh-scard="card"]:not([data-empty="1"])').first()
+      .locator('[data-dsh-speak="button"]').click().catch(() => {}) // 收尾停掉
+  }
+
   // ── 第二次单击：复用同一条会话、页面不重载 ──
   const beforeSecond = await page.evaluate(() => ({
     stamp: window.__smokeStamp,
@@ -475,11 +463,13 @@ try {
   await page.waitForTimeout(12000)
   const alive = await page.evaluate(() => ({
     title: document.title,
-    cards: document.querySelectorAll('[data-dsh-proactive="card"]').length,
+    cards: document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])').length,
+    tailCards: document.querySelectorAll('[data-dsh-proactive="card"], [data-dsh-proactive="wrap"]').length,
     shell: document.querySelectorAll('[data-pocket-secretary]').length,
   }))
   check('页面 30s 内没崩', alive.title.includes('DeepSeek Harness') || alive.title.includes('个人秘书'), `title=${alive.title}`)
-  check('30s 后卡片仍在（没有闪没）', !cardOk || alive.cards >= 1, `cards=${alive.cards}`)
+  check('30s 后回复卡仍在（没有闪没）', !cardOk || alive.cards >= 1, `cards=${alive.cards}`)
+  check('30s 后仍无尾巴卡', alive.tailCards === 0, `tailCards=${alive.tailCards}`)
   check('30s 后仍无自制外壳', alive.shell === 0)
 
   // ── 长按 600ms：打开控制室，且**不能**走秘书入口（手势对调后的另一半，两者不串） ──
@@ -532,24 +522,36 @@ try {
     assistantLanded && afterAssistantIntent.current === idBeforeLongPress && afterAssistantIntent.log > afterConsoleIntent.log,
     JSON.stringify(afterAssistantIntent))
 
-  // ── 引用块跳转（需求③）：卡片引用某会话 → 点击按会话 id 跳进对应会话详情 ──
-  const refChip = await page.$('[data-dsh-proactive="ref"]')
-  if (refChip !== null && demoRef.sessionId !== '') {
-    await refChip.click()
-    const jumped = await page.waitForFunction((want) => {
-      try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') === want } catch { return false }
-    }, demoRef.sessionId, { timeout: 12000 }).then(() => true).catch(() => false)
-    const nowSel = await readCurrentSessionId()
-    check('点引用块跳进对应会话（宿主会话 id 锚点）', jumped && nowSel === demoRef.sessionId, `selection=${nowSel} want=${demoRef.sessionId}`)
-    // 跳回秘书（走宿主 open-assistant 意图路由 = 既有唤起逻辑）
-    await page.evaluate(() => fetch('/api/assistant/open-assistant', { method: 'POST' }))
-    await page.waitForFunction((want) => {
-      try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') === want } catch { return false }
-    }, idBeforeLongPress, { timeout: 12000 }).catch(() => {})
-    await page.waitForTimeout(800)
-  } else {
-    notes.push('引用跳转：跳过（mock 卡未带 ref 或未找到目标会话）')
+  // ── 普通会话不受影响：切到一条普通会话，消息操作行必须仍然可见 ──
+  let normalChecked = false
+  for (const candidate of refCandidates) {
+    await page.evaluate((id) => {
+      try { window.__dshOpenSession?.(id) } catch { /* 切页失败由下方断言兜底 */ }
+    }, candidate)
+    await page.waitForTimeout(2500)
+    const nowId = await readCurrentSessionId()
+    if (nowId !== candidate) continue // 这条打不开（已归档等），试下一条
+    const normalRows = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('[data-clock]')]
+      const flag = document.body.dataset.dshSecretary ?? ''
+      return {
+        flag,
+        total: rows.length,
+        visible: rows.filter((el) => getComputedStyle(el).display !== 'none').length,
+      }
+    })
+    normalChecked = true
+    check('普通会话消息操作行不受影响（仍然可见）', normalRows.flag !== '1' && normalRows.total >= 1 && normalRows.visible >= 1,
+      `${candidate} ${JSON.stringify(normalRows)}`)
+    break
   }
+  if (!normalChecked) notes.push('普通会话抽查：候选都打不开，跳过可见性断言')
+  // 跳回秘书（走宿主 open-assistant 意图路由 = 既有唤起逻辑）
+  await page.evaluate(() => fetch('/api/assistant/open-assistant', { method: 'POST' }))
+  await page.waitForFunction((want) => {
+    try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') === want } catch { return false }
+  }, idBeforeLongPress, { timeout: 12000 }).catch(() => {})
+  await page.waitForTimeout(800)
 
   check('无未捕获异常', pageErrors.length === 0, JSON.stringify(pageErrors.slice(0, 3)))
   check('无（非既有噪声的）console error', consoleErrors.length === 0, JSON.stringify(consoleErrors.slice(0, 3)))

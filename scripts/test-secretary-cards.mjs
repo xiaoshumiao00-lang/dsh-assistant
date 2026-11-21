@@ -101,9 +101,9 @@ cases.push(['控制器：播放/暂停/继续/重读，播放器方法按序被�
   ctl.request('t1', '你好')
   await new Promise((resolve) => setTimeout(resolve, 10))
   assert.equal(ctl.getSnapshot().status, 'playing')
-  ctl.toggle('t1')
+  ctl.toggle('t1', '你好')
   assert.equal(ctl.getSnapshot().status, 'paused')
-  ctl.toggle('t1')
+  ctl.toggle('t1', '你好')
   assert.equal(ctl.getSnapshot().status, 'playing')
   ctl.restart('t1', '你好')
   assert.equal(ctl.getSnapshot().status, 'loading')
@@ -136,6 +136,47 @@ cases.push(['控制器：换 key（切卡片）先停上一条、只读当前卡
   assert.equal(players[0].stopped, true, '上一条被停止')
   assert.equal(ctl.getSnapshot().key, 't2')
   assert.equal(ctl.getSnapshot().status, 'playing')
+}])
+
+cases.push(['控制器：toggle 必须用传入文本（历史卡点击不回退到最新一条）', async () => {
+  const received = []
+  const make = (key, text) => {
+    const p = {
+      play: async () => { received.push([key, text]) },
+      pause: () => {},
+      resume: () => {},
+      restart: () => {},
+      stop: () => {},
+      onEnded: () => {},
+    }
+    return p
+  }
+  const ctl = surface.createSpeechController(make)
+  // 模拟「自动朗读最末一轮」（pendingText 因此 = 最新一条的文本）
+  ctl.request('turn:9', '最新一条：武汉明天下雨')
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  assert.deepEqual(received[0], ['turn:9', '最新一条：武汉明天下雨'])
+  // 点历史卡 toggle：必须读历史卡自己的文本，绝不能是 pendingText
+  ctl.toggle('turn:2', '第一条：天气 8 到 14 度')
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  assert.deepEqual(received[1], ['turn:2', '第一条：天气 8 到 14 度'], '历史卡读的是自己的文本')
+  assert.equal(ctl.getSnapshot().key, 'turn:2')
+  // 点另一张卡：读第二张自己的文本
+  ctl.toggle('turn:3', '第二条：车次 G1545')
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  assert.deepEqual(received[2], ['turn:3', '第二条：车次 G1545'])
+  // 状态机语义不变：同 key playing 时 toggle = 暂停，再 toggle = 继续（不传新文本也不重启）
+  ctl.toggle('turn:3', '第二条：车次 G1545')
+  assert.equal(ctl.getSnapshot().status, 'paused')
+  assert.equal(received.length, 3, '暂停不产生新的 TTS 请求')
+  ctl.toggle('turn:3', '第二条：车次 G1545')
+  assert.equal(ctl.getSnapshot().status, 'playing')
+  assert.equal(received.length, 3, '继续也不产生新的 TTS 请求')
+  // 长按从头读：换卡长按时也必须读所按卡片自己的文本
+  ctl.restart('turn:2', '第一条：天气 8 到 14 度')
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  assert.deepEqual(received[3], ['turn:2', '第一条：天气 8 到 14 度'])
+  assert.equal(ctl.getSnapshot().key, 'turn:2')
 }])
 
 cases.push(['控制器：长按重读 → loading → onPlaying 回到 playing', async () => {

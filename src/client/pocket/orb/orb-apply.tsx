@@ -5,9 +5,8 @@
 import { OrbOverlay } from './OrbOverlay.tsx'
 import { installBootGuard } from './boot-guard.ts'
 import { ORB_CSS } from './orb.css.ts'
-import { PROACTIVE_CSS } from './proactive-card.css.ts'
+import { FOLD_CARD_CSS } from './fold-card.css.ts'
 import { SECRETARY_CARD_CSS } from './secretary-cards.css.ts'
-import { ProactiveCardTail } from './ProactiveCardTail.tsx'
 import { SecretaryReplyCard } from './SecretaryReplyCard.tsx'
 import { currentSessionViaBridge } from '../../session-open.ts'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
@@ -28,7 +27,7 @@ export function orbApply(ctx: any): void {
   ctx.effect(() => {
     const tag = document.createElement('style')
     tag.dataset.plugin = 'dsh-pocket-orb'
-    tag.textContent = `${ORB_CSS}\n${PROACTIVE_CSS}\n${SECRETARY_CARD_CSS}`
+    tag.textContent = `${ORB_CSS}\n${FOLD_CARD_CSS}\n${SECRETARY_CARD_CSS}`
     document.head.appendChild(tag)
     return () => {
       tag.remove()
@@ -136,24 +135,8 @@ export function orbApply(ctx: any): void {
     ),
   )
 
-  // 主动服务卡片：秘书会话里由消息内容渲染的卡片（不是自制外壳）。
-  // 挂在宿主标准会话页的「本轮尾部」列表槽位上，只对个人秘书固定会话生效；
-  // 其它会话返回 null，所以普通会话的外观一个字都不变。
-  ctx.slots.inject('conversation.chat.turnTail', () =>
-    ctx.slots.register(
-      {
-        name: 'conversation.chat.turnTail',
-        id: 'assistant-proactive-card',
-        order: 40,
-        locale: NS,
-        inject: () => ({ api }),
-      },
-      ProactiveCardTail,
-    ),
-  )
-
-  // 秘书回复卡片：每条模型回复渲染成柔和浅色卡片（标题行 + 正文）。
-  // 同一列表槽位、order 40 之前 → 卡片出现在主动服务卡之上；只对个人秘书会话渲染。
+  // 秘书回复卡片：每条模型回复渲染成柔和浅色卡片（标题行 + 正文 + 引用块 + meta）。
+  // 固定高度/展开折叠与 fold-card.css.ts 共享。只对个人秘书会话渲染。
   ctx.slots.inject('conversation.chat.turnTail', () =>
     ctx.slots.register(
       {

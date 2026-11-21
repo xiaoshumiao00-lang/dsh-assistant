@@ -6,7 +6,8 @@
  *   秘书（或宿主里的定时主动服务）往这里写一张卡，会话页的「本轮尾部」扩展位
  *   就会按同一套形状把它渲染成卡片——以后每条主动消息都是这个形状，不需要改前端。
  *
- * 卡的形状（与客户端 src/client/pocket/orb/ProactiveCardTail.tsx 一致）：
+ * 卡的形状（与客户端展示层约定一致；2026-11-21 起末尾「尾巴卡」渲染已按用户要求移除，
+ * 本模块只保留数据能力：卡组存储 + 路由 + proactive_card 工具 + 首次示例卡）：
  *   { id, title, summary?, items?: string[], details?, time?, badge? }
  *   sessionId 为空串 = 绑到「当前固定秘书会话」（id 换了也跟着走）。
  *

@@ -215,8 +215,14 @@ export function createSpeechController(factory: SpeechPlayerFactory) {
       setState(next)
       if (next.key !== before.key || next.status === 'loading') start(key)
     },
-    toggle(key: string): void {
-      if (state.key !== key || state.status === 'idle' || state.status === 'error') { api.request(key, pendingText); return }
+    /**
+     * 单击：暂停/继续；空闲/报错/换 key 时用**调用方传入的文本**起播。
+     * text 必须是按钮所属卡片自己的规范化朗读文本 —— 绝不允许回退到
+     * pendingText（那是「最后一次 request」的文本 = 自动朗读的最新一轮，
+     * 历史卡点击会错读成最新一条，2026-11-21 实测 bug）。
+     */
+    toggle(key: string, text: string): void {
+      if (state.key !== key || state.status === 'idle' || state.status === 'error') { api.request(key, text); return }
       if (state.status === 'loading') return
       if (state.status === 'playing') { player?.pause(); setState(reduceSpeech(state, { type: 'pause' })) }
       else if (state.status === 'paused') { player?.resume(); setState(reduceSpeech(state, { type: 'resume' })) }
