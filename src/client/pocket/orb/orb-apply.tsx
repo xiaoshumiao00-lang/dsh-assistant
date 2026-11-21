@@ -151,9 +151,9 @@ export function orbApply(ctx: any): void {
     ),
   )
 
-  // 用户卡（2026-11-21 需求）：个人秘书页里真实用户消息做成一张卡（与秘书回复卡同规格、冷蓝主题）。
-  // 挂在 shell.overlay（整页常驻，与悬浮球同一层）：卡片用 React portal 挂进宿主那条用户行，
-  // 合成通知（系统通知 / [[session:…]] 引用行）由 collect 挡在外面，保持宿主原样。
+  // 用户卡 + 通知卡（2026-11-21 需求）：个人秘书页里真实用户消息做成冷蓝用户卡，
+  // 插件塞进来的合成通知做成灰底通知卡（引用 chip 要能点跳，所以这里得把 api 递进去）。
+  // 挂在 shell.overlay（整页常驻，与悬浮球同一层）：卡片用 React portal 挂进宿主那条用户行。
   ctx.slots.inject('shell.overlay', () =>
     ctx.slots.register(
       {
@@ -161,7 +161,7 @@ export function orbApply(ctx: any): void {
         id: 'assistant-secretary-user-card',
         order: 120,
         locale: NS,
-        inject: () => ({}),
+        inject: () => ({ api }),
       },
       SecretaryUserCards,
     ),
