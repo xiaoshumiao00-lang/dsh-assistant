@@ -252,12 +252,45 @@ export function registerAssistantSecretary(ctx: any): () => void {
     offStepGate = undefined
   }
 
+  // 朗读友好输出规范（2026-11-21）：秘书每条回复都会渲染成卡片并被微软 TTS 朗读，
+  // 所以单独加一段表达约束。只对本会话生效，其它会话一个字都不多。
+  let offSpeechStyle: (() => void) | undefined
+  try {
+    const systemPrompt = (typeof ctx?.get === 'function' ? ctx.get('systemPrompt') : undefined) ?? ctx?.systemPrompt
+    if (systemPrompt && typeof systemPrompt.section === 'function') {
+      offSpeechStyle = systemPrompt.section({
+        name: 'assistant:secretary-speech-style',
+        order: 1780, // 派活规则段（1790）之前：先定表达，再谈派活
+        text: (context: any) => {
+          const sessionId = String(context?.agent?.session?.id ?? '')
+          if (sessionId === '' || sessionId !== activeSessionId) return ''
+          return SECRETARY_SPEECH_STYLE_TEXT
+        },
+      })
+    }
+  } catch {
+    offSpeechStyle = undefined
+  }
+
   return () => {
     try { offToolGate?.() } catch {}
     try { offStepGate?.() } catch {}
+    try { if (typeof offSpeechStyle === 'function') offSpeechStyle() } catch {}
     try { routes.dispose() } catch {}
   }
 }
+
+/**
+ * 秘书会话「卡片 + 朗读」输出规范（系统提示段落正文）。
+ * 数字/单位念读规则按用户原话：8–14℃ → 「8 到 14 摄氏度」。
+ */
+export const SECRETARY_SPEECH_STYLE_TEXT = [
+  '# 输出与朗读（个人秘书）',
+  '你的每条回复都会：① 在会话页渲染成一张卡片；② 由微软 TTS 自动朗读。请严格遵守：',
+  '一、口语化短句，先给结论；只用正常中文标点；不要用 markdown 符号、表格、列表符号、表情符号、代码块。',
+  '二、数字和单位要念得出来：温度写「8 到 14 摄氏度」这样的说法，时间写「八点十二分」，距离写「三公里」，重量写「两公斤」；英文缩写尽量换成读得出的中文说法，必须保留时照原文写（如车次 G1545）。',
+  '三、引用某条会话时用 [[session:会话id|会话标题]] 一行一个（会话 id 从上下文里取），卡片会把它渲染成可点击的引用块。',
+].join('\n')
 
 /** 单测入口：不启动宿主也能验路由、归一与工具闸。 */
 export const assistantSecretaryTestSurface = {
@@ -266,4 +299,5 @@ export const assistantSecretaryTestSurface = {
   secretaryToolDenied,
   registerAssistantSecretary,
   secretarySessionRef,
+  SECRETARY_SPEECH_STYLE_TEXT,
 }

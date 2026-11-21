@@ -6,7 +6,12 @@ import { OrbOverlay } from './OrbOverlay.tsx'
 import { installBootGuard } from './boot-guard.ts'
 import { ORB_CSS } from './orb.css.ts'
 import { PROACTIVE_CSS } from './proactive-card.css.ts'
+import { SECRETARY_CARD_CSS } from './secretary-cards.css.ts'
 import { ProactiveCardTail } from './ProactiveCardTail.tsx'
+import { SecretaryReplyCard } from './SecretaryReplyCard.tsx'
+import { SecretaryActions } from './SecretaryActions.tsx'
+import { currentSessionViaBridge } from '../../session-open.ts'
+import { peekSecretarySessionId } from '../../assistant-entry.ts'
 import { NS, zh, en, type OrbKey } from './locales.ts'
 import { makeOrbApi } from './orb-api.ts'
 import { PcFileCommandIcon, PcFileInputBridge, PcFilePickerOverlay, hasPcFileComposer, isPhoneComposerLayout, pcFilePickerStore } from './PcFileAttach.tsx'
@@ -24,7 +29,7 @@ export function orbApply(ctx: any): void {
   ctx.effect(() => {
     const tag = document.createElement('style')
     tag.dataset.plugin = 'dsh-pocket-orb'
-    tag.textContent = `${ORB_CSS}\n${PROACTIVE_CSS}`
+    tag.textContent = `${ORB_CSS}\n${PROACTIVE_CSS}\n${SECRETARY_CARD_CSS}`
     document.head.appendChild(tag)
     return () => {
       tag.remove()
@@ -147,5 +152,56 @@ export function orbApply(ctx: any): void {
       ProactiveCardTail,
     ),
   )
+
+  // 秘书回复卡片：每条模型回复渲染成柔和浅色卡片（标题行 + 正文）。
+  // 同一列表槽位、order 40 之前 → 卡片出现在主动服务卡之上；只对个人秘书会话渲染。
+  ctx.slots.inject('conversation.chat.turnTail', () =>
+    ctx.slots.register(
+      {
+        name: 'conversation.chat.turnTail',
+        id: 'assistant-secretary-reply-card',
+        order: 30,
+        locale: NS,
+        inject: () => ({ api }),
+      },
+      SecretaryReplyCard,
+    ),
+  )
+
+  // 秘书卡片的右侧操作区：朗读按钮气泡（暂停/继续/长按重读）+ 会话引用块。
+  // 宿主渲染在每条助理消息的图标行动作区里；其它会话返回 null。
+  ctx.slots.inject('conversation.chat.assistant-actions', () =>
+    ctx.slots.register(
+      {
+        name: 'conversation.chat.assistant-actions',
+        id: 'assistant-secretary-speak',
+        order: 25,
+        locale: NS,
+        inject: () => ({ api }),
+      },
+      SecretaryActions,
+    ),
+  )
+
+  // 「当前是不是秘书会话」的页面级标记：秘书会话里隐藏原始 markdown 气泡、
+  // 只留回复卡片；用轻量轮询跟随主面板选择（宿主 selection 变化不广播）。
+  ctx.effect(() => {
+    let disposed = false
+    const apply = (): void => {
+      try {
+        const secretary = peekSecretarySessionId()
+        const current = currentSessionViaBridge()
+        const on = secretary !== '' && current !== '' && current === secretary
+        if (document.body.dataset.dshSecretary === (on ? '1' : undefined)) return
+        if (on) document.body.dataset.dshSecretary = '1'
+        else delete document.body.dataset.dshSecretary
+      } catch { /* 标记失败不影响功能 */ }
+    }
+    apply()
+    const timer = window.setInterval(apply, 700)
+    const dispose = (): void => { disposed = true; window.clearInterval(timer) }
+    void disposed
+    return dispose
+  }, 'dsh-pocket: secretary session body flag')
 
 }

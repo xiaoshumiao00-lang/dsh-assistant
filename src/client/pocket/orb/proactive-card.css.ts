@@ -87,6 +87,26 @@ export const PROACTIVE_CSS = `
   justify-content: space-between;
   gap: 8px;
 }
+[data-dsh-proactive="foot-actions"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+[data-dsh-proactive="ref"] {
+  border: 1px solid var(--dsw-alias-border-l2, #e5e7eb);
+  background: #ffffff;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--dsw-alias-label-secondary, #6b7280);
+  cursor: pointer;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-dsh-proactive="ref"]:active { background: #f4f6fd; }
 [data-dsh-proactive="time"] {
   font-size: 12px;
   color: var(--dsw-alias-label-tertiary, #8b93a1);

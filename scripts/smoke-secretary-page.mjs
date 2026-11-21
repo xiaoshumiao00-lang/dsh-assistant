@@ -56,7 +56,12 @@ function check(name, ok, detail = '') {
   return false
 }
 
-const browser = await chromium.launch({ headless: true, executablePath: CHROME })
+// 自动朗读要出声（哪怕是 stub 音频）：Chromium 默认禁无手势自动播放，这里放开。
+const browser = await chromium.launch({
+  headless: true,
+  executablePath: CHROME,
+  args: ['--autoplay-policy=no-user-gesture-required'],
+})
 const context = await browser.newContext({
   viewport: { width: 414, height: 896 },
   isMobile: true,
@@ -95,13 +100,45 @@ page.on('response', (response) => {
 // 主动服务卡片：默认拦下宿主路由返回示例卡（宿主侧代码要重启才进内存，客户端渲染这一层随时能验）。
 // DSH_SMOKE_REAL_CARD=1 时不拦，直接验宿主真实卡组（宿主已经带 /api/assistant/proactive 时用）。
 const REAL_CARD = process.env.DSH_SMOKE_REAL_CARD === '1'
+/** 示例卡引用的目标会话（在页面加载后、点开秘书前填入，引用块跳转测试用）。 */
+const demoRef = { sessionId: '', title: '' }
 if (!REAL_CARD) {
   await page.route('**/api/assistant/proactive**', (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ ok: true, cards: [DEMO_CARD] }),
+    body: JSON.stringify({
+      ok: true,
+      cards: [{ ...DEMO_CARD, refSessionId: demoRef.sessionId || undefined, refTitle: demoRef.title || undefined }],
+    }),
   }))
 }
+
+// 朗读 stub：30 秒静音 WAV（8kHz/mono/16bit）——撑住整个断言窗口不被播完。
+let ttsRequests = 0
+const stubWav = (() => {
+  const rate = 8000
+  const seconds = 30
+  const dataSize = rate * 2 * seconds
+  const buffer = Buffer.alloc(44 + dataSize)
+  buffer.write('RIFF', 0)
+  buffer.writeUInt32LE(36 + dataSize, 4)
+  buffer.write('WAVE', 8)
+  buffer.write('fmt ', 12)
+  buffer.writeUInt32LE(16, 16)
+  buffer.writeUInt16LE(1, 20)
+  buffer.writeUInt16LE(1, 22)
+  buffer.writeUInt32LE(rate, 24)
+  buffer.writeUInt32LE(rate * 2, 28)
+  buffer.writeUInt16LE(2, 32)
+  buffer.writeUInt16LE(16, 34)
+  buffer.write('data', 36)
+  buffer.writeUInt32LE(dataSize, 40)
+  return buffer
+})()
+await page.route('**/api/assistant/tts**', (route) => {
+  ttsRequests += 1
+  route.fulfill({ status: 200, contentType: 'audio/mpeg', body: stubWav })
+})
 
 const readHostSecretaryId = () => page.evaluate(async () => {
   const body = await fetch('/api/assistant/secretary', { cache: 'no-store' }).then((res) => res.json()).catch(() => null)
@@ -148,10 +185,29 @@ try {
       found: true,
       hasProactive: text.includes('dsh-proactive'),
       hasTurnDedup: text.includes('dsh-proactive-turn'),
+      hasScard: text.includes('dsh-scard'),
+      // 需求④：禁用浏览器 speechSynthesis 兜底 —— bundle 里根本不应出现这个 API
+      hasSpeechSynth: text.includes('speechSynthesis'),
       length: text.length,
     }
   })
-  check('宿主下发的客户端 bundle 是本次构建', bundle.found && bundle.hasProactive && bundle.hasTurnDedup, JSON.stringify(bundle))
+  check('宿主下发的客户端 bundle 是本次构建', bundle.found && bundle.hasProactive && bundle.hasTurnDedup && bundle.hasScard, JSON.stringify(bundle))
+  check('无浏览器 speechSynthesis 兜底（只用微软 TTS）', bundle.hasSpeechSynth === false)
+
+  // 给示例卡挑一个真实存在的引用目标（非秘书会话），引用块跳转测试用
+  const refPick = await page.evaluate(() => {
+    try {
+      const snap = window.__dshSessions?.list?.getSnapshot?.() ?? null
+      const ids = Array.isArray(snap?.ids) ? snap.ids : []
+      const sec = String(localStorage.getItem('dsh.assistant.secretary.sessionId') || '')
+      // 只挑真实侧栏会话（session-*）：mnemon-task 等引用不是可打开的会话
+      const other = ids.find((id) => String(id) !== sec && String(id).startsWith('session-'))
+      return { id: other ? String(other) : '', title: other ? String(snap?.byId?.[other]?.title ?? other).slice(0, 20) : '' }
+    } catch { return { id: '', title: '' } }
+  })
+  demoRef.sessionId = refPick.id
+  demoRef.title = refPick.title === '' ? '被引用的会话' : refPick.title
+  notes.push(`引用跳转目标 = ${demoRef.sessionId || '(未找到，跳过)'}`)
 
   const hostIdBefore = await readHostSecretaryId()
   notes.push(`宿主固定会话 id（单击前）= ${hostIdBefore || '(空)'}`)
@@ -254,6 +310,50 @@ try {
     check('主动服务卡只在最末一轮出现一次（不重复）', single, JSON.stringify(groups))
   }
 
+  // ── 秘书回复卡片 + 朗读（需求①②⑤） ──
+  await page.waitForTimeout(1500) // body[data-dsh-secretary] 轮询 700ms，等标记落上
+  const scard = await page.evaluate(() => {
+    const card = document.querySelector('[data-dsh-scard="card"]:not([data-empty="1"])')
+    const step = [...document.querySelectorAll('[data-chat-flow-kind="assistant-step"]')]
+      .find((el) => el.getAttribute('data-chat-group-part') !== 'reasoning')
+    const buttons = [...document.querySelectorAll('[data-dsh-speak="button"]')]
+    const button = buttons[buttons.length - 1] ?? null // 最末一轮的朗读键
+    return {
+      hasCard: card !== null,
+      badge: card?.querySelector('[data-dsh-scard="badge"]')?.textContent ?? '',
+      body: (card?.querySelector('[data-dsh-scard="body"]')?.textContent ?? '').trim().slice(0, 60),
+      stepDisplay: step ? getComputedStyle(step).display : '(无 step)',
+      hasButton: button !== null,
+      speakStatus: button?.getAttribute('data-status') ?? '',
+      bodyFlag: document.body.dataset.dshSecretary ?? '',
+    }
+  })
+  check('秘书回复渲染成卡片（标题行+正文，柔和浅色）', scard.hasCard && scard.badge === '个人秘书' && scard.body !== '', JSON.stringify(scard))
+  check('原始 markdown 气泡已隐藏（秘书会话专属）', scard.stepDisplay === 'none', `display=${scard.stepDisplay}`)
+  check('页面级秘书标记 body[data-dsh-secretary="1"]', scard.bodyFlag === '1')
+  check('朗读按钮出现且自动朗读已发起', scard.hasButton && ['loading', 'playing', 'paused'].includes(scard.speakStatus), `status=${scard.speakStatus}`)
+  check('TTS 只走宿主 /api/assistant/tts（微软 edge-tts，无 fallback）', ttsRequests >= 1, `requests=${ttsRequests}`)
+
+  // 朗读状态机：单击暂停 → 单击继续 → 长按从头重读
+  const speakBtn = page.locator('[data-dsh-speak="button"]').last()
+  await speakBtn.click()
+  await page.waitForTimeout(400)
+  let st = await speakBtn.getAttribute('data-status')
+  check('单击朗读按钮 = 暂停', st === 'paused', `status=${st}`)
+  await speakBtn.click()
+  await page.waitForTimeout(400)
+  st = await speakBtn.getAttribute('data-status')
+  check('再单击 = 继续', st === 'playing', `status=${st}`)
+  const btnBox = await speakBtn.boundingBox()
+  await page.mouse.move(btnBox.x + btnBox.width / 2, btnBox.y + btnBox.height / 2)
+  await page.mouse.down()
+  await page.waitForTimeout(750)
+  await page.mouse.up()
+  await page.waitForTimeout(500)
+  st = await speakBtn.getAttribute('data-status')
+  check('长按 600ms = 从头重读（回到播放）', st === 'playing', `status=${st}`)
+  await speakBtn.click().catch(() => {}) // 收尾停掉声音
+
   // ── 第二次单击：复用同一条会话、页面不重载 ──
   const beforeSecond = await page.evaluate(() => ({
     stamp: window.__smokeStamp,
@@ -300,6 +400,57 @@ try {
   // 收起控制室，让截图仍是标准会话页
   await page.click('.dsh-assistant-crClose', { timeout: 3000 }).catch(() => {})
   await page.waitForTimeout(600)
+
+  // ── 宿主意图落点：assistant.ts 的 Intent 映射 + 客户端分派（只信发送端不够）──
+  // 走宿主自己的两条唤起路由，模拟桌面球把意图送进页面：
+  //   open-console  → intent=console → 控制室
+  //   open-assistant→ intent=assistant → 关闭控制室 + 打开秘书固定会话
+  const logBeforeIntent = await page.evaluate(() => (window.__dshAssistantOpenLog || []).length)
+  await page.evaluate(() => fetch('/api/assistant/open-console', { method: 'POST' }))
+  const consoleLanded = await page.waitForSelector('.dsh-assistant-cr', { timeout: 12000 }).then(() => true).catch(() => false)
+  const afterConsoleIntent = await page.evaluate(() => ({
+    rooms: document.querySelectorAll('.dsh-assistant-cr').length,
+    log: (window.__dshAssistantOpenLog || []).length,
+  }))
+  check('宿主 intent=console 落到控制室（不串进秘书：打开日志无新增）',
+    consoleLanded && afterConsoleIntent.rooms > 0 && afterConsoleIntent.log === logBeforeIntent,
+    JSON.stringify(afterConsoleIntent))
+
+  await page.evaluate(() => fetch('/api/assistant/open-assistant', { method: 'POST' }))
+  const assistantLanded = await page.waitForFunction((wanted) => {
+    try {
+      const current = String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '')
+      const rooms = document.querySelectorAll('.dsh-assistant-cr').length
+      return current === wanted && rooms === 0
+    } catch { return false }
+  }, idBeforeLongPress, { timeout: 12000 }).then(() => true).catch(() => false)
+  const afterAssistantIntent = await page.evaluate(() => ({
+    rooms: document.querySelectorAll('.dsh-assistant-cr').length,
+    current: (() => { try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') } catch { return '' } })(),
+    log: (window.__dshAssistantOpenLog || []).length,
+  }))
+  check('宿主 intent=assistant 落到秘书固定会话（并收起控制室）',
+    assistantLanded && afterAssistantIntent.current === idBeforeLongPress && afterAssistantIntent.log > afterConsoleIntent.log,
+    JSON.stringify(afterAssistantIntent))
+
+  // ── 引用块跳转（需求③）：卡片引用某会话 → 点击按会话 id 跳进对应会话详情 ──
+  const refChip = await page.$('[data-dsh-proactive="ref"]')
+  if (refChip !== null && demoRef.sessionId !== '') {
+    await refChip.click()
+    const jumped = await page.waitForFunction((want) => {
+      try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') === want } catch { return false }
+    }, demoRef.sessionId, { timeout: 12000 }).then(() => true).catch(() => false)
+    const nowSel = await readCurrentSessionId()
+    check('点引用块跳进对应会话（宿主会话 id 锚点）', jumped && nowSel === demoRef.sessionId, `selection=${nowSel} want=${demoRef.sessionId}`)
+    // 跳回秘书（走宿主 open-assistant 意图路由 = 既有唤起逻辑）
+    await page.evaluate(() => fetch('/api/assistant/open-assistant', { method: 'POST' }))
+    await page.waitForFunction((want) => {
+      try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') === want } catch { return false }
+    }, idBeforeLongPress, { timeout: 12000 }).catch(() => {})
+    await page.waitForTimeout(800)
+  } else {
+    notes.push('引用跳转：跳过（mock 卡未带 ref 或未找到目标会话）')
+  }
 
   check('无未捕获异常', pageErrors.length === 0, JSON.stringify(pageErrors.slice(0, 3)))
   check('无（非既有噪声的）console error', consoleErrors.length === 0, JSON.stringify(consoleErrors.slice(0, 3)))

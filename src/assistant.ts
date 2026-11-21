@@ -24,6 +24,7 @@ import { registerAssistantArchive } from './assistant-archive'
 import { registerAssistantSecretary } from './assistant-secretary'
 import { registerAssistantDispatch } from './assistant-dispatch'
 import { registerAssistantProactive } from './assistant-proactive'
+import { registerAssistantTts } from './assistant-tts'
 import { assistantConfigTestSurface } from './assistant-config'
 import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -52,6 +53,10 @@ export { assistantDispatchTestSurface } from './assistant-dispatch'
 export { assistantProactiveTestSurface } from './assistant-proactive'
 /** 桌面球手势 → 意图的映射与生成出来的 helper 代码（供 scripts/test-desktop-ball-gestures.mjs） */
 export { desktopBallTestSurface } from './desktop-ball'
+/** 秘书卡片 TTS：路由 / 探测 / 音色解析（供 scripts/test-assistant-tts.mjs） */
+export { assistantTtsTestSurface } from './assistant-tts'
+/** 秘书朗读状态机 / 文本规范化 / 引用解析（纯函数，node 可单测） */
+export { secretaryCardsTestSurface } from './client/pocket/orb/secretary-cards.ts'
 /** 目录 allowlist 与终端环境变量（供 scripts/test-path-guard.mjs 直接验） */
 export { expandHome, defaultAllowedRoots, createPathGuard, minimalTermEnv, isDirectory } from './path-guard'
 /** turn-guard 的判定与状态函数（供 scripts/test-turn-guard.mjs 直接验） */
@@ -399,6 +404,8 @@ export function apply(ctx: any, config: any = {}): () => void {
     disposers.push(registerAssistantDispatch(ctx))
     // 主动服务卡片：卡组存储 + 路由 + proactive_card 工具 + 首次示例卡
     disposers.push(registerAssistantProactive(ctx))
+    // 秘书卡片朗读：POST /api/assistant/tts（微软 edge-tts，MP3），无 fallback
+    disposers.push(registerAssistantTts(ctx))
   } catch {}
 
   void applyBall()

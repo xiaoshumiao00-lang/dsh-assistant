@@ -42,6 +42,9 @@ export interface ProactiveCardRecord {
   time: string
   badge: string
   createdAt: string
+  /** 引用的会话（可选）：卡片渲染成可点引用块，点击按会话 id 跳进对应会话。 */
+  refSessionId?: string
+  refTitle?: string
 }
 
 /** 示例卡（明日武汉出差）——交付时给用户看效果的那一张。 */
@@ -95,6 +98,8 @@ export function normalizeCard(raw: unknown, now: Date = new Date()): ProactiveCa
     time: String(record.time ?? '').trim().slice(0, 40) || `今天 ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`,
     badge: String(record.badge ?? '').trim().slice(0, 20) || '主动服务',
     createdAt: String(record.createdAt ?? '').trim() || now.toISOString(),
+    refSessionId: String(record.refSessionId ?? '').trim().slice(0, 80) || undefined,
+    refTitle: String(record.refTitle ?? '').trim().slice(0, 120) || undefined,
   }
 }
 
@@ -197,6 +202,8 @@ export function proactiveCardToolDefinition(): any {
         details: { type: 'string', description: '点开「查看详情」后显示的正文（可多行）。' },
         time: { type: 'string', description: '卡片右下角时间，例如「今天 07:40」；省略则用当前时间。' },
         badge: { type: 'string', description: '左上角小标签，默认「主动服务」。' },
+        ref_session_id: { type: 'string', description: '卡片引用的会话 id（可选）：渲染成可点引用块，点击跳进该会话。' },
+        ref_title: { type: 'string', description: '引用会话的显示标题（可选，默认用 ref_session_id）。' },
       },
       required: ['title'],
     },
@@ -221,7 +228,12 @@ export function proactiveCardToolDefinition(): any {
       if (secretarySessionRef.id === '' || caller !== secretarySessionRef.id) {
         throw new Error(`${PROACTIVE_CARD_TOOL} 只能在个人秘书会话里调用`)
       }
-      const card = normalizeCard({ ...args, sessionId: '' })
+      const card = normalizeCard({
+        ...args,
+        sessionId: '',
+        refSessionId: args?.ref_session_id,
+        refTitle: args?.ref_title,
+      })
       if (card === null) throw new Error('title 不能为空')
       appendCard(card)
       return { ok: true, card_id: card.id }

@@ -33,6 +33,9 @@ cases.push(['生成的 helper：ball-up 发秘书、ball-long-press 发控制室
   assert.ok(longPress, 'helper 里找不到 ball-long-press 的 send()')
   assert.equal(shortPress[1], 'assistant', `ball-up 实际发的是 ${shortPress[1]}`)
   assert.equal(longPress[1], 'console', `ball-long-press 实际发的是 ${longPress[1]}`)
+  // 生成的代码必须和声明表一致（改了一边忘了另一边就会在这里红）
+  assert.equal(shortPress[1], surface.ballIntentFor('short-press'))
+  assert.equal(longPress[1], surface.ballIntentFor('long-press'))
   // 不能再有旧版「单击发 click」的写法（click 只允许作为 socket 的兼容别名）
   assert.ok(!/ball-up'[\s\S]{0,200}send\('click'\)/.test(main), 'ball-up 还在发旧的 click')
 }])
@@ -42,6 +45,7 @@ cases.push(['生成的 helper：热键仍发秘书，且与长按不同向', () 
   const hotkey = /globalShortcut\.register\('Control\+Alt\+A'[\s\S]*?send\('([a-z]+)'\)/.exec(main)
   assert.ok(hotkey, 'helper 里找不到 Ctrl+Alt+A 的 send()')
   assert.equal(hotkey[1], 'assistant')
+  assert.equal(hotkey[1], surface.ballIntentFor('hotkey'))
   const longPress = /ipcMain\.on\('ball-long-press'[\s\S]*?send\('([a-z]+)'\)/.exec(main)
   assert.notEqual(hotkey[1], longPress[1])
 }])

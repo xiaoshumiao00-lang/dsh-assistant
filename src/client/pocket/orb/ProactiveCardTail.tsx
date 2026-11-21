@@ -19,6 +19,7 @@
  */
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
+import type { OrbApi } from './orb-api.ts'
 
 export interface ProactiveCard {
   id: string
@@ -28,6 +29,9 @@ export interface ProactiveCard {
   details?: string
   time?: string
   badge?: string
+  /** 引用的会话（可选）：渲染成可点引用块。 */
+  refSessionId?: string
+  refTitle?: string
 }
 
 interface CachedCards {
@@ -93,6 +97,8 @@ export function proactiveSignature(cards: ProactiveCard[]): string {
       card.details ?? '',
       card.time ?? '',
       card.badge ?? '',
+      card.refSessionId ?? '',
+      card.refTitle ?? '',
     ].join('|'))
     .join('\n')
 }
@@ -114,6 +120,8 @@ export function normalizeCards(raw: unknown): ProactiveCard[] {
       details: typeof item.details === 'string' ? item.details : '',
       time: typeof item.time === 'string' ? item.time : '',
       badge: typeof item.badge === 'string' ? item.badge : '主动服务',
+      refSessionId: typeof item.refSessionId === 'string' && item.refSessionId !== '' ? item.refSessionId : undefined,
+      refTitle: typeof item.refTitle === 'string' && item.refTitle !== '' ? item.refTitle : undefined,
     })
   }
   return out
@@ -156,7 +164,7 @@ export async function fetchProactiveCards(sessionId: string): Promise<ProactiveC
 
 /** 组件 props：会话作用域槽位会带 sessionId（宿主 SessionStandardProps）；
  *  turnTail 槽位另外带 turn / seq（当前是第几轮），用来把卡片只挂在最末一轮。 */
-export function ProactiveCardTail({ sessionId, turn, seq }: { sessionId?: string; turn?: number; seq?: number }): any {
+export function ProactiveCardTail({ sessionId, turn, seq, api }: { sessionId?: string; turn?: number; seq?: number; api?: OrbApi }): any {
   const id = String(sessionId ?? '')
   const isSecretary = id !== '' && id === peekSecretarySessionId()
   // 宿主 turnTail 的 props 是 sessionId / turn（Turn **对象**，不是序号）/ seq（该轮关闭节点的序号，数字）。
@@ -261,13 +269,29 @@ export function ProactiveCardTail({ sessionId, turn, seq }: { sessionId?: string
             )}
             <div data-dsh-proactive="foot">
               <span data-dsh-proactive="time">{card.time ?? ''}</span>
-              <button
-                type="button"
-                data-dsh-proactive="toggle"
-                onClick={(event: any) => { event.stopPropagation(); toggle(card.id) }}
-              >
-                {open ? '收起' : '查看详情'}
-              </button>
+              <span data-dsh-proactive="foot-actions">
+                {card.refSessionId !== undefined && (
+                  <button
+                    type="button"
+                    data-dsh-proactive="ref"
+                    title={`打开会话：${card.refTitle ?? card.refSessionId}`}
+                    onClick={(event: any) => {
+                      event.stopPropagation()
+                      try { api?.openSession?.(card.refSessionId ?? '') } catch { /* 交给 focusSession 兜底 */ }
+                      void api?.focusSession?.(card.refSessionId ?? '').catch(() => {})
+                    }}
+                  >
+                    ↗ {card.refTitle ?? card.refSessionId}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  data-dsh-proactive="toggle"
+                  onClick={(event: any) => { event.stopPropagation(); toggle(card.id) }}
+                >
+                  {open ? '收起' : '查看详情'}
+                </button>
+              </span>
             </div>
           </article>
         )

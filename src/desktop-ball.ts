@@ -23,9 +23,11 @@ export type BallGesture = 'short-press' | 'long-press' | 'hotkey'
 export type BallIntent = 'console' | 'assistant'
 
 /**
- * **手势 → 意图的唯一真值**（2026-11-21 用户要求对调）：
+ * **手势 → 意图的声明表**（2026-11-21 用户要求对调）：
  *   单击悬浮球 = 直接进个人秘书；长按 600ms = 进控制室；Ctrl+Alt+A 仍进秘书。
- * 生成 helper 的代码与宿主 /api/assistant/ball 回报的映射都从这里取，避免两处漂移。
+ * 生成的 helper 里三处 send() 直接写死这三个字面量（读代码一眼能看出方向）；
+ * Host 的 /api/assistant/ball 与 scripts/test-desktop-ball-gestures.mjs 都读这张表，
+ * 单测会断言「生成的 helper 与这张表一致」，任何一边被改反都会红。
  */
 export const BALL_GESTURE_INTENT: Record<BallGesture, BallIntent> = {
   'short-press': 'assistant',
@@ -180,15 +182,16 @@ app.whenReady().then(() => {
     const dy = (Number(p && p.y) || 0) - startCursor.y
     try { win.setPosition(Math.round(startPos[0] + dx), Math.round(startPos[1] + dy)) } catch {}
   })
+  // 单击（短按松手、未拖动）= 个人秘书固定会话（2026-11-21 对调；原来这里是控制室）。
   ipcMain.on('ball-up', (_e, p) => {
     const moved = Number(p && p.moved) || 0
-    if (moved < 5) send('${BALL_GESTURE_INTENT['short-press']}')
+    if (moved < 5) send('assistant')
   })
-  // 长按球 = 控制室（和短按相反；映射见 BALL_GESTURE_INTENT，改一处即可）。
-  ipcMain.on('ball-long-press', () => { send('${BALL_GESTURE_INTENT['long-press']}') })
+  // 长按 600ms = 控制室（原来的单击行为）；拖动超过阈值时球体脚本根本不会发这条。
+  ipcMain.on('ball-long-press', () => { send('console') })
   // 桌面全局热键：窗口不在前台也能唤起个人秘书（与单击同向）。
   try {
-    globalShortcut.register('Control+Alt+A', () => { send('${BALL_GESTURE_INTENT.hotkey}') })
+    globalShortcut.register('Control+Alt+A', () => { send('assistant') })
   } catch {}
   connect()
 })
