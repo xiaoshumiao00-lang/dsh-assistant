@@ -23,6 +23,7 @@ import { assistantUrlIntent, noteAssistantIntent, openAssistant } from './assist
 import { loadAssistantConfig } from './assistant-config.ts'
 import { applyPersonalTerms } from './pocket/orb/asr-terms.ts'
 import { shouldAutoShow, showFirstRunGuide } from './firstRunGuide.ts'
+import { applyCuTitleBold } from './cu-title-bold.ts'
 
 export const name = 'dsh-assistant'
 
@@ -66,6 +67,20 @@ export function apply(ctx: any): void {
       },
     )
   } catch { setAssistantApi(null) }
+
+  // 左侧面板会话列表：Computer Use 会话标题加粗（纯客户端：注入样式表 + 行上打插件属性）。
+  // 判据与数据来源见 src/client/cu-title-bold.ts（宿主 DOM 取证与 CU 口径都写在那文件头部）。
+  try {
+    const install = (scopedCtx: any): void => {
+      const dispose = applyCuTitleBold(scopedCtx)
+      try { ctx.effect(() => dispose, 'dsh-assistant: computer-use session title bold') } catch { /* 没有 effect 也要装上 */ }
+    }
+    try {
+      ctx.inject(['sessions'], install)
+    } catch {
+      install(ctx)
+    }
+  } catch { /* 视觉区分失败不影响其它装配 */ }
 
   // 控制室兜底：面板未就绪时给一个「打开侧栏」按钮（布局服务可选，取不到就静默）
   try {
