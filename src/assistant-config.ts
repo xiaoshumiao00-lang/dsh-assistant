@@ -22,7 +22,6 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { assistantHomeDir, syncPersonaSection } from './assistant-home.ts'
 import { manageWebRoutes } from './web-routes.ts'
-import { isTihuCloudVoice } from './tihu/cloud-voices.ts'
 
 /** 一条语音转写术语规则（JSON 里没有 RegExp，只有源串）。 */
 export interface AsrTermRuleJson {
@@ -39,89 +38,6 @@ export interface AssistantPersonaJson {
   /** 逐行文本，原样写进 AGENTS.md 的受控小节里 */
   lines?: string[]
 }
-
-/* ─────────────────────────── 鹈鹕端（tihu） ───────────────────────────
- *
- * 2026-11-10 新增：设置 →「个人助手 → 鹈鹕端」只做三项——默认前台模型 / 默认后台模型 /
- * 默认云音色。字段放在 `tihu` 命名空间里（`tihu.model.foreground`、
- * `tihu.model.background`、`tihu.voice.edge`），落同一个 `config.json`，不另起文件、
- * 也不写 localStorage。
- *
- * 前台/后台在鹈鹕代码里的落点（lane.ts 只有这两条建会话路径）：
- *   - 前台 = 派单任务会话（`DISPATCH_PRESET` = computer-use，设备屏上跑的那条）；
- *   - 后台 = 指挥台会话（`TASK_PRESET` = standard，判项目/续聊，不占屏）。
- */
-
-/** 一条模型选择（provider + model，可选推理档）。 */
-export interface TihuModelConfig {
-  provider: string
-  model: string
-  reasoningEffort?: string
-}
-
-/** `tihu` 段（读出来的完整形态；没配置时全是「跟随默认」）。 */
-export interface TihuLocalConfig {
-  model: {
-    /** 默认前台模型：null = 跟随宿主默认（老行为）。 */
-    foreground: TihuModelConfig | null
-    /** 默认后台模型：null = 跟随宿主默认（老行为）。 */
-    background: TihuModelConfig | null
-  }
-  voice: {
-    /** 默认云音色（edge-tts 的 zh-CN-*Neural）；空串 = 跟随 TIHU_EDGE_VOICE / 云健。 */
-    edge: string
-    /**
-     * 语音结束词（2026-11-13）：强词表。缺省（undefined）= lane 内置白名单
-     * （完毕/结束/发送/over/done…），配置了就整表替换。
-     */
-    endWords?: string[] | null
-    /** 弱结束词表（好了/行了/搞定/可以了）；只允许尾部且独立成句。缺省 = 内置。 */
-    endWordsWeak?: string[] | null
-    /** 弱词开关（缺省 true）；false = 弱词一律不算结束词。 */
-    endWordWeakEnabled?: boolean | null
-    /** 结束词自动收尾总开关（缺省 true）；false = 不探针、不剥词、不自动发送。 */
-    endWordAutoSend?: boolean | null
-    /** 录音期分段探针间隔（毫秒，缺省 1200，夹 400–5000）。 */
-    segmentMs?: number | null
-    /** 每次探针带的尾部音频长度（毫秒，缺省 3200，夹 1200–8000）。 */
-    segmentTailMs?: number | null
-  }
-  /**
-   * 指挥台「判定会话」（2026-11-13 用户诉求）。
-   *
-   * 缺省（不配这一节）＝每次判定都新开一条短会话（`fresh`）：老行为是每条语音都往
-   * 同一条「鹈鹕指挥台」里追加，判定次数越多历史越长——配本地模型时首载与判定越来越慢。
-   * 想回退旧行为（复用同一条会话、历史继续累积）就写 `judge: 'reuse'`。
-   */
-  commander?: {
-    /** `fresh`（默认）＝每次判定新开一条；`reuse`＝复用同一条常驻指挥台。 */
-    judge?: 'fresh' | 'reuse'
-    /** 判定会话保留条数（1–20，默认 3，含刚建的那条）：超出后最旧的自动归档。 */
-    keep?: number
-  }
-}
-
-/** 一次写入的 `tihu` 子集（只带改过的子键；未出现的子键保持原值）。 */
-export interface TihuConfigPatch {
-  model?: {
-    foreground?: TihuModelConfig | null
-    background?: TihuModelConfig | null
-  }
-  voice?: {
-    edge?: string
-  }
-  /** 判定会话模式与保留条数（见 {@link TihuLocalConfig.commander}）。 */
-  commander?: {
-    judge?: 'fresh' | 'reuse'
-    keep?: number
-  }
-}
-
-/** 一份干净的 `tihu` 段（新对象，避免共享引用被就地改）。 */
-export function emptyTihuConfig(): TihuLocalConfig {
-  return { model: { foreground: null, background: null }, voice: { edge: '' } }
-}
-
 
 /** 本地配置文件形态（全部字段可选）。 */
 export interface AssistantLocalConfig {
@@ -143,8 +59,6 @@ export interface AssistantLocalConfig {
   updateSource: string
   /** 是否允许前端检查 GitHub 更新（默认 false：别人的机器不该被作者的仓库牵着升级）。 */
   updateCheckEnabled: boolean
-  /** 鹈鹕端（语音小屏）的默认模型与默认云音色。 */
-  tihu: TihuLocalConfig
   /** 实际读到的文件路径（空 = 没有任何本机配置）。 */
   sourceFile: string
   /** 解析失败时的提示（不阻塞使用）。 */
@@ -165,7 +79,6 @@ export const CLIENT_CONFIG_FIELDS = [
   'termEnvAllow',
   'updateSource',
   'updateCheckEnabled',
-  'tihu',
   'configSource',
 ] as const
 
@@ -180,16 +93,12 @@ export const WRITABLE_CONFIG_FIELDS = [
   'termEnvAllow',
   'updateSource',
   'updateCheckEnabled',
-  'tihu',
 ] as const
 
 export type WritableConfigField = (typeof WRITABLE_CONFIG_FIELDS)[number]
 
 /** 一次写入的可写子集（只带用户真的改过的那几个键）。 */
-export type AssistantConfigPatch = Partial<Pick<AssistantLocalConfig, Exclude<WritableConfigField, 'tihu'>>> & {
-  /** 鹈鹕端：按子键合并，未出现的子键保持原值。 */
-  tihu?: TihuConfigPatch
-}
+export type AssistantConfigPatch = Partial<Pick<AssistantLocalConfig, WritableConfigField>>
 
 const EMPTY: AssistantLocalConfig = {
   newProjectParent: null,
@@ -201,7 +110,6 @@ const EMPTY: AssistantLocalConfig = {
   termEnvAllow: [],
   updateSource: '',
   updateCheckEnabled: false,
-  tihu: { model: { foreground: null, background: null }, voice: { edge: '' } },
   sourceFile: '',
   loadError: '',
 }
@@ -332,181 +240,6 @@ function stripBom(text: string): string {
   return text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text
 }
 
-/** 一条模型选择：provider/model 必须都非空，否则视作「跟随默认」。 */
-function normalizeTihuModel(raw: unknown): TihuModelConfig | null {
-  if (!isPlainObject(raw)) return null
-  const provider = typeof raw.provider === 'string' ? raw.provider.trim() : ''
-  const model = typeof raw.model === 'string' ? raw.model.trim() : ''
-  if (provider === '' || model === '') return null
-  const effort = typeof raw.reasoningEffort === 'string' ? raw.reasoningEffort.trim() : ''
-  return { provider, model, ...(effort === '' ? {} : { reasoningEffort: effort }) }
-}
-
-/**
- * 读盘时的结束词词表：只收字符串、去空白、去重、压长度；空表/形状错 → undefined
- * （＝用 lane 内置默认，绝不把「配了个空数组」当成「一个词都不算」）。
- */
-function normalizeTihuWordList(raw: unknown): string[] | undefined {
-  if (!Array.isArray(raw)) return undefined
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const item of raw) {
-    if (typeof item !== 'string') continue
-    const word = item.replace(/\s+/g, ' ').trim()
-    if (word === '' || [...word].length > 24) continue
-    const key = word.toLowerCase().replace(/[\s\p{P}]+/gu, '')
-    if (key === '' || seen.has(key)) continue
-    seen.add(key)
-    out.push(word)
-    if (out.length >= 40) break
-  }
-  return out.length > 0 ? out : undefined
-}
-
-function normalizeTihuOptionalBool(raw: unknown): boolean | undefined {
-  return typeof raw === 'boolean' ? raw : undefined
-}
-
-function normalizeTihuOptionalInt(raw: unknown, min: number, max: number): number | undefined {
-  if (typeof raw !== 'number' || !Number.isFinite(raw)) return undefined
-  return Math.max(min, Math.min(max, Math.round(raw)))
-}
-
-/**
- * 读盘时的 `tihu` 段归一：任何形状错误都退成「跟随默认」，绝不因为一个坏字段让整份配置失效。
- * 云音色只认清单里的名字——本地 Kokoro（zf_/zm_/数字）即使手写进文件也当没配。
- */
-function normalizeTihu(raw: unknown): TihuLocalConfig {
-  const out = emptyTihuConfig()
-  if (!isPlainObject(raw)) return out
-  const model = isPlainObject(raw.model) ? raw.model : {}
-  out.model.foreground = normalizeTihuModel(model.foreground)
-  out.model.background = normalizeTihuModel(model.background)
-  const voice = isPlainObject(raw.voice) ? raw.voice : {}
-  const edge = typeof voice.edge === 'string' ? voice.edge.trim() : ''
-  out.voice.edge = isTihuCloudVoice(edge) ? edge : ''
-  const endWords = normalizeTihuWordList(voice.endWords)
-  if (endWords !== undefined) out.voice.endWords = endWords
-  const endWordsWeak = normalizeTihuWordList(voice.endWordsWeak)
-  if (endWordsWeak !== undefined) out.voice.endWordsWeak = endWordsWeak
-  const weakEnabled = normalizeTihuOptionalBool(voice.endWordWeakEnabled)
-  if (weakEnabled !== undefined) out.voice.endWordWeakEnabled = weakEnabled
-  const autoSend = normalizeTihuOptionalBool(voice.endWordAutoSend)
-  if (autoSend !== undefined) out.voice.endWordAutoSend = autoSend
-  const segmentMs = normalizeTihuOptionalInt(voice.segmentMs, 400, 5000)
-  if (segmentMs !== undefined) out.voice.segmentMs = segmentMs
-  const segmentTailMs = normalizeTihuOptionalInt(voice.segmentTailMs, 1200, 8000)
-  if (segmentTailMs !== undefined) out.voice.segmentTailMs = segmentTailMs
-  // 判定会话（2026-11-13）：两个子键都可缺省；一个都没写就不落这一节
-  // （GET 出去的形状保持原样，老设置页不用改）。
-  if (isPlainObject(raw.commander)) {
-    const commander = raw.commander
-    const judge = commander.judge === 'reuse' ? 'reuse' : commander.judge === 'fresh' ? 'fresh' : undefined
-    const keep = normalizeTihuOptionalInt(commander.keep, 1, 20)
-    if (judge !== undefined || keep !== undefined) {
-      out.commander = { judge: judge ?? 'fresh', keep: keep ?? 3 }
-    }
-  }
-  return out
-}
-
-/** 写盘时的模型子键：允许 null（＝清成跟随默认）/ 合法对象；其它一律 undefined（400）。 */
-function normalizeTihuModelForWrite(raw: unknown): TihuModelConfig | null | undefined {
-  if (raw === null) return null
-  if (!isPlainObject(raw)) return undefined
-  const provider = typeof raw.provider === 'string' ? raw.provider.trim() : ''
-  const model = typeof raw.model === 'string' ? raw.model.trim() : ''
-  if (provider === '' || model === '') return undefined
-  if (provider.length > 200 || model.length > 200) return undefined
-  if (/[\u0000-\u001f]/.test(provider) || /[\u0000-\u001f]/.test(model)) return undefined
-  if (raw.reasoningEffort !== undefined && raw.reasoningEffort !== null && typeof raw.reasoningEffort !== 'string') return undefined
-  const effort = typeof raw.reasoningEffort === 'string' ? raw.reasoningEffort.trim() : ''
-  if (effort.length > 64) return undefined
-  return { provider, model, ...(effort === '' ? {} : { reasoningEffort: effort }) }
-}
-
-/**
- * 写盘时的 `tihu` 段：只接受 `model.foreground/background` 与 `voice.edge`，其余子键一律拒
- * （拼错字段名不能静默丢改动）。空对象/没有可写子键 → undefined。
- */
-function normalizeTihuForWrite(raw: unknown): TihuConfigPatch | undefined {
-  if (!isPlainObject(raw)) return undefined
-  const patch: TihuConfigPatch = {}
-  for (const key of Object.keys(raw)) {
-    if (key !== 'model' && key !== 'voice' && key !== 'commander') return undefined
-  }
-  if ('model' in raw) {
-    const model = raw.model
-    if (!isPlainObject(model)) return undefined
-    const next: NonNullable<TihuConfigPatch['model']> = {}
-    for (const key of Object.keys(model)) {
-      if (key !== 'foreground' && key !== 'background') return undefined
-      const value = normalizeTihuModelForWrite(model[key])
-      if (value === undefined) return undefined
-      next[key as 'foreground' | 'background'] = value
-    }
-    patch.model = next
-  }
-  if ('voice' in raw) {
-    const voice = raw.voice
-    if (!isPlainObject(voice)) return undefined
-    const next: NonNullable<TihuConfigPatch['voice']> = {}
-    for (const key of Object.keys(voice)) {
-      if (key !== 'edge') return undefined
-      const rawEdge = voice.edge
-      if (rawEdge !== null && rawEdge !== undefined && typeof rawEdge !== 'string') return undefined
-      const text = typeof rawEdge === 'string' ? rawEdge.trim() : ''
-      // 只允许云端音色；'' = 清掉配置（回到 TIHU_EDGE_VOICE / 云健）。
-      if (text !== '' && !isTihuCloudVoice(text)) return undefined
-      next.edge = text
-    }
-    patch.voice = next
-  }
-  if ('commander' in raw) {
-    const commander = raw.commander
-    if (!isPlainObject(commander)) return undefined
-    const next: NonNullable<TihuConfigPatch['commander']> = {}
-    for (const key of Object.keys(commander)) {
-      if (key !== 'judge' && key !== 'keep') return undefined
-      if (key === 'judge') {
-        if (commander.judge !== 'fresh' && commander.judge !== 'reuse') return undefined
-        next.judge = commander.judge
-        continue
-      }
-      const keep = normalizeTihuOptionalInt(commander.keep, 1, 20)
-      if (keep === undefined) return undefined
-      next.keep = keep
-    }
-    if (Object.keys(next).length === 0) return undefined
-    patch.commander = next
-  }
-  if (Object.keys(patch).length === 0) return undefined
-  return patch
-}
-
-/** 把一次 `tihu` 补丁合进已落盘的旧值：补丁里没出现的子键原样保留。 */
-function mergeTihuPatch(base: unknown, patch: TihuConfigPatch): TihuLocalConfig {
-  const current = normalizeTihu(base)
-  const next: TihuLocalConfig = {
-    model: { ...current.model },
-    voice: { ...current.voice },
-    ...(current.commander === undefined ? {} : { commander: { ...current.commander } }),
-  }
-  if (patch.model !== undefined) {
-    if ('foreground' in patch.model) next.model.foreground = patch.model.foreground ?? null
-    if ('background' in patch.model) next.model.background = patch.model.background ?? null
-  }
-  if (patch.voice !== undefined && 'edge' in patch.voice) next.voice.edge = patch.voice.edge ?? ''
-  if (patch.commander !== undefined) {
-    const existing = next.commander ?? {}
-    next.commander = {
-      judge: patch.commander.judge ?? existing.judge ?? 'fresh',
-      keep: patch.commander.keep ?? existing.keep ?? 3,
-    }
-  }
-  return next
-}
-
 /** 配置文件缓存（按 mtime 失效）。测试改文件后无需重启进程。 */
 let cache: { file: string; mtimeMs: number; value: AssistantLocalConfig } | null = null
 
@@ -541,7 +274,6 @@ export function loadAssistantConfig(force = false): AssistantLocalConfig {
         : [],
       updateSource: typeof parsed.updateSource === 'string' ? parsed.updateSource.trim() : '',
       updateCheckEnabled: parsed.updateCheckEnabled === true,
-      tihu: normalizeTihu(parsed.tihu),
       sourceFile: file,
       loadError: '',
     }
@@ -577,7 +309,6 @@ export function assistantConfigClientView(): Record<string, unknown> {
     termEnvAllow: cfg.termEnvAllow,
     updateSource: cfg.updateSource,
     updateCheckEnabled: cfg.updateCheckEnabled,
-    tihu: cfg.tihu,
     configSource: cfg.sourceFile,
     configError: cfg.loadError || undefined,
   }
@@ -699,11 +430,6 @@ export function validateAssistantConfigPatch(raw: unknown): ValidateResult {
     if (typeof target.updateCheckEnabled !== 'boolean') return bad('updateCheckEnabled', 'expected-boolean')
     patch.updateCheckEnabled = target.updateCheckEnabled
   }
-  if ('tihu' in target) {
-    const value = normalizeTihuForWrite(target.tihu)
-    if (value === undefined) return bad('tihu', 'bad-tihu')
-    patch.tihu = value
-  }
   if (Object.keys(patch).length === 0) return { ok: false, error: 'nothing-to-change' }
   return { ok: true, patch }
 }
@@ -767,11 +493,6 @@ export function writeAssistantConfig(patch: AssistantConfigPatch): WriteResult {
   const next: Record<string, unknown> = { ...base }
   for (const key of WRITABLE_CONFIG_FIELDS) {
     if (!(key in patch)) continue
-    // tihu 按子键合并：设置页每次只发改过的那一项，不能把另外两项冲掉。
-    if (key === 'tihu') {
-      next.tihu = mergeTihuPatch(base.tihu, patch.tihu ?? {})
-      continue
-    }
     const value = (patch as Record<string, unknown>)[key]
     if (value === null || value === undefined) delete next[key]
     else next[key] = value

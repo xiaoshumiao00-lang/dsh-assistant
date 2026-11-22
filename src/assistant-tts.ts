@@ -5,11 +5,10 @@
  *   - 服务：微软 Edge TTS（公开读端点，**不需要任何订阅 key / 证书**）。
  *   - 端点：edge-tts 内部的 wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/…
  *     （由 python 包发起，不是本仓库直连）。
- *   - 运行时：`scripts/tihu-edge-tts.py`（MP3 写 stdout），与本机鹈鹕端同一套 python 环境：
- *       env TIHU_EDGE_PY / TIHU_EDGE_PYTHON > `~/.dsh/tihu/venv/Scripts/python.exe`
- *       > `~/.dsh/tihu/venv-sherpa/Scripts/python.exe` > 系统 `python` / `py`。
- *   - 音色：`TIHU_EDGE_VOICE` > `~/.dsh/assistant/config.json` 的 `tihu.voice.edge` > 晓晓
- *     （`tihu/edge-voice.ts` 统一解析，和鹈鹕端听到的是同一个声音）。
+ *   - 运行时：`scripts/edge-tts.py`（MP3 写 stdout），python 候选：
+ *       env ASSISTANT_TTS_EDGE_PY / ASSISTANT_TTS_EDGE_PYTHON > 系统 `python` / `py`。
+ *   - 音色：env ASSISTANT_TTS_EDGE_VOICE > 晓晓（`zh-CN-XiaoxiaoNeural`）。
+ *     朗读服务不再有别的音色来源（设备线已于 2026-11-22 整体移除）。
  *
  * 明确不做：不回落浏览器 speechSynthesis、不回落本地 Kokoro——用户要求只要微软，
  * 缺什么就报什么，绝不静默换引擎。
@@ -21,46 +20,51 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { manageWebRoutes } from './web-routes'
-import { tihuEdgeVoiceResolution } from './tihu/edge-voice'
+
+/** 朗读默认音色（edge-tts 云端晓晓）。 */
+export const ASSISTANT_TTS_VOICE_DEFAULT = 'zh-CN-XiaoxiaoNeural'
 
 export const ASSISTANT_TTS_ROUTE = '/api/assistant/tts'
 export const ASSISTANT_TTS_STATUS_ROUTE = '/api/assistant/tts/status'
 
-/** 固定的合成超时（edge 公开端点国内直连可用；走代理只在 TIHU_EDGE_PROXY 显式设置时）。 */
+/** 固定的合成超时（edge 公开端点国内直连可用；走代理只在 ASSISTANT_TTS_EDGE_PROXY 显式设置时）。 */
 const SYNTH_TIMEOUT_MS = 30_000
 const MAX_TEXT = 2000
 
-/** python 运行时候选（与 tihu/tts.ts 的 edgePythonCandidates 同优先级）。 */
-export function edgePythonCandidates(home = homedir()): string[] {
+/** python 运行时候选。 */
+export function edgePythonCandidates(): string[] {
   const env = (globalThis as any).process?.env ?? {}
-  const explicit = [env.TIHU_EDGE_PY, env.TIHU_EDGE_PYTHON].filter((v) => typeof v === 'string' && v !== '')
-  const tihuRoot = process.env.DSH_HOME ? join(process.env.DSH_HOME, 'tihu') : join(home, '.dsh', 'tihu')
-  const legacy = join(tihuRoot, 'venv', 'Scripts', 'python.exe')
-  const sherpa = join(tihuRoot, 'venv-sherpa', 'Scripts', 'python.exe')
+  const explicit = [env.ASSISTANT_TTS_EDGE_PY, env.ASSISTANT_TTS_EDGE_PYTHON].filter((v) => typeof v === 'string' && v !== '')
   const system = process.platform === 'win32' ? ['python', 'py'] : ['python3', 'python']
-  return [...explicit, legacy, sherpa, ...system]
+  return [...explicit, ...system]
 }
 
-/** edge-tts 脚本路径（与 lib/ 打包后定位一致：lib/../scripts/tihu-edge-tts.py）。 */
+/** 已解析的朗读音色：env ASSISTANT_TTS_EDGE_VOICE > 晓晓。 */
+export function assistantTtsVoice(): { voice: string; source: string } {
+  const env = String((globalThis as any).process?.env?.ASSISTANT_TTS_EDGE_VOICE ?? '').trim()
+  if (env !== '') return { voice: env, source: 'env' }
+  return { voice: ASSISTANT_TTS_VOICE_DEFAULT, source: 'default' }
+}
+
+/** edge-tts 脚本路径（与 lib/ 打包后定位一致：lib/../scripts/edge-tts.py）。 */
 export function edgeTtsScriptPath(): string {
   try {
     const here = fileURLToPath(new URL('.', import.meta.url))
-    return join(here, '..', 'scripts', 'tihu-edge-tts.py')
+    return join(here, '..', 'scripts', 'edge-tts.py')
   } catch {
-    return join(process.cwd(), 'scripts', 'tihu-edge-tts.py')
+    return join(process.cwd(), 'scripts', 'edge-tts.py')
   }
 }
 
-/** 常驻 worker 脚本路径（lib/../scripts/tihu-edge-tts-worker.py）。 */
+/** 常驻 worker 脚本路径（lib/../scripts/edge-tts-worker.py）。 */
 export function edgeTtsWorkerScriptPath(): string {
   try {
     const here = fileURLToPath(new URL('.', import.meta.url))
-    return join(here, '..', 'scripts', 'tihu-edge-tts-worker.py')
+    return join(here, '..', 'scripts', 'edge-tts-worker.py')
   } catch {
-    return join(process.cwd(), 'scripts', 'tihu-edge-tts-worker.py')
+    return join(process.cwd(), 'scripts', 'edge-tts-worker.py')
   }
 }
 
@@ -119,7 +123,7 @@ function readJsonBody(req: any): Promise<any> {
 /** 已选中的合成参数（status 路由回报用）。 */
 export function ttsRuntimeInfo(): { python: string; script: string; voice: string; source: string; endpoint: string } {
   const probe = probeEdgeRuntime()
-  const voice = tihuEdgeVoiceResolution()
+  const voice = assistantTtsVoice()
   return {
     python: probe.python,
     script: probe.script,
@@ -157,7 +161,7 @@ interface QueuedSynth {
 
 /**
  * 一条常驻 worker 连接（一个 python 进程，顺序处理）。
- * 协议见 scripts/tihu-edge-tts-worker.py：请求 = stdin 一行 JSON；
+ * 协议见 scripts/edge-tts-worker.py：请求 = stdin 一行 JSON；
  * 应答 = stdout 一行 JSON 头（ok 时带 bytes）+ 可选 bytes 长度帧 MP3 负载。
  */
 export class EdgeTtsWorkerConn {
@@ -386,8 +390,8 @@ export function registerAssistantTts(ctx: any): () => void {
       try { pool?.dispose() } catch { /* ignore */ }
       pool = new EdgeTtsWorkerPool({
         python,
-        rate: process.env.TIHU_EDGE_RATE || '+45%',
-        proxy: process.env.TIHU_EDGE_PROXY || null,
+        rate: process.env.ASSISTANT_TTS_EDGE_RATE || '+45%',
+        proxy: process.env.ASSISTANT_TTS_EDGE_PROXY || null,
         size: 2,
         logger: ctx?.logger,
       })
@@ -431,12 +435,12 @@ export function registerAssistantTts(ctx: any): () => void {
           sendJson(res, 503, {
             ok: false,
             engine: 'edge-tts（微软）',
-            missing: [probe.error ?? 'python 不可用', existsSync(probe.script) ? '' : 'scripts/tihu-edge-tts.py 不存在'].filter(Boolean),
-            hint: 'pip install "edge-tts>=7.3.1" 到任一候选 python（优先 ~/.dsh/tihu/venv）',
+            missing: [probe.error ?? 'python 不可用', existsSync(probe.script) ? '' : 'scripts/edge-tts.py 不存在'].filter(Boolean),
+            hint: 'pip install "edge-tts>=7.3.1" 到任一候选 python（默认系统 python）',
           })
           return
         }
-        const voice = String(body?.voice ?? '').trim() || tihuEdgeVoiceResolution().voice
+        const voice = String(body?.voice ?? '').trim() || assistantTtsVoice().voice
         let mp3: Buffer | null = null
         let lastError: unknown = null
         // 1) 常驻 worker（毫秒级固定开销）；2) 同引擎一次性合成兜底（worker 崩了也不换引擎）

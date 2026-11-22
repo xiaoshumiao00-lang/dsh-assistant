@@ -2,7 +2,7 @@
 """edge-tts 单句流式合成：MP3 直接写到 stdout。
 
 Node 侧用 ffmpeg 从管道解码成 24kHz/mono/pcm16；首块门限与重试由宿主 tts.ts 管理。
-失败（离线/403/超时/依赖缺失）以非 0 退出。代理只在 TIHU_EDGE_PROXY 显式设置时启用。
+失败（离线/403/超时/依赖缺失）以非 0 退出。代理只在 ASSISTANT_TTS_EDGE_PROXY 显式设置时启用。
 """
 import argparse
 import asyncio
@@ -46,8 +46,8 @@ def main() -> int:
     parser.add_argument("--text", required=True)
     parser.add_argument("--voice", default="zh-CN-YunjianNeural")
     parser.add_argument("--timeout", type=float, default=15.0)
-    parser.add_argument("--rate", default=os.environ.get("TIHU_EDGE_RATE", "+45%"))
-    parser.add_argument("--proxy", default=os.environ.get("TIHU_EDGE_PROXY") or None)
+    parser.add_argument("--rate", default=os.environ.get("ASSISTANT_TTS_EDGE_RATE", "+45%"))
+    parser.add_argument("--proxy", default=os.environ.get("ASSISTANT_TTS_EDGE_PROXY") or None)
     args = parser.parse_args()
     try:
         asyncio.run(asyncio.wait_for(run(args.text, args.voice, args.rate, args.timeout, args.proxy), timeout=args.timeout))

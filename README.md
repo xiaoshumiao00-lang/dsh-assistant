@@ -93,7 +93,7 @@ DeepSeek Harness 一体化助手插件：**悬浮球 → 控制室**，外加**�
 - **记忆闭环**：热记忆（`USER.md` / `MEMORY.md` 每轮注入）+ 人设里的收工蒸馏（写 journal、更新记忆、纠正即覆盖）+ `mnemon` 检索；记忆真值在 `~/.mnemon/runtime/`。
 - **一键导出诊断包（脱敏）**：设置 →「个人助手」页底的「🧰 导出诊断包（脱敏）」按钮（`src/assistant-diagnostics.ts`）。包里放的是：插件/清单/Node 版本、`~/.dsh/dsh-assistant-focus.log` 尾部、`<profile>/dsh-assistant-ball/helper.log` 尾部、`$DSH_HOME/dsh-pocket/diagnostic.jsonl` 的摘要（只留计数与最近几条的关键字段，payload 不倒）、状态 json 的概要（revision / 项数，不带内容）、助手目录用量、目录 allowlist 的根列表。写盘前一律过脱敏：已知绝对根（主目录 / DSH 数据根 / profile / 助手目录 / Desktop / 临时目录 / `skillRoot` / `allowedRoots`）换成 `<HOME>` `<DSH>` `<PROFILE>` `<ROOT>` 之类标记，残留的 `X:\...`、`/Users/...`、`/home/...` 换成 `<PATH>`，`pin:` / `token=` / `password:` / `Bearer …` / 32 位以上十六进制串、以及 **JSON 字符串内部** 的 6–8 位数字串换成 `«已脱敏»`（数字字段本身不动，不然包会 invalid）。`dsh-pocket/settings.json` 整份都不进包（PIN / 隧道 Token / cloudflared 路径都在那里），包里还有一行 `notCollected` 明确写着「哪些东西故意不给」。落盘位置：`~/.dsh/assistant/outputs/diagnostics-<时间戳>.json`（尽力 0o600），按钮旁边显示真实路径、体积与「脱敏替换 N 处」，另有一份浏览器下载。
 - **助手档案导出 / 导入**：页底的「📦 导出助手档案」与「📥 导入助手档案」（`src/assistant-archive.ts`）。导出是**单一 JSON 清单**（仓库里没有压缩库，也不为此新引一个 devDependency）：AGENTS.md、`journal/`、`notes/`、`archive/`、`config.json`、`USER.md` / `MEMORY.md` / `memories.json`、跨端状态 json；每项带相对路径、字节数与 SHA-256，整包带 `checksum`、文件数与总体积。导出的文件落 `~/.dsh/assistant/exports/archive-<时间戳>.json`（`exports/` 不在 `outputs/` 的 14 天自动清范围里，不会被悄悄删掉）。导入按 `?` 规则走：先校验 `checksum`（对不上整包拒绝，一个文件都不落）、把现有 AGENTS.md / journal / notes 现状备份到 `archive/import-backup-<时间戳>/`、按文件夹判重（内容 hash 一样 → 跳过）、内容不一样 →【不覆盖】，另存成 `<原名>.imported-<时间戳>.<后缀>`；`state` 区一律拒收（删除墓碑不写回，报告里 `tombstonesIgnored` 说明数量）；包里的相对路径不许跳出该区目录（`../` 与绝对路径都拒）。本机没有的预设 / 模板 id 不静默：报告 `missingPresets` 列表。UI 上直接打印「导入了什么、跳过了什么、冲突另存成哪、备份目录在哪、墓碑没写回」。`dryRun:true` 只报告不落盘。
-- **秘书回复 = 卡片 + 朗读（2026-11-21 起）**：秘书会话里每条模型回复渲染成柔和浅色卡片（标题行「个人秘书 · 回复」+ 正文，圆角/描边沿用 pocket 令牌，底色 #f7f8fb），原始 markdown 气泡在同会话内隐藏（`body[data-dsh-secretary="1"]`，其它会话零变化）；系统提示带朗读友好规范（口语短句、无 markdown/列表/表情/代码块、数字单位念读如「8 到 14 摄氏度」、引用会话写 `[[session:id|标题]]`）。卡片操作区有**朗读按钮气泡**：出现即自动朗读（微软 TTS），单击暂停/继续、长按 600ms 从头重读、换卡片自动停上一条；引用块点击按会话 id 走既有会话选择逻辑跳进对应会话。TTS 只用微软 edge-tts（宿主 `POST /api/assistant/tts` → MP3；音色 `TIHU_EDGE_VOICE` > `config.json tihu.voice.edge` > 晓晓，与鹈鹕端同一套；**无浏览器 speechSynthesis / 本地 Kokoro 兜底**，失败就是失败并在按钮上标红）。
+- **秘书回复 = 卡片 + 朗读（2026-11-21 起）**：秘书会话里每条模型回复渲染成柔和浅色卡片（标题行「个人秘书 · 回复」+ 正文，圆角/描边沿用 pocket 令牌，底色 #f7f8fb），原始 markdown 气泡在同会话内隐藏（`body[data-dsh-secretary="1"]`，其它会话零变化）；系统提示带朗读友好规范（口语短句、无 markdown/列表/表情/代码块、数字单位念读如「8 到 14 摄氏度」、引用会话写 `[[session:id|标题]]`）。卡片操作区有**朗读按钮气泡**：出现即自动朗读（微软 TTS），单击暂停/继续、长按 600ms 从头重读、换卡片自动停上一条；引用块点击按会话 id 走既有会话选择逻辑跳进对应会话。TTS 只用微软 edge-tts（宿主 `POST /api/assistant/tts` → MP3；音色 env `ASSISTANT_TTS_EDGE_VOICE` > 晓晓；**无浏览器 speechSynthesis / 本地 Kokoro 兜底**，失败就是失败并在按钮上标红）。
 - 宿主路由：`GET /api/assistant/home`（含 usage/limits/文件清单）、`GET /api/assistant/memory`、`POST /api/assistant/memory-entry-delete`、`POST /api/assistant/memory-clear`（要 `confirm:'DELETE-ALL'`）、`GET|POST /api/assistant/tidy`（收 + 归档）、`GET /api/assistant/config`、`GET|POST /api/assistant/state`、`GET|POST /api/assistant/secretary`（固定秘书 ID）、`GET|POST|DELETE /api/assistant/proactive`（主动服务卡片；首次启动种一张示例卡）、`POST /api/assistant/tts`（秘书卡片朗读，微软 edge-tts 流式 MP3）+ `GET /api/assistant/tts/status`（引擎/端点/音色诊断）、`GET|POST /api/assistant/open-assistant`（热键/外部唤起，带 intent 复用悬浮球长轮询）、`GET /api/assistant/diagnostics` + `POST /api/assistant/diagnostics/export`（一键诊断包，见下）、`GET /api/assistant/archive` + `POST /api/assistant/archive/export` + `POST /api/assistant/archive/import`（助手档案导出/导入，见下）。
 - 直达：`…/?assistant=chat` 或 `…/#assistant`。
 - **升级后需重启一次 DSH Desktop**：宿主新增的路由、全局热键与桌面球手势映射都要宿主重启才生效（只刷新页面只能拿到新客户端）。v0.2.10 改的全是客户端，刷新页面即可生效；**只要动过宿主侧代码（路由 / 热键 / 服务 / 桌面球 helper），就必须重启 DSH Desktop**。
@@ -319,27 +319,20 @@ npm run lint       # scripts/lint-standards.mjs（不靠 eslint：查个人化�
 
 ## 手机 APK（安卓外壳）
 
-装插件 + 装 APK 就能用：APK 是一块 Android WebView 外壳，里面两个屏——「助手」屏就是电脑上 DSH 那套页面（同一份前端、同一个会话、同一套插件），「鹈鹕」屏是 `/tihu` 模拟设备页 + 底部一键语音输入。
+装插件 + 装 APK 就能用：APK 是一块 Android WebView 外壳，里面只有「助手」屏——电脑上 DSH 那套页面（同一份前端、同一个会话、同一套插件）。
 
-- 源码 / 构建脚本 / 签名密钥 / 交付件都在 [`android/`](android/README.md)；当前版本 **1.2.0**（versionCode 8，包名 `com.chenpan.assistant.generic`）。
-- 交付件：`android/dist/个人助手-通用版-1.2.0.apk`；构建命令见 `android/README.md`。
-- 首次打开进设置页，两项地址（助手 / 鹈鹕）都留空，可手填或点「一键填入常用地址」；两个地址任一填好就能进对应屏，两个都空不会白屏。
-- 鹈鹕屏只留模拟设备显示屏，其余配置/日志收进音量条右端的齿轮「鹈鹕设置」；**默认浅色主题**（设置面板里可切回深色）；显示屏下方的音量条只调页面朗读（WebAudio masterGain），不动系统媒体音量。
+- 源码 / 构建脚本 / 签名密钥 / 交付件都在 [`android/`](android/README.md)；当前版本 **1.4.3**（包名 `com.chenpan.assistant.generic`）。
+- 交付件：`android/dist/个人助手-通用版-1.4.3.apk`；构建命令见 `android/README.md`。
+- 首次打开进设置页：助手地址留空时可手填或点「一键填入常用地址」。
+- 语音输入走页面内既有的麦克风入口（宿主语音转写 / 系统输入法），插件侧不再有设备转写接口（2026-11-22 设备线已整体移除）。
 
-### 语音输入依赖什么（重要）
+## 朗读（秘书卡片）TTS 运行时
 
-- **转写接口由插件自己提供**：`POST {origin}/tihu/asr`，挂在 pocket 代理的 tihu 分支上（`src/pocket-host/proxy.mjs`），鉴权沿用同一套 token / PIN / cookie，不另开免鉴权口子；实现在 `src/tihu/lane.ts` 的 `handleHttp`。
-- 转写顺序：**本地 whisper（`whisper/` 目录 + `127.0.0.1:3097`，插件自带，默认 medium）优先** → 本地不可用或返回空时回退**宿主 speech 服务**（需要装了语音转写类插件）。
-- 公网 `***REMOVED***` 那条 SSH 反向隧道上的 relay 也实现了同一个 `/tihu/asr`，**只用于反代**；换成局域网 `http://<电脑IP>:3081` 时走的就是插件本体，不需要 relay。
-- 两段都没有文字时接口返回 `{"text":"","error":"no-speech"}` 并写一行 `tihu-asr` 日志，手机端提示「没听清」，不会假装发送成功。
-
-## 鹈鹕（tihu）本地 TTS 运行时
-
-- 主 TTS：`edge-tts` + `zh-CN-YunjianNeural`（云健），默认语速 `TIHU_EDGE_RATE=+45%`。
-- 网络代理**默认不使用**；需要时显式设置 `TIHU_EDGE_PROXY`（例如 `http://127.0.0.1:7897`）。运行时会独立探测仓库内 edge 脚本、Python、`edge_tts` 与 ffmpeg。
+- 合成只用微软 `edge-tts`（宿主 `POST /api/assistant/tts` → MP3），音色 env `ASSISTANT_TTS_EDGE_VOICE`（默认晓晓）。
+- 语速 env `ASSISTANT_TTS_EDGE_RATE`（默认 `+45%`）；网络代理**默认不使用**，需要时显式设置 `ASSISTANT_TTS_EDGE_PROXY`（例如 `http://127.0.0.1:7897`）。运行时探测 python 候选与 `edge_tts`。
 - **edge-tts 必须 ≥ 7.3.1**：7.2.x 的 Sec-MS-GEC/DRM 已过期，Bing WSS 会 403。本机 PyPI 直连不通，用清华镜像升级：
   `python -m pip install -U edge-tts -i https://pypi.tuna.tsinghua.edu.cn/simple`
-- edge 依赖缺失或请求失败时按既有策略降级到本地 Kokoro；两者都不可用则无语音并在设备屏内明确提示，正文仍保留。
+- edge 依赖缺失或请求失败时不静默换引擎：朗读按钮标红、正文仍保留。
 
 ## 致谢
 

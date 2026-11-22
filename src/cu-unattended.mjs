@@ -11,7 +11,7 @@
  *   - 托管关 / 读不到状态 / 拿不到会话链 → `next()`，交回宿主与用户的正常流程；
  *   - 托管开 → 维持原来的默认项（含 plan-review 的 approve）与 `allowed-once`。
  *
- * 危险动作不在这里放行：鹈鹕（tihu）闸挂在 `tools/pre-execute` 上，审批只是其中一环。
+ * 危险动作不在这里放行：审批是官方流程的一环，这里只处理默认项与提问的自动回答。
  * 这里托管关时让路只会让流程**更严**（回到官方审批卡），不会绕过任何闸。
  */
 import { tuoguanGateOn } from './tuoguan-gate.ts'

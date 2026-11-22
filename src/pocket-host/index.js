@@ -21,9 +21,6 @@ import { createPocketService } from './service.mjs';
 import { acquirePocketRuntime, releasePocketRuntime } from './runtime.mjs';
 import { installPocketRpc } from './web-rpc.js';
 import { restartHost } from './restart.js';
-import { createTihuRuntime, appendTihuLaneNote } from '../tihu/lane.ts';
-import { registerTihuControl } from '../tihu/control.ts';
-import { createTihuDiscoveryResponder, TIHU_DISCOVER_PORT } from './tihu-discovery.mjs';
 import { advancedNoticeScript, DEFAULT_INJECT, classifyHost } from './proxy.mjs';
 import { lanEnabled, setLanEnabled, lanAuthEnabled, setLanAuthEnabled, lanIpOverride, setLanIpOverride, pinCustom, setPinCustom, tunnelMode, setTunnelMode, tunnelToken, setTunnelToken, tunnelHostname, setTunnelHostname, resetSettings, proxyPort, cloudflaredPath, sshTunnelConfig, setSshTunnelConfig, ensureFirstRunSettings } from './settings.mjs';
 
@@ -345,41 +342,6 @@ export function apply(ctx, config = {}, internals = {}) {
     logger.warn('dsh-pocket: DSH Desktop advanced mode — phone access unsupported, injecting notice | 桌面端 advanced 模式：手机访问暂不支持，已注入提示');
   }
 
-  // 鹈鹕（tihu）P0：宿主侧 lane（模拟设备页 + WebSocket + 三道闸）。
-  // 页面与 /tihu/lane 都由代理在**鉴权之后**接走（见 proxy.mjs），不新开端口；
-  // 语音走官方 speech 服务、注入走 agents.followup——这里只判可用性，失败不阻断手机访问。
-  let tihuRuntime = null;
-  try {
-    tihuRuntime = createTihuRuntime(ctx, {
-      log: (line) => {
-        try { (logger.info ?? logger.log).call(logger, line) } catch { /* 日志失败不影响功能 */ }
-      },
-      workspaceOf: (sessionId) => {
-        try {
-          const cwd = ctx.sessions?.get?.(sessionId)?.header?.cwd;
-          return typeof cwd === 'string' && cwd !== '' ? cwd : undefined;
-        } catch { return undefined; }
-      },
-      tts: { prewarm: false },
-    });
-    logger.info('dsh-pocket: tihu lane ready at /tihu (P0 simulator) | 鹈鹕模拟设备页已挂载');
-  } catch (error) {
-    logger.warn('dsh-pocket: tihu lane disabled | 鹈鹕 lane 挂载失败: %s', error?.stack ?? error);
-  }
-
-  // 鹈鹕设备控制工具（tihu）：全局注册原生工具 + 系统提示段落。
-  // 任意会话（尤其鹈鹕语音指令）都能用自然语言控制设备；别人部署整套系统时装
-  // dsh-assistant 一个插件即自动获得本工具，无新文件依赖、无额外插件。
-  if (tihuRuntime) {
-    registerTihuControl(ctx, tihuRuntime.control, (line) => {
-      try { (logger.info ?? logger.log).call(logger, line) } catch { /* 日志失败不影响功能 */ }
-    }).then((off) => {
-      if (typeof off === 'function') disposers.push(off);
-    }).catch((error) => {
-      logger.warn('dsh-pocket: tihu control tool disabled | 鹈鹕控制工具注册失败: %s', error?.stack ?? error);
-    });
-  }
-
   const runtime = internals.service ? null : acquirePocketRuntime(runtimeRevision, () => createPocketService({
     dshPort,
     // 端口（issue #70）：插件模式优先级 settings.proxyPort > cordis patch config.port > 3081。
@@ -387,8 +349,6 @@ export function apply(ctx, config = {}, internals = {}) {
     port: internals.port ?? config.port ?? (proxyPort() || 3081),
     home: pocketHome,
     internals,
-    // 鹈鹕（tihu）：页面与 lane 复用本代理的 token/cookie 鉴权
-    ...(tihuRuntime ? { tihu: tihuRuntime } : {}),
     getLanIpOverride: () => lanIpOverride(),
     getLanEnabled: () => lanEnabled(),
     // 桌面端**不再**注入 dsh-desktop-* 标记（issue #76）：
@@ -452,31 +412,6 @@ export function apply(ctx, config = {}, internals = {}) {
   const service = internals.service ?? runtime.service;
 
   const disposers = [];
-  if (tihuRuntime) disposers.push(() => tihuRuntime?.dispose());
-
-  // 鹈鹕设备发现响应器（UDP 3082）：设备换 Wi-Fi 后靠广播找到本机，不再写死 IP。
-  // 只回一句 `TIHU_HOST <本机局域网IP> <3081> <局域网PIN>`；收到的请求与回包都进 lane.log
-  // （note=tihu-discover），出问题只看日志就能判断是「没收到广播」还是「回了但设备连不上」。
-  // 独立于 lane 起停：lane 挂载失败也照样能让设备发现到宿主（只是随后 WS 连不上）。
-  const discovery = createTihuDiscoveryResponder({
-    port: TIHU_DISCOVER_PORT,
-    getToken: () => getLanToken(),
-    getLanePort: () => internals.port ?? config.port ?? (proxyPort() || 3081),
-    log: (line) => {
-      try { appendTihuLaneNote('tihu-discover', line) } catch { /* 日志失败不影响发现 */ }
-      try { (logger.info ?? logger.log).call(logger, `dsh-pocket: tihu discover ${line}`); } catch { /* 忽略 */ }
-    },
-  });
-  try {
-    if (discovery.start()) {
-      logger.info(`dsh-pocket: tihu discovery listening on udp ${TIHU_DISCOVER_PORT} | 鹈鹕设备发现已监听`);
-    } else {
-      logger.warn(`dsh-pocket: tihu discovery not started | 鹈鹕发现响应器未启动（UDP ${TIHU_DISCOVER_PORT} 可能被占用）`);
-    }
-  } catch (error) {
-    logger.warn(`dsh-pocket: tihu discovery disabled | 鹈鹕发现响应器失败: ${error?.message ?? error}`);
-  }
-  disposers.push(() => { try { discovery.stop() } catch { /* 忽略 */ } });
 
   const disposeRpc = installPocketRpc(ctx, {
     service,

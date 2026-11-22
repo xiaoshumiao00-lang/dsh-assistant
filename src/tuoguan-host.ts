@@ -429,7 +429,7 @@ function installAutoAnswerFor(ctx: any, store: TuoguanStore): () => void {
  *
  * 宿主仍然是唯一读状态的人（同一个 TuoguanStore + 同一套判定），vendor 侧不碰文件；
  * 读不到状态 / 拿不到会话链 → false（按不托管处理，交回官方审批卡与提问卡）。
- * 危险动作不经过这里：鹈鹕闸挂在 tools/pre-execute 上，审批只是其中一环。
+ * 危险动作不经过这里：官方审批卡照常弹，这里只替用户回答默认项与提问。
  * @param ctx - 宿主插件上下文（用来按 id 取 Agent）。
  * @param readState - 读托管状态（就是 TuoguanStore.read）。
  * @returns 卸载函数。

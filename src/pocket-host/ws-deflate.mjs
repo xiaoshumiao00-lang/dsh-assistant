@@ -41,7 +41,7 @@ export class WsFrameParser {
     /**
      * 分片消息重组（RFC 6455 §5.4）：Chrome 会把大消息（实测 ~128KB 以上）拆成
      * FIN=0 的起始帧 + 若干 continuation 帧。旧实现只认 opcode=1 的单帧，于是
-     * 鹈鹕页面上传 WAV（约 240KB）时第一片被判成坏 JSON 静默丢弃，页面永远等不到
+     * 一条 240KB 的上行（当年语音设备页的 WAV）时第一片被判成坏 JSON 静默丢弃，页面永远等不到
      * transcript（2026-11-07 实测根因）。
      */
     this.fragmentOpcode = 0;

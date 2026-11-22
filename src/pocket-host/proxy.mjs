@@ -498,7 +498,7 @@ function authCheck(req, tokens, sessionKey) {
  *  2026-11-06：**已有 cookie 但和当前 PIN 不匹配时也要重种**。旧实现见到任何
  *  cookie 就直接 return，于是一个过期/换过 PIN 的旧 cookie 永远修不回来：
  *  页面 `?token=` 走 query 分支照样 200 打得开，但后续同源 WebSocket 只认 cookie
- *  → 每 2 秒 401 重连（鹈鹕 P0 就是被这条坑了）。cookie 值本身是
+ *  → 每 2 秒 401 重连（设备 lane 就是被这条坑了，那条线 2026-11-22 已移除）。cookie 值本身是
  *  sha256(PIN:sessionKey)，比对不涉及明文，也不会放宽任何鉴权。 */
 function maybeSeedAuthCookie(req, res, rawToken, sessionKey) {
   if (!rawToken || !sessionKey) return;
@@ -895,7 +895,7 @@ function readDiagBody(req) {
  * @param {() => boolean} [opts.lanAccessEnabled] 局域网访问是否开启（默认开启）。关闭时拦截经局域网 Host 的请求（公网/loopback 不受影响）。
  * @returns {Promise<{server:import('node:http').Server, close:()=>Promise<void>}>}
  */
-export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DEFAULT_UPSTREAM, log = null, injectHtml = DEFAULT_INJECT, auth = null, rateLimit = null, heartbeat = {}, lanAccessEnabled = () => true, launchToken = () => '', handshakeLimit, tihu = null } = {}) {
+export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DEFAULT_UPSTREAM, log = null, injectHtml = DEFAULT_INJECT, auth = null, rateLimit = null, heartbeat = {}, lanAccessEnabled = () => true, launchToken = () => '', handshakeLimit } = {}) {
   const limiter = auth ? createRateLimiter(rateLimit ?? {}) : null;
   // WebSocket permessage-deflate（2026-10-25）：见 lib/ws-deflate.mjs 顶部注释。
   // 默认开启（省 3~4 倍字节），DSH_POCKET_WS_DEFLATE=0 一键回退明文。
@@ -1096,39 +1096,6 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
           maybeSeedAuthCookie(req, res, authResult.rawQueryToken, sessionKey);
         }
       }
-    }
-    // ── 鹈鹕语音转写（手机 APK 底部麦克风）────────────────────────────────
-    // POST /tihu/asr：body 就是原始 WAV（≤2MB）。**鉴权沿用上面那一套**
-    // （token / PIN / HttpOnly cookie / 局域网开关早已判过），这里只负责接走，
-    // 转写在 tihu 运行时里做（本地 whisper 优先 → 宿主 speech 回退），
-    // 所以别人只装插件 + APK 也能用，不依赖任何人私有的 relay。
-    // 其它方法/路径保持原样（不接走，继续按老规则转发或 404）。
-    if (tihu && req.method === 'POST' && urlPath === '/tihu/asr'
-        && typeof tihu.handleHttp === 'function' && tihu.handleHttp(req, res)) {
-      return;
-    }
-    // ── 鹈鹕（tihu）模拟设备页 ──────────────────────────────────────────────
-    // 由代理**在鉴权之后**直接吐出（不落到上游 dsh web：上游对 /tihu 是 404）。
-    // 局域网 / 公网 / 回环三种入口走的就是上面那一套 token + cookie 判定：
-    //   - 没有 cookie：先落到登录页，输 PIN 或带 ?token= 登录后种 cookie，再回来；
-    //   - 局域网访问总开关关着时，局域网 Host 会在更早的分支被 403（与首页一致）；
-    //   - 回环（本机 localhost 自测）默认同样要过 PIN（lanAuthEnabled 默认开）。
-    // 页面里的 WebSocket 走 /tihu/lane（同源、同 cookie），见下面的 upgrade 分支。
-    if (tihu && (urlPath === '/tihu' || urlPath === '/tihu/')) {
-      if (req.method !== 'GET' && req.method !== 'HEAD') {
-        res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8', allow: 'GET, HEAD' });
-        res.end('method not allowed');
-        return;
-      }
-      const page = Buffer.from(tihu.page(), 'utf8');
-      res.writeHead(200, {
-        'content-type': 'text/html; charset=utf-8',
-        'content-length': String(page.length),
-        'cache-control': 'no-store',
-        'x-dsh-tihu': 'p0',
-      });
-      res.end(req.method === 'HEAD' ? undefined : page);
-      return;
     }
     const headers = loopbackAuthority({ ...req.headers }, upstream);
     // HTML 必须取未压缩版本：注入与移动首屏精简都只能安全改写纯文本。
@@ -1361,9 +1328,6 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
       }
       if (token && wsAuth.ok && wsGuess) limiter?.clear(wsIp);
     }
-    // 鹈鹕（tihu）lane：与上面完全同一套鉴权（cookie / ?token=），通过后由 tihu
-    // 接走 /tihu/lane；其它路径返回 false，继续按原来的 WS 透传给上游。
-    if (tihu && typeof tihu.handleUpgrade === 'function' && tihu.handleUpgrade(req, socket, head)) return;
     // 诊断：WS 连接的生命周期（手机是否在周期性重连 = 页面跳动的直接证据）。
     const wsId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const wsStarted = Date.now();

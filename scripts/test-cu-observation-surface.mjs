@@ -110,7 +110,7 @@ cases.push(['ownerMinEdgePx 是 tunable：默认 64 时小窗可用，调到 100
 
 cases.push(['标题标记不看大小写，也不看前后缀', () => {
   assert.equal(isSelfUiWindow('DSH-Assistant-BALL', selfUiTitlePatterns(undefined)), true)
-  assert.equal(isSelfUiWindow('鹈鹕 · dsh-assistant-ribbon 条带', selfUiTitlePatterns(undefined)), true)
+  assert.equal(isSelfUiWindow('个人助手 · dsh-assistant-ribbon 条带', selfUiTitlePatterns(undefined)), true)
   assert.equal(isSelfUiWindow('微信', selfUiTitlePatterns(undefined)), false)
   assert.equal(isSelfUiWindow(undefined, selfUiTitlePatterns(undefined)), false)
   assert.deepEqual(selfUiTitlePatterns(['自定义覆盖层']).slice(-1)[0], '自定义覆盖层')

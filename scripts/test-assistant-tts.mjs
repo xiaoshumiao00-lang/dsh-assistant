@@ -3,8 +3,8 @@
  *   node scripts/test-assistant-tts.mjs
  *
  * 覆盖：
- *   - 运行时候选与探测（找到装了 edge_tts 的 python；venv-sherpa 没有时要跳过它）；
- *   - 音色解析走鹈鹕同一套：TIHU_EDGE_VOICE > config.json tihu.voice.edge > 晓晓；
+ *   - 运行时候选与探测（找到装了 edge_tts 的 python）；
+ *   - 音色解析：env ASSISTANT_TTS_EDGE_VOICE > 晓晓（默认）；
  *   - 路由：POST 合成出 audio/mpeg（真跑一次 edge-tts，网络不可用时此项 FAIL 并给出缺失清单）；
  *     空 text 400、非 POST 405、status 路由回报引擎/端点/音色。
  */
@@ -21,14 +21,24 @@ cases.push(['运行时候选：能找到装了 edge_tts 的 python', () => {
   assert.equal(probe.ok, true, `探测失败：${probe.error ?? ''}`)
   assert.ok(probe.python !== '', 'python 为空')
   assert.match(probe.version ?? '', /7\.3\.1|7\.[4-9]/)
-  assert.ok(surface.edgeTtsScriptPath().endsWith('tihu-edge-tts.py'), '脚本路径指向 tihu-edge-tts.py')
+  assert.ok(surface.edgeTtsScriptPath().endsWith('edge-tts.py'), '脚本路径指向 edge-tts.py')
+  assert.ok(!surface.edgeTtsScriptPath().endsWith('worker.py'), '一次性合成脚本与常驻 worker 脚本是两条路径')
 }])
 
-cases.push(['音色解析：env 优先于默认（鹈鹕同一套解析）', () => {
-  const info = surface.ttsRuntimeInfo()
-  assert.ok(info.voice.startsWith('zh-CN-'), `音色异常：${info.voice}`)
-  assert.match(info.endpoint, /speech\.platform\.bing\.com/)
-  assert.match(info.endpoint, /readaloud/)
+cases.push(['音色解析：env 优先于默认', () => {
+  process.env.ASSISTANT_TTS_EDGE_VOICE = 'zh-CN-YunxiNeural'
+  try {
+    const info = surface.ttsRuntimeInfo()
+    assert.equal(info.voice, 'zh-CN-YunxiNeural', 'env 音色没被采用')
+    assert.equal(info.source, 'env')
+  } finally {
+    delete process.env.ASSISTANT_TTS_EDGE_VOICE
+  }
+  const back = surface.ttsRuntimeInfo()
+  assert.equal(back.voice, 'zh-CN-XiaoxiaoNeural', 'env 清掉后要回默认晓晓')
+  assert.equal(back.source, 'default')
+  assert.match(back.endpoint, /speech\.platform\.bing\.com/)
+  assert.match(back.endpoint, /readaloud/)
 }])
 
 function fakeServer() {

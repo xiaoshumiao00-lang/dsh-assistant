@@ -22,11 +22,6 @@ function element(children = []) {
         if (el.dataset.dshpModelNotice === '1') return el
         return el.parentElement?.closest(selector) ?? null
       }
-      // 鹈鹕「指挥台模型」卡：根节点带 data-tihu-model-card="1"（注入 JS 写的就是这个属性）
-      if (selector === '[data-tihu-model-card]') {
-        if (el.attributes['data-tihu-model-card'] === '1') return el
-        return el.parentElement?.closest(selector) ?? null
-      }
       return null
     },
     set textContent(value) {
@@ -138,16 +133,15 @@ assert.equal(patcher.collect([{ type: 'characterData', target: composerText }]
 patcher.flush()
 assert.equal(composerText.nodeValue, 'lib/proxy.mjs', '输入框里的文本一字不改')
 
-// 鹈鹕「指挥台模型」卡（data-tihu-model-card）是手机上唯一允许改的模型设置：
-// 卡内的加载失败/目录错误必须原样显示，卡外同样的文案仍要被改写成「请去电脑端」。
+// 手机端模型设置一律改写：设备「指挥台模型」卡（手机上唯一允许改的那张）已随设备功能移除，
+// 曾经给它让路的例外不再存在——卡内卡外的加载失败文案都得改成「请去电脑端」。
 const modelCard = element([element([text('加载提供方目录失败')])])
-modelCard.attributes['data-tihu-model-card'] = '1'
 const outsideError = element([text('加载提供方目录失败')])
 const bothRoot = element([modelCard, outsideError])
 assert.equal(patcher.collect([{ type: 'childList', addedNodes: [bothRoot] }]), true)
 patcher.flush()
-assert.equal(modelCard.dataset.dshpModelNotice, undefined, '指挥台模型卡自己不许被标成「已改写」')
-assert.equal(modelCard.children[0].children[0].nodeValue, '加载提供方目录失败', '卡内原因必须原样回显')
+assert.equal(modelCard.children[0].children[0].nodeValue ?? modelCard.children[0].textContent, NOTICE,
+  '设备卡例外已删：嵌套在卡里的模型设置文案也要改写')
 assert.equal(outsideError.dataset.dshpModelNotice, '1', '卡外的模型设置照旧改写（不放宽整端）')
 assert.equal(outsideError.children[0].nodeValue, NOTICE)
 

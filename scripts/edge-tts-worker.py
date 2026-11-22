@@ -22,7 +22,7 @@ import sys
 
 
 def _force_threaded_resolver() -> None:
-    """aiohttp DNS 换线程解析器（与 tihu-edge-tts.py 同一根因修复，见该文件 docstring）。"""
+    """aiohttp DNS 换线程解析器（与 edge-tts.py 同一根因修复，见该文件 docstring）。"""
     import aiohttp.connector
     import aiohttp.resolver
 
