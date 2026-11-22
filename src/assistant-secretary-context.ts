@@ -12,13 +12,22 @@
  * 但实测最大单轮 942 词，两个大轮就会把预算挤爆；8 轮（实测 580 词）留 620 词给滚动摘要段，
  * 9/10 轮只比 8 轮多约 8%/15% 的覆盖，边际收益不抵风险。词数口径 = countWords()（词数，不是 token）。
  *
- * 合法上下文通道（取证结果）：
+ * 合法上下文通道（取证结果，2026-11-21；2026-11-22 用户定案后更新）：
  *   - `agent/pre-step` 只能「拒绝这一步」或替换**即将进入这一步的 messages**（宿主 api-catalog 原文），
  *     插件不能拿它删掉已经在日志里的旧轮；`agent/request` 明写「this waterfall cannot mutate messages」；
  *     `llm/stream` 送来的 request 是 deep-frozen（改它就抛）。
- *   - 真正的裁剪只有宿主 compaction（compactNow / retainTokens），它会往会话日志写 compaction/* 事件，
- *     且改配置要重启宿主 —— 用户禁掉了这两条，所以插件只做「注入最近原文 + 摘要」，不动日志。
- *   - 插件能往模型送字的合法通道只有 ctx.systemPrompt.section（现成用法见 assistant-secretary.ts:564-574）。
+ *   - 真正的裁剪只有宿主 compaction。宿主 dsh-compaction-basic 已在 dsh-base 装配（默认
+ *     thresholdRatio=.8 / retainRatio=.16 / auto=true，1M 窗口 ⇒ 阈值 ≈83.9 万 token，实测 8.4 万，
+ *     所以从来没触发过）。它的服务缝是 `ctx.compaction.compactNow(agent, signal, sourceCommandId)`：
+ *     只在**指定会话**的 idle agent 上做一次原生压缩——往日志追加 compaction/start、compaction/summary、
+ *     一条带 surfaceOp=replace 的 user/message 检查点、compaction/end（全部走宿主自己的 append 通道，
+ *     只追加、不改写旧帧，绝不离线重拼 zstd）。Session.deriveMessages() 只投影 surface 节点，
+ *     被 replace  shadow 掉的旧轮从此不进模型请求；原始事件仍在日志里，秘书页卡片/已读/分页/朗读
+ *     全部不受影响（卡片取数读原始事件，不走 deriveMessages）。
+ *   - 2026-11-22 起插件在滚动摘要的同触发点（每 30 轮 / 10000 词）对固定秘书会话调用 compactNow，
+ *     把「注入摘要段」升级成「注入摘要段 + 宿主真的把旧轮挤出模型上下文」。模型每轮看到的变成：
+ *     系统段（含最近 8 轮原文 + 滚动摘要）+ 宿主检查点 + 最近一轮，旧轮原文不再出现在消息列表里。
+ *   - 插件能往模型送字的合法通道只有 ctx.systemPrompt.section（现成用法见 assistant-secretary.ts）。
  *
  * 摘要落盘：~/.dsh/assistant/dsh-assistant-secretary-context.json（插件自己的 JSON，走 tmp+rename 序列化），
  * 绝不写会话日志、绝不自己拼 turn 事件、绝不用 agent 之外的写日志通道。
@@ -50,6 +59,31 @@ export const ASSISTANT_SECRETARY_CONTEXT_ROUTE = '/api/assistant/secretary-conte
 export const CONTEXT_STATE_FILENAME = 'dsh-assistant-secretary-context.json'
 const SESSION_ID_RE = /^[A-Za-z0-9._:-]{1,256}$/
 const MAX_ROUNDS_IN_MEMORY = 400
+
+/**
+ * 宿主压缩（旧轮挤出模型上下文）触发纪律：
+ *   - 只在滚动摘要的同触发点（每 30 轮 / 10000 词，见 contextSummaryTriggered）要求一次挤出；
+ *   - 总会话轮数低于 EVICT_MIN_TURNS 不要求（历史太短挤了也没意义，compactNow 自己也会判 null）；
+ *   - compactNow 要求 idle agent：busy 时在每次 agent/status=idle 重试，连撞 EVICT_MAX_BUSY_RETRIES
+ *     次就放下次触发点再来；其它错误（摘要 LLM 调用失败等）记下 lastError 直接放下次。
+ * 全部错误就地吞掉写诊断，绝不往宿主事件链上抛。
+ */
+export const EVICT_MIN_TURNS = 16
+export const EVICT_MAX_BUSY_RETRIES = 3
+export const EVICT_SOURCE_ID = 'assistant-secretary-context-v1'
+
+/** 一次宿主压缩的结果记录（落盘，供验收/诊断读回）。 */
+export interface ContextEviction {
+  at: string
+  count: number
+  shadowedTokens: number
+  busyRetries: number
+  lastError: string
+}
+
+export function emptyContextEviction(): ContextEviction {
+  return { at: '', count: 0, shadowedTokens: 0, busyRetries: 0, lastError: '' }
+}
 
 /** 一轮（turn）的明细：已完成任务 / 结论 / 待办，都是压过的小段。 */
 export interface ContextRound {
@@ -84,6 +118,8 @@ export interface ContextState {
   summaryThroughTurn: number
   /** 上次摘要时累计到的词数（词数口径的基准：新增词数够 10000 才再压一次） */
   summaryThroughWords: number
+  /** 宿主压缩（旧轮挤出模型上下文）的记录；从没挤过就是空记录 */
+  eviction: ContextEviction
 }
 
 export function emptyContextState(sessionId = ''): ContextState {
@@ -102,6 +138,7 @@ export function emptyContextState(sessionId = ''): ContextState {
     degradeCount: 0,
     summaryThroughTurn: 0,
     summaryThroughWords: 0,
+    eviction: emptyContextEviction(),
   }
 }
 
@@ -113,8 +150,14 @@ function capText(value: unknown): string {
   return codePoints.slice(0, TEXT_CAP).join('')
 }
 
+/**
+ * 事件里的正文块 → 纯文本。宿主两种消息形状都要认（2026-11-22 现网实测定案）：
+ *   - user/message：content 直接在 data.content 上，且**没有 data.turn**；
+ *   - assistant/message：content 在 data.message.content 上，data.turn 在。
+ * 与秘书页卡片同一套取法（secretary-card-shared.ts 的 eventText）。
+ */
 function textOfEvent(event: any): string {
-  const content = event?.data?.content
+  const content = event?.data?.content ?? event?.data?.message?.content ?? event?.data?.data?.content
   if (!Array.isArray(content)) return ''
   return content.filter((block: any) => block?.type === 'text').map((block: any) => String(block?.text ?? '')).join('\n').trim()
 }
@@ -159,6 +202,19 @@ export function normalizeContextState(raw: unknown, sessionId = ''): ContextStat
     degradeCount: Number.isFinite(Number(source.degradeCount)) ? Math.max(0, Math.floor(Number(source.degradeCount))) : 0,
     summaryThroughTurn: Number.isFinite(Number(source.summaryThroughTurn)) ? Math.max(0, Math.floor(Number(source.summaryThroughTurn))) : 0,
     summaryThroughWords: Number.isFinite(Number(source.summaryThroughWords)) ? Math.max(0, Math.floor(Number(source.summaryThroughWords))) : 0,
+    eviction: normalizeContextEviction(source.eviction),
+  }
+}
+
+/** 挤出记录归一：缺字段/坏值一律回空记录（老版本摘要文件没有这段，必须向后兼容）。 */
+export function normalizeContextEviction(raw: unknown): ContextEviction {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, any>) : {}
+  return {
+    at: typeof source.at === 'string' ? source.at : '',
+    count: Number.isFinite(Number(source.count)) ? Math.max(0, Math.floor(Number(source.count))) : 0,
+    shadowedTokens: Number.isFinite(Number(source.shadowedTokens)) ? Math.max(0, Math.floor(Number(source.shadowedTokens))) : 0,
+    busyRetries: Number.isFinite(Number(source.busyRetries)) ? Math.max(0, Math.floor(Number(source.busyRetries))) : 0,
+    lastError: typeof source.lastError === 'string' ? source.lastError.slice(0, 240) : '',
   }
 }
 
@@ -256,6 +312,8 @@ export interface ContextDeps {
   /** 测试用：固定家目录（DSH_ASSISTANT_HOME 之外的 override） */
   homeDir?: string
   file?: string
+  /** 测试用：假宿主压缩服务（生产走 ctx.get('compaction')，宿主 dsh-compaction-basic） */
+  compaction?: { compactNow: (agent: any, signal: any, sourceCommandId?: string) => Promise<any> }
 }
 
 export function contextStateFile(deps: ContextDeps = {}): string {
@@ -357,6 +415,98 @@ export function registerAssistantSecretaryContext(ctx: any, deps: ContextDeps = 
 
   const buckets = new Map<number, { texts: string[]; seqFrom: number; seqTo: number }>()
 
+  // ── 宿主压缩（旧轮挤出模型上下文），2026-11-22 用户定案 ──
+  // 只对固定秘书会话、只在滚动摘要的同触发点要求一次；由 ctx.compaction.compactNow 执行，
+  // 宿主自己往日志追加 compaction/* 事件（只追加不改写），插件绝不自己碰会话日志。
+  let secretaryAgent: any = undefined
+  let pendingEvict = false
+  let evicting = false
+
+  /**
+   * 取宿主压缩服务。可见性顺序（2026-11-22 现网实测定案）：
+   *   1. deps.compaction（单测注入）；
+   *   2. 插件自己 ctx 的 compaction 属性 / ctx.get —— cordis 服务按分支提供，
+   *      dsh-compaction-basic 装在 dsh-base 分支，对 profile 插件**不可见**（实测 undefined）；
+   *   3. 秘书 agent 自己的 ctx（agent.ctx 是它所属分支的上下文，dsh-agent 原文就是
+   *      "calling through agent.ctx scopes EFFECTs"）——同分支的服务在那里可见。
+   */
+  const compactionService = (agent?: any): any => {
+    if (deps.compaction && typeof deps.compaction.compactNow === 'function') return deps.compaction
+    const candidates = [ctx, agent?.ctx]
+    for (const candidate of candidates) {
+      if (!candidate) continue
+      try {
+        const direct = candidate.compaction
+        if (direct && typeof direct.compactNow === 'function') return direct
+      } catch { /* 分支上下文访问失败就试下一个 */ }
+      try {
+        const service = typeof candidate.get === 'function' ? candidate.get('compaction') : undefined
+        if (service && typeof service.compactNow === 'function') return service
+      } catch { /* 部分上下文对未注册服务会抛错而不是返回 undefined */ }
+    }
+    return undefined
+  }
+
+  const runEviction = async (): Promise<void> => {
+    if (evicting || !pendingEvict) return
+    // 只认固定秘书会话；会话 id 没绑定时绝不乱挤别的会话
+    if (sessionId === '' || sessionId !== secretarySessionRef.id) return
+    const compaction = compactionService(secretaryAgent)
+    if (compaction === undefined) {
+      pendingEvict = false
+      state = { ...state, eviction: { ...state.eviction, lastError: 'no compaction service' } }
+      try { writeStateFile(file, state) } catch { /* 下一轮再试 */ }
+      return
+    }
+    if (secretaryAgent === undefined) return // 还没见过 idle 的秘书 agent，等 agent/status 再试
+    evicting = true
+    try {
+      const controller = new AbortController()
+      const result = await compaction.compactNow(secretaryAgent, controller.signal, EVICT_SOURCE_ID)
+      state = {
+        ...state,
+        eviction: {
+          at: new Date().toISOString(),
+          count: state.eviction.count + 1,
+          shadowedTokens: Math.max(0, Math.floor(Number(result?.shadowedTokenCount) || 0)),
+          busyRetries: 0,
+          lastError: '',
+        },
+      }
+      pendingEvict = false
+      try { writeStateFile(file, state) } catch { /* 下一轮再试 */ }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      const busy = (error as any)?.name === 'ManualCompactionError' && (error as any)?.code === 'busy'
+      const busyRetries = busy ? state.eviction.busyRetries + 1 : state.eviction.busyRetries
+      state = { ...state, eviction: { ...state.eviction, busyRetries, lastError: message.slice(0, 240) } }
+      // busy 放到下次 idle/触发点再试；连撞上限或其它错误就放下个触发点
+      if (!busy || busyRetries >= EVICT_MAX_BUSY_RETRIES) pendingEvict = false
+      appendOpenDiag({ step: 'secretary-context-evict-failed', sessionId, error: message.slice(0, 200), busy })
+      try { writeStateFile(file, state) } catch { /* 下一轮再试 */ }
+    } finally {
+      evicting = false
+    }
+  }
+
+  const enqueueEviction = (): void => {
+    const task = async (): Promise<void> => { await runEviction() }
+    chain = chain.then(task, task)
+  }
+
+  // 捕获固定秘书会话的 agent（compactNow 需要 idle agent；busy 时也靠 idle 事件重试）
+  try {
+    off.push(ctx.on?.('agent/status', (payload: any) => {
+      const agent = payload?.agent
+      const status = String(payload?.status ?? '')
+      const agentSessionId = String(agent?.session?.id ?? '')
+      if (agentSessionId === '' || agentSessionId !== sessionId) return
+      if (status !== 'idle') return
+      secretaryAgent = agent
+      if (pendingEvict && !evicting) enqueueEviction()
+    }) ?? (() => void 0))
+  } catch { /* 宿主没给 agent/status：挤出不启用，注入摘要照旧 */ }
+
   const bump = (): void => {
     const task = async (): Promise<void> => {
       try { writeStateFile(file, state) } catch { /* 写不进去就下一轮再试，绝不阻塞会话 */ }
@@ -365,26 +515,33 @@ export function registerAssistantSecretaryContext(ctx: any, deps: ContextDeps = 
   }
 
   try {
+    // 宿主 user/message 事件没有 data.turn（2026-11-22 现网实测定案）：这类消息归到
+    // 最近一个 turn/start 打开的桶；assistant/message 的 data.turn 在（但正文在 data.message.content）。
+    let currentTurn = 0
     off.push(ctx.on?.('session/event', async (session: any, event: any) => {
       const id = String(session?.id ?? session?.sessionId ?? '')
       if (id !== '' && sessionId !== '' && id !== sessionId) return
       const type = String(event?.type ?? '')
       const turn = Number(event?.data?.turn ?? event?.turn)
-      if (!Number.isFinite(turn) || turn <= 0) return
       if (type === 'turn/start') {
-        buckets.set(Math.floor(turn), { texts: [], seqFrom: Number(event?.seq ?? 0), seqTo: Number(event?.seq ?? 0) })
+        if (!Number.isFinite(turn) || turn <= 0) return
+        currentTurn = Math.floor(turn)
+        buckets.set(currentTurn, { texts: [], seqFrom: Number(event?.seq ?? 0), seqTo: Number(event?.seq ?? 0) })
         return
       }
       if (type === 'assistant/message' || type === 'user/message') {
-        const bucket = buckets.get(Math.floor(turn)) ?? { texts: [], seqFrom: Number(event?.seq ?? 0), seqTo: Number(event?.seq ?? 0) }
+        const bucketTurn = Number.isFinite(turn) && turn > 0 ? Math.floor(turn) : currentTurn
+        if (bucketTurn <= 0) return
+        const bucket = buckets.get(bucketTurn) ?? { texts: [], seqFrom: Number(event?.seq ?? 0), seqTo: Number(event?.seq ?? 0) }
         const text = textOfEvent(event)
         // 合成通知（CU 完成汇报这类）与宿主自己塞的行都不算「用户原文」，不进轮原文窗口
         if (text !== '' && !(type === 'user/message' && isSyntheticNoticeUserText(text))) bucket.texts.push(text)
         bucket.seqTo = Math.max(bucket.seqTo, Number(event?.seq ?? 0))
-        buckets.set(Math.floor(turn), bucket)
+        buckets.set(bucketTurn, bucket)
         return
       }
       if (type !== 'turn/end') return
+      if (!Number.isFinite(turn) || turn <= 0) return
       const key = Math.floor(turn)
       const bucket = buckets.get(key) ?? { texts: [], seqFrom: Number(event?.seq ?? 0), seqTo: Number(event?.seq ?? 0) }
       buckets.delete(key)
@@ -393,6 +550,11 @@ export function registerAssistantSecretaryContext(ctx: any, deps: ContextDeps = 
       const run = async (): Promise<void> => {
         const applied = await applyTurnEnd(state, round, file, sessionId)
         state = applied.state
+        // 滚动摘要刚压过一次（每 30 轮 / 10000 词）且历史够长：同触发点要求宿主把旧轮挤出模型上下文
+        if (applied.summaryUpdated && state.totalTurns >= EVICT_MIN_TURNS && sessionId !== '' && sessionId === secretarySessionRef.id) {
+          pendingEvict = true
+          enqueueEviction()
+        }
       }
       chain = chain.then(run, run)
       void chain.then(() => { bump() }, () => { bump() })
@@ -452,6 +614,7 @@ export function registerAssistantSecretaryContext(ctx: any, deps: ContextDeps = 
           degradeCount: state.degradeCount,
           summaryThroughTurn: state.summaryThroughTurn,
           summaryThroughWords: state.summaryThroughWords,
+          eviction: state.eviction,
           injectedChars: contextSectionText(state).length,
           triggers: { roundTrigger: CONTEXT_ROUND_TRIGGER, wordTrigger: CONTEXT_WORD_TRIGGER, recentRounds: CONTEXT_RECENT_ROUNDS },
           askedSession: (() => {
@@ -475,6 +638,8 @@ export function registerAssistantSecretaryContext(ctx: any, deps: ContextDeps = 
 /** 单测/探针用的纯函数面（不依赖真宿主）。 */
 export const assistantSecretaryContextTestSurface = {
   emptyContextState,
+  emptyContextEviction,
+  normalizeContextEviction,
   normalizeContextState,
   contextSummaryTriggered,
   roundFromText,
@@ -488,5 +653,8 @@ export const assistantSecretaryContextTestSurface = {
   writeStateFile,
   CONTEXT_STATE_FILENAME,
   ASSISTANT_SECRETARY_CONTEXT_ROUTE,
+  EVICT_MIN_TURNS,
+  EVICT_MAX_BUSY_RETRIES,
+  EVICT_SOURCE_ID,
   registerAssistantSecretaryContext,
 }

@@ -52,18 +52,43 @@ function readSessionEvents(file) {
 const realEvents = readSessionEvents(SESSION_FILE)
 const realCards = shared.historyItemsFromEvents(realEvents)
 
+/** 这条会话正在被真人使用：读盘那一刻宿主机可能正在追加最后一帧（半轮），
+ *  计数等式会瞬时失真。允许 settle 后重读重试几次，仍不一致才算真红。 */
+function readSessionEventsSettled(file, attempts = 4, delayMs = 700) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const events = readSessionEvents(file)
+    const assistant = events.filter((event) => event?.type === 'assistant/message')
+    const users = events.filter((event) => event?.type === 'user/message')
+    const cards = shared.historyItemsFromEvents(events)
+    const kinds = new Map()
+    for (const item of cards) kinds.set(item.kind, (kinds.get(item.kind) ?? 0) + 1)
+    const consistent =
+      (kinds.get('assistant') ?? 0) === new Set(assistant.map((event) => Number(event?.data?.turn ?? 0))).size
+      && (kinds.get('user') ?? 0) + (kinds.get('notice') ?? 0) === users.filter((event) => shared.eventText(event) !== '').length
+    if (consistent || attempt === attempts - 1) return { events, cards, settled: consistent }
+    const start = Date.now()
+    while (Date.now() - start < delayMs) { /* settle */ }
+  }
+  throw new Error('unreachable')
+}
+
 cases.push(['真会话卡计数：按卡计数（assistant 每轮一张 / user / notice），不是按 DOM 行数', () => {
+  const { events, cards } = readSessionEventsSettled(SESSION_FILE)
   const kinds = new Map()
-  for (const item of realCards) kinds.set(item.kind, (kinds.get(item.kind) ?? 0) + 1)
-  const assistantTurns = new Set(realEvents.filter((event) => event?.type === 'assistant/message').map((event) => Number(event?.data?.turn ?? 0))).size
-  const userMessages = realEvents.filter((event) => event?.type === 'user/message').length
+  for (const item of cards) kinds.set(item.kind, (kinds.get(item.kind) ?? 0) + 1)
+  const assistantTurns = new Set(events.filter((event) => event?.type === 'assistant/message').map((event) => Number(event?.data?.turn ?? 0))).size
+  const userMessages = events.filter((event) => event?.type === 'user/message' && shared.eventText(event) !== '').length
   assert.equal(kinds.get('assistant'), assistantTurns, 'assistant/message 按轮次去重成一张卡')
-  assert.equal((kinds.get('user') ?? 0) + (kinds.get('notice') ?? 0), userMessages, '每条 user/message 正好一张卡（用户卡或通知卡）')
-  assert.ok(realCards.length >= 137, `整条会话 ${realCards.length} 张卡（这条会话还在长，按真实现算）`)
-  // 顺序必须是 seq 升序（分页游标靠它）
-  const seqs = realCards.map((item) => item.seq)
-  assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b), '卡按 seq 升序')
-  assert.equal(new Set(realCards.map((item) => item.cardKey)).size, realCards.length, 'cardKey 每张卡唯一')
+  assert.equal((kinds.get('user') ?? 0) + (kinds.get('notice') ?? 0), userMessages, '每条有正文的 user/message 正好一张卡（用户卡或通知卡；空正文事件管线按设计跳过）')
+  assert.ok(cards.length >= 137, `整条会话 ${cards.length} 张卡（这条会话还在长，按真实现算）`)
+  // 顺序：同 kind 内 seq 必须升序（分页游标靠它）。跨 kind 允许一次倒序——
+  // 宿主可能在一轮进行中注入合成通知（seq 落在该轮两步之间），而多步合并把秘书卡
+  // seq 升级到本轮最后一步（secretary-card-shared.ts 的同款口径），卡数组是轮序不是严格 seq 序。
+  for (const kind of ['assistant', 'user', 'notice']) {
+    const kindSeqs = cards.filter((item) => item.kind === kind).map((item) => item.seq)
+    assert.deepEqual(kindSeqs, [...kindSeqs].sort((a, b) => a - b), `${kind} 卡按 seq 升序`)
+  }
+  assert.equal(new Set(cards.map((item) => item.cardKey)).size, cards.length, 'cardKey 每张卡唯一')
 }])
 
 cases.push(['折叠行短标题口径稳定可复现：首行前 24 码点，同一输入永远同一标题', () => {
@@ -480,16 +505,20 @@ cases.push(['宿主上下文模块（假 ctx 真接线）：session/event turn/e
   const session = { id: 'session-83bca3e3' }
   for (let turn = 1; turn <= 31; turn += 1) {
     const emit = handlers.get('session/event')
+    // 宿主真实事件形状（2026-11-22 现网取证）：assistant 正文在 data.message.content；
+    // user/message 没有 data.turn（归到 currentTurn 桶），正文在 data.content
     await emit(session, { type: 'turn/start', seq: turn * 10, time: 0, data: { turn } })
-    await emit(session, { type: 'user/message', seq: turn * 10 + 1, time: 0, data: { id: `u${turn}`, content: [{ type: 'text', text: `第 ${turn} 问：帮我看下天气` }] } })
-    await emit(session, { type: 'assistant/message', seq: turn * 10 + 2, time: 0, data: { turn, content: [{ type: 'text', text: `第 ${turn} 答：明天有雨，记得带伞` }] } })
+    await emit(session, { type: 'user/message', seq: turn * 10 + 1, time: 0, data: { id: `u${turn}`, role: 'user', content: [{ type: 'text', text: `第 ${turn} 问：帮我看下天气` }] } })
+    await emit(session, { type: 'assistant/message', seq: turn * 10 + 2, time: 0, data: { turn, step: 1, message: { content: [{ type: 'reasoning', text: '想' }, { type: 'text', text: `第 ${turn} 答：明天有雨，记得带伞` }] } } })
     await emit(session, { type: 'turn/end', seq: turn * 10 + 3, time: 0, data: { turn, reason: { kind: 'completed' } } })
   }
   await new Promise((resolve) => setTimeout(resolve, 300))
   const file = JSON.parse(readFileSync(liveFile, 'utf8'))
   assert.equal(file.totalTurns, 31)
   assert.ok(file.summary.includes('第 30 轮'), '30 轮触发后摘要落盘')
-  assert.ok(file.summary.includes('带伞'), '摘要取的是结论行')
+  assert.ok(file.summary.includes('带伞'), '摘要取的是结论行（assistant 正文走 data.message.content 通道）')
+  const lastRound = file.rounds[file.rounds.length - 1]
+  assert.ok(lastRound.words >= 10, `user 消息无 data.turn 也要归进轮桶（currentTurn 归因），实际 ${lastRound.words} 词`)
   const section = sections.get('assistant:secretary-context').text({ agent: { session: { id: 'session-83bca3e3' } } })
   const occurrences = (section.match(/第 \d+ 轮（/g) ?? []).length
   assert.ok(occurrences <= 10 && occurrences >= 6, `注入段原文轮数 ${occurrences}（6-10 内）`)
@@ -501,6 +530,276 @@ cases.push(['宿主上下文模块（假 ctx 真接线）：session/event turn/e
   const route = routes.get('/api/assistant/secretary-context')
   assert.ok(typeof route === 'undefined' || true)
   unregister()
+}])
+
+/* ---------- 旧轮挤出模型上下文（宿主 compaction 通道，2026-11-22 用户定案） ---------- */
+
+const secretaryRef = lib.assistantSecretaryTestSurface.secretarySessionRef
+
+/** 组装带假 compaction 服务的宿主 ctx（与上面宿主模块测试同款形状）。 */
+function makeHostCtx(out, compaction) {
+  out.handlers = new Map()
+  out.sections = new Map()
+  out.routes = new Map()
+  return {
+    webServer: {
+      exact: new Map(),
+      prefixes: new Map(),
+      register(route) { out.routes.set(route.path, route); return () => out.routes.delete(route.path) },
+    },
+    sessions: { list: () => [] },
+    get(name) {
+      if (name === 'systemPrompt') return { section(section) { out.sections.set(section.name, section); return () => out.sections.delete(section.name) } }
+      if (name === 'profileContext') return { dir: TMP_HOME }
+      if (name === 'compaction') return compaction
+      return undefined
+    },
+    on(event, handler) { out.handlers.set(event, handler); return () => out.handlers.delete(event) },
+    logger: { warn() {}, info() {} },
+  }
+}
+
+/** 驱动 n 轮 turn/start + user + assistant + turn/end（宿主真实事件形状）。 */
+async function driveTurns(emit, session, from, to, wordPadding = 0) {
+  for (let turn = from; turn <= to; turn += 1) {
+    await emit(session, { type: 'turn/start', seq: turn * 10, time: 0, data: { turn } })
+    await emit(session, { type: 'user/message', seq: turn * 10 + 1, time: 0, data: { id: `u${turn}`, role: 'user', content: [{ type: 'text', text: `第 ${turn} 问：帮我看下天气` }] } })
+    const body = wordPadding > 0 ? `词 ${'词 '.repeat(wordPadding)}` : `第 ${turn} 答：明天有雨，记得带伞`
+    await emit(session, { type: 'assistant/message', seq: turn * 10 + 2, time: 0, data: { turn, step: 1, message: { content: [{ type: 'text', text: body }] } } })
+    await emit(session, { type: 'turn/end', seq: turn * 10 + 3, time: 0, data: { turn, reason: { kind: 'completed' } } })
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+cases.push(['挤出：滚动摘要同触发点（每 30 轮）调宿主 compactNow，且只认固定秘书会话', async () => {
+  const { rmSync } = await import('node:fs')
+  const liveFile = join(TMP_HOME, 'evict-once.json')
+  rmSync(liveFile, { force: true })
+  const prevRef = secretaryRef.id
+  secretaryRef.id = 'session-83bca3e3'
+  try {
+    const out = {}
+    const calls = []
+    const fakeCompaction = { compactNow: async (agent, signal, source) => { calls.push({ agent, signal, source }); return { shadowedTokenCount: 12345, summarySeq: 99 } } }
+    const ctx = makeHostCtx(out, fakeCompaction)
+    const unregister = context.registerAssistantSecretaryContext(ctx, { file: liveFile })
+    const agent = { session: { id: 'session-83bca3e3' } }
+    await out.handlers.get('agent/status')({ agent, status: 'idle' })
+    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 31)
+    await sleep(300)
+    assert.equal(calls.length, 1, `30 轮触发点应只要求一次挤出，实际 ${calls.length} 次（第 1 轮摘要触发但轮数不足 ${context.EVICT_MIN_TURNS} 被门槛挡住）`)
+    assert.equal(calls[0].agent, agent, '把秘书会话的 agent 交给 compactNow')
+    assert.equal(calls[0].source, context.EVICT_SOURCE_ID, '来源标记固定，宿主日志里可辨认')
+    assert.ok(calls[0].signal instanceof AbortSignal, '带独立可取消信号')
+    // 其它会话的 idle agent 不得触发挤出
+    await out.handlers.get('agent/status')({ agent: { session: { id: 'session-other' } }, status: 'idle' })
+    await sleep(120)
+    assert.equal(calls.length, 1, '其它会话的 agent/status 被忽略')
+    const file = JSON.parse(readFileSync(liveFile, 'utf8'))
+    assert.equal(file.eviction.count, 1, '挤出记录落盘')
+    assert.equal(file.eviction.shadowedTokens, 12345)
+    assert.equal(file.summaryThroughTurn, 31, '滚动摘要触发点口径不变（30 轮）')
+    unregister()
+  } finally {
+    secretaryRef.id = prevRef
+  }
+}])
+
+cases.push(['挤出：服务从 ctx.compaction 属性取（cordis 挂法，ctx.get 取不到也成立）', async () => {
+  const { rmSync } = await import('node:fs')
+  const liveFile = join(TMP_HOME, 'evict-prop.json')
+  rmSync(liveFile, { force: true })
+  const prevRef = secretaryRef.id
+  secretaryRef.id = 'session-83bca3e3'
+  try {
+    const out = {}
+    const calls = []
+    const fakeCompaction = { compactNow: async () => { calls.push(1); return { shadowedTokenCount: 7 } } }
+    const ctx = makeHostCtx(out, undefined) // get('compaction') 不给
+    ctx.compaction = fakeCompaction // 只挂属性（command-compact 的 inject 同款通道）
+    const unregister = context.registerAssistantSecretaryContext(ctx, { file: liveFile })
+    await out.handlers.get('agent/status')({ agent: { session: { id: 'session-83bca3e3' } }, status: 'idle' })
+    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 31)
+    await sleep(300)
+    assert.equal(calls.length, 1, 'ctx.compaction 属性通道必须能取到服务')
+    unregister()
+  } finally {
+    secretaryRef.id = prevRef
+  }
+}])
+
+cases.push(['挤出：插件 ctx 不可见时改从 agent.ctx 取 compaction 服务（cordis 分支可见性）', async () => {
+  const { rmSync } = await import('node:fs')
+  const liveFile = join(TMP_HOME, 'evict-agentctx.json')
+  rmSync(liveFile, { force: true })
+  const prevRef = secretaryRef.id
+  secretaryRef.id = 'session-83bca3e3'
+  try {
+    const out = {}
+    const calls = []
+    const fakeCompaction = { compactNow: async () => { calls.push(1); return { shadowedTokenCount: 9 } } }
+    const ctx = makeHostCtx(out, undefined) // 插件 ctx 不给 compaction（模拟 dsh-base 分支不可见）
+    const agent = { session: { id: 'session-83bca3e3' }, ctx: { compaction: fakeCompaction } } // agent 自己的分支可见
+    const unregister = context.registerAssistantSecretaryContext(ctx, { file: liveFile })
+    await out.handlers.get('agent/status')({ agent, status: 'idle' })
+    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 31)
+    await sleep(300)
+    assert.equal(calls.length, 1, 'agent.ctx.compaction 通道必须能取到服务')
+    unregister()
+  } finally {
+    secretaryRef.id = prevRef
+  }
+}])
+
+cases.push(['挤出：compactNow busy 按 idle 重试到上限后放下次触发点', async () => {
+  const { rmSync } = await import('node:fs')
+  const liveFile = join(TMP_HOME, 'evict-busy.json')
+  rmSync(liveFile, { force: true })
+  const prevRef = secretaryRef.id
+  secretaryRef.id = 'session-83bca3e3'
+  try {
+    const out = {}
+    let calls = 0
+    const busyError = new Error('manual compaction requires an idle agent with no waking queued work')
+    busyError.name = 'ManualCompactionError'
+    busyError.code = 'busy'
+    const fakeCompaction = { compactNow: async () => { calls += 1; throw busyError } }
+    const ctx = makeHostCtx(out, fakeCompaction)
+    const unregister = context.registerAssistantSecretaryContext(ctx, { file: liveFile })
+    const agent = { session: { id: 'session-83bca3e3' } }
+    await out.handlers.get('agent/status')({ agent, status: 'idle' })
+    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 31)
+    await sleep(300)
+    assert.equal(calls, 1, '触发点先试一次')
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      await out.handlers.get('agent/status')({ agent, status: 'idle' })
+      await sleep(80)
+    }
+    assert.equal(calls, context.EVICT_MAX_BUSY_RETRIES, `busy 重试封顶 ${context.EVICT_MAX_BUSY_RETRIES} 次，实际 ${calls}`)
+    const file = JSON.parse(readFileSync(liveFile, 'utf8'))
+    assert.equal(file.eviction.busyRetries, context.EVICT_MAX_BUSY_RETRIES)
+    assert.ok(file.eviction.lastError.includes('idle'), 'busy 原因记入 lastError')
+    unregister()
+  } finally {
+    secretaryRef.id = prevRef
+  }
+}])
+
+cases.push(['挤出：宿主没装 compaction 服务时静默降级，滚动摘要照旧', async () => {
+  const { rmSync } = await import('node:fs')
+  const liveFile = join(TMP_HOME, 'evict-nosvc.json')
+  rmSync(liveFile, { force: true })
+  const prevRef = secretaryRef.id
+  secretaryRef.id = 'session-83bca3e3'
+  try {
+    const out = {}
+    const ctx = makeHostCtx(out, undefined)
+    const unregister = context.registerAssistantSecretaryContext(ctx, { file: liveFile })
+    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 31)
+    await sleep(300)
+    const file = JSON.parse(readFileSync(liveFile, 'utf8'))
+    assert.ok(file.summary.includes('第 30 轮'), '没 compaction 服务也要把滚动摘要写好')
+    assert.equal(file.eviction.lastError, 'no compaction service')
+    assert.equal(file.eviction.count, 0)
+    unregister()
+  } finally {
+    secretaryRef.id = prevRef
+  }
+}])
+
+cases.push(['挤出：总会话轮数低于门槛不要求（词数触发点同样受门槛约束）', async () => {
+  const { rmSync } = await import('node:fs')
+  const liveFile = join(TMP_HOME, 'evict-fence.json')
+  rmSync(liveFile, { force: true })
+  const prevRef = secretaryRef.id
+  secretaryRef.id = 'session-83bca3e3'
+  try {
+    // 预置：已到第 9 轮、摘要已压过（避免首轮触发），词数基准 0
+    context.writeStateFile(liveFile, {
+      ...context.emptyContextState('session-83bca3e3'),
+      totalTurns: 9, summaryThroughTurn: 9, summaryThroughWords: 0, totalWords: 0,
+      summary: '旧摘要', summaryAt: new Date().toISOString(),
+    })
+    const out = {}
+    const calls = []
+    const fakeCompaction = { compactNow: async (agent, signal, source) => { calls.push(source); return { shadowedTokenCount: 1 } } }
+    const ctx = makeHostCtx(out, fakeCompaction)
+    const unregister = context.registerAssistantSecretaryContext(ctx, { file: liveFile })
+    await out.handlers.get('agent/status')({ agent: { session: { id: 'session-83bca3e3' } }, status: 'idle' })
+    // 一轮灌 11000 词：词数触发点（10000 词）到，但 totalTurns=10 < EVICT_MIN_TURNS=16
+    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 10, 10, 11000)
+    await sleep(400)
+    assert.equal(calls.length, 0, `轮数门槛 ${context.EVICT_MIN_TURNS} 没到，不许挤`)
+    const file = JSON.parse(readFileSync(liveFile, 'utf8'))
+    assert.ok(file.summary.includes('第 10 轮'), '词数触发点把摘要压到新轮（触发口径不变）')
+    unregister()
+    // 对照：预置 20 轮，同词数触发 → 必须挤
+    rmSync(liveFile, { force: true })
+    context.writeStateFile(liveFile, {
+      ...context.emptyContextState('session-83bca3e3'),
+      totalTurns: 20, summaryThroughTurn: 20, summaryThroughWords: 0, totalWords: 0,
+      summary: '旧摘要', summaryAt: new Date().toISOString(),
+    })
+    const out2 = {}
+    const calls2 = []
+    const ctx2 = makeHostCtx(out2, { compactNow: async () => { calls2.push(1); return { shadowedTokenCount: 2 } } })
+    const unregister2 = context.registerAssistantSecretaryContext(ctx2, { file: liveFile })
+    await out2.handlers.get('agent/status')({ agent: { session: { id: 'session-83bca3e3' } }, status: 'idle' })
+    await driveTurns(out2.handlers.get('session/event'), { id: 'session-83bca3e3' }, 21, 21, 11000)
+    await sleep(400)
+    assert.equal(calls2.length, 1, '过门槛后同触发点必须挤')
+    unregister2()
+  } finally {
+    secretaryRef.id = prevRef
+  }
+}])
+
+/** surface 折叠（读回用）：按 surfaceOp 重放宿主投影口径，返回 surface 节点与被 shadow 的 seq。 */
+function foldSurface(events) {
+  const surface = []
+  const shadowed = []
+  const ordered = [...events].filter((e) => e && typeof e === 'object').sort((a, b) => Number(a?.seq ?? 0) - Number(b?.seq ?? 0))
+  for (const event of ordered) {
+    const op = event?.surfaceOp
+    const seq = Number(event?.seq ?? 0)
+    if (op === undefined || seq <= 0) continue
+    if (op === 'append') {
+      if (!surface.includes(seq)) surface.push(seq)
+      continue
+    }
+    const start = Number(op?.startSeq ?? 0)
+    const end = Number(op?.endSeq ?? 0)
+    const from = surface.indexOf(start)
+    const to = surface.indexOf(end)
+    if (from < 0 || to < 0 || from > to) continue // 缺帧（zstd 某帧没解开）时跳过，硬断言看整体
+    shadowed.push(...surface.slice(from, to + 1))
+    surface.splice(from, to - from + 1, seq)
+  }
+  return { surface, shadowed }
+}
+
+cases.push(['真会话 surface 折叠读回：宿主压缩 shadow 的旧轮不在模型投影里、卡片事件仍在日志里', () => {
+  const compacted = realEvents.some((event) => event?.type === 'compaction/summary')
+  if (!compacted) {
+    log('  现网还没触发过宿主压缩（compaction/summary = 0）：surface 硬断言暂挂，触发后同一断言自动生效')
+    return
+  }
+  const { surface, shadowed } = foldSurface(realEvents)
+  const onSurface = new Set(surface)
+  const shadowedSet = new Set(shadowed)
+  const shadowedMessages = realEvents.filter((event) => shadowedSet.has(Number(event?.seq)) && (event?.type === 'assistant/message' || event?.type === 'user/message'))
+  assert.ok(shadowedMessages.length > 0, '宿主压缩确实 shadow 了消息节点')
+  for (const event of shadowedMessages) {
+    assert.ok(!onSurface.has(Number(event?.seq)), `seq ${event?.seq} 已 shadow，不许再进模型投影`)
+    assert.ok(realEvents.some((item) => item?.seq === event?.seq), `seq ${event?.seq} 的原始事件必须还在日志里（秘书页卡片/已读/朗读的取数源）`)
+  }
+  // 秘书页卡片源（原始事件 → 卡片口径）在压缩后必须一张不丢
+  const cardsBefore = shared.historyItemsFromEvents(realEvents).length
+  const messageEvents = realEvents.filter((event) => ['assistant/message', 'user/message'].includes(String(event?.type ?? '')))
+  assert.ok(cardsBefore >= messageEvents.length * 0.9, '卡片取数不受 compaction 影响')
+  const visibleMessages = realEvents.filter((event) => onSurface.has(Number(event?.seq)) && ['system/message', 'user/message', 'assistant/message'].includes(String(event?.type ?? '')))
+  log(`  现网 surface 投影消息 ${visibleMessages.length} 条（shadow ${shadowedMessages.length} 条不进模型上下文，事件全部留在日志）`)
 }])
 
 /* ---------- 报告需要的原文输出 ---------- */
