@@ -80,6 +80,8 @@ export { desktopBallTestSurface } from './desktop-ball'
 export { assistantTtsTestSurface } from './assistant-tts'
 /** 秘书朗读状态机 / 文本规范化 / 引用解析（纯函数，node 可单测） */
 export { secretaryCardsTestSurface } from './client/pocket/orb/secretary-cards.ts'
+/** 秘书朗读分块流水线（纯逻辑：预取/排队/abort/重试/缓存，node 可单测） */
+export { secretarySpeechPipelineTestSurface } from './client/pocket/orb/secretary-speech-pipeline.ts'
 /** 目录 allowlist 与终端环境变量（供 scripts/test-path-guard.mjs 直接验） */
 export { expandHome, defaultAllowedRoots, createPathGuard, minimalTermEnv, isDirectory } from './path-guard'
 /** turn-guard 的判定与状态函数（供 scripts/test-turn-guard.mjs 直接验） */

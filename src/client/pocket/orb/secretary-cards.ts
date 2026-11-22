@@ -129,6 +129,190 @@ export function normalizeForSpeech(raw: string): string {
   return text.replace(/[ \t]+/g, ' ').replace(/\n{2,}/g, ' ').replace(/\n/g, '，').trim()
 }
 
+/** ────────────────────────── 2.5 朗读分块（流式合成用） ────────────────────────── */
+
+/**
+ * 流式朗读分块器：把规范化后的朗读文本切成若干块，逐块送 TTS、边合成边播。
+ * 硬约束：
+ *   - chunks.join('') === 原文逐字符一致（含空白），调用方断言；
+ *   - 只切在中文句读后（。！？；!?;\n），绝不切在数字/小数/百分号/单位/引号对/括号对/
+ *     URL/文件路径/行内代码/emoji 序列中间；
+ *   - 单块长度上限 maxChars（默认 200 字）、下限 minChars（默认 40 字，仅尾块可不足）；
+ *     首块用更小的 firstMaxChars（默认 80 字）——第一块越小，首字可播越快；
+ *   - 短文本（≤ maxChars）不切块，原样一块返回；
+ *   - 超长句没有句读可切时，次级边界用「，、：」与空格，最后才退化为安全硬切
+ *     （仍避开上述保护区间与代理对/补充平面字符边界）。
+ */
+export interface SpeechChunkOptions {
+  /** 单块下限（字，码点计）。默认 40。 */
+  minChars?: number
+  /** 单块上限（字）。默认 200；短文本 ≤ 此值不切块。 */
+  maxChars?: number
+  /** 首块上限（字），抢首字可播时间。默认 80（自动不小于 minChars）。 */
+  firstMaxChars?: number
+}
+
+export const SPEECH_CHUNK_MIN_CHARS = 40
+export const SPEECH_CHUNK_MAX_CHARS = 200
+export const SPEECH_CHUNK_FIRST_MAX_CHARS = 80
+
+/** 中文句读（硬边界）。 */
+const CHUNK_HARD_STOPS = new Set(['。', '！', '？', '；', '!', '?', ';', '\n'])
+/** 次级边界（只有硬边界不可用时才切）。 */
+const CHUNK_SECONDARY_STOPS = new Set(['，', ',', '、', '：', ':', ' '])
+
+/** 成对符号：开 → 闭。闭包内（含闭符之前）不许切。 */
+const CHUNK_PAIRS: Record<string, string> = {
+  '“': '”', '‘': '’', '「': '」', '『': '』', '（': '）', '《': '》', '〈': '〉',
+  '【': '】', '〔': '〕', '〖': '〗',
+  '(': ')', '[': ']', '{': '}',
+}
+const CHUNK_CLOSERS = new Set(Object.values(CHUNK_PAIRS))
+
+/** 保护区间：inclusiveEnd=true 是闭区间（引号/括号对，闭符本身不许开头新块）；false 是半开（token）。 */
+interface ChunkSpan { start: number; end: number; inclusiveEnd: boolean }
+
+/** token 保护（半开区间 [start, end)）：URL / 路径 / 日期 / 时间 / 数字小数百分号单位 / 行内代码。 */
+const CHUNK_TOKEN_RES: RegExp[] = [
+  /`[^`\n]*`/g,                                     // 行内代码
+  /https?:\/\/[^\s，。！？；）】」』]+/gi,            // URL（吃到句读/闭括号前）
+  /(?:[A-Za-z]:[\\/]|~[\\/]|\.\.?[\\/])[\w.\\/\\-]*/g, // 文件路径（Windows / ~ / 相对）
+  /\d{4}[-/]\d{1,2}[-/]\d{1,2}/g,                   // 2026-11-22
+  /\d{1,2}:\d{2}(?::\d{2})?/g,                      // 10:30 / 10:30:00
+  /\d+(?:[.,]\d+)*(?:\s*(?:%|‰|℃|°[CFcf]|[a-zA-Zμ°²³]{1,6}))?/g, // 数字/小数/千分位 + 单位百分号
+]
+
+function chunkProtectedSpans(text: string): ChunkSpan[] {
+  const spans: ChunkSpan[] = []
+  for (const re of CHUNK_TOKEN_RES) {
+    re.lastIndex = 0
+    let m: RegExpExecArray | null
+    while ((m = re.exec(text)) !== null) {
+      if (m[0] !== '') spans.push({ start: m.index, end: m.index + m[0].length, inclusiveEnd: false })
+      if (m[0] === '') re.lastIndex += 1
+    }
+  }
+  // 成对符号：栈扫描，未闭合的开符号不保护（避免一句没写完就把分块堵死）。
+  const stack: Array<[string, number]> = []
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (CHUNK_PAIRS[ch] !== undefined) { stack.push([ch, i]); continue }
+    if (CHUNK_CLOSERS.has(ch)) {
+      for (let j = stack.length - 1; j >= 0; j--) {
+        if (CHUNK_PAIRS[stack[j][0]] === ch) { spans.push({ start: stack[j][1], end: i, inclusiveEnd: true }); stack.splice(j, 1); break }
+      }
+    }
+  }
+  return spans
+}
+
+function chunkIsBoundary(_text: string, spans: ChunkSpan[], pos: number): boolean {
+  if (pos <= 0 || pos >= _text.length) return false
+  for (const span of spans) {
+    // 闭区间（引号/括号对）：切在 (start, end] 之内都不行；token 半开区间：切在 (start, end) 之内不行。
+    if (span.inclusiveEnd) { if (span.start < pos && pos <= span.end) return false }
+    else if (span.start < pos && pos < span.end) return false
+  }
+  return true
+}
+
+function chunkIsSafeHardSplit(text: string, spans: ChunkSpan[], pos: number): boolean {
+  if (!chunkIsBoundary(text, spans, pos)) return false
+  const prev = text.charCodeAt(pos - 1)
+  const next = text.charCodeAt(pos)
+  // 不劈开代理对（emoji/补充平面字符）
+  if (prev >= 0xd800 && prev <= 0xdbff) return false
+  if (next >= 0xdc00 && next <= 0xdfff) return false
+  // 不劈开英文单词 / 字母数字串（避免半拉 token）
+  const wordy = (c: number): boolean => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+  if (wordy(prev) && wordy(next)) return false
+  // 小数点 / 千分位两侧不劈
+  if (prev === 0x2e || prev === 0x2c || next === 0x2e || next === 0x2c) {
+    if (wordy(text.charCodeAt(pos - 2) || 0) || wordy(text.charCodeAt(pos + 1) || 0)) return false
+  }
+  return true
+}
+
+/** 从 start 起数 count 个码点，返回字符串下标（不超过 text.length）。 */
+function advanceCodePoints(text: string, start: number, count: number): number {
+  let i = start
+  let n = 0
+  while (i < text.length && n < count) {
+    const code = text.charCodeAt(i)
+    i += code >= 0xd800 && code <= 0xdbff ? 2 : 1
+    n += 1
+  }
+  return i
+}
+
+function codePointLength(s: string): number {
+  let n = 0
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i)
+    if (code < 0xd800 || code > 0xdbff) n += 1
+  }
+  return n
+}
+
+/**
+ * 朗读分块（纯函数）。不变式：chunks.length === 0（仅空串）或 chunks.join('') === text。
+ * 全部边界都过 chunkIsBoundary —— 数字/单位/小数/百分号/引号对/括号对/URL/路径/行内代码
+ * 中间永远不会成为切点。
+ */
+export function splitSpeechChunks(text: string, options: SpeechChunkOptions = {}): string[] {
+  const src = String(text ?? '')
+  if (src === '') return []
+  const minChars = Math.max(1, options.minChars ?? SPEECH_CHUNK_MIN_CHARS)
+  const maxChars = Math.max(minChars, options.maxChars ?? SPEECH_CHUNK_MAX_CHARS)
+  const firstMaxChars = Math.max(minChars, options.firstMaxChars ?? Math.min(SPEECH_CHUNK_FIRST_MAX_CHARS, maxChars))
+  if (codePointLength(src) <= maxChars) return [src]
+
+  const spans = chunkProtectedSpans(src)
+  const out: string[] = []
+  let start = 0
+  while (start < src.length) {
+    const maxForThis = out.length === 0 ? firstMaxChars : maxChars
+    const remaining = codePointLength(src.slice(start))
+    if (remaining <= maxForThis) { out.push(src.slice(start)); break }
+    const limit = advanceCodePoints(src, start, maxForThis)
+    const minLimit = advanceCodePoints(src, start, minChars)
+    let cut = -1
+    // 1) 硬句读（从上限往下找最近的）
+    for (let p = limit; p >= minLimit; p--) {
+      if (CHUNK_HARD_STOPS.has(src[p - 1]) && chunkIsBoundary(src, spans, p)) { cut = p; break }
+    }
+    // 2) 次级边界（逗号/顿号/冒号/空格）
+    if (cut < 0) {
+      for (let p = limit; p >= minLimit; p--) {
+        if (CHUNK_SECONDARY_STOPS.has(src[p - 1]) && chunkIsBoundary(src, spans, p)) { cut = p; break }
+      }
+    }
+    // 3) 安全硬切（仍避开保护区间 / 代理对 / 单词）
+    if (cut < 0) {
+      for (let p = limit; p > start; p--) {
+        if (chunkIsSafeHardSplit(src, spans, p)) { cut = p; break }
+      }
+    }
+    // 4) 极端退化：直接按上限切（理论上到不了：limit 本身满足 safe split 的概率极高；
+    //    若真退化，保护约束优先——往前找任意非保护点，找不到就原地切，保证前进）。
+    if (cut <= start) {
+      let p = limit
+      while (p > start && !chunkIsBoundary(src, spans, p)) p--
+      cut = p > start ? p : limit
+    }
+    out.push(src.slice(start, cut))
+    start = cut
+  }
+  // 纯空白块（标点产生的边角）并入相邻块，避免 TTS 拿到空白文本；拼接不变式保持。
+  for (let i = out.length - 1; i >= 0; i--) {
+    if (out[i] !== '' && /^\s*$/.test(out[i])) {
+      if (i > 0) { out[i - 1] += out[i]; out.splice(i, 1) }
+      else if (out.length > 1) { out[1] = out[0] + out[1]; out.splice(0, 1) }
+    }
+  }
+  return out.length === 0 ? [src] : out
+}
+
 /** ────────────────────────── 2. 会话引用标记 ────────────────────────── */
 
 export interface SessionRef {
@@ -211,7 +395,7 @@ export function reduceSpeech(state: SpeechState, event: SpeechEvent): SpeechStat
   }
 }
 
-/** 播放器抽象：浏览器里是 HTMLAudioElement，单测里是假的。 */
+/** 播放器抽象：浏览器里是 Web Audio 分块流水线，单测里是假的。 */
 export interface SpeechPlayer {
   play(): Promise<void>
   pause(): void
@@ -221,6 +405,8 @@ export interface SpeechPlayer {
   onEnded(cb: () => void): void
   /** 真正开始出声（seek/restart 后也会再触发）：loading → playing 靠它。 */
   onPlaying?(cb: () => void): void
+  /** 播放中途某块彻底失败（已重试过一次）时回调一次；控制器据此进 error 态给可见提示。 */
+  onError?(cb: (message: string) => void): void
 }
 
 export type SpeechPlayerFactory = (key: string, text: string) => SpeechPlayer
@@ -254,6 +440,14 @@ export function createSpeechController(factory: SpeechPlayerFactory) {
     try {
       next.onPlaying?.(() => { if (player === next && state.key === key) setState({ status: 'playing', key, error: '' }) })
     } catch { /* 播放器不支持 onPlaying 时靠 play() 的 Promise 兜底 */ }
+    try {
+      next.onError?.((message) => {
+        if (player !== next) return
+        player = null
+        try { next.stop() } catch { /* 停不干净也不影响报错 */ }
+        setState(reduceSpeech(state, { type: 'error', error: message }))
+      })
+    } catch { /* 播放器不支持 onError 时由 play() 的 Promise 兜底 */ }
     next.play()
       .then(() => { if (player === next) setState(reduceSpeech(state, { type: 'playing', key })) })
       .catch((error: unknown) => {
@@ -1196,6 +1390,10 @@ export const secretaryCardsTestSurface = {
   normalizeForSpeech,
   stripSessionRefs,
   parseSessionRefs,
+  splitSpeechChunks,
+  SPEECH_CHUNK_MIN_CHARS,
+  SPEECH_CHUNK_MAX_CHARS,
+  SPEECH_CHUNK_FIRST_MAX_CHARS,
   reduceSpeech,
   createSpeechController,
   SPEECH_IDLE,
