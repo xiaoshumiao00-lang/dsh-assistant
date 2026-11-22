@@ -34,7 +34,6 @@ import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.KeyEvent;
-import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -68,7 +67,7 @@ import java.nio.charset.Charset;
  * 个人助手（dsh-assistant 手机/平板端外壳）。
  *
  * 一块屏：电脑上的 DSH 助手页面（同一份 HTML/CSS/JS、同一个会话、同一套插件）。
- * 鹈鹕设备屏与配套的录音 / 本地唤醒 / 音量条已在 1.4.3 随设备功能一起移除。
+ * 模拟设备屏那条线连同它的录音按钮 / 本地唤醒 / 音量条 / 悬浮切屏球，已在 1.4.3–1.4.4 一并移除。
  *
  * 自适应（手机 / 折叠屏 / 平板）：
  *   1. 不锁方向、resizeableActivity，Activity 自己吞掉配置变化（configChanges），
@@ -88,16 +87,10 @@ public class MainActivity extends Activity {
 
     private static final String PREFS = "dsh_assistant";
     private static final String KEY_URL = "home_url";
-    private static final String KEY_BALL_X = "ball_x";
-    private static final String KEY_BALL_Y = "ball_y";
 
-    // 原生配色（状态栏 / 导航栏 / 悬浮球）
+    // 原生配色（状态栏 / 导航栏）
     private static final int L_BG = 0xFFF7F8FA;
     private static final int L_CARD = 0xFFFFFFFF;
-    private static final int L_TEXT = 0xFF111827;
-    private static final int L_DIM = 0xFF6B7280;
-    private static final int L_LINE = 0xFFE5E7EB;
-    private static final int L_ACCENT = 0xFF0F766E;
 
     /** 桌面快捷方式「设置地址」带过来的标记。 */
     private static final String EXTRA_SETTINGS = "open_settings";
@@ -110,28 +103,12 @@ public class MainActivity extends Activity {
     private static final int TEXT = 0xFFE6E8EB;
     private static final int DIM = 0xFF8A9099;
     private static final int ACCENT = 0xFF3B82F6;
-    private static final int TEAL = 0xFF3FB6A8;
-    private static final int RED = 0xFFE05F5F;
-    private static final int AMBER = 0xFFE2B03F;
-
 
     private SharedPreferences prefs;
     private FrameLayout root;
     /** 承载助手 WebView 的容器。 */
     private FrameLayout screenHost;
     private WebView web;
-
-    private int ballX = -1;
-    private int ballY = -1;
-
-    private int accentMain() {
-        return L_ACCENT;
-    }
-
-    private int accentSecond() {
-        return 0xFF1D4ED8;
-    }
-
 
     private View setupView;
     private View errorView;
@@ -149,13 +126,6 @@ public class MainActivity extends Activity {
     private int authRecoveries;
     private boolean authRecovering;
 
-    // ---- 浮动切屏按钮 ----
-    private TextView screenBtn;
-
-
-
-
-
     private final Handler handler = new Handler(Looper.getMainLooper());
     private Runnable backLongPress;
     private boolean backLongFired;
@@ -166,10 +136,6 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
 
-        // 悬浮球位置：冷启动就按上次拖到的位置恢复
-        ballX = prefs.getInt(KEY_BALL_X, -1);
-        ballY = prefs.getInt(KEY_BALL_Y, -1);
-
         root = new FrameLayout(this);
         root.setBackgroundColor(BG);
         setContentView(root);
@@ -178,8 +144,6 @@ public class MainActivity extends Activity {
         screenHost.setBackgroundColor(BG);
         root.addView(screenHost, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-
-        buildScreenButton();
 
         web = buildWebView();
         screenHost.addView(web, new FrameLayout.LayoutParams(
@@ -207,7 +171,6 @@ public class MainActivity extends Activity {
                 }
             }, 2500);
         }
-        refreshChrome();
 
         // 桌面图标长按 →「设置地址」快捷方式（全面屏手势的手机没有返回键可长按）
         Intent intent = getIntent();
@@ -226,7 +189,6 @@ public class MainActivity extends Activity {
             showSetup(true);
         }
     }
-
 
     // ---------------------------------------------------------------- WebView
 
@@ -304,7 +266,6 @@ public class MainActivity extends Activity {
         web.loadUrl(base.isEmpty() ? saved : base + "/");
     }
 
-
     /**
      * 登录态自愈：清掉上一轮遗留的 dsh-auth-* cookie，再带 ?dsh-pocket-auth=1 强制重做一次握手。
      * 连清三次还不行就整包清 cookie（用户重新输一次访问密码），再不行交给错误页。
@@ -364,7 +325,6 @@ public class MainActivity extends Activity {
             // 弱网（尤其是走公网隧道）时首屏要等十几秒，以前这段时间是纯黑屏，
             // 看起来像卡死/点不动。给一个带秒数和「改地址」的过渡层，让等待可见、可退出。
             showLoading();
-            refreshChrome();
         }
 
         @Override
@@ -400,19 +360,6 @@ public class MainActivity extends Activity {
                             }
                         }
                     });
-            // 助手屏每次加载完也刷一次：万一切屏/降级时序错位，这里能把浮层收回去。
-            refreshChrome();
-        }
-
-        /** 前进/后退（含页面自己的 history.pushState）都要重算一次浮层可见性。 */
-        @Override
-        public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
-            refreshChrome();
-        }
-
-        @Override
-        public void onPageCommitVisible(WebView view, String url) {
-            refreshChrome();
         }
 
         @Override
@@ -586,7 +533,6 @@ public class MainActivity extends Activity {
     private void showSetup(boolean overlay) {
         if (setupView != null) {
             setupView.setVisibility(View.VISIBLE);
-            refreshChrome();
                 return;
         }
 
@@ -718,7 +664,7 @@ public class MainActivity extends Activity {
         TextView tip = new TextView(this);
         tip.setText("· 家里同一个 WiFi 可用局域网地址，出门用固定公网地址\n"
                 + "· 需要访问密码就在页面里输入一次，之后长期记住\n"
-                + "· 想换地址：长按左下角的悬浮球，随时回到这一页");
+                + "· 想换地址：长按返回键约 1 秒，或长按桌面图标选「设置地址」");
         tip.setTextColor(DIM);
         tip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         tip.setLineSpacing(dp(4), 1f);
@@ -730,12 +676,10 @@ public class MainActivity extends Activity {
         setupView = scroll;
         root.addView(setupView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        refreshChrome();
     }
 
     private void hideSetup() {
         if (setupView != null) setupView.setVisibility(View.GONE);
-        refreshChrome();
     }
 
     private String normalizeUrl(String raw) {
@@ -826,12 +770,10 @@ public class MainActivity extends Activity {
             errorDetail.setText(TextUtils.isEmpty(detail) ? "" : detail);
         }
         errorView.setVisibility(View.VISIBLE);
-        refreshChrome();
     }
 
     private void hideError() {
         if (errorView != null) errorView.setVisibility(View.GONE);
-        refreshChrome();
     }
 
     private final Runnable loadingTick = new Runnable() {
@@ -860,13 +802,11 @@ public class MainActivity extends Activity {
         loadingView.bringToFront();
         handler.removeCallbacks(loadingTick);
         handler.postDelayed(loadingTick, 1000);
-        refreshChrome();
     }
 
     private void hideLoading() {
         handler.removeCallbacks(loadingTick);
         if (loadingView != null) loadingView.setVisibility(View.GONE);
-        refreshChrome();
     }
 
     private void buildLoadingView() {
@@ -920,159 +860,6 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
     }
 
-    // ------------------------------------------------------- 浮动切屏按钮
-
-    private void buildScreenButton() {
-        screenBtn = new TextView(this);
-        screenBtn.setText("鹈");
-        screenBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
-        screenBtn.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-        screenBtn.setTextColor(0xFFEAF6F4);
-        screenBtn.setGravity(Gravity.CENTER);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setShape(GradientDrawable.OVAL);
-        bg.setColor(0xCC101820);
-        bg.setStroke(dp(1.5f), 0xCC3FB6A8);
-        screenBtn.setBackground(bg);
-        screenBtn.setAlpha(0.6f);
-        screenBtn.setContentDescription("切换屏幕");
-        screenBtn.setClickable(true);
-
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(40), dp(40));
-        lp.gravity = Gravity.BOTTOM | Gravity.START;
-        lp.leftMargin = dp(16);
-        lp.bottomMargin = dp(16);
-        root.addView(screenBtn, lp);
-
-        screenBtn.setOnTouchListener(new View.OnTouchListener() {
-            private float downX, downY;
-            private boolean dragging;
-
-            @Override
-            public boolean onTouch(View v, MotionEvent e) {
-                switch (e.getActionMasked()) {
-                    case MotionEvent.ACTION_DOWN:
-                        downX = e.getRawX();
-                        downY = e.getRawY();
-                        dragging = false;
-                        v.setAlpha(1f);
-                        return true;
-                    case MotionEvent.ACTION_MOVE:
-                        float dx = e.getRawX() - downX;
-                        float dy = e.getRawY() - downY;
-                        if (!dragging && Math.hypot(dx, dy) > dp(8)) dragging = true;
-                        if (dragging) moveBallTo(e.getRawX(), e.getRawY());
-                        return true;
-                    case MotionEvent.ACTION_UP:
-                    case MotionEvent.ACTION_CANCEL:
-                        v.setAlpha(0.6f);
-                        if (!dragging && e.getActionMasked() == MotionEvent.ACTION_UP) {
-                            v.animate().scaleX(1.14f).scaleY(1.14f).setDuration(110).start();
-                            handler.postDelayed(new Runnable() {
-                                @Override
-                                public void run() {
-                                    screenBtn.animate().scaleX(1f).scaleY(1f).setDuration(150).start();
-                                }
-                            }, 120);
-                            // 单击 = 重新加载当前页面（等效浏览器的刷新；长按才是菜单）
-                            if (web != null) web.reload();
-                        } else if (dragging) {
-                            prefs.edit().putInt(KEY_BALL_X, ballX).putInt(KEY_BALL_Y, ballY).apply();
-                        }
-                        dragging = false;
-                        return true;
-                    default:
-                        return false;
-                }
-            }
-        });
-        restoreBall();
-    }
-
-    /** 把悬浮球拖到手指处（按手指为中心），边界夹在 root 内并记住位置。 */
-    private void moveBallTo(float cx, float cy) {
-        if (screenBtn == null || root == null) return;
-        int size = dp(40);
-        int w = root.getWidth();
-        int h = root.getHeight();
-        if (w <= 0 || h <= 0) return;
-        int[] pos = BallRules.clamp(Math.round(cx - size / 2f), Math.round(cy - size / 2f), w, h, size);
-        if (pos == null) return;
-        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) screenBtn.getLayoutParams();
-        lp.gravity = Gravity.TOP | Gravity.START;
-        lp.leftMargin = pos[0];
-        lp.topMargin = pos[1];
-        lp.bottomMargin = 0;
-        screenBtn.setLayoutParams(lp);
-        screenBtn.bringToFront();
-        screenBtn.invalidate();
-        root.requestLayout();
-        ballX = pos[0];
-        ballY = pos[1];
-    }
-
-    /** 启动时恢复悬浮球：root 还没量出尺寸就稍后重试；坐标非法/越界一律回默认左下角。 */
-    private void restoreBall() {
-        if (ballX < 0 || ballY < 0) return;
-        final int attempt = 0;
-        tryRestoreBall(0);
-    }
-
-    private void tryRestoreBall(final int attempt) {
-        if (screenBtn == null || root == null) return;
-        int w = root.getWidth();
-        int h = root.getHeight();
-        int size = dp(40);
-        int[] pos = BallRules.clamp(ballX, ballY, w, h, size);
-        if (pos == null) {
-            if (attempt < 6 && (w <= 0 || h <= 0)) {
-                handler.postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                        tryRestoreBall(attempt + 1);
-                    }
-                }, 120);
-            } else {
-                resetBallToDefault();
-            }
-            return;
-        }
-        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) screenBtn.getLayoutParams();
-        lp.gravity = Gravity.TOP | Gravity.START;
-        lp.leftMargin = pos[0];
-        lp.topMargin = pos[1];
-        lp.bottomMargin = 0;
-        screenBtn.setLayoutParams(lp);
-        screenBtn.bringToFront();
-        ballX = pos[0];
-        ballY = pos[1];
-        root.requestLayout();
-    }
-
-    /** 默认位置：左下角 16dp（同时清掉落盘的坐标）。 */
-    private void resetBallToDefault() {
-        if (screenBtn == null) return;
-        prefs.edit().remove(KEY_BALL_X).remove(KEY_BALL_Y).apply();
-        ballX = -1;
-        ballY = -1;
-        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) screenBtn.getLayoutParams();
-        lp.gravity = Gravity.BOTTOM | Gravity.START;
-        lp.leftMargin = dp(BallRules.DEFAULT_MARGIN_DP);
-        lp.topMargin = 0;
-        lp.bottomMargin = dp(BallRules.DEFAULT_MARGIN_DP);
-        screenBtn.setLayoutParams(lp);
-        screenBtn.bringToFront();
-        root.requestLayout();
-    }
-
-    private void updateScreenButton() {
-        if (screenBtn == null) return;
-        // 悬浮球：单击 = 重新加载当前页面，长按 = 菜单（设置地址 / 重新加载 / 退出）
-        screenBtn.setText("⟳");
-        screenBtn.setAlpha(0.6f);
-    }
-
-
     /** 白底 → 状态栏/导航栏图标改深色；深色 → 恢复浅色图标。 */
     private void applySystemBars(boolean light) {
         try {
@@ -1091,33 +878,6 @@ public class MainActivity extends Activity {
             // 个别 ROM 上改系统栏失败不影响页面
         }
     }
-
-    private GradientDrawable roundBg(int color, float radiusDp, int strokeColor) {
-        GradientDrawable d = new GradientDrawable();
-        d.setShape(GradientDrawable.RECTANGLE);
-        d.setCornerRadius(dp(radiusDp));
-        d.setColor(color);
-        d.setStroke(dp(1), strokeColor);
-        return d;
-    }
-
-
-    /** 悬浮球在覆盖页（设置、错误、等待）出现时让位。 */
-    private void refreshChrome() {
-        boolean block = (setupView != null && setupView.getVisibility() == View.VISIBLE)
-                || (errorView != null && errorView.getVisibility() == View.VISIBLE)
-                || (loadingView != null && loadingView.getVisibility() == View.VISIBLE);
-        // 只让位给设置/错误/等待这些全屏页
-        if (screenBtn != null) {
-            screenBtn.setVisibility(block ? View.GONE : View.VISIBLE);
-        }
-    }
-
-
-
-
-    // ------------------------------------------------------- 波形动画 View
-
 
     // ------------------------------------------------------------ 返回键
 
@@ -1162,14 +922,6 @@ public class MainActivity extends Activity {
         }
         if (web != null && web.canGoBack()) {
             web.goBack();
-            // 先立刻复核一次浮层状态，再等页面回调二次确认（和浏览器的后退一样）
-            refreshChrome();
-            handler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    refreshChrome();
-                }
-            }, 300);
             return;
         }
         // 已经回到页面首页：全面屏手势的手机没有物理返回键可长按，
@@ -1227,7 +979,6 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         if (web != null) web.onResume();
-        refreshChrome();
         applySystemBars(false);
     }
 
@@ -1255,24 +1006,13 @@ public class MainActivity extends Activity {
             web.getSettings().setTextZoom(100);
             web.requestLayout();
         }
-        refreshChrome();
     }
-
-    // ---------------------------------------------- 转录确认卡（1.3.0，1.5 秒自动发送）
-
-
-
-
-
-
 
     // ------------------------------------------------------------ 小工具
 
     private int dp(float v) {
         return Math.round(v * getResources().getDisplayMetrics().density);
     }
-
-
 
     private void toast(String msg) {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();

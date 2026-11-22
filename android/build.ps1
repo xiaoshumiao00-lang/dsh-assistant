@@ -90,7 +90,7 @@ $pkgPath = Join-Path $STAGE ("java\" + ($V.AppId -replace '\.', '\'))
 New-Item -ItemType Directory -Force -Path $pkgPath | Out-Null
 Copy-Item (Join-Path $SRC 'res') (Join-Path $STAGE 'res') -Recurse
 
-# 同一个包里的所有 .java 都进变体（MainActivity + 悬浮球规则等纯逻辑类）
+# 同一个包里的所有 .java 都进变体（现在只剩 MainActivity 一个外壳类）
 Get-ChildItem -Filter *.java $basePkgPath | ForEach-Object {
     $javaText = [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8)
     $javaText = $javaText -replace '(?m)^package com\.chenpan\.assistant;', "package $($V.AppId);"
