@@ -22,14 +22,12 @@ $FLAVORS = @{
         AppId           = 'com.chenpan.assistant'
         Label           = '个人助手'
         DefaultUrl      = 'http://***REMOVED***'
-        DefaultTihuUrl  = 'http://***REMOVED***/tihu?token=96528673'
         Out             = '个人助手'
     }
     generic  = @{
         AppId           = 'com.chenpan.assistant.generic'
         Label           = '个人助手'
         DefaultUrl      = ''
-        DefaultTihuUrl  = ''
         Out             = '个人助手-通用版'
     }
 }
@@ -68,26 +66,10 @@ if (-not (Test-Path (Join-Path $JAVA_HOME 'bin\javac.exe'))) {
   现在找的是：$JAVA_HOME
   请装好 JDK 17，或用参数指定：-Jdk ""C:\Program Files\Eclipse Adoptium\jdk-17.0.17.10-hotspot""")
 }
-# ---- TFLite（本地唤醒模型）----
-$TFLITE_DIR = Join-Path $ROOT 'third_party\tflite\extracted'
-$TFLITE_JAR = Join-Path $TFLITE_DIR 'classes.jar'
-$TFLITE_JNI = Join-Path $TFLITE_DIR 'jni'
-$TFLITE_API_JAR = Join-Path $TFLITE_DIR 'tflite-api.jar'
-if (-not (Test-Path $TFLITE_JAR) -or -not (Test-Path (Join-Path $TFLITE_JNI 'arm64-v8a\libtensorflowlite_jni.so'))) {
-    throw ("缺少 TensorFlow Lite AAR。期望：$TFLITE_DIR\classes.jar 与 jni\arm64-v8a\libtensorflowlite_jni.so")
-}
+# 设备线（鹈鹕）已整体移除：唤醒模型（TFLite/Porcupine AAR 与 .so）不再进 APK
 $ASSETS = Join-Path $ROOT 'app\src\main\assets'
-
-# ---- Porcupine（语音唤醒）----
-$PORCUPINE_DIR = Join-Path $ROOT 'third_party\porcupine\extracted'
-$PORCUPINE_JAR = Join-Path $PORCUPINE_DIR 'classes.jar'
-$PORCUPINE_JNI = Join-Path $PORCUPINE_DIR 'jni'
-if (-not (Test-Path $PORCUPINE_JAR) -or -not (Test-Path (Join-Path $PORCUPINE_JNI 'arm64-v8a\libpv_porcupine.so'))) {
-    throw ("缺少 Porcupine AAR（语音唤醒要用）。
-  期望：$PORCUPINE_DIR\classes.jar 与 jni\arm64-v8a\libpv_porcupine.so
-  下载：https://repo1.maven.org/maven2/ai/picovoice/porcupine-android/3.0.3/porcupine-android-3.0.3.aar
-  解压到 third_party\porcupine\extracted（zip 解开即可，内含 classes.jar 与 jni/）")
-}
+$ASSETARG = @()
+if (Test-Path $ASSETS) { $ASSETARG = @('-A', $ASSETS) }
 $env:JAVA_HOME = $JAVA_HOME
 $env:PATH = "$JAVA_HOME\bin;$env:PATH"
 
@@ -108,12 +90,11 @@ $pkgPath = Join-Path $STAGE ("java\" + ($V.AppId -replace '\.', '\'))
 New-Item -ItemType Directory -Force -Path $pkgPath | Out-Null
 Copy-Item (Join-Path $SRC 'res') (Join-Path $STAGE 'res') -Recurse
 
-# 同一个包里的所有 .java 都进变体（MainActivity + TihuVoiceUtil 等纯逻辑类）
+# 同一个包里的所有 .java 都进变体（MainActivity + 悬浮球规则等纯逻辑类）
 Get-ChildItem -Filter *.java $basePkgPath | ForEach-Object {
     $javaText = [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8)
     $javaText = $javaText -replace '(?m)^package com\.chenpan\.assistant;', "package $($V.AppId);"
     $javaText = $javaText -replace '(?m)^(\s*private static final String DEFAULT_URL = ).*$', ('$1"' + $V.DefaultUrl + '";')
-    $javaText = $javaText -replace '(?m)^(\s*private static final String DEFAULT_TIHU_URL = ).*$', ('$1"' + $V.DefaultTihuUrl + '";')
     [System.IO.File]::WriteAllText((Join-Path $pkgPath $_.Name), $javaText, (New-Object System.Text.UTF8Encoding($false)))
 }
 
@@ -137,8 +118,7 @@ if (Test-Path $shortcutPath) {
     [System.IO.File]::WriteAllText($shortcutPath, $sc, (New-Object System.Text.UTF8Encoding($false)))
 }
 $shownUrl = if ($V.DefaultUrl) { $V.DefaultUrl } else { '(空，首次打开填)' }
-$shownTihu = if ($V.DefaultTihuUrl) { $V.DefaultTihuUrl } else { '(空，设置页一键填入)' }
-Write-Host ("   包名 {0} / 名称 {1} / 助手默认 {2} / 鹈鹕默认 {3}" -f $V.AppId, $V.Label, $shownUrl, $shownTihu) -ForegroundColor DarkGray
+Write-Host ("   包名 {0} / 名称 {1} / 助手默认 {2}" -f $V.AppId, $V.Label, $shownUrl) -ForegroundColor DarkGray
 Write-Host ("   根目录 {0}" -f $ROOT) -ForegroundColor DarkGray
 
 Write-Host '== 3/9 aapt2 compile 资源 ==' -ForegroundColor Cyan
@@ -155,7 +135,7 @@ Write-Host '== 4/9 aapt2 link（生成 R.java + 资源 APK）==' -ForegroundColo
     --target-sdk-version $TARGET `
     --version-code $VersionCode `
     --version-name $VersionName `
-    -A $ASSETS `
+    $ASSETARG `
     $resZip
 if ($LASTEXITCODE -ne 0) { throw 'aapt2 link 失败' }
 
@@ -166,7 +146,7 @@ $srcs += (Get-ChildItem -Recurse -Filter *.java $GEN | ForEach-Object { $_.FullN
 $argFile = Join-Path $OUT "sources-$Flavor.txt"
 $srcs | ForEach-Object { '"' + ($_ -replace '\\', '\\') + '"' } | Set-Content -Path $argFile -Encoding ascii
 & "$JAVA_HOME\bin\javac.exe" -nowarn -encoding UTF-8 -source 1.8 -target 1.8 `
-    -bootclasspath $JAR -cp "$PORCUPINE_JAR;$TFLITE_JAR;$TFLITE_API_JAR" -d $CLS "@$argFile"
+    -bootclasspath $JAR -d $CLS "@$argFile"
 if ($LASTEXITCODE -ne 0) { throw 'javac 失败' }
 
 Write-Host '== 6/9 d8 转 dex ==' -ForegroundColor Cyan
@@ -180,7 +160,7 @@ try {
     & "$JAVA_HOME\bin\jar.exe" cf $classesJar .
     if ($LASTEXITCODE -ne 0) { throw 'jar 打包 class 失败' }
 } finally { Pop-Location }
-& "$BT\d8.bat" --lib $JAR --min-api $MIN_SDK --output $DEX $classesJar $PORCUPINE_JAR $TFLITE_JAR $TFLITE_API_JAR
+& "$BT\d8.bat" --lib $JAR --min-api $MIN_SDK --output $DEX $classesJar
 if ($LASTEXITCODE -ne 0) { throw 'd8 失败' }
 
 Write-Host '== 7/9 装 dex 进 APK ==' -ForegroundColor Cyan
@@ -190,20 +170,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'jar uf 失败' }
 } finally { Pop-Location }
 
-# Porcupine 原生库：按 APK 内 lib/<abi>/ 布局塞进去
-Write-Host '== 7.5/9 打包 Porcupine .so ==' -ForegroundColor Cyan
-$LIBSTAGE = Join-Path $OUT 'libstage'
-Remove-Item $LIBSTAGE -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path (Join-Path $LIBSTAGE 'lib\arm64-v8a'), (Join-Path $LIBSTAGE 'lib\armeabi-v7a') | Out-Null
-Copy-Item (Join-Path $PORCUPINE_JNI 'arm64-v8a\libpv_porcupine.so') (Join-Path $LIBSTAGE 'lib\arm64-v8a\') -Force
-Copy-Item (Join-Path $PORCUPINE_JNI 'armeabi-v7a\libpv_porcupine.so') (Join-Path $LIBSTAGE 'lib\armeabi-v7a\') -Force
-Copy-Item (Join-Path $TFLITE_JNI 'arm64-v8a\libtensorflowlite_jni.so') (Join-Path $LIBSTAGE 'lib\arm64-v8a\') -Force
-Copy-Item (Join-Path $TFLITE_JNI 'armeabi-v7a\libtensorflowlite_jni.so') (Join-Path $LIBSTAGE 'lib\armeabi-v7a\') -Force
-Push-Location $LIBSTAGE
-try {
-    & "$JAVA_HOME\bin\jar.exe" uf $unsigned 'lib/arm64-v8a/libpv_porcupine.so' 'lib/armeabi-v7a/libpv_porcupine.so' 'lib/arm64-v8a/libtensorflowlite_jni.so' 'lib/armeabi-v7a/libtensorflowlite_jni.so'
-    if ($LASTEXITCODE -ne 0) { throw '打包 .so 失败' }
-} finally { Pop-Location }
+# 唤醒模型的原生库（Porcupine / TensorFlow Lite .so）不再打包：设备线已移除
 
 Write-Host '== 8/9 zipalign 对齐 ==' -ForegroundColor Cyan
 & "$BT\zipalign.exe" -p -f 4 $unsigned $aligned

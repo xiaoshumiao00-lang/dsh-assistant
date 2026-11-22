@@ -2,7 +2,7 @@
  * 常驻 edge-tts worker 连接/池单测（假 spawn，不启动 python）：
  *   node scripts/test-assistant-tts-worker.mjs
  *
- * 覆盖（scripts/tihu-edge-tts-worker.py 的行帧 + 长度帧协议）：
+ * 覆盖（scripts/edge-tts-worker.py 的行帧 + 长度帧协议）：
  *   - 合成成功：JSON 头 + MP3 负载正确组装（含跨 chunk 分包、头身分开发）；
  *   - 顺序队列：一条连接上多条请求按序应答；
  *   - 失败帧 → reject 带 worker 错误信息；
