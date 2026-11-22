@@ -149,6 +149,11 @@ cases.push(['通知回合工具全禁；用户真实回合恢复放行', async (
       assert.equal(allowed, false, `${name} 在通知回合不该被执行`)
       assert.equal(denied.kind, 'deny')
       assert.match(denied.reason, /系统通知/)
+      // 闸的措辞与通知模板同口径：要求完整汇报，不再要求短句；「工具已全部禁用」这句硬闸不动
+      assert.match(denied.reason, /完整汇报/, '闸的口径要跟上撤掉的长度限制')
+      assert.ok(!denied.reason.includes('一两句'), `闸的措辞里还留着长度限制：${denied.reason}`)
+      assert.match(denied.reason, /工具已全部禁用/)
+      assert.match(denied.reason, /不要调用任何工具/)
     }
 
     // turn/end 之后回到正常
@@ -164,11 +169,15 @@ cases.push(['通知回合工具全禁；用户真实回合恢复放行', async (
 }])
 
 /* ---------- 5. 摘要与正文 ---------- */
-cases.push(['摘要取首句、缺标题时兜底', () => {
-  assert.equal(watch.summarizeCompletion('第一句完成了。第二句细节。'), '第一句完成了。')
+cases.push(['摘要带整段原文（不再只取首句）、缺标题时兜底', () => {
+  const two = '第一句完成了。第二句细节。'
+  assert.equal(watch.summarizeCompletion(two), two, '通知要带得下全文，秘书才谈得上完整转述')
   const bare = watch.buildCompletionNotice({ sessionId: 'cu-1', title: '', summary: '' })
   assert.ok(bare.includes('[[session:cu-1|电脑上的任务]]'))
   assert.match(bare, /没有留下文字结果/)
+  assert.match(bare, /完整展示/, '正文要求完整展示这条结果')
+  assert.ok(!bare.includes('一两句'), `正文里不该再有「一两句」限制：${bare}`)
+  assert.match(bare, /工具已全部禁用/, '工具禁用约束句保留（与硬闸同口径）')
 }])
 
 let failed = 0

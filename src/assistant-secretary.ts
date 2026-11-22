@@ -500,7 +500,7 @@ export function registerAssistantSecretary(ctx: any): () => void {
       if (noticeTurnActive()) {
         return {
           kind: 'deny',
-          reason: '这一轮是插件自动送来的「电脑操作会话完成」系统通知，不是用户的要求：工具已全部禁用。请直接用一两句口语把结果汇报给用户，不要调用任何工具。',
+          reason: '这一轮是插件自动送来的「电脑操作会话完成」系统通知，不是用户的要求：工具已全部禁用。请把那条 Computer Use 会话的结果完整汇报给用户（原样转述，文件名、路径、数字、提交号、判据、结论都不许省略，不许为简短而删），不要调用任何工具。',
         }
       }
       if (!secretaryToolDenied(tool)) return next()

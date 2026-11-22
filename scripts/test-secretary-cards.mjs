@@ -320,6 +320,31 @@ cases.push(['通知卡正文：剥掉合成头（「（系统通知…）」与�
   assert.deepEqual(surface.parseNoticeCardBody('（系统通知，不是用户说的话）\n\n\n').paragraphs, [])
 }])
 
+cases.push(['新措辞的通知正文照旧解析成通知卡（模板改了行，客户端解析不破）', () => {
+  const watch = lib.assistantCuWatchTestSurface
+  const raw = watch.buildCompletionNotice({
+    sessionId: 'session-cu-1',
+    title: '派活：帮我看一下磷石膏 SCI',
+    summary: '结论：改了三处。\n文件 src/a.ts，提交 259e27d，门禁 npm test 全绿。',
+  })
+  assert.equal(surface.isSyntheticNoticeUserText(raw), true, '仍被认成合成通知')
+  const stripped = surface.stripNoticeSyntheticHead(raw)
+  assert.ok(!stripped.startsWith('（系统通知'), '只剥头一行')
+  assert.match(stripped, /电脑操作会话「派活：帮我看一下磷石膏 SCI」这一轮已经完成。/)
+  assert.ok(stripped.includes('src/a.ts') && stripped.includes('259e27d'), 'CU 原文里的文件名与提交号留在通知卡正文里')
+  const parsed = surface.parseNoticeCardBody(raw)
+  assert.equal(parsed.title, '电脑操作会话「派活：帮我看一下磷石膏 SCI」这一轮已经完成。')
+  assert.ok(parsed.paragraphs.some((p) => p.includes('完整展示') && p.includes('不许精简')), '完整转述口径那行进了卡片正文')
+  assert.ok(parsed.paragraphs.some((p) => p.includes('工具已全部禁用')), '工具禁用那行也照实显示')
+  const refs = surface.parseSessionRefs(raw)
+  assert.equal(refs.length, 1, '末尾引用仍被抽成可点跳 chip')
+  const ref = refs[0] ?? {}
+  assert.ok(Object.values(ref).includes('session-cu-1'), `引用里要带会话 id：${JSON.stringify(ref)}`)
+  assert.ok(Object.values(ref).includes('派活：帮我看一下磷石膏 SCI'), `引用里要带会话标题：${JSON.stringify(ref)}`)
+  assert.ok(!raw.includes('一两句'), '客户端喂进去的这条通知本身已无长度限制措辞')
+  assert.ok(surface.normalizeForSpeech(raw).length > 0, '通知卡正文可被朗读口径规范化')
+}])
+
 cases.push(['三种行分类不串味：真实用户行=user、合成通知行=notice、助手回答行不是用户行', () => {
   function fakeRow(text, kind) {
     return {

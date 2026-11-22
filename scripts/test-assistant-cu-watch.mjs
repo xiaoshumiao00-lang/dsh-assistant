@@ -8,7 +8,9 @@
  *      秘书自身不汇报、max-tokens/aborted/error 不汇报；
  *   3. 事件控制器：CU 会话完成 → notify 带该会话 id 与标题；标准会话完成 → 不收集也不 notify；
  *      同一轮只报一次；
- *   4. 通知正文含 [[session:<id>|<标题>]] 引用标记（渲染成可点跳信息行），口语简洁；
+ *   4. 通知正文含 [[session:<id>|<标题>]] 引用标记（渲染成可点跳信息行）；正文要求把 CU 会话
+ *      的结果完整、原样转述（2026-11-22 定案：撤掉「一两句口语汇报」的长度限制），
+ *      CU 结果带的是整段原文而不是首句；
  *   5. 合成完成轮：turn 号接在现有最大 turn 后，五个事件按序落盘；
  *   6. 派活分层：A 纯知识随口问直接回答；B 有 CU 会话续接最近的、
  *      无 CU 会话新建；C 新项目建文件夹；标准会话不作为续接候选；
@@ -91,14 +93,38 @@ cases.push(['控制器：标准会话完成 → 不收集、不汇报；子代�
 }])
 
 /* ---------- 4. 通知正文 ---------- */
-cases.push(['通知正文：口语 + 末尾可点跳引用标记 [[session:id|title]]', () => {
+cases.push(['通知正文：完整转述口径（撤掉「一两句」长度限制）+ 末尾可点跳引用标记', () => {
   const text = watch.buildCompletionNotice({ sessionId: 'cu-9', title: '门店详情页', summary: '白屏修好了。' })
   assert.match(text, /门店详情页/)
   assert.match(text, /这一轮已经完成/)
   assert.ok(text.includes('[[session:cu-9|门店详情页]]'), '含会话引用标记（卡片渲染成跳转信息行）')
+  // 新措辞：要求完整、原样转述，并点名必须保住的信息类别
+  assert.match(text, /完整展示/, '要写清「完整展示」')
+  assert.match(text, /原样转述/, '要写清「原样转述」')
+  assert.match(text, /不许精简/, '要禁止为精简而删')
+  assert.match(text, /文件名、路径、命令、数字、版本号、提交号、判据、结论/, '关键信息类别要逐条列出')
+  assert.match(text, /被截断（末尾带 …）就照实说明/, '截断要照实说，不许补写')
+  // 旧的精简口径必须已经不在正文里
+  assert.ok(!text.includes('一两句'), `通知正文里还留着「一两句」限制：${text}`)
+  assert.ok(!text.includes('口语向用户汇报'), `旧措辞还在：${text}`)
+  // 技术性约束句保留原样（它不是长度限制，是与 tools/pre-execute 硬闸配套的闸）
+  assert.ok(text.includes('这一回合工具已全部禁用，不要尝试派活或查询。'), '工具禁用约束句必须原样保留')
+  // 卡片解析依赖的两处结构不许变（src/secretary-card-shared.ts 两条正则）
+  const lines = text.split('\n')
+  assert.match(lines[0], /^\s*[（(【\[]?\s*系统通知/, '首行仍是「系统通知」开头（NOTICE_HEAD_LINE_RE）')
+  assert.match(lines[lines.length - 1], /^最后单独一行原样输出：\[\[session:[^\]]*\]\]$/, '引用行格式不变（NOTICE_SESSION_REF_LINE_RE）')
   const bare = watch.buildCompletionNotice({ sessionId: 'cu-1', title: '', summary: '' })
   assert.ok(bare.includes('[[session:cu-1|电脑上的任务]]'))
-  assert.equal(watch.summarizeCompletion('第一句完成了。第二句细节。'), '第一句完成了。')
+  assert.match(bare, /没有留下文字结果/)
+  // CU 结果带的是整段，不再是首句
+  const multiSentence = '第一句完成了。第二句细节。提交 259e27d，文件 src/a.ts。'
+  assert.equal(watch.summarizeCompletion(multiSentence), multiSentence, '整段照录，不再只取首句')
+  const multiline = watch.summarizeCompletion('结论：\n改了 a.ts\ncommit 259e27d')
+  assert.ok(multiline.includes('\n'), '换行保留（卡片按段落解析）')
+  const huge = watch.summarizeCompletion('字'.repeat(watch.CU_NOTICE_RESULT_MAX_CHARS + 300))
+  assert.equal(huge.length, watch.CU_NOTICE_RESULT_MAX_CHARS + 1, '只有超出上限才截尾')
+  assert.ok(huge.endsWith('…'), '截尾要留省略号（通知里要求照实说明）')
+  assert.equal(watch.CU_NOTICE_RESULT_MAX_CHARS, 900, '收集与通知同一长度口径（长报告不再被切开）')
 }])
 
 /* ---------- 5. 通知投递 ---------- */

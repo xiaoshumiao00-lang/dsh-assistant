@@ -15,9 +15,10 @@
  * 卡片消息 = 把一条说明「CU 会话完成了」的系统通知**交给宿主官方 prompt 通道**
  * （`agent.followup`），由宿主自己开轮、自己编号、自己落盘；插件不再拼任何 turn/step
  * 事件（旧写法会把 turn 号写成宿主的重复轮，直接把会话日志写坏，详见 postSecretaryNotice）。
- * 秘书页的回复卡片（SecretaryReplyCard）据此渲染：正文是秘书口语汇报，模型按通知里的
- * 要求把 `[[session:<cuSessionId>|<标题>]]` 原样留在末尾，渲染成可点引用块（左竖线 + 淡底），
- * 点击按会话 id 跳进那条 CU 会话详情；卡片同时被自动朗读。
+ * 秘书页的回复卡片（SecretaryReplyCard）据此渲染：正文是把 CU 会话结果**完整转述**给用户的
+ * 汇报（2026-11-22 定案：不再要求压成短句），模型按通知里的要求把 `[[session:<cuSessionId>|<标题>]]`
+ * 原样留在末尾，渲染成可点引用块（左竖线 + 淡底），点击按会话 id 跳进那条 CU 会话详情；
+ * 卡片同时被自动朗读。
  *
  * 纪律：
  *   - 只听 CU 模式会话；标准会话（包括 CU 后台 code_agent 派出的标准会话）不汇报；
@@ -62,6 +63,14 @@ export function shouldReportCompletion(input: {
 /**
  * 汇报消息正文。**这是发给秘书模型的一条系统通知**（角色是 user，宿主的 prompt 通道
  * 只接受这个角色），所以开头必须自我说明，结尾必须把会话引用原样留给卡片渲染。
+ *
+ * 2026-11-22 用户定案：去掉「一两句口语汇报」的长度限制——秘书要把 Computer Use 会话
+ * 返回的消息**完整、原样**展示出来，不许为精简丢掉文件名、路径、数字、提交号、判据、结论。
+ * 「这一回合工具已全部禁用，不要尝试派活或查询」这句照留：它不是长度限制，是防止
+ * 「通知 → 再派活 → 再通知」回路的闸（assistant-secretary.ts 的 tools/pre-execute 那一层
+ * 同时把这一轮的工具全禁，措辞与硬闸必须一致，否则模型会去调工具想"核实"）。
+ * 卡片解析依赖两处：首行以「系统通知」开头（NOTICE_HEAD_LINE_RE）与末尾
+ * `最后单独一行原样输出：[[session:id|title]]`（NOTICE_SESSION_REF_LINE_RE）——都不动。
  */
 export function buildCompletionNotice(input: { sessionId: string; title: string; summary: string }): string {
   const title = String(input.title ?? '').trim() || '电脑上的任务'
@@ -69,8 +78,9 @@ export function buildCompletionNotice(input: { sessionId: string; title: string;
   return [
     '（系统通知，不是用户说的话）',
     `电脑操作会话「${title}」这一轮已经完成。`,
-    summary !== '' ? `它最后一句结果：${summary}` : '它没有留下文字结果。',
-    '请用一两句口语向用户汇报这件事；这一回合工具已全部禁用，不要尝试派活或查询。',
+    summary !== '' ? `它最后一段返回原文（完整照录）：${summary}` : '它没有留下文字结果。',
+    '向用户汇报时把上面这条结果完整展示出来：原样转述，不许精简、不许合并或删细节，文件名、路径、命令、数字、版本号、提交号、判据、结论都必须保留；原文被截断（末尾带 …）就照实说明，不许自己补写。',
+    '这一回合工具已全部禁用，不要尝试派活或查询。',
     `最后单独一行原样输出：[[session:${input.sessionId}|${title}]]`,
   ].join('\n')
 }
@@ -90,12 +100,27 @@ export function buildNoticeMessage(input: { sessionId: string; title: string; su
   }
 }
 
-/** 摘要取最后一条回复的首句，截断到 120 字（朗读友好）。 */
+/**
+ * CU 结果的唯一长度口径（事件流收集与通知正文都用它）：整段能带全就全带，
+ * 只有超出 900 字的那部分才截尾、末尾留「…」，由通知正文里的「照实说明截断」交给模型。
+ * 取 900 是因为现网 CU 会话的完成汇报正文普遍在几百到一千字量级，600 会切开长报告；
+ * 900 也与卡片历史预览上限 HISTORY_PREVIEW_MAX_CHARS 同口径，卡片折叠负责剩下的观感。
+ */
+export const CU_NOTICE_RESULT_MAX_CHARS = 900
+
+/**
+ * CU 会话完成内容：最后一段返回文本**整段照录**（换行保留，空白折叠）。
+ * 旧口径是「只取首句、截到 120 字」——那是给「一两句口语汇报」配套的，
+ * 2026-11-22 用户定案撤掉精简口径：通知要带得下全文，秘书才谈得上完整转述。
+ */
 export function summarizeCompletion(text: string): string {
-  const clean = String(text ?? '').replace(/\s+/g, ' ').trim()
+  const clean = String(text ?? '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
   if (clean === '') return ''
-  const first = clean.split(/(?<=[。！？!?])\s*/)[0] ?? clean
-  return first.length > 120 ? `${first.slice(0, 120)}…` : first
+  if (clean.length <= CU_NOTICE_RESULT_MAX_CHARS) return clean
+  return `${clean.slice(0, CU_NOTICE_RESULT_MAX_CHARS)}…`
 }
 
 /* ---------- 事件控制器（收集文本 + 完成触发，依赖全注入） ---------- */
@@ -151,7 +176,8 @@ export function createCuWatch(deps: CuWatchDeps) {
           for (const block of content) {
             if (block?.type !== 'text') continue
             const text = String(block?.text ?? '').trim()
-            if (text !== '') parts.push(text.slice(0, 600))
+            // 与通知里带的上限同一口径：收集多宽就带多宽，不再分两套长度
+            if (text !== '') parts.push(text.slice(0, CU_NOTICE_RESULT_MAX_CHARS))
           }
           if (parts.length === 0) return
           let byTurn = texts.get(sessionId)
@@ -405,6 +431,7 @@ export const assistantCuWatchTestSurface = {
   shouldReportCompletion,
   buildCompletionNotice,
   buildNoticeMessage,
+  CU_NOTICE_RESULT_MAX_CHARS,
   summarizeCompletion,
   createCuWatch,
   postSecretaryNotice,
