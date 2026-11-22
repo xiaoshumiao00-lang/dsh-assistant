@@ -24,14 +24,14 @@
  *     只追加、不改写旧帧，绝不离线重拼 zstd）。Session.deriveMessages() 只投影 surface 节点，
  *     被 replace  shadow 掉的旧轮从此不进模型请求；原始事件仍在日志里，秘书页卡片/已读/分页/朗读
  *     全部不受影响（卡片取数读原始事件，不走 deriveMessages）。
- *   - 2026-11-22 起插件在滚动摘要的同触发点（每 30 轮 / 10000 词）对固定秘书会话调用 compactNow，
+ *   - 2026-11-22 起插件在滚动摘要的同触发点（每 12 轮 / 10000 词）对固定秘书会话调用 compactNow，
  *     把「注入摘要段」升级成「注入摘要段 + 宿主真的把旧轮挤出模型上下文」。模型每轮看到的变成：
  *     系统段（含最近 8 轮原文 + 滚动摘要）+ 宿主检查点 + 最近一轮，旧轮原文不再出现在消息列表里。
  *   - 插件能往模型送字的合法通道只有 ctx.systemPrompt.section（现成用法见 assistant-secretary.ts）。
  *
  * 摘要落盘：~/.dsh/assistant/dsh-assistant-secretary-context.json（插件自己的 JSON，走 tmp+rename 序列化），
  * 绝不写会话日志、绝不自己拼 turn 事件、绝不用 agent 之外的写日志通道。
- * 触发：每 30 轮（turn/end 计数）或累计词数 ≥ 10000（词数口径）。
+ * 触发：比上次摘要多满 12 轮（turn/end 计数）或累计新增词数 ≥ 10000（词数口径）。
  * 生成失败/超时：降级成「只带最近 N 轮原文」继续跑，并在诊断日志记一条（appendOpenDiag）。
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
@@ -62,8 +62,10 @@ const MAX_ROUNDS_IN_MEMORY = 400
 
 /**
  * 宿主压缩（旧轮挤出模型上下文）触发纪律：
- *   - 只在滚动摘要的同触发点（每 30 轮 / 10000 词，见 contextSummaryTriggered）要求一次挤出；
+ *   - 只在滚动摘要的同触发点（每 12 轮 / 10000 词，见 contextSummaryTriggered）要求一次挤出；
  *   - 总会话轮数低于 EVICT_MIN_TURNS 不要求（历史太短挤了也没意义，compactNow 自己也会判 null）；
+ *     这是单调的下限（>=），不是窗口：轮数持续增长，迟早越过门槛，不存在永远达不到的死锁——
+ *     触发线 12 时只是挤出比摘要晚一个边界（新会话轮 13 摘要被门槛挡住、轮 25 摘要时才挤）；
  *   - compactNow 要求 idle agent：busy 时在每次 agent/status=idle 重试，连撞 EVICT_MAX_BUSY_RETRIES
  *     次就放下次触发点再来；其它错误（摘要 LLM 调用失败等）记下 lastError 直接放下次。
  * 全部错误就地吞掉写诊断，绝不往宿主事件链上抛。
@@ -218,7 +220,7 @@ export function normalizeContextEviction(raw: unknown): ContextEviction {
   }
 }
 
-/** 触发判据（口径只有词数，不是 token）：比上次摘要多满 30 轮，或比上次摘要新增满 10000 词。 */
+/** 触发判据（口径只有词数，不是 token）：比上次摘要多满 12 轮，或比上次摘要新增满 10000 词。 */
 export function contextSummaryTriggered(state: ContextState, options: { skipRoundTrigger?: boolean } = {}): boolean {
   const turns = Math.max(0, Number(state.totalTurns) || 0)
   const words = Math.max(0, Number(state.totalWords) || 0)
@@ -357,7 +359,7 @@ export async function applyTurnEnd(state: ContextState, round: ContextRound, fil
     next.summaryAt = new Date().toISOString()
     next.degraded = false
     next.degradedReason = ''
-    // 口径基准往前推：下一段 30 轮 / 10000 词从这里重新算
+    // 口径基准往前推：下一段 12 轮 / 10000 词从这里重新算
     next.summaryThroughTurn = next.totalTurns
     next.summaryThroughWords = next.totalWords
     summaryUpdated = true
@@ -550,7 +552,7 @@ export function registerAssistantSecretaryContext(ctx: any, deps: ContextDeps = 
       const run = async (): Promise<void> => {
         const applied = await applyTurnEnd(state, round, file, sessionId)
         state = applied.state
-        // 滚动摘要刚压过一次（每 30 轮 / 10000 词）且历史够长：同触发点要求宿主把旧轮挤出模型上下文
+        // 滚动摘要刚压过一次（每 12 轮 / 10000 词）且历史够长：同触发点要求宿主把旧轮挤出模型上下文
         if (applied.summaryUpdated && state.totalTurns >= EVICT_MIN_TURNS && sessionId !== '' && sessionId === secretarySessionRef.id) {
           pendingEvict = true
           enqueueEviction()

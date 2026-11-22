@@ -337,8 +337,8 @@ export function shouldExpandOnScroll(input: {
 export const CONTEXT_RECENT_ROUNDS = 8
 /** 上下文注入预算（词数口径，与 countWords 同一口径）。 */
 export const CONTEXT_RECENT_WORD_BUDGET = 1200
-/** 触发点：每 30 轮…… */
-export const CONTEXT_ROUND_TRIGGER = 30
+/** 触发点：比上次摘要多满 12 轮（2026-11-22 用户定案：30 → 12，让旧轮挤出尽快生效）。 */
+export const CONTEXT_ROUND_TRIGGER = 12
 /** 触发点：或累计词数够 10000（口径 = 词数，不是 token）。 */
 export const CONTEXT_WORD_TRIGGER = 10000
 /** 单条摘要段最长字符数（把「已完成任务、结论、待办」压成一小段的预算）。 */

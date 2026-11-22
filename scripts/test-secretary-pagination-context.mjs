@@ -4,7 +4,7 @@
  *
  * 断言口径（用户定案的验收项）：
  *   一次渲染的卡片数 ≤30、存在折叠行、上滚才取回下一段、刷新后不自动回填、
- *   送进模型的原文轮数 ≤10 且含摘要文本、达到 30 轮或 10000 词后摘要文件确有更新。
+ *   送进模型的原文轮数 ≤10 且含摘要文本、比上次摘要多满 12 轮或新增 10000 词后摘要文件确有更新。
  */
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
@@ -341,48 +341,51 @@ cases.push(['摘要文件路径就是 ~/.dsh/assistant/ 下那条（生产口径
   log(`  生产摘要文件绝对路径 = ${production}`)
 }])
 
-cases.push(['摘要触发口径（轮数基准）：轮 1 起头一次，之后每逢「比上次多满 30 轮」才重压（轮 31 触发）', async () => {
+cases.push(['摘要触发口径（轮数基准）：轮 1 起头一次，之后每逢「比上次多满 12 轮」才重压（轮 13 触发）', async () => {
   const { rmSync } = await import('node:fs')
+  assert.equal(shared.CONTEXT_ROUND_TRIGGER, 12, '触发线常量定案值 12（2026-11-22 用户定案 30 → 12）')
+  assert.equal(shared.CONTEXT_WORD_TRIGGER, 10000, '词口径或关系不变：10000 词')
   rmSync(contextFile, { force: true })
   let state = context.emptyContextState('session-83bca3e3')
-  for (let turn = 1; turn <= 30; turn += 1) {
+  for (let turn = 1; turn <= 12; turn += 1) {
     const round = context.roundFromText(turn, [`第 ${turn} 件事做完了：结论是这一轮的结果。`, '下一步：还需要收尾。'], turn * 10, turn * 12)
     const applied = await context.applyTurnEnd(state, round, contextFile, 'session-83bca3e3')
     state = applied.state
-    assert.equal(applied.summaryUpdated, turn === 1, `第 ${turn} 轮摘要更新判据（实测只有轮 1 压过）`)
+    assert.equal(applied.summaryUpdated, turn === 1, `第 ${turn} 轮摘要更新判据（实测只有轮 1 压过，12-1=11 轮增量不满 12）`)
   }
   assert.equal(state.summaryThroughTurn, 1, '轮数基准停在轮 1')
   const snapshot = JSON.parse(readFileSync(contextFile, 'utf8'))
-  assert.equal(snapshot.totalTurns, 30)
-  assert.ok(!snapshot.summary.includes('第 30 轮'), '轮 30 时还不该重压（没满 30 轮增量）')
-  const round31 = context.roundFromText(31, ['第 31 件事做完了：这一段必须进摘要。'], 310, 312)
-  const applied = await context.applyTurnEnd(state, round31, contextFile, 'session-83bca3e3')
-  assert.equal(applied.summaryUpdated, true, '比上次满 30 轮（轮 31）触发摘要重压')
+  assert.equal(snapshot.totalTurns, 12)
+  assert.ok(!snapshot.summary.includes('第 12 轮'), '轮 12 时还不该重压（没满 12 轮增量）')
+  const round13 = context.roundFromText(13, ['第 13 件事做完了：这一段必须进摘要。'], 130, 132)
+  const applied = await context.applyTurnEnd(state, round13, contextFile, 'session-83bca3e3')
+  assert.equal(applied.summaryUpdated, true, '比上次满 12 轮（轮 13）触发摘要重压')
   const after = JSON.parse(readFileSync(contextFile, 'utf8'))
-  assert.ok(after.summary.includes('第 30 轮'), '摘要里有第 30 轮那一小段')
-  assert.ok(after.summary.includes('第 31 轮'), '摘要带到最新一轮')
+  assert.ok(after.summary.includes('第 12 轮'), '摘要里有第 12 轮那一小段')
+  assert.ok(after.summary.includes('第 13 轮'), '摘要带到最新一轮')
   assert.ok(after.summary.includes('已完成'), '摘要压的是「已完成任务、结论、待办」')
   assert.equal(after.degraded, false)
-  assert.equal(after.summaryThroughTurn, 31, '基准往前推到轮 31')
-  log(`  摘要文件（31 轮后）前 200 字：${after.summary.slice(0, 200).replace(/\n/g, ' / ')}`)
+  assert.equal(after.summaryThroughTurn, 13, '基准往前推到轮 13')
+  log(`  摘要文件（13 轮后）前 200 字：${after.summary.slice(0, 200).replace(/\n/g, ' / ')}`)
 }])
 
-cases.push(['累计词数够 10000 词触发（词数口径，轮数不到 30 也要压摘要）', async () => {
+cases.push(['累计词数够 10000 词触发（词数口径，轮数增量不到 12 也要压摘要）', async () => {
   const { rmSync } = await import('node:fs')
   rmSync(contextFile, { force: true })
   let state = context.emptyContextState('session-83bca3e3')
   const bigText = '结论已经定了。' + '这是一段很长的中间内容用来把词数推到一万词以上'.repeat(120)
-  for (let turn = 1; turn <= 12; turn += 1) {
+  for (let turn = 1; turn <= 11; turn += 1) {
     const round = context.roundFromText(turn, [`第 ${turn} 轮收尾：任务已完成。`, bigText], turn * 20, turn * 22)
     const applied = await context.applyTurnEnd(state, round, contextFile, 'session-83bca3e3')
     state = applied.state
   }
-  assert.equal(state.totalTurns, 12, '轮数远不到 30')
+  assert.equal(state.totalTurns, 11, '轮数增量不满 12（11-1=10），轮数口径不触发')
   assert.ok(state.totalWords > 10000, `词数口径已过 10000（实测 ${state.totalWords}）`)
   assert.ok(state.summary !== '', '词数口径下摘要确有更新')
   const file = JSON.parse(readFileSync(contextFile, 'utf8'))
   assert.equal(file.totalWords, state.totalWords)
-  assert.ok(state.summaryThroughTurn > 1 && state.summaryThroughTurn < 12, `摘要在词数够 10000 时就被压过（基准停在轮 ${state.summaryThroughTurn}）`)
+  assert.ok(state.summaryThroughTurn > 1 && state.summaryThroughTurn < 11, `摘要在词数够 10000 时就被压过（基准停在轮 ${state.summaryThroughTurn}，早于 12 轮边界）`)
+  assert.ok(11 - state.summaryThroughTurn < 12, '词数触发点早于轮 13 的轮数触发点，纯词数口径触发')
   assert.ok(state.summaryThroughWords >= 10000, '词数基准也往前推过')
   assert.ok(file.summary.includes('第 1 轮'), '摘要带最早那一段（滚动摘要的起点）')
 }])
@@ -503,7 +506,7 @@ cases.push(['宿主上下文模块（假 ctx 真接线）：session/event turn/e
   assert.equal(handlers.has('session/event'), true, '订阅了 session/event')
   assert.equal(sections.has('assistant:secretary-context'), true, '装了 systemPrompt.section')
   const session = { id: 'session-83bca3e3' }
-  for (let turn = 1; turn <= 31; turn += 1) {
+  for (let turn = 1; turn <= 13; turn += 1) {
     const emit = handlers.get('session/event')
     // 宿主真实事件形状（2026-11-22 现网取证）：assistant 正文在 data.message.content；
     // user/message 没有 data.turn（归到 currentTurn 桶），正文在 data.content
@@ -514,15 +517,15 @@ cases.push(['宿主上下文模块（假 ctx 真接线）：session/event turn/e
   }
   await new Promise((resolve) => setTimeout(resolve, 300))
   const file = JSON.parse(readFileSync(liveFile, 'utf8'))
-  assert.equal(file.totalTurns, 31)
-  assert.ok(file.summary.includes('第 30 轮'), '30 轮触发后摘要落盘')
+  assert.equal(file.totalTurns, 13)
+  assert.ok(file.summary.includes('第 12 轮'), '满 12 轮增量（轮 13）触发后摘要落盘')
   assert.ok(file.summary.includes('带伞'), '摘要取的是结论行（assistant 正文走 data.message.content 通道）')
   const lastRound = file.rounds[file.rounds.length - 1]
   assert.ok(lastRound.words >= 10, `user 消息无 data.turn 也要归进轮桶（currentTurn 归因），实际 ${lastRound.words} 词`)
   const section = sections.get('assistant:secretary-context').text({ agent: { session: { id: 'session-83bca3e3' } } })
   const occurrences = (section.match(/第 \d+ 轮（/g) ?? []).length
   assert.ok(occurrences <= 10 && occurrences >= 6, `注入段原文轮数 ${occurrences}（6-10 内）`)
-  assert.ok(section.includes('第 31 轮'), '注入段带最近一轮原文')
+  assert.ok(section.includes('第 13 轮'), '注入段带最近一轮原文')
   assert.ok(section.includes('摘要'), '注入段带摘要文本')
   const other = sections.get('assistant:secretary-context').text({ agent: { session: { id: 'session-other' } } })
   assert.equal(other, '', '不是秘书会话就一个字都不注入')
@@ -572,7 +575,7 @@ async function driveTurns(emit, session, from, to, wordPadding = 0) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-cases.push(['挤出：滚动摘要同触发点（每 30 轮）调宿主 compactNow，且只认固定秘书会话', async () => {
+cases.push(['挤出：滚动摘要同触发点（每 12 轮增量）调宿主 compactNow，且只认固定秘书会话', async () => {
   const { rmSync } = await import('node:fs')
   const liveFile = join(TMP_HOME, 'evict-once.json')
   rmSync(liveFile, { force: true })
@@ -586,9 +589,11 @@ cases.push(['挤出：滚动摘要同触发点（每 30 轮）调宿主 compactN
     const unregister = context.registerAssistantSecretaryContext(ctx, { file: liveFile })
     const agent = { session: { id: 'session-83bca3e3' } }
     await out.handlers.get('agent/status')({ agent, status: 'idle' })
-    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 31)
+    // 边界轮 1（首轮摘要）与轮 13（满 12 轮增量）时 totalTurns 13 < EVICT_MIN_TURNS 16 被门槛挡住，
+    // 轮 25 摘要触发时 totalTurns=25 ≥ 16：挤出一次（下限是单调 >=，不存在永远达不到 16 的窗口）
+    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 25)
     await sleep(300)
-    assert.equal(calls.length, 1, `30 轮触发点应只要求一次挤出，实际 ${calls.length} 次（第 1 轮摘要触发但轮数不足 ${context.EVICT_MIN_TURNS} 被门槛挡住）`)
+    assert.equal(calls.length, 1, `12 轮触发点应只在越过 ${context.EVICT_MIN_TURNS} 轮门槛后的边界挤一次，实际 ${calls.length} 次`)
     assert.equal(calls[0].agent, agent, '把秘书会话的 agent 交给 compactNow')
     assert.equal(calls[0].source, context.EVICT_SOURCE_ID, '来源标记固定，宿主日志里可辨认')
     assert.ok(calls[0].signal instanceof AbortSignal, '带独立可取消信号')
@@ -599,7 +604,7 @@ cases.push(['挤出：滚动摘要同触发点（每 30 轮）调宿主 compactN
     const file = JSON.parse(readFileSync(liveFile, 'utf8'))
     assert.equal(file.eviction.count, 1, '挤出记录落盘')
     assert.equal(file.eviction.shadowedTokens, 12345)
-    assert.equal(file.summaryThroughTurn, 31, '滚动摘要触发点口径不变（30 轮）')
+    assert.equal(file.summaryThroughTurn, 25, '滚动摘要触发点口径不变（12 轮增量，轮 25 = 1 + 12 + 12）')
     unregister()
   } finally {
     secretaryRef.id = prevRef
@@ -620,7 +625,7 @@ cases.push(['挤出：服务从 ctx.compaction 属性取（cordis 挂法，ctx.g
     ctx.compaction = fakeCompaction // 只挂属性（command-compact 的 inject 同款通道）
     const unregister = context.registerAssistantSecretaryContext(ctx, { file: liveFile })
     await out.handlers.get('agent/status')({ agent: { session: { id: 'session-83bca3e3' } }, status: 'idle' })
-    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 31)
+    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 25)
     await sleep(300)
     assert.equal(calls.length, 1, 'ctx.compaction 属性通道必须能取到服务')
     unregister()
@@ -643,7 +648,7 @@ cases.push(['挤出：插件 ctx 不可见时改从 agent.ctx 取 compaction 服
     const agent = { session: { id: 'session-83bca3e3' }, ctx: { compaction: fakeCompaction } } // agent 自己的分支可见
     const unregister = context.registerAssistantSecretaryContext(ctx, { file: liveFile })
     await out.handlers.get('agent/status')({ agent, status: 'idle' })
-    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 31)
+    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 25)
     await sleep(300)
     assert.equal(calls.length, 1, 'agent.ctx.compaction 通道必须能取到服务')
     unregister()
@@ -669,7 +674,7 @@ cases.push(['挤出：compactNow busy 按 idle 重试到上限后放下次触发
     const unregister = context.registerAssistantSecretaryContext(ctx, { file: liveFile })
     const agent = { session: { id: 'session-83bca3e3' } }
     await out.handlers.get('agent/status')({ agent, status: 'idle' })
-    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 31)
+    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 25)
     await sleep(300)
     assert.equal(calls, 1, '触发点先试一次')
     for (let attempt = 0; attempt < 6; attempt += 1) {
@@ -696,10 +701,10 @@ cases.push(['挤出：宿主没装 compaction 服务时静默降级，滚动摘�
     const out = {}
     const ctx = makeHostCtx(out, undefined)
     const unregister = context.registerAssistantSecretaryContext(ctx, { file: liveFile })
-    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 31)
+    await driveTurns(out.handlers.get('session/event'), { id: 'session-83bca3e3' }, 1, 25)
     await sleep(300)
     const file = JSON.parse(readFileSync(liveFile, 'utf8'))
-    assert.ok(file.summary.includes('第 30 轮'), '没 compaction 服务也要把滚动摘要写好')
+    assert.ok(file.summary.includes('第 24 轮'), '没 compaction 服务也要把滚动摘要写好')
     assert.equal(file.eviction.lastError, 'no compaction service')
     assert.equal(file.eviction.count, 0)
     unregister()
