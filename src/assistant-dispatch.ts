@@ -139,8 +139,68 @@ export async function candidateProjects(ctx: any, force = false): Promise<Dispat
 }
 
 function buildProjects(rows: SessionRowLike[]): DispatchProject[] {
+  return buildProjectsFromRegistry(readConsoleRegistry(), rows)
+}
+
+function buildProjectsFromRegistry(registry: ConsoleProjectEntry[], rows: SessionRowLike[]): DispatchProject[] {
   const home = safeAssistantHome()
-  return mergeConsoleProjects(readConsoleRegistry(), projectsFromSessions(rows, home ? [home] : []))
+  return mergeConsoleProjects(registry, projectsFromSessions(rows, home ? [home] : []))
+}
+
+/* ---------- 秘书提示词组装路径的项目快照（1775 全景段 与 1790 派活段同源） ---------- */
+
+/**
+ * 快照窗口：同一次提示词组装里相邻求值的两个段（order 1775 → 1790）落在窗口内，
+ * 拿到的是同一数组引用——同源不是「两次读取恰好一致」，而是物理上同一份数据。
+ * 窗口只用于合并同组装的多次求值；跨组装（>100ms）必然重算，绝不让旧组装的数据混进新组装。
+ */
+const PROMPT_SNAPSHOT_WINDOW_MS = 100
+let promptSnapshot: { projects: DispatchProject[]; at: number } | null = null
+
+/**
+ * 秘书提示词组装路径的项目取数（2026-11-22 用户定案：每轮注入控制室项目清单实时快照）。
+ * 口径 = parseConsoleProjects(includeHidden) ∪ projectsFromSessions，removed 排除、隐藏标注。
+ * 注册表是 readFileSync 同步重读（一份小 JSON，毫秒级）——控制室新建/删除文件夹后秘书
+ * 下一轮立即可见，天然绕过 projectCache 的 30s TTL（那个缓存只罩会话行，不罩注册表）。
+ * 会话行提供最近使用排序/会话标题/无卡片的散会话目录：同步渲染用「缓存行 ∪ 内存活会话行」
+ * （sessions.list 是同步内存调用，冷启动也不缺最近用的目录），同时 force 刷新
+ * （candidateProjects(ctx, true)）在后台把持久化会话行收紧——选 force 而不选缓存监听的理由：
+ * 注册表由控制室跨端同步写盘，没有可靠的变更通知钩子，同步重读是最简单且绝对实时的方案；
+ * inflight 去重保证同刻并发只读一次，成本 = 读一份注册表 JSON + 枚举一次会话行，全本地毫秒级。
+ */
+export function promptProjectSnapshot(ctx: any): DispatchProject[] {
+  const now = Date.now()
+  if (promptSnapshot !== null && now - promptSnapshot.at < PROMPT_SNAPSHOT_WINDOW_MS) {
+    return promptSnapshot.projects
+  }
+  const rows = [...projectCache.rows, ...liveSessionRows(ctx)]
+  const projects = buildProjectsFromRegistry(readConsoleRegistryAll(), rows)
+  promptSnapshot = { projects, at: now }
+  void candidateProjects(ctx, true)
+  return projects
+}
+
+/** 内存活会话行（同步；listSessionRows 的内存那一半，供提示词快照同步并集用）。 */
+function liveSessionRows(ctx: any): SessionRowLike[] {
+  try {
+    const live = ctx?.sessions?.list?.() ?? []
+    const rows: SessionRowLike[] = []
+    for (const session of Array.isArray(live) ? live : []) {
+      const header = session?.header ?? {}
+      rows.push({
+        sessionId: String(header.id ?? session?.id ?? ''),
+        cwd: String(header.cwd ?? ''),
+        title: String(header.title ?? ''),
+        updatedAt: toMs(header.updatedAt),
+      })
+    }
+    return rows.filter((row) => String(row.cwd ?? '').trim() !== '')
+  } catch { return [] }
+}
+
+/** 测试用：清掉提示词快照（不动 30s 会话行缓存——专门用来构造「缓存未过期」场景）。 */
+export function resetPromptSnapshotForTests(): void {
+  promptSnapshot = null
 }
 
 /* ---------- 控制室项目卡片数据源（同一份注册表，不另造目录体系） ---------- */
@@ -148,14 +208,16 @@ function buildProjects(rows: SessionRowLike[]): DispatchProject[] {
 export interface ConsoleProjectEntry {
   dir: string
   name: string
+  /** 控制室项目卡被标为隐藏（全景清单段保留并标注；默认口径仍排除）。 */
+  hidden?: boolean
 }
 
 /**
  * 读控制室项目注册表：`dsh-assistant-state.json` 就是 `/api/assistant/state` 跨端同步的那份
  * （src/assistant-store.ts），projects.folders = 项目卡 id → 文件夹，nameOverrides / layouts
- * 提供卡片显示名，removed / hidden 的卡片不算候选。
+ * 提供卡片显示名，removed 的卡片永远排除；hidden 默认排除，includeHidden 时保留并标 hidden。
  */
-export function parseConsoleProjects(raw: any): ConsoleProjectEntry[] {
+export function parseConsoleProjects(raw: any, options: { includeHidden?: boolean } = {}): ConsoleProjectEntry[] {
   const projects = raw?.projects ?? raw?.state?.projects ?? null
   if (projects === null || typeof projects !== 'object') return []
   const folders = projects.folders && typeof projects.folders === 'object' ? projects.folders : {}
@@ -165,14 +227,27 @@ export function parseConsoleProjects(raw: any): ConsoleProjectEntry[] {
   const layouts = Array.isArray(projects.layouts) ? projects.layouts : []
   const out: ConsoleProjectEntry[] = []
   for (const [pid, dir] of Object.entries(folders)) {
-    if (removed.has(pid) || hidden.has(pid)) continue
+    if (removed.has(pid)) continue
+    const isHidden = hidden.has(pid)
+    if (isHidden && options.includeHidden !== true) continue
     const cwd = String(dir ?? '').trim()
     if (cwd === '') continue
     const layout = layouts.find((l: any) => l?.id === pid)
     const name = String(names[pid] ?? layout?.title ?? '').trim()
-    out.push({ dir: cwd, name })
+    out.push({ dir: cwd, name, hidden: isHidden || undefined })
   }
   return out
+}
+
+/** 全景口径读注册表：hidden 保留（标「隐藏」），removed 照旧排除。秘书提示词路径专用。 */
+function readConsoleRegistryAll(): ConsoleProjectEntry[] {
+  try {
+    const file = join(registryDir || dispatchProfileDir(), 'dsh-assistant-state.json')
+    const raw = JSON.parse(readFileSync(file, 'utf8'))
+    return parseConsoleProjects(raw, { includeHidden: true })
+  } catch {
+    return []
+  }
 }
 
 function readConsoleRegistry(): ConsoleProjectEntry[] {
@@ -196,7 +271,7 @@ export function setDispatchRegistryDir(dir: string): void {
   registryDir = String(dir ?? '')
 }
 
-/** 注册表项目 ∪ 会话归并项目：注册表条目给显示名，同目录覆盖名字。 */
+/** 注册表项目 ∪ 会话归并项目：注册表条目给显示名，同目录覆盖名字；hidden 标记随注册表条目带入。 */
 export function mergeConsoleProjects(registry: ConsoleProjectEntry[], sessionProjects: DispatchProject[]): DispatchProject[] {
   const norm = (dir: string): string => String(dir ?? '').replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase()
   const byDir = new Map<string, DispatchProject>()
@@ -209,7 +284,7 @@ export function mergeConsoleProjects(registry: ConsoleProjectEntry[], sessionPro
       if (entry.name !== '') existing.name = entry.name
       continue
     }
-    byDir.set(key, { dir: entry.dir, name: entry.name !== '' ? entry.name : undefined, lastUsedAt: 0, titles: [] })
+    byDir.set(key, { dir: entry.dir, name: entry.name !== '' ? entry.name : undefined, lastUsedAt: 0, titles: [], hidden: entry.hidden })
   }
   return [...byDir.values()].sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0))
 }
@@ -318,6 +393,29 @@ export function dispatchPromptSection(ctx: any, projects: DispatchProject[]): st
   lines.push('')
   lines.push(`再次强调：「今天几号」「明天天气」这类纯知识或只读联网可查的问题直接答（天气用 web_search / web_fetch）；只要需要看屏幕、动手或操作本机，就先调用 ${SECRETARY_DISPATCH_TOOL}，再说已派。`)
   void ctx
+  return lines.join('\n')
+}
+
+/**
+ * 系统提示词段落：控制室全部专项任务项目文件夹的当轮实时快照（2026-11-22 用户新需求）。
+ * 与 1790 派活段共用 promptProjectSnapshot 的同一份结果；口径差异：全景段不截 12 条、
+ * 含隐藏卡（标注「隐藏」）、不附会话标题；派活 B 层段保持原口径（隐藏排除、top 12、带最近会话标题）。
+ */
+export function consoleProjectsPromptSection(projects: DispatchProject[]): string {
+  const lines: string[] = []
+  lines.push('# 控制室项目清单（实时快照）')
+  lines.push('')
+  if (projects.length > 0) {
+    lines.push('控制室当前全部专项任务项目文件夹，与控制室项目卡片同一份注册表（removed 已排除，隐藏卡片保留并标注；含会话目录归并，最近在用的排在前面）：')
+    for (const project of projects) {
+      const name = project.name && project.name !== project.dir ? `（${project.name}）` : ''
+      lines.push(`- ${project.dir}${name}${project.hidden ? '（隐藏）' : ''}`)
+    }
+  } else {
+    lines.push('控制室项目清单：（暂时读不到；分层 C 新建专项，或稍后重试）')
+  }
+  lines.push('')
+  lines.push('此清单为当轮实时快照，以它为准；派活选目录时逐字照抄这里的路径。')
   return lines.join('\n')
 }
 
@@ -546,6 +644,27 @@ export function registerAssistantDispatch(ctx: any): () => void {
     }
   }
 
+  // 系统提示词：控制室项目清单实时快照段，order 1775——滚动摘要段（1770）之后、
+  // 朗读规范段（1780）/语音段（1785）/派活分层段（1790）之前。只对固定秘书会话生效；
+  // 与 1790 段共用 promptProjectSnapshot 的同一份结果（100ms 窗口内同一引用，天然同源）。
+  try {
+    const systemPrompt = (typeof ctx?.get === 'function' ? ctx.get('systemPrompt') : undefined) ?? ctx?.systemPrompt
+    if (systemPrompt && typeof systemPrompt.section === 'function') {
+      const off = systemPrompt.section({
+        name: 'assistant:secretary-console-projects',
+        order: 1775,
+        text: (context: any) => {
+          const sessionId = String(context?.agent?.session?.id ?? '')
+          if (sessionId === '' || sessionId !== secretarySessionRef.id) return ''
+          return consoleProjectsPromptSection(promptProjectSnapshot(ctx))
+        },
+      })
+      if (typeof off === 'function') disposers.push(off)
+    }
+  } catch (error) {
+    ctx?.logger?.warn?.(`[dsh-assistant] 控制室项目清单提示词注册失败：${String((error as Error)?.message ?? error)}`)
+  }
+
   // 系统提示词：只对固定秘书会话生效（其它会话返回空串，等于没加这段）。
   try {
     const systemPrompt = (typeof ctx?.get === 'function' ? ctx.get('systemPrompt') : undefined) ?? ctx?.systemPrompt
@@ -556,8 +675,9 @@ export function registerAssistantDispatch(ctx: any): () => void {
         text: (context: any) => {
           const sessionId = String(context?.agent?.session?.id ?? '')
           if (sessionId === '' || sessionId !== secretarySessionRef.id) return ''
-          const projects = buildProjects(projectCache.rows)
-          void candidateProjects(ctx)
+          // 与 1775 全景段同源：promptProjectSnapshot 在快照窗口内返回同一引用；
+          // B 层候选保持原口径——隐藏卡片不进「既有项目目录」，仍截 top 12。
+          const projects = promptProjectSnapshot(ctx).filter((project) => !project.hidden)
           return dispatchPromptSection(ctx, projects)
         },
       })
@@ -593,6 +713,9 @@ export const assistantDispatchTestSurface = {
   resolveDispatchTarget,
   isUsableTargetDir,
   dispatchPromptSection,
+  consoleProjectsPromptSection,
+  promptProjectSnapshot,
+  resetPromptSnapshotForTests,
   listSessionRows,
   candidateProjects,
   resetDispatchCacheForTests,

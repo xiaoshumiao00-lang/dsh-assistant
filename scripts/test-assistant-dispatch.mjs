@@ -257,6 +257,163 @@ cases.push(['工具执行：非秘书会话调用被拒', async () => {
   )
 }])
 
+/* ---------- 控制室项目清单实时快照段（2026-11-22 用户新需求；临时注册表，不动真注册表） ---------- */
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function makeTempRegistry(state) {
+  const { mkdtempSync, writeFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const { tmpdir } = await import('node:os')
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-dispatch-reg-'))
+  writeFileSync(join(dir, 'dsh-assistant-state.json'), JSON.stringify(state))
+  return dir
+}
+
+cases.push(['全景段：实时快照注明 + 目录行数 = 当次取到的项目数（临时注册表）', async () => {
+  const { rmSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const dir = await makeTempRegistry({
+    projects: {
+      folders: { a: 'D:\\proj-a', b: 'D:\\proj-b', c: 'D:\\proj-c', d: 'D:\\proj-d' },
+      removed: ['d'],
+      hidden: ['c'],
+      nameOverrides: { a: '甲项目' },
+      layouts: [{ id: 'b', title: '乙项目卡' }],
+    },
+  })
+  surface.setDispatchRegistryDir(dir)
+  surface.resetDispatchCacheForTests()
+  surface.resetPromptSnapshotForTests()
+  try {
+    const ctx = {
+      sessions: {
+        list: () => [
+          { header: { id: 's1', cwd: 'D:\\proj-a', title: '旧任务', updatedAt: 5 } },
+          { header: { id: 's2', cwd: 'D:\\proj-x', title: '散会话', updatedAt: 9 } },
+        ],
+      },
+    }
+    const projects = surface.promptProjectSnapshot(ctx)
+    // 注册表 a/b/c（d 被 removed 排除）∪ 会话 proj-a（同目录归并）/proj-x = 4 条
+    assert.equal(projects.length, 4, 'removed 排除 + 同目录归并')
+    const text = surface.consoleProjectsPromptSection(projects)
+    assert.match(text, /实时快照/, '段落注明实时快照')
+    assert.match(text, /以它为准/, '段落末尾注明以它为准')
+    const dirLines = text.split('\n').filter((line) => line.startsWith('- '))
+    assert.equal(dirLines.length, projects.length, '目录行数 = 当次取到的项目数')
+    assert.ok(dirLines.some((line) => line.startsWith('- D:\\proj-a（甲项目）')), 'nameOverrides 名字沿用')
+    assert.ok(dirLines.some((line) => line.startsWith('- D:\\proj-b（乙项目卡）')), 'layout 标题作名字')
+    const hiddenLine = dirLines.find((line) => line.includes('D:\\proj-c'))
+    assert.ok(hiddenLine && hiddenLine.includes('（隐藏）'), '隐藏卡保留并标注')
+    assert.ok(!dirLines.some((line) => line.includes('proj-d')), 'removed 的目录不出现')
+    assert.ok(dirLines.find((line) => line.includes('D:\\proj-x')), '无卡片的散会话目录也在全景里')
+    assert.ok(projects[0].dir === 'D:\\proj-x' || projects[0].dir === 'D:\\proj-a', '最近在用的排前面（会话目录按 updatedAt 降序）')
+  } finally {
+    surface.setDispatchRegistryDir('')
+    rmSync(dir, { recursive: true, force: true })
+    surface.resetDispatchCacheForTests()
+    surface.resetPromptSnapshotForTests()
+  }
+}])
+
+cases.push(['全景段与派活段同源：同一快照引用、会话行同次组装只读一次', async () => {
+  const { rmSync } = await import('node:fs')
+  lib.assistantSecretaryTestSurface.secretarySessionRef.id = 'sec-panorama'
+  // 临时注册表（不动真注册表）：两个活跃目录 + 一个隐藏卡
+  const dir = await makeTempRegistry({
+    projects: {
+      folders: { a: 'D:\\pan-a', b: 'D:\\pan-b', h: 'D:\\pan-hidden' },
+      removed: [],
+      hidden: ['h'],
+      nameOverrides: {},
+      layouts: [],
+    },
+  })
+  surface.setDispatchRegistryDir(dir)
+  surface.resetDispatchCacheForTests()
+  surface.resetPromptSnapshotForTests()
+  const sections = new Map()
+  let listCalls = 0
+  const ctx = {
+    get(name) {
+      if (name === 'systemPrompt') return { section(s) { sections.set(s.order, s); return () => sections.delete(s.order) } }
+      if (name === 'sessionQuery') return { listSessions: async () => { listCalls += 1; return [{ header: { id: 's1', cwd: 'D:\\pan-a', title: '旧任务', updatedAt: 5 } }] } }
+      return undefined
+    },
+    on: () => () => {},
+    logger: { warn() {} },
+  }
+  const dispose = surface.registerAssistantDispatch(ctx)
+  try {
+    const panorama = sections.get(1775)
+    const dispatch = sections.get(1790)
+    assert.ok(panorama, '1775 全景段已注册')
+    assert.ok(dispatch, '1790 派活段已注册')
+    const context = { agent: { session: { id: 'sec-panorama' } } }
+    const textPanorama = panorama.text(context)
+    const textDispatch = dispatch.text(context)
+    assert.match(textPanorama, /控制室项目清单（实时快照）/)
+    assert.match(textPanorama, /以它为准/)
+    assert.match(textDispatch, /派活分层/)
+    await sleep(250) // 等当次 force 刷新落地再数读取次数
+    assert.equal(listCalls, 1, '同一次提示词组装只读一次会话行（快照窗口 + inflight 去重，两边各读一次不许发生）')
+    // 逐字同源：B 层「既有项目目录」的每个目录都出现在全景段（B 不带隐藏、带最近会话标题，按目录比对）
+    const dirOf = (line) => line.slice(2).split('（')[0].trim()
+    const panoramaLines = textPanorama.split('\n').filter((line) => line.startsWith('- '))
+    const panoramaDirs = new Set(panoramaLines.map(dirOf))
+    const bLines = textDispatch.split('\n').filter((line) => line.startsWith('- '))
+    assert.equal(panoramaLines.length, 3, '全景 = 注册表 3 条（隐藏保留）')
+    assert.ok(bLines.length === 2, 'B 层候选保持原口径：隐藏卡片不进既有项目目录')
+    assert.ok(!bLines.some((line) => line.includes('pan-hidden')), 'B 层不含隐藏卡')
+    for (const line of bLines) {
+      assert.ok(panoramaDirs.has(dirOf(line)), `B 层目录与全景段同源：${line}`)
+    }
+    assert.ok(panoramaLines.some((line) => line.includes('pan-hidden') && line.includes('（隐藏）')), '全景段保留隐藏卡并标注')
+    // 其它会话一个字都不注入
+    assert.equal(panorama.text({ agent: { session: { id: 'someone-else' } } }), '')
+    assert.equal(dispatch.text({ agent: { session: { id: 'someone-else' } } }), '')
+  } finally {
+    dispose()
+    lib.assistantSecretaryTestSurface.secretarySessionRef.id = ''
+    surface.setDispatchRegistryDir('')
+    rmSync(dir, { recursive: true, force: true })
+    surface.resetDispatchCacheForTests()
+    surface.resetPromptSnapshotForTests()
+  }
+}])
+
+cases.push(['提示词路径绕过 30s 缓存：控制室新建/删除文件夹 + 新会话目录都当轮收紧', async () => {
+  const { rmSync, writeFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const dir = await makeTempRegistry({ projects: { folders: { a: 'D:\\reg-a' }, removed: [], hidden: [], nameOverrides: {}, layouts: [] } })
+  surface.setDispatchRegistryDir(dir)
+  surface.resetDispatchCacheForTests()
+  surface.resetPromptSnapshotForTests()
+  const list = [{ header: { id: 's1', cwd: 'D:\\sess-1', title: 't', updatedAt: 1 } }]
+  const ctx = { sessions: { list: () => list } }
+  try {
+    const first = surface.promptProjectSnapshot(ctx)
+    assert.equal(first.length, 2, '注册表 reg-a ∪ 会话 sess-1')
+    await sleep(250) // force 刷新落地：30s 缓存此刻是「新鲜」的
+    // 控制室变了：注册表加文件夹、删文件夹，同时出现新会话目录——模拟「缓存未过期」
+    writeFileSync(join(dir, 'dsh-assistant-state.json'), JSON.stringify({ projects: { folders: { b: 'D:\\reg-b' }, removed: [], hidden: [], nameOverrides: {}, layouts: [] } }))
+    list.push({ header: { id: 's2', cwd: 'D:\\sess-2', title: 't2', updatedAt: 2 } })
+    surface.resetPromptSnapshotForTests() // 只清快照窗口、不动 30s 缓存：模拟「下一轮组装」
+    const second = surface.promptProjectSnapshot(ctx)
+    assert.ok(second.some((p) => p.dir === 'D:\\reg-b'), '注册表新建文件夹当轮立即可见（同步重读注册表，不吃 30s 缓存）')
+    assert.ok(!second.some((p) => p.dir === 'D:\\reg-a'), '注册表删除文件夹当轮立即消失')
+    await sleep(250) // 当次 force 刷新把新会话行写进缓存
+    const third = surface.promptProjectSnapshot(ctx)
+    assert.ok(third.some((p) => p.dir === 'D:\\sess-2'), '新会话目录经当轮 force 刷新后下一轮可见')
+  } finally {
+    surface.setDispatchRegistryDir('')
+    rmSync(dir, { recursive: true, force: true })
+    surface.resetDispatchCacheForTests()
+    surface.resetPromptSnapshotForTests()
+  }
+}])
+
 let failed = 0
 for (const [name, fn] of cases) {
   try {

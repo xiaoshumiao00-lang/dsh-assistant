@@ -24,6 +24,8 @@ export interface DispatchProject {
   lastUsedAt?: number
   /** 该项目下最近的会话标题（用于"旧任务延续"判定）。 */
   titles?: string[]
+  /** 控制室里被标为隐藏的项目卡（全景清单段展示并标注「隐藏」；派活 B 层候选不含）。 */
+  hidden?: boolean
 }
 
 export interface DispatchInput {
