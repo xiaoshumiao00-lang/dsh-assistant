@@ -186,6 +186,8 @@ const SECRETARY_ALLOWED_TOOLS = new Set([
   'list_agents', 'job_list', 'job_output',
   'proactive_card',
   'web_search', 'web_fetch',
+  // 日程四件套只作用于本会话自己的提醒表（不落本机文件/不动屏幕/不跑终端），2026-11-22 用户要求放行。
+  'schedule_list', 'schedule_create', 'schedule_update', 'schedule_delete',
 ])
 
 export function secretaryToolDenied(toolName: string): boolean {
