@@ -578,14 +578,47 @@ export function registerAssistantSecretary(ctx: any): () => void {
     offSpeechStyle = undefined
   }
 
+  // 语音输入提示（2026-11-22 用户新需求）：用户多用语音转文字，常带同音字/断句问题。
+  // 单独一段，order 1785 紧贴派活分层段（1790）之前，不并入朗读规范、不改派活规则原文。
+  let offVoiceInput: (() => void) | undefined
+  try {
+    const systemPrompt = (typeof ctx?.get === 'function' ? ctx.get('systemPrompt') : undefined) ?? ctx?.systemPrompt
+    if (systemPrompt && typeof systemPrompt.section === 'function') {
+      offVoiceInput = systemPrompt.section({
+        name: 'assistant:secretary-voice-input',
+        order: 1785,
+        text: (context: any) => {
+          const sessionId = String(context?.agent?.session?.id ?? '')
+          if (sessionId === '' || sessionId !== activeSessionId) return ''
+          return SECRETARY_VOICE_INPUT_TEXT
+        },
+      })
+    }
+  } catch {
+    offVoiceInput = undefined
+  }
+
   return () => {
     try { offToolGate?.() } catch {}
     try { offNoticeReset?.() } catch {}
     try { offStepGate?.() } catch {}
     try { if (typeof offSpeechStyle === 'function') offSpeechStyle() } catch {}
+    try { if (typeof offVoiceInput === 'function') offVoiceInput() } catch {}
     try { routes.dispose() } catch {}
   }
 }
+
+/**
+ * 秘书会话「语音输入」提示段（系统提示段落正文，最多三行）。
+ * 语义：内部纠同音、不改写原话、不因错别字失败/反问、歧义影响执行才最短确认；
+ * 派活 task 照抄原话、用户卡与附件一律原文、改读要在正文说明。
+ * 位置：紧接在派活分层段（1790）之前，由 1785 号段落挂载。
+ */
+export const SECRETARY_VOICE_INPUT_TEXT = [
+  '# 语音输入（个人秘书）',
+  '一、本页输入多是用户语音转文字：可能带同音字或相近音的错别字、断句不当、缺标点。按语义理解，同音纠正在你内部完成；不许悄悄改写用户原话，不许因一个错别字判任务失败或反问；只有歧义确实影响执行时，才用最短一句确认。',
+  '二、派活时 secretary_dispatch 的 task 字段照抄用户原话，可在其后加括号注明「语音输入，可能有同音字误」，但不得替换关键词；秘书页用户卡（冷蓝那张）与附件内容一律显示原文、不显示纠正版本，附件一律不改写；若你在回复里改读了某个词，必须在正文说清改了哪个词。',
+].join('\n')
 
 /**
  * 秘书会话「卡片 + 朗读」输出规范（系统提示段落正文）。
@@ -800,6 +833,7 @@ export const assistantSecretaryTestSurface = {
   isNoticeMessageId,
   clearNoticeMessageIds,
   SECRETARY_SPEECH_STYLE_TEXT,
+  SECRETARY_VOICE_INPUT_TEXT,
   repairSecretaryLogLines,
   repairSecretaryLogText,
   compressSessionLogText,

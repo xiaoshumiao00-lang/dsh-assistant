@@ -328,6 +328,74 @@ cases.push(['POST 同一个 id 去抖：不重写盘、不重刷 updatedAt（多
   }
 }])
 
+cases.push(['语音输入提示段：三行内语义齐全，1785 挂在派活分层（1790）之前', async () => {
+  const voiceRoot = mkdtempSync(join(tmpdir(), 'assistant-secretary-voice-'))
+  const server = fakeServer()
+  const sections = []
+  const ctx = {
+    webServer: server,
+    get(name) {
+      if (name === 'profileContext') return { dir: voiceRoot }
+      if (name === 'systemPrompt') {
+        return {
+          section(definition) {
+            sections.push(definition)
+            return () => {}
+          },
+        }
+      }
+      return undefined
+    },
+    on() { return () => void 0 },
+  }
+  const disposeExtra = surface.registerAssistantSecretary(ctx)
+  const routeExtra = server.exact.get(surface.ASSISTANT_SECRETARY_ROUTE)
+  const call = async (method, payload) => {
+    const res = fakeRes()
+    const req = fakeReq(method, payload === undefined ? undefined : JSON.stringify(payload))
+    await routeExtra.handler(req, res)
+    return JSON.parse(res.body)
+  }
+  try {
+    await call('POST', { sessionId: 'session-voice-input-1' })
+    const text = surface.SECRETARY_VOICE_INPUT_TEXT
+    assert.equal(typeof text, 'string')
+    const lines = text.split('\n')
+    assert.ok(lines.length <= 3, `语音输入小节最多三行，实际 ${lines.length} 行`)
+    for (const must of [
+      '语音', '同音字', '相近音', '断句', '缺标点',
+      '按语义理解', '同音纠正在你内部完成',
+      '不许悄悄改写用户原话', '不许因一个错别字判任务失败或反问',
+      '只有歧义确实影响执行时，才用最短一句确认',
+      'secretary_dispatch', 'task 字段照抄用户原话', '不得替换关键词',
+      '用户卡', '显示原文', '不显示纠正版本', '附件', '不改写',
+      '改读了某个词', '说清改了哪个词',
+    ]) {
+      assert.ok(text.includes(must), `语音输入小节缺语义「${must}」：\n${text}`)
+    }
+    assert.equal(surface.SECRETARY_SPEECH_STYLE_TEXT.includes('语音输入'), false, '语音输入段必须独立，不许并进朗读规范')
+
+    const speech = sections.find((item) => item.name === 'assistant:secretary-speech-style')
+    const voice = sections.find((item) => item.name === 'assistant:secretary-voice-input')
+    assert.ok(speech, '朗读规范段（1780）还在')
+    assert.ok(voice, '没注册 assistant:secretary-voice-input 段')
+    assert.equal(voice.order, 1785)
+    assert.ok(voice.order > 1780 && voice.order < 1790, `语音段必须在朗读（1780）之后、派活分层（1790）之前，实际 ${voice.order}`)
+    assert.equal(voice.text({ agent: { session: { id: 'session-voice-input-1' } } }), text)
+    assert.equal(voice.text({ agent: { session: { id: 'session-other' } } }), '', '其它会话一个字都不多')
+    assert.equal(speech.text({ agent: { session: { id: 'session-voice-input-1' } } }), surface.SECRETARY_SPEECH_STYLE_TEXT)
+    // 每轮上下文字符数的增量只有这一小节：朗读规范原文一字未动，语音段独立成段。
+    assert.equal(
+      surface.SECRETARY_SPEECH_STYLE_TEXT.length + text.length,
+      speech.text({ agent: { session: { id: 'session-voice-input-1' } } }).length + voice.text({ agent: { session: { id: 'session-voice-input-1' } } }).length,
+    )
+    assert.ok(text.length < 400, `语音输入小节本身要短（实际 ${text.length} 字），否则每轮上下文白涨`)
+  } finally {
+    try { disposeExtra() } catch {}
+    rmSync(voiceRoot, { recursive: true, force: true })
+  }
+}])
+
 let failed = 0
 for (const [name, fn] of cases) {
   try {

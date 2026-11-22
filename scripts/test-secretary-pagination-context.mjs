@@ -442,7 +442,11 @@ cases.push(['送进模型的注入段：原文轮数 ≤10（实测定 8）且�
   const realSection = context.contextSectionText({ ...state, rounds: realRounds, summary: '', totalTurns: realRounds.length, totalWords: 5965 })
   const realOccurrences = (realSection.match(/第 \d+ 轮（/g) ?? []).length
   assert.ok(realOccurrences <= 10, `真会话注入轮数 ≤10（实测 ${realOccurrences}）`)
-  assert.ok(realSection.includes('第 51 轮'), '真会话最近一轮在注入段里')
+  // 这条会话还在长：最新轮次要现算，不能写死成写这条断言时的第 51 轮（会话长到 66 轮后就会假红）。
+  const realTurns = realCards.filter((item) => item.kind === 'assistant').map((item) => Number(item.turn)).filter((turn) => Number.isFinite(turn))
+  const latestTurn = Math.max(0, ...realTurns)
+  assert.ok(latestTurn > 0, '真会话里至少有一轮 assistant 卡')
+  assert.ok(realSection.includes(`第 ${latestTurn} 轮（`), `真会话最近一轮（第 ${latestTurn} 轮）在注入段里`)
   log(`  真会话注入轮数 = ${realOccurrences} 字符长度 = ${realSection.length}`)
 }])
 
