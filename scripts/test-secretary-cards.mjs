@@ -306,7 +306,12 @@ cases.push(['卡片 kind 常量：秘书卡 assistant / 用户卡 user / 通知�
   assert.equal(surface.CARD_KIND_USER, 'user')
   assert.equal(surface.CARD_KIND_NOTICE, 'notice')
   assert.equal(surface.FOLD_BODY_LINE_BUDGET, 3)
+  assert.equal(surface.FOLD_TITLE_LINE_BUDGET, 2)
   assert.equal(surface.FOLD_BLOCK_GAP, 10)
+  assert.equal(surface.FOLD_FALLBACK_LINE_HEIGHT_PX, 27)
+  // 折叠态固定上限（标准字号：标题 17px/1.5 两行 51px + 间距 10px + 正文 15px/1.8 三行 81px + 两个块间距 20px）
+  assert.equal(surface.foldCollapsedCapPx({ lineHeight: 27, titleLineHeight: 25.5, hasTitle: true }), 162)
+  assert.equal(surface.foldCollapsedCapPx({ lineHeight: 27, hasTitle: false }), 101)
 }])
 
 cases.push(['通知卡正文：剥掉合成头（「（系统通知…）」与「最后单独一行原样输出：」），首行做标题、其余成段落', () => {
@@ -382,8 +387,9 @@ cases.push(['卡片 key：秘书卡 assistant:turn:N，通知卡 notice:<消息 
   assert.notEqual(surface.noticeCardSpeechKey('14:input-message-cu-01', '9'), surface.userCardSpeechKey('14:input-message-cu-01', '9'))
 }])
 
-cases.push(['折叠几何（三种卡共用一套算术）：卡标题不吃预算、正文最多 3 行、落点不切半行', () => {
+cases.push(['折叠几何（三种卡共用一套算术）：卡标题也进预算（最多 2 行）、正文最多 3 行、落点不切半行、固定高度封顶', () => {
   const lineHeight = 27
+  const titleLine = 25.5
   const blocks = [
     { kind: 'title', top: 0, height: 26 },
     { kind: 'para', top: 36, height: 54 },   // 2 行
@@ -391,27 +397,49 @@ cases.push(['折叠几何（三种卡共用一套算术）：卡标题不吃预�
     { kind: 'para', top: 191, height: 54 },
   ]
   const natural = 245
-  const out = surface.foldClipFromBlocks({ blocks, naturalHeight: natural, lineHeight })
   // 预算 3 行：第一个块 2 行（bottom 90），第二个块只切 1 行 → 100 + 27 = 127
+  const out = surface.foldClipFromBlocks({ blocks, naturalHeight: natural, lineHeight, titleLineHeight: titleLine })
   assert.equal(out.collapsedMaxHeight, 127)
   assert.equal(out.overflow, true)
   assert.equal(out.bodyLines, 3)
   assert.equal(out.clip, 127)
+  assert.equal(out.cap, 162)
   // 不溢出：正文只有 3 行 → 不截断，collapsedMaxHeight 为 undefined（自然高度）
-  const short = surface.foldClipFromBlocks({ blocks: [{ kind: 'para', top: 0, height: 81 }], naturalHeight: 81, lineHeight })
+  const short = surface.foldClipFromBlocks({ blocks: [{ kind: 'para', top: 0, height: 81 }], naturalHeight: 81, lineHeight, titleLineHeight: titleLine })
   assert.equal(short.collapsedMaxHeight, undefined)
   assert.equal(short.overflow, false)
   assert.equal(short.bodyLines, 3)
-  // 只有标题：没有正文块 → 不折叠
-  assert.deepEqual(surface.foldClipFromBlocks({ blocks: [{ kind: 'title', top: 0, height: 26 }], naturalHeight: 26, lineHeight }).collapsedMaxHeight, undefined)
+  // 只有标题、且标题只有一行（没被裁）：不折叠
+  assert.deepEqual(surface.foldClipFromBlocks({ blocks: [{ kind: 'title', top: 0, height: 26 }], naturalHeight: 26, lineHeight, titleLineHeight: titleLine }).collapsedMaxHeight, undefined)
   // 引用 chip 整块不可切一半（chip 算 1 行）
-  const withRef = surface.foldClipFromBlocks({ blocks: [{ kind: 'para', top: 0, height: 27 }, { kind: 'ref', top: 37, height: 36 }], naturalHeight: 100, lineHeight })
+  const withRef = surface.foldClipFromBlocks({ blocks: [{ kind: 'para', top: 0, height: 27 }, { kind: 'ref', top: 37, height: 36 }], naturalHeight: 100, lineHeight, titleLineHeight: titleLine })
   assert.equal(withRef.collapsedMaxHeight, undefined)
   assert.equal(withRef.bodyLines, 2)
-  // 坏行高不塌陷成 0（回自然高度）
+  // 现网实测的坏情形（2026-11-22 手机截图）：整段首段被排版成 230px 长标题（9 行）。
+  // 旧口径「标题永远露出、不计预算」把它整段留在折叠态里 → max-height 321–346px；新口径只让标题出 2 行。
+  const longTitle = [
+    { kind: 'title', top: 0, height: 230 },
+    { kind: 'para', top: 240, height: 81 },
+    { kind: 'para', top: 331, height: 27 },
+  ]
+  const folded = surface.foldClipFromBlocks({ blocks: longTitle, naturalHeight: 358, lineHeight, titleLineHeight: titleLine })
+  assert.equal(folded.collapsedMaxHeight, 51, '标题按自己的行高切在第 2 行行尾（17px/1.5 × 2）')
+  assert.equal(folded.overflow, true)
+  assert.equal(folded.bodyLines, 0)
+  // 整条回复只有一段连续文字（正文块只剩标题一个）：标题被行夹裁过时也必须折叠，绝不再整段平铺
+  const onlyTitle = surface.foldClipFromBlocks({ blocks: [{ kind: 'title', top: 0, height: 51 }], naturalHeight: 51, lineHeight, titleLineHeight: titleLine, titleClippedHidden: true })
+  assert.equal(onlyTitle.overflow, true)
+  assert.equal(onlyTitle.collapsedMaxHeight, 51)
+  // 行高量不出来（字体没落、块被宿主藏起来）：按兜底行高 27 折叠，不许因为量不到就平铺
   const bad = surface.foldClipFromBlocks({ blocks, naturalHeight: natural, lineHeight: 0 })
-  assert.equal(bad.collapsedMaxHeight, undefined)
-  assert.equal(bad.overflow, false)
+  assert.equal(bad.collapsedMaxHeight, 127)
+  assert.equal(bad.overflow, true)
+  assert.equal(bad.cap, 165)
+  // 卡体内联样式三态：没量过不放开（CSS 首帧固定上限顶住）→ 量过且没溢出才放开 → 溢出就写真实落点
+  assert.equal(surface.cardFoldStyle(false, false, undefined), undefined)
+  assert.deepEqual(surface.cardFoldStyle(false, true, undefined), { maxHeight: 'none' })
+  assert.deepEqual(surface.cardFoldStyle(false, true, 142), { maxHeight: '142px' })
+  assert.deepEqual(surface.cardFoldStyle(true, false, undefined), { maxHeight: 'none' })
 }])
 
 cases.push(['已读集合：cardKey 归一（坏值丢掉、去重、截上限）', () => {

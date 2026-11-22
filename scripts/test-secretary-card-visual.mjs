@@ -7,9 +7,11 @@
  * 折叠算术与已读 store 不在这里复制一遍：直接从 lib/index.js 里取**本次构建的真实现**
  * （foldClipFromBlocks / createSecretaryReadStore / formatClock），页面只负责量块、脚本只负责接线。
  *
- * 取证口径（2026-11-21 本批需求）：
+ * 取证口径（2026-11-21 本批需求，2026-11-22 折叠补丁更新）：
  *   - 先按**旧折叠实现**（标题 + 前 3 个内容块 + gap）量一遍并打印 BEFORE 行（行数、max-height），
- *     再用新实现（最多 3 行正文）量 AFTER，两项都从 getComputedStyle/offsetHeight 出真数；
+ *     再用新实现量 AFTER，两项都从 getComputedStyle/offsetHeight 出真数；
+ *   - 新口径 = 折叠态**最多 2 行卡标题 + 最多 3 行正文**，判据全部是内容高度（不看字符数），
+ *     固定上限 foldCollapsedCapPx（标准字号 162px）封顶，CSS 首帧就顶住（治现网「测量前整段平铺」的时序洞）；
  *   - 折叠态行数、卡体点击展开、脚部时间位置、字号（正文 15px）、未读红点、已读持久化都断言。
  *
  * 通过 = 退出码 0；截图：
@@ -348,12 +350,22 @@ async function measureFold(kind) {
     const content = card.querySelector('[data-dsh-scard="content"]')
     const blocks = [...content.querySelectorAll('[data-dsh-scard="title"], [data-dsh-scard="para"], [data-dsh-scard="ref"]')]
       .map((el) => ({ kind: el.getAttribute('data-dsh-scard'), top: el.offsetTop, height: el.offsetHeight }))
-    const para = content.querySelector('[data-dsh-scard="para"]')
+    const para = content.querySelector('[data-dsh-scard="para"]') ?? content
     const cs = getComputedStyle(para)
+    const titleEl = content.querySelector('[data-dsh-scard="title"]')
+    const titleCs = titleEl === null ? null : getComputedStyle(titleEl)
     return {
       blocks,
       naturalHeight: content.scrollHeight,
       lineHeight: Number.parseFloat(cs.lineHeight),
+      hasTitle: titleEl !== null,
+      titleLineHeight: titleCs === null ? Number.parseFloat(cs.lineHeight) : Number.parseFloat(titleCs.lineHeight),
+      titleClippedHidden: titleEl !== null && titleEl.scrollHeight > titleEl.clientHeight + 1,
+      titleClientHeight: titleEl === null ? 0 : titleEl.clientHeight,
+      titleScrollHeight: titleEl === null ? 0 : titleEl.scrollHeight,
+      titleLineClamp: titleCs === null ? 'none' : titleCs.webkitLineClamp,
+      // 还没跑任何测量时，正文区已有一条 CSS 固定上限（首帧就不许整段平铺）
+      firstPaintMaxHeight: getComputedStyle(content).maxHeight,
       fontSize: cs.fontSize,
       lineStyle: cs.lineHeight,
     }
@@ -362,6 +374,8 @@ async function measureFold(kind) {
     blocks: measured.blocks,
     naturalHeight: measured.naturalHeight,
     lineHeight: measured.lineHeight,
+    titleLineHeight: measured.titleLineHeight,
+    titleClippedHidden: measured.titleClippedHidden,
     budget: FOLD_BUDGET,
   })
   return { ...measured, geometry }
@@ -378,7 +392,7 @@ function legacyFoldFromBlocks(measured) {
 async function applyFold(kind) {
   const measured = await measureFold(kind)
   await page.evaluate(({ which, geometry }) => window.__applyFold(which, geometry), { which: kind, geometry: measured.geometry })
-  await page.waitForTimeout(120)
+  await page.waitForTimeout(320)
   return measured
 }
 
@@ -508,6 +522,23 @@ try {
   pass('AFTER 折叠实测比 BEFORE 明显收窄',
     Number.parseFloat(fold.maxHeight) < legacy.collapsedMaxHeight,
     JSON.stringify({ before: `${legacy.collapsedMaxHeight}px / 约 ${legacy.lines} 行`, after: `${fold.maxHeight} / ${folded.assistant.geometry.bodyLines} 行` }))
+  // 现网「长卡整段平铺」三条根因逐一对着打（2026-11-22 手机 390px 实测：折叠 max-height 321–346px、卡高 456–481px）
+  const capAssistant = folded.assistant.geometry.cap
+  pass('折叠落点封顶在固定上限内（不随首段行数膨胀）',
+    Number.parseFloat(fold.maxHeight) <= capAssistant && capAssistant === surface.foldCollapsedCapPx({ lineHeight: before.lineHeight, titleLineHeight: before.titleLineHeight, hasTitle: true }),
+    JSON.stringify({ maxHeight: fold.maxHeight, cap: capAssistant, natural: before.naturalHeight, lineHeight: before.lineHeight, titleLineHeight: before.titleLineHeight }))
+  pass('卡标题折叠态被行夹成 2 行（旧口径「标题永远露出」让折叠高度随首段膨胀）',
+    before.titleLineClamp === '2' && before.titleClientHeight <= Math.round(2 * before.titleLineHeight) + 1 && Math.abs(Number.parseFloat(info.title.line) - before.titleLineHeight) < 0.6,
+    JSON.stringify({ clamp: before.titleLineClamp, titleClientH: before.titleClientHeight, titleLineHeight: before.titleLineHeight, declaredTitleMaxHeight: 'calc(1.5em * 2)' }))
+  pass('首帧（还没跑任何测量）正文区就已有固定上限，不会整段平铺（现网时序兜底）',
+    before.firstPaintMaxHeight === '162px' && before.naturalHeight > 162,
+    JSON.stringify({ firstPaintMaxHeight: before.firstPaintMaxHeight, natural: before.naturalHeight }))
+  pass('整条回复只有一段连续文字（正文块只剩被裁过的标题）也必须折叠',
+    (() => {
+      const onlyTitle = foldClipFromBlocks({ blocks: [{ kind: 'title', top: 0, height: 332 }], naturalHeight: 332, lineHeight: 27, titleLineHeight: 25.5, titleClippedHidden: true })
+      return onlyTitle.overflow === true && onlyTitle.collapsedMaxHeight === 51
+    })(),
+    JSON.stringify({ 旧口径: '无 max-height → 整段平铺', 新口径: '折叠在 51px（标题 2 行）' }))
   pass('折叠末尾是「…」省略标记（不是渐变遮罩）',
     info.fold.ellipsis !== null && info.fold.ellipsis.text === '…' && info.fold.ellipsis.display !== 'none',
     JSON.stringify(info.fold.ellipsis))

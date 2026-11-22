@@ -726,6 +726,82 @@ try {
   check('卡体可聚焦可展开（role=button + tabindex=0 + aria-expanded=false + 可点 fold=toggle）',
     scard.bodyRole === 'button' && scard.bodyTabIndex === '0' && scard.bodyAriaExpanded === 'false' && scard.bodyFoldMode === 'toggle',
     JSON.stringify({ role: scard.bodyRole, tabindex: scard.bodyTabIndex, aria: scard.bodyAriaExpanded, fold: scard.bodyFoldMode }))
+  // 2026-11-22 折叠失效补丁：三条根因在现网（手机入口视口）逐条取证，并验「折叠生效率 100%」
+  const foldFallbackProbe = await page.evaluate(async () => {
+    const card = document.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])')
+    const content = card === null ? null : card.querySelector('[data-dsh-scard="content"]')
+    if (content === null) return null
+    const title = content.querySelector('[data-dsh-scard="title"]')
+    // 静态证据：样式表里那条「首帧就生效」的折叠上限规则必须存在且不是 none
+    let declaredCap = ''
+    for (const sheet of document.styleSheets) {
+      try {
+        for (const rule of sheet.cssRules) {
+          if (rule.selectorText === '[data-dsh-scard="card"]:not([data-open="1"]) [data-dsh-scard="content"]') declaredCap = rule.style.maxHeight
+        }
+      } catch { /* 跨域 sheet 读不到就跳过 */ }
+    }
+    const inline = content.getAttribute('style') ?? ''
+    // 把行内 max-height 摘掉 = 模拟「卡片刚挂载、JS 还没测量」的那一帧，CSS 必须已经顶住；
+    // 等过渡动画结束再读真值（160ms 过渡会让同步读数停在起始帧），测完原样贴回
+    content.removeAttribute('style')
+    await new Promise((resolve) => setTimeout(resolve, 230))
+    const cap = Number.parseFloat(getComputedStyle(content).maxHeight)
+    const clientAtCap = content.clientHeight
+    const scrollAtCap = content.scrollHeight
+    content.setAttribute('style', inline)
+    const titleCs = title === null ? null : getComputedStyle(title)
+    return {
+      restored: (content.getAttribute('style') ?? '') === inline,
+      declaredCap, cap, clientAtCap, scrollAtCap,
+      titleClamp: titleCs === null ? 'none' : titleCs.webkitLineClamp,
+      titleMaxHeight: title === null ? '' : titleCs.maxHeight,
+      titleClientHeight: title === null ? 0 : title.clientHeight,
+      titleScrollHeight: title === null ? 0 : title.scrollHeight,
+    }
+  })
+  check('折叠时序兜底：测量前（没有行内 max-height）正文区就有固定上限 162px，卡片不会整段平铺',
+    foldFallbackProbe !== null && Number.isFinite(foldFallbackProbe.cap) && foldFallbackProbe.cap > 0
+      && foldFallbackProbe.cap <= 162 && foldFallbackProbe.clientAtCap <= foldFallbackProbe.cap
+      && foldFallbackProbe.scrollAtCap > foldFallbackProbe.cap && foldFallbackProbe.restored === true
+      && foldFallbackProbe.declaredCap.includes('162px'),
+    JSON.stringify(foldFallbackProbe))
+  check('卡标题折叠态被行夹到 2 行（标题也不再整段露出，展开才放开）',
+    foldFallbackProbe !== null && foldFallbackProbe.titleClamp === '2'
+      && foldFallbackProbe.titleMaxHeight.endsWith('px')
+      && Number.parseFloat(foldFallbackProbe.titleMaxHeight) <= 60
+      && foldFallbackProbe.titleClientHeight <= Number.parseFloat(foldFallbackProbe.titleMaxHeight),
+    JSON.stringify({ clamp: foldFallbackProbe?.titleClamp, maxHeight: foldFallbackProbe?.titleMaxHeight, clientH: foldFallbackProbe?.titleClientHeight, scrollH: foldFallbackProbe?.titleScrollHeight }))
+  const foldEffectiveness = await page.evaluate(() => {
+    const flat = []
+    const folded = []
+    for (const card of document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])')) {
+      if (card.getAttribute('data-open') === '1') continue
+      if (card.querySelector('[data-dsh-scard="collapsed-row"], [data-dsh-scard="collapse-row"]') !== null) continue
+      const content = card.querySelector('[data-dsh-scard="content"]')
+      if (content === null) continue
+      const natural = content.scrollHeight
+      if (natural <= 162) continue
+      const max = Number.parseFloat(getComputedStyle(content).maxHeight)
+      const body = card.querySelector('[data-dsh-scard="body"]')
+      const item = {
+        kind: card.getAttribute('data-dsh-scard-kind') ?? '',
+        maxHeight: Number.isFinite(max) ? max : 'none',
+        natural, clientHeight: content.clientHeight,
+        cardHeight: Math.round(card.getBoundingClientRect().height),
+        fold: body === null ? '' : body.getAttribute('data-dsh-scard-fold') ?? '',
+        ellipsis: content.querySelector('[data-dsh-scard="ellipsis"]') !== null,
+        expand: card.querySelector('[data-dsh-scard="expand"]') !== null,
+      }
+      if (!Number.isFinite(max) || item.clientHeight > 162 || item.fold !== 'toggle' || !item.ellipsis || !item.expand) flat.push(item)
+      else folded.push(item)
+    }
+    return { foldedCount: folded.length, flatCards: flat, folded }
+  })
+  check('折叠生效率 100%：页面上每张内容超过固定上限的卡都收在 ≤162px 正文区（整卡高 ≤320px、带…标记与「展开全文」），没有一张整段平铺',
+    foldEffectiveness.foldedCount > 0 && foldEffectiveness.flatCards.length === 0
+      && foldEffectiveness.folded.every((item) => item.maxHeight <= 162 && item.cardHeight <= 320),
+    JSON.stringify({ foldedCount: foldEffectiveness.foldedCount, flatCards: foldEffectiveness.flatCards, sample: foldEffectiveness.folded.slice(0, 3) }))
   check('朗读按钮不再出现在底部', scard.footReadCount === 0, JSON.stringify({ footReadCount: scard.footReadCount }))
   check('移动端时间仍然显示（换脚部顺序后不许丢时间）、卡片不横向溢出、朗读按钮仍在右上角',
     scard.timeDisplay !== 'none' && scard.hasButton && scard.btnIsLast && scard.btnRightGap >= 15
@@ -908,6 +984,9 @@ try {
       aria: el.querySelector('[data-dsh-scard="body"]')?.getAttribute('aria-expanded') ?? '',
       height: el.querySelector('[data-dsh-scard="content"]').clientHeight,
       maxHeight: getComputedStyle(el.querySelector('[data-dsh-scard="content"]')).maxHeight,
+      titleClamp: (() => { const t = el.querySelector('[data-dsh-scard="title"]'); return t === null ? 'none' : getComputedStyle(t).webkitLineClamp })(),
+      titleMaxHeight: (() => { const t = el.querySelector('[data-dsh-scard="title"]'); return t === null ? '' : getComputedStyle(t).maxHeight })(),
+      titleClientHeight: (() => { const t = el.querySelector('[data-dsh-scard="title"]'); return t === null ? 0 : t.clientHeight })(),
       ellipsis: el.querySelector('[data-dsh-scard="content"] [data-dsh-scard="ellipsis"]') !== null,
       text: el.querySelector('[data-dsh-scard="expand-text"]')?.textContent ?? '',
       speakPressed: el.querySelector('[data-dsh-speak="button"]')?.getAttribute('aria-pressed') ?? '',
@@ -929,6 +1008,9 @@ try {
       open: el.getAttribute('data-open'),
       aria: el.querySelector('[data-dsh-scard="body"]')?.getAttribute('aria-expanded') ?? '',
       maxHeight: getComputedStyle(el.querySelector('[data-dsh-scard="content"]')).maxHeight,
+      titleClamp: (() => { const t = el.querySelector('[data-dsh-scard="title"]'); return t === null ? 'none' : getComputedStyle(t).webkitLineClamp })(),
+      titleMaxHeight: (() => { const t = el.querySelector('[data-dsh-scard="title"]'); return t === null ? '' : getComputedStyle(t).maxHeight })(),
+      titleClientHeight: (() => { const t = el.querySelector('[data-dsh-scard="title"]'); return t === null ? 0 : t.clientHeight })(),
       ellipsis: el.querySelector('[data-dsh-scard="content"] [data-dsh-scard="ellipsis"]') !== null,
       text: el.querySelector('[data-dsh-scard="expand-text"]')?.textContent ?? '',
     }))
@@ -942,11 +1024,19 @@ try {
       aria: el.querySelector('[data-dsh-scard="expand"]')?.getAttribute('aria-expanded') ?? '',
       text: el.querySelector('[data-dsh-scard="expand-text"]')?.textContent ?? '',
       bodyMaxHeight: getComputedStyle(el.querySelector('[data-dsh-scard="content"]')).maxHeight,
+      titleClamp: (() => { const t = el.querySelector('[data-dsh-scard="title"]'); return t === null ? 'none' : getComputedStyle(t).webkitLineClamp })(),
+      titleMaxHeight: (() => { const t = el.querySelector('[data-dsh-scard="title"]'); return t === null ? '' : getComputedStyle(t).maxHeight })(),
+      titleClientHeight: (() => { const t = el.querySelector('[data-dsh-scard="title"]'); return t === null ? 0 : t.clientHeight })(),
+      titleScrollHeight: (() => { const t = el.querySelector('[data-dsh-scard="title"]'); return t === null ? 0 : t.scrollHeight })(),
       arrowTransform: getComputedStyle(el.querySelector('[data-dsh-scard="expand-arrow"]')).transform,
     }))
     check('展开全文按钮独立 work：aria-expanded 切换、文案变「收起」、箭头旋转、max-height 变 none',
       expanded.open === '1' && expanded.aria === 'true' && expanded.text === '收起' && expanded.bodyMaxHeight === 'none'
         && expanded.arrowTransform.includes('-1'), JSON.stringify(expanded))
+    // 展开态必须放开标题行夹（长标题的其余行这时才看得到）
+    check('展开态放开卡标题行夹（clamp 变 none、max-height 放开、标题露出更多行）',
+      expanded.titleClamp === 'none' && expanded.titleMaxHeight === 'none' && expanded.titleClientHeight >= expanded.titleScrollHeight - 1,
+      JSON.stringify({ clamp: expanded.titleClamp, maxHeight: expanded.titleMaxHeight, clientH: expanded.titleClientHeight, scrollH: expanded.titleScrollHeight }))
     await expandCard.locator('[data-dsh-scard="expand"]').click()
     await page.waitForTimeout(400)
     const collapsed = await expandCard.evaluate((el) => ({
@@ -954,9 +1044,13 @@ try {
       aria: el.querySelector('[data-dsh-scard="body"]')?.getAttribute('aria-expanded') ?? '',
       text: el.querySelector('[data-dsh-scard="expand-text"]')?.textContent ?? '',
       maxHeight: getComputedStyle(el.querySelector('[data-dsh-scard="content"]')).maxHeight,
+      titleClamp: (() => { const t = el.querySelector('[data-dsh-scard="title"]'); return t === null ? 'none' : getComputedStyle(t).webkitLineClamp })(),
+      titleMaxHeight: (() => { const t = el.querySelector('[data-dsh-scard="title"]'); return t === null ? '' : getComputedStyle(t).maxHeight })(),
     }))
     check('收起后卡体与按钮状态一致（折叠态、aria-expanded=false、文案「展开全文」、max-height 数值回来）',
       collapsed.open === '0' && collapsed.aria === 'false' && collapsed.text === '展开全文' && collapsed.maxHeight.endsWith('px'), JSON.stringify(collapsed))
+    check('收起后标题行夹回到 2 行上限（折叠与展开两种状态都有明确固定高度）',
+      collapsed.open === '0' && collapsed.titleClamp === '2' && collapsed.titleMaxHeight.endsWith('px'), JSON.stringify({ clamp: collapsed.titleClamp, maxHeight: collapsed.titleMaxHeight }))
     // 键盘：卡体获得焦点后 Enter 也能切换（先展开、再收起）
     const bodyHandle = expandCard.locator('[data-dsh-scard="body"]')
     await bodyHandle.focus()

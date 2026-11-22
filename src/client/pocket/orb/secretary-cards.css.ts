@@ -228,6 +228,36 @@ body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard=
   overflow: hidden;
   transition: max-height 160ms ease;
 }
+/* 正文块一律不许被 flex 压缩：折叠态的裁剪要靠 overflow:hidden 切在行尾，
+   不是把块挤成 0 高（实测 flex-shrink 默认 1 会让 -webkit-box 的标题块塌成 0 高）。 */
+[data-dsh-scard="content"] > [data-dsh-scard="title"],
+[data-dsh-scard="content"] > [data-dsh-scard="para"],
+[data-dsh-scard="content"] > [data-dsh-scard="ref"] {
+  flex: 0 0 auto;
+}
+/* 折叠态固定高度（2026-11-22 修「长卡整段平铺」）：
+   1) 卡标题先被行夹裁到 2 行 —— 现网实测旧口径把整段首段（230–255px）全部露出，折叠 max-height 涨到 321–346px；
+   2) 正文区有一条**首帧就生效**的上限（标题 2 行 51px + 间距 10px + 正文 3 行 81px + 两个块间距 20px = 162px，
+      与 foldCollapsedCapPx 同一个数），JS 量完落点后写进行内样式覆盖它；没溢出就写 maxHeight:none 显式放开。
+      这条兜底专门治「测量发生在布局稳定前」的现网时序：卡片刚挂载那一帧不再整段平铺。 */
+[data-dsh-scard="card"]:not([data-open="1"]) [data-dsh-scard="title"] {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  max-height: calc(1.5em * 2); /* 标题 17px / 1.5 → 两行 51px；按行高算，不看字符数 */
+  overflow: hidden;
+}
+[data-dsh-scard="card"]:not([data-open="1"]) [data-dsh-scard="content"] {
+  max-height: var(--dsh-card-fold-cap, 162px);
+}
+[data-dsh-scard="card"][data-open="1"] [data-dsh-scard="title"] {
+  display: block;
+  -webkit-line-clamp: none;
+  line-clamp: none;
+  max-height: none;
+  overflow: visible;
+}
 [data-dsh-scard="card"][data-open="1"] [data-dsh-scard="content"] {
   max-height: none !important;
   overflow: visible;

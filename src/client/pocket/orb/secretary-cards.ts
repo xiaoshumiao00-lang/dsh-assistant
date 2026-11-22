@@ -12,7 +12,8 @@
  *      默认每条卡片出现后自动朗读；单击暂停/继续；长按从头重读；换卡片停上一条。
  *      **只用宿主 /api/assistant/tts（微软 edge-tts），不用 speechSynthesis。**
  *   4. 卡片脚部时间（2026-11-21 改动）：只写时间（`9:08`），不再带「今天」字样。
- *   5. 折叠预算：折叠态正文最多 **3 行**（见 FOLD_BODY_LINE_BUDGET，三种卡共用一套）。
+ *   5. 折叠预算：折叠态正文最多 **3 行**、卡标题最多 **2 行**（见 FOLD_BODY_LINE_BUDGET / FOLD_TITLE_LINE_BUDGET，
+ *      三种卡共用一套；判据一律是内容高度，不看字符数）。
  *   6. 秘书页 user 角色行分类：真实用户输入 → 冷蓝用户卡；插件塞进来的合成通知 → 灰底通知卡
  *      （见 collectSecretaryCardRows / parseNoticeCardBody）。
  *   7. 已读卡集合（未读红点）：cardKey 沿用朗读 key（`assistant:` / `notice:` 前缀那套），
@@ -690,16 +691,27 @@ export const CARD_KIND_USER = 'user'
 export const CARD_KIND_NOTICE = 'notice'
 
 /**
- * 折叠态正文预算（2026-11-21 用户改需求）：三种卡共用，折叠态最多 **3 行正文**（不是 3 个内容块）。
- * 卡标题（17px）与要点行里的行内标签不占这 3 行的预算，正文按行高切，超出部分打省略标记。
+ * 折叠态预算（2026-11-22 用户实测反馈改口径）：三种卡共用，折叠态最多 **3 行正文**（不是 3 个内容块）。
+ *
+ * 旧口径是「卡标题不参与预算、永远露出」——手机上一条长回复的整段首段会被排版成 230–255px 的标题块，
+ * 于是折叠落点变成「首段全部 + 3 行正文」：现网实测 max-height 321–346px、卡高 456–481px（844px 高的
+ * 手机 WebView 里就是「整段平铺、占满屏」）。还有更糟的：整条回复只有一段连续文字时正文块只剩标题一个，
+ * 旧算法 `bodyBlocks.length === 0` 直接判「不溢出」→ 完全没有折叠、连「展开全文」入口都不渲染。
+ *
+ * 新口径：卡标题也进预算（最多 2 行，超出被自己裁掉），折叠高度由此固定；判据全部是**内容高度**
+ * （offsetTop / offsetHeight / scrollHeight），不在任何地方按字符数算，字号或行高变了也稳。
  */
 export const FOLD_BODY_LINE_BUDGET = 3
+/** 折叠态卡标题最多几行（超出被行夹裁掉，展开态整段放开）。 */
+export const FOLD_TITLE_LINE_BUDGET = 2
 /** 卡片内正文块之间的距离（与 CSS 的 content gap 一致）。 */
 export const FOLD_BLOCK_GAP = 10
+/** 行高量不出来时的兜底行高（正文 15px / 1.8 = 27px）：量不到也必须折叠，绝不留下平铺状态。 */
+export const FOLD_FALLBACK_LINE_HEIGHT_PX = 27
 
 /** 一个正文块在卡片正文里的位置（offsetTop）与高度（offsetHeight）——浏览器量的，纯函数只管算术。 */
 export interface FoldBlockBox {
-  /** title = 卡标题（17px，不占正文行数预算、永远露出）；para = 正文段落；ref = 会话引用 chip。 */
+  /** title = 卡标题（折叠态最多 2 行，也计入预算）；para = 正文段落；ref = 会话引用 chip。 */
   kind: 'title' | 'para' | 'ref'
   top: number
   height: number
@@ -708,58 +720,118 @@ export interface FoldBlockBox {
 export interface FoldGeometryOut {
   /** 折叠态正文的 max-height（px）；不溢出就是 undefined（正文自然高度）。 */
   collapsedMaxHeight: number | undefined
-  /** 正文是不是被 `budget` 行切掉了（决定「…」省略标记与「展开全文」入口）。 */
+  /** 正文是不是被预算切掉了（决定「…」省略标记与「展开全文」入口）。 */
   overflow: boolean
   /** 折叠态实际露出的正文行数（<= budget）。 */
   bodyLines: number
   /** 切掉的行箱落点（px）；未溢出时 = 自然高度。 */
   clip: number
+  /** 这张卡折叠态的固定上限（px）：标题行数 + 正文行数 + 块间距，测量退化时也用它兜底。 */
+  cap: number
+}
+
+/**
+ * 折叠态固定上限（纯算术，CSS 兜底与测试都引用这一个数）：
+ *   有标题：`titleBudget * 标题行高 + gap + budget * 正文行高 + gap * (budget - 1)`
+ *   没标题（用户卡只有段落）：`budget * 正文行高 + gap * (budget - 1)`
+ * 现网标准字号（标题 17px/1.5、正文 15px/1.8）→ 51 + 10 + 81 + 20 = **162px**。
+ */
+export function foldCollapsedCapPx(input: {
+  lineHeight: number
+  titleLineHeight?: number
+  hasTitle?: boolean
+  budget?: number
+  titleBudget?: number
+  gap?: number
+}): number {
+  const budget = Math.max(1, Number(input.budget ?? FOLD_BODY_LINE_BUDGET))
+  const titleBudget = Math.max(1, Number(input.titleBudget ?? FOLD_TITLE_LINE_BUDGET))
+  const gap = Math.max(0, Number(input.gap ?? FOLD_BLOCK_GAP))
+  const lineHeightRaw = Number(input.lineHeight)
+  const lineHeight = Number.isFinite(lineHeightRaw) && lineHeightRaw > 0 ? lineHeightRaw : FOLD_FALLBACK_LINE_HEIGHT_PX
+  const titleLineRaw = Number(input.titleLineHeight)
+  const titleLine = Number.isFinite(titleLineRaw) && titleLineRaw > 0 ? titleLineRaw : lineHeight
+  const bodyPart = budget * lineHeight + gap * (budget - 1)
+  const titlePart = input.hasTitle === true ? titleBudget * titleLine + gap : 0
+  return Math.max(1, Math.round(titlePart + bodyPart))
+}
+
+/**
+ * 折叠落点 → 卡体内联样式（三种卡共用一套，纯函数，测试直接验它）：
+ *   - 展开态：显式放开（CSS 里也有一条 `max-height:none !important`）；
+ *   - **还没量过**：什么都不写，让 CSS 那条首帧固定上限（162px）先顶住，卡片挂载到测量之间的那一帧不会整段平铺；
+ *   - 量过且判定不溢出：显式写 none 放开，盖掉 CSS 的首帧上限（短卡就该整张显示）。
+ */
+export function cardFoldStyle(open: boolean, measured: boolean, collapsedMaxHeight: number | undefined): { maxHeight: string } | undefined {
+  if (open) return { maxHeight: 'none' }
+  if (!measured) return undefined
+  if (collapsedMaxHeight === undefined) return { maxHeight: 'none' }
+  return { maxHeight: `${collapsedMaxHeight}px` }
 }
 
 /**
  * 折叠几何（三种卡共用一套算术，浏览器只负责量块的位置，算法在这里）：
- *   - 卡标题不参与 3 行预算、永远露出；
+ *   - 卡标题按自己的行高进预算（最多 titleBudget 行，落点停在第 titleBudget 行的行尾）；
  *   - 段落按行高累加，落点正好停在第 `budget` 行的行尾，绝不切出半行字；
  *   - 引用 chip 算一整块（不可切一半）；
- *   - 块与块之间的距离按 top 天然算进高度。
+ *   - 块与块之间的距离按 top 天然算进高度，落点再由 `foldCollapsedCapPx` 封顶；
+ *   - `titleClippedHidden`：标题被 CSS 行夹裁掉但 scrollHeight 还留着全文 → 这种卡必须折叠。
  */
 export function foldClipFromBlocks(input: {
   blocks: readonly FoldBlockBox[]
   naturalHeight: number
   lineHeight: number
+  titleLineHeight?: number
+  titleClippedHidden?: boolean
   budget?: number
+  titleBudget?: number
 }): FoldGeometryOut {
   const budget = Math.max(1, Number(input.budget ?? FOLD_BODY_LINE_BUDGET))
-  const lineHeight = Number(input.lineHeight)
+  const titleBudget = Math.max(1, Number(input.titleBudget ?? FOLD_TITLE_LINE_BUDGET))
+  const lineHeightRaw = Number(input.lineHeight)
+  // 行高量不出来（字体还没落、块被宿主藏起来）也要按兜底行高折叠，不许因为量不到就平铺
+  const lineHeight = Number.isFinite(lineHeightRaw) && lineHeightRaw > 0 ? lineHeightRaw : FOLD_FALLBACK_LINE_HEIGHT_PX
+  const titleLineRaw = Number(input.titleLineHeight)
+  const titleLine = Number.isFinite(titleLineRaw) && titleLineRaw > 0 ? titleLineRaw : lineHeight
   const natural = Math.max(1, Math.round(Number(input.naturalHeight) || 1))
-  if (!Number.isFinite(lineHeight) || lineHeight <= 0) {
-    return { collapsedMaxHeight: undefined, overflow: false, bodyLines: 0, clip: natural }
-  }
-  const bodyBlocks = input.blocks.filter((block) => block.kind !== 'title')
-  if (bodyBlocks.length === 0) return { collapsedMaxHeight: undefined, overflow: false, bodyLines: 0, clip: natural }
+  const hasTitle = input.blocks.some((block) => block.kind === 'title')
+  const cap = foldCollapsedCapPx({ lineHeight, titleLineHeight: titleLine, hasTitle, budget, titleBudget })
+  if (input.blocks.length === 0) return { collapsedMaxHeight: undefined, overflow: false, bodyLines: 0, clip: natural, cap }
 
-  let running = 0
+  let bodyLines = 0
+  let titleLines = 0
   let lastBottom = 0
   let clip: number | undefined
-  for (const block of bodyBlocks) {
+  for (const block of input.blocks) {
+    const isTitle = block.kind === 'title'
+    const unit = isTitle ? titleLine : lineHeight
     const top = Math.max(0, Math.round(block.top))
-    const height = Math.max(1, Math.round(block.height || lineHeight))
-    const lines = block.kind === 'ref' ? 1 : Math.max(1, Math.round(height / lineHeight))
-    const remaining = budget - running
-    if (remaining <= 0) { clip = lastBottom; break }
+    const height = Math.max(1, Math.round(block.height || unit))
+    const lines = block.kind === 'ref' ? 1 : Math.max(1, Math.round(height / unit))
+    const allowance = isTitle ? titleBudget : budget
+    const used = isTitle ? titleLines : bodyLines
+    const remaining = allowance - used
+    if (remaining <= 0) { clip = lastBottom > 0 ? lastBottom : top; break }
     if (lines <= remaining) {
-      running += lines
+      if (isTitle) titleLines += lines
+      else bodyLines += lines
       lastBottom = top + height
       continue
     }
-    clip = top + remaining * lineHeight
-    running = budget
+    clip = top + remaining * unit
+    if (isTitle) titleLines = allowance
+    else bodyLines = allowance
     break
   }
-  if (clip === undefined) return { collapsedMaxHeight: undefined, overflow: false, bodyLines: running, clip: natural }
-  const maxHeight = Math.max(1, Math.min(Math.round(clip), natural))
-  const overflow = maxHeight < natural - 1
-  return { collapsedMaxHeight: overflow ? maxHeight : undefined, overflow, bodyLines: running, clip: maxHeight }
+  const titleClipped = input.titleClippedHidden === true
+  if (clip === undefined) {
+    // 全部块都放得下：只有「标题被行夹裁掉」这一种情况还得折叠（长卡只有首段的极端情形）
+    if (!titleClipped) return { collapsedMaxHeight: undefined, overflow: false, bodyLines, clip: natural, cap }
+    clip = lastBottom > 0 ? lastBottom : cap
+  }
+  const maxHeight = Math.max(1, Math.min(Math.round(clip), cap, natural))
+  const overflow = maxHeight < natural - 1 || titleClipped
+  return { collapsedMaxHeight: overflow ? maxHeight : undefined, overflow, bodyLines, clip: maxHeight, cap }
 }
 
 
@@ -1411,7 +1483,10 @@ export const secretaryCardsTestSurface = {
   CARD_KIND_USER,
   CARD_KIND_NOTICE,
   FOLD_BODY_LINE_BUDGET,
+  FOLD_TITLE_LINE_BUDGET,
   FOLD_BLOCK_GAP,
+  FOLD_FALLBACK_LINE_HEIGHT_PX,
+  foldCollapsedCapPx,
   isSyntheticNoticeUserText,
   stripNoticeSyntheticHead,
   parseNoticeCardBody,
@@ -1424,6 +1499,7 @@ export const secretaryCardsTestSurface = {
   collectSecretaryCardRows,
   collectSecretaryCardElements,
   foldClipFromBlocks,
+  cardFoldStyle,
   ASSISTANT_SECRETARY_READ_ROUTE,
   READ_STORAGE_PREFIX,
   MAX_READ_KEYS,

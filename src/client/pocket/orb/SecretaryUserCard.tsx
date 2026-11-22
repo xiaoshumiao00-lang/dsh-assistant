@@ -19,13 +19,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
-  CopyAnswerButton, ExpandCollapseButton, inlineAnswerText, measureFoldClip, turnEndTime, useCardFoldRegion,
+  CopyAnswerButton, ExpandCollapseButton, inlineAnswerText, turnEndTime, useCardFoldMeasure, useCardFoldRegion,
   useSecretaryReadState,
 } from './SecretaryReplyCard.tsx'
 import { CollapsedSecretaryCard, useSecretaryCardWindow, useSecretaryPagerVersion } from './SecretaryCollapsedCard.tsx'
 import { SecretarySpeakButton } from './SecretarySpeakButton.tsx'
 import {
-  assistantCardSpeechKey, buildSecretaryPagerCards, CARD_KIND_NOTICE, CARD_KIND_USER, collectSecretaryCardRows, formatClock,
+  assistantCardSpeechKey, buildSecretaryPagerCards, CARD_KIND_NOTICE, CARD_KIND_USER, cardFoldStyle, collectSecretaryCardRows, formatClock,
   noticeCardSpeechKey, parseNoticeCardBody, parseSessionRefs, parseUserCardBody, secretaryPager, stripSessionRefs,
   userCardSpeechKey, EARLIER_HINT_TEXT, SCROLL_TOP_THRESHOLD_PX, scrollAnchorTopPatch, shouldExpandOnScroll,
   type PagerDomCard, type SecretaryCardRow,
@@ -94,8 +94,6 @@ function toEpoch(clockText: string): string {
 function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbApi }): any {
   const contentRef = useRef<HTMLDivElement | null>(null)
   const [open, setOpen] = useState(false)
-  const [overflow, setOverflow] = useState(false)
-  const [collapsedMaxHeight, setCollapsedMaxHeight] = useState<number | undefined>(undefined)
   const notice = row.kind === CARD_KIND_NOTICE
   const speechKey = notice ? noticeCardSpeechKey(row.key, row.turnNo) : userCardSpeechKey(row.key, row.turnNo)
   const readKey = notice ? speechKey : ''
@@ -110,36 +108,8 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
   const unread = notice && readKey !== '' && !readState.isRead(readKey)
   const timeText = cardTimeText(row)
 
-  useEffect(() => {
-    const el = contentRef.current
-    if (el === null) return
-    const measure = (): void => {
-      const geometry = measureFoldClip(el)
-      setCollapsedMaxHeight(geometry.collapsedMaxHeight)
-      setOverflow(geometry.overflow)
-    }
-    measure()
-    const timer = window.setTimeout(measure, RESCAN_DELAY_MS)
-    const onResize = (): void => measure()
-    window.addEventListener('resize', onResize)
-    // 同上：正文一变就重新量折叠落点，宿主轮次文字改写后不许留过期 max-height
-    let frame = 0
-    const remeasure = (): void => {
-      if (frame !== 0) return
-      frame = window.requestAnimationFrame(() => { frame = 0; measure() })
-    }
-    const mutationObserver = new MutationObserver(remeasure)
-    mutationObserver.observe(el, { childList: true, subtree: true, characterData: true })
-    const resizeObserver = new ResizeObserver(remeasure)
-    resizeObserver.observe(el)
-    return () => {
-      window.clearTimeout(timer)
-      window.removeEventListener('resize', onResize)
-      if (frame !== 0) window.cancelAnimationFrame(frame)
-      mutationObserver.disconnect()
-      resizeObserver.disconnect()
-    }
-  }, [open, row.text, blocks.paragraphs.length, refs.length])
+  // 折叠态：与秘书回复卡共用同一套测量与补测（正文最多 3 行、卡标题最多 2 行、固定高度）
+  const { overflow, collapsedMaxHeight, measured } = useCardFoldMeasure(contentRef, true, open, `${row.text}|${blocks.paragraphs.length}|${refs.length}`)
 
   const markRead = (): void => { if (readKey !== '') readState.markRead(readKey) }
   const toggle = (): void => { setOpen((value) => !value); markRead() }
@@ -159,7 +129,8 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
       />
     )
   }
-  const bodyStyle = open ? undefined : (collapsedMaxHeight === undefined ? undefined : { maxHeight: `${collapsedMaxHeight}px` })
+  // 折叠落点 → 内联样式（与秘书回复卡共用 cardFoldStyle：测量前不放开、没溢出才放开）
+  const bodyStyle = cardFoldStyle(open, measured, collapsedMaxHeight)
 
   return (
     <article

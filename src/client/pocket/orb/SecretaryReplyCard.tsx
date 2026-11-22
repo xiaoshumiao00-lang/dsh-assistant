@@ -4,7 +4,7 @@
  * 结构（自上而下）：
  *   1. 未读红点：只在「这条卡没被朗读过、也没被点过/复制过」时出现（8px #D83A2B，卡头顶边、标识组左侧）；
  *   2. 头部：左 32px 紫色四角星助手标识、名称「个人秘书」、身份标签「AI 助手」；右只有一个 34px 朗读按钮；
- *   3. 正文：**折叠态最多 3 行正文**（超出部分打「…」省略标记，不用渐变遮罩）；17px 结论标题 + 15px/1.8 正文段落；
+ *   3. 正文：**折叠态固定高度 = 最多 2 行卡标题 + 最多 3 行正文**（超出打「…」省略标记 + 「展开全文」入口，不用渐变遮罩）；17px 结论标题 + 15px/1.8 正文段落；
  *      模型名自动渲染成浅紫等宽行内标签；会话引用渲染成可点击 chip；
  *   4. 卡体正文区域本身可点击/可键盘切换（Enter/Space）展开与收起：role=button + aria-expanded，
  *      内部那颗朗读/复制/展开全文按钮与引用 chip 都 stopPropagation，点卡体不会触发它们；
@@ -14,12 +14,12 @@
  * TTS 状态机不变：换卡停上一条、单击暂停/继续、长按 600ms 从头重读。
  * 已读判据：这条卡被朗读过（含自动朗读，成功或被中断都算）或用户点过卡体/展开全文/复制 → 立刻写进已读集合。
  */
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useEffect, useRef, useState, useSyncExternalStore, type RefObject } from 'react'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
 import {
-  answerInlineTokens, assistantCardSpeechKey, collectTurnText, foldClipFromBlocks, formatClock, latestReplyTurnNo, parseAnswerBody,
+  answerInlineTokens, assistantCardSpeechKey, collectTurnText, foldClipFromBlocks, foldCollapsedCapPx, formatClock, latestReplyTurnNo, parseAnswerBody,
   parseSessionRefs, stripSessionRefs, normalizeForSpeech, secretaryReadStore,
-  CARD_KIND_ASSISTANT, FOLD_BODY_LINE_BUDGET, FOLD_BLOCK_GAP,
+  CARD_KIND_ASSISTANT, FOLD_BODY_LINE_BUDGET, FOLD_BLOCK_GAP, FOLD_TITLE_LINE_BUDGET, FOLD_FALLBACK_LINE_HEIGHT_PX, cardFoldStyle,
   type FoldBlockBox, type FoldGeometryOut,
 } from './secretary-cards.ts'
 import { secretarySpeech } from './secretary-speech.ts'
@@ -147,18 +147,94 @@ export function blockLineHeightPx(el: HTMLElement): number {
 /** 折叠几何输出直接沿用 secretary-cards.ts 的那套（避免两套定义漂移）。 */
 export type FoldGeometry = FoldGeometryOut
 
-/** 从 DOM 量出正文块的位置与高度，算术全交给 secretary-cards.ts 的 foldClipFromBlocks（测试也直接验它）。 */
+/**
+ * 从 DOM 量出正文块的位置与高度，算术全交给 secretary-cards.ts 的 foldClipFromBlocks（测试也直接验它）。
+ *
+ * 判据一律是**内容高度**（offsetTop / offsetHeight / scrollHeight），绝不按字符数算：字号或行高变了也稳。
+ * 卡标题也进折叠预算（最多 2 行）：现网实测旧口径让长卡的折叠落点随首段行数膨胀（321–346px / 卡高 456–481px）。
+ * 标题被 CSS 行夹裁过时，`titleEl.scrollHeight > titleEl.clientHeight` 就是「还有文字被藏着」的判据，
+ * 这类卡（整条回复只有一段连续文字）也必须折叠——旧实现这时会判成「不溢出」，卡片整段平铺。
+ */
 export function measureFoldClip(contentEl: HTMLElement, budget: number = FOLD_BODY_LINE_BUDGET): FoldGeometry {
   const blocks = [...contentEl.querySelectorAll('[data-dsh-scard="title"], [data-dsh-scard="para"], [data-dsh-scard="ref"]')] as HTMLElement[]
+  const titleEl = blocks.find((el) => el.getAttribute('data-dsh-scard') === 'title') ?? null
   const bodyEls = blocks.filter((el) => el.getAttribute('data-dsh-scard') !== 'title')
   const natural = Math.max(1, contentEl.scrollHeight)
-  if (bodyEls.length === 0) return { collapsedMaxHeight: undefined, overflow: false, bodyLines: 0, clip: natural }
+  if (blocks.length === 0) {
+    // 正文区还挂着但块没到位（测量早于布局稳定）：按固定上限折叠，绝不留下平铺状态
+    const cap = foldCollapsedCapPx({ lineHeight: FOLD_FALLBACK_LINE_HEIGHT_PX, hasTitle: false })
+    return { collapsedMaxHeight: cap, overflow: natural > cap, bodyLines: 0, clip: cap, cap }
+  }
+  const lineHeight = blockLineHeightPx(bodyEls[0] ?? titleEl ?? contentEl)
+  const titleLineHeight = titleEl !== null ? blockLineHeightPx(titleEl) : lineHeight
   const boxes: FoldBlockBox[] = blocks.map((el) => ({
     kind: String(el.getAttribute('data-dsh-scard')) as 'title' | 'para' | 'ref',
     top: el.offsetTop,
     height: el.offsetHeight,
   }))
-  return foldClipFromBlocks({ blocks: boxes, naturalHeight: natural, lineHeight: blockLineHeightPx(bodyEls[0]), budget })
+  const titleClippedHidden = titleEl !== null && titleEl.scrollHeight > titleEl.clientHeight + 1
+  return foldClipFromBlocks({ blocks: boxes, naturalHeight: natural, lineHeight, titleLineHeight, titleClippedHidden, budget })
+}
+
+/** 首帧之后再补测几次：现网卡片是「paint 完才 useEffect 测量」，手机 WebView 上布局可能晚一帧才稳定。 */
+const FOLD_MEASURE_RETRY_DELAYS_MS = [100, 400, 1200, 2500]
+/** 收正文的补读时点（与补测量同源同口径）：投影/分页/流式收尾晚到时也不留下「只读到一半」的卡。 */
+const TEXT_READ_RETRY_DELAYS_MS = [100, 400, 1200, 2500]
+
+/**
+ * 折叠测量（三种卡共用一套实现）：正文一变就重新量，字体落完再量一次，
+ * 布局晚到的卡也不会留下「测量发生在布局稳定前」的过期不折叠状态。
+ */
+export function useCardFoldMeasure(contentRef: RefObject<HTMLDivElement | null>, active: boolean, open: boolean, signature: string) {
+  const [overflow, setOverflow] = useState(false)
+  const [collapsedMaxHeight, setCollapsedMaxHeight] = useState<number | undefined>(undefined)
+  // 没量过之前不许把折叠上限写成「放开」：CSS 那条首帧固定上限（--dsh-card-fold-cap，162px）要先顶住，
+  // 否则卡片挂载到 effect 测量之间的那一帧就是整段平铺（实测现网长卡首帧 748–856px）。
+  const [measured, setMeasured] = useState(false)
+
+  useEffect(() => {
+    const el = contentRef.current
+    if (!active || open || el === null) return
+    let alive = true
+    const measure = (): void => {
+      if (!alive) return
+      const geometry = measureFoldClip(el)
+      setOverflow(geometry.overflow)
+      setCollapsedMaxHeight(geometry.collapsedMaxHeight)
+      setMeasured(true)
+    }
+    measure()
+    const timers = FOLD_MEASURE_RETRY_DELAYS_MS.map((ms) => window.setTimeout(measure, ms))
+    const onResize = (): void => measure()
+    window.addEventListener('resize', onResize)
+    // webfont / 系统字体后落会改行高与换行：等 ready 再重测一次
+    const fonts = (typeof document !== 'undefined' ? document.fonts : undefined) as { ready?: Promise<unknown> } | undefined
+    if (fonts?.ready instanceof Promise) void fonts.ready.then(() => measure()).catch(() => { /* 字体 API 不支持就靠补测兜底 */ })
+    // 宿主轮次文字会边走边变（streaming/收尾重写）：正文一变就重新量，绝不留下过期的折叠落点
+    // （实测过期状态：max-height 245px 但正文只有 211px → 没有真截断却还挂着「…」标记）。
+    let frame = 0
+    const remeasure = (): void => {
+      if (frame !== 0) return
+      frame = window.requestAnimationFrame(() => { frame = 0; measure() })
+    }
+    const mutationObserver = new MutationObserver(remeasure)
+    // 观察卡体（正文区的父节点）而不只是正文区：宿主往这一轮里补节点时也要重测
+    const region = el.parentElement ?? el
+    mutationObserver.observe(region, { childList: true, subtree: true, characterData: true })
+    const resizeObserver = new ResizeObserver(remeasure)
+    resizeObserver.observe(el)
+    if (region !== el) resizeObserver.observe(region)
+    return () => {
+      alive = false
+      for (const timer of timers) window.clearTimeout(timer)
+      window.removeEventListener('resize', onResize)
+      if (frame !== 0) window.cancelAnimationFrame(frame)
+      mutationObserver.disconnect()
+      resizeObserver.disconnect()
+    }
+  }, [active, open, signature, contentRef])
+
+  return { overflow, collapsedMaxHeight, measured }
 }
 
 /** 卡体正文区域（可点击/可键盘展开收起）：三种卡共用同一套语义与手势。 */
@@ -229,8 +305,6 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
   const [turnNo, setTurnNo] = useState('')
   const [body, setBody] = useState('')
   const [open, setOpen] = useState(false)
-  const [overflow, setOverflow] = useState(false)
-  const [collapsedMaxHeight, setCollapsedMaxHeight] = useState<number | undefined>(undefined)
 
   useEffect(() => {
     if (!isSecretary) return
@@ -244,9 +318,23 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
       setBody(collectTurnText(document, no))
     }
     read()
-    // 尾节点与正文同帧挂载，但投影/分页可能晚一拍：400ms 后再读一次兜底
-    const timer = window.setTimeout(read, 400)
-    return () => { alive = false; window.clearTimeout(timer) }
+    // 尾节点与正文同帧挂载，但投影/分页/流式收尾可能晚一拍：补读几次，别只靠一次 400ms 兜底
+    const timers = TEXT_READ_RETRY_DELAYS_MS.map((ms) => window.setTimeout(read, ms))
+    // 宿主往这一轮里补写 assistant-step 文字时（streaming 收尾、投影改写）也重新收一次正文，
+    // 卡片正文与折叠落点才不会停在「只读到一半」的过期状态（纯读取 DOM，不写任何 turn 事件）。
+    const row = el.closest('[data-chat-turn]') ?? el.parentElement
+    let readFrame = 0
+    const mutationObserver = new MutationObserver(() => {
+      if (!alive || readFrame !== 0) return
+      readFrame = window.requestAnimationFrame(() => { readFrame = 0; read() })
+    })
+    if (row !== null) mutationObserver.observe(row, { childList: true, subtree: true, characterData: true })
+    return () => {
+      alive = false
+      for (const timer of timers) window.clearTimeout(timer)
+      if (readFrame !== 0) window.cancelAnimationFrame(readFrame)
+      mutationObserver.disconnect()
+    }
   }, [isSecretary])
 
   const key = assistantCardSpeechKey(turnNo)
@@ -269,39 +357,8 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
     readState.markRead(key)
   }, [isSecretary, turnNo, speechText, key, readState])
 
-  // 折叠态：正文最多 3 行；实际溢出靠 measureFoldClip 的落点判断，未溢出就不渲染省略标记与展开全文
-  useEffect(() => {
-    if (!isSecretary || display === '' || open) return
-    const el = mainRef.current
-    if (el === null) return
-    const measure = (): void => {
-      const geometry = measureFoldClip(el)
-      setCollapsedMaxHeight(geometry.collapsedMaxHeight)
-      setOverflow(geometry.overflow)
-    }
-    measure()
-    const timer = window.setTimeout(measure, 400)
-    const onResize = (): void => measure()
-    window.addEventListener('resize', onResize)
-    // 宿主轮次文字会边走边变（streaming/收尾重写）：正文一变就重新量，绝不留下过期的折叠落点
-    // （实测过期状态：max-height 245px 但正文只有 211px → 没有真截断却还挂着「…」标记）。
-    let frame = 0
-    const remeasure = (): void => {
-      if (frame !== 0) return
-      frame = window.requestAnimationFrame(() => { frame = 0; measure() })
-    }
-    const mutationObserver = new MutationObserver(remeasure)
-    mutationObserver.observe(el, { childList: true, subtree: true, characterData: true })
-    const resizeObserver = new ResizeObserver(remeasure)
-    resizeObserver.observe(el)
-    return () => {
-      window.clearTimeout(timer)
-      window.removeEventListener('resize', onResize)
-      if (frame !== 0) window.cancelAnimationFrame(frame)
-      mutationObserver.disconnect()
-      resizeObserver.disconnect()
-    }
-  }, [display, isSecretary, open, paragraphs.length, refs.length])
+  // 折叠态：正文最多 3 行、卡标题最多 2 行；溢出与落点都由 measureFoldClip 的落点判断，未溢出就不渲染省略标记与展开全文
+  const { overflow, collapsedMaxHeight, measured } = useCardFoldMeasure(mainRef, isSecretary && display !== '', open, `${display}|${paragraphs.length}|${refs.length}`)
 
   // 折叠区里的 hooks（useCardFoldRegion）必须在任何条件 return 之前调用：
   // 首帧正文为空 → 走到空壳 return，下一帧正文到位 → 走到完整 return，
@@ -310,7 +367,8 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
   const toggle = (): void => { setOpen((value) => !value); if (turnNo !== '') readState.markRead(key) }
   const { foldProps } = useCardFoldRegion(open, overflow, toggle)
   const timeText = formatClock(turnEndTime(turn))
-  const bodyStyle = open ? undefined : (collapsedMaxHeight === undefined ? undefined : { maxHeight: `${collapsedMaxHeight}px` })
+  // 折叠落点 → 内联样式（三种卡共用 cardFoldStyle：测量前不放开、没溢出才放开）
+  const bodyStyle = cardFoldStyle(open, measured, collapsedMaxHeight)
 
   if (!isSecretary) return null
   // 根节点必须无条件渲染（ref 要靠它定位轮次）；空壳由 CSS 整体隐藏（不输出占位条）

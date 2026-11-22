@@ -6,7 +6,7 @@
  *   内容主区挂    data-dsh-fold="main"   （flex:1、超出截断）
  *   底部信息行挂  data-dsh-fold="foot"   （flex:none，恒贴在卡片底部）
  *
- * 折叠态：正文最多 3 行（预算与落点由 SecretaryReplyCard.tsx 的 measureFoldClip 算出来挂成 max-height）；
+ * 折叠态：正文最多 3 行、卡标题最多 2 行（预算与落点由 SecretaryReplyCard.tsx 的 measureFoldClip 算出来挂成 max-height）；
  * 被切掉的行末尾打「…」省略标记（2026-11-21 改动：**不再用底部渐变遮罩**），展开态 height:auto 放全文。
  */
 export const FOLD_CARD_CSS = `
