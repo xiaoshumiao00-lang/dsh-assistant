@@ -455,7 +455,12 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   box-sizing: border-box;
   flex: 0 1 auto;
   min-width: 0;
-  max-width: min(360px, 52vw);
+  /* 宽度上限必须按「工具行自己的宽度」算，不能按视口算：宿主 InputBar 的 .row 是 flex-wrap:wrap，
+     而 .trailing 是 flex:none（整组不 shrink），flex-wrap 又是按每一项的假想宽度（content 宽度截到 max-width）决定换不行的——
+     桌面那次错位（715 宽窗口里「托管 + 提示 + 模型 + 发送」被顶到输入框工具行之下的独立一行）正是这么来的。
+     宿主 .row 带 container-type:inline-size，所以这里用 cqw 直接问那一行；同一行里另外那几件（+ / 仅可查看 / 托管 / 模型 / 发送 + gap）实测合计约 334px，
+     这里扣 340 留 6px 余量，下限 140px 是提示自己 min-content 的量，上限 420px 是宽桌面那种行里也不许占得太多的量。 */
+  max-width: clamp(140px, calc(100cqw - 340px), 420px);
   height: 30px;
   padding: 0 0 0 10px;
   background: var(--dsh-squote-wash);
@@ -517,6 +522,13 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 宿主那一行（.row 有 container-type:inline-size）窄到 720px 以下时，「· 卡片种类」这一截先收掉：
+   腾出来的宽度留给摘要——问的是那一行自己，不是浏览器视口，所以带侧栏的窄桌面窗也照得下。 */
+@container (max-width: 720px) {
+  [data-dsh-squote="meta-kind"] {
+    display: none;
+  }
 }
 /* 取消入口那颗 ×：与卡脚那棵复制/引用按钮完全同一规格（30×30、同 muted、同 8px 圆角、同 hover） */
 [data-dsh-squote="cancel"] {
@@ -712,9 +724,9 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   [data-dsh-scard="actions"] {
     flex-wrap: nowrap;
   }
-  /* 窄屏：引用提示别把模型胶囊与发送钮挤没（手机端还有粗指针那一档在上面） */
+  /* 窄屏：引用提示别把模型胶囊与发送钮挤没，也别把那一行顶成第二行（同样按那一行自己的宽度算） */
   [data-dsh-squote="chip"] {
-    max-width: min(300px, 58vw);
+    max-width: clamp(140px, calc(100cqw - 300px), 240px);
   }
 }
 
@@ -736,7 +748,7 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
  * 现场实测过一版：composer 卡片只有 380px 宽、那一行只留 278px，那颗提示只分到 164px，
  * 一行式布局会把「第 245 轮」和摘要拦腰截断（截图里就是那样）——手机上这一档改成自己换两行：
  * 第一行「带引用 + 第 N 轮」+ 那颗 × 顶到右边，第二行整行放那张卡正文开头一小段。
- * 高度 auto（至少 34px）、那颗 × 也 34×34 够点、摘要 14px、meta 13px，宽度上限 60%。 */
+ * 高度 auto（至少 34px）、那颗 × 也 34×34 够点、摘要 14px、meta 13px，宽度上限按那一行自己算（clamp/100cqw）。 */
 @media (pointer: coarse) {
   [data-dsh-squote="chip"] {
     height: auto;
@@ -748,7 +760,11 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
     padding: 4px 6px 4px 10px;
     font-size: 14px;
     line-height: 20px;
-    max-width: min(420px, 60vw);
+    /* 现场实测那一行只给得起 162px（那一行里另外那几件 + 权限胶囊 + 托管 + 模型 + 发送 + gap 实测合计 116px）：
+       扣 190 让上限落回 174px 这一量级（现场那 162px 由 flex 自己收到），下限 160px 比「带引用 + 第 N 轮 + ×」
+       那一行的实测量（42+51+34+gap 8+padding 16 = 151px）还留 9px 余量——低于这个就会自己换第三行、盒子长到 88px（现场跑测逮到过）；
+       上限 340px 留给 1080 宽那种手机 WebView。 */
+    max-width: clamp(160px, calc(100cqw - 190px), 340px);
   }
   [data-dsh-squote="flag"] {
     font-size: 14px;

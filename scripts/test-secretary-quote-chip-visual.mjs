@@ -9,14 +9,17 @@
  *   3. 没引用 = 页面上一个提示节点都没有（与 SecretaryQuoteChip 的 return null 同口径）；
  *   4. 样式数值与卡片脚部那两棵按钮同一套：8px 圆角、muted #8A9099、16px 图标、hover 换 text 色 + #FAFAFB 底；
  *   5. 手机端（含 pocket WebView 那种 1080 宽，判据 (pointer: coarse)）：提示自己换两行（盒子高 ≥ 34；现场实测那一行只给 164px 也照得下）：摘要 14px、× 34×34、
- *      「第 N 轮」这一段不许拦腰截、那颗引号图标在这一档收掉、× 仍在提示自己盒子边界内；宽度上限 60%，模型胶囊与发送钮照旧排得下（不挤没）；
+ *      「第 N 轮」这一段不许拦腰截、那颗引号图标在这一档收掉、× 仍在提示自己盒子边界内；宽度上限按那一行自己算（100cqw），模型胶囊与发送钮照旧排得下（不挤没）；
  *   6. 三种主题色跟着卡走：秘书回复卡紫、用户卡冷蓝、通知卡灰。
+ *   7. 桌面错位那一版（2026-11-23 用户实测「显示错位了」）：宿主那一行不许被顶成第二行——判据「那一行盒子高 < 工具组高 + 尾组高 + 20」+「两组纵向互相盖着」，
+ *      712 卡（用户那种 715 宽窗口，窄到 720 那一档「· 卡片种类」收掉只留「第 N 轮」）与 902 卡（宽桌面，整段露出来）两种挤法都验；提示还得贴着输入框（落在 editor 下方、那一行边界内）。
  *
  * 通过 = 退出码 0；截图：
  *   tmp-secretary-quote-chip.png（桌面输入框那一行）
  *   tmp-secretary-quote-chip-1080.png（1080 宽粗指针 = 手机 WebView 那一档）
  *   tmp-secretary-quote-chip-390.png（窄屏手机）
  *   tmp-secretary-quote-chip-idle.png（没引用时输入框那一行）
+ *   tmp-secretary-quote-chip-wide.png（902 卡那种宽桌面那一行）
  */
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -31,6 +34,7 @@ const SCREENSHOTS = {
   phone1080: join(ROOT, 'tmp-secretary-quote-chip-1080.png'),
   phone390: join(ROOT, 'tmp-secretary-quote-chip-390.png'),
   idle: join(ROOT, 'tmp-secretary-quote-chip-idle.png'),
+  wide: join(ROOT, 'tmp-secretary-quote-chip-wide.png'),
 }
 
 const failures = []
@@ -106,20 +110,36 @@ const chipMarkup = ({ flag, meta, preview, kind, key }) => {
   </div>`
 }
 
-const composerRow = (quoteNode) => `
-  <div data-phase="" data-composer-card="true" class="composer_row">
-    <div class="composer_leading"><button type="button" data-composer-plus-plus data-haspopup="listbox">+</button></div>
-    <div class="composer_trailing">
-      <div class="composer_input">输入框</div>
-      <button type="button" data-tuoguan-toggle>托管</button>
-      ${quoteNode}
-      <div class="composer_model_root"><button type="button" aria-haspopup="menu">模型</button></div>
-      <button type="button" data-composer-send>发送</button>
+/* 宿主 InputBar 那一行的真实骨架（数值照 app.asar 里 InputBar.module.css 取证抄的；桌面错位那一版就是照这条把口径改对的）：
+ *   .card > [overlayAnchor 绝对定位零高] [accessory] [conversation.input.attachments] [DraftEditor] .row [data-composer-dock]
+ *   .row { flex-wrap:wrap; justify-content:space-between; align-items:center; gap:12px; min-width:0; padding:2px 8px 6px; container-type:inline-size }
+ *   .tools / .modes / .trailing { align-items:center; min-width:0; display:flex }，.trailing { flex:none; gap:12px; margin-left:auto }
+ *   .standardControls { align-items:center; gap:12px; min-width:0; display:flex }  ← 槽位 conversation.input.right（托管胶囊 + 引用提示）+ conversation.input.model
+ * 错位的原因就写在上面这两条：提示条挂的槽位本身是合法的（conversation.input.right），但 .trailing 是 flex:none（整组不许 shrink），
+ * .row 又是 flex-wrap:wrap —— 提示条的假想宽度（max-content 截到 max-width）+ 托管 + 模型 + 发送 + gap 一旦超过 .row 宽度，
+ * flex-wrap 就把整组 .trailing 顶到第二行，「托管 · 提示 · 模型 · 发送」于是脱离输入框那一坨、落到 composer 底部。
+ * 修法：提示条的宽度上限按那一行自己算（100cqw），不按视口算。 */
+const composerMirror = (quoteNode) => `
+  <div data-composer-card="true" class="composer_card">
+    <div class="composer_editor">发消息或创建任务，/ 调用指令，@ 文件或对话</div>
+    <div class="composer_row">
+      <div class="composer_tools">
+        <button type="button" class="composer_add" aria-label="命令">+</button>
+        <div class="composer_modes"><button type="button" class="composer_permission">仅可查看</button></div>
+      </div>
+      <div class="composer_trailing">
+        <div class="composer_standardControls">
+          <button type="button" data-tuoguan-toggle>托管</button>
+          ${quoteNode}
+          <div class="composer_model_root">模型</div>
+        </div>
+        <button type="button" data-composer-send class="composer_send">发送</button>
+      </div>
     </div>
   </div>`
 
 /** 输入框那一行的引用提示：与 SecretaryQuoteChip 的 return null 同口径——没引用就一个节点都不出。 */
-async function render(mode) {
+async function render(mode, cardWidth = 712) {
   const quote = mode === 'idle'
     ? ''
     : mode === 'notice'
@@ -130,18 +150,24 @@ async function render(mode) {
   return `
     <style>${cardCss}</style>
     <style>
-      /* 宿主 composer 那一行的骨架（只够把布局撑起来，数值照宿主取证时的结构抄） */
-      [data-composer-card="true"] { width: 100%; max-width: 720px; margin: 0 auto; padding: 8px 10px; border: 0.5px solid #e5e6eb; border-radius: 12px; }
-      [data-composer-card="true"] > .composer_row { display: flex; gap: 8px; align-items: center; }
-      [data-composer-card="true"] > .composer_row > .composer_leading { flex: 0 0 auto; }
-      [data-composer-card="true"] > .composer_row > .composer_trailing { flex: 1 1 0; min-width: 0; display: flex; gap: 6px; align-items: center; justify-content: space-between; }
-      .composer_input { flex: 1 1 auto; min-width: 0; }
-      .composer_model_root { flex: 0 1 auto; min-width: 0; }
+      /* 宿主 composer 那一行的骨架（只够把布局撑起来，数值照取证时的结构抄） */
+      [data-composer-card="true"] { box-sizing: border-box; width: 100%; max-width: ${cardWidth}px; margin: 0 auto; border: 0.5px solid #e5e6eb; border-radius: 12px; display: flex; flex-direction: column; gap: 6px; }
+      .composer_editor { min-height: 36px; padding: 6px 8px 0; color: #8b93a1; font-size: 14px; line-height: 24px; }
+      [data-composer-card="true"] > .composer_row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; min-width: 0; padding: 2px 8px 6px; container-type: inline-size; }
+      [data-composer-card="true"] > .composer_row > .composer_tools { align-items: center; min-width: 0; display: flex; gap: 12px; flex: 0 1 auto; }
+      [data-composer-card="true"] > .composer_row > .composer_trailing { align-items: center; min-width: 0; display: flex; flex: none; gap: 12px; margin-left: auto; }
+      .composer_modes { align-items: center; gap: 12px; min-width: 0; display: flex; }
+      .composer_standardControls { align-items: center; gap: 12px; min-width: 0; display: flex; }
+      .composer_add { box-sizing: border-box; width: 28px; height: 28px; flex: none; border: 0; border-radius: 999px; background: #f2f3f5; color: #1f2329; }
+      .composer_permission { height: 28px; padding: 0 20px 0 8px; border: 0; background: transparent; color: #81858c; font-size: 13px; white-space: nowrap; }
+      .composer_model_root { height: 28px; padding: 0 10px; color: #81858c; font-size: 13px; white-space: nowrap; }
+      .composer_send { box-sizing: border-box; width: 34px; height: 34px; flex: none; border: 0; border-radius: 999px; background: #247bbf; color: #fff; }
+      [data-tuoguan-toggle] { height: 28px; padding: 0 10px; border: 0; border-radius: 999px; background: #f2f3f5; color: #1f2329; font-size: 13px; white-space: nowrap; }
       /* 与 mobile.css.ts 里那条保护规则同一效果（手机端不许挤没模型胶囊与发送钮） */
       [data-phase] [data-composer-card="true"] > [class$="_row"] > [class$="_trailing"] [data-dsh-squote="chip"] { flex: 0 1 auto !important; min-width: 0 !important; }
     </style>
     <body style="margin:0;background:#f2f3f5;padding:18px 16px;font-family:system-ui,-apple-system,'Segoe UI',sans-serif">
-      ${composerRow(quote)}
+      ${composerMirror(quote)}
     </body>`
 }
 
@@ -170,18 +196,23 @@ try {
     const preview = chip.querySelector('[data-dsh-squote="preview"]')
     const cancel = chip.querySelector('[data-dsh-squote="cancel"]')
     const cancelIcon = cancel.querySelector('svg')
-    const row = chip.closest('.composer_trailing')
+    const trailingEl = chip.closest('.composer_trailing')
+    const rowEl = document.querySelector('.composer_row')
+    const toolsEl = document.querySelector('.composer_tools')
+    const editorEl = document.querySelector('.composer_editor')
     const send = document.querySelector('[data-composer-send]')
     const model = document.querySelector('.composer_model_root')
     const rectOf = (el) => el.getBoundingClientRect()
     return {
       flagText: flag.querySelector('[data-dsh-squote="flag-text"]').textContent,
       metaText: meta.textContent,
+      metaVisibleText: meta.innerText,
       metaKindText: (meta.querySelector('[data-dsh-squote="meta-kind"]')?.textContent ?? '').trim(),
       metaKindVisibleAtDesktop: (function () { const el = meta.querySelector('[data-dsh-squote="meta-kind"]'); return el !== null && cs(el).display !== 'none' })(),
       previewText: preview.textContent,
       chipRadius: cs(chip).borderRadius,
-      chipHeight: Math.round(rectOf(chip).height),
+        chipHeight: Math.round(rectOf(chip).height),
+      chipWidth: Math.round(rectOf(chip).width),
       chipBg: cs(chip).backgroundColor,
       chipBorder: cs(chip).borderTopWidth + ' ' + cs(chip).borderStyle + ' ' + cs(chip).borderColor,
       chipColor: cs(chip).color,
@@ -194,16 +225,38 @@ try {
       cancelIconSize: `${Math.round(rectOf(cancelIcon).width)}x${Math.round(rectOf(cancelIcon).height)}`,
       previewEllipsis: cs(preview).textOverflow,
       chipRight: Math.round(rectOf(chip).right),
-      rowRight: Math.round(rectOf(row).right),
+      rowRight: Math.round(rectOf(trailingEl).right),
       sendVisible: rectOf(send).width > 0 && rectOf(send).height > 0,
       modelVisible: rectOf(model).width > 0,
-      chipFitsRow: rectOf(chip).right <= rectOf(row).right + 1,
+      chipFitsRow: rectOf(chip).right <= rectOf(trailingEl).right + 1,
+      /* 桌面错位那一版真正要卡住的两条：那一行不许被顶成第二行（tools 与 trailing 同顶、同高），提示条不许掉到输入区之下 */
+      toolsTop: Math.round(rectOf(toolsEl).top),
+      trailingTop: Math.round(rectOf(trailingEl).top),
+      rowTop: Math.round(rectOf(rowEl).top),
+      rowWidth: Math.round(rectOf(rowEl).width),
+      rowScrollWidth: rowEl.scrollWidth,
+      toolsRight: Math.round(rectOf(toolsEl).right),
+      trailingLeft: Math.round(rectOf(trailingEl).left),
+      editorBottom: Math.round(rectOf(editorEl).bottom),
+      /* 换没换行用「那一行的盒子高」判：那一行自己 48px 高就是一行，88px 以上就是被顶成第二行 */
+      toolsHeight: Math.round(rectOf(toolsEl).height),
+      trailingHeight: Math.round(rectOf(trailingEl).height),
+      rowHeight: Math.round(rectOf(rowEl).height),
+      oneLine: rectOf(toolsEl).top < rectOf(trailingEl).bottom && rectOf(trailingEl).top < rectOf(toolsEl).bottom,
+      rowNotOverflowing: Math.round(rectOf(rowEl).height) < Math.round(rectOf(toolsEl).height) + Math.round(rectOf(trailingEl).height) + 20,
+      chipJustBelowEditor: rectOf(chip).top >= rectOf(editorEl).top && rectOf(chip).bottom <= rectOf(rowEl).bottom + 1,
+      rowRightEdge: Math.round(rectOf(rowEl).right),
     }
   })
   await page.screenshot({ path: SCREENSHOTS.desktop, fullPage: true })
-  pass('提示文案：带引用 + 第 12 轮 + 卡片种类 + 摘要一小段',
-    desktop.flagText === surface.QUOTE_CHIP_FLAG_TEXT && desktop.metaText === '第 12 轮 · 秘书回复卡' && desktop.previewText === parts.preview && desktop.metaKindVisibleAtDesktop === true && desktop.metaKindText === '· 秘书回复卡',
-    JSON.stringify({ flagText: desktop.flagText, metaText: desktop.metaText, previewText: desktop.previewText }))
+  pass('提示文案（712 卡那种窄桌面 = 用户报错位的那一档）：带引用 + 第 12 轮 + 摘要一小段，「· 卡片种类」按那一行的宽度自己收掉',
+    desktop.flagText === surface.QUOTE_CHIP_FLAG_TEXT && desktop.metaText === '第 12 轮 · 秘书回复卡' && desktop.metaVisibleText === '第 12 轮' && desktop.metaKindVisibleAtDesktop === false && desktop.previewText === parts.preview,
+    JSON.stringify({ metaText: desktop.metaText, metaVisibleText: desktop.metaVisibleText, previewText: desktop.previewText }))
+  pass('桌面那一行不换行：提示条与 +/仅可查看/托管/模型/发送 同一行、也紧贴着输入框那行（宿主 .row 只有一行、没被顶成第二行；2026-11-23 错位回归）',
+    desktop.oneLine === true && desktop.rowNotOverflowing === true && desktop.chipJustBelowEditor === true && desktop.trailingLeft >= desktop.toolsRight,
+    JSON.stringify({ oneLine: desktop.oneLine, rowNotOverflowing: desktop.rowNotOverflowing, chipJustBelowEditor: desktop.chipJustBelowEditor, chipWidth: desktop.chipWidth, rowWidth: desktop.rowWidth, toolsTop: desktop.toolsTop, trailingTop: desktop.trailingTop, trailingLeft: desktop.trailingLeft, toolsRight: desktop.toolsRight }))
+  pass('桌面档宽度按那一行自己算（100cqw 上限）、不许超过那一行减掉那几件固定控件的量',
+    desktop.chipWidth <= desktop.rowWidth - 294 && desktop.chipWidth >= 300 - 60, JSON.stringify({ chipWidth: desktop.chipWidth, rowWidth: desktop.rowWidth }))
   pass('样式与卡片脚部那两棵按钮同一套（8px 圆角 / muted 色 / 16px 图标 / 同 accent 底 + 0.5px 边 / 摘要 ellipsis）',
     desktop.chipRadius === '8px' && desktop.cancelRadius === '8px' && desktop.cancelColor === 'rgb(138, 144, 153)' && desktop.iconSize === '16x16' && desktop.cancelIconSize === '16x16' && desktop.chipBorder.includes('0.5px') || desktop.chipBorder.includes('1px solid') ? true : desktop.previewEllipsis === 'ellipsis',
     JSON.stringify(desktop))
@@ -214,6 +267,45 @@ try {
   pass('桌面档高度 30px（与卡片脚部那颗按钮同高）',
     desktop.chipHeight === 30 && desktop.cancelSize === '30x30', JSON.stringify({ chipHeight: desktop.chipHeight, cancelSize: desktop.cancelSize }))
 
+  /* ── 宽桌面那一档（902 卡：那一行容得下「第 12 轮 · 秘书回复卡」，也照样不许换行） ── */
+  const wide = await browser.newPage({ viewport: { width: 1280, height: 520 } })
+  await wide.setContent(await render('assistant', 902), { waitUntil: 'load' })
+  await wide.waitForTimeout(220)
+  const wideDesk = await wide.evaluate(() => {
+    const chip = document.querySelector('[data-dsh-squote="chip"]')
+    const cs = (el) => getComputedStyle(el)
+    const rectOf = (el) => el.getBoundingClientRect()
+    const row = document.querySelector('.composer_row')
+    const tools = document.querySelector('.composer_tools')
+    const trailing = document.querySelector('.composer_trailing')
+    const meta = chip.querySelector('[data-dsh-squote="meta"]')
+    const kind = chip.querySelector('[data-dsh-squote="meta-kind"]')
+    const preview = chip.querySelector('[data-dsh-squote="preview"]')
+    return {
+      metaText: meta.textContent,
+      metaVisibleText: meta.innerText,
+      kindDisplay: kind === null ? 'missing' : cs(kind).display,
+      chipWidth: Math.round(rectOf(chip).width),
+      chipHeight: Math.round(rectOf(chip).height),
+      rowWidth: Math.round(rectOf(row).width),
+      rowClientWidth: row.clientWidth,
+      toolsHeight: Math.round(rectOf(tools).height),
+      trailingHeight: Math.round(rectOf(trailing).height),
+      rowHeight: Math.round(rectOf(row).height),
+      rowNotOverflowing: Math.round(rectOf(row).height) < Math.round(rectOf(tools).height) + Math.round(rectOf(trailing).height) + 20,
+      oneLine: rectOf(tools).top < rectOf(trailing).bottom && rectOf(trailing).top < rectOf(tools).bottom,
+      previewWidth: Math.round(rectOf(preview).width),
+      sendVisible: rectOf(document.querySelector('[data-composer-send]')).width > 0,
+      modelVisible: rectOf(document.querySelector('.composer_model_root')).width > 0,
+    }
+  })
+  await wide.screenshot({ path: SCREENSHOTS.wide, fullPage: true })
+  pass('宽桌面那一档：「第 12 轮 · 秘书回复卡」整段露出来、那一行还是一行、摘要照得有位置',
+    wideDesk.oneLine === true && wideDesk.rowNotOverflowing === true && wideDesk.kindDisplay !== 'none'
+    && wideDesk.metaText === '第 12 轮 · 秘书回复卡' && wideDesk.metaVisibleText === '第 12 轮 · 秘书回复卡'
+    && wideDesk.chipHeight === 30 && wideDesk.previewWidth > 60 && wideDesk.sendVisible === true && wideDesk.modelVisible === true,
+    JSON.stringify(wideDesk))
+  await wide.close()
   const hoverStyles = await page.evaluate(async () => {
     const cancel = document.querySelector('[data-dsh-squote="cancel"]')
     cancel.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))

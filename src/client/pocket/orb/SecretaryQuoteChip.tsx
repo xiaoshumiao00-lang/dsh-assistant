@@ -110,8 +110,9 @@ export function SecretaryQuoteChip({ sessionId }: { sessionId?: string }): any {
         <QuoteGlyphIcon />
         <span data-dsh-squote="flag-text">{parts.flag}</span>
       </span>
-      {/* 现场实测：手机那一行只给得起 164px，「· 卡片种类」这一段在粗指针档收掉（卡片本身已经看得出来是什么卡），
-          只留「第 N 轮」；文案合起来在桌面档仍是「第 N 轮 · 卡片种类」。 */}
+      {/* 「· 卡片种类」这一截由 CSS 按档收放：粗指针那一档（手机）与窄桌面那一档（宿主那一行 ≤ 720px，容器查询）都收掉，
+          只留「第 N 轮」——卡片本身已经看得出是什么卡，而且提示条不许把宿主那一行顶成第二行；宽桌面那一档整段照露。
+          aria/tooltip 那份全文（parts.label）不受这一档影响。 */}
       <span data-dsh-squote="meta">
         {parts.turnLabel}
         <span data-dsh-squote="meta-kind"> · {parts.kindLabel}</span>

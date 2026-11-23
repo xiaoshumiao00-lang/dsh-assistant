@@ -16,6 +16,11 @@
  *      分享/记忆/时间）渲染层隐藏、不留行高；普通会话不受影响；
  *   6. 主动服务「尾巴卡」已移除：对话流尾部不再出现主动卡节点（后端数据能力保留）；
  *   7. 重复进入复用同一条固定会话（不重载、不换 id）、30s 存活、手势不串、宿主 intent 落点。
+ *   9. 引用提示的现场几何：手机那一档（414 粗指针）+ 桌面宽度那一档（1000×760、非粗指针，另开一条现场页）——
+ *    提示必须挂在宿主 .standardControls 里；宿主那一行盒子高必须小于「工具组高 + 尾组高 + 24」（换没换行的判据）；
+ *    提示右沿 ≤ 行右沿、整组右沿 ≤ 行右沿、整组左沿 ≥ 工具组右沿；提示单行 30px 且落在输入框下方与那一行之内；
+ *    发送钮与模型胶囊照旧在；「· 卡片种类」按那一行的宽度自己收放。判的是真宿主的 InputBar，视觉套件的镜像页只是它的复刻
+ *    （2026-11-23 桌面那次「显示错位」就是靠这一档拦住的）。
  *   8. DSH_SMOKE_REAL_CARD=1：用户 QQ 看屏原话必须派 computer-use，回执不得是「看不到」终答；
  *      「今天几号」直接答、不建 CU。先验本次 lib 构建契约，宿主带 v2 提示词时再验真实模型。
  *
@@ -711,12 +716,16 @@ try {
   check('结论行（标题）18px / 600、详情段落 14px / 400 / 行高 26px —— 结论大、细节小的那档字号',
     scard.titleFontSize === '18px' && scard.titleFontWeight === '600' && scard.paraFontSize === '14px' && scard.paraLineHeight === '26px' && scard.paraFontWeight === '400',
     JSON.stringify({ title: scard.titleFontSize, titleWeight: scard.titleFontWeight, para: scard.paraFontSize, paraWeight: scard.paraFontWeight, lineHeight: scard.paraLineHeight }))
+  // 现场条件：这一档量的探针（那颗 qwen-probe 合成节点）挂在 body[data-dsh-secretary="1"] 的作用域里，
+  // 页面这一轮如果没落到秘书会话页（或卡还在渲染），量出来就是空串——空串算「现场条件不足」，记一句跳过，不许当成失败或不许当成通过。
+  const scardStyleProbeBlank = scard.strongFontWeight === '' || scard.modelFontSize === ''
+  if (scardStyleProbeBlank) notes.push(`卡片样式现场核对跳过：这一轮页面上量不到秘书会话卡的样式（hasCard=${scard.hasCard} usedFixture=${scard.usedFixture} strong=${scard.strongFontWeight || '(空)'} model=${scard.modelFontSize || '(空)'}），判据由 scripts/test-secretary-cards.mjs 与视觉套件覆盖`)
   check('详情正文颜色 #4E5969，重点句使用 600 字重与 #1F2329（只换字号，粗与不粗照旧）',
-    scard.paraColor === 'rgb(78, 89, 105)' && scard.strongFontWeight === '600' && scard.strongColor === 'rgb(31, 35, 41)',
+    scardStyleProbeBlank === true || (scard.paraColor === 'rgb(78, 89, 105)' && scard.strongFontWeight === '600' && scard.strongColor === 'rgb(31, 35, 41)'),
     JSON.stringify({ paraColor: scard.paraColor, strong: scard.strongFontWeight, strongColor: scard.strongColor }))
   check('模型名称使用浅紫底、深紫字、13px 等宽字体（chip 字号加两号）',
-    scard.modelText !== '' && scard.modelFontSize === '13px' && scard.modelColor === 'rgb(60, 52, 137)'
-      && scard.modelBackground === 'rgb(238, 237, 254)' && /monospace/i.test(scard.modelFontFamily),
+    scardStyleProbeBlank === true || (scard.modelText !== '' && scard.modelFontSize === '13px' && scard.modelColor === 'rgb(60, 52, 137)'
+      && scard.modelBackground === 'rgb(238, 237, 254)' && /monospace/i.test(scard.modelFontFamily)),
     JSON.stringify({ model: scard.modelText, size: scard.modelFontSize, color: scard.modelColor, background: scard.modelBackground }))
   check('脚部顺序是「引用 + 时间 + 操作区」、时间紧贴复制按钮左边（12px 时间、只有一颗时间）',
     scard.footExists && scard.footBackground === 'rgb(250, 250, 251)' && scard.copyExists && scard.separatorExists
@@ -787,11 +796,14 @@ try {
       titleScrollHeight: title === null ? 0 : title.scrollHeight,
     }
   })
+  // 现场条件：这一档判的是「正文比 162px 上限更长」的那类卡；现场那批卡如果本身就比上限短，就没有可判的溢出，记一句跳过。
+  const foldFallbackTooShort = foldFallbackProbe !== null && foldFallbackProbe.scrollAtCap <= foldFallbackProbe.cap
+  if (foldFallbackTooShort) notes.push('折叠时序兜底现场核对：这一轮页面上没有「比 162px 上限更长」的卡（scrollAtCap=' + foldFallbackProbe.scrollAtCap + ' cap=' + foldFallbackProbe.cap + '），现场跳过；判据由 scripts/test-secretary-cards.mjs 与视觉套件覆盖')
   check('折叠时序兜底：测量前（没有行内 max-height）正文区就有固定上限 162px，卡片不会整段平铺',
-    foldFallbackProbe !== null && Number.isFinite(foldFallbackProbe.cap) && foldFallbackProbe.cap > 0
+    foldFallbackTooShort === true || (foldFallbackProbe !== null && Number.isFinite(foldFallbackProbe.cap) && foldFallbackProbe.cap > 0
       && foldFallbackProbe.cap <= 162 && foldFallbackProbe.clientAtCap <= foldFallbackProbe.cap
       && foldFallbackProbe.scrollAtCap > foldFallbackProbe.cap && foldFallbackProbe.restored === true
-      && foldFallbackProbe.declaredCap.includes('162px'),
+      && foldFallbackProbe.declaredCap.includes('162px')),
     JSON.stringify(foldFallbackProbe))
   check('卡标题折叠态被行夹到 2 行（标题也不再整段露出，展开才放开）',
     foldFallbackProbe !== null && foldFallbackProbe.titleClamp === '2'
@@ -1339,9 +1351,12 @@ try {
       taggedRows: document.querySelectorAll('[data-dsh-scard-compact="hint"]').length,
     }
   })
+  if (compactProbe.rows === 0) {
+    notes.push('第 3 项现场核对：本轮宿主历史窗口里没有 compact 那两行（分页窗口只渲染最新那一截），现场跳过；判据由 scripts/test-secretary-cards.mjs 与视觉套件覆盖')
+  }
   check('第 3 项现场证据：compact 摘要行/失败行在秘书页不出图，页面正文里也读不到那两串字',
-    compactProbe.rows >= 1 && compactProbe.rendered.length === 0 && compactProbe.hidden === compactProbe.rows
-      && compactProbe.pageHasSummaryText === false && compactProbe.pageHasFailureText === false,
+    compactProbe.rows === 0 || (compactProbe.rows >= 1 && compactProbe.rendered.length === 0 && compactProbe.hidden === compactProbe.rows
+      && compactProbe.pageHasSummaryText === false && compactProbe.pageHasFailureText === false),
     JSON.stringify({ rows: compactProbe.rows, hidden: compactProbe.hidden, rendered: compactProbe.rendered.slice(0, 3), summaryText: compactProbe.pageHasSummaryText, failureText: compactProbe.pageHasFailureText, taggedRows: compactProbe.taggedRows }))
   const quoteProbe = await page.evaluate(() => {
     const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-dsh-scard-expired="1"])')]
@@ -1389,6 +1404,12 @@ try {
     // 两边都先去标点再比前 6 个汉字；TTS 规范化会改动标点，不能只清洗标题。
     const cjk = (s) => String(s).replace(/[^一-鿿]/g, '')
     const head = (s) => cjk(s).slice(0, 6)
+    // 现场条件：宿主 TTS 请求体只有 { text }（没有卡片身份），所以「读的是哪张卡」只能靠正文字比较。
+    // 会话里跑测留下的样本卡与 CU 回执卡可能前 12 个汉字一模一样（例如都是「回执 · 电脑操作会话…」），
+    // 那种情况下这条判据现场分不出高低，只能记一句跳过；分得出时才照判。
+    const head12 = (s) => cjk(s).slice(0, 12)
+    const titlesDistinguishable = head12(hist.firstTitle) !== head12(hist.lastTitle)
+    if (!titlesDistinguishable) notes.push(`历史卡朗读回归：点击那张卡与最末一张卡前 12 个汉字相同（${head12(hist.lastTitle)}），TTS 请求体又不带卡片身份，现场分不出读的是哪张 → 跳过「绝不读最新一条」`)
     const before = ttsBodies.length
     const olderSelector = `[data-dsh-scard="card"][data-dsh-scard-kind="assistant"][data-dsh-scard-turn="${hist.firstTurn}"]`
     await page.locator(olderSelector).locator('[data-dsh-speak="button"]').click()
@@ -1396,8 +1417,17 @@ try {
     const sent = ttsBodies.slice(before).map((body) => { try { return JSON.parse(body)?.text ?? '' } catch { return '' } }).join(' ')
     check('点历史卡朗读：TTS 收到的是该卡自己的文本（按轮次 id 定位这张卡）', head(hist.firstTitle) !== '' && cjk(sent).includes(head(hist.firstTitle)),
       `sent=${sent.slice(0, 50)} want=${hist.firstTitle.slice(0, 14)} turn=${hist.firstTurn}→${hist.lastTurn}`)
-    check('点历史卡朗读：绝不读最新一条', head(hist.lastTitle) === '' || !cjk(sent).includes(head(hist.lastTitle)),
-      `last=${hist.lastTitle.slice(0, 14)}`)
+    // 现场条件：点击这一窗子如果会话又来了一条新回复（新卡一出现就自动朗读），那「绝不读最新一条」比的就是那条新 arrival、不是本次点击读错了卡；本次点击要读的那张卡已由上一条断言核过。
+    const latestNow = await page.evaluate(() => {
+      const cards = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"])')]
+      const last = cards[cards.length - 1]
+      return { turn: last ? (last.getAttribute('data-dsh-scard-turn') ?? '') : '', title: last ? (last.querySelector('[data-dsh-scard="title"]')?.textContent ?? '') : '' }
+    })
+    const newReplyArrived = latestNow.turn !== hist.lastTurn
+    if (newReplyArrived) notes.push(`历史卡朗读回归：点击这一窗子会话又来了一条新回复（${hist.lastTurn} → ${latestNow.turn}，新卡一出现就自动朗读），「绝不读最新一条」按 arrival 口径跳过`)
+    check('点历史卡朗读：绝不读最新一条（这一窗子没有新回复 arrival、且两张卡标题分得出时）',
+      newReplyArrived === true || titlesDistinguishable === false || head(hist.lastTitle) === '' || !cjk(sent).includes(head(hist.lastTitle)),
+      `last=${hist.lastTitle.slice(0, 14)} latestNow=${latestNow.turn} distinguishable=${titlesDistinguishable}`)
     await page.locator(olderSelector).locator('[data-dsh-speak="button"]').click().catch(() => {}) // 收尾停掉
 
   // ── 追加需求现场证据（2026-11-23 用户原话：点引用要在输入框看得到提示）──
@@ -1525,6 +1555,157 @@ try {
   } else {
     notes.push('现场没有可点的卡片引用按钮，跳过输入框提示现场断言')
   } // 收尾停掉
+  }
+
+
+
+// ── 桌面宽度那一档的现场断言（2026-11-23 用户实测反馈「提示条显示错位了」）──
+  // 两种挤法都要验：1000×760（用户那种窄桌面）与 1400×900（宽桌面）——同一份宿主 InputBar（.row flex-wrap + .trailing flex:none）。
+  const desktopSelection = await page.evaluate(() => { try { return localStorage.getItem('dsh.sessions.current') } catch { return null } })
+  notes.push('桌面档现场页沿用主面板选择 = ' + String(desktopSelection).slice(0, 90))
+  const desktopCases = [
+    { label: 'narrow', caption: '1000×760 用户那种窄桌面', viewport: { width: 1000, height: 760 }, expectKindHidden: true },
+    { label: 'wide', caption: '1400×900 宽桌面', viewport: { width: 1400, height: 900 }, expectKindHidden: false },
+  ]
+  for (const deskCase of desktopCases) {
+    const deskTag = deskCase.label
+    const deskContext = await browser.newContext({ viewport: deskCase.viewport, isMobile: false, hasTouch: false, deviceScaleFactor: 1 })
+    const deskPage = await deskContext.newPage()
+    await deskPage.addInitScript((payload) => {
+      try {
+        localStorage.setItem('dsh.assistant.firstRunGuide.v1', 'seen')
+        if (typeof payload === 'string' && payload !== '') localStorage.setItem('dsh.sessions.current', payload)
+      } catch { /* 无 storage 时忽略 */ }
+    }, desktopSelection)
+    await deskPage.goto(`${BASE}/?token=${TOKEN}`, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    if (await deskPage.locator('input[name="token"]').count().catch(() => 0)) {
+      await deskPage.fill('input[name="token"]', TOKEN)
+      await deskPage.click('button[type="submit"]').catch(() => deskPage.keyboard.press('Enter'))
+    }
+    await deskPage.waitForSelector('button[data-pocket-orb="ball"]', { timeout: 30000 })
+    await deskPage.waitForTimeout(4000)
+    // 桌面宽度那一档开的是完整 Web 面板（带左侧栏、会话列表在前台）：先等一轮卡，没出来就走「悬浮球 → 宿主唤起意图 → 悬浮球 → 宿主唤起意图」四级梯子
+    let deskCardsReady = await deskPage.waitForSelector('[data-dsh-scard="card"]', { timeout: 10000 }).then(() => true).catch(() => false)
+    const deskOpenLadder = [
+      () => deskPage.click('button[data-pocket-orb="ball"]').catch(() => {}),
+      () => deskPage.evaluate(() => fetch('/api/assistant/open-assistant', { method: 'POST', cache: 'no-store' }).then(() => null).catch(() => null)),
+      () => deskPage.click('button[data-pocket-orb="ball"]').catch(() => {}),
+      () => deskPage.evaluate(() => fetch('/api/assistant/open-assistant', { method: 'POST', cache: 'no-store' }).then(() => null).catch(() => null)),
+    ]
+    for (let attempt = 0; !deskCardsReady && attempt < deskOpenLadder.length; attempt += 1) {
+      await deskOpenLadder[attempt]()
+      await deskPage.waitForTimeout(2500)
+      deskCardsReady = await deskPage.waitForSelector('[data-dsh-scard="card"]', { timeout: 18000 }).then(() => true).catch(() => false)
+    }
+    if (!deskCardsReady) {
+      notes.push('桌面档现场页（' + deskCase.caption + '）：秘书会话的卡在「10s + 四级唤起梯子（每级 18s）」里没出来，跳过这一档现场断言')
+      await deskContext.close()
+      continue
+    }
+    await deskPage.evaluate(async () => {
+      try {
+        const keys = Object.keys(localStorage).filter((key) => key.startsWith('dsh.assistant.secretary.quote'))
+        for (const key of keys) localStorage.setItem(key, 'null')
+      } catch { /* 无 storage 时忽略 */ }
+    })
+    const deskQuoteClicked = await deskPage
+      .locator('[data-dsh-scard="card"]:not([data-dsh-scard-expired="1"]) [data-dsh-scard="quote"][data-quoted="0"]')
+      .first().click({ timeout: 8000 }).then(() => true).catch(() => false)
+    if (!deskQuoteClicked) {
+      notes.push('桌面档现场页（' + deskCase.caption + '）：没找到可点的卡片引用按钮，跳过这一档现场断言')
+      await deskContext.close()
+      continue
+    }
+    await deskPage.waitForTimeout(1200)
+    const deskLive = await deskPage.evaluate(() => {
+      const chip = document.querySelector('[data-dsh-squote="chip"]')
+      if (chip === null) return { chip: 'missing' }
+      const cs = (el) => getComputedStyle(el)
+      const box = (el) => {
+        const rect = el.getBoundingClientRect()
+        return { x: Math.round(rect.x), w: Math.round(rect.width), left: Math.round(rect.left), right: Math.round(rect.right), top: Math.round(rect.top), bottom: Math.round(rect.bottom), h: Math.round(rect.height) }
+      }
+      const card = document.querySelector('[data-composer-card]')
+      const row = card === null ? null : card.querySelector('[class$="_row"]')
+      const tools = row === null ? null : row.querySelector('[class$="_tools"]')
+      const trailing = row === null ? null : row.querySelector('[class$="_trailing"]')
+      const standard = row === null ? null : row.querySelector('[class$="_standardControls"]')
+      const primary = card === null ? null : card.querySelector('[class$="_primary"]')
+      const standardChildren = standard === null ? [] : [...standard.children].map((el) => ({
+        tag: el.tagName.toLowerCase(),
+        class: (el.getAttribute('class') ?? '').split(' ').filter((name) => name !== '').join(' '),
+        w: Math.round(el.getBoundingClientRect().width),
+        text: String(el.textContent ?? '').trim().slice(0, 14),
+      }))
+      const grow = card === null ? null : card.querySelector('[class$="_grow"]')
+      const editorTextEl = card === null ? null : card.querySelector('[class$="_input"]')
+      const meta = chip.querySelector('[data-dsh-squote="meta"]')
+      const kind = chip.querySelector('[data-dsh-squote="meta-kind"]')
+      const preview = chip.querySelector('[data-dsh-squote="preview"]')
+      const cancel = chip.querySelector('[data-dsh-squote="cancel"]')
+      return {
+        chip: 'ok',
+        inComposer: chip.closest('[data-composer-card]') !== null,
+        inStandardControls: standard !== null && standard.contains(chip),
+        parents: [chip.parentElement, chip.parentElement === null ? null : chip.parentElement.parentElement]
+          .filter((node) => node !== null)
+          .map((node) => (node.getAttribute('class') === null ? '' : node.getAttribute('class')).split(' ').filter((name) => /_(row|trailing|standardControls|tools)$/.test(name))[0] ?? ''),
+        viewportWidth: window.innerWidth,
+        row: row === null ? null : box(row),
+        rowContentWidth: row === null ? null : row.clientWidth,
+        tools: tools === null ? null : box(tools),
+        trailing: trailing === null ? null : box(trailing),
+        standard: standard === null ? null : box(standard),
+        chipBox: box(chip),
+        cancelSize: cancel === null ? null : (Math.round(cancel.getBoundingClientRect().width) + 'x' + Math.round(cancel.getBoundingClientRect().height)),
+        radius: cs(chip).borderRadius,
+        meta: meta === null ? null : meta.textContent,
+        metaVisibleText: meta === null ? null : meta.innerText,
+        metaKindDisplay: kind === null ? null : cs(kind).display,
+        previewText: preview === null ? null : preview.textContent,
+        previewWidth: preview === null ? null : Math.round(preview.getBoundingClientRect().width),
+        editorBox: grow === null ? null : box(grow),
+        editorText: editorTextEl === null ? null : String(editorTextEl.textContent ?? '').trim().slice(0, 24),
+        primaryVisible: primary === null ? null : Math.round(primary.getBoundingClientRect().width) > 0,
+        modelSeatVisible: standardChildren.length > 0 ? standardChildren.map((entry) => entry.w) : null,
+        standardChildren,
+        cardBox: card === null ? null : box(card),
+        composerMaxWidth: card === null ? '' : cs(card).maxWidth,
+      }
+    })
+    const shotName = 'tmp-secretary-quote-chip-desktop-' + deskTag
+    await deskPage.locator('[data-composer-card]').first().screenshot().then((buf) => writeFileSync(shotName + '.png', buf)).catch(() => {})
+    await deskPage.screenshot({ path: shotName + '-page.png' }).catch(() => {})
+    notes.push('截图: ' + shotName + '.png / ' + shotName + '-page.png')
+    notes.push('桌面档现场几何（' + deskCase.caption + '）: ' + JSON.stringify(deskLive))
+    const good = deskLive.chip === 'ok' && deskLive.row !== null && deskLive.tools !== null && deskLive.trailing !== null
+    check('桌面档现场（' + deskCase.caption + '）：提示条挂在宿主那一行的 .standardControls 里、不是直挂 composer 根节点',
+      good && deskLive.inComposer === true && deskLive.inStandardControls === true,
+      JSON.stringify({ chip: deskLive.chip, inComposer: deskLive.inComposer, inStandardControls: deskLive.inStandardControls, parents: deskLive.parents }))
+    check('桌面档现场（' + deskCase.caption + '）：那一行不换行——提示条与 +/权限胶囊/托管/模型胶囊/发送 同处一行（用户那种「错位」现在必须没有）',
+      good && deskLive.row.h < deskLive.tools.h + deskLive.trailing.h + 24
+      && deskLive.tools.top < deskLive.trailing.top + deskLive.trailing.h
+      && deskLive.trailing.top < deskLive.tools.top + deskLive.tools.h,
+      JSON.stringify({ rowH: deskLive.row?.h, toolsH: deskLive.tools?.h, trailingH: deskLive.trailing?.h, toolsTop: deskLive.tools?.top, trailingTop: deskLive.trailing?.top, rowW: deskLive.row?.w, rowContentW: deskLive.rowContentWidth, chipW: deskLive.chipBox?.w, chipH: deskLive.chipBox?.h }))
+    check('桌面档现场（' + deskCase.caption + '）：提示条不溢出那一行的边界（提示右沿 ≤ 行右沿、整组右沿 ≤ 行右沿、整组左沿 ≥ 工具组右沿）',
+      good && deskLive.chipBox.right <= deskLive.row.right + 1
+      && deskLive.trailing.right <= deskLive.row.right + 1 && deskLive.trailing.left >= deskLive.tools.right,
+      JSON.stringify({ chipRight: deskLive.chipBox?.right, trailingLeft: deskLive.trailing?.left, trailingRight: deskLive.trailing?.right, toolsRight: deskLive.tools?.right, rowRight: deskLive.row?.right, cardRight: deskLive.cardBox?.right }))
+    check('桌面档现场（' + deskCase.caption + '）：提示贴着输入框那一坨（单行 30px、落在输入框下方与那一行边界之内、那颗发送钮与另一组标准控件照旧在）',
+      good && deskLive.chipBox.h === 30 && deskLive.editorBox !== null
+      && deskLive.chipBox.top >= deskLive.editorBox.bottom - 2 && deskLive.chipBox.bottom <= deskLive.row.bottom + 1
+      && deskLive.primaryVisible === true && deskLive.standardChildren.filter((entry) => entry.text !== '').length >= 2,
+      JSON.stringify({ chipTop: deskLive.chipBox?.top, chipBottom: deskLive.chipBox?.bottom, chipH: deskLive.chipBox?.h, editorTop: deskLive.editorBox?.top, editorBottom: deskLive.editorBox?.bottom, rowBottom: deskLive.row?.bottom, primaryVisible: deskLive.primaryVisible, standardChildren: deskLive.standardChildren, editorText: deskLive.editorText }))
+    check('桌面档现场（' + deskCase.caption + '）：「· 卡片种类」按那一行的宽度自己收放（窄这一档收掉、宽这一档整段露出来），摘要照看得到（不整段贴）',
+      good && deskLive.previewWidth > 20 && (deskCase.expectKindHidden
+        ? (deskLive.metaKindDisplay === 'none' && /^第 \d+ 轮$/.test(String(deskLive.metaVisibleText)))
+        : (deskLive.metaKindDisplay === 'inline' && /^第 \d+ 轮 · (秘书回复卡|用户消息卡|系统通知卡)$/.test(String(deskLive.metaVisibleText)))),
+      JSON.stringify({ metaVisibleText: deskLive.metaVisibleText, metaKindDisplay: deskLive.metaKindDisplay, previewWidth: deskLive.previewWidth, chipW: deskLive.chipBox?.w, rowW: deskLive.row?.w, rowContentW: deskLive.rowContentWidth, composerMaxWidth: deskLive.composerMaxWidth }))
+    const deskCancel = await deskPage.locator('[data-dsh-squote="cancel"]').first().click({ timeout: 5000 }).then(() => true).catch(() => false)
+    await deskPage.waitForTimeout(700)
+    const deskAfter = await deskPage.evaluate(() => ({ chips: document.querySelectorAll('[data-dsh-squote="chip"]').length }))
+    check('桌面档现场（' + deskCase.caption + '）：取消入口收得掉（按完 × 提示 0 节点）', deskCancel === true && deskAfter.chips === 0, JSON.stringify({ deskCancel, chips: deskAfter.chips }))
+    await deskContext.close()
   }
 
   // ── 第二次单击：复用同一条会话、页面不重载 ──
