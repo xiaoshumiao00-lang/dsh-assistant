@@ -6,11 +6,14 @@
  *      （sessionProjections / sessionProjectionCache 的 cachedSnapshot().values.agentPreset，
  *      由 agent-preset/selected 事件维护，比 header 新），读不到再回退 `session.header.agentPreset`。
  *      标准模式（standard / standard-slim-local / 空）一律不监听、不汇报。
- *   2. 完成事件 = 宿主 `session/event` 的 `turn/end`，且 `data.reason.kind === 'completed'`
- *      （max-tokens / aborted / error / interrupted / blocked 都不算完成）。与托管自动续写
- *      （src/tuoguan-autocontinue.ts）共用同一条真值事件流。
+ *   2. 轮次结束事件 = 宿主 `session/event` 的 `turn/end`：`data.reason.kind === 'completed'`
+ *      算完成，`error` / `aborted` / `interrupted` / `blocked` 算**失败轮**。2026-11-23 用户定案：
+ *      失败轮同样要出通知卡（带 reason.kind、错误码、错误原文），不许把失败静默成「已派活」；
+ *      `max-tokens` 归托管自动续写（src/tuoguan-autocontinue.ts）管，既不算完成也不算失败。
+ *      完成与失败都走宿主这一条真值事件流。
  *   3. 完成内容 = 同一 turn 的 `assistant/message` 事件里 message.content 的 text 块；
- *      本模块在事件流上顺手收集，不另开历史读取通道。
+ *      本模块在事件流上顺手收集，不另开历史读取通道。失败轮常常什么文本都没有（模型解析
+ *      失败前一个 step 都不开），这时卡片带的是错误原文，不是「它没有留下文字结果」。
  *
  * 卡片消息 = 把一条说明「CU 会话完成了」的系统通知**交给宿主官方 prompt 通道**
  * （`agent.followup`），由宿主自己开轮、自己编号、自己落盘；插件不再拼任何 turn/step
@@ -42,16 +45,41 @@ export function presetOfSource(projected: unknown, header: unknown): string {
   return ''
 }
 
-/** 一条会话完成事件该不该汇报给秘书（任何一条不满足都不报）。 */
-export function shouldReportCompletion(input: {
+/** CU 会话这一轮的两种结果（2026-11-23 用户定案：失败轮不许静默）。 */
+export type CuTurnOutcome = 'completed' | 'failed'
+
+/**
+ * reason.kind → 该轮结果。completed 算完成；error / aborted / interrupted / blocked 算失败轮；
+ * max-tokens（以及任何未知 kind）不汇报，归托管自动续写那套管。
+ */
+export function classifyCuTurn(reasonKind: unknown): CuTurnOutcome | null {
+  const kind = String(reasonKind ?? '')
+  if (kind === 'completed') return 'completed'
+  if (kind === 'error' || kind === 'aborted' || kind === 'interrupted' || kind === 'blocked') return 'failed'
+  return null
+}
+
+/** 失败轮的错误原文（reason.error.message / .code），读不到就空串，绝不编。 */
+export function failureOfTurnEnd(data: any): { kind: string; message: string; code: string } {
+  const reason = data?.reason ?? {}
+  const error = reason?.error ?? {}
+  return {
+    kind: String(reason?.kind ?? ''),
+    message: String(error?.message ?? '').trim(),
+    code: String(error?.code ?? '').trim(),
+  }
+}
+
+/** 一条会话轮次结束事件该不该汇报给秘书（完成与失败都汇报；任何一条不满足都不报）。 */
+export function shouldReportTurn(input: {
   preset: string
-  reasonKind: string
+  reasonKind: unknown
   origin?: unknown
   delegationDepth?: unknown
   isSecretary?: boolean
 }): boolean {
   if (input.preset !== CU_PRESET) return false // 标准会话一律不汇报
-  if (input.reasonKind !== 'completed') return false
+  if (classifyCuTurn(input.reasonKind) === null) return false
   if (input.isSecretary === true) return false
   if (input.origin === 'subagent') return false
   if (typeof input.delegationDepth === 'number' && input.delegationDepth > 0) return false
@@ -61,32 +89,70 @@ export function shouldReportCompletion(input: {
 /* ---------- 通知投递：走宿主官方 prompt 通道，插件不再自己写任何日志事件 ---------- */
 
 /**
+ * 失败轮的后缀：`（原因 error；错误码 UNKNOWN_MODEL；错误原文「…」）`。
+ * 只拼宿主事件里真有的字段，一个都读不到就返回空串——绝不编造。
+ */
+export function formatCuFailureLine(failure?: { kind: string; message: string; code: string }): string {
+  const bits: string[] = []
+  const kind = String(failure?.kind ?? '').trim()
+  const code = String(failure?.code ?? '').trim()
+  const message = String(failure?.message ?? '').trim()
+  if (kind !== '') bits.push(`原因 ${kind}`)
+  if (code !== '') bits.push(`错误码 ${code}`)
+  if (message !== '') bits.push(`错误原文「${message}」`)
+  return bits.length === 0 ? '' : `（${bits.join('；')}）`
+}
+
+/**
  * 汇报消息正文。**这是发给秘书模型的一条系统通知**（角色是 user，宿主的 prompt 通道
  * 只接受这个角色），所以开头必须自我说明，结尾必须把会话引用原样留给卡片渲染。
  *
  * 2026-11-22 用户定案：去掉「一两句口语汇报」的长度限制——秘书要把 Computer Use 会话
  * 返回的消息**完整、原样**展示出来，不许为精简丢掉文件名、路径、数字、提交号、判据、结论。
+ * 2026-11-23 用户定案：失败轮（error / aborted / interrupted / blocked）走同一条通知、同一套
+ * 卡片规格，但措辞必须是「这一轮失败了」并带上 reason.kind、错误码与错误原文；
+ * 秘书向用户汇报时不许把它说成已派活／已完成／已落地。
  * 「这一回合工具已全部禁用，不要尝试派活或查询」这句照留：它不是长度限制，是防止
  * 「通知 → 再派活 → 再通知」回路的闸（assistant-secretary.ts 的 tools/pre-execute 那一层
  * 同时把这一轮的工具全禁，措辞与硬闸必须一致，否则模型会去调工具想"核实"）。
  * 卡片解析依赖两处：首行以「系统通知」开头（NOTICE_HEAD_LINE_RE）与末尾
  * `最后单独一行原样输出：[[session:id|title]]`（NOTICE_SESSION_REF_LINE_RE）——都不动。
  */
-export function buildCompletionNotice(input: { sessionId: string; title: string; summary: string }): string {
+export function buildCompletionNotice(input: {
+  sessionId: string
+  title: string
+  summary: string
+  outcome?: CuTurnOutcome
+  failure?: { kind: string; message: string; code: string }
+}): string {
   const title = String(input.title ?? '').trim() || '电脑上的任务'
   const summary = String(input.summary ?? '').trim()
+  const failed = input.outcome === 'failed'
+  const failureLine = formatCuFailureLine(input.failure)
   return [
     '（系统通知，不是用户说的话）',
-    `电脑操作会话「${title}」这一轮已经完成。`,
-    summary !== '' ? `它最后一段返回原文（完整照录）：${summary}` : '它没有留下文字结果。',
-    '向用户汇报时把上面这条结果完整展示出来：原样转述，不许精简、不许合并或删细节，文件名、路径、命令、数字、版本号、提交号、判据、结论都必须保留；原文被截断（末尾带 …）就照实说明，不许自己补写。',
+    failed
+      ? `电脑操作会话「${title}」这一轮失败了${failureLine}。`
+      : `电脑操作会话「${title}」这一轮已经完成。`,
+    summary !== ''
+      ? `它最后一段返回原文（完整照录）：${summary}`
+      : (failed ? '它这一轮没有留下文字结果。' : '它没有留下文字结果。'),
+    failed
+      ? '向用户汇报时必须照实说是「这一轮失败／派活失败」，不许说成已完成、已落地、已派活：把上面那条错误码与错误原文完整转述（引号、路径、模型名、错误码都不许省），并告诉用户可以改派——换一条新建的 Computer Use 会话（派活失败后插件会自动改新建并如实写进回执），或换个项目目录再派一次。'
+      : '向用户汇报时把上面这条结果完整展示出来：原样转述，不许精简、不许合并或删细节，文件名、路径、命令、数字、版本号、提交号、判据、结论都必须保留；原文被截断（末尾带 …）就照实说明，不许自己补写。',
     '这一回合工具已全部禁用，不要尝试派活或查询。',
     `最后单独一行原样输出：[[session:${input.sessionId}|${title}]]`,
   ].join('\n')
 }
 
 /** 一条交给宿主 prompt 通道的 user 消息（形状与宿主 createUserMessage 一致）。 */
-export function buildNoticeMessage(input: { sessionId: string; title: string; summary: string }): {
+export function buildNoticeMessage(input: {
+  sessionId: string
+  title: string
+  summary: string
+  outcome?: CuTurnOutcome
+  failure?: { kind: string; message: string; code: string }
+}): {
   id: string
   role: 'user'
   content: Array<{ type: 'text'; text: string }>
@@ -123,13 +189,22 @@ export function summarizeCompletion(text: string): string {
   return `${clean.slice(0, CU_NOTICE_RESULT_MAX_CHARS)}…`
 }
 
-/* ---------- 事件控制器（收集文本 + 完成触发，依赖全注入） ---------- */
+/* ---------- 事件控制器（收集文本 + 完成/失败触发，依赖全注入） ---------- */
+
+/** 一条 CU 轮次结果的汇报内容（完成与失败共用同一形状）。 */
+export interface CuNoticePayload {
+  sessionId: string
+  title: string
+  summary: string
+  outcome: CuTurnOutcome
+  failure?: { kind: string; message: string; code: string }
+}
 
 export interface CuWatchDeps {
   /** 该会话当前的 agent 预设（投影优先，header 兜底）。 */
   presetOf: (session: any) => string
-  /** 汇报出口：把完成内容发到秘书固定会话。 */
-  notify: (payload: { sessionId: string; title: string; summary: string }) => void | Promise<void>
+  /** 汇报出口：把完成／失败内容发到秘书固定会话。 */
+  notify: (payload: CuNoticePayload) => void | Promise<void>
   /** 会话标题（投影 title / header.title）。 */
   titleOf?: (session: any) => string
   /** 当前秘书会话 id（自身不汇报）。 */
@@ -198,13 +273,15 @@ export function createCuWatch(deps: CuWatchDeps) {
         if (type !== 'turn/end') return
         const data = event?.data ?? {}
         const turn = Number(data?.turn)
+        const outcome = classifyCuTurn(data?.reason?.kind)
+        const failure = outcome === 'failed' ? failureOfTurnEnd(data) : undefined
         const byTurn = texts.get(sessionId)
         const collected = Number.isFinite(turn) ? (byTurn?.get(turn) ?? []) : []
         if (Number.isFinite(turn) && byTurn !== undefined) byTurn.delete(turn)
         const preset = deps.presetOf(session)
-        if (!shouldReportCompletion({
+        if (!shouldReportTurn({
           preset,
-          reasonKind: String(data?.reason?.kind ?? ''),
+          reasonKind: data?.reason?.kind,
           origin: session?.header?.origin,
           delegationDepth: session?.header?.delegationDepth,
           isSecretary: isSecretary(sessionId),
@@ -218,16 +295,21 @@ export function createCuWatch(deps: CuWatchDeps) {
           if (typeof oldest === 'string') reported.delete(oldest)
         }
         const lastText = collected[collected.length - 1] ?? ''
-        const payload = {
+        const payload: CuNoticePayload = {
           sessionId,
           title: titleOf(session),
           summary: summarizeCompletion(lastText),
+          outcome: outcome ?? 'completed',
+          ...(failure !== undefined ? { failure } : {}),
+        }
+        if (outcome === 'failed') {
+          log(`CU 失败轮汇报：${sessionId} turn ${turn} ${formatCuFailureLine(failure) || '（宿主没带错误原文）'}`)
         }
         Promise.resolve(deps.notify(payload)).catch((error: unknown) => {
-          log(`CU 完成通知发送失败（${sessionId} turn ${turn}）：${String((error as Error)?.message ?? error)}`)
+          log(`CU ${outcome === 'failed' ? '失败' : '完成'}通知发送失败（${sessionId} turn ${turn}）：${String((error as Error)?.message ?? error)}`)
         })
       } catch (error: unknown) {
-        log(`CU 完成监听处理事件失败：${String((error as Error)?.message ?? error)}`)
+        log(`CU 完成/失败监听处理事件失败：${String((error as Error)?.message ?? error)}`)
       }
     },
     handleSessionDisposed(session: any): void {
@@ -256,7 +338,7 @@ export function createCuWatch(deps: CuWatchDeps) {
  *
  * @returns true = 宿主已接受这条消息（不代表模型已经答完）；false = 秘书会话没有活的 agent。
  */
-export function postSecretaryNotice(agent: any, notice: { sessionId: string; title: string; summary: string }): boolean {
+export function postSecretaryNotice(agent: any, notice: CuNoticePayload): boolean {
   if (agent === null || agent === undefined) return false
   if (typeof agent.followup !== 'function') return false
   const message = buildNoticeMessage(notice)
@@ -339,17 +421,18 @@ export function secretarySessionOf(ctx: any): any {
   return null
 }
 
-/** 发送一条通知（路由与事件监听共用）。返回宿主是否已接受这条消息。 */
-export function notifySecretary(ctx: any, notice: { sessionId: string; title: string; summary: string }, log: (line: string) => void): boolean {
+/** 发送一条完成／失败通知（路由与事件监听共用）。返回宿主是否已接受这条消息。 */
+export function notifySecretary(ctx: any, notice: CuNoticePayload, log: (line: string) => void): boolean {
   if (secretarySessionRef.id === '') {
-    log('CU 完成通知：秘书固定会话还没就绪，这条先不发')
+    log('CU 汇报：秘书固定会话还没就绪，这条先不发')
     return false
   }
   const agent = secretaryAgentOf(ctx)
   const ok = postSecretaryNotice(agent, notice)
+  const head = notice.outcome === 'failed' ? 'CU 失败轮汇报' : 'CU 完成汇报'
   log(ok
-    ? `CU 完成通知已交给宿主 prompt 通道（agent.followup）：${notice.sessionId}「${notice.title}」`
-    : `CU 完成通知没发出去：秘书会话没有活的 agent（宿主未提供 agent.followup），已跳过而不是自己写日志（${notice.sessionId}）`)
+    ? `${head}已交给宿主 prompt 通道（agent.followup）：${notice.sessionId}「${notice.title}」${formatCuFailureLine(notice.failure)}`
+    : `${head}没发出去：秘书会话没有活的 agent（宿主未提供 agent.followup），已跳过而不是自己写日志（${notice.sessionId}）`)
   return ok
 }
 
@@ -407,9 +490,26 @@ export function registerAssistantCuWatch(ctx: any): () => void {
           const sessionId = String(body?.sessionId ?? '').trim()
           const title = String(body?.title ?? '').trim()
           const summary = String(body?.summary ?? '').trim()
+          // 手动触发口也认失败轮：outcome='failed' 或 reasonKind 是 error/aborted/… 都算失败卡
+          const outcome: CuTurnOutcome = String(body?.outcome ?? '') === 'failed' || classifyCuTurn(body?.reasonKind) === 'failed'
+            ? 'failed'
+            : 'completed'
+          const failure = outcome === 'failed'
+            ? {
+                kind: String(body?.reasonKind ?? body?.failure?.kind ?? 'error'),
+                message: String(body?.failure?.message ?? body?.error ?? ''),
+                code: String(body?.failure?.code ?? body?.code ?? ''),
+              }
+            : undefined
           if (sessionId === '') { sendJson(res, 400, { ok: false, error: 'invalid-session-id' }); return }
-          const ok = notifySecretary(ctx, { sessionId, title, summary }, log)
-          sendJson(res, ok ? 200 : 409, { ok, sessionId })
+          const ok = notifySecretary(ctx, {
+            sessionId,
+            title,
+            summary,
+            outcome,
+            ...(failure !== undefined ? { failure } : {}),
+          }, log)
+          sendJson(res, ok ? 200 : 409, { ok, sessionId, outcome })
         },
       })
       disposers.push(() => { try { routes.dispose() } catch {} })
@@ -428,7 +528,10 @@ export const assistantCuWatchTestSurface = {
   CU_PRESET,
   CU_NOTIFY_ROUTE,
   presetOfSource,
-  shouldReportCompletion,
+  classifyCuTurn,
+  shouldReportTurn,
+  failureOfTurnEnd,
+  formatCuFailureLine,
   buildCompletionNotice,
   buildNoticeMessage,
   CU_NOTICE_RESULT_MAX_CHARS,

@@ -728,13 +728,13 @@ export function registerAssistantSecretary(ctx: any): () => void {
       if (noticeTurnActive()) {
         return {
           kind: 'deny',
-          reason: '这一轮是插件自动送来的「电脑操作会话完成」系统通知，不是用户的要求：工具已全部禁用。请把那条 Computer Use 会话的结果完整汇报给用户（原样转述，文件名、路径、数字、提交号、判据、结论都不许省略，不许为简短而删），不要调用任何工具。',
+          reason: '这一轮是插件自动送来的「电脑操作会话完成／失败」系统通知，不是用户的要求：工具已全部禁用。完成就把那条 Computer Use 会话的结果完整汇报给用户（原样转述，文件名、路径、数字、提交号、判据、结论都不许省略，不许为简短而删）；失败轮就照实说是「派活失败／这一轮失败」，把错误码与错误原文完整汇报给用户并提示可以改派（新建一条 Computer Use 会话或换个项目目录），不许说成已派活／已完成，不要调用任何工具。',
         }
       }
       if (!secretaryToolDenied(tool)) return next()
       return {
         kind: 'deny',
-        reason: `个人秘书只读闸已拒绝 ${tool || '未知工具'}（写文件/终端/直接操作屏幕/派子代理不能在秘书会话执行；只读联网查询 web_search、web_fetch 是放行的）。这不是收工理由：必须立即调用 secretary_dispatch，已有项目用 kind=existing + cwd，没有项目用 kind=new-folder；派活成功后再回报已派 Computer Use 会话处理。`,
+        reason: `个人秘书只读闸已拒绝 ${tool || '未知工具'}（写文件/终端/直接操作屏幕/派子代理不能在秘书会话执行；只读联网查询 web_search、web_fetch 是放行的）。这不是收工理由：必须立即调用 secretary_dispatch，已有项目用 kind=existing + cwd，没有项目用 kind=new-folder；派活成功后照实回报回执文案——「已派活（…已确认在跑）」才是真接上了话，「已入队（未确认在跑）」不许说成已派活。`,
       }
     })
   } catch {

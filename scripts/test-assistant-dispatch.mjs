@@ -6,7 +6,12 @@
  *   - 模型给了合法绝对路径 → 用模型的目录（decidedBy='model'），不再跑规则；
  *   - 模型没给 / 给了非法路径 → 规则函数兜底（decidedBy='rules'），三条规则仍然生效；
  *   - 工具定义形状（参数/输出 schema 合法，名称固定）；
- *   - 提示词段落只对秘书会话有内容，且把三条规则 + 助手目录 + 项目清单写进去。
+ *   - 提示词段落只对秘书会话有内容，且把三条规则 + 助手目录 + 项目清单写进去；
+ *   - 派活回执三态口径（2026-11-23 用户定案）：观测到会话接上话才写「已派活」；只入队写
+ *     「已入队（未确认在跑）」；入队抛错 = 抛错、绝不新建、绝不出「已派活」；
+ *     续接轮失败（error/aborted）→ 自动改新建并如实写「续接失败已改新建」；
+ *   - 续接候选的模型可用性：读得到清单就按「模型还配着吗」排除退役会话（回执指名跳过哪条），
+ *     读不到清单或读不到模型选择 = 不猜、不排除。
  */
 import assert from 'node:assert/strict'
 
@@ -123,7 +128,12 @@ cases.push(['工具定义：名字/schema/渲染齐全', () => {
   assert.equal(typeof tool.execute, 'function')
   assert.equal(typeof tool.output.render, 'function')
   assert.equal(tool.output.schema.type, 'object')
-  const text = tool.output.render({}, { session_id: 's1', cwd: 'D:\\hpg', kind: 'existing', reason: 'r', decided_by: 'model', created_folder: false, continued: true, agent_preset: 'computer-use' })[0].text
+  assert.ok(tool.output.schema.required.includes('verification'), '回执必须带三态字段')
+  assert.ok(tool.output.schema.required.includes('verified'), '回执必须带 verified')
+  assert.ok(tool.output.schema.required.includes('redispatched'), '回执必须带降级标记')
+  const text = tool.output.render({}, { session_id: 's1', cwd: 'D:\\hpg', kind: 'existing', reason: 'r', decided_by: 'model', created_folder: false, continued: true, agent_preset: 'computer-use', verification: 'confirmed', verified: true, redispatched: false, turn: 3, pending: false })[0].text
+  assert.match(text, /已派活/)
+  assert.match(text, /已确认在跑/)
   assert.match(text, /秘书模型判断/)
   assert.match(text, /D:\\hpg/)
   assert.match(text, /Computer Use/)
@@ -412,6 +422,316 @@ cases.push(['提示词路径绕过 30s 缓存：控制室新建/删除文件夹 
     surface.resetDispatchCacheForTests()
     surface.resetPromptSnapshotForTests()
   }
+}])
+
+/* ---------- 派活回执三态口径（2026-11-23 用户定案：只入队不许说成已派活） ---------- */
+
+function execOf() { return { agent: { session: { id: 'sec-1' } } } }
+
+function sessionRow(id, cwd, preset = 'computer-use') {
+  return { header: { id, cwd, title: `会话 ${id}`, updatedAt: 1000, agentPreset: preset } }
+}
+
+/** 假宿主：会话行 + 事件总线 + 投影模型选择 + llm 清单 + sessionController 调用记录。 */
+function fakeDispatchCtx(options) {
+  const calls = []
+  const handlers = []
+  const models = options.models instanceof Map ? options.models : new Map(Object.entries(options.models ?? {}))
+  const emit = (session, event) => { for (const fn of handlers.slice()) fn(session, event) }
+  const ctx = {
+    calls,
+    emit,
+    sessions: { list: () => options.rows ?? [] },
+    get(name) {
+      if (name === 'sessionProjections') {
+        return {
+          cachedSnapshot: (source) => {
+            const id = String(source?.header?.id ?? source?.id ?? '')
+            const model = models.get(id)
+            if (model === undefined) return { values: {} }
+            return { values: { modelSelection: { lastUsed: model, next: model } } }
+          },
+        }
+      }
+      if (name === 'llm') return options.llm
+      return undefined
+    },
+    sessionController: {
+      create: options.create ?? (async (req) => {
+        calls.push(['create', req])
+        return { sessionId: options.newSessionId ?? 'session-cu-new', agentPreset: 'computer-use' }
+      }),
+      rename: async (req) => { calls.push(['rename', req]) },
+      prompt: async (req) => {
+        calls.push(['prompt', req])
+        if (typeof options.onPrompt === 'function') await options.onPrompt(req, emit)
+      },
+    },
+    on(name, fn) {
+      if (name === 'session/event') handlers.push(fn)
+      return () => { const index = handlers.indexOf(fn); if (index >= 0) handlers.splice(index, 1) }
+    },
+  }
+  return ctx
+}
+
+/** 宿主事件模拟：这条派活被消费、起了轮、跑出了一步。 */
+function hostStartedTurn(turn) {
+  return (req, emit) => {
+    emit({ id: req.sessionId }, { type: 'agent/inbox/spliced', data: { turn, inserted: [{ source: { kind: 'user', rpcId: req.requestId } }] } })
+    emit({ id: req.sessionId }, { type: 'turn/start', data: { turn } })
+    emit({ id: req.sessionId }, { type: 'step/start', data: { turn, step: 1 } })
+  }
+}
+
+/** 宿主事件模拟：起轮后一 0 步就崩（钉着的模型已退役那种），kind 可传 error/aborted/interrupted。 */
+function hostFailedTurn(turn, kind, error) {
+  return (req, emit) => {
+    emit({ id: req.sessionId }, { type: 'agent/inbox/spliced', data: { turn, inserted: [{ source: { kind: 'user', rpcId: req.requestId } }] } })
+    emit({ id: req.sessionId }, { type: 'turn/start', data: { turn } })
+    emit({ id: req.sessionId }, { type: 'turn/end', data: { turn, reason: { kind, error } } })
+  }
+}
+
+const RETIRED_MODEL = { provider: 'strata', model: 'qwen3.8-flash-next-iq3_s' }
+const UNKNOWN_MODEL_ERROR = {
+  message: 'pi-ai provider "strata" has no configured model "qwen3.8-flash-next-iq3_s"',
+  code: 'UNKNOWN_MODEL',
+}
+
+async function withVerifyMs(value, run) {
+  const previous = process.env.DSH_ASSISTANT_DISPATCH_VERIFY_MS
+  process.env.DSH_ASSISTANT_DISPATCH_VERIFY_MS = String(value)
+  try { return await run() } finally {
+    if (previous === undefined) delete process.env.DSH_ASSISTANT_DISPATCH_VERIFY_MS
+    else process.env.DSH_ASSISTANT_DISPATCH_VERIFY_MS = previous
+  }
+}
+
+function freshDispatch() {
+  lib.assistantSecretaryTestSurface.secretarySessionRef.id = 'sec-1'
+  surface.resetDispatchCacheForTests()
+  surface.resetModelChecksForTests()
+}
+
+cases.push(['回执文案：确认在跑才写「已派活」，只入队写「已入队（未确认在跑）」', () => {
+  const confirmed = surface.dispatchReceiptText({ cwd: 'D:\\x', continued: true, decided_by: 'model', reason: 'r', verification: 'confirmed', verified: true, turn: 7 })
+  assert.match(confirmed, /^已派活（Computer Use 续接·已确认在跑 第 7 轮）/)
+  assert.match(confirmed, /秘书模型判断/)
+  const queued = surface.dispatchReceiptText({ cwd: 'D:\\x', continued: true, decided_by: 'rules', reason: 'r', verification: 'unverified', verified: false, pending: true })
+  assert.match(queued, /^已入队（未确认在跑，Computer Use 续接·消息还排在待办队列里）/)
+  assert.ok(!queued.includes('已派活'), `只入队不许出现「已派活」：${queued}`)
+  const unknown = surface.dispatchReceiptText({ cwd: 'D:\\x', continued: false, decided_by: 'rules', reason: 'r', verification: undefined })
+  assert.match(unknown, /已入队（未确认在跑，Computer Use 新建·宿主窗口内没给出证据）/, '没有 verification 字段也只许写未确认')
+  const redispatched = surface.dispatchReceiptText({ cwd: 'D:\\x', continued: false, decided_by: 'rules', reason: 'r', verification: 'confirmed', verified: true, turn: 1, redispatched: true })
+  assert.match(redispatched, /续接失败已改新建/, '自动降级要在回执里如实写出来')
+}])
+
+cases.push(['入队失败（宿主 prompt 抛错）：execute 抛错、绝不新建、绝不出「已派活」', async () => {
+  freshDispatch()
+  const ctx = fakeDispatchCtx({ rows: [sessionRow('session-cu-old', 'D:\\proj-a')], onPrompt: async (req) => { throw new Error('宿主会话已收工，入队被拒') } })
+  const tool = surface.dispatchToolDefinition(ctx)
+  let error = null
+  try {
+    await withVerifyMs(0, () => tool.execute({ task: '把报名表填完', cwd: 'D:\\proj-a', kind: 'existing' }, execOf()))
+  } catch (error_) { error = error_ }
+  assert.ok(error instanceof Error, '入队失败必须抛错，不许静默成「已入队」')
+  assert.match(error.message, /派活失败/)
+  assert.match(error.message, /入队被拒/, '失败原因要原文带在错里')
+  assert.ok(!error.message.includes('已派活'), `不许出「已派活」文案：${error.message}`)
+  assert.deepEqual(ctx.calls.map(([kind]) => kind), ['prompt'], '入队失败不许偷偷新建会话')
+}])
+
+cases.push(['只入队、窗口内没证据：verification=unverified，文案不是「已派活」', async () => {
+  freshDispatch()
+  const ctx = fakeDispatchCtx({ rows: [sessionRow('session-cu-old', 'D:\\proj-a')] })
+  const tool = surface.dispatchToolDefinition(ctx)
+  const out = await withVerifyMs(0, () => tool.execute({ task: '把报名表填完', cwd: 'D:\\proj-a', kind: 'existing' }, execOf()))
+  assert.equal(out.continued, true)
+  assert.equal(out.verification, 'unverified')
+  assert.equal(out.verified, false)
+  assert.equal(out.redispatched, false)
+  const text = tool.output.render({}, out)[0].text
+  assert.match(text, /已入队（未确认在跑/)
+  assert.ok(!text.includes('已派活'), `未确认在跑不许出现「已派活」：${text}`)
+  assert.deepEqual(ctx.calls.map(([kind]) => kind), ['prompt'], '未确认也不许新建会话')
+}])
+
+cases.push(['观测到会话接上话（消费 → 起轮 → 起步）：verification=confirmed 才出「已派活（续接）」', async () => {
+  freshDispatch()
+  const ctx = fakeDispatchCtx({ rows: [sessionRow('session-cu-old', 'D:\\proj-a')], onPrompt: hostStartedTurn(9) })
+  const tool = surface.dispatchToolDefinition(ctx)
+  const out = await withVerifyMs(0, () => tool.execute({ task: '把报名表填完', cwd: 'D:\\proj-a', kind: 'existing' }, execOf()))
+  assert.equal(out.verification, 'confirmed')
+  assert.equal(out.verified, true)
+  assert.equal(out.turn, 9)
+  assert.equal(out.continued, true)
+  const text = tool.output.render({}, out)[0].text
+  assert.match(text, /^已派活（Computer Use 续接·已确认在跑 第 9 轮）/, '确认到在跑才许写已派活')
+}])
+
+cases.push(['续接的会话这一轮失败（UNKNOWN_MODEL）：自动改新建并如实写「续接失败已改新建」', async () => {
+  freshDispatch()
+  const ctx = fakeDispatchCtx({
+    rows: [sessionRow('session-cu-old', 'D:\\proj-a')],
+    models: new Map([['session-cu-old', RETIRED_MODEL]]),
+    onPrompt: (req, emit) => {
+      if (req.sessionId === 'session-cu-old') return hostFailedTurn(9, 'error', UNKNOWN_MODEL_ERROR)(req, emit)
+      return hostStartedTurn(1)(req, emit)
+    },
+  })
+  const tool = surface.dispatchToolDefinition(ctx)
+  const out = await withVerifyMs(0, () => tool.execute({ task: '把报名表填完', cwd: 'D:\\proj-a', kind: 'existing' }, execOf()))
+  assert.equal(out.continued, false, '降级后的回执走的是新建会话')
+  assert.equal(out.redispatched, true)
+  assert.equal(out.failed_session_id, 'session-cu-old')
+  assert.equal(out.session_id, 'session-cu-new')
+  assert.equal(out.verification, 'confirmed')
+  assert.match(out.reason, /续接会话 session-cu-old 这一轮失败/)
+  assert.match(out.reason, /UNKNOWN_MODEL/, '错误码要写进回执')
+  assert.match(out.reason, /已改新建 Computer Use 会话 session-cu-new/)
+  assert.match(out.reason, /它钉的模型 strata\/qwen3\.8-flash-next-iq3_s/)
+  const text = tool.output.render({}, out)[0].text
+  assert.match(text, /续接失败已改新建/, '回执照实写降级')
+  assert.ok(ctx.calls.some(([kind]) => kind === 'create'), '降级确实新建了一条会话')
+}])
+
+cases.push(['aborted 轮口径：同样算失败、也自动改新建（不许说成已派活）', async () => {
+  freshDispatch()
+  const ctx = fakeDispatchCtx({
+    rows: [sessionRow('session-cu-old', 'D:\\proj-a')],
+    onPrompt: (req, emit) => {
+      if (req.sessionId === 'session-cu-old') return hostFailedTurn(4, 'aborted', { message: '用户中断了这一轮', code: 'ABORTED' })(req, emit)
+      return hostStartedTurn(1)(req, emit)
+    },
+  })
+  const tool = surface.dispatchToolDefinition(ctx)
+  const out = await withVerifyMs(0, () => tool.execute({ task: '把报名表填完', cwd: 'D:\\proj-a', kind: 'existing' }, execOf()))
+  assert.equal(out.redispatched, true)
+  assert.equal(out.verification, 'confirmed')
+  assert.match(out.reason, /这一轮失败/)
+  assert.match(out.reason, /aborted\/ABORTED/, 'kind 与错误码要写进回执')
+  assert.match(out.reason, /用户中断了这一轮/, '错误原文要写进回执')
+  assert.ok(!out.reason.includes('已完成'), '失败轮不许说成已完成')
+}])
+
+cases.push(['候选会话钉着已退役模型 → 排除它、改新建（回执写清跳过了哪条）', async () => {
+  freshDispatch()
+  const ctx = fakeDispatchCtx({
+    rows: [sessionRow('session-cu-stale', 'D:\\proj-a')],
+    models: new Map([['session-cu-stale', RETIRED_MODEL]]),
+    llm: { listModels: async (provider) => (provider === 'strata' ? [{ provider: 'strata', id: 'qwen3.8-flash-next-iq3_xxs', name: 'iq3_xxs' }] : []) },
+    onPrompt: hostStartedTurn(1),
+  })
+  const tool = surface.dispatchToolDefinition(ctx)
+  const out = await withVerifyMs(0, () => tool.execute({ task: '把报名表填完', cwd: 'D:\\proj-a', kind: 'existing' }, execOf()))
+  assert.equal(out.continued, false)
+  assert.equal(out.redispatched, false, '没续接过就不该写「续接失败已改新建」')
+  assert.match(out.reason, /跳过 1 条钉着已退役模型的 Computer Use 会话/)
+  assert.match(out.reason, /session-cu-stale→strata\/qwen3\.8-flash-next-iq3_s/, '要指名是哪条会话钉着哪个模型')
+  assert.deepEqual(ctx.calls.map(([kind]) => kind), ['create', 'rename', 'prompt'])
+}])
+
+cases.push(['读不到模型清单 → 不排除（不许猜），照旧续接', async () => {
+  freshDispatch()
+  const ctx = fakeDispatchCtx({
+    rows: [sessionRow('session-cu-old', 'D:\\proj-a')],
+    models: new Map([['session-cu-old', RETIRED_MODEL]]),
+    onPrompt: hostStartedTurn(3),
+  })
+  const tool = surface.dispatchToolDefinition(ctx)
+  const out = await withVerifyMs(0, () => tool.execute({ task: '把报名表填完', cwd: 'D:\\proj-a', kind: 'existing' }, execOf()))
+  assert.equal(ctx.get('llm'), undefined, '这条假宿主没给 llm 服务')
+  assert.equal(out.continued, true, '读不到模型清单就不许据此排除候选')
+  assert.equal(out.redispatched, false)
+  assert.ok(!out.reason.includes('跳过'), '没有排除依据时不该写「跳过」')
+}])
+
+cases.push(['读不到模型选择 → 也不排除（不猜）', async () => {
+  freshDispatch()
+  const ctx = fakeDispatchCtx({
+    rows: [sessionRow('session-cu-old', 'D:\\proj-a')],
+    llm: { listModels: async () => [{ provider: 'strata', id: 'qwen3.8-flash-next-iq3_xxs', name: 'iq3_xxs' }] },
+    onPrompt: hostStartedTurn(3),
+  })
+  const tool = surface.dispatchToolDefinition(ctx)
+  const out = await withVerifyMs(0, () => tool.execute({ task: '把报名表填完', cwd: 'D:\\proj-a', kind: 'existing' }, execOf()))
+  assert.equal(out.continued, true, '会话行里没有模型信息时不许排除它')
+}])
+
+cases.push(['纯观测器：入队抛错=failed(queue-throw)、队列还排着=unverified+pending、起轮 0 步就崩=failed', async () => {
+  const requestId = 'rpc-1'
+  const handlers = []
+  const ctx = {
+    get: (name) => (name === 'agents' ? { get: () => ({ inbox: { nextTurn: [{ source: { kind: 'user', rpcId: requestId } }], nextStep: [] } }) } : undefined),
+    on: (name, fn) => { if (name === 'session/event') handlers.push(fn); return () => {} },
+  }
+  const queued = await surface.observeDispatchPrompt({ ctx, sessionId: 's-1', requestId, timeoutMs: 0, prompt: async () => {} })
+  assert.equal(queued.verification, 'unverified', '消息还排在待办队列里 = 只入队，未确认在跑')
+  assert.equal(queued.pending, true)
+  assert.equal(queued.observed_via, 'poll')
+  const thrown = await surface.observeDispatchPrompt({ ctx, sessionId: 's-1', requestId, timeoutMs: 0, prompt: async () => { throw Object.assign(new Error('入队被拒'), { code: 'SESSION_CLOSED' }) } })
+  assert.equal(thrown.verification, 'failed')
+  assert.equal(thrown.failure.kind, 'queue-throw')
+  assert.equal(thrown.failure.code, 'SESSION_CLOSED')
+  assert.match(thrown.failure.message, /入队被拒/)
+  assert.equal(thrown.observed_via, 'queue-throw')
+  const busy = []
+  const ctx2 = { get: () => undefined, on: (name, fn) => { busy.push(fn); return () => {} } }
+  const failed = await surface.observeDispatchPrompt({
+    ctx: ctx2,
+    sessionId: 's-2',
+    requestId: 'rpc-2',
+    timeoutMs: 5_000,
+    graceMs: 300,
+    pollMs: 5,
+    prompt: async () => {
+      for (const fn of busy) {
+        fn({ id: 's-2' }, { type: 'agent/inbox/spliced', data: { turn: 8, inserted: [{ source: { kind: 'user', rpcId: 'rpc-2' } }] } })
+        fn({ id: 's-2' }, { type: 'turn/start', data: { turn: 8 } })
+        fn({ id: 's-2' }, { type: 'turn/end', data: { turn: 8, reason: { kind: 'error', error: { message: 'no configured model', code: 'UNKNOWN_MODEL' } } } })
+      }
+    },
+  })
+  assert.equal(failed.verification, 'failed', '起轮后 0 步就崩（grace 期内就失败）不许算 confirmed')
+  assert.equal(failed.failure.code, 'UNKNOWN_MODEL')
+  assert.equal(failed.turn, 8)
+  assert.equal(failed.observed_via, 'bus')
+}])
+
+cases.push(['观测确认走宽限期：起了轮、跑出一 step 才算已派活（grace 内没等到失败）', async () => {
+  const handlers = []
+  const ctx = { get: () => undefined, on: (name, fn) => { handlers.push(fn); return () => {} } }
+  const evidence = await surface.observeDispatchPrompt({
+    ctx,
+    sessionId: 's-3',
+    requestId: 'rpc-3',
+    timeoutMs: 4_000,
+    graceMs: 60,
+    pollMs: 10,
+    prompt: async () => {
+      for (const fn of handlers) {
+        fn({ id: 's-3' }, { type: 'agent/inbox/spliced', data: { turn: 5, inserted: [{ source: { kind: 'user', rpcId: 'rpc-3' } }] } })
+        fn({ id: 's-3' }, { type: 'turn/start', data: { turn: 5 } })
+      }
+      setTimeout(() => { for (const fn of handlers) fn({ id: 's-3' }, { type: 'turn/end', data: { turn: 5, reason: { kind: 'completed' } } }) }, 120)
+    },
+  })
+  assert.equal(evidence.verification, 'confirmed', '轮收尾（completed）也算接上了话')
+  assert.equal(evidence.turn, 5)
+}])
+
+cases.push(['宿主既没事件流也没活队列：立刻判未确认，不空等 10 秒', async () => {
+  const started = Date.now()
+  const evidence = await surface.observeDispatchPrompt({
+    ctx: { get: () => undefined },
+    sessionId: 's-4',
+    requestId: 'rpc-4',
+    prompt: async () => {},
+  })
+  assert.equal(evidence.verification, 'unverified')
+  assert.equal(evidence.observed_via, 'none')
+  assert.ok(Date.now() - started < 1_000, `没有可观测通道时不该等满窗口：${Date.now() - started}ms`)
 }])
 
 let failed = 0

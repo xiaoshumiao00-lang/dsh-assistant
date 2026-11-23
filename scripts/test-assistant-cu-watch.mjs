@@ -4,10 +4,10 @@
  *
  * 覆盖（与需求逐条对应）：
  *   1. CU 模式判定：投影 agentPreset 优先、header 兜底；standard / 空 ≠ CU；
- *   2. 完成汇报闸：只有 CU + completed 才报；**标准会话不汇报**、子代理不汇报、
- *      秘书自身不汇报、max-tokens/aborted/error 不汇报；
- *   3. 事件控制器：CU 会话完成 → notify 带该会话 id 与标题；标准会话完成 → 不收集也不 notify；
- *      同一轮只报一次；
+ *   2. 轮次汇报闸：CU 会话的 completed 与失败轮（error / aborted / interrupted / blocked）都汇报；
+ *      **标准会话不汇报**、子代理不汇报、秘书自身不汇报、max-tokens 不汇报（归托管自动续写管）；
+ *   3. 事件控制器：CU 会话完成 → notify 带该会话 id 与标题；失败轮 → notify 带 outcome=failed 与
+ *      错误原文（错误码、message）；标准会话完成 → 不收集也不 notify；同一轮只报一次；
  *   4. 通知正文含 [[session:<id>|<标题>]] 引用标记（渲染成可点跳信息行）；正文要求把 CU 会话
  *      的结果完整、原样转述（2026-11-22 定案：撤掉「一两句口语汇报」的长度限制），
  *      CU 结果带的是整段原文而不是首句；
@@ -33,17 +33,41 @@ cases.push(['CU 判定：投影优先、header 兜底、空按标准', () => {
   assert.equal(watch.presetOfSource(undefined, undefined), '')
 }])
 
-/* ---------- 2. 完成汇报闸 ---------- */
-cases.push(['汇报闸：CU + completed 才报，标准会话一律不汇报', () => {
-  assert.equal(watch.shouldReportCompletion({ preset: 'computer-use', reasonKind: 'completed' }), true)
-  assert.equal(watch.shouldReportCompletion({ preset: 'standard', reasonKind: 'completed' }), false, '标准会话不汇报')
-  assert.equal(watch.shouldReportCompletion({ preset: '', reasonKind: 'completed' }), false)
-  assert.equal(watch.shouldReportCompletion({ preset: 'computer-use', reasonKind: 'max-tokens' }), false)
-  assert.equal(watch.shouldReportCompletion({ preset: 'computer-use', reasonKind: 'aborted' }), false)
-  assert.equal(watch.shouldReportCompletion({ preset: 'computer-use', reasonKind: 'error' }), false)
-  assert.equal(watch.shouldReportCompletion({ preset: 'computer-use', reasonKind: 'completed', origin: 'subagent' }), false)
-  assert.equal(watch.shouldReportCompletion({ preset: 'computer-use', reasonKind: 'completed', delegationDepth: 1 }), false)
-  assert.equal(watch.shouldReportCompletion({ preset: 'computer-use', reasonKind: 'completed', isSecretary: true }), false)
+/* ---------- 2. 轮次汇报闸（完成与失败都汇报） ---------- */
+cases.push(['汇报闸：CU + completed / error / aborted / interrupted / blocked 都报，标准会话与 max-tokens 不报', () => {
+  assert.equal(watch.shouldReportTurn({ preset: 'computer-use', reasonKind: 'completed' }), true)
+  assert.equal(watch.shouldReportTurn({ preset: 'computer-use', reasonKind: 'error' }), true, '失败轮必须报（2026-11-23 用户定案：失败不许静默成已派活）')
+  assert.equal(watch.shouldReportTurn({ preset: 'computer-use', reasonKind: 'aborted' }), true, 'aborted 轮也得出卡')
+  assert.equal(watch.shouldReportTurn({ preset: 'computer-use', reasonKind: 'interrupted' }), true)
+  assert.equal(watch.shouldReportTurn({ preset: 'computer-use', reasonKind: 'blocked' }), true)
+  assert.equal(watch.shouldReportTurn({ preset: 'standard', reasonKind: 'completed' }), false, '标准会话不汇报')
+  assert.equal(watch.shouldReportTurn({ preset: 'standard', reasonKind: 'error' }), false, '标准会话的失败轮也不归秘书汇报')
+  assert.equal(watch.shouldReportTurn({ preset: '', reasonKind: 'completed' }), false)
+  assert.equal(watch.shouldReportTurn({ preset: 'computer-use', reasonKind: 'max-tokens' }), false, 'max-tokens 归托管自动续写管')
+  assert.equal(watch.shouldReportTurn({ preset: 'computer-use', reasonKind: '' }), false)
+  assert.equal(watch.shouldReportTurn({ preset: 'computer-use', reasonKind: undefined }), false)
+  assert.equal(watch.shouldReportTurn({ preset: 'computer-use', reasonKind: 'completed', origin: 'subagent' }), false)
+  assert.equal(watch.shouldReportTurn({ preset: 'computer-use', reasonKind: 'error', origin: 'subagent' }), false)
+  assert.equal(watch.shouldReportTurn({ preset: 'computer-use', reasonKind: 'completed', delegationDepth: 1 }), false)
+  assert.equal(watch.shouldReportTurn({ preset: 'computer-use', reasonKind: 'completed', isSecretary: true }), false)
+  // 轮次分类
+  assert.equal(watch.classifyCuTurn('completed'), 'completed')
+  assert.equal(watch.classifyCuTurn('error'), 'failed')
+  assert.equal(watch.classifyCuTurn('aborted'), 'failed')
+  assert.equal(watch.classifyCuTurn('interrupted'), 'failed')
+  assert.equal(watch.classifyCuTurn('blocked'), 'failed')
+  assert.equal(watch.classifyCuTurn('max-tokens'), null)
+  assert.equal(watch.classifyCuTurn(''), null)
+  assert.equal(watch.classifyCuTurn(undefined), null)
+  // 失败轮的错误原文（宿主 turn/end 的 reason.error）
+  assert.deepEqual(watch.failureOfTurnEnd({ reason: { kind: 'error', error: { message: '  pi-ai provider "strata" has no configured model "qwen3.8-flash-next-iq3_s"  ', code: 'UNKNOWN_MODEL' } } }), {
+    kind: 'error',
+    message: 'pi-ai provider "strata" has no configured model "qwen3.8-flash-next-iq3_s"',
+    code: 'UNKNOWN_MODEL',
+  })
+  assert.deepEqual(watch.failureOfTurnEnd({ reason: { kind: 'aborted' } }), { kind: 'aborted', message: '', code: '' })
+  assert.equal(watch.formatCuFailureLine({ kind: 'error', message: 'boom', code: 'UNKNOWN_MODEL' }), '（原因 error；错误码 UNKNOWN_MODEL；错误原文「boom」）')
+  assert.equal(watch.formatCuFailureLine(undefined), '')
 }])
 
 /* ---------- 3. 事件控制器 ---------- */
@@ -69,6 +93,90 @@ cases.push(['控制器：CU 完成触发 notify（带会话 id 与标题），�
   await new Promise((r) => setTimeout(r, 5))
   assert.equal(sent.length, 1)
   assert.equal(ctl.reportedOf('cu-1', 3), true)
+}])
+
+cases.push(['控制器：CU 失败轮（error + UNKNOWN_MODEL）→ notify 带 outcome=failed 与错误原文，同一轮只报一次', async () => {
+  const sent = []
+  const logs = []
+  const ctl = watch.createCuWatch({
+    presetOf: (session) => session.preset,
+    titleOf: (session) => session.header.title,
+    secretaryId: () => 'sec-1',
+    notify: (payload) => { sent.push(payload) },
+    log: (line) => { logs.push(line) },
+  })
+  const cu = { id: 'cu-fail-1', preset: 'computer-use', header: { title: '竞赛管理系统录入成果' } }
+  ctl.handleSessionEvent(cu, { type: 'turn/start', data: { turn: 9 } })
+  ctl.handleSessionEvent(cu, { type: 'turn/end', data: { turn: 9, reason: { kind: 'error', error: { message: 'pi-ai provider "strata" has no configured model "qwen3.8-flash-next-iq3_s"', code: 'UNKNOWN_MODEL' } } } })
+  await new Promise((r) => setTimeout(r, 5))
+  assert.equal(sent.length, 1, '失败轮要出汇报')
+  assert.equal(sent[0].outcome, 'failed')
+  assert.equal(sent[0].failure.kind, 'error')
+  assert.equal(sent[0].failure.code, 'UNKNOWN_MODEL')
+  assert.match(sent[0].failure.message, /no configured model/)
+  assert.equal(sent[0].summary, '', '失败轮通常没有文本结果')
+  // 同一失败轮重复 turn/end 只报一次
+  ctl.handleSessionEvent(cu, { type: 'turn/end', data: { turn: 9, reason: { kind: 'error' } } })
+  await new Promise((r) => setTimeout(r, 5))
+  assert.equal(sent.length, 1, '同一轮只报一次')
+  // max-tokens 轮不报（归托管自动续写管）
+  ctl.handleSessionEvent(cu, { type: 'turn/end', data: { turn: 10, reason: { kind: 'max-tokens' } } })
+  await new Promise((r) => setTimeout(r, 5))
+  assert.equal(sent.length, 1, 'max-tokens 轮不出卡')
+  // aborted 轮出卡（口径：失败，不是完成）
+  ctl.handleSessionEvent(cu, { type: 'turn/end', data: { turn: 11, reason: { kind: 'aborted', error: { message: '用户中断这一轮', code: 'ABORTED' } } } })
+  await new Promise((r) => setTimeout(r, 5))
+  assert.equal(sent.length, 2)
+  assert.equal(sent[1].outcome, 'failed')
+  assert.equal(sent[1].failure.kind, 'aborted')
+  assert.ok(logs.some((line) => /失败轮汇报/.test(line)), '失败轮要留一条日志')
+}])
+
+cases.push(['控制器：秘书自身的失败轮不汇报（防止自循环）', async () => {
+  const sent = []
+  const ctl = watch.createCuWatch({
+    presetOf: (session) => session.preset,
+    titleOf: (session) => session.header.title,
+    secretaryId: () => 'sec-1',
+    notify: (payload) => { sent.push(payload) },
+  })
+  const self = { id: 'sec-1', preset: 'computer-use', header: { title: '秘书自己' } }
+  ctl.handleSessionEvent(self, { type: 'turn/end', data: { turn: 4, reason: { kind: 'error', error: { message: 'boom', code: 'UNKNOWN_MODEL' } } } })
+  await new Promise((r) => setTimeout(r, 5))
+  assert.equal(sent.length, 0)
+}])
+
+cases.push(['失败轮通知正文：照实说「这一轮失败了」并带错误码/错误原文，不许说成已完成，卡片两处结构不变', () => {
+  const text = watch.buildCompletionNotice({
+    sessionId: 'cu-9',
+    title: '竞赛管理系统录入成果',
+    summary: '',
+    outcome: 'failed',
+    failure: { kind: 'error', message: 'pi-ai provider "strata" has no configured model "qwen3.8-flash-next-iq3_s"', code: 'UNKNOWN_MODEL' },
+  })
+  assert.match(text, /这一轮失败了/)
+  assert.match(text, /UNKNOWN_MODEL/, '卡片正文要带错误码')
+  assert.match(text, /错误原文「pi-ai provider/, '卡片正文要带错误原文')
+  assert.match(text, /派活失败/, '要写清这是派活失败')
+  assert.match(text, /新建的 Computer Use 会话/, '要提示可以改新建一条会话')
+  assert.ok(!text.includes('这一轮已经完成'), '失败轮不许说成已完成')
+  assert.ok(text.includes('[[session:cu-9|竞赛管理系统录入成果]]'), '失败轮卡片也要能点开跳转')
+  assert.ok(text.includes('这一回合工具已全部禁用，不要尝试派活或查询。'), '工具禁用约束句照留')
+  const lines = text.split('\n')
+  assert.match(lines[0], /^\s*[（(【\[]?\s*系统通知/, '首行仍是「系统通知」开头（NOTICE_HEAD_LINE_RE）')
+  assert.match(lines[lines.length - 1], /^最后单独一行原样输出：\[\[session:[^\]]*\]\]$/, '引用行格式不变（NOTICE_SESSION_REF_LINE_RE）')
+  // 不带 outcome 时仍是完成口径（旧文案不动）
+  const done = watch.buildCompletionNotice({ sessionId: 'cu-9', title: '门店详情页', summary: '白屏修好了。' })
+  assert.match(done, /这一轮已经完成/)
+  assert.ok(!done.includes('失败了'), '完成轮不该带失败措辞')
+  // 失败轮但宿主事件只给 kind、没给错误原文与错误码：也出卡，且不许编造错误码
+  const noDetail = watch.buildCompletionNotice({ sessionId: 'cu-8', title: '录入成果', summary: '', outcome: 'failed', failure: { kind: 'aborted', message: '', code: '' } })
+  assert.match(noDetail, /这一轮失败了（原因 aborted）。/)
+  assert.ok(!noDetail.includes('错误码 UNKNOWN'), '读不到错误码就不编造')
+  assert.match(noDetail, /没有留下文字结果/)
+  const naked = watch.buildCompletionNotice({ sessionId: 'cu-7', title: 'T', summary: '', outcome: 'failed', failure: { kind: '', message: '', code: '' } })
+  assert.match(naked, /这一轮失败了。/)
+  assert.ok(!naked.includes('（原因'), 'kind 读不到就不写原因')
 }])
 
 cases.push(['控制器：标准会话完成 → 不收集、不汇报；子代理不汇报', async () => {

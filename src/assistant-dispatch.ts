@@ -46,7 +46,7 @@ export const DISPATCH_RULES = [
 /** 工具描述（模型看到的就是这段）。 */
 const DISPATCH_DESCRIPTION = [
   '把需要外部动手能力的任务派给一条 Computer Use 模式会话（不是标准会话、不是子代理）。需要看屏幕、操作应用、读写本机文件、保存/下载/整理文件时必须调用本工具；纯知识随口问题和只读联网一查就能答的轻量事实（如「明天天气」）不要调用，直接用 web_search / web_fetch 回答。',
-  '禁止用「我看不到」「没有截图能力」「无法直接确认」「我做不了」直接终答或收工。遇到自己做不到的事，第一步必须先调用本工具；成功后再回报「已派 Computer Use 会话处理」。',
+  '禁止用「我看不到」「没有截图能力」「无法直接确认」「我做不了」直接终答或收工。遇到自己做不到的事，第一步必须先调用本工具；成功后照实回报回执文案：只有「已派活（…已确认在跑）」才是那条会话真接上了话，「已入队（未确认在跑）」就是只投进了队列、宿主还没给出证据——不许把未确认说成已派活；回执出现「续接失败已改新建」就是那条会话这一轮失败了（错误原文在 reason 里），照实说是派活失败并改用了新建会话。',
   '已有项目文件夹时 kind=existing 并填绝对路径 cwd（B）；没有对应项目时 kind=new-folder 且 cwd 留空（C）。不要再用 assistant 类型。',
   '宿主只建/续 Computer Use 模式会话。标准会话由 CU 会话在后台自行派发，不归你管，也不要给它们建卡片。',
   '选目录按这三层规则：',
@@ -74,10 +74,52 @@ export interface CuSessionRow extends SessionRowLike {
   agentPreset?: string
   origin?: string
   delegationDepth?: number
+  /**
+   * 会话钉住的模型选择（宿主 modelSelection 投影：next ?? lastUsed）。
+   * undefined = 读不到（不参与可用性过滤，不许猜）；null = 读到了但这条会话没有记录模型。
+   */
+  model?: { provider: string; model: string } | null
+}
+
+/** 读一条会话投影里的 modelSelection（live = 用 sessionProjections，冷行 = 用 sessionProjectionCache）。 */
+function modelSelectionFromBlock(block: any): { provider: string; model: string } | null | undefined {
+  const view = block?.values?.modelSelection
+  const selection = view?.next ?? view?.lastUsed
+  if (view === undefined || view === null) return undefined
+  if (selection === null || selection === undefined) return null
+  if (typeof selection.provider === 'string' && typeof selection.model === 'string') {
+    return { provider: selection.provider, model: selection.model }
+  }
+  return null
 }
 
 /**
- * 读出全部会话行（cwd / title / updatedAt / sessionId / agentPreset / 血缘）。
+ * 会话钉的模型（provider/model）。读不到就 undefined——调用方据此「不猜、不拿它当排除依据」。
+ * 宿主服务名字与 src/assistant-cu-watch.ts 的 agentPreset 读取同一套（sessionProjections /
+ * sessionProjectionCache），零 I/O 的缓存视图，不读会话日志。
+ */
+export function modelSelectionOf(ctx: any, source: any, live = false): { provider: string; model: string } | null | undefined {
+  if (source === undefined || source === null) return undefined
+  if (live) {
+    try {
+      const projections = typeof ctx?.get === 'function' ? ctx.get('sessionProjections') : undefined
+      if (projections && typeof projections.cachedSnapshot === 'function') {
+        const value = modelSelectionFromBlock(projections.cachedSnapshot(source, ['modelSelection']))
+        if (value !== undefined) return value
+      }
+    } catch { /* 投影没就绪：继续试持久缓存 */ }
+  }
+  try {
+    const cache = typeof ctx?.get === 'function' ? ctx.get('sessionProjectionCache') : undefined
+    if (cache && typeof cache.cachedSnapshot === 'function') {
+      return modelSelectionFromBlock(cache.cachedSnapshot(source?.header ?? source, ['modelSelection']))
+    }
+  } catch { /* 读不到就是 undefined */ }
+  return undefined
+}
+
+/**
+ * 读出全部会话行（cwd / title / updatedAt / sessionId / agentPreset / 血缘 / 钉住的模型）。
  * 优先 sessionQuery（持久化全集，重启后也在），退而用内存里的活会话。
  */
 export async function listSessionRows(ctx: any): Promise<CuSessionRow[]> {
@@ -96,6 +138,7 @@ export async function listSessionRows(ctx: any): Promise<CuSessionRow[]> {
           agentPreset: typeof header.agentPreset === 'string' ? header.agentPreset : '',
           origin: typeof header.origin === 'string' ? header.origin : '',
           delegationDepth: Number(header.delegationDepth) || 0,
+          model: modelSelectionOf(ctx, header ?? record),
         })
       }
     }
@@ -110,8 +153,9 @@ export async function listSessionRows(ctx: any): Promise<CuSessionRow[]> {
         title: String(header.title ?? ''),
         updatedAt: toMs(header.updatedAt),
         agentPreset: typeof header.agentPreset === 'string' ? header.agentPreset : '',
-        origin: typeof header.origin === 'string' ? header.origin : '',
+        origin: typeof session?.header?.origin === 'string' ? session.header.origin : '',
         delegationDepth: Number(header.delegationDepth) || 0,
+        model: modelSelectionOf(ctx, session, true) ?? modelSelectionOf(ctx, header),
       })
     }
   } catch { /* 宿主没有 sessions.list：只剩 sessionQuery 的结果 */ }
@@ -373,7 +417,7 @@ export function dispatchPromptSection(ctx: any, projects: DispatchProject[]): st
   lines.push('标准会话由 Computer Use 会话在后台自行派发，不归你管，也不要给它们建卡片。')
   lines.push('')
   lines.push('禁止收工式回答：不得以「我看不到」「没有截图能力」「无法直接确认」「我做不了」作为终答，也不要先猜一个答案再结束；不得用「工具清单里没有派活工具」当终答。')
-  lines.push(`遇到自己做不到或需要动手的任务，必须先派 ${SECRETARY_DISPATCH_TOOL}，工具成功后再简短回报「已派 Computer Use 会话处理」；工具失败才如实说派活失败。`)
+  lines.push(`遇到自己做不到或需要动手的任务，必须先派 ${SECRETARY_DISPATCH_TOOL}，工具成功后再照实回报回执文案：只有「已派活（…已确认在跑）」才是那条会话真接上了话，「已入队（未确认在跑）」就是只投进了队列、不许说成已派活，回执带「续接失败已改新建」就是那条会话这一轮失败了。`)
   lines.push(`例：「你看我打开的 QQ 页面，他们说的 38 fn 指什么模型？」需要看当前屏幕，必须先调用 ${SECRETARY_DISPATCH_TOOL}，绝不能在秘书页回答看不到。`)
   lines.push('例：「明天天气」是只读联网可查的轻量问题，直接用 web_search / web_fetch 查并给出结果；万一联网工具不可用，再派活，不能直接说没办成。')
   lines.push('例：「今天几号」是纯知识随口问，直接回答，不调用工具、不建会话。')
@@ -426,29 +470,349 @@ function titleOf(task: string): string {
   return `派活：${clean === '' ? '新任务' : clean}`
 }
 
-/**
- * 分层 B 续接挑选：该项目文件夹下最近的 Computer Use 会话。
- * 排除：非 CU 模式（标准会话不归秘书管）、子代理会话、秘书固定会话自身。
- * 纯函数（单测直接驱动）。
- */
-export function pickCuSessionToContinue(rows: CuSessionRow[], cwd: string, secretaryId = ''): CuSessionRow | null {
+/** 该目录下可续接的 CU 会话行（归一 cwd、排除标准会话/子代理/秘书自身），按 updatedAt 降序。纯函数。 */
+export function cuContinueCandidates(rows: CuSessionRow[], cwd: string, secretaryId = ''): CuSessionRow[] {
   const norm = (dir: string): string => String(dir ?? '').replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase()
   const target = norm(cwd)
-  if (target === '') return null
-  const candidates = rows.filter((row) => {
-    if (String(row.sessionId ?? '') === '') return false
-    if (row.sessionId === secretaryId) return false
-    if (row.agentPreset !== CU_AGENT_PRESET) return false
-    if (row.origin === 'subagent' || (Number(row.delegationDepth) || 0) > 0) return false
-    return norm(String(row.cwd ?? '')) === target
-  })
-  if (candidates.length === 0) return null
-  return candidates.sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0))[0]
+  if (target === '') return []
+  return rows
+    .filter((row) => {
+      if (String(row.sessionId ?? '') === '') return false
+      if (row.sessionId === secretaryId) return false
+      if (row.agentPreset !== CU_AGENT_PRESET) return false
+      if (row.origin === 'subagent' || (Number(row.delegationDepth) || 0) > 0) return false
+      return norm(String(row.cwd ?? '')) === target
+    })
+    .sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0))
+}
+
+/**
+ * 分层 B 续接挑选：该项目文件夹下最近的 Computer Use 会话。
+ * 排除：非 CU 模式（标准会话不归秘书管）、子代理会话、秘书固定会话自身、
+ * 以及 `isUnusable` 判为不可用的会话（2026-11-23 新增：模型已退役的那种）。
+ * 纯函数（单测直接驱动）。
+ */
+export function pickCuSessionToContinue(
+  rows: CuSessionRow[],
+  cwd: string,
+  secretaryId = '',
+  isUnusable?: (row: CuSessionRow) => boolean,
+): CuSessionRow | null {
+  const candidates = typeof isUnusable === 'function'
+    ? cuContinueCandidates(rows, cwd, secretaryId).filter((row) => !isUnusable(row))
+    : cuContinueCandidates(rows, cwd, secretaryId)
+  return candidates[0] ?? null
+}
+
+/* ---------- 派活执行确认（2026-11-23 用户定案：回执不许谎报） ---------- */
+
+/** 观测窗口默认值与轮询间隔；DSH_ASSISTANT_DISPATCH_VERIFY_MS / _POLL_MS 覆盖（0 = 不等）。 */
+export const DISPATCH_VERIFY_TIMEOUT_MS = 10_000
+export const DISPATCH_VERIFY_POLL_MS = 150
+/** 起了轮但还没跑出一 step 时的宽限期：等这么久再看它是不是立刻崩成失败轮。 */
+export const DISPATCH_VERIFY_GRACE_MS = 1_500
+
+/** confirmed = 观测到会话真接上了话；unverified = 只入队没确认；failed = 入队失败或那一轮失败。 */
+export type DispatchVerification = 'confirmed' | 'unverified' | 'failed'
+
+export interface DispatchFailure { kind: string; message: string; code: string }
+
+export interface DispatchEvidence {
+  verification: DispatchVerification
+  /** 观测到的轮次号（0 = 没观测到） */
+  turn: number
+  /** 失败轮的错误原文（只有 verification='failed' 有值） */
+  failure?: DispatchFailure
+  /** 观测到派活消息还躺在该会话的待办队列里（入队成功、尚未被消费） */
+  pending: boolean
+  /** 证据来源：宿主事件流 / 活的 agent 队列 / 入队就抛错 */
+  observed_via: 'bus' | 'poll' | 'none' | 'queue-throw'
+}
+
+function clampMs(value: unknown, fallback: number, max: number): number {
+  const raw = Number(value)
+  if (!Number.isFinite(raw) || raw < 0) return fallback
+  return Math.min(Math.floor(raw), max)
+}
+
+function envMs(name: string, fallback: number, max: number): number {
+  return clampMs(process.env[name], fallback, max)
+}
+
+/** 该会话的待办队列里还有我们这条派活消息吗。null = 读不到队列（不猜）。 */
+export function pendingRequestInAgent(ctx: any, sessionId: string, requestId: string): boolean | null {
+  let agent: any
+  try {
+    const agents = (typeof ctx?.get === 'function' ? ctx.get('agents') : undefined) ?? ctx?.agents
+    agent = typeof agents?.get === 'function' ? agents.get(sessionId) : undefined
+  } catch { return null }
+  if (agent === undefined || agent === null) return null
+  const lists = [agent?.inbox?.nextTurn, agent?.inbox?.nextStep]
+  let known = false
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue
+    known = true
+    for (const message of list) {
+      if (String(message?.source?.rpcId ?? '') === requestId) return true
+    }
+  }
+  return known ? false : null
+}
+
+/**
+ * 入队前后盯那条会话：观测窗口内看到「起了轮 / 跑了步 / 轮已收尾」= confirmed，
+ * 看到失败轮（error/aborted/interrupted/blocked）= failed，入队本身抛错 = failed（kind=queue-throw），
+ * 什么证据都没有 = unverified。只观测宿主事件，绝不写任何会话事件。
+ */
+export async function observeDispatchPrompt(input: {
+  ctx: any
+  sessionId: string
+  requestId: string
+  prompt: () => Promise<unknown>
+  timeoutMs?: number
+  pollMs?: number
+  graceMs?: number
+  signal?: AbortSignal
+}): Promise<DispatchEvidence> {
+  const ctx = input.ctx
+  const sessionId = String(input.sessionId ?? '')
+  const requestId = String(input.requestId ?? '')
+  const timeoutMs = input.timeoutMs !== undefined ? clampMs(input.timeoutMs, DISPATCH_VERIFY_TIMEOUT_MS, 60_000) : envMs('DSH_ASSISTANT_DISPATCH_VERIFY_MS', DISPATCH_VERIFY_TIMEOUT_MS, 60_000)
+  const pollMs = input.pollMs !== undefined ? clampMs(input.pollMs, DISPATCH_VERIFY_POLL_MS, 2_000) : envMs('DSH_ASSISTANT_DISPATCH_POLL_MS', DISPATCH_VERIFY_POLL_MS, 2_000)
+  const graceMs = input.graceMs !== undefined ? clampMs(input.graceMs, DISPATCH_VERIFY_GRACE_MS, 30_000) : envMs('DSH_ASSISTANT_DISPATCH_GRACE_MS', DISPATCH_VERIFY_GRACE_MS, 30_000)
+  const busAvailable = typeof ctx?.on === 'function'
+
+  const state = {
+    turn: 0,
+    opened: false,
+    worked: false,
+    consumed: false,
+    ended: false,
+    pending: false,
+    busSeen: false,
+    failure: null as DispatchFailure | null,
+  }
+  let settled = false
+  let resolveDone: (value: DispatchEvidence) => void = () => {}
+  const done = new Promise<DispatchEvidence>((resolve) => { resolveDone = resolve })
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let tick: ReturnType<typeof setInterval> | undefined
+  let graceTimer: ReturnType<typeof setTimeout> | undefined
+  let offBus: unknown
+
+  const evidenceOf = (verification: DispatchVerification): DispatchEvidence => ({
+    verification,
+    turn: state.turn,
+    ...(state.failure !== null ? { failure: state.failure } : {}),
+    pending: state.pending,
+    observed_via: state.failure !== null && state.failure.kind === 'queue-throw'
+      ? 'queue-throw'
+      : (state.busSeen ? 'bus' : (pendingKnown.value !== null ? 'poll' : (busAvailable ? 'bus' : 'none'))),
+  } as DispatchEvidence)
+
+  const finish = (verification: DispatchVerification): void => {
+    if (settled) return
+    settled = true
+    if (timer !== undefined) clearTimeout(timer)
+    if (tick !== undefined) clearInterval(tick)
+    if (graceTimer !== undefined) clearTimeout(graceTimer)
+    if (typeof offBus === 'function') { try { offBus() } catch { /* 解绑失败不影响回执 */ } }
+    resolveDone(evidenceOf(verification))
+  }
+
+  const pendingKnown: { value: boolean | null } = { value: null }
+  const readPending = (): boolean | null => {
+    const value = pendingRequestInAgent(ctx, sessionId, requestId)
+    pendingKnown.value = value
+    if (value !== null) state.pending = value
+    return value
+  }
+
+  const evaluate = (): void => {
+    if (settled) return
+    const pending = readPending()
+    const absorbed = state.consumed || pending === false
+    if (state.failure !== null) return finish('failed')
+    if (state.worked && pending !== true) return finish('confirmed')
+    if (state.ended && absorbed) return finish('confirmed')
+    // 起了轮、也接上了话，但一还没跑出一 step：先等 graceMs 再看宿主是不是立刻把这轮判成失败
+    // （钉着已退役模型的会话就是这种：turn/start 后 60～130ms 内 0 步就 turn/end error）
+    if (state.opened && absorbed && graceMs > 0 && graceTimer === undefined) {
+      graceTimer = setTimeout(() => {
+        graceTimer = undefined
+        if (state.failure !== null) return finish('failed')
+        finish('confirmed')
+      }, graceMs)
+    }
+  }
+
+  const handleEvent = (event: any): void => {
+    const type = String(event?.type ?? '')
+    const data = event?.data ?? {}
+    const turn = Number(data?.turn)
+    state.busSeen = true
+    if (type === 'agent/inbox/spliced') {
+      const inserted = Array.isArray(data?.inserted) ? data.inserted : []
+      if (inserted.some((message: any) => String(message?.source?.rpcId ?? '') === requestId)) {
+        state.consumed = true
+        evaluate()
+      }
+      return
+    }
+    if (type === 'turn/start') {
+      state.opened = true
+      if (Number.isFinite(turn) && turn > 0) state.turn = turn
+      evaluate()
+      return
+    }
+    if (type === 'step/start' || type === 'assistant/message' || type === 'assistant/attempt' || type === 'tool/call') {
+      state.worked = true
+      if (Number.isFinite(turn) && turn > 0) state.turn = turn
+      evaluate()
+      return
+    }
+    if (type === 'turn/end') {
+      const kind = String(data?.reason?.kind ?? '')
+      if (Number.isFinite(turn) && turn > 0) state.turn = turn
+      if (kind === 'error' || kind === 'aborted' || kind === 'interrupted' || kind === 'blocked') {
+        // 这条失败轮是我们的消息造成的才算失败；我们的消息还排着队 = 别的轮出岔，不算这次派活失败
+        if (readPending() === true) return
+        state.failure = {
+          kind,
+          message: String(data?.reason?.error?.message ?? '').trim(),
+          code: String(data?.reason?.error?.code ?? '').trim(),
+        }
+        evaluate()
+        return
+      }
+      if (kind !== '') state.ended = true
+      evaluate()
+      return
+    }
+  }
+
+  if (busAvailable) {
+    try {
+      offBus = ctx.on('session/event', (session: any, event: any) => {
+        if (String(session?.id ?? '') !== sessionId) return
+        handleEvent(event)
+      })
+    } catch { offBus = undefined }
+  }
+
+  try {
+    await input.prompt()
+  } catch (error) {
+    state.failure = {
+      kind: 'queue-throw',
+      message: String((error as Error)?.message ?? error),
+      code: String((error as any)?.code ?? ''),
+    }
+    finish('failed')
+    return done
+  }
+
+  if (!busAvailable && pendingRequestInAgent(ctx, sessionId, requestId) === null) {
+    // 宿主既不给事件流也读不到活的 agent 队列：没有任何可观测通道，如实报「未确认」，不空等
+    finish('unverified')
+    return done
+  }
+  if (input.signal?.aborted === true) {
+    finish('unverified')
+    return done
+  }
+  try { input.signal?.addEventListener?.('abort', () => finish('unverified')) } catch { /* 老信号实现没有 addEventListener */ }
+  evaluate()
+  if (!settled) {
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => finish('unverified'), timeoutMs)
+      tick = setInterval(evaluate, pollMs)
+    } else {
+      // 窗口为 0 = 不等（测试口径）：当场没有证据就如实报未确认
+      finish('unverified')
+    }
+  }
+  return done
+}
+
+/* ---------- 续接候选的模型可用性（读得到就按「模型还配着吗」过滤，读不到就不猜） ---------- */
+
+const MODEL_CHECK_TTL_MS = 30_000
+const modelChecks = new Map<string, { at: number; value: boolean }>()
+
+/** 测试用：清掉模型可用性缓存。 */
+export function resetModelChecksForTests(): void {
+  modelChecks.clear()
+}
+
+/**
+ * 这个模型变体现在还在宿主配置的模型清单里吗。
+ * true = 还配着；false = 已退役/没配（据此排除该会话）；null = 宿主读不到清单（不许据此排除）。
+ */
+export async function isModelConfigured(
+  ctx: any,
+  selection: { provider: string; model: string } | null | undefined,
+): Promise<boolean | null> {
+  if (selection === undefined || selection === null) return null
+  const provider = String(selection.provider ?? '')
+  const model = String(selection.model ?? '')
+  if (provider === '' || model === '') return null
+  let llm: any
+  try { llm = (typeof ctx?.get === 'function' ? ctx.get('llm') : undefined) ?? ctx?.llm } catch { llm = undefined }
+  if (llm === undefined || llm === null) return null
+  const key = `${provider}\u0000${model}`
+  const cached = modelChecks.get(key)
+  if (cached !== undefined && Date.now() - cached.at < MODEL_CHECK_TTL_MS) return cached.value
+  let value: boolean | null = null
+  if (typeof llm.listModels === 'function') {
+    try {
+      const models = await llm.listModels(provider)
+      value = Array.isArray(models) ? models.some((info: any) => String(info?.id ?? '') === model) : null
+    } catch { value = null }
+  }
+  if (value === null && typeof llm.resolveModelInfo === 'function') {
+    try {
+      value = (await llm.resolveModelInfo(provider, model)) !== undefined
+    } catch (error) {
+      // 只有宿主明确说「没配这个模型」才算不可用；其它错误 = 不确定，不据此排除
+      value = String((error as any)?.code ?? '') === 'UNKNOWN_MODEL' ? false : null
+    }
+  }
+  if (value === null) return null
+  modelChecks.set(key, { at: Date.now(), value })
+  return value
+}
+
+/** 候选会话 → 逐条查它钉的模型还配着吗（读不到模型的行不进这张表，也就不排除）。 */
+async function modelStatesForCandidates(ctx: any, rows: CuSessionRow[], cwd: string, secretaryId: string): Promise<Map<string, boolean | null>> {
+  const map = new Map<string, boolean | null>()
+  for (const row of cuContinueCandidates(rows, cwd, secretaryId)) {
+    if (row.model === undefined) continue
+    map.set(String(row.sessionId), await isModelConfigured(ctx, row.model))
+  }
+  return map
 }
 
 /** 调用方会话 id。 */
 function callerOf(exec: any): string {
   return String(exec?.agent?.session?.id ?? exec?.session?.id ?? exec?.sessionId ?? '')
+}
+
+/**
+ * 派活回执文案（三态口径，2026-11-23 用户定案）：
+ * - confirmed：真正确认到那条会话接上了话（观测到它起了轮 / 跑了步）→ 才说「已派活」。
+ * - unverified：只是入队成功、窗口内没看到它真在跑 → 只能说「已入队（未确认在跑）」，绝不写「已派活」。
+ * - failed：入队失败或那一轮失败 → 由 execute() 抛错/自动改新建，绝不出「已派活」文案。
+ */
+export function dispatchReceiptText(value: any): string {
+  const verification = String(value?.verification ?? 'unverified')
+  const mode = value?.continued === true ? '续接' : '新建'
+  const decided = value?.decided_by === 'model' ? '秘书模型判断' : '规则兜底'
+  const head = verification === 'confirmed'
+    ? `已派活（Computer Use ${mode}·已确认在跑${Number(value?.turn) > 0 ? ` 第 ${value.turn} 轮` : ''}）`
+    : `已入队（未确认在跑，Computer Use ${mode}${value?.pending === true ? '·消息还排在待办队列里' : '·宿主窗口内没给出证据'}）`
+  const redispatch = value?.redispatched === true ? '｜续接失败已改新建' : ''
+  return `${head}${redispatch} → ${value?.cwd ?? ''}（${decided}：${value?.reason ?? ''}）`
 }
 
 /** 宿主工具定义（手写 JSON Schema：不依赖 @deepseek-ai/dsh-tools 的 defineTool）。 */
@@ -489,13 +853,20 @@ export function dispatchToolDefinition(ctx: any): any {
           created_folder: { type: 'boolean' },
           continued: { type: 'boolean' },
           agent_preset: { type: 'string' },
+          /** confirmed = 观测到会话接上了话；unverified = 只入队没能确认；failed 只在抛错时出现（没有回执） */
+          verification: { type: 'string', enum: ['confirmed', 'unverified'] },
+          verified: { type: 'boolean' },
+          /** 观测到的轮次号（0 = 没观测到） */
+          turn: { type: 'number' },
+          /** 观测窗口内这条派活消息是否还在会话待办队列里 */
+          pending: { type: 'boolean' },
+          /** 续接失败后自动改新建（回执如实写「续接失败已改新建」） */
+          redispatched: { type: 'boolean' },
+          failed_session_id: { type: 'string' },
         },
-        required: ['session_id', 'cwd', 'kind', 'reason', 'decided_by', 'created_folder', 'continued', 'agent_preset'],
+        required: ['session_id', 'cwd', 'kind', 'reason', 'decided_by', 'created_folder', 'continued', 'agent_preset', 'verification', 'verified', 'redispatched'],
       },
-      render: (_args: unknown, value: any): any[] => [{
-        type: 'text',
-        text: `已派活（Computer Use ${value?.continued ? '续接' : '新建'}）→ ${value?.cwd ?? ''}（${value?.decided_by === 'model' ? '秘书模型判断' : '规则兜底'}：${value?.reason ?? ''}）`,
-      }],
+      render: (_args: unknown, value: any): any[] => [{ type: 'text', text: dispatchReceiptText(value) }],
     },
     isConcurrencySafe: () => false,
     async execute(args: any, exec: any): Promise<any> {
@@ -543,56 +914,120 @@ export function dispatchToolDefinition(ctx: any): any {
 
       // 分层 B：该项目下已有 CU 会话 → 续接最近的一条（标准会话一律不续、不管理）
       const rows = projectCache.rows as CuSessionRow[]
-      const continuing = pickCuSessionToContinue(rows, target.cwd, secretary)
+      const candidates = cuContinueCandidates(rows, target.cwd, secretary)
+      // 能读到宿主给这条会话钉住的模型就按「模型变体现在还配着吗」排除；读不到就不猜，照旧候选
+      const modelStates = await modelStatesForCandidates(ctx, rows, target.cwd, secretary)
+      const staleRows = candidates.filter((row) => modelStates.get(String(row.sessionId)) === false)
+      const continuing = pickCuSessionToContinue(rows, target.cwd, secretary, (row) => modelStates.get(String(row.sessionId)) === false)
+      const staleNote = staleRows.length === 0 ? '' : `；跳过 ${staleRows.length} 条钉着已退役模型的 Computer Use 会话（${staleRows.map((row) => `${row.sessionId}→${row.model?.provider}/${row.model?.model}`).join('、')}）`
+
+      /** 新建一条 Computer Use 模式会话并重投任务（含观测确认）。 */
+      const openNewCuSession = async (cwd: string): Promise<{ sessionId: string; preset: string; evidence: DispatchEvidence }> => {
+        const created = await sessionController.create({ cwd, agentPreset: CU_AGENT_PRESET })
+        const newId = String(created?.sessionId ?? '')
+        if (newId === '') throw new Error('宿主没有返回新会话 id')
+        const reportedPreset = typeof created?.agentPreset === 'string' ? created.agentPreset : ''
+        if (reportedPreset !== '' && reportedPreset !== CU_AGENT_PRESET) {
+          throw new Error(`新建会话落成了 ${reportedPreset} 模式（要求 computer-use），这次不派：请确认宿主已注册 computer-use 预设`)
+        }
+        try {
+          if (typeof sessionController.rename === 'function') {
+            await sessionController.rename({ sessionId: newId, title: titleOf(task) })
+          }
+        } catch { /* 标题不是功能依赖 */ }
+        const requestId = randomUUID()
+        const evidence = await observeDispatchPrompt({
+          ctx,
+          sessionId: newId,
+          requestId,
+          signal: exec?.signal,
+          prompt: () => sessionController.prompt({
+            requestId,
+            sessionId: newId,
+            mode: 'queue',
+            content: [{ type: 'text', text: task }],
+          }, exec?.signal),
+        })
+        return { sessionId: newId, preset: reportedPreset || CU_AGENT_PRESET, evidence }
+      }
+
       if (continuing !== null && !createdFolder) {
         const sessionId = String(continuing.sessionId)
-        await sessionController.prompt({
-          requestId: randomUUID(),
+        const requestId = randomUUID()
+        const evidence = await observeDispatchPrompt({
+          ctx,
           sessionId,
-          mode: 'queue',
-          content: [{ type: 'text', text: task }],
-        }, exec?.signal)
+          requestId,
+          signal: exec?.signal,
+          prompt: () => sessionController.prompt({
+            requestId,
+            sessionId,
+            mode: 'queue',
+            content: [{ type: 'text', text: task }],
+          }, exec?.signal),
+        })
+        const failure: DispatchFailure = evidence.failure ?? { kind: '', message: '', code: '' }
+        // 入队本身失败 → 抛错，绝不出「已派活」文案
+        if (evidence.verification === 'failed' && failure.kind === 'queue-throw') {
+          throw new Error(`派活失败：宿主没能把任务投进 Computer Use 会话 ${sessionId}（${failure.message || '入队报错'}）${staleNote}`)
+        }
+        if (evidence.verification === 'failed') {
+          // 续接的会话这一轮直接失败（例如它钉的模型已从宿主配置里退役）→ 自动改新建并重投，回执照实写
+          const pinned = continuing.model !== undefined && continuing.model !== null
+            ? `它钉的模型 ${continuing.model.provider}/${continuing.model.model} `
+            : ''
+          const detail = `${failure.kind}${failure.code !== '' ? `/${failure.code}` : ''}：${failure.message || '宿主没给错误原文'}`
+          const fallback = await openNewCuSession(target.cwd)
+          return {
+            session_id: fallback.sessionId,
+            cwd: target.cwd,
+            kind: target.kind,
+            reason: `${target.reason}；续接会话 ${sessionId} 这一轮失败（${pinned}${detail}）；已改新建 Computer Use 会话 ${fallback.sessionId} 并重投同样的任务${staleNote}`,
+            decided_by: target.decidedBy,
+            created_folder: false,
+            continued: false,
+            redispatched: true,
+            failed_session_id: sessionId,
+            agent_preset: fallback.preset,
+            verification: fallback.evidence.verification === 'failed' ? 'unverified' : fallback.evidence.verification,
+            verified: fallback.evidence.verification === 'confirmed',
+            turn: fallback.evidence.turn,
+            pending: fallback.evidence.pending,
+          }
+        }
         return {
           session_id: sessionId,
           cwd: target.cwd,
           kind: target.kind,
-          reason: `${target.reason}；续接该项目最近的 Computer Use 会话`,
+          reason: `${target.reason}；续接该项目最近的 Computer Use 会话${staleNote}`,
           decided_by: target.decidedBy,
           created_folder: false,
           continued: true,
+          redispatched: false,
           agent_preset: CU_AGENT_PRESET,
+          verification: evidence.verification,
+          verified: evidence.verification === 'confirmed',
+          turn: evidence.turn,
+          pending: evidence.pending,
         }
       }
 
       // 分层 B（无 CU 会话可续）/ C：新建 Computer Use 模式会话，并核对回执预设
-      const created = await sessionController.create({ cwd: target.cwd, agentPreset: CU_AGENT_PRESET })
-      const sessionId = String(created?.sessionId ?? '')
-      if (sessionId === '') throw new Error('宿主没有返回新会话 id')
-      const reportedPreset = typeof created?.agentPreset === 'string' ? created.agentPreset : ''
-      if (reportedPreset !== '' && reportedPreset !== CU_AGENT_PRESET) {
-        throw new Error(`新建会话落成了 ${reportedPreset} 模式（要求 computer-use），这次不派：请确认宿主已注册 computer-use 预设`)
-      }
-      try {
-        if (typeof sessionController.rename === 'function') {
-          await sessionController.rename({ sessionId, title: titleOf(task) })
-        }
-      } catch { /* 标题不是功能依赖 */ }
-      await sessionController.prompt({
-        requestId: randomUUID(),
-        sessionId,
-        mode: 'queue',
-        content: [{ type: 'text', text: task }],
-      }, exec?.signal)
-
+      const fresh = await openNewCuSession(target.cwd)
       return {
-        session_id: sessionId,
+        session_id: fresh.sessionId,
         cwd: target.cwd,
         kind: target.kind,
-        reason: target.reason,
+        reason: `${target.reason}${staleNote}`,
         decided_by: target.decidedBy,
         created_folder: createdFolder,
         continued: false,
-        agent_preset: reportedPreset || CU_AGENT_PRESET,
+        redispatched: false,
+        agent_preset: fresh.preset,
+        verification: fresh.evidence.verification,
+        verified: fresh.evidence.verification === 'confirmed',
+        turn: fresh.evidence.turn,
+        pending: fresh.evidence.pending,
       }
     },
   }
@@ -720,8 +1155,18 @@ export const assistantDispatchTestSurface = {
   candidateProjects,
   resetDispatchCacheForTests,
   dispatchToolDefinition,
+  dispatchReceiptText,
   registerAssistantDispatch,
   pickCuSessionToContinue,
+  cuContinueCandidates,
+  modelSelectionOf,
+  isModelConfigured,
+  resetModelChecksForTests,
+  observeDispatchPrompt,
+  pendingRequestInAgent,
+  DISPATCH_VERIFY_TIMEOUT_MS,
+  DISPATCH_VERIFY_POLL_MS,
+  DISPATCH_VERIFY_GRACE_MS,
   parseConsoleProjects,
   mergeConsoleProjects,
   setDispatchRegistryDir,
