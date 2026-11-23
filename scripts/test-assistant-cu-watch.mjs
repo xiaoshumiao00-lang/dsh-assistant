@@ -161,7 +161,7 @@ cases.push(['失败轮通知正文：照实说「这一轮失败了」并带错�
   assert.match(text, /新建的 Computer Use 会话/, '要提示可以改新建一条会话')
   assert.ok(!text.includes('这一轮已经完成'), '失败轮不许说成已完成')
   assert.ok(text.includes('[[session:cu-9|竞赛管理系统录入成果]]'), '失败轮卡片也要能点开跳转')
-  assert.ok(text.includes('这一回合工具已全部禁用，不要尝试派活或查询。'), '工具禁用约束句照留')
+  assert.ok(text.includes('这一回合动手类工具已禁用：不要尝试派活、跑命令或联网查询。'), '工具禁用约束句照留')
   const lines = text.split('\n')
   assert.match(lines[0], /^\s*[（(【\[]?\s*系统通知/, '首行仍是「系统通知」开头（NOTICE_HEAD_LINE_RE）')
   assert.match(lines[lines.length - 1], /^最后单独一行原样输出：\[\[session:[^\]]*\]\]$/, '引用行格式不变（NOTICE_SESSION_REF_LINE_RE）')
@@ -216,7 +216,7 @@ cases.push(['通知正文：完整转述口径（撤掉「一两句」长度限�
   assert.ok(!text.includes('一两句'), `通知正文里还留着「一两句」限制：${text}`)
   assert.ok(!text.includes('口语向用户汇报'), `旧措辞还在：${text}`)
   // 技术性约束句保留原样（它不是长度限制，是与 tools/pre-execute 硬闸配套的闸）
-  assert.ok(text.includes('这一回合工具已全部禁用，不要尝试派活或查询。'), '工具禁用约束句必须原样保留')
+  assert.ok(text.includes('这一回合动手类工具已禁用：不要尝试派活、跑命令或联网查询。'), '工具禁用约束句必须原样保留')
   // 卡片解析依赖的两处结构不许变（src/secretary-card-shared.ts 两条正则）
   const lines = text.split('\n')
   assert.match(lines[0], /^\s*[（(【\[]?\s*系统通知/, '首行仍是「系统通知」开头（NOTICE_HEAD_LINE_RE）')

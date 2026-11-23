@@ -12,8 +12,9 @@
  *   1. 只走宿主官方 prompt 通道 `agent.followup(message)`，**一个会话事件都不写**；
  *   2. 消息形状是宿主认的 user 消息（role/source/content），正文含系统通知说明与会话引用；
  *   3. 拿不到活 agent（宿主没提供 followup）→ 返回 false，绝不退回"自己写事件"；
- *   4. 通知回合工具全禁：模型不能借通知回合再派活，避免「通知→派活→再通知」的回路；
- *      用户真实回合完全不受影响。
+ *   4. 通知回合只禁动手类：模型不能借通知回合再派活，避免「通知→派活→再通知」的回路；
+ *      纯读类（read/glob/grep）与目标类（create_goal/update_goal/get_goal）仍放行——
+ *      通知原文被截断时读报告文件是唯一补救（2026-11-23 用户实报）。用户真实回合完全不受影响。
  *
  *   node scripts/test-secretary-notice-turn.mjs
  */
@@ -53,7 +54,8 @@ cases.push(['投递只走 agent.followup，一个会话事件都不写', () => {
   assert.match(text, /门店详情页/)
   assert.match(text, /白屏修好了/)
   assert.ok(text.includes('[[session:cu-1|门店详情页]]'), '会话引用要原样留在通知里，卡片才能渲染可点跳')
-  assert.match(text, /工具已全部禁用/, '要明确告诉模型这一轮不能调工具')
+  assert.match(text, /动手类工具已禁用/, '要明确告诉模型这一轮不能动手')
+  assert.match(text, /read\/glob\/grep 放行/, '读文件在这一轮是放行的（原文截断时的唯一补救）')
 }])
 
 /* ---------- 2. 没有官方通道就放弃，绝不自己写 ---------- */
@@ -88,7 +90,7 @@ cases.push(['notifySecretary 按固定 id 取到 agent 并投递', () => {
   assert.ok(logs.some((line) => line.includes('没有活的 agent')), '跳过原因要写进日志')
 }])
 
-/* ---------- 4. 通知回合工具全禁（防止派活回路） ---------- */
+/* ---------- 4. 通知回合只禁动手类（防止派活回路） ---------- */
 function fakeServer() {
   const exact = new Map()
   return {
@@ -113,7 +115,7 @@ function fakeRes() {
   return out
 }
 
-cases.push(['通知回合工具全禁；用户真实回合恢复放行', async () => {
+cases.push(['通知回合只禁动手类；用户真实回合恢复放行', async () => {
   const root = mkdtempSync(join(tmpdir(), 'assistant-notice-turn-'))
   const server = fakeServer()
   const hooks = new Map()
@@ -139,21 +141,29 @@ cases.push(['通知回合工具全禁；用户真实回合恢复放行', async (
     const userTurn = await preTool({ name: 'web_search', agent: { session: { id: 'session-notice-4' } } }, next)
     assert.equal(userTurn.kind, 'allow', '用户自己的回合不受影响')
 
-    // 系统通知消息 → 这一轮工具全禁（连白名单里的也禁）
+    // 系统通知消息 → 这一轮动手类工具全禁（连白名单里的派活/联网也禁）
     const noticeId = 'notice-4'
     secretary.registerNoticeMessageId(noticeId)
     await preStep({ agent: { session: { id: 'session-notice-4' } }, messages: [{ id: noticeId, role: 'user' }], turn: 2, step: 1 }, next)
-    for (const name of ['secretary_dispatch', 'web_search', 'write', 'computer_use']) {
+    for (const name of ['secretary_dispatch', 'web_search', 'write', 'edit', 'apply_patch', 'bash', 'pwsh', 'computer_use', 'subagent']) {
       let allowed = false
       const denied = await preTool({ name, agent: { session: { id: 'session-notice-4' } } }, async () => { allowed = true; return { kind: 'allow' } })
       assert.equal(allowed, false, `${name} 在通知回合不该被执行`)
       assert.equal(denied.kind, 'deny')
       assert.match(denied.reason, /系统通知/)
-      // 闸的措辞与通知模板同口径：要求完整汇报，不再要求短句；「工具已全部禁用」这句硬闸不动
+      // 闸的措辞与通知模板同口径：要求完整汇报，不再要求短句；只禁动手类
       assert.match(denied.reason, /完整汇报/, '闸的口径要跟上撤掉的长度限制')
       assert.ok(!denied.reason.includes('一两句'), `闸的措辞里还留着长度限制：${denied.reason}`)
-      assert.match(denied.reason, /工具已全部禁用/)
-      assert.match(denied.reason, /不要调用任何工具/)
+      assert.match(denied.reason, /动手类工具已禁用/)
+      assert.match(denied.reason, /read\/glob\/grep/, '要告诉模型读文件是这一轮允许的补救手段')
+    }
+
+    // 2026-11-23 用户实报：读类与 goal 类在通知回合也不该被误伤——截断的原文要靠读报告文件补齐。
+    for (const name of ['read', 'glob', 'grep', 'create_goal', 'update_goal', 'get_goal']) {
+      let allowed = false
+      const result = await preTool({ name, agent: { session: { id: 'session-notice-4' } } }, async () => { allowed = true; return { kind: 'allow' } })
+      assert.equal(allowed, true, `${name} 不写不跑不派活，通知回合不该被禁`)
+      assert.equal(result.kind, 'allow')
     }
 
     // turn/end 之后回到正常
@@ -177,7 +187,7 @@ cases.push(['摘要带整段原文（不再只取首句）、缺标题时兜底'
   assert.match(bare, /没有留下文字结果/)
   assert.match(bare, /完整展示/, '正文要求完整展示这条结果')
   assert.ok(!bare.includes('一两句'), `正文里不该再有「一两句」限制：${bare}`)
-  assert.match(bare, /工具已全部禁用/, '工具禁用约束句保留（与硬闸同口径）')
+  assert.match(bare, /动手类工具已禁用/, '工具禁用约束句保留（与硬闸同口径）')
 }])
 
 let failed = 0

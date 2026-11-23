@@ -137,13 +137,36 @@ const SECRETARY_DELEGATION_TOOLS = new Set([
 ])
 
 /**
+ * 纯读类：读文件 / 找文件 / 搜内容 / 看图片，一个字节都不写本机。
+ *
+ * 2026-11-23 用户实报：读类工具被只读闸一起拦掉后，秘书读不到 Computer Use 会话
+ * 写出来的报告文件，只能干等那条会话回话，跟「必须先拿到完整内容再整理」的口径冲突。
+ * 只读闸的正确语义是「禁止破坏性/动手类动作」，读不是动手，必须放行。
+ */
+const SECRETARY_READONLY_TOOLS = new Set([
+  'read', 'glob', 'grep', 'read_image',
+])
+
+/**
+ * 目标类：立/改/读本会话的长期目标。它只写本会话的目标状态（宿主 goal 服务 + 会话日志），
+ * 不写任何用户文件、不跑终端、不动屏幕，因此属于「调度类」而非「动手类」。
+ *
+ * 2026-11-23 用户实报：长任务（逐条核实 15 篇参考文献那种）在秘书侧立不了 goal，
+ * 失去 goal-round-driver 的自动续跑兜底，所以 create_goal / update_goal 必须放行。
+ */
+const SECRETARY_GOAL_TOOLS = new Set([
+  'create_goal', 'update_goal', 'get_goal',
+])
+
+/**
  * 「系统通知回合」的消息 id 登记表。
  *
  * CU 完成汇报不再拼日志事件，而是把一条 user 消息交给宿主官方 prompt 通道
  * （`agent.followup`），由宿主自己开轮、自己编号、自己落盘（见 assistant-cu-watch.ts）。
  * 代价是这一轮真的会跑模型，所以必须钉死两件事：
- *   1. 这一轮的工具全部禁用——否则模型可能又去派活，派活 → CU 完成 → 通知 → 再派活，
- *      形成没有出口的回路；
+ *   1. 这一轮的**动手类**工具全部禁用——否则模型可能又去派活，派活 → CU 完成 → 通知 → 再派活，
+ *      形成没有出口的回路；纯读类（read/glob/grep）与目标类（create_goal/update_goal/get_goal）
+ *      不写不跑不派活，仍放行（见 secretaryNoticeTurnAllowed）；
  *   2. 只有这一轮禁用，用户正常发起的回合完全不受影响。
  */
 const NOTICE_MESSAGE_IDS = new Set<string>()
@@ -174,15 +197,16 @@ export function clearNoticeMessageIds(): void {
 /**
  * 秘书会话的其它只读/汇总工具白名单；未知执行工具默认拒绝。
  *
- * 只读限制的对象是「会改本机或动屏幕」的动作：写文件、终端、直接 Computer Use、派子代理。
- * 只读查询（web_search / web_fetch）不在此列——「明天天气」这类轻量问题必须能由秘书
- * 自己联网查完，否则会退化成「查不了 → 也没法派活」的死路（2026-11-21 用户实测）。
- * read/grep/read_image 仍不在这里：读本机文件按分层规则应由 CU 会话执行。
+ * 只读限制的对象是「会改本机或动屏幕」的动作：写文件、编辑文件、终端、直接 Computer Use、
+ * 派子代理。以下三类**不是**动手，必须放行（2026-11-23 用户定语义）：
+ *   - 纯读类 read / glob / grep / read_image（读文件、找文件、搜内容，见 SECRETARY_READONLY_TOOLS）；
+ *   - 目标类 create_goal / update_goal / get_goal（立长期目标，长任务防中断兜底，见 SECRETARY_GOAL_TOOLS）；
+ *   - 只读联网 web_search / web_fetch（「明天天气」这类轻量问题由秘书自己查）。
  * 会话/记忆摘要仍可按前缀放行。
  */
 const SECRETARY_ALLOWED_TOOLS = new Set([
   'ask_user_question', 'present', 'skill',
-  'todo_write', 'get_goal',
+  'todo_write',
   'list_agents', 'job_list', 'job_output',
   'proactive_card',
   'web_search', 'web_fetch',
@@ -194,6 +218,8 @@ export function secretaryToolDenied(toolName: string): boolean {
   const name = String(toolName ?? '').trim().toLowerCase()
   if (name === '') return false
   if (SECRETARY_DELEGATION_TOOLS.has(name)) return false
+  if (SECRETARY_READONLY_TOOLS.has(name)) return false
+  if (SECRETARY_GOAL_TOOLS.has(name)) return false
   if (SECRETARY_ALLOWED_TOOLS.has(name)) return false
   // 宿主以后新增的 web 读工具（如 web_extract）同样是只读查询，按前缀放行。
   if (name.startsWith('web_')) return false
@@ -201,6 +227,22 @@ export function secretaryToolDenied(toolName: string): boolean {
   if (name.startsWith('session_')) return false
   if (name.startsWith('mnemon_')) return false
   return true
+}
+
+/**
+ * 「系统通知回合」里仍然放行的工具：纯读类 + 目标类。
+ *
+ * 那条闸的用途只有一个——掐掉「通知 → 再派活 → 再通知」的回路，以及这一轮的动手能力；
+ * 它不该顺手把读文件和查目标也禁掉：通知里的返回原文一旦被截断，秘书唯一的补救办法
+ * 就是去读那条 CU 会话写出来的报告文件（用户 2026-11-23 实报的第二个后果）。
+ * 这两类都不写本机文件、不跑命令、不派活，放行不会造成回路。
+ */
+export function secretaryNoticeTurnAllowed(toolName: string): boolean {
+  const name = String(toolName ?? '').trim().toLowerCase()
+  if (name === '') return false
+  if (SECRETARY_READONLY_TOOLS.has(name)) return true
+  if (SECRETARY_GOAL_TOOLS.has(name)) return true
+  return false
 }
 
 function sendJson(res: any, status: number, body: unknown): void {
@@ -724,17 +766,18 @@ export function registerAssistantSecretary(ctx: any): () => void {
       const caller = String(exec?.agent?.session?.id ?? exec?.session?.id ?? exec?.sessionId ?? '')
       if (caller !== activeSessionId) return next()
       const tool = String(exec?.name ?? '')
-      // 系统通知回合：工具全禁。这一轮只允许把结果念给用户，不允许再派活/再查/再写。
-      if (noticeTurnActive()) {
+      // 系统通知回合：动手类工具全禁（写文件/终端/屏幕/子代理/再派活），但纯读类与目标类放行——
+      // 通知里的原文被截断时，读报告文件是这一轮唯一的补救办法，且读不写不跑，造不成回路。
+      if (noticeTurnActive() && !secretaryNoticeTurnAllowed(tool)) {
         return {
           kind: 'deny',
-          reason: '这一轮是插件自动送来的「电脑操作会话完成／失败」系统通知，不是用户的要求：工具已全部禁用。完成就把那条 Computer Use 会话的结果完整汇报给用户（原样转述，文件名、路径、数字、提交号、判据、结论都不许省略，不许为简短而删）；失败轮就照实说是「派活失败／这一轮失败」，把错误码与错误原文完整汇报给用户并提示可以改派（新建一条 Computer Use 会话或换个项目目录），不许说成已派活／已完成，不要调用任何工具。',
+          reason: '这一轮是插件自动送来的「电脑操作会话完成／失败」系统通知，不是用户的要求：动手类工具已禁用（写文件、编辑、终端、直接操作屏幕、派子代理、再派活都不行）。完成就把那条 Computer Use 会话的结果完整汇报给用户（原样转述，文件名、路径、数字、提交号、判据、结论都不许省略，不许为简短而删）；原文被截断时可以用 read/glob/grep 把报告文件读回来再汇报；失败轮就照实说是「派活失败／这一轮失败」，把错误码与错误原文完整汇报给用户并提示可以改派（新建一条 Computer Use 会话或换个项目目录），不许说成已派活／已完成。',
         }
       }
       if (!secretaryToolDenied(tool)) return next()
       return {
         kind: 'deny',
-        reason: `个人秘书只读闸已拒绝 ${tool || '未知工具'}（写文件/终端/直接操作屏幕/派子代理不能在秘书会话执行；只读联网查询 web_search、web_fetch 是放行的）。这不是收工理由：必须立即调用 secretary_dispatch，已有项目用 kind=existing + cwd，没有项目用 kind=new-folder；派活成功后照实回报回执文案——「已派活（…已确认在跑）」才是真接上了话，「已入队（未确认在跑）」不许说成已派活。`,
+        reason: `个人秘书只读闸已拒绝 ${tool || '未知工具'}（写文件/编辑/终端/直接操作屏幕/派子代理不能在秘书会话执行；读文件 read/glob/grep、立目标 create_goal/update_goal/get_goal、只读联网 web_search/web_fetch 都是放行的）。这不是收工理由：必须立即调用 secretary_dispatch，已有项目用 kind=existing + cwd，没有项目用 kind=new-folder；派活成功后照实回报回执文案——「已派活（…已确认在跑）」才是真接上了话，「已入队（未确认在跑）」不许说成已派活。`,
       }
     })
   } catch {
@@ -1085,6 +1128,7 @@ export const assistantSecretaryTestSurface = {
   SECRETARY_DISPATCH_POLICY,
   normalizeSecretaryState,
   secretaryToolDenied,
+  secretaryNoticeTurnAllowed,
   registerAssistantSecretary,
   secretarySessionRef,
   registerNoticeMessageId,

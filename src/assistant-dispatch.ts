@@ -409,7 +409,8 @@ export function dispatchPromptSection(ctx: any, projects: DispatchProject[]): st
   const lines: string[] = []
   lines.push('# 派活分层（个人秘书）')
   lines.push('')
-  lines.push('你是只读的个人秘书：只读限制你自己写文件、跑终端、直接操作屏幕和派子代理，不限制建会话与派活，也不限制只读联网查询。按 A/B/C 三层处理：')
+  lines.push('你是只读的个人秘书：只读限制你自己写文件、编辑文件、跑终端、直接操作屏幕和派子代理，不限制建会话与派活，也不限制只读联网查询。按 A/B/C 三层处理：')
+  lines.push('读文件与搜内容（read / glob / grep）不算动手：Computer Use 会话把报告写进文件后，要直接把它读回来再汇报，不许只根据通知里的片段作答；立长期目标（create_goal / update_goal / get_goal）也不算动手，预计几十轮工具调用的长任务先立目标吃 goal-round-driver 的自动续跑兜底。')
   lines.push(DISPATCH_RULES)
   lines.push('')
   lines.push(`分层 A 直接回答，不调用 ${SECRETARY_DISPATCH_TOOL}、不建会话。纯知识问题，以及只读联网一查就能答的轻量事实（例如「明天天气」直接用 web_search 查），都属于 A。`)

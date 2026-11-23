@@ -91,12 +91,32 @@ cases.push(['POST 原子持久化并回读', async () => {
   const g = await call('GET')
   assert.equal(g.json.sessionId, r.json.sessionId)
 }])
-cases.push(['工具闸：默认拒绝执行/本机读取，放行只读联网、汇总与派活', async () => {
-  for (const name of ['write', 'edit', 'pwsh', 'bash', 'computer_use', 'code_agent', 'subagent', 'subagent_fork', 'send_message', 'mcp__desktop__click', 'read', 'grep', 'glob', 'read_image', 'some_future_tool']) {
-    assert.equal(surface.secretaryToolDenied(name), true, `${name} 应拒绝`)
+cases.push(['工具闸：只禁动手类（写/编辑/补丁/终端/屏幕/子代理），纯读与目标类一律放行', async () => {
+  for (const name of ['write', 'edit', 'apply_patch', 'pwsh', 'bash', 'terminal', 'computer_use', 'code_agent', 'subagent', 'subagent_fork', 'workflow', 'send_message', 'mcp__desktop__click', 'some_future_tool']) {
+    assert.equal(surface.secretaryToolDenied(name), true, `${name} 是动手类，应拒绝`)
   }
-  for (const name of ['ask_user_question', 'mnemon_recall', 'session_search', 'secretary_dispatch', 'web_search', 'web_fetch']) {
+  // 2026-11-23 用户实报：读类与 goal 类曾被误拦（读不到 CU 报告、长任务立不了 goal）。
+  for (const name of ['read', 'glob', 'grep', 'read_image', 'create_goal', 'update_goal', 'get_goal']) {
+    assert.equal(surface.secretaryToolDenied(name), false, `${name} 不写本机文件/不动屏幕，不该被只读闸拦`)
+  }
+  for (const name of ['ask_user_question', 'present', 'mnemon_recall', 'session_search', 'secretary_dispatch', 'web_search', 'web_fetch']) {
     assert.equal(surface.secretaryToolDenied(name), false, `${name} 应放行`)
+  }
+}])
+cases.push(['读类与 goal 类真的穿过 tools/pre-execute（不只是谓词层放行）', async () => {
+  const session = { id: 'session-11111111-2222-3333-4444-555555555555' }
+  for (const name of ['read', 'glob', 'grep', 'create_goal', 'update_goal', 'get_goal']) {
+    let allowed = false
+    const result = await preTool({ name, agent: { session } }, async () => { allowed = true; return { kind: 'allow' } })
+    assert.equal(allowed, true, `${name} 在秘书会话里必须能跑到，不该被只读闸拒绝`)
+    assert.equal(result.kind, 'allow')
+  }
+  for (const name of ['write', 'edit', 'apply_patch', 'pwsh', 'bash', 'computer_use', 'subagent']) {
+    let allowed = false
+    const result = await preTool({ name, agent: { session } }, async () => { allowed = true; return { kind: 'allow' } })
+    assert.equal(allowed, false, `${name} 在秘书会话里必须仍被拒绝`)
+    assert.equal(result.kind, 'deny')
+    assert.match(result.reason, /个人秘书只读闸已拒绝/)
   }
 }])
 cases.push(['用户原话「明天天气」：只读联网工具真的能跑到，不再被只读闸拦死', async () => {
