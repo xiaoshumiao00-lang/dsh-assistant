@@ -1,6 +1,7 @@
 // 悬浮球装配层：注入样式/词典、会话输入框「电脑文件」桥与选择器：
-//   shell.overlay         → 悬浮球页 / 电脑文件选择器
+//   shell.overlay           → 悬浮球页 / 电脑文件选择器 / 秘书用户卡+通知卡
 //   conversation.input.left → 登记官方附件写入面（不可见）
+//   conversation.input.right→ 秘书页「带引用」提示（2026-11-23 追加需求，托管那颗胶囊同一槽位）
 // 手机抽屉底部不再注册旧「悬浮球」入口，避免误入已停用的旧操作流程。
 import { OrbOverlay } from './OrbOverlay.tsx'
 import { installBootGuard } from './boot-guard.ts'
@@ -9,6 +10,7 @@ import { FOLD_CARD_CSS } from './fold-card.css.ts'
 import { SECRETARY_CARD_CSS } from './secretary-cards.css.ts'
 import { SecretaryReplyCard } from './SecretaryReplyCard.tsx'
 import { SecretaryUserCards } from './SecretaryUserCard.tsx'
+import { SecretaryQuoteChip } from './SecretaryQuoteChip.tsx'
 import { currentSessionViaBridge } from '../../session-open.ts'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
 import { NS, zh, en, type OrbKey } from './locales.ts'
@@ -164,6 +166,21 @@ export function orbApply(ctx: any): void {
         inject: () => ({ api }),
       },
       SecretaryUserCards,
+    ),
+  )
+
+  // 输入框旁边那颗「带引用」提示（2026-11-23 追加需求）：卡片引用按钮按下去就在输入框那一行出现状态提示，
+  // 按取消 / 发出去 / 30 分钟到期三种收口都在引用 store 里（secretary-cards.ts）。
+  // 槽位与托管开关同一棵 conversation.input.right（宿主自己的 composer 工具行，插件不往 Lexical 输入框里写 DOM）。
+  ctx.slots.inject('conversation.input.right', () =>
+    ctx.slots.register(
+      {
+        name: 'conversation.input.right',
+        id: 'assistant-secretary-quote-chip',
+        order: 5,
+        inject: (sessionId: string | undefined) => ({ sessionId }),
+      },
+      SecretaryQuoteChip,
     ),
   )
 

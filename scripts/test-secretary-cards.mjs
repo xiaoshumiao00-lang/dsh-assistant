@@ -647,6 +647,194 @@ cases.push(['引用登记（第 4 项）：归一 + store 口径 + 宿主真值�
   assert.equal(surface.secretaryQuoteStore() !== null, true, '进程内引用 store 懒创建')
 }])
 
+cases.push(['输入框「带引用」提示文案（追加需求）：轮次 + 卡片种类 + 正文开头一小段，没引用回 null', () => {
+  const assistant = surface.quoteChipParts({
+    cardKey: 'assistant:turn:12',
+    kind: 'assistant',
+    turnNo: '12',
+    preview: '主动关心 · 明日武汉出差\n第二行不该出现\n结论：早上 7 点走高速，车上带保温杯和身份证。',
+    refSessionIds: [],
+    updatedAt: 1,
+  })
+  assert.equal(assistant.flag, surface.QUOTE_CHIP_FLAG_TEXT, '第一句就是「带引用」')
+  assert.equal(assistant.turnLabel, '第 12 轮', '提示带轮次号')
+  assert.equal(assistant.kindLabel, surface.QUOTE_CHIP_KIND_LABELS.assistant, '提示说清是哪张卡')
+  assert.equal(assistant.meta, '第 12 轮 · 秘书回复卡')
+  assert.ok(assistant.preview.startsWith('主动关心 · 明日武汉出差'), '摘要接的是那张卡正文开头')
+  assert.ok(!assistant.preview.includes('身份证'), '只截开头那一小段，不把整段贴出来')
+  assert.ok(assistant.preview.length <= surface.QUOTE_CHIP_PREVIEW_MAX_CHARS, '摘要在上限内')
+  assert.equal(surface.quoteChipParts(null), null, '没引用 → 组件什么都不渲染')
+
+  const notice = surface.quoteChipParts({ cardKey: 'notice:8:1:msg', kind: 'notice', turnNo: '8', preview: '  第一行  第二行 ', refSessionIds: [], updatedAt: 1 })
+  assert.equal(notice.kindLabel, surface.QUOTE_CHIP_KIND_LABELS.notice)
+  assert.equal(notice.preview, '第一行 第二行', '换行压成空格')
+  const long = surface.quoteChipParts({ cardKey: 'assistant:turn:9', kind: 'assistant', turnNo: '9', preview: '甲'.repeat(surface.QUOTE_CHIP_PREVIEW_MAX_CHARS + 20), refSessionIds: [], updatedAt: 1 })
+  assert.equal(long.preview.length, surface.QUOTE_CHIP_PREVIEW_MAX_CHARS, '超上限补省略号')
+  assert.ok(long.preview.endsWith('…'))
+  const unknownTurn = surface.quoteChipParts({ cardKey: 'assistant:turn:9', kind: 'assistant', turnNo: '', preview: '甲', refSessionIds: [], updatedAt: 1 })
+  assert.equal(unknownTurn.turnLabel, '第 9 轮', 'turnNo 空、但 key 里有轮次号 → 补上（不是瞎猜）')
+  const trulyUnknown = surface.quoteChipParts({ cardKey: 'assistant:turn:abc', kind: 'assistant', turnNo: '', preview: '正文', refSessionIds: [], updatedAt: 1 })
+  assert.equal(trulyUnknown.turnLabel, '轮次未知', 'key 里没有轮次号形状才说「轮次未知」，不硬凑')
+  // 卡片 key 里带轮次号时（宿主那种 user:13:input-message…），提示要把轮次号补上
+  assert.equal(surface.quoteTurnFromCardKey('assistant:turn:12'), '12')
+  assert.equal(surface.quoteTurnFromCardKey('user:13:input-message1747b10f-06ad-4dcd'), '13')
+  assert.equal(surface.quoteTurnFromCardKey('notice:8:1:msg'), '8')
+  assert.equal(surface.quoteTurnFromCardKey('user:msg-1'), '', 'key 没有轮次号形状就不硬凑')
+  assert.equal(surface.quoteTurnFromCardKey(''), '')
+  const fromKey = surface.quoteChipParts({ cardKey: 'user:13:input-message1747b10f', kind: 'user', turnNo: '', preview: '帮我把这份稿子核一遍', refSessionIds: [], updatedAt: 1 })
+  assert.equal(fromKey.turnLabel, '第 13 轮', 'turnNo 空、但 key 里有轮次号 → 补上')
+  assert.equal(fromKey.kindLabel, surface.QUOTE_CHIP_KIND_LABELS.user)
+
+
+  assert.equal(surface.quoteChipPreview('第一条\n\t第二条   第三条', 12), '第一条 第二条 第三条', '换行与连续空白压成单个空格')
+  assert.equal(surface.quoteChipPreview('第一条\n\t第二条   第三条', 6), '第一条 第…', '超过上限才截断、末尾加省略号')
+  assert.equal(surface.quoteChipPreview('   '), '')
+  assert.equal(surface.quoteChipVisible('session-83bca3e3', 'session-83bca3e3'), true, '只在固定秘书会话那条输入框显示')
+  assert.equal(surface.quoteChipVisible('session-83bca3e3', 'session-other'), false)
+  assert.equal(surface.quoteChipVisible('', 'session-other'), false, '不知道固定会话就不显示')
+  assert.equal(surface.quoteChipVisible('session-83bca3e3', ''), false, '槽位没给会话 id 也不显示')
+  assert.equal(surface.QUOTE_CHIP_CANCEL_TEXT, '取消引用', '那颗 × 的说法')
+  assert.equal(surface.QUOTE_CHIP_PREVIEW_MAX_CHARS, 34, '摘要上限就这么多')
+}])
+
+cases.push(['引用吃掉判据（追加需求）：轮次号可比按轮次号，同轮换 key 不误收，页面没投影用户行不吃', () => {
+  const baseline = { cardKey: 'user:8:1:msg-a', turnNo: '8' }
+  assert.equal(surface.quoteConsumedByUserRow(null, { cardKey: 'user:8:1:msg-a', turnNo: '8' }), false, '基线没定：这一次只立基线')
+  assert.equal(surface.quoteConsumedByUserRow(baseline, { cardKey: 'user:8:1:msg-a', turnNo: '8' }), false, '同一轮没动 → 没收')
+  assert.equal(surface.quoteConsumedByUserRow(baseline, { cardKey: 'user:9:2:msg-b', turnNo: '9' }), true, '第 9 轮的新消息 → 那条消息发出去了')
+  assert.equal(surface.quoteConsumedByUserRow(baseline, { cardKey: 'user:8:99:re-keyed', turnNo: '8' }), false, '宿主重新投影换了 node key 也不算发过')
+  assert.equal(surface.quoteConsumedByUserRow(baseline, { cardKey: '', turnNo: '' }), false, '页面还没投影出用户行，不许凭空收引用')
+  assert.equal(surface.quoteConsumedByUserRow({ cardKey: 'user:x', turnNo: '' }, { cardKey: 'user:y', turnNo: '' }), true, '轮次号比不了才退回比 key')
+  assert.equal(surface.quoteConsumedByUserRow({ cardKey: 'user:x', turnNo: '' }, { cardKey: 'user:x', turnNo: '' }), false)
+  assert.equal(surface.quoteTurnNumber('12'), 12)
+  assert.equal(surface.quoteTurnNumber(''), null)
+  assert.equal(surface.quoteTurnNumber('abc'), null)
+
+  const fakeDoc = (rowList) => ({
+    querySelectorAll: (selector) => (selector === '[data-chat-flow-kind="user"]' ? rowList : []),
+  })
+  const userElements = [
+    fakeUserRow('msg-1', '7', '真实用户消息一条', '11:01'),
+    fakeUserRow('msg-2', '8', '（系统通知，不是用户说的话）\n电脑操作会话「备份」这一轮已经完成。', '11:02'),
+  ]
+  const rows = surface.collectSecretaryCardRows(fakeDoc(userElements))
+  const newest = surface.latestRealUserCardRef(rows)
+  assert.equal(newest.cardKey, 'user:msg-1', '只认真实用户行：那条通知行一律不算（口径同「通知轮不吃引用」）')
+  assert.equal(newest.turnNo, '7')
+  assert.deepEqual(surface.latestRealUserCardRef(surface.collectSecretaryCardRows(fakeDoc([userElements[1]]))), { cardKey: '', turnNo: '' }, '只有通知行 → 没有基线')
+  const withUser = surface.collectSecretaryCardRows(fakeDoc([
+    ...userElements,
+    fakeUserRow('msg-3', '9', '真实用户消息二条', '11:03'),
+  ]))
+  assert.equal(surface.latestRealUserCardRef(withUser).cardKey, 'user:msg-3', '最末那条真实用户消息才算基线')
+}])
+
+cases.push(['引用 store 吃掉口径（追加需求）：真实用户消息发出去即收；宿主那侧不抢先清', async () => {
+  const seen = []
+  const hostQuote = new Map()
+  const fetchImpl = async (url, init) => {
+    seen.push({ url, init })
+    if (init?.method === 'POST') {
+      const body = JSON.parse(init.body)
+      if (body.mark === 'clear') hostQuote.delete(body.sessionId)
+      else hostQuote.set(body.sessionId, body)
+      return { ok: true }
+    }
+    return { ok: true, quote: hostQuote.get(new URL(url).searchParams.get('sessionId')) ?? null }
+  }
+  const store = surface.createSecretaryQuoteStore({ fetchImpl, storage: null })
+  store.setSession('session-secretary')
+  // 页面先投影出两条真实用户消息 + 一条通知行
+  store.noteLatestUserCard({ cardKey: 'user:8:msg-old', turnNo: '8' })
+  assert.equal(store.isQuoted('assistant:turn:8'), false)
+  assert.equal(store.setQuote({ cardKey: 'assistant:turn:8', kind: 'assistant', turnNo: '8', preview: '秘书回答正文', refSessionIds: [] }), true)
+  const postedAfterQuote = seen.filter((item) => item.init?.method === 'POST').length
+  assert.equal(postedAfterQuote, 1, '登记引用落宿主一次')
+  assert.deepEqual(store.baselineUserCard(), { cardKey: 'user:8:msg-old', turnNo: '8' }, '基线 = 那一刻最末那条真实用户消息')
+
+  // 通知行随后来了（CU 完成通知）：不许把引用吃掉
+  assert.equal(store.noteLatestUserCard({ cardKey: 'user:8:msg-old', turnNo: '8' }), false)
+  assert.equal(store.isQuoted('assistant:turn:8'), true, '通知轮不吃引用')
+  // 用户把下一条消息发出去了：最末真实用户卡换成了更新的轮次
+  assert.equal(store.noteLatestUserCard({ cardKey: 'user:9:msg-new', turnNo: '9' }), true, '这一看判成「已经发出去了」')
+  assert.equal(store.isQuoted('assistant:turn:8'), false, '输入框提示该收')
+  assert.equal(store.active(), null)
+  const postedAfterSend = seen.filter((item) => item.init?.method === 'POST').length
+  assert.equal(postedAfterSend, 1, '客户端不抢先 POST clear：宿主那一轮自己 turn/end 收，别把它喂到一半就摘掉')
+  assert.equal(hostQuote.has('session-secretary'), true, '宿主那份还在（等 turn/end）')
+
+  // 用户主动按取消 → 本地 + 服务端一起清
+  assert.equal(store.setQuote({ cardKey: 'notice:9:msg-n', kind: 'notice', turnNo: '9', preview: '通知正文', refSessionIds: [] }), true)
+  assert.equal(store.clearQuote('notice:9:msg-n'), true)
+  const clears = seen.filter((item) => item.init?.method === 'POST' && JSON.parse(item.init.body).mark === 'clear')
+  assert.equal(clears.length, 1, '取消引用请宿主也清一次')
+  assert.equal(hostQuote.has('session-secretary'), false)
+}])
+
+cases.push(['引用 TTL 到期自动清除（追加需求）：到点本地收掉并请宿主清', async () => {
+  const seen = []
+  const cache = new Map()
+  const storage = { getItem: (key) => cache.get(key) ?? null, setItem: (key, value) => { cache.set(key, value) } }
+  const fetchImpl = async (url, init) => {
+    seen.push({ url, init })
+    if (init?.method === 'POST') {
+      const body = JSON.parse(init.body)
+      if (body.mark === 'clear') void body.sessionId
+      return { ok: true }
+    }
+    return { ok: true, quote: null }
+  }
+  const store = surface.createSecretaryQuoteStore({ fetchImpl, storage, ttlMs: 60 })
+  store.setSession('session-ttl')
+  store.setQuote({ cardKey: 'assistant:turn:3', kind: 'assistant', turnNo: '3', preview: '正文', refSessionIds: [] })
+  assert.equal(store.isQuoted('assistant:turn:3'), true)
+  // 等到那颗到期定时器真的跑过（不靠固定 sleep：本机负载高时 node 的定时器会漂，测试只等它落定）
+    const waitOut = await (async () => {
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const posted = seen.filter((item) => item.init?.method === 'POST' && JSON.parse(item.init.body).mark === 'clear')
+        if (posted.length > 0) return true
+        await new Promise((resolve) => { setTimeout(resolve, 40) })
+      }
+      return false
+    })()
+    assert.equal(waitOut, true, 'TTL 到期要把本地引用收干净并请宿主清（不许只等下一次 DOM 变化）')
+  assert.equal(store.isQuoted('assistant:turn:3'), false, '到期自动收（不用等下一次 DOM 变化）')
+  assert.equal(store.active(), null)
+  const clears = seen.filter((item) => item.init?.method === 'POST' && JSON.parse(item.init.body).mark === 'clear')
+  assert.equal(clears.length, 1, '到期也请宿主清一份')
+  assert.equal(cache.get(surface.QUOTE_STORAGE_PREFIX + 'session-ttl'), 'null', '本地缓存也收干净')
+
+  // 还剩多少算多少：quoteExpiryDelayMs
+  const record = { cardKey: 'assistant:turn:3', kind: 'assistant', turnNo: '3', preview: '', refSessionIds: [], updatedAt: 1000 }
+  assert.equal(surface.quoteExpiryDelayMs(record, 1000, 30 * 60 * 1000), 30 * 60 * 1000)
+  assert.equal(surface.quoteExpiryDelayMs(record, 1000 + 30 * 60 * 1000 + 1, 30 * 60 * 1000), 0, '已经过期回 0')
+  assert.equal(surface.quoteExpiryDelayMs(null), 0)
+}])
+
+cases.push(['刷新页面不复活已发出去的引用（追加需求）：基线落 localStorage，宿主 404 也认', async () => {
+  const cache = new Map()
+  const storage = { getItem: (key) => cache.get(key) ?? null, setItem: (key, value) => { cache.set(key, value) } }
+  const hostFirst = surface.createSecretaryQuoteStore({ fetchImpl: async () => ({ ok: false }), storage })
+  hostFirst.setSession('session-404')
+  hostFirst.noteLatestUserCard({ cardKey: 'user:5:msg-a', turnNo: '5' })
+  hostFirst.setQuote({ cardKey: 'assistant:turn:5', kind: 'assistant', turnNo: '5', preview: '秘书正文', refSessionIds: [] })
+  assert.equal(cache.has(surface.QUOTE_BASELINE_STORAGE_PREFIX + 'session-404'), true, '基线也落本地缓存')
+  assert.equal(hostFirst.isQuoted('assistant:turn:5'), true)
+
+  // 用户在消息发出去之前刷新了页面：引用还在，最末用户卡也没变 → 提示继续挂着
+  const reloaded = surface.createSecretaryQuoteStore({ fetchImpl: async () => ({ ok: false }), storage })
+  reloaded.setSession('session-404')
+  await reloaded.hydrate()
+  assert.equal(reloaded.isQuoted('assistant:turn:5'), true, 'TTL 没到、消息没发 → 引用还在')
+  assert.equal(reloaded.noteLatestUserCard({ cardKey: 'user:5:msg-a', turnNo: '5' }), false)
+  assert.equal(reloaded.isQuoted('assistant:turn:5'), true)
+
+  // 刷新发生在消息发出去之后：基线还在、最末用户卡换成更新的轮次 → 收掉，不留过期提示
+  assert.equal(reloaded.noteLatestUserCard({ cardKey: 'user:6:msg-b', turnNo: '6' }), true)
+  assert.equal(reloaded.isQuoted('assistant:turn:5'), false)
+  assert.equal(JSON.parse(cache.get(surface.QUOTE_STORAGE_PREFIX + 'session-404')), null, '本地那份也收干净')
+}])
+
 cases.push(['过期通知卡不进卡片窗口（第 1 项）：buildSecretaryPagerCards 只数还没到点的通知', () => {
   const now = Date.now()
   const pad = (value) => String(value).padStart(2, '0')

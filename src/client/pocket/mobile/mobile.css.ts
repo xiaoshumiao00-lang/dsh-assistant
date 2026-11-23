@@ -681,6 +681,13 @@ const NARROW_RULES = `
     flex: 0 0 auto !important;
     min-width: 0 !important;
   }
+  /* 秘书页「带引用」提示 (dsh-assistant, slot conversation.input.right, 2026-11-23 追加需求):
+     same row as the 托管 pill and the send button. It shrinks (never crushes the model seat
+     or the send button) and its 摘要 line ellipsizes inside the chip. */
+  [data-phase] [data-composer-card="true"] > [class$="_row"] > [class$="_trailing"] [data-dsh-squote="chip"] {
+    flex: 0 1 auto !important;
+    min-width: 0 !important;
+  }
   /* Hero (new-session page) composer reuses this row markup, but there is no 托管 pill
      and no model seat there: the right group then holds only the submit button, and
      space-between would park it right behind the left group. Push it to the card's

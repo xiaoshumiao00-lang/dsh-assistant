@@ -30,6 +30,10 @@
  *  10. compact 提示抑制（2026-11-23 第 3 项）：按已核实的宿主来源压掉那两行文本，见下。
  *  11. 引用登记（2026-11-23 第 4 项）：createSecretaryQuoteStore 与宿主 `/api/assistant/secretary-quote`
  *      同一套口径（真值在宿主、localStorage 兜底），供卡片脚部那颗「引用」按钮使用。
+ *  12. 输入框「带引用」提示（2026-11-23 追加）：同一套引用 store 多出三条口径——
+ *      `noteLatestUserCard`（真实用户消息发出去即吃引用）、TTL 到期自己排定时器收、
+ *      以及 `quoteChipParts` 那三段文案（轮次 + 卡片种类 + 正文开头一小段）。渲染落在
+ *      src/client/pocket/orb/SecretaryQuoteChip.tsx（宿主 `conversation.input.right` 槽位）。
  */
 
 import {
@@ -1618,10 +1622,154 @@ export function clearSecretaryCompactHintRows(doc: Document): number {
 export const ASSISTANT_SECRETARY_QUOTE_ROUTE = '/api/assistant/secretary-quote'
 /** 本地缓存键前缀（真值仍在宿主，localStorage 只是宿主答不上时的降级缓存）。 */
 export const QUOTE_STORAGE_PREFIX = 'dsh.assistant.secretary.quote:'
+/** 引用基线（「引用登记那一刻页面上最末那条真实用户消息」）的本地缓存键前缀：刷新页面也认得出去过没有。 */
+export const QUOTE_BASELINE_STORAGE_PREFIX = 'dsh.assistant.secretary.quote-baseline:'
 /** 一条引用最多活多久（用户点了引用但一直没发消息时，别把它无限挂着）。 */
 export const QUOTE_TTL_MS = 30 * 60 * 1000
 /** 引用里正文摘录上限（只用于告诉模型「引用的是哪段话」，不是完整汇报口径）。 */
 export const QUOTE_PREVIEW_MAX_CHARS = 600
+
+/* ───────── 11.1 输入框那侧的「带引用」提示（2026-11-23 追加需求）─────────
+ *
+ * 需求原话：「我希望点击引用后在输入框有个提示，不然不知道是否有引用对话」。
+ * 落点：src/client/pocket/orb/SecretaryQuoteChip.tsx，注册到宿主 `conversation.input.right`
+ * （与托管那颗胶囊同一个槽位、同一套手感：8px 圆角、脚部那套 muted / accent 数值、同 hover）。
+ * 三种收口口径（逐条对应用户要求）：
+ *   - 没按引用 → 组件一个字都不渲染（`quoteChipParts(null)` → null，没有空壳）；
+ *   - 消息发出去 → 扫描层 noteLatestUserCard 把引用收掉（只算真实用户行，通知行不算，口径同宿主「通知轮不吃引用」）；
+ *   - TTL 30 分钟到期 → store 自己排一个到期定时器，到点本地收掉，并顺手请宿主也清（服务端本来就按 updatedAt 判 TTL）。
+ * 服务端与本地两条路都认：hydrate GET 拿得到就用宿主那份 cardKey/轮次/摘录，404 就用 localStorage 那份。
+ */
+
+/** 引用提示里「带引用」那一句（输入框旁边一眼看到的就是它）。 */
+export const QUOTE_CHIP_FLAG_TEXT = '带引用'
+/** 取消入口的文案（那颗 × 的 aria/title）。 */
+export const QUOTE_CHIP_CANCEL_TEXT = '取消引用'
+/** 引用提示里那张卡正文开头截一小段（不是整段贴，上限 34 字）。 */
+export const QUOTE_CHIP_PREVIEW_MAX_CHARS = 34
+/** 卡片种类说法：与宿主注入段同一组标签（src/assistant-secretary.ts 的 QUOTE_KIND_LABELS）。 */
+export const QUOTE_CHIP_KIND_LABELS: Record<string, string> = {
+  assistant: '秘书回复卡',
+  user: '用户消息卡',
+  notice: '系统通知卡',
+}
+
+/** 引用基线：登记那一刻「页面上最末一条真实用户消息卡」的身份（key + 轮次）。 */
+export interface QuoteUserCardRef {
+  cardKey: string
+  turnNo: string
+}
+
+/** 轮次文本 → 数字（拿不到回 null，判据退回「比 key」）。 */
+export function quoteTurnNumber(turnNo: unknown): number | null {
+  const raw = String(turnNo ?? '').trim()
+  if (raw === '') return null
+  const value = Number.parseInt(raw, 10)
+  return Number.isFinite(value) ? value : null
+}
+
+/**
+ * 「那条消息是不是已经发出去了」判据（纯函数，测试逐条断言）。
+ * 口径：基线是引用登记那一刻页面上最末那条真实用户消息；
+ * 现在最末那条**换成了更新的轮次**才算发出去（轮次号可比就按轮次号比，
+ * 比不了才退回比 key——同一轮被宿主重新投影换了 node key 也不许误收）。
+ * 页面还没投影出用户行（newest 空）一律不收，不许凭空收掉用户的引用。
+ */
+export function quoteConsumedByUserRow(baseline: QuoteUserCardRef | null, newest: QuoteUserCardRef): boolean {
+  const newestKey = normalizeCardKey(newest?.cardKey)
+  if (newestKey === '') return false
+  if (baseline === null) return false
+  const baselineKey = normalizeCardKey(baseline.cardKey)
+  if (baselineKey === '') return false
+  const baselineTurn = quoteTurnNumber(baseline.turnNo)
+  const newestTurn = quoteTurnNumber(newest.turnNo)
+  if (baselineTurn !== null && newestTurn !== null) return newestTurn > baselineTurn
+  return newestKey !== baselineKey
+}
+
+/** 页面上最末一条**真实**用户消息卡（kind=user；合成通知行一律不算）。 */
+export function latestRealUserCardRef(rows: readonly SecretaryCardRow[]): QuoteUserCardRef {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index]
+    if (String(row?.kind ?? '') !== CARD_KIND_USER) continue
+    return { cardKey: userCardSpeechKey(row.key, row.turnNo), turnNo: String(row.turnNo ?? '') }
+  }
+  return { cardKey: '', turnNo: '' }
+}
+
+/** 卡片 key 里能扒出轮次号就扒（宿主那种 `assistant:turn:12`、`user:13:input-message…`）。
+  拿不到照实回空串，组件自己会说「轮次未知」，不许瞎猜。
+*/
+export function quoteTurnFromCardKey(cardKey: unknown): string {
+  const key = String(cardKey ?? '').trim()
+  if (key === '') return ''
+  const named = key.match(/^(?:assistant|user|notice):turn:(\d{1,6})$/)
+  if (named) return named[1]
+  const bare = key.match(/^(?:user|notice):(\d{1,6}):/)
+  if (bare) return bare[1]
+  return ''
+}
+
+/** 引用提示只在固定秘书会话那条输入框显示（别的会话一个字都不出）。 */
+export function quoteChipVisible(secretarySessionId: unknown, slotSessionId: unknown): boolean {
+  const secretary = String(secretarySessionId ?? '')
+  const slot = String(slotSessionId ?? '')
+  return secretary !== '' && slot !== '' && secretary === slot
+}
+
+/** 摘要只截一小段：换行压成空格、超长加省略号。 */
+export function quoteChipPreview(preview: unknown, maxChars: number = QUOTE_CHIP_PREVIEW_MAX_CHARS): string {
+  const collapsed = String(preview ?? '').replace(/\s+/g, ' ').trim()
+  if (collapsed === '') return ''
+  const limit = Math.max(1, Math.trunc(maxChars))
+  if (collapsed.length <= limit) return collapsed
+  return `${collapsed.slice(0, limit - 1).trimEnd()}…`
+}
+
+export interface QuoteChipParts {
+  /** 「带引用」那一句。 */
+  flag: string
+  /** 第 N 轮 / 轮次未知。 */
+  turnLabel: string
+  /** 这张卡是什么（秘书回复卡 / 用户消息卡 / 系统通知卡）。 */
+  kindLabel: string
+  /** 轮次 + 卡片种类（一行短语）。 */
+  meta: string
+  /** 该卡正文开头一小段。 */
+  preview: string
+  /** tooltip / aria 全文（手机上点不到 hover 也看得到）。 */
+  label: string
+}
+
+/** 输入框提示的三段文案（纯函数）：没引用 → null（组件什么都不渲染）。 */
+export function quoteChipParts(record: SecretaryQuoteRecord | null): QuoteChipParts | null {
+  if (record === null) return null
+  const kindLabel = QUOTE_CHIP_KIND_LABELS[record.kind] ?? '卡片'
+  const turnNumber = quoteTurnNumber(record.turnNo) ?? quoteTurnNumber(quoteTurnFromCardKey(record.cardKey))
+  const turnLabel = turnNumber !== null ? `第 ${turnNumber} 轮` : '轮次未知'
+  const preview = quoteChipPreview(record.preview)
+  const meta = `${turnLabel} · ${kindLabel}`
+  const parts: QuoteChipParts = {
+    flag: QUOTE_CHIP_FLAG_TEXT,
+    turnLabel,
+    kindLabel,
+    meta,
+    preview,
+    label: preview === ''
+      ? `本条消息带引用：接着${meta}说（发出去即失效，点取消就不带引用）`
+      : `本条消息带引用：接着${meta}说，那张卡正文开头「${preview}」（发出去即失效，点取消就不带引用）`,
+  }
+  return parts
+}
+
+/** 还要不要排到期定时器：还活着的引用回剩余毫秒（下限 1ms、上限截到 setTimeout 安全值），没了/过期回 0。 */
+export function quoteExpiryDelayMs(record: SecretaryQuoteRecord | null, now = Date.now(), ttlMs = QUOTE_TTL_MS): number {
+  if (record === null) return 0
+  const left = record.updatedAt + ttlMs - now
+  if (!(left > 0)) return 0
+  // 2^31-1 是 setTimeout 的安全上限（超过浏览器会立刻当成 0 触发）
+  return Math.min(Math.max(1, Math.trunc(left)), 2147483647)
+}
 
 export interface SecretaryQuoteRecord {
   /** 卡片 key（沿用已读/朗读那套 cardKey 口径：assistant: / user: / notice: 前缀）。 */
@@ -1686,6 +1834,8 @@ export interface SecretaryQuoteDeps {
   fetchImpl?: (url: string, init?: any) => Promise<any>
   /** 本地兜底缓存（宿主答不上时还能立刻知道引用着哪张卡）；缺 → 只用心跳集合。 */
   storage?: { getItem(key: string): string | null; setItem(key: string, value: string): void } | null
+  /** 引用还能活多久（单测验「到期自动清除」才注入短的；缺 → QUOTE_TTL_MS 三十分钟）。 */
+  ttlMs?: number
 }
 
 export interface SecretaryQuoteStore {
@@ -1695,8 +1845,15 @@ export interface SecretaryQuoteStore {
   isQuoted(cardKey: string): boolean
   /** 登记引用：立刻本地生效（按钮当场变成引用态），再写缓存 + 落宿主；宿主失败不阻塞。 */
   setQuote(record: { cardKey: string; kind: string; turnNo?: string; preview?: string; refSessionIds?: string[] }): boolean
-  /** 取消引用（cardKey 不匹配当前引用时什么都不动）。 */
+  /** 取消引用（cardKey 不匹配当前引用时什么都不动）。用户主动按取消 → 服务端那份也一起清。 */
   clearQuote(cardKey?: string): boolean
+  /**
+   * 扫描层上报「页面上最末一条真实用户消息卡」（合成通知行不算，口径同宿主「通知轮不吃引用」）。
+   * 返回 true = 这一看发现那条消息已经发出去了，引用该收（提示跟着消失）。
+   */
+  noteLatestUserCard(ref: QuoteUserCardRef): boolean
+  /** 当前基线（引用登记那一刻的最末真实用户卡）：测试取证。 */
+  baselineUserCard(): QuoteUserCardRef | null
   hydrate(): Promise<{ ok: boolean; hostOk: boolean; active: boolean }>
   subscribe(listener: () => void): () => void
   getVersion(): number
@@ -1706,12 +1863,18 @@ export function createSecretaryQuoteStore(deps: SecretaryQuoteDeps = {}): Secret
   const listeners = new Set<() => void>()
   const storage = deps.storage ?? null
   const storageKey = QUOTE_STORAGE_PREFIX
+  const ttlMs = Number.isFinite(deps.ttlMs) && Number(deps.ttlMs) > 0 ? Number(deps.ttlMs) : QUOTE_TTL_MS
   let session = ''
   let version = 0
   let active: SecretaryQuoteRecord | null = null
   let hostBroken = false
   let hydrateCall: Promise<{ ok: boolean; hostOk: boolean; active: boolean }> | null = null
+  // 引用基线 + 最末真实用户卡（扫描层每次扫完报一次），加上 TTL 到期定时器
+  let latestUser: QuoteUserCardRef | null = null
+  let baseline: QuoteUserCardRef | null = null
+  let expiryTimer: any = null
 
+  const g = globalThis as any
   const emit = (): void => { for (const listener of [...listeners]) { try { listener() } catch { /* 单个订阅者出错不影响别的 */ } } }
   const bump = (): void => { version += 1; emit() }
 
@@ -1723,10 +1886,48 @@ export function createSecretaryQuoteStore(deps: SecretaryQuoteDeps = {}): Secret
     if (storage === null || session === '') return
     try { storage.setItem(`${storageKey}${session}`, JSON.stringify(record)) } catch { /* 缓存写不进去不影响引用 */ }
   }
+  const readBaselineCache = (): QuoteUserCardRef | null => {
+    if (storage === null || session === '') return null
+    try {
+      const raw = JSON.parse(String(storage.getItem(`${QUOTE_BASELINE_STORAGE_PREFIX}${session}`) ?? 'null')) as any
+      const cardKey = normalizeCardKey(raw?.cardKey)
+      if (cardKey === '') return null
+      return { cardKey, turnNo: String(raw?.turnNo ?? '') }
+    } catch { return null }
+  }
+  const writeBaselineCache = (ref: QuoteUserCardRef | null): void => {
+    if (storage === null || session === '') return
+    try { storage.setItem(`${QUOTE_BASELINE_STORAGE_PREFIX}${session}`, JSON.stringify(ref ?? null)) } catch { /* 基线记不住不影响引用本身 */ }
+  }
+
+  const clearExpiryTimer = (): void => {
+    if (expiryTimer === null) return
+    try { g.clearTimeout?.(expiryTimer) } catch { /* 定时器已经没了 */ }
+    expiryTimer = null
+  }
+  /** 到点自己收（要求 2：TTL 到期自动清除）：本地收掉 + 请宿主也清；引用本身按 updatedAt 已经判死。 */
+  const scheduleExpiry = (record: SecretaryQuoteRecord | null): void => {
+    clearExpiryTimer()
+    if (record === null) return
+    const delay = quoteExpiryDelayMs(record, Date.now(), ttlMs)
+    // 挂上来那一刻就已经过期（delay 0）也照收：1ms 后立刻收干净，不许挂在 store 里等下一次 DOM 变化
+    if (typeof g.setTimeout !== 'function') return
+    expiryTimer = g.setTimeout(() => {
+      expiryTimer = null
+      if (active === null) return
+      if (quoteAlive(active, Date.now(), ttlMs)) { scheduleExpiry(active); return }
+      baseline = null
+      writeBaselineCache(null)
+      apply(null, true)
+    }, delay > 0 ? delay : 1)
+    // node 环境（单测）别把这个定时器算进事件循环，否则进程会一直挂着等三十分钟
+    try { expiryTimer?.unref?.() } catch { /* 浏览器里没有 unref */ }
+  }
 
   const apply = (record: SecretaryQuoteRecord | null, persistHost: boolean): void => {
     active = record
     writeCache(record)
+    scheduleExpiry(record)
     bump()
     if (persistHost) void postQuote(record)
   }
@@ -1751,11 +1952,13 @@ export function createSecretaryQuoteStore(deps: SecretaryQuoteDeps = {}): Secret
       if (id === session) return
       session = id
       active = readCache()
+      baseline = readBaselineCache()
+      scheduleExpiry(active)
       bump()
     },
-    active(): SecretaryQuoteRecord | null { return quoteAlive(active) ? active : null },
+    active(): SecretaryQuoteRecord | null { return quoteAlive(active, Date.now(), ttlMs) ? active : null },
     isQuoted(cardKey: string): boolean {
-      const current = quoteAlive(active) ? active : null
+      const current = quoteAlive(active, Date.now(), ttlMs) ? active : null
       return current !== null && current.cardKey === normalizeCardKey(cardKey)
     },
     setQuote(record: { cardKey: string; kind: string; turnNo?: string; refSessionIds?: string[], preview?: string }): boolean {
@@ -1769,6 +1972,9 @@ export function createSecretaryQuoteStore(deps: SecretaryQuoteDeps = {}): Secret
       })
       if (next === null) return false
       if (active !== null && active.cardKey === next.cardKey) return false
+      // 基线 = 那一刻页面上最末那条真实用户消息；它变了就意味着用户已经发过消息了
+      baseline = latestUser !== null && normalizeCardKey(latestUser.cardKey) !== '' ? { ...latestUser } : null
+      writeBaselineCache(baseline)
       apply(next, true)
       return true
     },
@@ -1776,31 +1982,55 @@ export function createSecretaryQuoteStore(deps: SecretaryQuoteDeps = {}): Secret
       const key = normalizeCardKey(cardKey)
       if (active === null) return false
       if (key !== '' && active.cardKey !== key) return false
+      baseline = null
+      writeBaselineCache(null)
       apply(null, true)
       return true
     },
+    noteLatestUserCard(ref: QuoteUserCardRef): boolean {
+      const cardKey = normalizeCardKey(ref?.cardKey)
+      latestUser = { cardKey, turnNo: String(ref?.turnNo ?? '') }
+      if (active === null) return false
+      if (!quoteAlive(active, Date.now(), ttlMs)) return false
+      if (baseline === null) {
+        // 基线还没定（刷新页面 / 引用登记时页面上还没有用户行）：这一次只立基线，不吃引用
+        if (cardKey === '') return false
+        baseline = { ...latestUser }
+        writeBaselineCache(baseline)
+        return false
+      }
+      if (!quoteConsumedByUserRow(baseline, latestUser)) return false
+      // 那条消息已经发出去了：本地收掉（服务端由宿主自己在 turn/end 收，客户端不抢先 POST clear）
+      baseline = null
+      writeBaselineCache(null)
+      apply(null, false)
+      return true
+    },
+    baselineUserCard(): QuoteUserCardRef | null { return baseline },
     hydrate(): Promise<{ ok: boolean; hostOk: boolean; active: boolean }> {
       if (hydrateCall !== null) return hydrateCall
       hydrateCall = (async (): Promise<{ ok: boolean; hostOk: boolean; active: boolean }> => {
         const cached = readCache()
-        if (cached !== null && active === null) { active = cached; bump() }
+        if (cached !== null && active === null) { active = cached; baseline = readBaselineCache(); scheduleExpiry(cached); bump() }
         const fetchImpl = deps.fetchImpl
         if (hostBroken || session === '' || typeof fetchImpl !== 'function') {
-          return { ok: true, hostOk: false, active: quoteAlive(active) }
+          return { ok: true, hostOk: false, active: quoteAlive(active, Date.now(), ttlMs) }
         }
         try {
           const res = await fetchImpl(`${ASSISTANT_SECRETARY_QUOTE_ROUTE}?sessionId=${encodeURIComponent(session)}`, { cache: 'no-store' })
-          if (res?.ok !== true) { hostBroken = true; return { ok: true, hostOk: false, active: quoteAlive(active) } }
+          if (res?.ok !== true) { hostBroken = true; return { ok: true, hostOk: false, active: quoteAlive(active, Date.now(), ttlMs) } }
           const payload = await res.json()
-          if ((payload as any)?.ok !== true) { hostBroken = true; return { ok: true, hostOk: false, active: quoteAlive(active) } }
+          if ((payload as any)?.ok !== true) { hostBroken = true; return { ok: true, hostOk: false, active: quoteAlive(active, Date.now(), ttlMs) } }
           const fromHost = normalizeQuoteRecord((payload as any)?.quote)
           active = fromHost
           writeCache(fromHost)
+          if (fromHost === null) { baseline = null; writeBaselineCache(null) }
+          scheduleExpiry(fromHost)
           bump()
-          return { ok: true, hostOk: true, active: quoteAlive(fromHost) }
+          return { ok: true, hostOk: true, active: quoteAlive(fromHost, Date.now(), ttlMs) }
         } catch {
           hostBroken = true
-          return { ok: true, hostOk: false, active: quoteAlive(active) }
+          return { ok: true, hostOk: false, active: quoteAlive(active, Date.now(), ttlMs) }
         }
       })()
       return hydrateCall
@@ -1878,11 +2108,24 @@ export const secretaryCardsTestSurface = {
   clearSecretaryCompactHintRows,
   ASSISTANT_SECRETARY_QUOTE_ROUTE,
   QUOTE_STORAGE_PREFIX,
+  QUOTE_BASELINE_STORAGE_PREFIX,
   QUOTE_TTL_MS,
   QUOTE_PREVIEW_MAX_CHARS,
+  QUOTE_CHIP_FLAG_TEXT,
+  QUOTE_CHIP_CANCEL_TEXT,
+  QUOTE_CHIP_PREVIEW_MAX_CHARS,
+  QUOTE_CHIP_KIND_LABELS,
   normalizeQuoteRecord,
   normalizeQuoteSessionIds,
   quoteAlive,
+  quoteTurnNumber,
+  quoteConsumedByUserRow,
+  latestRealUserCardRef,
+  quoteChipVisible,
+  quoteChipPreview,
+  quoteChipParts,
+  quoteExpiryDelayMs,
+    quoteTurnFromCardKey,
   createSecretaryQuoteStore,
   secretaryQuoteStore,
   ASSISTANT_SECRETARY_READ_ROUTE,

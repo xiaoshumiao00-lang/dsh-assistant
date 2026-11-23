@@ -22,7 +22,7 @@
  * 退出码 0 = 全绿。任何断言失败都会打印现场事实。
  */
 import { chromium } from 'playwright'
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 
 const REAL_CARD = process.env.DSH_SMOKE_REAL_CARD === '1'
 const LOCAL_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
@@ -1362,6 +1362,7 @@ try {
     quoteProbe.cards >= 1 && quoteProbe.buttonsWithoutCard === 0 && quoteProbe.collapsedRowsWithButton === 0
       && quoteProbe.cardsWithButton === quoteProbe.cards && quoteProbe.order.every((line) => line === 'quote,time,actions'),
     JSON.stringify({ cards: quoteProbe.cards, cardsWithButton: quoteProbe.cardsWithButton, buttons: quoteProbe.buttons, collapsedRowsWithButton: quoteProbe.collapsedRowsWithButton, order: quoteProbe.order }))
+
   check('读掉之后红点彻底消失（不留灰点、不淡出成长条）：最新卡已读、全页红点数=未读卡数',
     nowState.lastKey !== '' && nowState.lastUnread === '0' && nowState.lastDot === false && nowState.totalDots === nowState.unreadCardCount,
     JSON.stringify({ lastKey: nowState.lastKey, lastUnread: nowState.lastUnread, lastDot: nowState.lastDot, totalDots: nowState.totalDots, unreadCardCount: nowState.unreadCardCount }))
@@ -1398,6 +1399,132 @@ try {
     check('点历史卡朗读：绝不读最新一条', head(hist.lastTitle) === '' || !cjk(sent).includes(head(hist.lastTitle)),
       `last=${hist.lastTitle.slice(0, 14)}`)
     await page.locator(olderSelector).locator('[data-dsh-speak="button"]').click().catch(() => {}) // 收尾停掉
+
+  // ── 追加需求现场证据（2026-11-23 用户原话：点引用要在输入框看得到提示）──
+  // 上一次跑测残留的引用先收干净（与已读集合那一段同一口径：清缓存 + 按宿主那份 + 页面上有提示就直接按 ×）
+  await page.evaluate(() => {
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith('dsh.assistant.secretary.quote:') || key.startsWith('dsh.assistant.secretary.quote-baseline:')) localStorage.setItem(key, 'null')
+    }
+    const chip = document.querySelector('[data-dsh-squote="chip"]')
+    if (chip !== null) {
+      const cancel = chip.querySelector('[data-dsh-squote="cancel"]')
+      if (cancel !== null) cancel.click()
+    }
+  })
+  await page.evaluate(async () => {
+    const sid = String(window.localStorage.getItem('dsh.assistant.secretary.sessionId') ?? '')
+    if (sid === '') return
+    try { await fetch('/api/assistant/secretary-quote?sessionId=' + encodeURIComponent(sid), { method: 'DELETE' }) } catch { /* 宿主没这条路由（没重启）也不阻塞 */ }
+  })
+  await page.waitForTimeout(900)
+  const chipIdle = await page.evaluate(() => ({
+    chips: document.querySelectorAll('[data-dsh-squote="chip"]').length,
+    composer: document.querySelectorAll('[data-composer-card]').length,
+  }))
+  check('没按引用时输入框那侧一个「带引用」提示节点都没有', chipIdle.chips === 0, JSON.stringify(chipIdle))
+  const quoteButton = page.locator('[data-dsh-scard="card"]:not([data-dsh-scard-expired="1"]) [data-dsh-scard="quote"][data-quoted="0"]').first()
+  const quoteClicked = await quoteButton.click().then(() => true).catch(() => false)
+  if (quoteClicked) {
+    await page.waitForTimeout(900)
+    const chipLive = await page.evaluate(() => {
+      const chip = document.querySelector('[data-dsh-squote="chip"]')
+      if (chip === null) return { chip: null, composer: document.querySelectorAll('[data-composer-card]').length }
+      const cs = getComputedStyle(chip)
+      const rect = (el) => { const r = el.getBoundingClientRect(); return { x: Math.round(r.x), w: Math.round(r.width), right: Math.round(r.right), h: Math.round(r.height) } }
+      const cancel = chip.querySelector('[data-dsh-squote="cancel"]')
+      const metaEl = chip.querySelector('[data-dsh-squote="meta"]')
+      const previewEl = chip.querySelector('[data-dsh-squote="preview"]')
+      const cardEl = document.querySelector('[data-composer-card]')
+      return {
+        chip: 'ok',
+        flag: chip.querySelector('[data-dsh-squote="flag-text"]')?.textContent ?? '',
+        meta: metaEl?.textContent ?? '',
+        preview: previewEl?.textContent ?? '',
+        radius: cs.borderRadius,
+        inComposer: chip.closest('[data-composer-card]') !== null,
+        overflowHidden: cs.overflow === 'hidden',
+        metaWhole: metaEl === null ? false : (metaEl.scrollWidth <= metaEl.clientWidth + 1),
+        metaEllipsis: metaEl === null ? false : (metaEl.scrollWidth > metaEl.clientWidth + 1),
+        previewEllipsis: previewEl === null ? false : getComputedStyle(previewEl).textOverflow === 'ellipsis',
+        previewOwnLine: (previewEl === null || metaEl === null) ? false : (previewEl.getBoundingClientRect().top > metaEl.getBoundingClientRect().top + 1),
+        metaKindHidden: (function () { const el = chip.querySelector('[data-dsh-squote="meta-kind"]'); return el === null ? false : getComputedStyle(el).display === 'none' })(),
+        metaVisibleText: metaEl === null ? '' : metaEl.innerText.trim(),
+        chipHeight: Math.round(chip.getBoundingClientRect().height),
+        previewText: previewEl?.textContent ?? '',
+        cancelColor: cancel === null ? '' : getComputedStyle(cancel).color,
+        cancelSize: cancel === null ? '' : `${Math.round(cancel.getBoundingClientRect().width)}x${Math.round(cancel.getBoundingClientRect().height)}`,
+        kind: chip.getAttribute('data-dsh-squote-kind') ?? '',
+        cardKey: chip.getAttribute('data-dsh-squote-key') ?? '',
+        chipRect: rect(chip),
+        cancelRect: cancel === null ? null : rect(cancel),
+        composerCardRect: cardEl === null ? null : rect(cardEl),
+        cancelHit: (function () {
+          if (cancel === null) return false
+          const r = cancel.getBoundingClientRect()
+          const el = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)
+          return el === null ? false : el.closest('[data-dsh-squote="cancel"]') !== null
+        })(),
+        parentChain: (function () {
+          const out = []
+          let node = chip.parentElement
+          for (let depth = 0; depth < 4 && node !== null; depth += 1) {
+            const r = node.getBoundingClientRect()
+            out.push({ slot: node.getAttribute('data-slot') ?? '', class: String(node.className).slice(0, 34), w: Math.round(r.width), right: Math.round(r.right) })
+            node = node.parentElement
+          }
+          return out
+        })(),
+        hitTests: (function () {
+          const r = chip.getBoundingClientRect()
+          const probes = [[r.left + 6, r], [r.left + r.width / 2, r], [r.right - 4, r]]
+          return probes.map(([x, box]) => {
+            const el = document.elementFromPoint(x, box.top + box.height / 2)
+            if (el === null) return { hit: null }
+            const tag = el.getAttribute('data-dsh-squote') ?? el.getAttribute('data-dsh-scard') ?? (el.tagName + '.' + String(el.className).slice(0, 20))
+            return { x: Math.round(x), hit: tag }
+          })
+        })(),
+      }
+    })
+    await page.screenshot({ path: 'tmp-secretary-quote-chip-live.png' })
+    notes.push('截图: tmp-secretary-quote-chip-live.png')
+    await page.locator('[data-composer-card]').first().screenshot().then((buf) => writeFileSync('tmp-secretary-quote-chip-composer.png', buf)).catch(() => notes.push('composer 局部截图没写成'))
+    notes.push('截图: tmp-secretary-quote-chip-composer.png')
+    notes.push('引用提示现场几何: ' + JSON.stringify(chipLive))
+    check('点卡片引用后输入框那侧出现「带引用」提示、而且挂在宿主 composer 里',
+      chipLive.chip === 'ok' && chipLive.inComposer === true, JSON.stringify(chipLive))
+    check('提示带轮次号 + 卡片种类 + 那张卡正文开头一小段（不整段贴）',
+      chipLive.chip === 'ok' && chipLive.flag === '带引用' && /第 ?\d+ ?轮|轮次未知/.test(chipLive.meta) && chipLive.preview.length > 0 && chipLive.preview.length <= 34,
+      JSON.stringify({ flag: chipLive.flag, meta: chipLive.meta, preview: chipLive.preview }))
+    check('提示样式与卡片脚部那两棵按钮同一套（8px 圆角 / muted #8A9099 的 ×）',
+      chipLive.chip === 'ok' && chipLive.radius === '8px' && chipLive.cancelColor === 'rgb(138, 144, 153)' && /^\d{2}x\d{2}$/.test(chipLive.cancelSize),
+      JSON.stringify(chipLive))
+    check('引用提示在宿主 composer 那一行里不溢出：× 整颗落在提示自己的边界内、点得到、提示盒子 overflow hidden',
+      chipLive.chip === 'ok' && chipLive.overflowHidden === true && chipLive.cancelHit === true
+        && chipLive.cancelRect !== null && chipLive.chipRect !== null && chipLive.composerCardRect !== null
+        && chipLive.cancelRect.right <= chipLive.chipRect.right + 1 && chipLive.chipRect.right <= chipLive.composerCardRect.right,
+      JSON.stringify({ chipRect: chipLive.chipRect, cancelRect: chipLive.cancelRect, composerCardRect: chipLive.composerCardRect, overflowHidden: chipLive.overflowHidden, cancelHit: chipLive.cancelHit, parentChain: chipLive.parentChain }))
+    check('现场这一档（真机实测：composer 卡片 380px、那一行只留 278px、提示只分到 164px）：轮次号不许拦腰截、摘要自己换第二行、提示盒子长高',
+      chipLive.chip === 'ok' && chipLive.metaWhole === true && /^第 \d+ 轮$/.test(chipLive.metaVisibleText) && chipLive.previewOwnLine === true && chipLive.metaKindHidden === true && chipLive.chipHeight > 34 && chipLive.chipHeight <= 72 && chipLive.previewText.length > 0,
+      JSON.stringify({ meta: chipLive.meta, metaWhole: chipLive.metaWhole, previewOwnLine: chipLive.previewOwnLine, chipHeight: chipLive.chipHeight, previewText: chipLive.previewText }))
+    const cancelClicked = await page.locator('[data-dsh-squote="cancel"]').first().click().then(() => true).catch(() => false)
+    if (cancelClicked) {
+      await page.waitForTimeout(900)
+      const afterCancel = await page.evaluate(() => ({
+        chips: document.querySelectorAll('[data-dsh-squote="chip"]').length,
+        cached: Object.keys(localStorage).filter((key) => key.startsWith('dsh.assistant.secretary.quote:')).map((key) => localStorage.getItem(key)),
+      }))
+      await page.screenshot({ path: 'tmp-secretary-quote-chip-cancelled.png' })
+      notes.push('截图: tmp-secretary-quote-chip-cancelled.png')
+      check('按「取消引用」后提示立刻收掉、本地缓存那份也清干净（下一条不带引用）',
+        afterCancel.chips === 0 && afterCancel.cached.every((value) => value === null || value === 'null'), JSON.stringify(afterCancel))
+    } else {
+      notes.push('取消引用那颗 × 没找到，跳过取消断言（提示是否渲染出来了？' + JSON.stringify(chipLive) + '）')
+    }
+  } else {
+    notes.push('现场没有可点的卡片引用按钮，跳过输入框提示现场断言')
+  } // 收尾停掉
   }
 
   // ── 第二次单击：复用同一条会话、页面不重载 ──

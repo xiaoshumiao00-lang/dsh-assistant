@@ -435,6 +435,124 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   line-height: 16px;
   color: var(--dsh-card-text-muted);
 }
+/* ── 输入框旁边那颗「带引用」提示（2026-11-23 追加需求）────────────────
+ * 落点：src/client/pocket/orb/SecretaryQuoteChip.tsx（宿主 conversation.input.right 槽位）。
+ * 数值一律照卡片脚部那两棵按钮抄（muted #8A9099、8px 圆角、同 hover、16px 图标、同 160ms 过渡），
+ * 只把 accent 换成那张卡自己的主题色（紫 / 冷蓝 / 灰），好让人一眼对上接的是哪张卡。
+ * 没引用时组件根本不渲染（这些规则也就用不上）——不许留占位条。 */
+[data-dsh-squote="chip"] {
+  --dsh-squote-muted: #8a9099;
+  --dsh-squote-soft: #4e5969;
+  --dsh-squote-text: #1f2329;
+  --dsh-squote-hover-surface: #fafafb;
+  --dsh-squote-accent: #534ab7;
+  --dsh-squote-wash: #eeedfe;
+  --dsh-squote-line: #cecbf6;
+  --dsh-squote-focus-ring: #afa9ec;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: min(360px, 52vw);
+  height: 30px;
+  padding: 0 0 0 10px;
+  background: var(--dsh-squote-wash);
+  border: 0.5px solid var(--dsh-squote-line);
+  border-radius: 8px;
+  color: var(--dsh-squote-text);
+  font-size: 13px;
+  line-height: 18px;
+  /* 内容一律不许溢出盒子：窄起来先让 meta 走省略号，那颗 × 永远留在 composer 那一行里 */
+  overflow: hidden;
+}
+/* 三种卡的主题色在这里换：紫卡 → 提示也紫，蓝卡 → 蓝，灰通知卡 → 灰 */
+[data-dsh-squote="chip"][data-dsh-squote-kind="user"] {
+  --dsh-squote-accent: #184a80;
+  --dsh-squote-wash: #eef4ff;
+  --dsh-squote-line: #c9dcf7;
+  --dsh-squote-focus-ring: #7fb0ee;
+}
+[data-dsh-squote="chip"][data-dsh-squote-kind="notice"] {
+  --dsh-squote-accent: #5c6470;
+  --dsh-squote-wash: #f6f7f9;
+  --dsh-squote-line: #cfd3d9;
+  --dsh-squote-focus-ring: #9aa1ab;
+}
+[data-dsh-squote="flag"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  min-width: 0;
+  color: var(--dsh-squote-accent);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 18px;
+  white-space: nowrap;
+}
+[data-dsh-squote="flag"] svg {
+  display: block;
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+[data-dsh-squote="meta"] {
+  flex: 0 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--dsh-squote-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+[data-dsh-squote="preview"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--dsh-squote-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 取消入口那颗 ×：与卡脚那棵复制/引用按钮完全同一规格（30×30、同 muted、同 8px 圆角、同 hover） */
+[data-dsh-squote="cancel"] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: var(--dsh-squote-muted);
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: color 160ms ease, background-color 160ms ease;
+}
+[data-dsh-squote="cancel"]:hover,
+[data-dsh-squote="cancel"]:focus-visible {
+  color: var(--dsh-squote-text);
+  background: var(--dsh-squote-hover-surface);
+}
+[data-dsh-squote="cancel"]:focus-visible {
+  outline: 2px solid var(--dsh-squote-focus-ring);
+  outline-offset: 2px;
+}
+[data-dsh-squote="cancel"] svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+/* 过期自动收掉时不留盒子（与卡片 data-dsh-scard-expired 那条同一个效果）：
+ * 组件其实已经 return null，这条只兜「宿主 slot 出错边界吃掉组件」时的残留节点。 */
+[data-dsh-squote="chip"][data-empty="1"] {
+  display: none !important;
+}
 /* 过期自动消失的通知卡：外壳仍然要挂在那里（它撑着「宿主气泡不许冒回来」的那条 :has 判据），
  * 但盒子不输出——与上面那条 data-empty="1" 的空壳规则同一个效果。 */
 [data-dsh-scard="card"][data-dsh-scard-expired="1"] {
@@ -559,7 +677,8 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
 @media (prefers-reduced-motion: reduce) {
   [data-dsh-scard="content"],
   [data-dsh-speak="button"],
-  [data-dsh-scard="expand-arrow"] {
+  [data-dsh-scard="expand-arrow"],
+  [data-dsh-squote="cancel"] {
     transition: none !important;
   }
 }
@@ -593,6 +712,10 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   [data-dsh-scard="actions"] {
     flex-wrap: nowrap;
   }
+  /* 窄屏：引用提示别把模型胶囊与发送钮挤没（手机端还有粗指针那一档在上面） */
+  [data-dsh-squote="chip"] {
+    max-width: min(300px, 58vw);
+  }
 }
 
 @media (max-width: 360px) {
@@ -604,6 +727,58 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   }
   [data-dsh-scard="expand-text"] {
     white-space: normal;
+  }
+}
+
+/* 手机端输入框那一行（2026-11-23 追加需求）：
+ * 手机 WebView 也有 1080 宽那种（CSS 宽度 ≠ 520），所以手机这一档一律靠 (pointer: coarse) 判，
+ * 与 pocket 布局 isPhoneComposerLayout() 用的是同一个判据。
+ * 现场实测过一版：composer 卡片只有 380px 宽、那一行只留 278px，那颗提示只分到 164px，
+ * 一行式布局会把「第 245 轮」和摘要拦腰截断（截图里就是那样）——手机上这一档改成自己换两行：
+ * 第一行「带引用 + 第 N 轮」+ 那颗 × 顶到右边，第二行整行放那张卡正文开头一小段。
+ * 高度 auto（至少 34px）、那颗 × 也 34×34 够点、摘要 14px、meta 13px，宽度上限 60%。 */
+@media (pointer: coarse) {
+  [data-dsh-squote="chip"] {
+    height: auto;
+    min-height: 34px;
+    align-items: center;
+    flex-wrap: wrap;
+    row-gap: 4px;
+    gap: 4px;
+    padding: 4px 6px 4px 10px;
+    font-size: 14px;
+    line-height: 20px;
+    max-width: min(420px, 60vw);
+  }
+  [data-dsh-squote="flag"] {
+    font-size: 14px;
+    font-weight: 600;
+  }
+  /* 手机端这一档先把那颗引号小图标收掉：现场那一行只给得起 164px，先让「带引用 + 第 N 轮 + ×」这一行完整落得下 */
+  [data-dsh-squote="flag"] svg {
+    display: none;
+  }
+  /* 卡片种类那一截也收掉（卡本身看得出来是什么卡），只留「第 N 轮」 */
+  [data-dsh-squote="meta-kind"] {
+    display: none;
+  }
+  [data-dsh-squote="meta"] {
+    font-size: 13px;
+    /* 轮次号这一段在手机上不许被截：它拿自己的自然宽度（flex: 0 0 auto），宁可摘要那一行让位 */
+    flex: 0 0 auto;
+    overflow: visible;
+    text-overflow: clip;
+  }
+  [data-dsh-squote="preview"] {
+    font-size: 14px;
+    flex: 1 1 100%;
+    order: 3;
+  }
+  [data-dsh-squote="cancel"] {
+    width: 34px;
+    height: 34px;
+    order: 2;
+    margin-left: auto;
   }
 }
 `

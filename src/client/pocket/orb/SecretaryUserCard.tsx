@@ -32,8 +32,8 @@ import { SecretarySpeakButton } from './SecretarySpeakButton.tsx'
 import {
   assistantCardSpeechKey, buildSecretaryPagerCards, CARD_KIND_NOTICE, CARD_KIND_USER, cardFoldStyle, collectSecretaryCardRows,
   clearSecretaryCompactHintRows, formatClock,
-  noticeCardExpired, noticeCardSpeechKey, nearestNoticeExpiryMs, parseNoticeCardBody, parseSessionRefs, parseUserCardBody, secretaryPager,
-  stripSessionRefs, tagSecretaryCompactHintRows, userCardSpeechKey, EARLIER_HINT_TEXT, SCROLL_TOP_THRESHOLD_PX,
+  latestRealUserCardRef, noticeCardExpired, noticeCardSpeechKey, nearestNoticeExpiryMs, parseNoticeCardBody, parseSessionRefs, parseUserCardBody, secretaryPager,
+  secretaryQuoteStore, stripSessionRefs, tagSecretaryCompactHintRows, userCardSpeechKey, EARLIER_HINT_TEXT, SCROLL_TOP_THRESHOLD_PX,
   scrollAnchorTopPatch, shouldExpandOnScroll,
   type PagerDomCard, type SecretaryCardRow,
 } from './secretary-cards.ts'
@@ -360,6 +360,10 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
       const domCards: PagerDomCard[] = buildSecretaryPagerCards(document)
       pager.setSession(secretarySessionId())
       pager.noteDomCards(domCards)
+      // 引用吃掉口径（2026-11-23 追加需求）：把这条会话页面上最末那条**真实**用户消息卡送进引用 store。
+      // 它比「引用登记那一刻的基线」更靠前，就说明用户已经把那条消息发出去了 → 输入框旁边那颗提示该收。
+      // 合成通知行一律不算（latestRealUserCardRef 只认 kind=user），口径同宿主注入段「通知轮不吃引用」。
+      secretaryQuoteStore().noteLatestUserCard(latestRealUserCardRef(next))
       // 只取最近一段（幂等）：绝不在这里回填更旧的卡
       void pager.ensureWindow()
       const missing = next.some((row) => !rowHasCard(row.element))
