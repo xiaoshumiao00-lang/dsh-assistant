@@ -6,6 +6,8 @@
  *   - 请求文本带任务与「只做这一步 / 回具体结果 / 不要再交给 code_agent」；
  *   - computer_use 只由后台会话调用；结果取前台会话新产生的 assistant 文字；
  *   - 同一前台会话串行处理（两个后台同时请求不会交错、各拿各的结果）；
+ *   - 前台答复进结果工具的口径（2026-11-23 修第四个 bug）：notice 之后的几整段按顺序拼接、
+ *     上限对齐 20000 字（旧 4000 与「只取第一条」都废掉），用户插话那条仍是硬边界；
  *   - 前台不在 / 没开始 / 超时 / 被取消都有明确、可继续的失败结果；
  *   - 回传次数有上限，防止后台反复来回。
  */
@@ -18,6 +20,7 @@ import {
   firstAssistantTextAfter,
   isQueued,
   lastAssistantText,
+  MAX_RESULT_CHARS,
   resetBridgeQueues,
   resolveCallerId
 } from '../src/cu-bridge-core.mjs'
@@ -143,10 +146,17 @@ cases.push(['请求文本带任务、只做一步、回结果、不要再转 cod
   assert.match(text, /ask_user_question/)
 }])
 
-cases.push(['capText 保留结尾；lastAssistantText 支持只看注入之后的消息', async () => {
+cases.push(['capText 新口径：结果整段带全（不再 4000 拦腰截），保留结尾；lastAssistantText 支持只看注入之后的消息', async () => {
+  assert.equal(MAX_RESULT_CHARS, 20000, '与秘书/CU 通知同一长度口径（旧 4000 已废弃）')
+  assert.ok(MAX_RESULT_CHARS > 4000, '不许退回旧的 4000')
   assert.equal(capText('abc'), 'abc')
-  assert.ok(capText('x'.repeat(100), 10).startsWith('…'))
-  assert.ok(capText('x'.repeat(100), 10).endsWith('x'))
+  const long = capText('x'.repeat(12000))
+  assert.equal(long.length, 12000, '12000 字的结果不许被截断')
+  assert.ok(!long.startsWith('…'), '没超上限不该留省略号')
+  const cut = capText('x'.repeat(MAX_RESULT_CHARS + 500), 200)
+  assert.ok(cut.startsWith('…'), '超出上限才截，且保留结尾（结果通常比开头有用）')
+  assert.equal(cut.length, 200)
+  assert.ok(cut.endsWith('x'))
   const agent = makeAgent()
   agent.messages.push({ role: 'assistant', content: [{ type: 'text', text: 'old' }] })
   agent.messages.push({ role: 'user', content: [{ type: 'text', text: 'notice' }] })
@@ -157,16 +167,21 @@ cases.push(['capText 保留结尾；lastAssistantText 支持只看注入之后�
   assert.equal(lastAssistantText({ session: { deriveMessages: () => [] } }), '')
 }])
 
-cases.push(['firstAssistantTextAfter：只取 notice 之后的第一条 assistant（用户插话也不串）', async () => {
+cases.push(['firstAssistantTextAfter：notice 之后的几整段按顺序拼接（改前只取第一条），用户插话仍是硬边界', async () => {
   const events = [
     { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'old' }] } } },
     { type: 'user/message', data: { id: 'notice-1' } },
     { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'gui answer' }] } } },
+    { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '甲'.repeat(1200) }, { type: 'non-text' }] } } },
+    { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '乙'.repeat(1200) }] } } },
     { type: 'user/message', data: { id: 'user-2' } },
     { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'user answer' }] } } }
   ]
   const agent = { session: { snapshotEvents: () => events } }
-  assert.equal(firstAssistantTextAfter(agent, 'notice-1'), 'gui answer')
+  const answer = firstAssistantTextAfter(agent, 'notice-1')
+  assert.equal(answer, `gui answer\n\n${'甲'.repeat(1200)}\n\n${'乙'.repeat(1200)}`, '跨消息的几整段要拼在一起')
+  assert.ok(!answer.includes('user answer'), '用户插话之后的答复不算这次请求的结果')
+  assert.ok(answer.length > 2400, `改前这里只带第一条（10 字），整段拼接后该有 2400 字以上：${answer.length}`)
   assert.equal(firstAssistantTextAfter(agent, 'missing'), '')
   assert.equal(firstAssistantTextAfter({ session: { snapshotEvents: () => [] } }, 'notice-1'), '')
 }])

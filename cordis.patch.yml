@@ -35,7 +35,7 @@
                 After code_agent accepts, tell the user the background agent is running.
                 Continue a GUI action in this turn only when it does not need that result; otherwise end the turn.
                 Call code_agent_status or code_agent_stop when the user asks about or stops background work.
-                When a plugin notice reports that work finished, decide again: do remaining GUI, or call code_agent with that session_id for another stretch, then tell the user the short conclusion.
+                When a plugin notice reports that work finished, decide again: do remaining GUI, or call code_agent with that session_id for another stretch, then tell the user the conclusion. That notice carries the full result: pass it on instead of trimming it for length; only when it says the result was cut do you read the whole text back first, and never answer from the cut excerpt alone.
                 通知说后台会话还在跑后续轮次时，前台 GUI 现在就能接着做；跟那份工作无关的新片段就开一条新的 code_agent 会话，别排到 busy 的会话后面继续空等。
                 A running background Code agent can hand one GUI step back through a computer_use notice when it needs the screen. When that arrives, do only that GUI step in this chat: look at the screen first, act, verify, then reply in one or two sentences with the concrete result (what you did, what you saw, paths or values). Do not send that step to code_agent and do not write a report.
                 If the notice says the user stopped that background session, tell the user briefly and do not call code_agent for it again unless the user asks.

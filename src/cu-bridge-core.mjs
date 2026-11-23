@@ -18,8 +18,14 @@
 /** 模型可见的工具名。 */
 export const COMPUTER_USE_TOOL = 'computer_use'
 
-/** 一次回传结果最多带回多少字符（防止把整段报告塞回后台上下文）。 */
-export const MAX_RESULT_CHARS = 4000
+/**
+ * 一次回传结果最多带回多少字符。
+ * 2026-11-23 修第四个 bug：这条口径原来也是 4000，前台做完一步把长结果交回后台会话时，
+ * 后台只收到半截（与 code_agent 完成通知同源的第二条链路）。现在对齐秘书/通知那条唯一口径
+ * （src/assistant-cu-watch.ts 的 CU_NOTICE_RESULT_MAX_CHARS = 20000，宿主 followup 通道不裁正文）。
+ * capText 保留结尾的语义不变：整段能带全就原样带，超出上限才留「…」。
+ */
+export const MAX_RESULT_CHARS = 20000
 
 /** 默认等待上限：20 分钟。GUI 步骤通常几秒，留足用户在场决策的时间。 */
 export const DEFAULT_HANDOFF_TIMEOUT_MS = 20 * 60 * 1000
@@ -89,6 +95,20 @@ export function findNoticeIndex(agent, messageId) {
   return -1
 }
 
+/** 一条消息里所有 text 块拼成整段（块与块之间隔一个空行）。 */
+function messageText(message) {
+  const parts = (message?.content ?? [])
+    .filter((block) => block?.type === 'text')
+    .map((block) => String(block.text ?? '').trim())
+    .filter((text) => text !== '')
+  return parts.join('\n\n')
+}
+
+/**
+ * 前台这次答复的整段文字：从注入的 notice 之后、到下一条用户消息之前，
+ * 所有 assistant 消息按顺序拼接（2026-11-23 修第四个 bug：原来只取第一条 assistant，
+ * 答复被模型分几条消息交回时后面几整段直接丢掉；用户插话那条仍是硬边界）。
+ */
 export function firstAssistantTextAfter(agent, messageId) {
   if (messageId === undefined) return ''
   let events
@@ -99,17 +119,15 @@ export function firstAssistantTextAfter(agent, messageId) {
   }
   const start = findNoticeIndex(agent, messageId)
   if (start < 0) return ''
+  const segments = []
   for (let index = start + 1; index < events.length; index += 1) {
     const event = events[index]
+    if (event?.type === 'user/message') break
     if (event?.type !== 'assistant/message') continue
-    const text = (event.data?.message?.content ?? [])
-      .filter((block) => block?.type === 'text')
-      .map((block) => block.text)
-      .join('\n')
-      .trim()
-    if (text !== '') return text
+    const text = messageText(event.data?.message).trim()
+    if (text !== '') segments.push(text)
   }
-  return ''
+  return segments.join('\n\n')
 }
 
 /** 会话里最新一条非空 assistant 文字；没有则返回空串。 */
@@ -165,9 +183,9 @@ export function resultText(result) {
   return `Computer Use 已完成这一步：\n${capText(body)}\n\n继续原任务；同一个步骤不要再请求一次。`
 }
 
-/** 工具结果（失败/超时）。 */
+/** 工具结果（失败/超时）。失败原文按同一口径带全（改前这里另有一个 600 字的独立上限）。 */
 export function failureText(reason) {
-  return `Computer Use 没能完成这一步：${capText(reason, 600)}\n\n不要重复调用 computer_use 追问同一步；继续用你现有的工具完成任务，或把需要用户在桌面上操作的事项写成清单交给用户。`
+  return `Computer Use 没能完成这一步：${capText(reason)}\n\n不要重复调用 computer_use 追问同一步；继续用你现有的工具完成任务，或把需要用户在桌面上操作的事项写成清单交给用户。`
 }
 
 /** 同一前台会话内串行执行。 */

@@ -185,6 +185,10 @@ export function buildNoticeMessage(input: {
  * 所以不需要多条通知分段送达，一条通知直接带整段即可。
  * 卡片历史预览上限 `HISTORY_PREVIEW_MAX_CHARS`（secretary-card-shared.ts）是列表折叠时的
  * 观感口径，与「喂给模型的这条通知带多少字」无关，不再拿它当长度依据。
+ *
+ * 同一个口径另外两条链路也对齐了（2026-11-23 修第四个 bug）：后台 Code 会话完成通知
+ * `CODE_AGENT_NOTICE_MAX_CHARS`（vendor/computer-use/code-agent-registry-*.js）和
+ * GUI 回传桥的结果上限 `MAX_RESULT_CHARS`（src/cu-bridge-core.mjs）。
  */
 export const CU_NOTICE_RESULT_MAX_CHARS = 20000
 

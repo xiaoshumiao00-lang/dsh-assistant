@@ -43,7 +43,7 @@ async function runWatch(watch, signal) {
 		if (await raceAbort(signal, raceCompletionSignals(watch.code, signal)) === "aborted") return;
 		const stillRunning = watch.code.status === "running";
 		const userStopped = lastTurnEndedUserAborted(watch.code);
-		const outcome = lastAssistantText(watch.code) ?? NO_ASSISTANT;
+		const outcome = lastAssistantText(watch.code, watch.requestId) ?? NO_ASSISTANT;
 		if (await raceAbort(signal, watch.caller.whenIdle()) === "aborted") return;
 		if (watch.agents.get(watch.caller.id) !== watch.caller) return;
 		watch.caller.followup(createUserMessage({
@@ -169,8 +169,71 @@ async function raceCompletionSignals(code, signal) {
 	await Promise.race([turnWatch, idle, abortPromise(signal)]);
 }
 /** Newest non-empty assistant text of the session, or undefined when none exists. */
-function lastAssistantText(code) {
-	const messages = code.session.deriveMessages();
+function textBlocksOf(message) {
+	const texts = [];
+	for (const block of message?.content ?? []) {
+		if (block?.type !== "text") continue;
+		const text = String(block?.text ?? "").trim();
+		if (text !== "") texts.push(text);
+	}
+	return texts;
+}
+/**
+ * 这一轮 Code 会话交回来的**整段**文字（跨消息按顺序拼接）。
+ * 2026-11-23 修第四个 bug：原来只取「最新一条 assistant 消息」的 text 块，
+ * 长报告被模型分几条消息交回时（连续输出、max-tokens 续写、按段落发）前面几整段直接丢掉。
+ * 先按事件流找派发边界（带 `rpcId` 那条用户消息）之后的所有 assistant 文本；
+ * 读不到事件流或边界时退回「最后关闭那一轮」的整段；再不行退回旧口径（最新一条非空 assistant）。
+ */
+function lastAssistantText(code, requestId) {
+	let events = [];
+	try {
+		events = code.session?.snapshotEvents?.() ?? [];
+	} catch {
+		events = [];
+	}
+	let boundary = -1;
+	for (let index = events.length - 1; index >= 0; index -= 1) {
+		const event = asRecord(events[index]);
+		if (event?.type !== "user/message") continue;
+		const data = asRecord(event.data);
+		const source = asRecord(data?.message?.source) ?? asRecord(data?.source);
+		if (requestId !== void 0 && source?.rpcId === requestId) { boundary = index; break; }
+		if (requestId === void 0) { boundary = index; break; }
+	}
+	if (boundary >= 0) {
+		const parts = [];
+		for (let index = boundary + 1; index < events.length; index += 1) {
+			const event = asRecord(events[index]);
+			if (event?.type !== "assistant/message") continue;
+			const text = textBlocksOf(asRecord(asRecord(event.data)?.message)).join("\n\n");
+			if (text !== "") parts.push(text);
+		}
+		if (parts.length > 0) return parts.join("\n\n");
+	}
+	const closer = lastTurnEndIndex(code);
+	if (closer > 0) {
+		const turn = Number(asRecord(asRecord(events[closer])?.data)?.turn);
+		const parts = [];
+		for (let index = 0; index < closer; index += 1) {
+			const event = asRecord(events[index]);
+			if (event?.type !== "assistant/message") continue;
+			if (Number.isFinite(turn) && Number(asRecord(event.data)?.turn) !== turn) continue;
+			const text = textBlocksOf(asRecord(asRecord(event.data)?.message)).join("\n\n");
+			if (text !== "") parts.push(text);
+		}
+		if (parts.length > 0) return parts.join("\n\n");
+	}
+	return fallbackLastAssistantText(code);
+}
+/** 旧口径（兜底用）：会话里最新一条非空 assistant 文字。 */
+function fallbackLastAssistantText(code) {
+	let messages = [];
+	try {
+		messages = code.session.deriveMessages() ?? [];
+	} catch {
+		return;
+	}
 	for (let index = messages.length - 1; index >= 0; index -= 1) {
 		const message = messages[index];
 		if (message?.role !== "assistant") continue;
@@ -214,9 +277,26 @@ function anotherComputerUseRunning(watch) {
 function presetOf(agent) {
 	return agent.session?.header?.agentPreset;
 }
+/**
+ * 通知正文里 Code 会话结果那一段的长度口径。
+ * 与插件侧秘书通知同一套口径（见 src/assistant-cu-watch.ts 的 CU_NOTICE_RESULT_MAX_CHARS = 20000）。
+ * 改前是 4e3：逐条核实参考文献、批量改稿那种长报告普遍上万字，4000 一刀把报告拦腰截掉，
+ * 前台 Computer Use 只能依据半截的摘录往下走。宿主这条通道本身不裁正文
+ * （@deepseek-ai/dsh-agent-loop `send` 只做 `inbox.splice`，:800-808），所以放大上限即可，
+ * 不需要多条通知分段送达。卡片那一行的一行话另有口径：@deepseek-ai/dsh-llm
+ * `CONTEXT_SUMMARY_MAX_CHARS = 120`（`boundContextSummary`）与书签列表的 200（`BOOKMARK_OUTCOME_MAX_CHARS`），
+ * 那两个是观感口径，不裁模型看到的正文。
+ */
+const CODE_AGENT_NOTICE_MAX_CHARS = 20000;
+function capNoticeOutcome(text) {
+	const value = String(text ?? "");
+	if (value.length <= CODE_AGENT_NOTICE_MAX_CHARS) return { text: value, truncated: false };
+	return { text: `${value.slice(0, CODE_AGENT_NOTICE_MAX_CHARS)}…`, truncated: true };
+}
 function completionNoticeText(sessionId, task, outcome, screenBusy, userStopped, stillRunning = false) {
-	const body = userStopped ? `The user stopped background Code agent session ${sessionId} from the main window:\n${task}\n\nLast output before it stopped:\n${outcome}` : `Background Code agent session ${sessionId} ${stillRunning ? "completed the stretch you dispatched (its own turns are still running)" : "finished this task"}:\n${task}\n\n${outcome}`;
-	return `${body.length <= 4e3 ? body : `${body.slice(0, 3999)}…`}${userStopped ? "\n\nDo not restart this task and do not call code_agent for it again unless the user asks." : stillRunning ? "\n\nThat Code session is still working on later rounds. Use this result to decide your next step now; call code_agent_status to check progress, and only dispatch another stretch to the same session_id when this one is not the answer you needed." : ""}${screenBusy ? `\n\n${SCREEN_BUSY_SUFFIX}` : ""}`;
+	const capped = capNoticeOutcome(outcome);
+	const body = userStopped ? `The user stopped background Code agent session ${sessionId} from the main window:\n${task}\n\nLast output before it stopped:\n${capped.text}` : `Background Code agent session ${sessionId} ${stillRunning ? "completed the stretch you dispatched (its own turns are still running)" : "finished this task"}:\n${task}\n\n${capped.text}`;
+	return `${body}${capped.truncated ? `\n\nThat reply is cut here at ${CODE_AGENT_NOTICE_MAX_CHARS} characters (the tail after the \`…\` is missing). Do not conclude from the excerpt alone: read the full text back from the file that Code session wrote, or open session ${sessionId} in the app. Dispatch another stretch to that session only when the user asked you to.` : ""}${userStopped ? "\n\nDo not restart this task and do not call code_agent for it again unless the user asks." : stillRunning ? "\n\nThat Code session is still working on later rounds. Use this result to decide your next step now; call code_agent_status to check progress, and only dispatch another stretch to the same session_id when this one is not the answer you needed." : ""}${screenBusy ? `\n\n${SCREEN_BUSY_SUFFIX}` : ""}`;
 }
 //#endregion
 //#region src/code-agent-registry.ts
@@ -326,7 +406,7 @@ function completeRecord(record, agent) {
 	}
 	record.state = "completed";
 	record.endedAt ??= Date.now();
-	record.outcome = capOutcome(lastAssistantText(agent));
+	record.outcome = capOutcome(lastAssistantText(agent, record.requestId));
 	detachRecord(record);
 }
 function detachRecord(record) {
@@ -348,7 +428,7 @@ function subscribe(record) {
 			record.state = "completed";
 			record.endedAt ??= Date.now();
 			try {
-				record.outcome = capOutcome(lastAssistantText(agent));
+				record.outcome = capOutcome(lastAssistantText(agent, record.requestId));
 			} catch {}
 			detachRecord(record);
 		});

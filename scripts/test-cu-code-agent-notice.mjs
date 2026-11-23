@@ -13,7 +13,10 @@
  *   - 通知文案分「跑完了」/「这一片段交付完了、会话还在跑后续轮」两种，
  *     后者明说前台现在就能接着做 GUI，并提醒别把无关的新片段排到 busy 的会话后面；
  *   - 用户从主窗口停掉的会话仍走「stopped by the user」文案，且不许自动重开；
- *   - 前台被别的 Computer Use 会话占着时仍带屏幕忙后缀（旧行为）。
+ *   - 前台被别的 Computer Use 会话占着时仍带屏幕忙后缀（旧行为）；
+ *   - 后台 Code 会话的结果进通知的口径（2026-11-23 修第四个 bug）：整段带全（上限 20000 字，
+ *     与秘书通知 CU_NOTICE_RESULT_MAX_CHARS 同一口径），跨消息交回的几整段按顺序拼接，
+ *     真超上限才截尾并在正文里照实标注「cut here … tail is missing」。
  */
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -24,7 +27,7 @@ const source = readFileSync(registryPath, 'utf8')
 const body = source
   .replace(/^import[^\n]*\n/m, '')
   .replace(/^export \{[^\n]*\n?/m, '')
-const factory = new Function('boundContextSummary', 'createUserMessage', `${body}\nreturn { runWatch, raceCompletionSignals, completionNoticeText, lastTurnEndIndex, anotherComputerUseRunning, NO_ASSISTANT, SCREEN_BUSY_SUFFIX };`)
+const factory = new Function('boundContextSummary', 'createUserMessage', `${body}\nreturn { runWatch, raceCompletionSignals, completionNoticeText, lastAssistantText, lastTurnEndIndex, anotherComputerUseRunning, CODE_AGENT_NOTICE_MAX_CHARS, NO_ASSISTANT, SCREEN_BUSY_SUFFIX };`)
 const stubs = {
   boundContextSummary: (text) => String(text).slice(0, 120),
   createUserMessage: (message) => message,
@@ -194,15 +197,80 @@ cases.push(['lastTurnEndIndex：只数真正关闭的轮，缺 snapshotEvents �
   assert.equal(registry.lastTurnEndIndex({ session: undefined }), -1)
 }])
 
-cases.push(['completionNoticeText 直接调用时的边界（长文本要截、busy 与 stopped 互不干扰）', () => {
-  const long = 'x'.repeat(5000)
-  const cut = registry.completionNoticeText('code-1', '任务', long, false, false, false)
-  assert.ok(cut.length < 5000, '正文没截断')
-  assert.ok(cut.endsWith('…'))
+cases.push(['completionNoticeText 新口径：后台长结果整段带全（不再 4000 拦腰截），真超上限才截尾并照实标注', () => {
+  const cap = registry.CODE_AGENT_NOTICE_MAX_CHARS
+  assert.equal(cap, 20000, '与秘书通知那条唯一口径（CU_NOTICE_RESULT_MAX_CHARS）对齐')
+  assert.ok(cap > 4000, '不许退回旧的 4000 上限')
+  // 改前这条会拦腰砍：12000 字后台结果 → 只带 4000 字
+  const long = 'x'.repeat(12000)
+  const whole = registry.completionNoticeText('code-1', '任务', long, false, false, false)
+  assert.ok(whole.includes(long), '12000 字的结果要整段带全')
+  assert.ok(!whole.endsWith('…'), '整段带全时不许留省略号')
+  assert.ok(!whole.includes('cut here'), '没截断就不许带截断标注')
+  // 真正超出新上限的极端长结果：截尾 + 省略号 + 明确说后半段不在通知里
+  const overflow = registry.completionNoticeText('code-1', '任务', 'y'.repeat(cap + 5000), false, false, false)
+  assert.ok(overflow.includes('y'.repeat(cap)), '截断前的一半必须完整带出')
+  assert.ok(!overflow.includes('y'.repeat(cap + 1)), '超出上限的那部分不该带出')
+  assert.match(overflow, /That reply is cut here at 20000 characters/, '截断要在通知正文里如实标注')
+  assert.match(overflow, /the tail after the .…. is missing/, '要说清后半段不在通知里')
+  assert.match(overflow, /read the full text back from the file that Code session wrote/, '要给出补救办法（读回整段 / 开那条会话）')
+  assert.match(overflow, /Dispatch another stretch to that session only when the user asked you to/, '截断补救不许自己造「通知→再派活→再通知」回路')
+  assert.ok(overflow.length < cap + 5000 + 400, '正文里除了上限本身不该再塞全量结果')
+  // stopped 与 busy 两条支路互不干扰（旧口径保留）
   const stopped = registry.completionNoticeText('code-1', '任务', '结果', true, true, true)
   assert.match(stopped, /The user stopped/)
   assert.match(stopped, new RegExp(registry.SCREEN_BUSY_SUFFIX.slice(0, 20)))
   assert.ok(!stopped.includes('still working'))
+}])
+
+cases.push(['后台结果跨消息交回时按顺序拼接进通知（改前只取最新一条 assistant，前面几整段丢掉）', async () => {
+  const events = [
+    { type: 'user/message', data: { id: 'm-1', source: { kind: 'user', rpcId: 'rpc-1' } } },
+    { type: 'assistant/message', data: { turn: 3, message: { content: [{ type: 'text', text: '甲'.repeat(1200) }] } } },
+    { type: 'assistant/message', data: { turn: 3, message: { content: [{ type: 'text', text: '乙'.repeat(1200) }, { type: 'toolCall', name: 'pwsh' }] } } },
+    { type: 'assistant/message', data: { turn: 3, message: { content: [{ type: 'text', text: '丙'.repeat(1200) }, { type: 'text', text: '丁'.repeat(900) }] } } },
+    { type: 'turn/end', data: { turn: 3, reason: { kind: 'completed' } } },
+  ]
+  const code = fakeCodeAgent({ events, idleMs: 80 })
+  const caller = fakeCaller()
+  await withAbort(({ controller }) => registry.runWatch(fakeWatch({ code, caller }), controller.signal))
+  assert.equal(caller.notices.length, 1)
+  const text = caller.notices[0].content[0].text
+  assert.ok(text.includes('甲'.repeat(1200)), '第一条消息的整段要在')
+  assert.ok(text.includes('乙'.repeat(1200)), '第二条消息的整段要在')
+  assert.ok(text.includes('丙'.repeat(1200)), '一条消息里第一个 text 块要在')
+  assert.ok(text.includes('丁'.repeat(900)), '同一条消息的第二个 text 块也不许丢')
+  assert.ok(!text.endsWith('…'), '整段带全时不许留省略号：' + text.slice(-24))
+  assert.match(text, /甲{1200}\n\n乙{1200}/, '按顺序拼接（段之间隔一个空行）')
+  // 没有派发边界（老会话/没有 rpcId）时退回「最后关闭那一轮」的整段，也不许再只取一条
+  const noBoundary = [
+    { type: 'assistant/message', data: { turn: 5, message: { content: [{ type: 'text', text: '戊'.repeat(1500) }] } } },
+    { type: 'assistant/message', data: { turn: 5, message: { content: [{ type: 'text', text: '己'.repeat(1500) }] } } },
+    { type: 'turn/end', data: { turn: 5, reason: { kind: 'completed' } } },
+  ]
+  const code2 = fakeCodeAgent({ events: noBoundary, idleMs: 80 })
+  const caller2 = fakeCaller()
+  await withAbort(({ controller }) => registry.runWatch(fakeWatch({ code: code2, caller: caller2 }), controller.signal))
+  const text2 = caller2.notices[0].content[0].text
+  assert.ok(text2.includes('戊'.repeat(1500)) && text2.includes('己'.repeat(1500)), '按轮次拼接也要两条都在')
+}])
+
+cases.push(['提示词口径也不再要求「为简短而裁」：code_agent 工具描述、CU 提示词、cordis 预设三处同步', () => {
+  const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8')
+  const codeAgent = read('../vendor/computer-use/code-agent.js')
+  const cuIndex = read('../vendor/computer-use/index.js')
+  const patch = read('../cordis.patch.yml')
+  for (const [label, text] of [['code_agent 工具描述', codeAgent], ['CU 提示词', cuIndex], ['cordis 预设', patch]]) {
+    assert.ok(!text.includes('Do not recite a long report'), `${label} 里不许再留「不要念长报告」`)
+    assert.ok(!text.includes('tell the user the short conclusion'), `${label} 里不许再要求只说短结论`)
+  }
+  assert.ok(codeAgent.includes('pass it on as it is instead of trimming it for length'), '工具描述要要求把通知里的整段结果原样转给用户')
+  assert.ok(codeAgent.includes('give them in full instead of compressing them into a summary'), '后台角色文本不许再把完整调查结果压成摘要')
+  assert.ok(cuIndex.includes('pass it on instead of trimming it for length'), 'CU 提示词同样不许裁')
+  assert.ok(patch.includes('pass it on instead of trimming it for length'), 'cordis 预设那条也要对齐')
+  assert.ok(codeAgent.includes('omit session_id and start a second Code session'), '别把无关片段排到 busy 的会话后面这条闸不许被顺手删掉')
+  assert.ok(cuIndex.includes('call code_agent with that session_id'), '续接同一条会话的闸保留')
+  assert.ok(patch.includes('通知说后台会话还在跑后续轮次时'), 'busy 会话那条中文提醒保留')
 }])
 
 /** 给 await 加一层超时，避免测试因为路径没回传而挂到 node 自己退出。 */
