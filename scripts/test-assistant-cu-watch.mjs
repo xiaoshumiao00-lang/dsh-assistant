@@ -10,7 +10,8 @@
  *      错误原文（错误码、message）；标准会话完成 → 不收集也不 notify；同一轮只报一次；
  *   4. 通知正文含 [[session:<id>|<标题>]] 引用标记（渲染成可点跳信息行）；正文要求把 CU 会话
  *      的结果完整、原样转述（2026-11-22 定案：撤掉「一两句口语汇报」的长度限制），
- *      CU 结果带的是整段原文而不是首句；
+ *      CU 结果带的是整段原文而不是首句；长度口径 20000 字（2026-11-23 修：旧 900 会把长报告
+ *      切开，收集端不再按 900 砍块、汇报端不再只取最后一段，正文按「完整照录 / 按上限截断」如实标注）；
  *   5. 合成完成轮：turn 号接在现有最大 turn 后，五个事件按序落盘；
  *   6. 派活分层：A 纯知识随口问直接回答；B 有 CU 会话续接最近的、
  *      无 CU 会话新建；C 新项目建文件夹；标准会话不作为续接候选；
@@ -200,7 +201,52 @@ cases.push(['控制器：标准会话完成 → 不收集、不汇报；子代�
   assert.equal(sent.length, 0, '标准会话 / 子代理 / 秘书自身都不汇报')
 }])
 
-/* ---------- 4. 通知正文 ---------- */
+cases.push(['控制器：长报告整段落进通知（收集端不再按 900 砍块、汇报不再只取最后一段）', async () => {
+  const sent = []
+  const ctl = watch.createCuWatch({
+    presetOf: (session) => session.preset,
+    titleOf: (session) => session.header.title,
+    secretaryId: () => 'sec-1',
+    notify: (payload) => { sent.push(payload) },
+  })
+  const cu = { id: 'cu-long', preset: 'computer-use', header: { title: '逐条核实 15 篇参考文献' } }
+  // 一条 assistant 消息里三个 text 块，每块都远超旧的 900 字：改前每个块被 slice(0, 900) 拦腰砍过
+  const blockA = '参考文献核对记录 '.repeat(150) + '【第1块完整】'
+  const blockB = '参考文献核对记录 '.repeat(150) + '【第2块完整】'
+  const blockC = '参考文献核对记录 '.repeat(150) + '【第3块完整】'
+  assert.ok(blockA.length > 900 && blockB.length > 900 && blockC.length > 900, '样本块必须比旧口径长，才谈得上截断')
+  const blockD = '丁'.repeat(600)
+  ctl.handleSessionEvent(cu, {
+    type: 'assistant/message',
+    data: { turn: 7, message: { content: [{ type: 'text', text: blockA }, { type: 'text', text: blockB }, { type: 'text', text: blockC }, { type: 'non-text', text: '不算' }] } },
+  })
+  assert.equal(ctl.collectedOf('cu-long', 7), 1, '一条消息 = 一个整段（非 text 块不参与拼接）')
+  // 同一轮还有一条后续消息（max-tokens 续写 / 分段返回）：改前只取最后一段，前面几整段全丢
+  ctl.handleSessionEvent(cu, { type: 'assistant/message', data: { turn: 7, message: { content: [{ type: 'text', text: blockD }] } } })
+  ctl.handleSessionEvent(cu, { type: 'turn/end', data: { turn: 7, reason: { kind: 'completed' } } })
+  await new Promise((r) => setTimeout(r, 5))
+  assert.equal(sent.length, 1)
+  const summary = sent[0].summary
+  assert.ok(!summary.endsWith('…'), '整段都带上了，不该再留省略号：' + summary.slice(-24))
+  assert.ok(summary.includes(blockA), '第一个块的完整长度（远超旧 900 字）要原样进通知')
+  assert.ok(summary.includes(blockB), '第二个块不许被砍')
+  assert.ok(summary.includes(blockC), '第三个块不许被砍')
+  assert.ok(summary.includes(blockD), '后续那条消息也要拼进来（改前只取最后一段就丢在前面几段）')
+  assert.equal(summary.length, blockA.length + blockB.length + blockC.length + blockD.length + 6,
+    '整段拼接：三段之间与两段消息之间只隔一个空行（6 个字符）')
+  assert.ok(summary.length > 4000, `拼接后的整段长度该超过 4000 字，实际 ${summary.length}`)
+  // 真正超出新上限的极端长报告：只在这种情况下才截尾，且通知正文要如实标注截断
+  const overflow = watch.summarizeCompletion('戊'.repeat(watch.CU_NOTICE_RESULT_MAX_CHARS + 5000))
+  assert.equal(overflow.length, watch.CU_NOTICE_RESULT_MAX_CHARS + 1, '超出新上限才截尾')
+  const overflowNotice = watch.buildCompletionNotice({ sessionId: 'cu-long', title: '长报告', summary: overflow })
+  assert.match(overflowNotice, /按插件上限截断到 20000 字/, '截断要在通知正文里如实标注')
+  assert.match(overflowNotice, /后半段不在通知里/, '要说清后半段不在通知里（秘书得去读报告文件补）')
+  const wholeNotice = watch.buildCompletionNotice({ sessionId: 'cu-long', title: '长报告', summary: summary })
+  assert.match(wholeNotice, /完整照录/, '没被截断时正文要写「完整照录」')
+  assert.ok(!wholeNotice.includes('按插件上限截断到'), '没截断就不该带截断标注')
+}])
+
+/* ---------- 4. 通知正文（长度口径与转述口径） ---------- */
 cases.push(['通知正文：完整转述口径（撤掉「一两句」长度限制）+ 末尾可点跳引用标记', () => {
   const text = watch.buildCompletionNotice({ sessionId: 'cu-9', title: '门店详情页', summary: '白屏修好了。' })
   assert.match(text, /门店详情页/)
@@ -232,7 +278,15 @@ cases.push(['通知正文：完整转述口径（撤掉「一两句」长度限�
   const huge = watch.summarizeCompletion('字'.repeat(watch.CU_NOTICE_RESULT_MAX_CHARS + 300))
   assert.equal(huge.length, watch.CU_NOTICE_RESULT_MAX_CHARS + 1, '只有超出上限才截尾')
   assert.ok(huge.endsWith('…'), '截尾要留省略号（通知里要求照实说明）')
-  assert.equal(watch.CU_NOTICE_RESULT_MAX_CHARS, 900, '收集与通知同一长度口径（长报告不再被切开）')
+  assert.equal(watch.CU_NOTICE_RESULT_MAX_CHARS, 20000, '新的唯一长度口径（旧 900 已废弃，长报告整段落进通知）')
+  assert.ok(watch.CU_NOTICE_RESULT_MAX_CHARS > 900, '不许退回旧的 900 字口径')
+  // 一万字量级的长报告（逐条核实参考文献那种）必须整段带全
+  const longReport = watch.summarizeCompletion('字'.repeat(12000))
+  assert.equal(longReport.length, 12000, '12000 字的报告不许被截断')
+  assert.ok(!longReport.endsWith('…'), '整段带全时不许留省略号')
+  // 手动触发口那条路由必须带得下同一口径的整段报告
+  assert.ok(watch.CU_NOTIFY_ROUTE_BODY_MAX_CHARS >= 2 * watch.CU_NOTICE_RESULT_MAX_CHARS,
+    `路由 body 上限必须够装一条整段长报告：${watch.CU_NOTIFY_ROUTE_BODY_MAX_CHARS}`)
 }])
 
 /* ---------- 5. 通知投递 ---------- */

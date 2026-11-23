@@ -117,6 +117,8 @@ export function formatCuFailureLine(failure?: { kind: string; message: string; c
  * 同样只放行纯读类与目标类，措辞与硬闸必须一致，否则模型会去调工具想"核实"）。
  * 2026-11-23 用户实报：原文被截断时秘书唯一的补救办法是读报告文件，所以 read/glob/grep
  * 与 create_goal/update_goal/get_goal 在这一轮是放行的，措辞别再说成「全部禁用」。
+ * 同一轮实报第三个 bug：通知里的原文总被截断。长度口径见 CU_NOTICE_RESULT_MAX_CHARS
+ * （已从 900 放大到 20000），正文现在按「完整照录 / 按上限截断」如实标注是截断还是整段。
  * 卡片解析依赖两处：首行以「系统通知」开头（NOTICE_HEAD_LINE_RE）与末尾
  * `最后单独一行原样输出：[[session:id|title]]`（NOTICE_SESSION_REF_LINE_RE）——都不动。
  */
@@ -131,13 +133,17 @@ export function buildCompletionNotice(input: {
   const summary = String(input.summary ?? '').trim()
   const failed = input.outcome === 'failed'
   const failureLine = formatCuFailureLine(input.failure)
+  // 只有真的被上限裁过才带「截断」标注（末尾带 … 就是 summarizeCompletion 裁过的证据）
+  const truncated = summary.endsWith('…')
   return [
     '（系统通知，不是用户说的话）',
     failed
       ? `电脑操作会话「${title}」这一轮失败了${failureLine}。`
       : `电脑操作会话「${title}」这一轮已经完成。`,
     summary !== ''
-      ? `它最后一段返回原文（完整照录）：${summary}`
+      ? (truncated
+        ? `它这一轮的返回原文按顺序拼接，其中按插件上限截断到 ${CU_NOTICE_RESULT_MAX_CHARS} 字（末尾带 …，后半段不在通知里）：${summary}`
+        : `它这一轮的返回原文按顺序拼接、完整照录（整段都在这条通知里）：${summary}`)
       : (failed ? '它这一轮没有留下文字结果。' : '它没有留下文字结果。'),
     failed
       ? '向用户汇报时必须照实说是「这一轮失败／派活失败」，不许说成已完成、已落地、已派活：把上面那条错误码与错误原文完整转述（引号、路径、模型名、错误码都不许省），并告诉用户可以改派——换一条新建的 Computer Use 会话（派活失败后插件会自动改新建并如实写进回执），或换个项目目录再派一次。'
@@ -170,16 +176,27 @@ export function buildNoticeMessage(input: {
 
 /**
  * CU 结果的唯一长度口径（事件流收集与通知正文都用它）：整段能带全就全带，
- * 只有超出 900 字的那部分才截尾、末尾留「…」，由通知正文里的「照实说明截断」交给模型。
- * 取 900 是因为现网 CU 会话的完成汇报正文普遍在几百到一千字量级，600 会切开长报告；
- * 900 也与卡片历史预览上限 HISTORY_PREVIEW_MAX_CHARS 同口径，卡片折叠负责剩下的观感。
+ * 只有超出上限的那部分才截尾、末尾留「…」，由通知正文里的「照实说明截断」交给模型。
+ *
+ * 口径从 900 改成 20000（2026-11-23 修第三个 bug）：900 是当初按「现网 CU 完成汇报普遍
+ * 几百到一千字」定的，逐条核实参考文献、批量改稿那种长报告普遍上万字，900 一刀把报告切开，
+ * 秘书只能依据半截的摘录作答。宿主那条通道本身没有长度上限（`Agent.followup` →
+ * `ReactLoopInbox.splice`（dsh-agent-loop）只是插入消息，没有任何按长度的校验或裁切），
+ * 所以不需要多条通知分段送达，一条通知直接带整段即可。
+ * 卡片历史预览上限 `HISTORY_PREVIEW_MAX_CHARS`（secretary-card-shared.ts）是列表折叠时的
+ * 观感口径，与「喂给模型的这条通知带多少字」无关，不再拿它当长度依据。
  */
-export const CU_NOTICE_RESULT_MAX_CHARS = 900
+export const CU_NOTICE_RESULT_MAX_CHARS = 20000
+
+/** 手动/冒烟触发口那条路由的 body 上限：按同一长度口径给足（一条中文报告 20000 字 ≈ 60KB UTF-8）。 */
+export const CU_NOTIFY_ROUTE_BODY_MAX_CHARS = CU_NOTICE_RESULT_MAX_CHARS * 10
 
 /**
  * CU 会话完成内容：最后一段返回文本**整段照录**（换行保留，空白折叠）。
  * 旧口径是「只取首句、截到 120 字」——那是给「一两句口语汇报」配套的，
  * 2026-11-22 用户定案撤掉精简口径：通知要带得下全文，秘书才谈得上完整转述。
+ * 裁切只在这里做一次（上限 20000 字），超出才带省略号；收集端不再各自砍块。
+ * 通知正文里带「按插件上限截断」的标注，秘书看到标注就知道后半段得去读报告文件补。
  */
 export function summarizeCompletion(text: string): string {
   const clean = String(text ?? '')
@@ -219,7 +236,7 @@ export function createCuWatch(deps: CuWatchDeps) {
   const titleOf = typeof deps.titleOf === 'function'
     ? deps.titleOf
     : (session: any): string => String(session?.header?.title ?? '')
-  /** (sessionId) → turn → 收集到的文本（只在 CU 会话上收集） */
+  /** (sessionId) → turn → 收集到的整段（一条 assistant 消息 = 一段，段内多块已拼好、没砍过长度） */
   const texts = new Map<string, Map<number, string[]>>()
   /** 已汇报的 (sessionId:turn)，同一轮只报一次 */
   const reported = new Set<string>()
@@ -229,7 +246,7 @@ export function createCuWatch(deps: CuWatchDeps) {
   }
 
   return {
-    /** 测试/诊断：某会话某轮已收集的文本段数。 */
+    /** 测试/诊断：某会话某轮已收集的整段条数（一条 assistant 消息一条，段内 text 块已拼接）。 */
     collectedOf(sessionId: string, turn: number): number {
       return texts.get(sessionId)?.get(turn)?.length ?? 0
     },
@@ -253,8 +270,10 @@ export function createCuWatch(deps: CuWatchDeps) {
           for (const block of content) {
             if (block?.type !== 'text') continue
             const text = String(block?.text ?? '').trim()
-            // 与通知里带的上限同一口径：收集多宽就带多宽，不再分两套长度
-            if (text !== '') parts.push(text.slice(0, CU_NOTICE_RESULT_MAX_CHARS))
+            // 收集端不再按长度砍块（2026-11-23 修）：一条消息的 text 块整段拼起来原样存，
+            // 唯一的裁切只到汇报时做一次（summarizeCompletion 的上限口径）。
+            // 原来这里每块 slice(0, 900)，长报告在第一段就被拦腰截掉。
+            if (text !== '') parts.push(text)
           }
           if (parts.length === 0) return
           let byTurn = texts.get(sessionId)
@@ -265,7 +284,9 @@ export function createCuWatch(deps: CuWatchDeps) {
             if (typeof oldest === 'number') byTurn.delete(oldest)
           }
           const list = byTurn.get(turn) ?? []
-          byTurn.set(turn, [...list, ...parts].slice(-4))
+          // 一条 assistant 消息 = 一个整段（多块拼起来）；同一轮的段按顺序留着，最多 24 段
+          // （长报告被模型分几条消息 / max-tokens 续写成多段时，靠拼接补回，不再只取最后一段）
+          byTurn.set(turn, [...list, parts.join('\n\n')].slice(-24))
           if (texts.size > 40) {
             const oldest = texts.keys().next().value
             if (typeof oldest === 'string') texts.delete(oldest)
@@ -296,11 +317,12 @@ export function createCuWatch(deps: CuWatchDeps) {
           const oldest = reported.values().next().value
           if (typeof oldest === 'string') reported.delete(oldest)
         }
-        const lastText = collected[collected.length - 1] ?? ''
+        // 本轮的返回原文按顺序拼接（不再「只取最后一段」：长报告被分多条消息时前面几段也在）
+        const reportText = collected.join('\n\n')
         const payload: CuNoticePayload = {
           sessionId,
           title: titleOf(session),
-          summary: summarizeCompletion(lastText),
+          summary: summarizeCompletion(reportText),
           outcome: outcome ?? 'completed',
           ...(failure !== undefined ? { failure } : {}),
         }
@@ -485,7 +507,8 @@ export function registerAssistantCuWatch(ctx: any): () => void {
           let raw = ''
           for await (const chunk of req) {
             raw += String(chunk ?? '')
-            if (raw.length > 16384) { sendJson(res, 413, { ok: false, error: 'too-large' }); return }
+            // 手动触发口得带得下一条整段长报告：按通知长度口径给足（不再 16384 就把长报告判成 too-large）
+            if (raw.length > CU_NOTIFY_ROUTE_BODY_MAX_CHARS) { sendJson(res, 413, { ok: false, error: 'too-large' }); return }
           }
           let body: any = null
           try { body = JSON.parse(raw || '{}') } catch { body = null }
@@ -537,6 +560,7 @@ export const assistantCuWatchTestSurface = {
   buildCompletionNotice,
   buildNoticeMessage,
   CU_NOTICE_RESULT_MAX_CHARS,
+  CU_NOTIFY_ROUTE_BODY_MAX_CHARS,
   summarizeCompletion,
   createCuWatch,
   postSecretaryNotice,
