@@ -396,6 +396,212 @@ cases.push(['语音输入提示段：三行内语义齐全，1785 挂在派活�
   }
 }])
 
+cases.push(['引用登记段（第 4 项）：路由形状、落盘、吃掉一轮就收、通知轮不吃引用、1783 排在派活分层 1790 之前', async () => {
+  const quoteRoot = mkdtempSync(join(tmpdir(), 'assistant-secretary-quote-'))
+  const server = fakeServer()
+  const sections = []
+  const hooks = new Map()
+  const ctx = {
+    webServer: server,
+    get(name) {
+      if (name === 'profileContext') return { dir: quoteRoot }
+      if (name === 'systemPrompt') return { section(definition) { sections.push(definition); return () => {} } }
+      return undefined
+    },
+    on(name, fn) { hooks.set(name, fn); return () => { if (hooks.get(name) === fn) hooks.delete(name) } },
+  }
+  const disposeExtra = surface.registerAssistantSecretary(ctx)
+  // 先固定秘书会话：引用段只在「当前那条固定会话」上注入，state 没落定前 activeSessionId 是空串
+  const secretRoute = server.exact.get(surface.ASSISTANT_SECRETARY_ROUTE)
+  {
+    const res = fakeRes()
+    await secretRoute.handler(fakeReq('POST', JSON.stringify({ sessionId: 'session-quote-1' })), res)
+  }
+  const quoteRoute = server.exact.get(surface.ASSISTANT_SECRETARY_QUOTE_ROUTE)
+  assert.ok(quoteRoute, '没注册 /api/assistant/secretary-quote')
+  const callQuote = async (method, payload, urlSuffix = '') => {
+    const res = fakeRes()
+    const req = fakeReq(method, payload === undefined ? undefined : JSON.stringify(payload))
+    req.url = `${surface.ASSISTANT_SECRETARY_QUOTE_ROUTE}${urlSuffix}`
+    await quoteRoute.handler(req, res)
+    let json = null
+    try { json = JSON.parse(res.body) } catch { json = null }
+    return { status: res.status, json, headers: res.headers ?? null, raw: res.body }
+  }
+  const readQuoteFile = () => {
+    const raw = readFileSync(join(quoteRoot, 'dsh-assistant-secretary-quote.json'), 'utf8')
+    return JSON.parse(raw)
+  }
+  const sessionEvent = hooks.get('session/event')
+  const preStep = hooks.get('agent/pre-step')
+  assert.equal(typeof sessionEvent, 'function', '没注册 session/event')
+  assert.equal(typeof preStep, 'function', '没注册 agent/pre-step')
+  const session = { id: 'session-quote-1' }
+  try {
+    // 空会话：GET 回 quote:null（客户端拿不到引用就不许凭空造话）
+    const empty = await callQuote('GET', undefined, '?sessionId=session-quote-1')
+    assert.equal(empty.status, 200)
+    assert.equal(empty.json.quote, null, '没有引用时必须回 null')
+    assert.equal(empty.json.ttlMs, surface.QUOTE_TTL_MS)
+
+    // 标上引用
+    const marked = await callQuote('POST', {
+      sessionId: 'session-quote-1',
+      mark: 'quote',
+      cardKey: 'assistant:turn:77',
+      kind: 'assistant',
+      turnNo: '77',
+      preview: '第 4 项那条汇报正文'.repeat(80),
+      refSessionIds: ['session-cu-1', 'session-cu-1', '非法 id 带空格'],
+    })
+    assert.equal(marked.status, 200)
+    assert.equal(marked.json.ok, true)
+    assert.equal(marked.json.quote.cardKey, 'assistant:turn:77')
+    assert.equal(marked.json.quote.kind, 'assistant')
+    assert.equal(marked.json.quote.turnNo, '77')
+    assert.ok(marked.json.quote.preview.length <= surface.QUOTE_PREVIEW_MAX_CHARS, '摘录必须截到上限字符内')
+    assert.ok(marked.json.quote.preview.endsWith('…'), '截断要有省略号')
+    assert.equal(marked.json.quote.refSessionIds.length, 1, '非法 id 与重复 id 都要被判据剔掉')
+    assert.equal(marked.json.quote.refSessionIds[0], 'session-cu-1')
+
+    // 同一张卡 + 同一个 updatedAt 再标一次：unchanged 不产生新时间戳、不重复落盘（判据是 cardKey+updatedAt）
+    const again = await callQuote('POST', { sessionId: 'session-quote-1', mark: 'quote', cardKey: 'assistant:turn:77', kind: 'assistant', turnNo: '77', preview: '同一张卡', updatedAt: marked.json.quote.updatedAt })
+    assert.equal(again.json.unchanged, true, '同一张卡同一 updatedAt 重复标引用必须算 unchanged')
+    const later = await callQuote('POST', { sessionId: 'session-quote-1', mark: 'quote', cardKey: 'assistant:turn:77', kind: 'assistant', turnNo: '77', preview: '同一张卡', updatedAt: marked.json.quote.updatedAt + 1 })
+    assert.equal(later.json.unchanged, false, '同一张卡换了 updatedAt 要算新的引用（覆盖上一条）')
+    assert.equal(typeof marked.json.quote.updatedAt, 'number', '引用记录的时间戳是 epoch 毫秒')
+    // 重标一次带上引用卡里的会话 id：注入段必须把它说清
+    await callQuote('POST', { sessionId: 'session-quote-1', mark: 'quote', cardKey: 'assistant:turn:77', kind: 'assistant', turnNo: '77', preview: '第 4 项那条汇报正文', refSessionIds: ['session-cu-1'], updatedAt: marked.json.quote.updatedAt + 2 })
+
+    const stored = readQuoteFile()
+    assert.equal(stored.version, 1)
+    assert.equal(typeof stored.quoteBySession, 'object', '落盘必须按会话分组（sessionId → 引用）')
+    assert.equal(stored.quoteBySession['session-quote-1'].cardKey, 'assistant:turn:77')
+    assert.equal(typeof stored.updatedAt, 'string', '落盘文件要带更新时间戳（ISO 串）')
+
+    // GET 拿回引用
+    const fetched = await callQuote('GET', undefined, '?sessionId=session-quote-1')
+    assert.equal(fetched.json.quote.cardKey, 'assistant:turn:77')
+
+    // 提示段：只有这条会话有引用时才注入，别会话一个字都不多
+    const quoteSection = sections.find((item) => item.name === 'assistant:secretary-card-quote')
+    assert.ok(quoteSection, '没注册 assistant:secretary-card-quote 段')
+    assert.equal(quoteSection.order, 1783, `引用段必须排在语音输入(1785)之后、派活分层(1790)之前，实际 ${quoteSection.order}`)
+    assert.ok(quoteSection.order > 1700 && quoteSection.order < 1790)
+    const injected = quoteSection.text({ agent: { session } })
+    assert.ok(injected.includes('assistant:turn:77'), '注入必须带卡片定位（cardKey）')
+    assert.ok(injected.includes('kind=assistant') && injected.includes('轮次 77'), '注入要写清 kind 与轮次')
+    assert.ok(injected.includes('session-cu-1'), '注入要带那张卡引用的会话 id')
+    assert.ok(injected.includes('引用登记只说明'), '注入必须说明「引用不等于派活/不改变工具规则」')
+    assert.ok(injected.includes('不是完整汇报'), '注入要说清这只是摘录')
+    assert.equal(quoteSection.text({ agent: { session: { id: 'session-other-9' } } }), '', '别的会话不许沾到这条引用')
+    assert.equal(quoteSection.text({ agent: { session: { id: 'session-quote-1' } } }), injected)
+
+    // 通知轮（插件自己送进来的系统通知）不许吃掉引用：判据是「这条消息 id 是插件登记过的通知 id」
+    const noticeMessageId = 'notice-message-1'
+    surface.registerNoticeMessageId(noticeMessageId)
+    assert.equal(surface.isNoticeMessageId(noticeMessageId), true, '通知 id 必须登记得上（否则本轮会被当真实用户消息吃掉引用）')
+    const noticeMessage = { id: noticeMessageId, text: '（系统通知，不是用户说的话）\n\n卡片引用：无' }
+    await preStep({ agent: { session }, messages: [noticeMessage] }, async () => null)
+    sessionEvent(session, { type: 'turn/end' })
+    const afterNoticeTurn = await callQuote('GET', undefined, '?sessionId=session-quote-1')
+    assert.equal(afterNoticeTurn.json.quote !== null, true, '通知轮不许把引用收掉')
+
+    // 真实用户消息那轮：pre-step 标记吃掉 → turn/end 收掉引用
+    await preStep({ agent: { session }, messages: [{ id: 'user-message-1', text: '接着那张卡说' }] }, async () => null)
+    sessionEvent(session, { type: 'turn/end' })
+    const afterConsumed = await callQuote('GET', undefined, '?sessionId=session-quote-1')
+    assert.equal(afterConsumed.json.quote, null, '引用只能被一条真实用户消息吃掉（本轮 turn/end 收掉）')
+
+    // 清引用：mark=clear 与 DELETE 都回到 null
+    await callQuote('POST', { sessionId: 'session-quote-1', mark: 'quote', cardKey: 'user:abc', kind: 'user', turnNo: '', preview: '用户消息卡' })
+    const cleared = await callQuote('POST', { sessionId: 'session-quote-1', mark: 'clear' })
+    assert.equal(cleared.json.quote, null)
+    await callQuote('POST', { sessionId: 'session-quote-1', mark: 'quote', cardKey: 'user:def', kind: 'user', turnNo: '', preview: '再来一次' })
+    const deleted = await callQuote('DELETE', undefined, '?sessionId=session-quote-1')
+    assert.equal(deleted.status, 200)
+    assert.equal(deleted.json.cleared, true)
+    assert.equal((await callQuote('GET', undefined, '?sessionId=session-quote-1')).json.quote, null)
+
+    // 非法输入全部 400
+    const badSession = await callQuote('POST', { sessionId: '', mark: 'quote', cardKey: 'assistant:turn:1' })
+    assert.equal(badSession.status, 400)
+    assert.equal(badSession.json.error, 'invalid-session-id')
+    const badMark = await callQuote('POST', { sessionId: 'session-quote-1', mark: 'nonsense', cardKey: 'assistant:turn:1' })
+    assert.equal(badMark.status, 400)
+    assert.equal(badMark.json.error, 'invalid-mark')
+    const badKey = await callQuote('POST', { sessionId: 'session-quote-1', mark: 'quote', cardKey: '', kind: 'assistant' })
+    assert.equal(badKey.status, 400)
+    assert.equal(badKey.json.error, 'invalid-quote', '整条引用记录形状不对就一律 invalid-quote（缺 cardKey 也是这一支）')
+    const badKind = await callQuote('POST', { sessionId: 'session-quote-1', mark: 'quote', cardKey: 'assistant:turn:2', kind: '乱写' })
+    assert.equal(badKind.status, 400)
+    assert.equal(badKind.json.error, 'invalid-quote', 'kind 不在三种卡种里也判 invalid-quote')
+    const bareGet = await callQuote('GET', undefined, '')
+    assert.equal(bareGet.status, 200, '不带 sessionId 的 GET 按当前固定会话答')
+    assert.equal(bareGet.json.sessionId, 'session-quote-1')
+    const junkGet = await callQuote('GET', undefined, '?sessionId=%20bad')
+    // 查询串里塞非法字符：parseSecretaryRequestQuery 把脏部分丢掉 → 剩下「bad」当会话 id 答（宿主只认它自己那套 id 形状）
+    assert.equal(junkGet.status, 200, '脏 sessionId 解析后当成另一条会话答，不许 500')
+    assert.equal(junkGet.json.sessionId, 'bad')
+    assert.equal(junkGet.json.quote, null, '另一条会话没有引用时必须回 null（不许把当前会话的引用串给别的会话）')
+    const badPatch = await callQuote('PATCH', { sessionId: 'session-quote-1' })
+    assert.equal(badPatch.status, 405)
+    assert.equal(badPatch.headers.allow, 'GET, HEAD, POST, PUT, DELETE', '405 要带 allow 头（跟既有秘书路由同一形状）')
+    assert.equal(badPatch.raw, '', '405 不带 JSON 正文（既有秘书路由就是这么回的）')
+
+    // 没有固定会话（新 profile、从没 POST 过秘书路由）时：GET/DELETE 才回 400 invalid-session-id
+    const noStateRoot = mkdtempSync(join(tmpdir(), 'assistant-secretary-quote-nostate-'))
+    const noStateServer = fakeServer()
+    const disposeNoState = surface.registerAssistantSecretary({
+      webServer: noStateServer,
+      get(name) { return name === 'profileContext' ? { dir: noStateRoot } : undefined },
+      on() { return () => void 0 },
+    })
+    try {
+      const noStateRoute = noStateServer.exact.get(surface.ASSISTANT_SECRETARY_QUOTE_ROUTE)
+      assert.ok(noStateRoute, '没固定会话时也要注册引用路由')
+      for (const method of ['GET', 'DELETE']) {
+        const res = fakeRes()
+        const req = fakeReq(method, undefined)
+        req.url = surface.ASSISTANT_SECRETARY_QUOTE_ROUTE
+        await noStateRoute.handler(req, res)
+        const json = JSON.parse(res.body)
+        assert.equal(res.status, 400, `${method} 在没有固定会话时必须 400`)
+        assert.equal(json.error, 'invalid-session-id', `${method} 在没有固定会话时必须报 invalid-session-id`)
+      }
+      const postRes = fakeRes()
+      const postReq = fakeReq('POST', JSON.stringify({ sessionId: '', mark: 'quote', cardKey: 'assistant:turn:1', kind: 'assistant' }))
+      postReq.url = surface.ASSISTANT_SECRETARY_QUOTE_ROUTE
+      await noStateRoute.handler(postReq, postRes)
+      assert.equal(postRes.status, 400)
+      assert.equal(JSON.parse(postRes.body).error, 'invalid-session-id')
+    } finally {
+      try { disposeNoState() } catch {}
+      rmSync(noStateRoot, { recursive: true, force: true })
+    }
+
+    // TTL 与判据层（引用记录里的 updatedAt 是 epoch 毫秒，不是 ISO 串）
+    const staleAt = Date.now() - surface.QUOTE_TTL_MS - 1000
+    const old = { cardKey: 'assistant:turn:5', kind: 'assistant', turnNo: '5', preview: 'old', refSessionIds: [], updatedAt: staleAt }
+    assert.equal(surface.quoteAlive(old, Date.now()), false, '超过 TTL 的引用必须判为已失效')
+    assert.equal(surface.quoteAlive({ ...old, updatedAt: Date.now() }, Date.now()), true, '刚标的引用必须还活着')
+    assert.equal(surface.normalizeQuoteRecord({ cardKey: 'bogus' }), null, '缺 kind 的记录要整条丢（宁可不注入）')
+    assert.equal(surface.normalizeQuoteRecord({ cardKey: 'assistant:turn:5', kind: '不是卡种' }), null, 'kind 不在 assistant/user/notice 三种里的一律丢')
+    assert.equal(surface.normalizeQuoteCardKey('带 空 格'), '', 'cardKey 判据不许放过带空格的值')
+    assert.deepEqual(surface.normalizeQuoteSessionIds(['ok-1', '带 空格', 'ok-1', 'x'.repeat(121)]), ['ok-1'], '会话 id 坏值要丢、要按序去重')
+    assert.deepEqual(surface.normalizeSecretaryQuoteState({ 'session-quote-1': old }), {}, '过期记录不进内存')
+    assert.deepEqual(surface.normalizeSecretaryQuoteState({ '带 空格': { cardKey: 'assistant:turn:5', kind: 'assistant', updatedAt: Date.now() } }), {}, '坏 sessionId 不进内存')
+    assert.equal(surface.secretaryQuoteInjectionText(null), '', '没有引用时提示文本必须是空串')
+    const injectedText = surface.secretaryQuoteInjectionText({ cardKey: 'user:abc', kind: 'user', turnNo: '', preview: '用户原话', refSessionIds: ['session-cu-9'] })
+    assert.ok(injectedText.includes('kind=user') && injectedText.includes('轮次 未知'), '没有轮次的用户卡要说清轮次未知')
+    assert.ok(injectedText.includes('用户消息卡'), 'kind 要有中文标签')
+    assert.ok(injectedText.includes('session-cu-9') && injectedText.includes('secretary_dispatch kind=existing'), '引用带会话 id 时要把落项目目录的话说清')
+  } finally {
+    try { disposeExtra() } catch {}
+    rmSync(quoteRoot, { recursive: true, force: true })
+  }
+}])
+
 let failed = 0
 for (const [name, fn] of cases) {
   try {

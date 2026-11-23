@@ -4,12 +4,14 @@
  * 结构（自上而下）：
  *   1. 未读红点：只在「这条卡没被朗读过、也没被点过/复制过」时出现（8px #D83A2B，卡头顶边、标识组左侧）；
  *   2. 头部：左 32px 紫色四角星助手标识、名称「个人秘书」、身份标签「AI 助手」；右只有一个 34px 朗读按钮；
- *   3. 正文：**折叠态固定高度 = 最多 2 行卡标题 + 最多 3 行正文**（超出打「…」省略标记 + 「展开全文」入口，不用渐变遮罩）；17px 结论标题 + 15px/1.8 正文段落；
+ *   3. 正文：**折叠态固定高度 = 最多 2 行结论 + 最多 3 行详情**（超出打「…」省略标记 + 「展开全文」入口，不用渐变遮罩）；
+ *      18px/600 结论行（稍大、加粗、主文字色） + 14px/26px 详情段落（稍小、次要文字色）——2026-11-23 第 2 项需求，
+ *      只动字号与字重，「结论—细节」的**表达**顺序不动、正文一个字都不删；
  *      模型名自动渲染成浅紫等宽行内标签；会话引用渲染成可点击 chip；
  *   4. 卡体正文区域本身可点击/可键盘切换（Enter/Space）展开与收起：role=button + aria-expanded，
  *      内部那颗朗读/复制/展开全文按钮与引用 chip 都 stopPropagation，点卡体不会触发它们；
- *   5. 底部操作栏：时间（HH:MM）紧贴复制按钮左侧 → 复制 → 0.5px 分隔线 → 「展开全文」（仅溢出时）；
- *   6. 朗读按钮只出现在头部，不出现在底部。
+ *   5. 底部操作栏：**引用按钮（时间左边，与复制按钮同一套规格）→ 时间（HH:MM）紧贴复制按钮左侧 → 复制 → 0.5px 分隔线 → 「展开全文」（仅溢出时）；
+ *   6. 朗读按钮只出现在头部，不出在底部。
  *
  * TTS 状态机不变：换卡停上一条、单击暂停/继续、长按 600ms 从头重读。
  * 已读判据：这条卡被朗读过（含自动朗读，成功或被中断都算）或用户点过卡体/展开全文/复制 → 立刻写进已读集合。
@@ -18,8 +20,8 @@ import { useEffect, useRef, useState, useSyncExternalStore, type RefObject } fro
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
 import {
   answerInlineTokens, assistantCardSpeechKey, collectTurnText, foldClipFromBlocks, foldCollapsedCapPx, formatClock, latestReplyTurnNo, parseAnswerBody,
-  parseSessionRefs, stripSessionRefs, normalizeForSpeech, secretaryReadStore,
-  CARD_KIND_ASSISTANT, FOLD_BODY_LINE_BUDGET, FOLD_BLOCK_GAP, FOLD_TITLE_LINE_BUDGET, FOLD_FALLBACK_LINE_HEIGHT_PX, cardFoldStyle,
+  parseSessionRefs, stripSessionRefs, normalizeForSpeech, secretaryReadStore, secretaryQuoteStore, QUOTE_PREVIEW_MAX_CHARS,
+  CARD_KIND_ASSISTANT, CARD_KIND_NOTICE, CARD_KIND_USER, FOLD_BODY_LINE_BUDGET, FOLD_BLOCK_GAP, FOLD_TITLE_LINE_BUDGET, FOLD_FALLBACK_LINE_HEIGHT_PX, cardFoldStyle,
   type FoldBlockBox, type FoldGeometryOut,
 } from './secretary-cards.ts'
 import { secretarySpeech } from './secretary-speech.ts'
@@ -116,6 +118,102 @@ export function CopyAnswerButton({ fullText, label = '复制完整回答', onCop
   )
 }
 
+/**
+ * 引用登记状态（2026-11-23 第 4 项需求）：与已读集合同一套 store 口径——
+ * 真值在宿主 `/api/assistant/secretary-quote`（→ dsh-assistant-secretary-quote.json），
+ * localStorage 只是首屏缓存与宿主答不上时的兜底。卡片靠它决定那颗按钮的引用态与状态文字。
+ */
+export function useSecretaryQuoteState(sessionId: string): {
+  isQuoted: (cardKey: string) => boolean
+  register: (record: { cardKey: string; kind: string; turnNo?: string; preview?: string; refSessionIds?: string[] }) => boolean
+  cancel: (cardKey: string) => boolean
+} {
+  const store = secretaryQuoteStore()
+  useSyncExternalStore(store.subscribe, store.getVersion, store.getVersion)
+  useEffect(() => {
+    const id = String(sessionId ?? '')
+    if (id === '') return
+    store.setSession(id)
+    void store.hydrate()
+  }, [store, sessionId])
+  return {
+    isQuoted: (cardKey: string) => store.isQuoted(cardKey),
+    register: (record) => store.setQuote(record),
+    cancel: (cardKey: string) => store.clearQuote(cardKey),
+  }
+}
+
+/**
+ * 卡片脚部「引用」按钮（三种卡共用同一颗实现，规格与复制那棵一模一样：30×30、同一灰、同一 hover、16px 图标）。
+ * 位置由调用方决定：秘书回复卡、用户卡、通知卡都把它放在**时间左边**。
+ * 点一次 = 把这张卡登记成「下一条消息要回复的对象」（宿主引用注入段随后就把这张卡喂给秘书模型）；
+ * 再点一次 = 取消登记。卡片带 `[[session:…]]` 引用时把那条会话 id 一起登记进去。
+ */
+export function QuoteCardButton({ cardKey, kind, turnNo = '', preview = '', refSessionIds = [], onToggled }: {
+  cardKey: string
+  kind: string
+  turnNo?: string
+  preview?: string
+  refSessionIds?: string[]
+  onToggled?: (quoted: boolean) => void
+}): any {
+  const store = secretaryQuoteStore()
+  useSyncExternalStore(store.subscribe, store.getVersion, store.getVersion)
+  const [status, setStatus] = useState<'idle' | 'on' | 'off'>('idle')
+  const timerRef = useRef<number | null>(null)
+
+  useEffect(() => () => { if (timerRef.current !== null) window.clearTimeout(timerRef.current) }, [])
+
+  const show = (next: 'on' | 'off'): void => {
+    setStatus(next)
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current)
+    timerRef.current = window.setTimeout(() => setStatus('idle'), next === 'on' ? 2600 : 1500)
+  }
+
+  const quoted = store.isQuoted(cardKey)
+  const onQuote = (event: any): void => {
+    // 引用按钮不能把卡体的折叠态带下去
+    event.stopPropagation()
+    if (quoted) {
+      store.clearQuote(cardKey)
+      show('off')
+      if (typeof onToggled === 'function') onToggled(false)
+      return
+    }
+    store.setQuote({ cardKey, kind, turnNo, preview: truncateQuotePreview(preview), refSessionIds })
+    show('on')
+    if (typeof onToggled === 'function') onToggled(true)
+  }
+
+  const label = quoted ? '取消引用这条卡' : '引用这条卡：下一条消息就接着它说'
+  return (
+    <>
+      <button type="button" data-dsh-scard="quote" data-quoted={quoted ? '1' : '0'} aria-pressed={quoted} title={label} aria-label={label} onClick={onQuote}>
+        {quoted ? (
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M5 13l4 4L19 7" />
+          </svg>
+        ) : (
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M9.4 6.8C6.6 8.4 5 10.9 5 13.8c0 2 1.4 3.5 3.2 3.5 1.7 0 3-1.3 3-3 0-1.7-1.3-3-3-3" />
+            <path d="M18.6 6.8C15.8 8.4 14.2 10.9 14.2 13.8c0 2 1.4 3.5 3.2 3.5 1.7 0 3-1.3 3-3 0-1.7-1.3-3-3-3" />
+          </svg>
+        )}
+      </button>
+      {status !== 'idle' && (
+        <span data-dsh-scard="quote-status" aria-live="polite">{status === 'on' ? '已引用' : '引用已取消'}</span>
+      )}
+    </>
+  )
+}
+
+/** 引用的正文摘录只用来告诉模型「引用的是哪段话」，上限与客户端口径同一个数（QUOTE_PREVIEW_MAX_CHARS）。 */
+function truncateQuotePreview(text: string): string {
+  const raw = String(text ?? '')
+  if (raw.length <= QUOTE_PREVIEW_MAX_CHARS) return raw
+  return `${raw.slice(0, QUOTE_PREVIEW_MAX_CHARS - 1)}…`
+}
+
 /** 展开全文入口（仅溢出时渲染）：点它既切换折叠，也算「这条已读」。 */
 export function ExpandCollapseButton({ open, onToggle, overflow, collapseTitle = '收起回答' }: { open: boolean; onToggle: () => void; overflow: boolean; collapseTitle?: string }): any {
   if (!overflow) return null
@@ -135,13 +233,13 @@ export function ExpandCollapseButton({ open, onToggle, overflow, collapseTitle =
   )
 }
 
-/** 一个正文块的行高：CSS 正文 15px / 1.8 → 27px；取 computed 值，不在组件里写死数字。 */
+/** 一个正文块的行高：CSS 详情正文 14px / 26px → 26px（结论行 18px / 1.5 → 27px）；取 computed 值，不在组件里写死数字。 */
 export function blockLineHeightPx(el: HTMLElement): number {
   const cs = (typeof window !== 'undefined' ? window : el.ownerDocument?.defaultView ?? window).getComputedStyle(el)
   const lineHeight = Number.parseFloat(cs?.lineHeight ?? '')
   if (Number.isFinite(lineHeight) && lineHeight > 0) return lineHeight
-  const fontSize = Number.parseFloat(cs?.fontSize ?? '') || 15
-  return fontSize * 1.8
+  const fontSize = Number.parseFloat(cs?.fontSize ?? '') || 14
+  return Math.max(1, Math.round((fontSize * FOLD_FALLBACK_LINE_HEIGHT_PX) / 14))
 }
 
 /** 折叠几何输出直接沿用 secretary-cards.ts 的那套（避免两套定义漂移）。 */
@@ -244,7 +342,7 @@ export function useCardFoldRegion(open: boolean, overflow: boolean, toggle: () =
   const guard = (event: any): boolean => {
     // 卡体里的按钮（引用 chip）与脚部/头部按钮都不会经由卡体触发
     const target: HTMLElement | null = event?.target instanceof HTMLElement ? event.target : null
-    if (target !== null && target.closest('[data-dsh-speak="button"], [data-dsh-scard="copy"], [data-dsh-scard="expand"], [data-dsh-scard="ref"], [data-dsh-scard="head"]') !== null) return true
+    if (target !== null && target.closest('[data-dsh-speak="button"], [data-dsh-scard="copy"], [data-dsh-scard="quote"], [data-dsh-scard="expand"], [data-dsh-scard="ref"], [data-dsh-scard="head"]') !== null) return true
     return false
   }
 
@@ -339,6 +437,7 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
 
   const key = assistantCardSpeechKey(turnNo)
   const readState = useSecretaryReadState(id)
+  const quoteState = useSecretaryQuoteState(id)
   // 分页窗口：这张秘书回复卡是完整渲染还是压成一行折叠行（hooks 全部在此之前，条件 return 之后不能再有 hook）
   const windowState = useSecretaryCardWindow(key)
   const display = stripSessionRefs(body).trim()
@@ -399,6 +498,7 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
       data-open={open ? '1' : '0'}
       data-overflow={overflow ? '1' : '0'}
       data-unread={unread ? '1' : '0'}
+      data-quoted={quoteState.isQuoted(key) ? '1' : '0'}
     >
       {unread && <span data-dsh-scard="unread-dot" role="img" aria-label="未读" title="未读" />}
       <div data-dsh-scard="head">
@@ -442,6 +542,15 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
         </div>
       </div>
       <div data-dsh-scard="foot">
+        {/* 三种卡同一颗引用按钮：都放在时间左边，规格与时间右边那棵复制按钮完全一样 */}
+        <QuoteCardButton
+          cardKey={key}
+          kind={CARD_KIND_ASSISTANT}
+          turnNo={turnNo}
+          preview={display}
+          refSessionIds={refs.map((ref) => ref.sessionId)}
+          onToggled={() => { if (turnNo !== '') readState.markRead(key) }}
+        />
         <time data-dsh-scard="time">{timeText}</time>
         <div data-dsh-scard="actions">
           <CopyAnswerButton fullText={display} onCopied={() => { if (turnNo !== '') readState.markRead(key) }} />

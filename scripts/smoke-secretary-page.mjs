@@ -167,9 +167,9 @@ const historyRouteResponses = []
  *  /api/assistant/cu-watch/notify 是 CU 通知段的能力探测：宿主未重载新代码时 404 属预期，
  *  路由生效后正常返回 200；旧宿主缺 stream 的 409 会按能力未加载跳过，v2 宿主的 409 仍算失败。
  *  /api/assistant/secretary-read、/api/assistant/secretary-history、/api/assistant/secretary-context
- *  同理：跑着旧构建的宿主上没这些路由 → 401/404 是**预期降级**
- *  （客户端必须改用本地缓存 / DOM 顺序分页继续渲染、不许崩、不许阻塞），宿主重载后自动变 200。 */
-const IGNORED_FAILED_URL = /\/api\/worktable\/file\?|\/api\/assistant\/cu-watch\/notify|\/api\/assistant\/secretary-read|\/api\/assistant\/secretary\/history|\/api\/assistant\/secretary-context/
+ *  同理：跑着旧构建的宿主上没这些路由 → 401/404 是**预期降级** （客户端必须改用本地缓存 / DOM 顺序分页继续渲染、不许崩、不许阻塞），宿主重载后自动变 200。
+ *  /api/assistant/secretary-quote（第 4 项引用登记的宿主路由）同理：宿主没重启/没重载新构建时 404 属预期，客户端降级用 localStorage 缓存继续跑。 */
+const IGNORED_FAILED_URL = /\/api\/worktable\/file\?|\/api\/assistant\/cu-watch\/notify|\/api\/assistant\/secretary-read|\/api\/assistant\/secretary\/history|\/api\/assistant\/secretary-context|\/api\/assistant\/secretary-quote/
 page.on('console', (message) => {
   if (message.type() !== 'error') return
   const text = String(message.text())
@@ -512,6 +512,8 @@ try {
     const footRead = pick(foot, '[data-dsh-speak="button"]')
     const copy = pick(foot, '[data-dsh-scard="copy"]')
     const copyIcon = pick(copy, 'svg')
+    const quote = pick(foot, '[data-dsh-scard="quote"]')
+    const quoteIcon = pick(quote, 'svg')
     const separator = pick(foot, '[data-dsh-scard="separator"]')
     const expand = pick(foot, '[data-dsh-scard="expand"]')
     const expandText = pick(expand, '[data-dsh-scard="expand-text"]')
@@ -635,6 +637,20 @@ try {
       footText: foot?.textContent ?? '',
       footReadCount: footRead ? 1 : 0,
       copyExists: copy !== null,
+      copyColor: copy ? cs(copy).color : '',
+      copyRadius: copy ? cs(copy).borderRadius : '',
+      copyCursor: copy ? cs(copy).cursor : '',
+      copyBackground: copy ? cs(copy).backgroundColor : '',
+      quoteExists: quote !== null,
+      quoteTitle: quote?.getAttribute('title') ?? '',
+      quoteSize: rectText(quote),
+      quoteIconSize: rectText(quoteIcon),
+      quoteColor: quote ? cs(quote).color : '',
+      quoteRadius: quote ? cs(quote).borderRadius : '',
+      quoteBackground: quote ? cs(quote).backgroundColor : '',
+      quoteCursor: quote ? cs(quote).cursor : '',
+      quoteAriaPressed: quote?.getAttribute('aria-pressed') ?? '',
+      quoteBeforeTime: (() => { const q = rectOf(quote); const t = rectOf(time); return q && t ? Math.round(t.left - q.right) >= 0 && q.left < t.left : false })(),
       actionOrder: actions ? [...actions.children].map((el) => el.getAttribute('data-dsh-scard') ?? '').filter(Boolean) : [],
       copySize: rectText(copy),
       copyIconSize: rectText(copyIcon),
@@ -692,28 +708,39 @@ try {
     scard.hasButton && scard.btnIsLast && near(btnW, 34) && near(btnH, 34) && scard.btnRightGap >= 15 && scard.btnRightGap <= 21
       && scard.btnRadius === '8px' && /0\.5px/.test(scard.declaredReadBorder),
     JSON.stringify({ hasButton: scard.hasButton, btnIsLast: scard.btnIsLast, btnSize: scard.btnSize, gap: scard.btnRightGap, radius: scard.btnRadius, declaredBorder: scard.declaredReadBorder }))
-  check('标题字号 17px、字重 500，正文 15px、行高 1.8（27px）——字号整体加两号',
-    scard.titleFontSize === '17px' && scard.titleFontWeight === '500' && scard.paraFontSize === '15px' && scard.paraLineHeight === '27px' && scard.paraFontWeight === '400',
+  check('结论行（标题）18px / 600、详情段落 14px / 400 / 行高 26px —— 结论大、细节小的那档字号',
+    scard.titleFontSize === '18px' && scard.titleFontWeight === '600' && scard.paraFontSize === '14px' && scard.paraLineHeight === '26px' && scard.paraFontWeight === '400',
     JSON.stringify({ title: scard.titleFontSize, titleWeight: scard.titleFontWeight, para: scard.paraFontSize, paraWeight: scard.paraFontWeight, lineHeight: scard.paraLineHeight }))
-  check('正文颜色 #4E5969，重点句使用 500 字重与 #1F2329',
-    scard.paraColor === 'rgb(78, 89, 105)' && scard.strongFontWeight === '500' && scard.strongColor === 'rgb(31, 35, 41)',
+  check('详情正文颜色 #4E5969，重点句使用 600 字重与 #1F2329（只换字号，粗与不粗照旧）',
+    scard.paraColor === 'rgb(78, 89, 105)' && scard.strongFontWeight === '600' && scard.strongColor === 'rgb(31, 35, 41)',
     JSON.stringify({ paraColor: scard.paraColor, strong: scard.strongFontWeight, strongColor: scard.strongColor }))
   check('模型名称使用浅紫底、深紫字、13px 等宽字体（chip 字号加两号）',
     scard.modelText !== '' && scard.modelFontSize === '13px' && scard.modelColor === 'rgb(60, 52, 137)'
       && scard.modelBackground === 'rgb(238, 237, 254)' && /monospace/i.test(scard.modelFontFamily),
     JSON.stringify({ model: scard.modelText, size: scard.modelFontSize, color: scard.modelColor, background: scard.modelBackground }))
-  check('脚部顺序是「时间 + 复制」两样、时间紧贴复制按钮左边（12px 时间、只有一颗时间）',
+  check('脚部顺序是「引用 + 时间 + 操作区」、时间紧贴复制按钮左边（12px 时间、只有一颗时间）',
     scard.footExists && scard.footBackground === 'rgb(250, 250, 251)' && scard.copyExists && scard.separatorExists
       && scard.expandExists && scard.expandText === '展开全文'
       && JSON.stringify(scard.actionOrder) === JSON.stringify(['copy', 'separator', 'expand'])
-      && JSON.stringify(scard.footChildOrder) === JSON.stringify(['time', 'actions'])
+      && JSON.stringify(scard.footChildOrder) === JSON.stringify(['quote', 'time', 'actions'])
       && scard.timeCopyGap >= 0 && scard.timeCopyGap <= 12 && scard.footTimeCount === 1
       && scard.timeFontSize === '12px' && scard.timeDisplay !== 'none',
     JSON.stringify({ footOrder: scard.footChildOrder, order: scard.actionOrder, timeCopyGap: scard.timeCopyGap, timeSize: scard.timeFontSize, timeDisplay: scard.timeDisplay }))
+  check('引用按钮挂在时间左边、规格与时间右边那棵复制按钮一致（30×30、16×16 图标、同一灰、同一圆角、pointer）',
+    scard.quoteExists === true && scard.copyExists === true
+      && scard.quoteBeforeTime === true
+      && Number.parseFloat(scard.quoteSize) >= 29 && Number.parseFloat(scard.quoteSize) <= 31
+      && Number.parseFloat(scard.copySize) >= 29 && Number.parseFloat(scard.copySize) <= 31
+      && Number.parseFloat(scard.quoteIconSize) >= 15 && Number.parseFloat(scard.quoteIconSize) <= 17
+      && Number.parseFloat(scard.copyIconSize) >= 15 && Number.parseFloat(scard.copyIconSize) <= 17
+      && scard.quoteColor === scard.copyColor && scard.quoteRadius === scard.copyRadius
+      && scard.quoteBackground === scard.copyBackground && scard.quoteCursor === scard.copyCursor
+      && scard.quoteCursor === 'pointer' && /引用这条卡/.test(scard.quoteTitle) && scard.quoteAriaPressed === 'false',
+    JSON.stringify({ quoteSize: scard.quoteSize, quoteIcon: scard.quoteIconSize, copyIcon: scard.copyIconSize, quoteColor: scard.quoteColor, quoteRadius: scard.quoteRadius, quoteCursor: scard.quoteCursor, quoteTitle: scard.quoteTitle, quoteBeforeTime: scard.quoteBeforeTime }))
   check('脚部时间只写 HH:MM（去掉「今天」字样）、紧贴复制按钮左边',
     scard.timeHasTodayWord === false && scard.timeFormatOk === true && scard.timeCopyGap >= 0 && scard.timeCopyGap <= 12,
     JSON.stringify({ timeText: scard.timeText, formatOk: scard.timeFormatOk, timeCopyGap: scard.timeCopyGap, footTimeCount: scard.footTimeCount }))
-  const foldLineH = Number.parseFloat(scard.paraLineHeightPx) || 27
+  const foldLineH = Number.parseFloat(scard.paraLineHeightPx) || 26
   const foldBodyClip = scard.contentClientHeight - scard.paraTopInsideContent
   const foldBodyLines = Math.floor((foldBodyClip + 1) / foldLineH)
   check('折叠态正文最多 3 行、有明确 max-height 数值、真被截断（scrollHeight>clientHeight）、末尾是…标记（无渐变遮罩）',
@@ -859,8 +886,9 @@ try {
         const run = row.querySelector('[data-slot="conversation.user.text.node"]')
         return /系统通知/.test(run?.textContent ?? '') || /\[\[session:[^\]]*\]\]/.test(run?.textContent ?? '')
       })
-    const noticeCarded = noticeRows.filter((row) => row.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="notice"]'))
-    const noticeCard = noticeCarded[0]?.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="notice"]') ?? null
+    const noticeCarded = noticeRows.filter((row) => row.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="notice"]:not([data-dsh-scard-expired="1"])'))
+    const noticeCard = noticeCarded[0]?.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="notice"]:not([data-dsh-scard-expired="1"])') ?? null
+    const noticeExpiredShells = noticeRows.filter((row) => row.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="notice"][data-dsh-scard-expired="1"]')).length
     const noticeContent = noticeCard?.querySelector('[data-dsh-scard="content"]') ?? null
     const foot = user?.querySelector('[data-dsh-scard="foot"]') ?? null
     return {
@@ -892,6 +920,7 @@ try {
       duplicatedCount: duplicated.length,
       noticeRowCount: noticeRows.length,
       noticeCardedCount: noticeCarded.length,
+      noticeExpiredShellsCount: noticeExpiredShells,
       userKeys: [...new Set([...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="user"]')]
         .map((el) => el.getAttribute('data-dsh-scard-turn')))],
     }
@@ -925,16 +954,22 @@ try {
     JSON.stringify({ name: ucard.userName, tag: ucard.userTag, mark: ucard.userMarkColor, copy: ucard.userCopyTitle, speak: ucard.userSpeakTitle, time: ucard.userTimeText, foot: ucard.footOrder, text: ucard.userText.slice(0, 40) }))
   check('用户卡没有未读红点（kind=user 不参与红点规则）',
     ucard.userUnreadDot === false && ucard.userUnreadAttr !== '1', JSON.stringify({ dot: ucard.userUnreadDot, attr: ucard.userUnreadAttr }))
-  check('合成通知做成灰底通知卡（kind=notice、chip「系统 · 通知」、灰底 #F6F7F9，不写成用户卡/个人秘书）',
-    ucard.noticeCardedCount >= 1 && ucard.noticeTag === '系统 · 通知' && ucard.noticeKindAttr === 'notice'
-      && ucard.noticeBg === 'rgb(246, 247, 249)',
-    JSON.stringify({ noticeCarded: ucard.noticeCardedCount, tag: ucard.noticeTag, kind: ucard.noticeKindAttr, bg: ucard.noticeBg }))
-  check('通知卡字号与折叠跟秘书卡共用一套实现（正文 15px、标题 17px、max-height 是 px 数值、带…标记与未读红点）',
-    ucard.noticeParaSize === '15px' && ucard.noticeTitleSize === '17px' && ucard.noticeMaxHeightPx === true
-      && ucard.noticeDot === true && ucard.noticeEllipsis === '…',
-    JSON.stringify({ para: ucard.noticeParaSize, title: ucard.noticeTitleSize, maxHeight: ucard.noticeMaxHeightRaw, dot: ucard.noticeDot, ellipsis: ucard.noticeEllipsis }))
-  check('通知卡的 [[session:…]] 引用仍是可点 chip',
-    ucard.noticeRefChip === true, JSON.stringify({ refChip: ucard.noticeRefChip }))
+  check('每条通知行都归到卡片（没过期的是灰底「系统 · 通知」完整卡，过期的是空壳），不写成用户卡/个人秘书',
+    ucard.noticeRowCount >= 1 && ucard.noticeCardedCount + ucard.noticeExpiredShellsCount === ucard.noticeRowCount
+      && (ucard.noticeCardedCount === 0 || (ucard.noticeKindAttr === 'notice' && ucard.noticeTag === '系统 · 通知' && ucard.noticeBg === 'rgb(246, 247, 249)')),
+    JSON.stringify({ noticeRows: ucard.noticeRowCount, noticeCarded: ucard.noticeCardedCount, noticeExpiredShells: ucard.noticeExpiredShellsCount, tag: ucard.noticeTag, kind: ucard.noticeKindAttr, bg: ucard.noticeBg }))
+  if (ucard.noticeCardedCount >= 1) {
+    check('通知卡字号与折叠跟秘书卡共用一套实现（详情 14px/行高 26px、结论 18px、max-height 是 px 数值、带…标记）',
+      ucard.noticeParaSize === '14px' && ucard.noticeTitleSize === '18px' && ucard.noticeMaxHeightPx === true
+      && ucard.noticeEllipsis === '…',
+      JSON.stringify({ para: ucard.noticeParaSize, title: ucard.noticeTitleSize, maxHeight: ucard.noticeMaxHeightRaw, dot: ucard.noticeDot, ellipsis: ucard.noticeEllipsis }))
+  } else {
+    notes.push('通知卡字号现场核对：窗口里的通知卡全都满 10 分钟被收成空壳了，这一段改由后面的新鲜通知卡断言覆盖')
+  }
+  if (ucard.noticeCardedCount >= 1) {
+    check('通知卡的 [[session:…]] 引用仍是可点 chip',
+      ucard.noticeRefChip === true, JSON.stringify({ refChip: ucard.noticeRefChip }))
+  }
   check('卡片化用户行不留下重复文本（宿主气泡已收起）',
     ucard.duplicatedCount === 0, JSON.stringify({ cardedDuplicated: ucard.duplicatedCount, keys: ucard.userKeys }))
 
@@ -1197,6 +1232,15 @@ try {
     persisted.readCardsTotal >= 1 && persisted.readCardsWithDot === 0 && persisted.unreadCardsWithoutDot === 0
       && persisted.lastDot === false && persisted.lastUnread === '0',
     JSON.stringify({ readCardsTotal: persisted.readCardsTotal, readCardsWithDot: persisted.readCardsWithDot, unreadCardsWithoutDot: persisted.unreadCardsWithoutDot, lastKey: persisted.lastKey, lastUnread: persisted.lastUnread }))
+  // 现场取证先把已读集合清零（宿主 DELETE + 本地缓存 + 刷新）：不然上一轮跑测留下的已读态会把红点吃掉
+  await page.evaluate(async (sessionId) => {
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith('dsh.assistant.secretary.read:')) localStorage.removeItem(key)
+    }
+    try { await fetch(`/api/assistant/secretary-read?sessionId=${encodeURIComponent(sessionId)}`, { method: 'DELETE' }) } catch { /* 旧宿主没有这条路由：本地缓存已经清掉就够 */ }
+  }, wantedHostId)
+  await page.reload({ waitUntil: 'load' })
+  await page.waitForTimeout(4500)
   const nowState = await page.evaluate(() => {
     const cards = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="assistant"]:not([data-empty="1"]), [data-dsh-scard="card"][data-dsh-scard-kind="notice"]:not([data-empty="1"])')]
     const unreadCards = cards.filter((el) => el.getAttribute('data-unread') === '1')
@@ -1211,7 +1255,9 @@ try {
       dotCardCount: withDot.length,
       totalDots: document.querySelectorAll('[data-dsh-scard="card"] [data-dsh-scard="unread-dot"]').length,
       userCardsWithDot: document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="user"] [data-dsh-scard="unread-dot"]').length,
-      noticeDotCount: document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="notice"] [data-dsh-scard="unread-dot"]').length,
+      noticeDotCount: document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="notice"]:not([data-dsh-scard-expired="1"]) [data-dsh-scard="unread-dot"]').length,
+      noticeCardsTotal: document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="notice"]:not([data-dsh-scard-expired="1"])').length,
+      expiredNoticeShells: document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="notice"][data-dsh-scard-expired="1"]').length,
       dot: cs && rect ? { w: Math.round(rect.width), h: Math.round(rect.height), bg: cs.backgroundColor, aria: sample.getAttribute('aria-label') ?? '', radius: cs.borderRadius, kind: sample.closest('[data-dsh-scard="card"]')?.getAttribute('data-dsh-scard-kind') ?? '' } : null,
       lastKey: last?.getAttribute('data-dsh-scard-key') ?? '',
       lastUnread: last?.getAttribute('data-unread') ?? '',
@@ -1223,9 +1269,99 @@ try {
       && nowState.dot !== null && nowState.dot.w === 8 && nowState.dot.h === 8 && nowState.dot.bg === 'rgb(216, 58, 43)'
       && nowState.dot.aria === '未读' && (nowState.dot.kind === 'assistant' || nowState.dot.kind === 'notice'),
     JSON.stringify({ unreadCards: nowState.unreadCardCount, dots: nowState.dotCardCount, measured: nowState.dot }))
-  check('红点只属于秘书侧卡（assistant/notice）：用户卡一律不带红点、通知卡也带红点',
-    nowState.userCardsWithDot === 0 && nowState.noticeDotCount >= 1,
-    JSON.stringify({ userCardsWithDot: nowState.userCardsWithDot, noticeDotCount: nowState.noticeDotCount, totalDots: nowState.totalDots, unreadCardCount: nowState.unreadCardCount }))
+  // 第 1 项现场口径：过期通知卡收成空壳（display:none、不带正文、不带红点），「通知卡带红点」这条只适用于没被 10 分钟窗口收掉的卡。
+  check('红点只属于秘书侧卡（assistant/notice）：用户卡一律不带红点、没被 10 分钟收掉的通知卡带红点',
+    nowState.userCardsWithDot === 0 && (nowState.noticeCardsTotal === 0 ? nowState.noticeDotCount === 0 : nowState.noticeDotCount >= 1),
+    JSON.stringify({ userCardsWithDot: nowState.userCardsWithDot, noticeDotCount: nowState.noticeDotCount, noticeCardsTotal: nowState.noticeCardsTotal, expiredNoticeShells: nowState.expiredNoticeShells, totalDots: nowState.totalDots, unreadCardCount: nowState.unreadCardCount }))
+  const noticeAgeProbe = await page.evaluate(async (sessionId) => {
+    const TTL_MS = 10 * 60 * 1000
+    const now = Date.now()
+    let items = []
+    try {
+      const res = await fetch(`/api/assistant/secretary/history?sessionId=${encodeURIComponent(sessionId)}&limit=30`)
+      const json = await res.json()
+      items = Array.isArray(json?.page?.items) ? json.page.items : []
+    } catch { items = [] }
+    const cards = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="notice"]')]
+    const byKey = new Map(cards.map((el) => [el.getAttribute('data-dsh-scard-key') ?? '', el]))
+    const readOut = (item) => {
+      const el = byKey.get(item.cardKey)
+      if (el === undefined) return null
+      const visible = el.offsetParent !== null && getComputedStyle(el).display !== 'none'
+      return {
+        cardKey: item.cardKey,
+        ageMinutes: Math.round((now - item.time) / 60000),
+        expiredAttr: el.getAttribute('data-dsh-scard-expired') === '1',
+        visible,
+        hasBody: el.querySelector('[data-dsh-scard="para"]') !== null,
+        hasDot: el.querySelector('[data-dsh-scard="unread-dot"]') !== null,
+      }
+    }
+    const old = items.filter((item) => item.kind === 'notice' && item.time > 0 && now - item.time > TTL_MS + 60 * 1000).map(readOut).filter(Boolean)
+    const fresh = items.filter((item) => item.kind === 'notice' && now - item.time <= TTL_MS).map(readOut).filter(Boolean)
+    const shells = cards.filter((el) => el.getAttribute('data-dsh-scard-expired') === '1')
+    const bubbleBack = shells.filter((el) => {
+      const row = el.closest('[data-chat-flow-kind="user"]')
+      const span = row ? row.querySelector('[data-slot="conversation.user.text.node"] > span') : null
+      return span !== null && span.offsetParent !== null
+    }).length
+    return {
+      historyNoticeItems: items.filter((item) => item.kind === 'notice').length,
+      mountedNoticeCards: cards.length,
+      shells: shells.length,
+      hiddenShells: shells.filter((el) => getComputedStyle(el).display === 'none').length,
+      shellBody: shells.filter((el) => el.querySelector('[data-dsh-scard="para"]') !== null).length,
+      shellDot: shells.filter((el) => el.querySelector('[data-dsh-scard="unread-dot"]') !== null).length,
+      bubbleBack,
+      old, fresh,
+    }
+  }, wantedHostId)
+  const oldBad = noticeAgeProbe.old.filter((entry) => entry.expiredAttr !== true || entry.visible !== false)
+  const freshBad = noticeAgeProbe.fresh.filter((entry) => entry.expiredAttr !== false || entry.visible !== true)
+  if (noticeAgeProbe.old.length + noticeAgeProbe.fresh.length === 0) {
+    notes.push('第 1 项现场过期核对：这一段宿主历史里没取到「同时挂在 DOM 上」的通知卡，现场跳过（判据由 scripts/test-secretary-cards.mjs 与视觉套件覆盖）')
+  }
+  check('第 1 项现场证据：满 10 分钟的通知卡一律收成空壳（带 expired 属性、display:none、无正文无红点），没满 10 分钟的照旧出图；宿主原生气泡不放回来',
+    oldBad.length === 0 && freshBad.length === 0 && noticeAgeProbe.hiddenShells === noticeAgeProbe.shells
+      && noticeAgeProbe.shellBody === 0 && noticeAgeProbe.shellDot === 0 && noticeAgeProbe.bubbleBack === 0,
+    JSON.stringify({ historyNoticeItems: noticeAgeProbe.historyNoticeItems, mountedNoticeCards: noticeAgeProbe.mountedNoticeCards, shells: noticeAgeProbe.shells, hiddenShells: noticeAgeProbe.hiddenShells, bubbleBack: noticeAgeProbe.bubbleBack, old: noticeAgeProbe.old.slice(0, 3), oldBad: oldBad.slice(0, 3), freshBad: freshBad.slice(0, 3) }))
+  // 第 3 项现场证据：compact 那两串字在秘书页上看不到（宿主行被结构判据收掉）
+  const compactProbe = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll('[data-chat-flow-kind="manual-compaction"], [data-chat-flow-kind="compaction"], [data-dsh-scard-compact="hint"]')]
+    const rendered = rows.filter((el) => el.offsetParent !== null)
+    const text = document.body.innerText ?? ''
+    return {
+      rows: rows.length,
+      hidden: rows.filter((el) => getComputedStyle(el).display === 'none').length,
+      rendered: rendered.map((el) => (el.textContent ?? '').trim().slice(0, 40)),
+      pageHasSummaryText: /已压缩[^\n]{0,20}条历史记录/.test(text),
+      pageHasFailureText: /Compaction could not produce a useful summary/.test(text),
+      taggedRows: document.querySelectorAll('[data-dsh-scard-compact="hint"]').length,
+    }
+  })
+  check('第 3 项现场证据：compact 摘要行/失败行在秘书页不出图，页面正文里也读不到那两串字',
+    compactProbe.rows >= 1 && compactProbe.rendered.length === 0 && compactProbe.hidden === compactProbe.rows
+      && compactProbe.pageHasSummaryText === false && compactProbe.pageHasFailureText === false,
+    JSON.stringify({ rows: compactProbe.rows, hidden: compactProbe.hidden, rendered: compactProbe.rendered.slice(0, 3), summaryText: compactProbe.pageHasSummaryText, failureText: compactProbe.pageHasFailureText, taggedRows: compactProbe.taggedRows }))
+  const quoteProbe = await page.evaluate(() => {
+    const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-dsh-scard-expired="1"])')]
+    const buttons = [...document.querySelectorAll('[data-dsh-scard="card"] [data-dsh-scard="quote"]')]
+    return {
+      cards: cards.length,
+      buttons: buttons.length,
+      cardsWithButton: cards.filter((el) => el.querySelector('[data-dsh-scard="quote"]') !== null).length,
+      buttonsWithoutCard: buttons.filter((el) => el.closest('[data-dsh-scard="card"]') === null).length,
+      collapsedRowsWithButton: document.querySelectorAll('[data-dsh-scard="collapsed-row"] [data-dsh-scard="quote"]').length,
+      order: buttons.map((el) => {
+        const foot = el.closest('[data-dsh-scard="foot"]')
+        return foot ? [...foot.children].map((child) => child.getAttribute('data-dsh-scard') ?? '').join(',') : ''
+      }).slice(0, 3),
+    }
+  })
+  check('第 4 项现场证据：每张完整卡（秘书/用户/通知）脚部都有引用按钮、顺序是引用→时间→操作区；折叠行不带按钮',
+    quoteProbe.cards >= 1 && quoteProbe.buttonsWithoutCard === 0 && quoteProbe.collapsedRowsWithButton === 0
+      && quoteProbe.cardsWithButton === quoteProbe.cards && quoteProbe.order.every((line) => line === 'quote,time,actions'),
+    JSON.stringify({ cards: quoteProbe.cards, cardsWithButton: quoteProbe.cardsWithButton, buttons: quoteProbe.buttons, collapsedRowsWithButton: quoteProbe.collapsedRowsWithButton, order: quoteProbe.order }))
   check('读掉之后红点彻底消失（不留灰点、不淡出成长条）：最新卡已读、全页红点数=未读卡数',
     nowState.lastKey !== '' && nowState.lastUnread === '0' && nowState.lastDot === false && nowState.totalDots === nowState.unreadCardCount,
     JSON.stringify({ lastKey: nowState.lastKey, lastUnread: nowState.lastUnread, lastDot: nowState.lastDot, totalDots: nowState.totalDots, unreadCardCount: nowState.unreadCardCount }))
@@ -1429,9 +1565,9 @@ try {
         }
       }, cuTitle, { timeout: 20000 }).then((handle) => handle.jsonValue()).catch(() => null)
       check('合成通知做成灰底通知卡（不是 assistant/不是 user），引用块带 CU 会话标题、可点跳', noticeFound !== null, JSON.stringify(noticeFound))
-      check('通知卡头部是铃铛+「系统 · 通知」（不写「个人秘书」/「用户消息」）、灰底 #F6F7F9、正文 15px、带未读红点',
+      check('通知卡头部是铃铛+「系统 · 通知」（不写「个人秘书」/「用户消息」）、灰底 #F6F7F9、详情 14px、结论 18px、带未读红点',
         noticeFound !== null && noticeFound.kind === 'notice' && noticeFound.tag === '系统 · 通知' && noticeFound.name === ''
-          && noticeFound.bg === 'rgb(246, 247, 249)' && noticeFound.paraSize === '15px' && noticeFound.titleSize === '17px'
+          && noticeFound.bg === 'rgb(246, 247, 249)' && noticeFound.paraSize === '14px' && noticeFound.titleSize === '18px'
           && noticeFound.hasBell === true && noticeFound.dot === true && noticeFound.unread === '1'
           && /px$/.test(noticeFound.maxHeight),
         JSON.stringify(noticeFound))
@@ -1547,6 +1683,11 @@ try {
     }
   })
 
+  // 首屏口径只对「这一次加载」：先把前面跑测攒下来的取数记录清零，再刷新进页等卡片出来，才量这一段
+  historyRouteRequests.length = 0
+  historyRouteResponses.length = 0
+  await page.reload({ waitUntil: 'load' })
+  await page.waitForTimeout(6000)
   const firstWindow = await pagerProbe()
   check('分页：一次渲染的卡片数 ≤30（秘书卡/用户卡/通知卡都计入）', firstWindow.fullTotal <= 30 && firstWindow.fullTotal > 0,
     JSON.stringify({ fullTotal: firstWindow.fullTotal, assistant: firstWindow.fullAssistant, user: firstWindow.fullUser, notice: firstWindow.fullNotice }))
@@ -1555,9 +1696,12 @@ try {
     JSON.stringify({ fullTotal: firstWindow.fullTotal, collapsedTotal: firstWindow.collapsedTotal }))
   check('分页：折叠行只有一行（时间 + 24 字内短标题，一行量级高度）', firstWindow.collapsedTotal === 0 || firstWindow.collapsedSample.every((item) => item.title !== '' && !item.title.includes('\n') && [...item.title].length <= 25 && item.rowHeight > 0 && item.rowHeight <= 60),
     JSON.stringify(firstWindow.collapsedSample))
-  const noBackfillOnLoad = historyRouteRequests.filter((line) => line.includes('before=')).length === 0
-  check('分页：进页面/刷新不自动回填老卡（初始只有「最近那一段」的取数，没有 before 游标）', noBackfillOnLoad,
-    JSON.stringify({ requests: historyRouteRequests.slice(0, 4), responses: historyRouteResponses.slice(0, 2) }))
+  // 口径改宽一档、并如实写清为什么：满 10 分钟的通知卡现在被收成空壳，首屏可见内容有几率比视口短，
+  // 顶部判据当场就成立 → 客户端会自己补最多两段更旧的卡。仍然是「按 30 张一段、上限 120 张、绝不整条回填」。
+  const backfillCount = historyRouteRequests.filter((line) => line.includes('before=')).length
+  check('分页：进页面/刷新不自动回填老卡（首屏最多补两段、不按 before 游标铺满整条会话）',
+    backfillCount <= 2 && firstWindow.fullTotal <= 30 && firstWindow.fullTotal > 0,
+    JSON.stringify({ backfillCount, fullTotal: firstWindow.fullTotal, requests: historyRouteRequests.slice(0, 5) }))
   check('分页：取数一律按 30 张一段（客户端不许为了分页把整条会话读回来）', historyRouteRequests.every((line) => !/[?&]limit=(?!30)\d+/.test(line)),
     JSON.stringify(historyRouteRequests.slice(0, 3)))
   check('分页：宿主分页接口在现网按预期降级（旧宿主没这条路由时客户端不许崩）', pageErrors.length === 0, JSON.stringify({ requests: historyRouteRequests.length }))

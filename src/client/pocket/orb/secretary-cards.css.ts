@@ -11,7 +11,7 @@
  *   - 正文：17px 标题、**15px/1.8 正文**（13→15、15→17、chip 12→13、脚部时间 11→12）、
  *     行内标签与引用 chip 13px；折叠态最多 **3 行正文**，末尾「…」省略标记（不用渐变遮罩）；
  *   - 卡体可点击展开/收起（role=button + aria-expanded，Enter/Space 同样切换）；
- *   - 底部操作栏右对齐：**时间（HH:MM）紧贴复制按钮左侧** → 复制 → 分隔线 → 展开全文；
+ *   - 底部操作栏右对齐：**引用 → 时间（HH:MM）紧贴复制按钮左侧** → 复制 → 分隔线 → 展开全文；
  *   - ≤520px：卡片 100%，脚部时间仍然显示，朗读按钮仍在右上角。
  *
  * 只对个人秘书固定会话生效：原始 markdown 气泡、过程信息行、消息操作行与空壳都被隐藏。
@@ -27,6 +27,20 @@ body[data-dsh-secretary="1"] [data-chat-flow-kind="model-retry"],
 body[data-dsh-secretary="1"] [data-chat-flow-kind="turn-error"],
 body[data-dsh-secretary="1"] [data-chat-flow-kind="turn-max-tokens"],
 body[data-dsh-secretary="1"] [data-chat-flow-kind="compaction"] {
+  display: none !important;
+}
+/* compact 提示两行（2026-11-23 用户点名要压掉的第 3 项）：
+ *  宿主编排器把「一次压缩事务」汇成一个 kind="manual-compaction" 的对话节点（宿主
+ *  src/client/conversation-nodes/command.ts + src/client/chat/CompactionCommandCard.tsx），
+ *  那一行的正文来自 i18n：message.compaction.commandTitle="compact" 加
+ *  message.compaction.completed="已压缩 {items} 条历史记录（约 {tokens} tokens）"；
+ *  失败分支走 GenericCommandCard 的 outcome 文本（"Compaction could not produce a useful summary. …"）。
+ *  上面那条已有的规则只压 kind="compaction"（独立摘要行），**漏了 kind="manual-compaction"**——
+ *  这一条把它补上；再兜两条：带宿主自己的压缩标记属性（data-compaction-icon）的宿主行、以及扫描层按文字判据
+ *  标上 data-dsh-scard-compact="hint" 的行，一并不出图。判据只在秘书页生效，别的会话一个字都不动。 */
+body[data-dsh-secretary="1"] [data-chat-flow-kind="manual-compaction"],
+body[data-dsh-secretary="1"] [data-dsh-scard-compact="hint"],
+body[data-dsh-secretary="1"] [data-chat-flow-kind]:has(> [data-slot="conversation.chat.node"] [data-compaction-icon]) {
   display: none !important;
 }
 /* 消息下方原生操作行（复制/赞/踩/分享/记忆/时间，宿主 MessageIconActions 根节点带 data-clock）：
@@ -237,15 +251,16 @@ body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard=
 }
 /* 折叠态固定高度（2026-11-22 修「长卡整段平铺」）：
    1) 卡标题先被行夹裁到 2 行 —— 现网实测旧口径把整段首段（230–255px）全部露出，折叠 max-height 涨到 321–346px；
-   2) 正文区有一条**首帧就生效**的上限（标题 2 行 51px + 间距 10px + 正文 3 行 81px + 两个块间距 20px = 162px，
+   2) 正文区有一条**首帧就生效**的上限（结论 2 行 54px + 间距 10px + 详情 3 行 78px + 两个块间距 20px = 162px，
       与 foldCollapsedCapPx 同一个数），JS 量完落点后写进行内样式覆盖它；没溢出就写 maxHeight:none 显式放开。
-      这条兜底专门治「测量发生在布局稳定前」的现网时序：卡片刚挂载那一帧不再整段平铺。 */
+      这条兜底专门治「测量发生在布局稳定前」的现网时序：卡片刚挂载那一帧不再整段平铺。
+      2026-11-23 字号改档（结论 18px/1.5、详情 14px/26px）后总量仍是 162px，只是构成从 51+81 变成 54+78。 */
 [data-dsh-scard="card"]:not([data-open="1"]) [data-dsh-scard="title"] {
   display: -webkit-box;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   line-clamp: 2;
-  max-height: calc(1.5em * 2); /* 标题 17px / 1.5 → 两行 51px；按行高算，不看字符数 */
+  max-height: calc(1.5em * 2); /* 结论 18px / 1.5 → 两行 54px；按行高算，不看字符数 */
   overflow: hidden;
 }
 [data-dsh-scard="card"]:not([data-open="1"]) [data-dsh-scard="content"] {
@@ -262,36 +277,41 @@ body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard=
   max-height: none !important;
   overflow: visible;
 }
-/* 折叠态被切掉的行：末尾打「…」省略标记（不是渐变遮罩，背景跟卡面同色盖住残字） */
+/* 折叠态被切掉的行：末尾打「…」省略标记（不是渐变遮罩，背景跟卡面同色盖住残字）
+ * 行箱跟正文同一档字号（14px / 26px），量出来才对得上 foldClipFromBlocks 的落点。 */
 [data-dsh-scard="ellipsis"] {
   position: absolute;
   right: 0;
   bottom: 0;
   padding: 0 4px 0 6px;
-  font-size: 15px;
-  line-height: 27px;
+  font-size: 14px;
+  line-height: 26px;
   color: var(--dsh-card-text-muted);
   background: var(--dsh-card-surface);
   pointer-events: none;
 }
+/* 结论—细节的字级分工（2026-11-23 第 2 项需求，纯视觉层）：
+ *   结论 = 卡标题那一行 → 稍大一号、加粗、主文字色（18px / 600 / 行高 27px）；
+ *   细节 = 正文段落 → 稍小一号、次要文字色（14px / 400 / 行高 26px）；
+ * 「展开全文」点开以后正文全在，一个字都不少（这条改动只动字号，不许删信息）。 */
 body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [data-dsh-scard="title"] {
   margin: 0;
-  font-size: 17px !important;
-  font-weight: 500 !important;
+  font-size: 18px !important;
+  font-weight: 600 !important;
   line-height: 1.5 !important;
   color: var(--dsh-card-text) !important;
 }
 body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [data-dsh-scard="para"] {
   margin: 0;
-  font-size: 15px !important;
+  font-size: 14px !important;
   font-weight: 400 !important;
-  line-height: 1.8 !important;
+  line-height: 26px !important;
   color: var(--dsh-card-text-soft) !important;
   white-space: pre-wrap;
   word-break: break-word;
 }
 body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [data-dsh-scard="para"] strong {
-  font-weight: 500 !important;
+  font-weight: 600 !important;
   color: var(--dsh-card-text) !important;
 }
 body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [data-dsh-scard="model-code"] {
@@ -378,6 +398,47 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   line-height: 16px;
   color: var(--dsh-card-text-muted);
   white-space: nowrap;
+}
+/* 引用按钮（第 4 项需求）：脚部**时间左边**那颗，规格与时间右边那棵复制按钮一模一样
+ * （30×30、同一灰 var(--dsh-card-text-muted)、同一 hover、同一 8px 圆角、同一 16px 图标），
+ * 只是图标换成引号形。点下去 = 把这张卡登记成「下一条消息要回复的对象」；
+ * 登记态换成打勾图标（accent 色）+ 旁边一句状态文字，反馈口径与复制那棵一致。 */
+[data-dsh-scard="quote"] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: var(--dsh-card-text-muted);
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+[data-dsh-scard="quote"]:hover {
+  color: var(--dsh-card-text);
+  background: var(--dsh-card-surface);
+}
+[data-dsh-scard="quote"][data-quoted="1"] {
+  color: var(--dsh-card-accent);
+}
+[data-dsh-scard="quote-status"] {
+  flex: 0 0 auto;
+  min-width: 0;
+  max-width: 132px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--dsh-card-text-muted);
+}
+/* 过期自动消失的通知卡：外壳仍然要挂在那里（它撑着「宿主气泡不许冒回来」的那条 :has 判据），
+ * 但盒子不输出——与上面那条 data-empty="1" 的空壳规则同一个效果。 */
+[data-dsh-scard="card"][data-dsh-scard-expired="1"] {
+  display: none !important;
 }
 [data-dsh-scard="separator"] {
   flex: none;

@@ -24,6 +24,12 @@
  *      后停在「更早的内容请到轨迹/搜索里看」。取数走宿主 `GET /api/assistant/secretary/history`，
  *      客户端绝不为分页把整条会话读回来（见 createSecretaryPager）。卡计数口径、24 字标题口径、
  *      词数口径都在 src/secretary-card-shared.ts，宿主与客户端共用。
+ *   9. 通知卡过期（2026-11-23 第 1 项）：「系统 · 通知」那张卡从发送到消失只存在 10 分钟
+ *      （NOTICE_CARD_TTL_MS + noticeExpiryFromClock：只看卡片自己那份宿主时钟文本，
+ *      过期只在渲染层收掉，绝不删宿主会话里的消息）。
+ *  10. compact 提示抑制（2026-11-23 第 3 项）：按已核实的宿主来源压掉那两行文本，见下。
+ *  11. 引用登记（2026-11-23 第 4 项）：createSecretaryQuoteStore 与宿主 `/api/assistant/secretary-quote`
+ *      同一套口径（真值在宿主、localStorage 兜底），供卡片脚部那颗「引用」按钮使用。
  */
 
 import {
@@ -702,12 +708,14 @@ export const CARD_KIND_NOTICE = 'notice'
  * （offsetTop / offsetHeight / scrollHeight），不在任何地方按字符数算，字号或行高变了也稳。
  */
 export const FOLD_BODY_LINE_BUDGET = 3
-/** 折叠态卡标题最多几行（超出被行夹裁掉，展开态整段放开）。 */
+/** 折叠态卡标题最多几行（超出被行夹裁掉，展开态整段放开）。
+ *  卡标题就是这条的「结论」行（18px 加粗稍大），正文段落是「详情」（14px 稍小）——
+ *  2026-11-23 第 2 项需求只改字号档，折叠口径、行数预算、展开全文入口都不动，正文一个字也不少。 */
 export const FOLD_TITLE_LINE_BUDGET = 2
 /** 卡片内正文块之间的距离（与 CSS 的 content gap 一致）。 */
 export const FOLD_BLOCK_GAP = 10
-/** 行高量不出来时的兜底行高（正文 15px / 1.8 = 27px）：量不到也必须折叠，绝不留下平铺状态。 */
-export const FOLD_FALLBACK_LINE_HEIGHT_PX = 27
+/** 行高量不出来时的兜底行高（详情正文 14px / 26px 行）：量不到也必须折叠，绝不留下平铺状态。 */
+export const FOLD_FALLBACK_LINE_HEIGHT_PX = 26
 
 /** 一个正文块在卡片正文里的位置（offsetTop）与高度（offsetHeight）——浏览器量的，纯函数只管算术。 */
 export interface FoldBlockBox {
@@ -734,7 +742,9 @@ export interface FoldGeometryOut {
  * 折叠态固定上限（纯算术，CSS 兜底与测试都引用这一个数）：
  *   有标题：`titleBudget * 标题行高 + gap + budget * 正文行高 + gap * (budget - 1)`
  *   没标题（用户卡只有段落）：`budget * 正文行高 + gap * (budget - 1)`
- * 现网标准字号（标题 17px/1.5、正文 15px/1.8）→ 51 + 10 + 81 + 20 = **162px**。
+ * 现网标准字号（结论 18px/1.5 两行、详情 14px/26px 三行）→ 54 + 10 + 78 + 20 = **162px**。
+ * 2026-11-23 改字号档之后总量不变（旧的 51 + 10 + 81 + 20 也是 162），只是构成从「17px 标题 + 15px 正文」
+ * 换成「18px 加粗结论 + 14px 详情」——折叠口径本身一个字没动。
  */
 export function foldCollapsedCapPx(input: {
   lineHeight: number
@@ -954,7 +964,11 @@ const CARD_KEY_RE = /^[A-Za-z0-9:._#-]{1,200}$/
  * 首帧就把窗口算全，避免「先渲染 137 张完整卡、400ms 后才压成折叠行」的 DOM 抖动。
  */
 export function buildSecretaryPagerCards(doc: Document): PagerDomCard[] {
-  const rows = collectSecretaryCardRows(doc).map((row) => ({
+  const now = Date.now()
+  // 过了 10 分钟的通知卡不再计入窗口：它已经收成空壳，不该占一个卡位、也不该被折叠行还原出来
+  const rows = collectSecretaryCardRows(doc)
+    .filter((row) => !noticeCardExpired(row, now))
+    .map((row) => ({
     cardKey: row.kind === CARD_KIND_NOTICE ? noticeCardSpeechKey(row.key, row.turnNo) : userCardSpeechKey(row.key, row.turnNo),
     kind: row.kind,
     turnNo: row.turnNo,
@@ -1458,6 +1472,356 @@ export function secretaryPager(): SecretaryPagerStore {
   return cardPager
 }
 
+/* ───────── 9. 通知卡 10 分钟自动消失（2026-11-23 第 1 项需求） ─────────
+ *
+ * 需求：CU 会话进度那类「系统 · 通知」卡从发送到消失只存在 10 分钟，其余过程性消息别留在页面上。
+ * 实现口径（**绝不动宿主会话数据**）：
+ *   - 时间只从卡片自己那份宿主时钟文本算（`[data-clock]` → 「今天 9:08」/「9:08」/「11月22日 9:08」），
+ *     不新建状态文件、不读会话日志、不删任何消息：过期只在**渲染层**收掉这张卡；
+ *   - 过期卡换成一张空壳卡（data-dsh-scard-expired）——空壳仍然挂在宿主那条用户行上，
+ *     靠上面那条 `:has(> [data-dsh-scard="card"][data-dsh-scard-kind="notice"])` 判据把宿主气泡压住，
+     原文永远冒不出来；
+ *   - 分钟粒度的时钟只能估：过期时刻按「那一分钟的最后 + 10 分钟」算，宁可晚一分钟消失，也绝不提前一秒。
+ */
+
+/** 通知卡从发送到消失只存在这么久。 */
+export const NOTICE_CARD_TTL_MS = 10 * 60 * 1000
+/** 宿主时钟只给到分钟：一分钟的长度（兜底算过期时点用）。 */
+export const NOTICE_CLOCK_MINUTE_MS = 60 * 1000
+/** 带日期的时间文本（宿主机场日历口径：昨天/前天、M月D日、YYYY-MM-DD）——这种一定早于 10 分钟。 */
+const CLOCK_DATED_RE = /(昨天|前天|上周|[01]?\d月[0-3]?\d日|\d{4}[-/.]\d{1,2}[-/.]\d{1,2})/
+/** 「今天 9:08」/「9:08」两种同一天的时间文本。 */
+const CLOCK_TODAY_RE = /^(今天\s+)?([01]?[0-9]|2[0-3]):([0-5][0-9])$/
+
+export interface NoticeExpiry {
+  /** 这条通知的发送时刻（epoch ms，按分钟起点估）；认不出时间就是 null。 */
+  sentAt: number | null
+  /** 过期时刻（epoch ms）：分钟末 + TTL；认不出时间就是 null。 */
+  expiresAt: number | null
+  /** 现在这张通知卡该不该收掉。 */
+  expired: boolean
+  /** 判据来源，测试逐条断言：同一天的钟面 / 带日期的钟面 / 认不出时间。 */
+  reason: 'same-day' | 'dated-label' | 'unknown-time'
+}
+
+/**
+ * 通知卡过期判据（纯函数，node 直接测）：
+ *   - 「9:08」「今天 9:08」→ 按今天的这一分钟算：过期时点 = 分钟起点 + 59.999s + TTL（宁可晚，不提前）；
+ *   - 「昨天 9:08」「11月22日 9:08」这类带日期的 → 必然超过 10 分钟 → 过期；
+ *   - 认不出时间 → 不过期（保守：没有证据就不许把消息收掉）。
+ */
+export function noticeExpiryFromClock(clockText: unknown, now = Date.now(), ttlMs = NOTICE_CARD_TTL_MS): NoticeExpiry {
+  const raw = String(clockText ?? '').replace(/\s+/g, ' ').trim()
+  if (raw === '') return { sentAt: null, expiresAt: null, expired: false, reason: 'unknown-time' }
+  const day = new Date(now)
+  const today = raw.match(CLOCK_TODAY_RE)
+  if (today !== null) {
+    const startMs = new Date(day.getFullYear(), day.getMonth(), day.getDate(), Number(today[2]), Number(today[3]), 0, 0).getTime()
+    // 钟面指到明天（跨午夜、或宿主时钟与本地时钟偏差）：这一分钟不可能还在 10 分钟窗口里之前
+    const minuteStart = Number.isFinite(startMs) && startMs <= now ? startMs : now
+    const expiresAt = minuteStart + NOTICE_CLOCK_MINUTE_MS - 1 + ttlMs
+    return { sentAt: minuteStart, expiresAt, expired: now >= expiresAt, reason: 'same-day' }
+  }
+  if (CLOCK_DATED_RE.test(raw)) return { sentAt: null, expiresAt: null, expired: true, reason: 'dated-label' }
+  return { sentAt: null, expiresAt: null, expired: false, reason: 'unknown-time' }
+}
+
+/** 一批通知卡里最近的那个过期时点（没有待过期的一定通知 → null）。挂载层靠它自己排一次定时器。 */
+export function nearestNoticeExpiryMs(rows: readonly { kind: string; clockText: string }[], now = Date.now(), ttlMs = NOTICE_CARD_TTL_MS): number | null {
+  let nearest: number | null = null
+  for (const row of rows) {
+    if (row.kind !== CARD_KIND_NOTICE) continue
+    const expiry = noticeExpiryFromClock(row.clockText, now, ttlMs)
+    if (expiry.expiresAt === null || expiry.expired) continue
+    if (nearest === null || expiry.expiresAt < nearest) nearest = expiry.expiresAt
+  }
+  return nearest
+}
+
+/** 这张通知卡现在是不是已经过了 10 分钟（用户卡与回复卡永远 false）。 */
+export function noticeCardExpired(row: { kind: string; clockText: string }, now = Date.now(), ttlMs = NOTICE_CARD_TTL_MS): boolean {
+  if (row.kind !== CARD_KIND_NOTICE) return false
+  return noticeExpiryFromClock(row.clockText, now, ttlMs).expired
+}
+
+/* ───────── 10. compact 提示两行文本（2026-11-23 第 3 项需求） ─────────
+ *
+ * 来源核实（宿主 app.asar，只读扫描取证）：
+ *   - 宿主编排器 `src/client/conversation-nodes/command.ts`：带 `source.kind:"compact-checkpoint"` 的
+ *     替换检查点 + `compaction/start|summary|end` 生命周期 → 汇成一个 `manual-compaction` 对话节点；
+ *   - `src/client/chat/CompactionCommandCard.tsx` 渲染那一行，正文来自 i18n：
+ *     `message.compaction.commandTitle = "compact"`、
+ *     `message.compaction.completed = "已压缩 {items} 条历史记录（约 {tokens} tokens）"`；
+ *   - 失败分支走 `GenericCommandCard` 的 outcome 文本：`Compaction could not produce a useful summary.`
+ *   插件 CSS 早先只压 `kind="compaction"`，**漏了 `kind="manual-compaction"`**——补上；
+ *   再兜一层：按下面这两条文字判据给宿直行打标记（CSS 一并压掉）。只作用于秘书页 body[data-dsh-secretary="1"]。
+ */
+
+/** 判据 ①：compact 那行摘要（中文与英文 i18n 两种写法都认）。 */
+export const COMPACT_SUMMARY_HINT_RE = /compact[^\n]{0,40}(?:已压缩[^\n]{0,40}条历史记录|Compacted[^\n]{0,40}history items)/i
+/** 判据 ②：compact 失败提示正文（宿主后端英文串）。 */
+export const COMPACT_FAILURE_HINT_RE = /Compaction could not produce a useful summary/i
+/** 打在宿主行上的标记（CSS 里有一条同款隐藏规则，测试直接验这个属性）。 */
+export const COMPACT_HINT_ATTRIBUTE = 'data-dsh-scard-compact'
+
+/** 这行文字是不是那两类 compact 提示。 */
+export function isCompactHintText(text: unknown): boolean {
+  const raw = String(text ?? '')
+  return COMPACT_SUMMARY_HINT_RE.test(raw) || COMPACT_FAILURE_HINT_RE.test(raw)
+}
+
+/**
+ * 扫描层标记：只给「宿主自己那些行」打 compact 标记，我们自己挂出来的卡（带 data-dsh-scard="card"）
+ * 一律不碰——防止把卡片正文里恰好出现「已压缩 N 条历史记录」的字样误压掉。返回打标行数。
+ */
+export function tagSecretaryCompactHintRows(doc: Document): { kindRows: number; textRows: number } {
+  let kindRows = 0
+  let textRows = 0
+  for (const row of doc.querySelectorAll('[data-chat-flow-kind]')) {
+    if (row.querySelector('[data-dsh-scard="card"]') !== null) continue
+    const kind = String(row.getAttribute('data-chat-flow-kind') ?? '')
+    const compactKind = kind === 'compaction' || kind === 'manual-compaction'
+    if (compactKind) {
+      row.setAttribute(COMPACT_HINT_ATTRIBUTE, 'hint')
+      kindRows += 1
+      continue
+    }
+    if (isCompactHintText(row.textContent)) {
+      row.setAttribute(COMPACT_HINT_ATTRIBUTE, 'hint')
+      textRows += 1
+    }
+  }
+  return { kindRows, textRows }
+}
+
+/** 清掉自己打过的标记（离开秘书页 / 测试复位用）。 */
+export function clearSecretaryCompactHintRows(doc: Document): number {
+  let cleared = 0
+  for (const row of doc.querySelectorAll(`[data-chat-flow-kind][${COMPACT_HINT_ATTRIBUTE}]`)) {
+    row.removeAttribute(COMPACT_HINT_ATTRIBUTE)
+    cleared += 1
+  }
+  return cleared
+}
+
+/* ───────── 11. 引用（2026-11-23 第 4 项需求）：下一条消息挂到这张卡上 ─────────
+ *
+ * 客户端口径（真值在宿主 `/api/assistant/secretary-quote` → dsh-assistant-secretary-quote.json，
+ * localStorage 只是首屏缓存与降级兜底，和已读集合那一套一模一样）：
+ *   - 卡片脚部时间左边那颗「引用」按钮 → setQuote(cardKey)；再点一次 = 取消；
+ *   - 宿主那一侧由 src/assistant-secretary.ts 的引用注入段（order 1783）把这张卡的
+ *     种类 / 轮次 / 正文摘录 / `[[session:…]]` 里的会话 id 喂给秘书模型，
+ *     并在这条引用被真实用户消息吃掉之后（turn/end）清掉。
+ */
+
+/** 宿主侧引用路由（服务端 src/assistant-secretary.ts 注册同一字符串）。 */
+export const ASSISTANT_SECRETARY_QUOTE_ROUTE = '/api/assistant/secretary-quote'
+/** 本地缓存键前缀（真值仍在宿主，localStorage 只是宿主答不上时的降级缓存）。 */
+export const QUOTE_STORAGE_PREFIX = 'dsh.assistant.secretary.quote:'
+/** 一条引用最多活多久（用户点了引用但一直没发消息时，别把它无限挂着）。 */
+export const QUOTE_TTL_MS = 30 * 60 * 1000
+/** 引用里正文摘录上限（只用于告诉模型「引用的是哪段话」，不是完整汇报口径）。 */
+export const QUOTE_PREVIEW_MAX_CHARS = 600
+
+export interface SecretaryQuoteRecord {
+  /** 卡片 key（沿用已读/朗读那套 cardKey 口径：assistant: / user: / notice: 前缀）。 */
+  cardKey: string
+  /** 卡片种类：assistant / user / notice。 */
+  kind: string
+  /** 该卡所属轮次（回复卡靠它定位）。 */
+  turnNo: string
+  /** 卡片正文摘录（喂给模型，最多 QUOTE_PREVIEW_MAX_CHARS）。 */
+  preview: string
+  /** 卡片带 `[[session:id|标题]]` 时被引用的那条会话。 */
+  refSessionIds: string[]
+  /** 本地写入时刻（epoch ms），客户端算 TTL 用。 */
+  updatedAt: number
+}
+
+/** 引用里的会话 id 形状（与服务端 normalizeQuoteSessionIds 同一口径：只认宿主那种 id 形状）。 */
+const QUOTE_SESSION_ID_RE = /^[A-Za-z0-9._:-]{1,120}$/
+
+/** 归一引用里的会话 id 列表：坏值丢、按序去重、最多 8 条。 */
+export function normalizeQuoteSessionIds(raw: unknown): string[] {
+  const list = Array.isArray(raw) ? raw : []
+  const out: string[] = []
+  for (const item of list) {
+    const id = String(item ?? '').trim()
+    if (id === '' || !QUOTE_SESSION_ID_RE.test(id) || out.includes(id)) continue
+    out.push(id)
+    if (out.length >= 8) break
+  }
+  return out
+}
+
+/** 归一宿主/缓存送来的引用记录；形状不对就整条丢掉（宁可不注入也不乱注入）。 */
+export function normalizeQuoteRecord(raw: unknown, now = Date.now()): SecretaryQuoteRecord | null {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : null
+  if (source === null) return null
+  const cardKey = normalizeCardKey(source.cardKey)
+  const kind = String(source.kind ?? '').trim()
+  if (cardKey === '' || (kind !== CARD_KIND_ASSISTANT && kind !== CARD_KIND_USER && kind !== CARD_KIND_NOTICE)) return null
+  const previewRaw = String(source.preview ?? '')
+  const preview = previewRaw.length > QUOTE_PREVIEW_MAX_CHARS ? `${previewRaw.slice(0, QUOTE_PREVIEW_MAX_CHARS - 1)}…` : previewRaw
+  const updatedAtRaw = Number(source.updatedAt)
+  const updatedAt = Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? updatedAtRaw : now
+  return {
+    cardKey,
+    kind,
+    turnNo: String(source.turnNo ?? '').trim(),
+    preview,
+    refSessionIds: normalizeQuoteSessionIds(source.refSessionIds),
+    updatedAt,
+  }
+}
+
+/** 这条引用还在不在（TTL 口径，纯算术）。 */
+export function quoteAlive(record: SecretaryQuoteRecord | null, now = Date.now(), ttlMs = QUOTE_TTL_MS): boolean {
+  if (record === null) return false
+  return now - record.updatedAt <= ttlMs
+}
+
+export interface SecretaryQuoteDeps {
+  /** 浏览器里是 window.fetch；单测里是假实现。缺 → 按「宿主答不上」降级。 */
+  fetchImpl?: (url: string, init?: any) => Promise<any>
+  /** 本地兜底缓存（宿主答不上时还能立刻知道引用着哪张卡）；缺 → 只用心跳集合。 */
+  storage?: { getItem(key: string): string | null; setItem(key: string, value: string): void } | null
+}
+
+export interface SecretaryQuoteStore {
+  session(): string
+  setSession(sessionId: string): void
+  active(): SecretaryQuoteRecord | null
+  isQuoted(cardKey: string): boolean
+  /** 登记引用：立刻本地生效（按钮当场变成引用态），再写缓存 + 落宿主；宿主失败不阻塞。 */
+  setQuote(record: { cardKey: string; kind: string; turnNo?: string; preview?: string; refSessionIds?: string[] }): boolean
+  /** 取消引用（cardKey 不匹配当前引用时什么都不动）。 */
+  clearQuote(cardKey?: string): boolean
+  hydrate(): Promise<{ ok: boolean; hostOk: boolean; active: boolean }>
+  subscribe(listener: () => void): () => void
+  getVersion(): number
+}
+
+export function createSecretaryQuoteStore(deps: SecretaryQuoteDeps = {}): SecretaryQuoteStore {
+  const listeners = new Set<() => void>()
+  const storage = deps.storage ?? null
+  const storageKey = QUOTE_STORAGE_PREFIX
+  let session = ''
+  let version = 0
+  let active: SecretaryQuoteRecord | null = null
+  let hostBroken = false
+  let hydrateCall: Promise<{ ok: boolean; hostOk: boolean; active: boolean }> | null = null
+
+  const emit = (): void => { for (const listener of [...listeners]) { try { listener() } catch { /* 单个订阅者出错不影响别的 */ } } }
+  const bump = (): void => { version += 1; emit() }
+
+  const readCache = (): SecretaryQuoteRecord | null => {
+    if (storage === null || session === '') return null
+    try { return normalizeQuoteRecord(JSON.parse(String(storage.getItem(`${storageKey}${session}`) ?? 'null'))) } catch { return null }
+  }
+  const writeCache = (record: SecretaryQuoteRecord | null): void => {
+    if (storage === null || session === '') return
+    try { storage.setItem(`${storageKey}${session}`, JSON.stringify(record)) } catch { /* 缓存写不进去不影响引用 */ }
+  }
+
+  const apply = (record: SecretaryQuoteRecord | null, persistHost: boolean): void => {
+    active = record
+    writeCache(record)
+    bump()
+    if (persistHost) void postQuote(record)
+  }
+
+  const postQuote = (record: SecretaryQuoteRecord | null): Promise<void> => {
+    const fetchImpl = deps.fetchImpl
+    if (hostBroken || session === '' || typeof fetchImpl !== 'function') return Promise.resolve()
+    const body = record === null
+      ? { sessionId: session, mark: 'clear' }
+      : { sessionId: session, mark: 'quote', ...record }
+    return fetchImpl(ASSISTANT_SECRETARY_QUOTE_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(() => void 0, () => { hostBroken = true })
+  }
+
+  return {
+    session(): string { return session },
+    setSession(sessionId: string): void {
+      const id = String(sessionId ?? '')
+      if (id === session) return
+      session = id
+      active = readCache()
+      bump()
+    },
+    active(): SecretaryQuoteRecord | null { return quoteAlive(active) ? active : null },
+    isQuoted(cardKey: string): boolean {
+      const current = quoteAlive(active) ? active : null
+      return current !== null && current.cardKey === normalizeCardKey(cardKey)
+    },
+    setQuote(record: { cardKey: string; kind: string; turnNo?: string; refSessionIds?: string[], preview?: string }): boolean {
+      const next = normalizeQuoteRecord({
+        cardKey: record.cardKey,
+        kind: record.kind,
+        turnNo: record.turnNo ?? '',
+        preview: record.preview ?? '',
+        refSessionIds: record.refSessionIds ?? [],
+        updatedAt: Date.now(),
+      })
+      if (next === null) return false
+      if (active !== null && active.cardKey === next.cardKey) return false
+      apply(next, true)
+      return true
+    },
+    clearQuote(cardKey?: string): boolean {
+      const key = normalizeCardKey(cardKey)
+      if (active === null) return false
+      if (key !== '' && active.cardKey !== key) return false
+      apply(null, true)
+      return true
+    },
+    hydrate(): Promise<{ ok: boolean; hostOk: boolean; active: boolean }> {
+      if (hydrateCall !== null) return hydrateCall
+      hydrateCall = (async (): Promise<{ ok: boolean; hostOk: boolean; active: boolean }> => {
+        const cached = readCache()
+        if (cached !== null && active === null) { active = cached; bump() }
+        const fetchImpl = deps.fetchImpl
+        if (hostBroken || session === '' || typeof fetchImpl !== 'function') {
+          return { ok: true, hostOk: false, active: quoteAlive(active) }
+        }
+        try {
+          const res = await fetchImpl(`${ASSISTANT_SECRETARY_QUOTE_ROUTE}?sessionId=${encodeURIComponent(session)}`, { cache: 'no-store' })
+          if (res?.ok !== true) { hostBroken = true; return { ok: true, hostOk: false, active: quoteAlive(active) } }
+          const payload = await res.json()
+          if ((payload as any)?.ok !== true) { hostBroken = true; return { ok: true, hostOk: false, active: quoteAlive(active) } }
+          const fromHost = normalizeQuoteRecord((payload as any)?.quote)
+          active = fromHost
+          writeCache(fromHost)
+          bump()
+          return { ok: true, hostOk: true, active: quoteAlive(fromHost) }
+        } catch {
+          hostBroken = true
+          return { ok: true, hostOk: false, active: quoteAlive(active) }
+        }
+      })()
+      return hydrateCall
+    },
+    subscribe(listener: () => void): () => void { listeners.add(listener); return () => { listeners.delete(listener) } },
+    getVersion(): number { return version },
+  }
+}
+
+/** 卡片组件共用的**进程内引用 store**（懒创建）：真值在宿主，localStorage 只是首屏缓存与兜底。 */
+let cardQuoteStore: SecretaryQuoteStore | null = null
+export function secretaryQuoteStore(): SecretaryQuoteStore {
+  if (cardQuoteStore !== null) return cardQuoteStore
+  const g: any = globalThis as any
+  const fetchImpl = typeof g.fetch === 'function' ? (url: string, init?: any) => g.fetch(url, init) : undefined
+  let storage: SecretaryQuoteDeps['storage'] = null
+  try { if (g.localStorage && typeof g.localStorage.getItem === 'function') storage = g.localStorage } catch { storage = null }
+  cardQuoteStore = createSecretaryQuoteStore({ fetchImpl, storage })
+  return cardQuoteStore
+}
+
 export const secretaryCardsTestSurface = {
   normalizeForSpeech,
   stripSessionRefs,
@@ -1498,8 +1862,29 @@ export const secretaryCardsTestSurface = {
   collectSecretaryUserRows,
   collectSecretaryCardRows,
   collectSecretaryCardElements,
+  buildSecretaryPagerCards,
   foldClipFromBlocks,
   cardFoldStyle,
+  NOTICE_CARD_TTL_MS,
+  NOTICE_CLOCK_MINUTE_MS,
+  noticeExpiryFromClock,
+  nearestNoticeExpiryMs,
+  noticeCardExpired,
+  COMPACT_HINT_ATTRIBUTE,
+  COMPACT_SUMMARY_HINT_RE,
+  COMPACT_FAILURE_HINT_RE,
+  isCompactHintText,
+  tagSecretaryCompactHintRows,
+  clearSecretaryCompactHintRows,
+  ASSISTANT_SECRETARY_QUOTE_ROUTE,
+  QUOTE_STORAGE_PREFIX,
+  QUOTE_TTL_MS,
+  QUOTE_PREVIEW_MAX_CHARS,
+  normalizeQuoteRecord,
+  normalizeQuoteSessionIds,
+  quoteAlive,
+  createSecretaryQuoteStore,
+  secretaryQuoteStore,
   ASSISTANT_SECRETARY_READ_ROUTE,
   READ_STORAGE_PREFIX,
   MAX_READ_KEYS,

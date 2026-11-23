@@ -7,12 +7,15 @@
  * 折叠算术与已读 store 不在这里复制一遍：直接从 lib/index.js 里取**本次构建的真实现**
  * （foldClipFromBlocks / createSecretaryReadStore / formatClock），页面只负责量块、脚本只负责接线。
  *
- * 取证口径（2026-11-21 本批需求，2026-11-22 折叠补丁更新）：
+ * 取证口径（2026-11-21 本批需求，2026-11-22 折叠补丁更新，2026-11-23 结论—细节字号档 + 第 1/3/4 项）：
  *   - 先按**旧折叠实现**（标题 + 前 3 个内容块 + gap）量一遍并打印 BEFORE 行（行数、max-height），
  *     再用新实现量 AFTER，两项都从 getComputedStyle/offsetHeight 出真数；
- *   - 新口径 = 折叠态**最多 2 行卡标题 + 最多 3 行正文**，判据全部是内容高度（不看字符数），
+ *   - 新口径 = 折叠态**最多 2 行结论 + 最多 3 行详情**，判据全部是内容高度（不看字符数），
  *     固定上限 foldCollapsedCapPx（标准字号 162px）封顶，CSS 首帧就顶住（治现网「测量前整段平铺」的时序洞）；
- *   - 折叠态行数、卡体点击展开、脚部时间位置、字号（正文 15px）、未读红点、已读持久化都断言。
+ *   - 折叠态行数、卡体点击展开、脚部时间位置、字号（结论 18px/600、详情 14px/26px）、未读红点、已读持久化都断言；
+ *   - 第 3 项：compact 那两行（manual-compaction 行、带 data-compaction-icon 的宿主行、扫描层打标的行）在秘书页不出图；
+ *   - 第 1 项：满 10 分钟的通知卡收成空壳（外壳仍挂着撑住气泡判据，盒子 display:none）；
+ *   - 第 4 项：脚部引用按钮在时间左边、规格与时间右边那棵复制按钮一致。
  *
  * 通过 = 退出码 0；截图：
  *   tmp-secretary-card-collapsed.png / tmp-secretary-card-expanded.png
@@ -85,6 +88,10 @@ const speakButtonHtml = (label) => `<button type="button" data-dsh-speak="button
   <svg data-dsh-speak="icon" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5.5 6.5 9H3.5v6h3L11 18.5z"/><path d="M14.8 8.2a4 4 0 0 1 0 7.6"/><path d="M17.6 5.8a7 7 0 0 1 0 12.4"/></svg>
 </button>`
 const copyIconHtml = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="10" height="10" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2"/></svg>'
+/* 引用按钮（第 4 项需求）：脚部时间左边那颗，图标与尺寸与复制那颗一模一样（16×16、stroke-width 1.6）。
+ * 与 React 组件 SecretaryReplyCard.tsx 的 QuoteCardButton 同一份 markup。 */
+const quoteIconHtml = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.4 6.8C6.6 8.4 5 10.9 5 13.8c0 2 1.4 3.5 3.2 3.5 1.7 0 3-1.3 3-2.9 0-1.6-1.2-2.8-2.7-2.8-.4 0-.8.1-1.1.2.2-1.9 1.5-3.5 3.6-4.6z"/><path d="M18.6 6.8C15.8 8.4 14.2 10.9 14.2 13.8c0 2 1.4 3.5 3.2 3.5 1.7 0 3-1.3 3-2.9 0-1.6-1.2-2.8-2.7-2.8-.4 0-.8.1-1.1.2.2-1.9 1.5-3.5 3.6-4.6z"/></svg>'
+const quoteHtml = (label) => `<button type="button" data-dsh-scard="quote" data-quoted="0" title="${label}" aria-label="${label}" aria-pressed="false">${quoteIconHtml}</button>`
 const markAssistant = '<span data-dsh-scard="mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.8l1.9 5.7 5.7 1.9-5.7 1.9L12 19l-1.9-5.7L4.4 11.4l5.7-1.9L12 3.8z"/><path d="M4.6 4.6l2 2"/><path d="M17.4 19.4l2 2"/></svg></span>'
 const markUser = '<span data-dsh-scard="mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 12a4 4 0 1 0 0-6.5 4 4 0 0 0 0 6.5z"/><path d="M4.8 19.5a7.2 7.2 0 0 1 14.4 0"/></svg></span>'
 const markNotice = '<span data-dsh-scard="mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.2a5.4 5.4 0 0 0-5.4 5.4c0 4.2-1.6 5.9-1.6 6.4h14c0-.5-1.6-2.2-1.6-6.4A5.4 5.4 0 0 0 12 3.2z"/><path d="M9.8 18.4a2.4 2.4 0 0 0 4.4 0"/></svg></span>'
@@ -94,11 +101,12 @@ const expandHtml = (open = false) => `<button type="button" data-dsh-scard="expa
 </button>`
 const refHtml = (id, title) => `<button type="button" data-dsh-scard="ref" title="打开会话：${title}"><span data-dsh-scard="ref-icon" aria-hidden="true">↗</span><span data-dsh-scard="ref-title">${title}</span></button>`
 
-/** 一张卡：三种 kind 同一套外壳（未读红点、卡体 fold 区、脚部时间+复制）。 */
-function cardHtml({ kind, key, unread, timeText, head, paras, refs, footCopyLabel }) {
+/** 一张卡：三种 kind 同一套外壳（未读红点、卡体 fold 区、脚部引用+时间+复制）。 */
+function cardHtml({ kind, key, unread, timeText, head, paras, refs, footCopyLabel, footQuoteLabel, expired = false }) {
   const dot = unread ? '<span data-dsh-scard="unread-dot" role="img" aria-label="未读" title="未读"></span>' : ''
   const refBlock = (refs ?? []).map((ref) => refHtml(ref.id, ref.title)).join('')
-  return `<article data-dsh-scard="card" data-dsh-scard-kind="${kind}" data-dsh-scard-key="${key}" data-dsh-scard-turn="${key}" data-empty="0" data-open="0" data-overflow="0" data-unread="${unread ? '1' : '0'}">
+  const expiredAttr = expired ? ' data-dsh-scard-expired="1" data-empty="1" aria-hidden="true"' : ''
+  return `<article data-dsh-scard="card" data-dsh-scard-kind="${kind}" data-dsh-scard-key="${key}" data-dsh-scard-turn="${key}" data-empty="0" data-open="0" data-overflow="0" data-unread="${unread ? '1' : '0'}" data-quoted="0"${expiredAttr}>
   ${dot}
   <div data-dsh-scard="head">
     <div data-dsh-scard="identity">${head.mark}<span data-dsh-scard="tag">${head.tag}</span>${head.name ?? ''}</div>
@@ -112,6 +120,7 @@ function cardHtml({ kind, key, unread, timeText, head, paras, refs, footCopyLabe
     </div>
   </div>
   <div data-dsh-scard="foot">
+    ${quoteHtml(footQuoteLabel ?? '引用这条卡：下一条消息就接着它说')}
     <time data-dsh-scard="time">${timeText}</time>
     <div data-dsh-scard="actions">
       <button type="button" data-dsh-scard="copy" title="${footCopyLabel}" aria-label="${footCopyLabel}">${copyIconHtml}</button>
@@ -186,15 +195,50 @@ ${assistantCard}
     </div>
     ${noticeCard}
   </div>
+  <!-- 第 3 项需求的宿主行：宿主编排器把一次压缩汇成 kind="manual-compaction" 的行（真结构照搬） -->
+  <div data-chat-turn="10" data-chat-flow-kind="manual-compaction" data-probe="compact-summary-row">
+    <div data-slot="conversation.chat.node">
+      <div class="host-compaction-row"><span data-compaction-icon="context" aria-hidden="true"></span><span data-compaction-disclosure="">compact</span><span>已压缩 41 条历史记录（约 19692 tokens）</span></div>
+    </div>
+  </div>
+  <!-- 同一条压缩事务的失败分支：宿主 GenericCommandCard 的 outcome 文本 -->
+  <div data-chat-turn="11" data-chat-flow-kind="command" data-probe="compact-failure-row">
+    <div data-slot="conversation.chat.node">
+      <div class="host-compaction-row"><span>compact</span><span>Compaction could not produce a useful summary. The attempt is recorded in the session log.</span></div>
+    </div>
+  </div>
+  <!-- 独立摘要行（已有规则压的那一种）：仍然要不出图 -->
+  <div data-chat-turn="12" data-chat-flow-kind="compaction" data-probe="compaction-kind-row">
+    <div data-slot="conversation.chat.node"><div class="host-compaction-row">上下文已压缩</div></div>
+  </div>
+  <!-- 扫描层按文字判据打上 data-dsh-scard-compact="hint" 的那一行 -->
+  <div data-chat-turn="13" data-chat-flow-kind="command" data-dsh-scard-compact="hint" data-probe="compact-tagged-row">
+    <div data-slot="conversation.chat.node"><div class="host-compaction-row">compact·已压缩41条历史记录(19692 tokens)</div></div>
+  </div>
+  <!-- 第 1 项需求：发送满 10 分钟的通知卡收成空壳（外壳仍在、盒子不出图） -->
+  <div data-chat-turn="14" data-chat-flow-kind="user" data-chat-node-key="16:input-message-cu-03" data-probe="expired-notice-row">
+    <div data-slot="conversation.chat.node">
+      <div class="host-user-row">
+        <div class="host-user-stack">
+          <div class="host-bubble">
+            <span data-slot="conversation.user.text.node"><span class="host-plain-run">（系统通知，不是用户说的话）
+这一条通知早就过了 10 分钟，按第 1 项需求收掉。</span></span>
+          </div>
+        </div>
+        <div class="host-actions" data-clock="start"><span>09:08</span></div>
+      </div>
+    </div>
+    <article data-dsh-scard="card" data-dsh-scard-kind="notice" data-dsh-scard-key="notice:16:input-message-cu-03" data-dsh-scard-turn="14" data-dsh-scard-expired="1" data-empty="1" aria-hidden="true"></article>
+  </div>
 </div>
 <script>
 /* 与 React 组件同一套接线：卡体可点击/可键盘展开收起、内部按钮 stopPropagation、已读即摘红点。 */
-window.__GUARD = '[data-dsh-speak="button"], [data-dsh-scard="copy"], [data-dsh-scard="expand"], [data-dsh-scard="ref"], [data-dsh-scard="head"]'
+window.__GUARD = '[data-dsh-speak="button"], [data-dsh-scard="copy"], [data-dsh-scard="quote"], [data-dsh-scard="expand"], [data-dsh-scard="ref"], [data-dsh-scard="head"]'
 window.__readKeys = []
 window.__jump = null
 window.__copied = false
-function cardsAll() { return [...document.querySelectorAll('[data-dsh-scard="card"]')] }
-window.cardOf = (kind) => document.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="' + kind + '"]')
+function cardsAll() { return [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-dsh-scard-expired="1"])')] }
+window.cardOf = (kind) => document.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="' + kind + '"]:not([data-dsh-scard-expired="1"])')
 function setFoldMax(content, card, open) {
   const max = Number(card.dataset.foldMax || 0)
   content.style.maxHeight = open ? 'none' : (max > 0 ? max + 'px' : 'none')
@@ -423,6 +467,9 @@ try {
     const read = card.querySelector('[data-dsh-speak="button"]')
     const copy = card.querySelector('[data-dsh-scard="copy"]')
     const copyIcon = copy.querySelector('svg')
+    const quote = card.querySelector('[data-dsh-scard="quote"]')
+    const quoteIcon = quote?.querySelector('svg') ?? null
+    const quoteStatus = card.querySelector('[data-dsh-scard="quote-status"]')
     const sep = card.querySelector('[data-dsh-scard="separator"]')
     const expand = card.querySelector('[data-dsh-scard="expand"]')
     const arrow = card.querySelector('[data-dsh-scard="expand-arrow"]')
@@ -490,9 +537,10 @@ try {
         footRight: Math.round(footRect.right),
       },
       dot: dot === null ? null : { w: rect(dot).w, h: rect(dot).h, bg: getComputedStyle(dot).backgroundColor, radius: getComputedStyle(dot).borderRadius, aria: dot.getAttribute('aria-label'), top: Math.round(rect(dot).top), left: Math.round(rect(dot).left), markLeft: Math.round(rect(mark).left) },
-      foot: { bg: getComputedStyle(foot).backgroundColor, border: declaredBorder('[data-dsh-scard="foot"]'), borderWidth: getComputedStyle(foot).borderTopWidth, order: [...actions.children].map((el) => el.getAttribute('data-dsh-scard') ?? '').filter(Boolean) },
+      foot: { bg: getComputedStyle(foot).backgroundColor, border: declaredBorder('[data-dsh-scard="foot"]'), borderWidth: getComputedStyle(foot).borderTopWidth, order: [...actions.children].map((el) => el.getAttribute('data-dsh-scard') ?? '').filter(Boolean), childrenOrder: [...foot.children].map((el) => el.getAttribute('data-dsh-scard') ?? (el.tagName === 'TIME' ? 'time' : '')).filter(Boolean) },
+      quote: quote === null ? null : { ...rect(quote), icon: quoteIcon === null ? null : rect(quoteIcon), title: quote.getAttribute('title'), aria: quote.getAttribute('aria-pressed'), color: getComputedStyle(quote).color, bg: getComputedStyle(quote).backgroundColor, radius: getComputedStyle(quote).borderRadius, size: getComputedStyle(quote).width, left: Math.round(rect(quote).left), timeLeft: Math.round(timeRect.left), statusText: quoteStatus?.textContent ?? '' },
+      copy: { ...rect(copy), icon: rect(copyIcon), label: copy.getAttribute('aria-label'), title: copy.getAttribute('title'), color: getComputedStyle(copy).color },
       time: { display: getComputedStyle(time).display, size: getComputedStyle(time).fontSize, color: getComputedStyle(time).color, text: time.textContent },
-      copy: { ...rect(copy), icon: rect(copyIcon), label: copy.getAttribute('aria-label'), title: copy.getAttribute('title') },
       sep: { ...rect(sep), color: getComputedStyle(sep).backgroundColor, margin: getComputedStyle(sep).margin },
       expand: { h: rect(expand).h, padding: getComputedStyle(expand).padding, size: getComputedStyle(expand).fontSize, color: getComputedStyle(expand).color, arrow: rect(arrow), aria: expand.getAttribute('aria-expanded'), title: expand.getAttribute('title'), text: expand.textContent.trim() },
       overflowX: document.documentElement.scrollWidth - document.documentElement.clientWidth,
@@ -505,9 +553,9 @@ try {
   pass('卡片 overflow:hidden', info.card.overflow === 'hidden', info.card.overflow)
   pass('32px 紫色助手标识与名称/标签', near(info.mark.w, 32) && near(info.mark.h, 32) && info.mark.radius === '10px' && info.mark.color === 'rgb(83, 74, 183)' && info.mark.bg === 'rgb(238, 237, 254)', JSON.stringify(info.mark))
   pass('右上角唯一 34px 朗读按钮（尺寸不动），带 title', near(info.read.w, 34) && near(info.read.h, 34) && /0\.5px/.test(info.read.border) && info.read.title === '朗读回答' && info.read.aria === 'false', JSON.stringify(info.read))
-  pass('标题 17px / 500 / 主文字色（字号加两号）', info.title.size === '17px' && info.title.weight === '500' && info.title.color === 'rgb(31, 35, 41)', JSON.stringify(info.title))
-  pass('正文 15px / 400 / 1.8 行高 27px / #4E5969（字号加两号）', info.para.size === '15px' && info.para.weight === '400' && info.para.line === '27px' && info.para.color === 'rgb(78, 89, 105)', JSON.stringify(info.para))
-  pass('重点句 500 / #1F2329', info.strong.weight === '500' && info.strong.color === 'rgb(31, 35, 41)', JSON.stringify(info.strong))
+  pass('结论行（卡标题）18px / 600 / 主文字色 —— 第 2 项需求：先看到的就是结论', info.title.size === '18px' && info.title.weight === '600' && info.title.color === 'rgb(31, 35, 41)', JSON.stringify(info.title))
+  pass('详情段落 14px / 400 / 行高 26px / #4E5969 —— 第 2 项需求：细节稍小一号', info.para.size === '14px' && info.para.weight === '400' && info.para.line === '26px' && info.para.color === 'rgb(78, 89, 105)', JSON.stringify(info.para))
+  pass('正文里的重点句仍然 600 / 主文字色（只换字号，粗与不粗照旧）', info.strong.weight === '600' && info.strong.color === 'rgb(31, 35, 41)', JSON.stringify(info.strong))
   pass('模型标签 13px 等宽、浅紫底深紫字、5px 圆角（chip 加两号）', info.model.size === '13px' && info.model.color === 'rgb(60, 52, 137)' && info.model.bg === 'rgb(238, 237, 254)' && info.model.radius === '5px' && /monospace/i.test(info.model.family) && info.model.padding === '2px 5px', JSON.stringify(info.model))
   pass('引用 chip 13px（chip 加两号）', info.ref !== null && info.ref.size === '13px' && info.ref.color === 'rgb(60, 52, 137)', JSON.stringify(info.ref))
 
@@ -535,10 +583,10 @@ try {
     JSON.stringify({ firstPaintMaxHeight: before.firstPaintMaxHeight, natural: before.naturalHeight }))
   pass('整条回复只有一段连续文字（正文块只剩被裁过的标题）也必须折叠',
     (() => {
-      const onlyTitle = foldClipFromBlocks({ blocks: [{ kind: 'title', top: 0, height: 332 }], naturalHeight: 332, lineHeight: 27, titleLineHeight: 25.5, titleClippedHidden: true })
-      return onlyTitle.overflow === true && onlyTitle.collapsedMaxHeight === 51
+      const onlyTitle = foldClipFromBlocks({ blocks: [{ kind: 'title', top: 0, height: 332 }], naturalHeight: 332, lineHeight: 26, titleLineHeight: 27, titleClippedHidden: true })
+      return onlyTitle.overflow === true && onlyTitle.collapsedMaxHeight === 54
     })(),
-    JSON.stringify({ 旧口径: '无 max-height → 整段平铺', 新口径: '折叠在 51px（标题 2 行）' }))
+    JSON.stringify({ 旧口径: '无 max-height → 整段平铺', 新口径: '折叠在 54px（结论 2 行）' }))
   pass('折叠末尾是「…」省略标记（不是渐变遮罩）',
     info.fold.ellipsis !== null && info.fold.ellipsis.text === '…' && info.fold.ellipsis.display !== 'none',
     JSON.stringify(info.fold.ellipsis))
@@ -573,6 +621,103 @@ try {
 
   pass('页面级秘书标记存在', info.bodyFlag === '1', info.bodyFlag)
 
+  // ── 第 4 项：引用按钮（脚部时间左边，规格与时间右边那棵复制按钮一致） ──
+  pass('脚部顺序 = 引用 → 时间 → 操作区（引用挂在时间左边）',
+    JSON.stringify(info.foot.childrenOrder) === JSON.stringify(['quote', 'time', 'actions']) && info.foot.order.join('+') === 'copy+separator+expand',
+    JSON.stringify({ childrenOrder: info.foot.childrenOrder, order: info.foot.order }))
+  pass('引用按钮与复制按钮同一档规格（30×30、16×16 图标、同一灰、同一圆角、同一 padding/hover 底色）',
+    info.quote !== null
+      && near(info.quote.w, 30, 0.6) && near(info.quote.h, 30, 0.6)
+      && info.quote.icon !== null && near(info.quote.icon.w, 16, 0.6) && near(info.quote.icon.h, 16, 0.6)
+      && info.quote.color === info.copy.color && info.quote.radius === '8px'
+      && info.quote.bg === 'rgba(0, 0, 0, 0)',
+    JSON.stringify({ quote: info.quote, copy: { w: info.copy.w, h: info.copy.h, color: info.copy.color, icon: info.copy.icon } }))
+  pass('引用按钮在时间左侧（left 小于时间 left）且标题文案指到下一条消息',
+    info.quote !== null && info.quote.left < info.quote.timeLeft && /下一条消息就接着它说/.test(info.quote.title ?? ''),
+    JSON.stringify({ quoteLeft: info.quote?.left, timeLeft: info.quote?.timeLeft, title: info.quote?.title }))
+
+  // ── 第 3 项：compact 那两行在秘书页不出图（按宿主 kind + 扫描层打标记两条判据） ──
+  const compactRows = await page.evaluate(() => {
+    const show = (probe) => {
+      const el = document.querySelector(`[data-probe="${probe}"]`)
+      if (el === null) return { display: 'missing', text: '' }
+      return { display: getComputedStyle(el).display, offsetHeight: el.offsetHeight, text: (el.textContent ?? '').trim().slice(0, 40) }
+    }
+    const freshNotice = document.querySelector('[data-probe="notice-row"]')
+    const expiredRow = document.querySelector('[data-probe="expired-notice-row"]')
+    const expiredCard = expiredRow?.querySelector('[data-dsh-scard="card"]') ?? null
+    const expiredSlot = expiredRow?.querySelector('[data-slot="conversation.chat.node"]') ?? null
+    const expiredRun = expiredRow?.querySelector('[data-slot="conversation.user.text.node"] > span') ?? null
+    return {
+      manualCompaction: show('compact-summary-row'),
+      failureCommand: show('compact-failure-row'),
+      compactionKind: show('compaction-kind-row'),
+      taggedHint: show('compact-tagged-row'),
+      freshNoticeDisplay: freshNotice === null ? 'missing' : getComputedStyle(freshNotice).display,
+      expiredCardDisplay: expiredCard === null ? 'missing' : getComputedStyle(expiredCard).display,
+      expiredCardHasShellAttr: expiredCard?.getAttribute('data-dsh-scard-expired') ?? '',
+      expiredSlotDisplay: expiredSlot === null ? 'missing' : getComputedStyle(expiredSlot).display,
+      expiredSlotHeight: expiredSlot === null ? -1 : expiredSlot.offsetHeight,
+      expiredRunDisplay: expiredRun === null ? 'missing' : getComputedStyle(expiredRun).display,
+      expiredSlotOffsetHeight: expiredSlot === null ? -1 : expiredSlot.offsetHeight,
+      expiredRowDisplay: expiredRow === null ? 'missing' : getComputedStyle(expiredRow).display,
+      chatStageHeight: (() => { const el = document.querySelector('.chat-stage'); return el === null ? 0 : el.offsetHeight })(),
+    }
+  })
+  pass('第 3 项：compact 已压缩那一行（kind="manual-compaction"）在秘书页不出图',
+    compactRows.manualCompaction.display === 'none' && compactRows.manualCompaction.offsetHeight === 0,
+    JSON.stringify(compactRows.manualCompaction))
+  pass('第 3 项：kind="compaction"（独立摘要行）仍然不出图（原有规则没被改坏）',
+    compactRows.compactionKind.display === 'none', JSON.stringify(compactRows.compactionKind))
+  pass('第 3 项：扫描层打上 data-dsh-scard-compact="hint" 的行不出图（文字判据那条兜底）',
+    compactRows.taggedHint.display === 'none' && compactRows.taggedHint.offsetHeight === 0, JSON.stringify(compactRows.taggedHint))
+  pass('第 3 项：失败分支那行在没打标时仍然照常出图（说明压的是判据，不是所有 command 行）',
+    compactRows.failureCommand.display !== 'none' && compactRows.failureCommand.offsetHeight > 0, JSON.stringify(compactRows.failureCommand))
+  pass('第 3 项：普通通知卡与用户行不受影响（仍然出图）',
+    compactRows.freshNoticeDisplay !== 'none', JSON.stringify({ freshNoticeDisplay: compactRows.freshNoticeDisplay }))
+
+  // ── 第 1 项：满 10 分钟的通知卡收成空壳（外壳挂着、盒子不出图、宿主气泡也不许冒回来） ──
+  pass('第 1 项：过期通知卡外壳带 data-dsh-scard-expired="1" 且盒子 display:none',
+    compactRows.expiredCardHasShellAttr === '1' && compactRows.expiredCardDisplay === 'none',
+    JSON.stringify({ expiredCardDisplay: compactRows.expiredCardDisplay, expiredCardHasShellAttr: compactRows.expiredCardHasShellAttr }))
+  pass('第 1 项：过期通知卡那行的宿主内容仍然被 :has 判据压住（不因为卡片收掉就冒回原生气泡）',
+    compactRows.expiredSlotDisplay === 'none' && compactRows.expiredSlotHeight === 0 && compactRows.expiredRunDisplay === 'none' && compactRows.expiredRowDisplay !== 'none',
+    JSON.stringify({ expiredSlotDisplay: compactRows.expiredSlotDisplay, expiredSlotHeight: compactRows.expiredSlotHeight, expiredRunDisplay: compactRows.expiredRunDisplay, expiredRowDisplay: compactRows.expiredRowDisplay, expiredCardDisplay: compactRows.expiredCardDisplay }))
+
+  // ── 第 3 项的负向取证：同一份 CSS、同一批宿主行，在**没有秘书标记**的普通会话页里一条都不许隐藏 ──
+  const otherPage = await browser.newPage({ viewport: { width: 900, height: 1000 } })
+  let otherHtml = null
+  await otherPage.route('https://dsh.local/secretary-visual-other.html', (route) => {
+    otherHtml = pageHtml.replace('<body data-dsh-secretary="1">', '<body>')
+    if (otherHtml === pageHtml) throw new Error('替换没生效：别的会话页仍带秘书标记')
+    return route.fulfill({ body: otherHtml, contentType: 'text/html; charset=utf-8' })
+  })
+  await otherPage.goto('https://dsh.local/secretary-visual-other.html', { waitUntil: 'load' })
+  await otherPage.waitForTimeout(250)
+  const otherRows = await otherPage.evaluate(() => {
+    const show = (probe) => {
+      const el = document.querySelector(`[data-probe="${probe}"]`)
+      if (el === null) return { display: 'missing', offsetHeight: -1 }
+      return { display: getComputedStyle(el).display, offsetHeight: el.offsetHeight }
+    }
+    const title = document.querySelector('[data-dsh-scard="card"] [data-dsh-scard="title"]')
+    const para = document.querySelector('[data-dsh-scard="card"] [data-dsh-scard="para"]')
+    return {
+      bodyFlag: document.body.getAttribute('data-dsh-secretary') ?? '',
+      manualCompaction: show('compact-summary-row'),
+      compactionKind: show('compaction-kind-row'),
+      taggedHint: show('compact-tagged-row'),
+    }
+  })
+  pass('第 3 项不许外溢：没有秘书标记的会话页里那两行照旧出图（display 不是 none、有高度）',
+    otherRows.bodyFlag === '' && otherRows.manualCompaction.display !== 'none' && otherRows.manualCompaction.offsetHeight > 0
+      && otherRows.compactionKind.display !== 'none' && otherRows.compactionKind.offsetHeight > 0
+      && otherRows.taggedHint.display !== 'none' && otherRows.taggedHint.offsetHeight > 0,
+    JSON.stringify(otherRows))
+  pass('第 2 项只改秘书卡片字体：别的会话页里宿主行不受影响（宿主正文仍然照排）',
+    otherRows.manualCompaction.display !== 'none' && otherRows.taggedHint.offsetHeight > 0, JSON.stringify(otherRows.taggedHint))
+  await otherPage.close()
+
   // ── 三种卡主题与外壳 ──
   const dual = await page.evaluate(() => {
     const assistant = window.cardOf('assistant')
@@ -597,7 +742,7 @@ try {
       userExists: user !== null,
       noticeExists: notice !== null,
       userKindCount: document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="user"]').length,
-      noticeKindCount: document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="notice"]').length,
+      noticeKindCount: document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="notice"]:not([data-dsh-scard-expired="1"])').length,
       noticeRowHasUserCard: noticeRow.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="user"]') !== null,
       noticeBubbleDisplay: getComputedStyle(noticeRow.querySelector('[data-slot="conversation.chat.node"]')).display,
       noticeHostRunDisplay: getComputedStyle(noticeRow.querySelector('.host-plain-run')).display,
@@ -734,8 +879,8 @@ try {
     JSON.stringify({ tag: dual.noticeMark.tagText, name: dual.noticeMark.nameText }))
   pass('通知卡保留可点击的会话引用 chip（灰底卡里仍带跳转）',
     dual.noticeRef === true, JSON.stringify({ noticeRef: dual.noticeRef }))
-  pass('通知卡折叠、字号、点卡展开跟秘书卡同一套（正文 15px/27、17px 标题、卡体 role/aria、…标记）',
-    dual.noticeParaStyle.size === '15px' && dual.noticeParaStyle.line === '27px' && dual.noticeTitleStyle.size === '17px'
+  pass('通知卡折叠、字号、点卡展开跟秘书卡同一套（详情 14px/26、结论 18px 标题、卡体 role/aria、…标记）',
+    dual.noticeParaStyle.size === '14px' && dual.noticeParaStyle.line === '26px' && dual.noticeTitleStyle.size === '18px'
       && dual.noticeFold.role === 'button' && dual.noticeFold.aria === 'false' && dual.noticeFold.maxHeight.endsWith('px')
       && dual.noticeFold.clientHeight === Number.parseFloat(dual.noticeFold.maxHeight) && dual.noticeFold.ellipsis === '…',
     JSON.stringify({ para: dual.noticeParaStyle, title: dual.noticeTitleStyle, fold: dual.noticeFold, geometry: folded.notice.geometry }))
@@ -754,9 +899,9 @@ try {
     JSON.stringify(dual.noticeFoot.order) === JSON.stringify(['copy', 'separator', 'expand']) && !dual.noticeFoot.speakInFoot
       && /^([01]?\d|2[0-3]):[0-5]\d$/.test(dual.noticeFoot.timeText) && dual.noticeFoot.timeRect.copyLeft - dual.noticeFoot.timeRect.timeRight <= 12,
     JSON.stringify(dual.noticeFoot))
-  pass('用户卡正文原样显示用户说的话（15px/1.8，不截断不改写）',
+  pass('用户卡正文原样显示用户说的话（详情 14px/26，不截断不改写）',
     dual.paras.length === 2 && /帮我把今天下午的安排理一遍/.test(dual.paras[0]) && /用户卡不许改写/.test(dual.paras[1])
-      && dual.paraStyle.size === '15px' && dual.paraStyle.line === '27px' && dual.paraStyle.color === 'rgb(78, 89, 105)',
+      && dual.paraStyle.size === '14px' && dual.paraStyle.line === '26px' && dual.paraStyle.color === 'rgb(78, 89, 105)',
     JSON.stringify({ paras: dual.paras, style: dual.paraStyle }))
   pass('用户卡不溢出时卡体是 static（不 cursor、aria-expanded=true、没有展开全文）',
     dual.userFold.role === 'button' && dual.userFold.fold === 'static' && dual.userFold.aria === 'true' && dual.userFold.cursor === 'auto'
@@ -914,7 +1059,7 @@ try {
   const hasButtonRule = focus.rules.some((rule) => /button:focus-visible/.test(rule.selector) && /\b2px solid\b/.test(rule.outline) && rule.offset === '2px')
   const hasBodyRule = focus.rules.some((rule) => rule.selector.includes('[data-dsh-scard="body"]:focus-visible') && /\b2px solid\b/.test(rule.outline) && rule.offset === '2px')
   pass('卡内朗读/引用/复制按钮与卡体都有 2px :focus-visible 焦点环（卡体 tabindex=0 可 Tab 到）',
-    focus.bodyTabIndex === '0' && focus.bodyRole === 'button' && focus.tabbable.length === 4 && hasButtonRule && hasBodyRule && focus.ringVar !== '',
+    focus.bodyTabIndex === '0' && focus.bodyRole === 'button' && focus.tabbable.length === 5 && focus.tabbable.includes('quote') && hasButtonRule && hasBodyRule && focus.ringVar !== '',
     JSON.stringify({ selectors: focus.rules.map((rule) => rule.selector), ringVar: focus.ringVar, bodyTabIndex: focus.bodyTabIndex, tabbable: focus.tabbable }))
   pass('卡体 Enter/Space 真键盘切换折叠（卡内其它按钮不掺进来）', await (async () => {
     const before = await page.evaluate(() => { const el = window.cardOf('assistant'); const body = el.querySelector('[data-dsh-scard="body"]'); body.focus(); return { focused: document.activeElement === body, aria: body.getAttribute('aria-expanded'), height: el.querySelector('[data-dsh-scard="content"]').clientHeight } })

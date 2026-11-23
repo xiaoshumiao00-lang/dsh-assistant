@@ -3,8 +3,12 @@
  *   - 真实用户消息 → 冷蓝用户卡（kind=user，无未读红点）；
  *   - 插件塞进来的合成通知（「（系统通知，不是用户说的话）」开头或带 `[[session:…]]` 的合成行）
  *     → 中性灰通知卡（kind=notice，带未读红点、可点跳的会话引用 chip）；
- *   外壳与秘书回复卡同一套规格（宽 620px、16px 圆角、0.5px #E5E6EB 边、无阴影、脚部 HH:MM 时间 + 复制），
+ *   外壳与秘书回复卡同一套规格（宽 620px、16px 圆角、0.5px #E5E6EB 边、无阴影、脚部 引用 + HH:MM 时间 + 复制），
  *   折叠/字号/点卡展开三种卡一律共用 SecretaryReplyCard.tsx 那一套实现，不许各自漂移。
+ *
+ * 两条新的口径（2026-11-23）：
+ *   - 通知卡发送满 10 分钟只在渲染层收成空壳（noticeCardExpired / NOTICE_CARD_TTL_MS），会话数据一个字都不删；
+ *   - 脚部那颗引用按钮（QuoteCardButton）三种卡都有，挂在时间左边。
  *
  * 挂载与取证：
  *   - 卡片内容来自宿主那条用户行本身：`[data-chat-flow-kind="user"]` →
@@ -20,14 +24,17 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   CopyAnswerButton, ExpandCollapseButton, inlineAnswerText, turnEndTime, useCardFoldMeasure, useCardFoldRegion,
+  QuoteCardButton, useSecretaryQuoteState,
   useSecretaryReadState,
 } from './SecretaryReplyCard.tsx'
 import { CollapsedSecretaryCard, useSecretaryCardWindow, useSecretaryPagerVersion } from './SecretaryCollapsedCard.tsx'
 import { SecretarySpeakButton } from './SecretarySpeakButton.tsx'
 import {
-  assistantCardSpeechKey, buildSecretaryPagerCards, CARD_KIND_NOTICE, CARD_KIND_USER, cardFoldStyle, collectSecretaryCardRows, formatClock,
-  noticeCardSpeechKey, parseNoticeCardBody, parseSessionRefs, parseUserCardBody, secretaryPager, stripSessionRefs,
-  userCardSpeechKey, EARLIER_HINT_TEXT, SCROLL_TOP_THRESHOLD_PX, scrollAnchorTopPatch, shouldExpandOnScroll,
+  assistantCardSpeechKey, buildSecretaryPagerCards, CARD_KIND_NOTICE, CARD_KIND_USER, cardFoldStyle, collectSecretaryCardRows,
+  clearSecretaryCompactHintRows, formatClock,
+  noticeCardExpired, noticeCardSpeechKey, nearestNoticeExpiryMs, parseNoticeCardBody, parseSessionRefs, parseUserCardBody, secretaryPager,
+  stripSessionRefs, tagSecretaryCompactHintRows, userCardSpeechKey, EARLIER_HINT_TEXT, SCROLL_TOP_THRESHOLD_PX,
+  scrollAnchorTopPatch, shouldExpandOnScroll,
   type PagerDomCard, type SecretaryCardRow,
 } from './secretary-cards.ts'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
@@ -90,13 +97,18 @@ function toEpoch(clockText: string): string {
   return raw
 }
 
-/** 一张卡（用户卡 / 通知卡）：与秘书回复卡同一套外壳与折叠实现。 */
+/**
+ * 一张卡（用户卡 / 通知卡）：与秘书回复卡同一套外壳与折叠实现。
+ * 通知卡多一条口径（第 1 项需求）：发送满 10 分钟后这张卡在渲染层收成**空壳**（原文还在宿主会话里，
+ * 插件一个字都不删），空壳仍然挂在宿主那条用户行上，把宿主气泡压住不给它冒回来。
+ */
 function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbApi }): any {
   const contentRef = useRef<HTMLDivElement | null>(null)
   const [open, setOpen] = useState(false)
   const notice = row.kind === CARD_KIND_NOTICE
   const speechKey = notice ? noticeCardSpeechKey(row.key, row.turnNo) : userCardSpeechKey(row.key, row.turnNo)
   const readKey = notice ? speechKey : ''
+  const noticeExpired = noticeCardExpired(row)
   const readState = useSecretaryReadState(secretarySessionId())
   // 分页窗口：这张用户卡/通知卡完整渲染还是压成一行折叠行（hooks 一律在条件 return 之前）
   const windowState = useSecretaryCardWindow(speechKey)
@@ -114,6 +126,23 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
   const markRead = (): void => { if (readKey !== '') readState.markRead(readKey) }
   const toggle = (): void => { setOpen((value) => !value); markRead() }
   const { foldProps } = useCardFoldRegion(open, overflow, toggle)
+  const quoteState = useSecretaryQuoteState(secretarySessionId())
+
+  // 过期通知卡（发送满 10 分钟）：只收成空壳。原文还在宿主会话里，插件一个字都不删；
+  // 空壳 kind=notice 仍然撑着那条 :has 判据，宿主气泡不会冒回来。
+  if (noticeExpired) {
+    return (
+      <article
+        data-dsh-scard="card"
+        data-dsh-scard-kind={CARD_KIND_NOTICE}
+        data-dsh-scard-key={speechKey}
+        data-dsh-scard-turn={row.turnNo}
+        data-dsh-scard-expired="1"
+        data-empty="1"
+        aria-hidden="true"
+      />
+    )
+  }
 
   if (!hasBody && refs.length === 0) return null
   // 分页窗口外（比最近 30 张更旧）：这张卡压成一行折叠行，绝不把整张老卡拉回渲染
@@ -142,6 +171,7 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
       data-open={open ? '1' : '0'}
       data-overflow={overflow ? '1' : '0'}
       data-unread={unread ? '1' : '0'}
+      data-quoted={quoteState.isQuoted(speechKey) ? '1' : '0'}
       aria-label={notice ? '系统通知' : '你的消息'}
     >
       {unread && <span data-dsh-scard="unread-dot" role="img" aria-label="未读" title="未读" />}
@@ -201,6 +231,15 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
         </div>
       </div>
       <div data-dsh-scard="foot">
+        {/* 脚部那颗引用按钮（第 4 项需求）：三种卡都把它放在**时间左边**，规格与时间右边那棵复制按钮一样 */}
+        <QuoteCardButton
+          cardKey={speechKey}
+          kind={notice ? CARD_KIND_NOTICE : CARD_KIND_USER}
+          turnNo={row.turnNo}
+          preview={copyText}
+          refSessionIds={refs.map((ref) => ref.sessionId)}
+          onToggled={markRead}
+        />
         <time data-dsh-scard="time">{timeText}</time>
         <div data-dsh-scard="actions">
           <CopyAnswerButton fullText={copyText} label={notice ? '复制这条通知' : '复制这条消息'} onCopied={markRead} />
@@ -303,13 +342,20 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
   useEffect(() => {
     let alive = true
     let timer: number | null = null
+    // 通知卡过期定时器：算出最近一个过期时点，到点 bump rev → 每张卡重新按现在的时间判一次（空壳出口在卡片里）
+    let expiryTimer: number | null = null
     const scan = (): void => {
       if (!alive) return
       if (!secretaryPageActive()) {
         setRows((prev) => (prev.length === 0 ? prev : []))
         syncEarlierHint(document, false)
+        // 离开秘书页：把自己打过的 compact 标记清干净（宿主行本身一个属性都没动过，只清我们加的）
+        clearSecretaryCompactHintRows(document)
+        if (expiryTimer !== null) { window.clearTimeout(expiryTimer); expiryTimer = null }
         return
       }
+      // 第 3 项需求：compact 提示两行只在秘书页压掉（CSS 按 kind + 这里打的标记）
+      tagSecretaryCompactHintRows(document)
       const next = collectSecretaryCardRows(document)
       const domCards: PagerDomCard[] = buildSecretaryPagerCards(document)
       pager.setSession(secretarySessionId())
@@ -319,6 +365,18 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
       const missing = next.some((row) => !rowHasCard(row.element))
       setRows((prev) => (sameRows(prev, next) ? prev : next))
       if (missing) setRev((value) => value + 1)
+      // 第 1 项需求：还有没到点的通知卡 → 排一次定时器，到点强制重判（不排就永远等下一次 DOM 变化）
+      const expiresAt = nearestNoticeExpiryMs(next)
+      if (expiryTimer !== null) { window.clearTimeout(expiryTimer); expiryTimer = null }
+      if (expiresAt !== null) {
+        const delay = Math.max(1000, expiresAt - Date.now())
+        expiryTimer = window.setTimeout(() => {
+          expiryTimer = null
+          if (!alive) return
+          setRev((value) => value + 1)
+          scan()
+        }, delay)
+      }
     }
     const schedule = (): void => {
       if (timer !== null) window.clearTimeout(timer)
@@ -338,6 +396,8 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
       observer.disconnect()
       window.clearTimeout(initial)
       if (timer !== null) window.clearTimeout(timer)
+      if (expiryTimer !== null) window.clearTimeout(expiryTimer)
+      expiryTimer = null
     }
   }, [])
 

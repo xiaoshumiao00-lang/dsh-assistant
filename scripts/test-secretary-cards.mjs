@@ -308,10 +308,33 @@ cases.push(['卡片 kind 常量：秘书卡 assistant / 用户卡 user / 通知�
   assert.equal(surface.FOLD_BODY_LINE_BUDGET, 3)
   assert.equal(surface.FOLD_TITLE_LINE_BUDGET, 2)
   assert.equal(surface.FOLD_BLOCK_GAP, 10)
-  assert.equal(surface.FOLD_FALLBACK_LINE_HEIGHT_PX, 27)
-  // 折叠态固定上限（标准字号：标题 17px/1.5 两行 51px + 间距 10px + 正文 15px/1.8 三行 81px + 两个块间距 20px）
-  assert.equal(surface.foldCollapsedCapPx({ lineHeight: 27, titleLineHeight: 25.5, hasTitle: true }), 162)
-  assert.equal(surface.foldCollapsedCapPx({ lineHeight: 27, hasTitle: false }), 101)
+  assert.equal(surface.FOLD_FALLBACK_LINE_HEIGHT_PX, 26)
+  // 折叠态固定上限（2026-11-23 新字号档：结论 18px/1.5 两行 54px + 间距 10px + 详情 14px/26px 三行 78px + 两个块间距 20px = 162px；
+  // 旧的「17px/1.5 标题 + 15px/1.8 正文」那档算出来也是 162px —— 总量口径一个字没动）
+  assert.equal(surface.foldCollapsedCapPx({ lineHeight: 26, titleLineHeight: 27, hasTitle: true }), 162)
+  assert.equal(surface.foldCollapsedCapPx({ lineHeight: 26, hasTitle: false }), 98)
+  // 通知卡 10 分钟过期口径（第 1 项需求）：同一天的钟面、带日期的钟面、认不出时间，三种判据分开断言
+  assert.equal(surface.NOTICE_CARD_TTL_MS, 10 * 60 * 1000)
+  {
+    const sentAt = new Date(2026, 10, 22, 9, 8, 0, 0).getTime()
+    const at908 = sentAt + 1000
+    const at918 = sentAt + 11 * 60 * 1000
+    const at919 = sentAt + 12 * 60 * 1000
+    const fresh = surface.noticeExpiryFromClock('9:08', at908)
+    assert.equal(fresh.reason, 'same-day')
+    assert.equal(fresh.expired, false, '刚发送的不到 10 分钟不许收')
+    assert.equal(fresh.expiresAt, sentAt + surface.NOTICE_CLOCK_MINUTE_MS - 1 + surface.NOTICE_CARD_TTL_MS)
+    // 分钟粒度只能估：宁可晚一分钟收，绝不提前一秒——10 分钟整还没到期，11 分钟才铁定到期
+    assert.equal(surface.noticeExpiryFromClock('9:08', sentAt + 10 * 60 * 1000 + 30 * 1000).expired, false, '过 10 分钟整还不收（分钟末口径）')
+    assert.equal(surface.noticeExpiryFromClock('9:08', at918).expired, true, '到点就收（分钟末 + 10 分钟）')
+    assert.equal(surface.noticeExpiryFromClock('今天 9:08', at919).expired, true)
+    assert.equal(surface.noticeExpiryFromClock('11月22日 9:08', at908).expired, true, '带日期的钟面必然超过 10 分钟')
+    assert.equal(surface.noticeExpiryFromClock('昨天 9:08', at908).reason, 'dated-label')
+    assert.equal(surface.noticeExpiryFromClock('', at908).expired, false, '认不出时间不动卡）')
+    assert.equal(surface.noticeExpiryFromClock('乱码', at908).reason, 'unknown-time')
+    assert.equal(surface.noticeCardExpired({ kind: 'user', clockText: '11月22日 9:08' }, at908), false, '用户卡永不过期')
+    assert.equal(surface.noticeCardExpired({ kind: 'notice', clockText: '11月22日 9:08' }, at908), true)
+  }
 }])
 
 cases.push(['通知卡正文：剥掉合成头（「（系统通知…）」与「最后单独一行原样输出：」），首行做标题、其余成段落', () => {
@@ -430,11 +453,11 @@ cases.push(['折叠几何（三种卡共用一套算术）：卡标题也进预�
   const onlyTitle = surface.foldClipFromBlocks({ blocks: [{ kind: 'title', top: 0, height: 51 }], naturalHeight: 51, lineHeight, titleLineHeight: titleLine, titleClippedHidden: true })
   assert.equal(onlyTitle.overflow, true)
   assert.equal(onlyTitle.collapsedMaxHeight, 51)
-  // 行高量不出来（字体没落、块被宿主藏起来）：按兜底行高 27 折叠，不许因为量不到就平铺
+  // 行高量不出来（字体没落、块被宿主藏起来）：按兜底行高 26 折叠，不许因为量不到就平铺
   const bad = surface.foldClipFromBlocks({ blocks, naturalHeight: natural, lineHeight: 0 })
-  assert.equal(bad.collapsedMaxHeight, 127)
+  assert.equal(bad.collapsedMaxHeight, 126)
   assert.equal(bad.overflow, true)
-  assert.equal(bad.cap, 165)
+  assert.equal(bad.cap, 160)
   // 卡体内联样式三态：没量过不放开（CSS 首帧固定上限顶住）→ 量过且没溢出才放开 → 溢出就写真实落点
   assert.equal(surface.cardFoldStyle(false, false, undefined), undefined)
   assert.deepEqual(surface.cardFoldStyle(false, true, undefined), { maxHeight: 'none' })
@@ -519,6 +542,170 @@ cases.push(['已读 store：宿主真值优先、宿主答不上降级 localStor
   const noneHydrated = await none.hydrate()
   assert.equal(noneHydrated.hostOk, false)
   assert.equal(none.isRead('assistant:turn:1'), true)
+}])
+
+cases.push(['通知卡过期算术（第 1 项）：10 分钟只从卡片自己那份钟面算', () => {
+  const sentAt = new Date(2026, 10, 22, 9, 8, 0, 0).getTime()
+  const fresh = surface.noticeExpiryFromClock('9:08', sentAt + 1000)
+  assert.equal(fresh.reason, 'same-day')
+  assert.equal(fresh.expired, false, '刚发送的不许收')
+  assert.equal(fresh.sentAt, sentAt, '发送时刻按那一分钟的起点算')
+  assert.equal(fresh.expiresAt, sentAt + surface.NOTICE_CLOCK_MINUTE_MS - 1 + surface.NOTICE_CARD_TTL_MS, '过期时点宁可晚一分钟，绝不提前')
+  assert.equal(surface.noticeExpiryFromClock('9:08', sentAt + 10 * 60 * 1000).expired, false, '刚好 10 分钟还不收（分钟末口径）')
+  assert.equal(surface.noticeExpiryFromClock('9:08', sentAt + 11 * 60 * 1000).expired, true, '过 11 分钟铁定收')
+  assert.equal(surface.noticeExpiryFromClock('今天 9:08', sentAt + 11 * 60 * 1000).expired, true, '「今天」写法同一套判据')
+  assert.equal(surface.noticeExpiryFromClock('11月22日 9:08', sentAt).reason, 'dated-label', '带日期即早于 10 分钟')
+  assert.equal(surface.noticeExpiryFromClock('11月22日 9:08', sentAt).expired, true, '带日期的通知卡直接过期')
+  assert.equal(surface.noticeExpiryFromClock('昨天 9:08', sentAt).expired, true)
+  for (const clock of ['', '乱码', '上午九点']) {
+    const out = surface.noticeExpiryFromClock(clock, sentAt)
+    assert.equal(out.reason, 'unknown-time', `${clock} 认不出时间`)
+    assert.equal(out.expired, false, '认不出时间不许把消息收掉')
+    assert.equal(out.expiresAt, null)
+  }
+  assert.equal(surface.noticeCardExpired({ kind: 'user', clockText: '11月22日 9:08' }, sentAt), false, '用户卡永不过期')
+  assert.equal(surface.noticeCardExpired({ kind: 'notice', clockText: '11月22日 9:08' }, sentAt), true, '通知卡走同一判据')
+  const rows = [{ kind: 'notice', clockText: '9:08' }, { kind: 'user', clockText: '9:08' }]
+  assert.equal(surface.nearestNoticeExpiryMs(rows, sentAt + 1000), sentAt + surface.NOTICE_CLOCK_MINUTE_MS - 1 + surface.NOTICE_CARD_TTL_MS, '挂载层按最近一个到点的通知卡排定时器')
+  assert.equal(surface.nearestNoticeExpiryMs([{ kind: 'notice', clockText: '9:08' }], sentAt + 12 * 60 * 1000), null, '全都过期了就不必再排定时器')
+  const future = surface.noticeExpiryFromClock('23:41', new Date(2026, 10, 22, 9, 0, 0, 0).getTime())
+  assert.equal(future.sentAt, new Date(2026, 10, 22, 9, 0, 0, 0).getTime(), '钟面跑到未来（跨午夜/钟面偏差）按现在算，不许算成已过期')
+  assert.equal(future.expired, false)
+}])
+
+cases.push(['compact 提示判据（第 3 项）：那两行文本按已核实的宿主文字认，别的文字不误伤', () => {
+  assert.equal(surface.isCompactHintText('compact 已压缩 41 条历史记录（约 19692 tokens）'), true)
+  assert.equal(surface.isCompactHintText('compact·已压缩41条历史记录(19692 tokens)'), true, '用户原话里那种没有空格的写法也认')
+  assert.equal(surface.isCompactHintText('compact: Compaction could not produce a useful summary. The attempt is recorded in the session log.'), true)
+  assert.equal(surface.isCompactHintText('compact · Compacted 12 history items (~4200 tokens)'), true, '英文 i18n 同一判据')
+  assert.equal(surface.isCompactHintText('你好，帮我看看今天下午'), false, '普通用户消息不许被误判')
+  assert.equal(surface.isCompactHintText('这轮已经压缩完了，接着说'), false, '模型自己说「压缩完了」不许算成那两行')
+  assert.equal(surface.isCompactHintText(''), false)
+}])
+
+cases.push(['引用登记（第 4 项）：归一 + store 口径 + 宿主真值优先', async () => {
+  const base = { cardKey: 'notice:14:msg-cu-01', kind: 'notice', turnNo: '9', preview: '结论：改了三处。', refSessionIds: ['session-cu-1', 'session-cu-1', '带 空 格', 'x'.repeat(130)] }
+  const record = surface.normalizeQuoteRecord(base)
+  assert.equal(record.cardKey, 'notice:14:msg-cu-01')
+  assert.equal(record.kind, 'notice')
+  assert.deepEqual(record.refSessionIds, ['session-cu-1'], '坏值丢掉、按序去重')
+  assert.equal(record.preview, '结论：改了三处。')
+  assert.equal(surface.normalizeQuoteRecord({ cardKey: '', kind: 'notice' }), null, '没卡 key 整条丢')
+  assert.equal(surface.normalizeQuoteRecord({ cardKey: 'a:1', kind: 'unknown-kind' }), null, '种类不在这三种整条丢')
+  const long = surface.normalizeQuoteRecord({ cardKey: 'a:1', kind: 'assistant', preview: '甲'.repeat(surface.QUOTE_PREVIEW_MAX_CHARS + 30) })
+  assert.equal(long.preview.length, surface.QUOTE_PREVIEW_MAX_CHARS, '摘录截到上限、末尾补省略号')
+  assert.equal(long.preview.endsWith('…'), true)
+  const old = surface.normalizeQuoteRecord({ cardKey: 'a:1', kind: 'assistant', preview: 'x', updatedAt: 1234 })
+  assert.equal(surface.quoteAlive(old, 1234), true)
+  assert.equal(surface.quoteAlive(old, 1234 + surface.QUOTE_TTL_MS + 1), false, '超过 30 分钟不挂着')
+  assert.equal(surface.quoteAlive(null), false)
+
+  const seen = []
+  const hostQuote = new Map()
+  const fetchImpl = async (url, init) => {
+    seen.push({ url, init })
+    if (!url.startsWith(surface.ASSISTANT_SECRETARY_QUOTE_ROUTE)) return { ok: false }
+    if (init?.method === 'POST') {
+      const body = JSON.parse(init.body)
+      if (body.mark === 'clear') hostQuote.delete(body.sessionId)
+      else hostQuote.set(body.sessionId, { ...body, refSessionIds: body.refSessionIds ?? [] })
+      return { ok: true }
+    }
+    return { ok: true, quote: hostQuote.get(new URL(url).searchParams.get('sessionId')) ?? null }
+  }
+  const store = surface.createSecretaryQuoteStore({ fetchImpl, storage: null })
+  store.setSession('session-secretary')
+  assert.equal(store.setQuote({ cardKey: 'assistant:turn:7', kind: 'assistant', turnNo: '7', preview: '今天武汉 8 到 14 摄氏度', refSessionIds: [] }), true)
+  assert.equal(store.isQuoted('assistant:turn:7'), true)
+  assert.equal(store.isQuoted('notice:14:msg-cu-01'), false)
+  assert.equal(store.setQuote({ cardKey: 'notice:14:msg-cu-01', kind: 'notice', preview: '电脑操作会话已完成。', refSessionIds: ['session-cu-1'] }), true)
+  assert.equal(store.isQuoted('notice:14:msg-cu-01'), true, '一张卡只能挂着一条当前引用')
+  const posted = seen.filter((item) => item.init?.method === 'POST')
+  assert.equal(posted.length, 2, '每次登记都落宿主')
+  assert.equal(posted[0].init.url ?? posted[0].url, surface.ASSISTANT_SECRETARY_QUOTE_ROUTE)
+  assert.equal(JSON.parse(posted[0].init.body).sessionId, 'session-secretary')
+  assert.equal(JSON.parse(posted[1].init.body).refSessionIds[0], 'session-cu-1', '卡片里的会话 id 一起登记')
+  assert.equal(store.clearQuote('assistant:turn:7'), false, 'key 不匹配当前引用不许乱清')
+  assert.equal(store.clearQuote('notice:14:msg-cu-01'), true)
+  assert.equal(store.isQuoted('notice:14:msg-cu-01'), false)
+
+  // 宿主答不上 → 降级用 localStorage 缓存，且不阻塞
+  const cache = new Map()
+  const storage = { getItem: (key) => cache.get(key) ?? null, setItem: (key, value) => { cache.set(key, value) } }
+  storage.setItem(surface.QUOTE_STORAGE_PREFIX + 'session-2', JSON.stringify({ cardKey: 'notice:turn:9', kind: 'notice', preview: 'x', refSessionIds: [], updatedAt: Date.now() }))
+  const degraded = surface.createSecretaryQuoteStore({ fetchImpl: async () => ({ ok: false }), storage })
+  degraded.setSession('session-2')
+  const degradedHydrated = await degraded.hydrate()
+  assert.equal(degradedHydrated.ok, true)
+  assert.equal(degradedHydrated.hostOk, false)
+  assert.equal(degraded.isQuoted('notice:turn:9'), true)
+  const throwing = surface.createSecretaryQuoteStore({ fetchImpl: async () => { throw new Error('网络断了') }, storage: null })
+  throwing.setSession('session-3')
+  const thrown = await throwing.hydrate()
+  assert.equal(thrown.ok, true, '宿主答不上不许阻塞渲染')
+  assert.equal(thrown.hostOk, false)
+  assert.equal(surface.secretaryQuoteStore() !== null, true, '进程内引用 store 懒创建')
+}])
+
+cases.push(['过期通知卡不进卡片窗口（第 1 项）：buildSecretaryPagerCards 只数还没到点的通知', () => {
+  const now = Date.now()
+  const pad = (value) => String(value).padStart(2, '0')
+  const clock = `${pad(new Date(now).getHours())}:${pad(new Date(now).getMinutes())}`
+  const rows = [
+    fakeUserRow('8:11:msg-new', '8', '（系统通知，不是用户说的话）\n电脑操作会话「备份」这一轮已经完成。', clock),
+    fakeUserRow('8:12:msg-old', '8', '（系统通知，不是用户说的话）\n老的通知正文。', '11月22日 9:08'),
+    fakeUserRow('8:13:user', '8', '真实用户消息正文', clock),
+  ]
+  const doc = {
+    querySelectorAll: (selector) => {
+      if (selector === '[data-chat-flow-kind="user"]') return rows
+      if (selector === '[data-chat-turn]') return [{ getAttribute: () => '8' }]
+      if (selector.includes('data-dsh-scard')) return []
+      return []
+    },
+  }
+  const cards = surface.buildSecretaryPagerCards(doc)
+  const keys = cards.map((card) => card.cardKey)
+  assert.ok(keys.includes('notice:8:11:msg-new'), '没过期的通知卡仍然占一个卡位')
+  assert.ok(!keys.some((key) => key.includes('msg-old')), '过期通知卡不再计入窗口（也不会被折叠行还原）')
+  assert.ok(keys.includes('user:8:13:user'), '真实用户消息不受过期口径影响')
+}])
+
+function fakeUserRow(nodeKey, turnNo, text, clockText) {
+  return {
+    getAttribute: (name) => (name === 'data-chat-flow-kind' ? 'user'
+      : name === 'data-chat-node-key' ? nodeKey
+        : name === 'data-chat-turn' ? turnNo : null),
+    querySelector: (selector) => {
+      if (selector === '[data-slot="conversation.user.text.node"]') return { textContent: text }
+      if (selector === '[data-clock]') return { textContent: clockText }
+      return null
+    },
+  }
+}
+
+cases.push(['扫描层打标（第 3 项）：compact 两行按 kind 与文字判据打标，我们的卡一律不碰', () => {
+  const tagged = []
+  const rows = [
+    { kind: 'manual-compaction', text: 'compact 已压缩 41 条历史记录（约 19692 tokens）', ownCard: false },
+    { kind: 'compaction', text: '独立摘要行', ownCard: false },
+    { kind: 'command', text: 'compact: Compaction could not produce a useful summary. The attempt is recorded in the session log.', ownCard: false },
+    { kind: 'user', text: '用户自己说：已压缩 41 条历史记录（约 19692 tokens）', ownCard: true },
+    { kind: 'assistant-step', text: '好的，我看完了', ownCard: true },
+    { kind: 'context', text: '普通上下文行', ownCard: false },
+  ].map((row) => ({
+    getAttribute: (name) => (name === 'data-chat-flow-kind' ? row.kind : null),
+    textContent: row.text,
+    querySelector: (inner) => (inner === '[data-dsh-scard="card"]' && row.ownCard ? {} : null),
+    setAttribute: (name, value) => { tagged.push({ name, value, kind: row.kind }) },
+    removeAttribute: () => {},
+  }))
+  const out = surface.tagSecretaryCompactHintRows({ querySelectorAll: () => rows })
+  assert.equal(out.kindRows, 2, 'compaction / manual-compaction 两行按 kind 打标')
+  assert.equal(out.textRows, 1, '文字判据只命中那一条 command 行')
+  assert.deepEqual(tagged.filter((item) => item.kind === 'user'), [], '用户卡里出现同样字样不许打标')
+  assert.equal(tagged.every((item) => item.name === surface.COMPACT_HINT_ATTRIBUTE && item.value === 'hint'), true, '打的都是那一个标记')
+  assert.equal(surface.COMPACT_HINT_ATTRIBUTE, 'data-dsh-scard-compact')
 }])
 
 let failed = 0

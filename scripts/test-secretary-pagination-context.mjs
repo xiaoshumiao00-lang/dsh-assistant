@@ -52,18 +52,27 @@ function readSessionEvents(file) {
 const realEvents = readSessionEvents(SESSION_FILE)
 const realCards = shared.historyItemsFromEvents(realEvents)
 
+/** 卡计数口径（现网实测 2026-11-23）：assistant 卡按「有正文的 assistant/message 轮次」去重算。
+ *  管线对空正文的 assistant/message 按设计不出卡（与下面 user/notice 那条 `eventText !== ''` 同一判据）。
+ *  真会话里确实存在这种轮：轮 212 唯一一条 assistant/message 抽出来是空串 → 那一轮没有卡。
+ *  旧写法「按所有 assistant/message 轮次去重」把这种轮算进来，等式就永远差一张。 */
+function assistantTurnsWithText(events) {
+  return new Set(events
+    .filter((event) => event?.type === 'assistant/message' && shared.eventText(event) !== '')
+    .map((event) => Number(event?.data?.turn ?? 0))).size
+}
+
 /** 这条会话正在被真人使用：读盘那一刻宿主机可能正在追加最后一帧（半轮），
  *  计数等式会瞬时失真。允许 settle 后重读重试几次，仍不一致才算真红。 */
 function readSessionEventsSettled(file, attempts = 4, delayMs = 700) {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const events = readSessionEvents(file)
-    const assistant = events.filter((event) => event?.type === 'assistant/message')
     const users = events.filter((event) => event?.type === 'user/message')
     const cards = shared.historyItemsFromEvents(events)
     const kinds = new Map()
     for (const item of cards) kinds.set(item.kind, (kinds.get(item.kind) ?? 0) + 1)
     const consistent =
-      (kinds.get('assistant') ?? 0) === new Set(assistant.map((event) => Number(event?.data?.turn ?? 0))).size
+      (kinds.get('assistant') ?? 0) === assistantTurnsWithText(events)
       && (kinds.get('user') ?? 0) + (kinds.get('notice') ?? 0) === users.filter((event) => shared.eventText(event) !== '').length
     if (consistent || attempt === attempts - 1) return { events, cards, settled: consistent }
     const start = Date.now()
@@ -76,9 +85,9 @@ cases.push(['真会话卡计数：按卡计数（assistant 每轮一张 / user /
   const { events, cards } = readSessionEventsSettled(SESSION_FILE)
   const kinds = new Map()
   for (const item of cards) kinds.set(item.kind, (kinds.get(item.kind) ?? 0) + 1)
-  const assistantTurns = new Set(events.filter((event) => event?.type === 'assistant/message').map((event) => Number(event?.data?.turn ?? 0))).size
+  const assistantTurns = assistantTurnsWithText(events)
   const userMessages = events.filter((event) => event?.type === 'user/message' && shared.eventText(event) !== '').length
-  assert.equal(kinds.get('assistant'), assistantTurns, 'assistant/message 按轮次去重成一张卡')
+  assert.equal(kinds.get('assistant'), assistantTurns, 'assistant 卡按「有正文的轮次」去重计数（空正文的 assistant/message 按设计不出卡）')
   assert.equal((kinds.get('user') ?? 0) + (kinds.get('notice') ?? 0), userMessages, '每条有正文的 user/message 正好一张卡（用户卡或通知卡；空正文事件管线按设计跳过）')
   assert.ok(cards.length >= 137, `整条会话 ${cards.length} 张卡（这条会话还在长，按真实现算）`)
   // 顺序：同 kind 内 seq 必须升序（分页游标靠它）。跨 kind 允许一次倒序——
@@ -89,6 +98,20 @@ cases.push(['真会话卡计数：按卡计数（assistant 每轮一张 / user /
     assert.deepEqual(kindSeqs, [...kindSeqs].sort((a, b) => a - b), `${kind} 卡按 seq 升序`)
   }
   assert.equal(new Set(cards.map((item) => item.cardKey)).size, cards.length, 'cardKey 每张卡唯一')
+}])
+
+cases.push(['空正文事件一律不出卡（assistant 与 user 同一判据）：轮 212 那种只有空正文的 assistant 轮没有卡', () => {
+  const events = [
+    { seq: 1, type: 'turn/start', data: { turn: 1 } },
+    { seq: 2, type: 'assistant/message', data: { turn: 1, content: [{ type: 'text', text: '有正文的第一轮回复' }] } },
+    { seq: 3, type: 'turn/start', data: { turn: 2 } },
+    { seq: 4, type: 'assistant/message', data: { turn: 2, content: [{ type: 'text', text: '   ' }] } },
+    { seq: 5, type: 'user/message', data: { turn: 2, content: [{ type: 'text', text: '' }] } },
+  ]
+  const items = shared.historyItemsFromEvents(events)
+  assert.deepEqual(items.map((item) => item.kind), ['assistant'], '空正文的 assistant 与 user 事件都不出卡')
+  assert.equal(assistantTurnsWithText(events), items.filter((item) => item.kind === 'assistant').length, '助手卡计数口径与管线对得上')
+  assert.equal(new Set(events.filter((event) => event?.type === 'assistant/message').map((event) => Number(event?.data?.turn ?? 0))).size, 2, '按轮号算会把空正文那轮也算进来（旧口径的红）')
 }])
 
 cases.push(['折叠行短标题口径稳定可复现：首行前 24 码点，同一输入永远同一标题', () => {

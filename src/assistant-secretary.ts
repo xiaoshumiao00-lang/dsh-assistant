@@ -250,6 +250,113 @@ const READ_STATE_FILENAME = 'dsh-assistant-secretary-read.json'
 export const READ_MAX_KEYS = 400
 const READ_CARD_KEY_RE = /^[A-Za-z0-9:._#-]{1,200}$/
 
+/* ── 卡片引用登记（2026-11-23 第 4 项需求）────────────────────────────────
+ * 客户端那颗「引用」按钮（卡片脚部、时间左边）写这条路由；插件落
+ * dsh-assistant-secretary-quote.json（每条会话只留一条当前引用），随后由下面那条
+ * systemPrompt 段落（order 1783，只喂秘书会话）把这张卡的种类 / 轮次 / 摘录 /
+ * `[[session:…]]` 会话 id 喂给秘书模型——用户接下去那条消息就是接着它说的内容。
+ * 真实用户消息把引用吃掉之后（那一轮 turn/end）清掉；用户一直没发消息 → 30 分钟过期。
+ * 引用只喂上下文：只读闸、通知回合锁定一个字都没动，不给任何工具开口子。
+ * cardKey 口径与已读集合同一条正则，与客户端 normalizeCardKey 同一形状。 */
+export const ASSISTANT_SECRETARY_QUOTE_ROUTE = '/api/assistant/secretary-quote'
+const QUOTE_STATE_FILENAME = 'dsh-assistant-secretary-quote.json'
+/** 一条引用最多活多久（用户点了引用但一直没往下说时，不许无限挂着）。 */
+export const QUOTE_TTL_MS = 30 * 60 * 1000
+/** 引用摘录上限：只用于告诉模型「引用的是哪段话」，不是完整汇报口径。 */
+export const QUOTE_PREVIEW_MAX_CHARS = 600
+/** 三种卡片种类（与客户端 CARD_KIND_* 同一组字面量）。 */
+export const QUOTE_CARD_KINDS = ['assistant', 'user', 'notice'] as const
+/** 引用注入段的段落号（1785 语音输入段、1790 派活分层段之间；不并入任何既有段落）。 */
+export const SECRETARY_QUOTE_SECTION_ORDER = 1783
+
+export interface SecretaryQuoteRecord {
+  cardKey: string
+  kind: string
+  turnNo: string
+  preview: string
+  refSessionIds: string[]
+  /** 客户端写入时刻（epoch ms）；TTL 就按它算。 */
+  updatedAt: number
+}
+
+export function normalizeQuoteCardKey(raw: unknown): string {
+  const value = String(raw ?? '').trim()
+  return READ_CARD_KEY_RE.test(value) ? value : ''
+}
+
+/** 归一引用里的会话 id 列表：坏值丢、按序去重、最多 8 条（与客户端 normalizeQuoteSessionIds 同一口径）。 */
+export function normalizeQuoteSessionIds(raw: unknown): string[] {
+  const list = Array.isArray(raw) ? raw : []
+  const out: string[] = []
+  for (const item of list) {
+    const id = String(item ?? '').trim()
+    if (id === '' || id.length > 120 || !SESSION_ID_RE.test(id) || out.includes(id)) continue
+    out.push(id)
+    if (out.length >= 8) break
+  }
+  return out
+}
+
+/** 归一条引用记录：形状不对整条丢（宁可不注入也不乱注入；与客户端 normalizeQuoteRecord 同一口径）。 */
+export function normalizeQuoteRecord(raw: unknown, now = Date.now()): SecretaryQuoteRecord | null {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : null
+  if (source === null) return null
+  const cardKey = normalizeQuoteCardKey(source.cardKey)
+  const kind = String(source.kind ?? '').trim()
+  if (cardKey === '' || !(QUOTE_CARD_KINDS as readonly string[]).includes(kind)) return null
+  const previewRaw = String(source.preview ?? '')
+  const preview = previewRaw.length > QUOTE_PREVIEW_MAX_CHARS ? `${previewRaw.slice(0, QUOTE_PREVIEW_MAX_CHARS - 1)}…` : previewRaw
+  const updatedAtRaw = Number(source.updatedAt)
+  const updatedAt = Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? updatedAtRaw : now
+  return { cardKey, kind, turnNo: String(source.turnNo ?? '').trim(), preview, refSessionIds: normalizeQuoteSessionIds(source.refSessionIds), updatedAt }
+}
+
+/** 这条引用还在不在（与客户端 quoteAlive 同一口径）。 */
+export function quoteAlive(record: SecretaryQuoteRecord | null, now = Date.now(), ttlMs = QUOTE_TTL_MS): boolean {
+  if (record === null) return false
+  return now - record.updatedAt <= ttlMs
+}
+
+/** 归一「sessionId → 当前引用」的存储：坏 sessionId 丢、坏记录丢、过期记录丢。 */
+export function normalizeSecretaryQuoteState(raw: unknown, now = Date.now()): Record<string, SecretaryQuoteRecord> {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  const out: Record<string, SecretaryQuoteRecord> = {}
+  for (const [sessionId, value] of Object.entries(source)) {
+    if (!SESSION_ID_RE.test(String(sessionId ?? ''))) continue
+    const record = normalizeQuoteRecord(value, now)
+    if (record === null || !quoteAlive(record, now)) continue
+    out[sessionId] = record
+  }
+  return out
+}
+
+const QUOTE_KIND_LABELS: Record<string, string> = {
+  notice: '系统通知卡',
+  user: '用户消息卡',
+  assistant: '秘书回复卡',
+}
+
+/**
+ * 引用注入段正文（纯函数，测试逐条断言）。
+ * 语义：这张卡就是下一条消息要回复的对象；摘录只是定位用，结果口径仍然完整照实。
+ */
+export function secretaryQuoteInjectionText(record: SecretaryQuoteRecord | null): string {
+  if (record === null) return ''
+  const kindLabel = QUOTE_KIND_LABELS[record.kind] ?? '卡片'
+  const lines = [
+    '# 卡片引用（个人秘书）',
+    `用户刚在会话页上按了「引用」，引用的就是下面这张${kindLabel}；用户接下来那条消息就是要接着它说的内容。`,
+    `定位：kind=${record.kind}｜轮次 ${record.turnNo === '' ? '未知' : record.turnNo}｜cardKey=${record.cardKey}`,
+    `卡片正文摘录（不是完整汇报，只用来定位引用的是哪段话）：${record.preview}`,
+  ]
+  if (record.refSessionIds.length > 0) {
+    lines.push(`这张卡里引用的会话 id：${record.refSessionIds.join('、')}——接着这件事要继续，就用 secretary_dispatch kind=existing 落到那条会话所在的项目目录。`)
+  }
+  lines.push('处理要求：把用户这条消息当作对这张卡的回应；不许因为摘录短就把用户那条消息里的要求吞掉，也不许把这张卡的原有内容改写成别的说法。引用登记只说明「接着哪张卡说」，不改变任何派活与工具规则。')
+  return lines.join('\n')
+}
+
+
 export function normalizeReadCardKey(raw: unknown): string {
   const value = String(raw ?? '').trim()
   return READ_CARD_KEY_RE.test(value) ? value : ''
@@ -469,10 +576,117 @@ export function registerAssistantSecretary(ctx: any): () => void {
     },
   })
 
+  // ── 卡片引用登记（未读红点那套 store 的同一形状：文件 + chain，不写会话日志）────
+  const quoteFile = join(profileDir(ctx), QUOTE_STATE_FILENAME)
+  const quoteState: Record<string, SecretaryQuoteRecord> = (() => {
+    try {
+        return normalizeSecretaryQuoteState(JSON.parse(readFileSync(quoteFile, 'utf8')).quoteBySession)
+    } catch {
+      return {}
+    }
+  })()
+  let quoteUpdatedAt = ''
+  // 引用登记（第 4 项）：真实用户消息那轮把引用吃掉 → 那一轮 turn/end 清掉这条引用。
+  // 系统通知那轮不许吃掉（用户可能刚按了引用、CU 结果随后才送来）。
+  let quoteConsumedTurn = false
+
+  const persistQuoteState = (): Promise<void> => {
+    const task = async (): Promise<void> => {
+      mkdirSync(dirname(quoteFile), { recursive: true })
+      const tmp = `${quoteFile}.${process.pid}.tmp`
+      const payload = { version: 1, updatedAt: new Date().toISOString(), quoteBySession: quoteState }
+      writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8')
+      renameSync(tmp, quoteFile)
+      quoteUpdatedAt = payload.updatedAt
+    }
+    const run = chain.then(task, task)
+    chain = run.then(() => void 0, () => void 0)
+    return run
+  }
+
+  const liveQuote = (sessionId: string): SecretaryQuoteRecord | null => {
+    const record = quoteState[sessionId]
+    if (record === undefined) return null
+    if (!quoteAlive(record)) {
+      delete quoteState[sessionId]
+      void persistQuoteState().catch(() => void 0)
+      return null
+    }
+    return record
+  }
+
+  webServer.register({
+    kind: 'exact',
+    path: ASSISTANT_SECRETARY_QUOTE_ROUTE,
+    handler: async (req: any, res: any) => {
+      const method = String(req.method ?? 'GET').toUpperCase()
+      try {
+        if (method === 'POST' || method === 'PUT') {
+          const body = await readJsonBody(req)
+          if (body?.__tooLarge === true) { sendJson(res, 413, { ok: false, error: 'too-large' }); return }
+          const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : ''
+          if (!SESSION_ID_RE.test(sessionId)) { sendJson(res, 400, { ok: false, error: 'invalid-session-id' }); return }
+          const mark = typeof body?.mark === 'string' ? body.mark.trim() : ''
+          if (mark === 'clear') {
+            const had = quoteState[sessionId] !== undefined
+            delete quoteState[sessionId]
+            quoteConsumedTurn = false
+            if (had) await persistQuoteState()
+            sendJson(res, 200, { ok: true, sessionId, quote: null, cleared: had, updatedAt: quoteUpdatedAt })
+            return
+          }
+          if (mark !== 'quote') { sendJson(res, 400, { ok: false, error: 'invalid-mark' }); return }
+          const record = normalizeQuoteRecord({
+            cardKey: body?.cardKey,
+            kind: body?.kind,
+            turnNo: body?.turnNo,
+            preview: body?.preview,
+            refSessionIds: body?.refSessionIds,
+            updatedAt: typeof body?.updatedAt === 'number' ? body.updatedAt : Date.now(),
+          })
+          if (record === null) { sendJson(res, 400, { ok: false, error: 'invalid-quote' }); return }
+          const previous = quoteState[sessionId]
+          if (previous !== undefined && previous.cardKey === record.cardKey && previous.updatedAt === record.updatedAt) {
+            sendJson(res, 200, { ok: true, sessionId, quote: record, unchanged: true, updatedAt: quoteUpdatedAt })
+            return
+          }
+          quoteState[sessionId] = record
+          quoteConsumedTurn = false
+          await persistQuoteState()
+          sendJson(res, 200, { ok: true, sessionId, quote: record, unchanged: false, updatedAt: quoteUpdatedAt })
+          return
+        }
+        const query = parseSecretaryRequestQuery(String(req.url ?? ''))
+        const askedId = query.requestedId !== '' ? query.requestedId : (state?.sessionId ?? '')
+        if (askedId === '' || !SESSION_ID_RE.test(askedId)) {
+          sendJson(res, 400, { ok: false, error: 'invalid-session-id' })
+          return
+        }
+        if (method === 'GET' || method === 'HEAD') {
+          sendJson(res, 200, { ok: true, sessionId: askedId, quote: liveQuote(askedId), ttlMs: QUOTE_TTL_MS, updatedAt: quoteUpdatedAt })
+          return
+        }
+        if (method === 'DELETE') {
+          const had = quoteState[askedId] !== undefined
+          delete quoteState[askedId]
+          if (had) await persistQuoteState()
+          sendJson(res, 200, { ok: true, sessionId: askedId, quote: null, cleared: had })
+          return
+        }
+        res.writeHead(405, { allow: 'GET, HEAD, POST, PUT, DELETE' })
+        res.end()
+      } catch (err: any) {
+        sendJson(res, 500, { ok: false, error: 'internal', message: String(err?.message ?? err) })
+      }
+    },
+  })
+
   // 「系统通知回合」标记：由 agent/pre-step 里声明的那批消息判定，turn/end 或下一批真实
   // 用户消息到达时清掉；10 分钟兜底过期，绝不让一次异常把秘书的工具永久锁死。
   let noticeTurn = false
   let noticeTurnAt = 0
+
+
   const NOTICE_TURN_TTL_MS = 10 * 60 * 1000
   const noticeTurnActive = (): boolean => {
     if (!noticeTurn) return false
@@ -483,7 +697,19 @@ export function registerAssistantSecretary(ctx: any): () => void {
   try {
     const off = ctx.on?.('session/event', (session: any, event: any) => {
       if (String(session?.id ?? '') !== activeSessionId) return
-      if (String(event?.type ?? '') === 'turn/end') { noticeTurn = false; noticeTurnAt = 0 }
+      const type = String(event?.type ?? '')
+      if (type === 'turn/end') {
+        noticeTurn = false
+        noticeTurnAt = 0
+        // 引用吃掉口径：这一轮真的把某条引用喂过了（真实用户消息），就该收掉；没吃掉的不收
+        if (quoteConsumedTurn) {
+          quoteConsumedTurn = false
+          if (quoteState[activeSessionId] !== undefined) {
+            delete quoteState[activeSessionId]
+            void persistQuoteState().catch(() => void 0)
+          }
+        }
+      }
     })
     if (typeof off === 'function') offNoticeReset = off
   } catch {
@@ -534,6 +760,8 @@ export function registerAssistantSecretary(ctx: any): () => void {
         const notice = claimed.some((message: any) => isNoticeMessageId(message?.id))
         noticeTurn = notice
         noticeTurnAt = notice ? Date.now() : 0
+        // 引用吃掉：真实用户消息（不是插件送进来的通知）这一轮确实接上了那张卡 → 本轮 turn/end 收掉引用
+        if (!notice && quoteState[activeSessionId] !== undefined) quoteConsumedTurn = true
       }
       let mode = ''
       try {
@@ -600,12 +828,40 @@ export function registerAssistantSecretary(ctx: any): () => void {
     offVoiceInput = undefined
   }
 
+  // 卡片引用注入段（2026-11-23 第 4 项需求）：用户按了「引用」以后，把那张卡的种类/轮次/摘录/
+  // 会话 id 喂给秘书模型，让下一条消息接得上。只喂秘书会话；引用没过期前只喂这一轮。
+  let offQuoteSection: (() => void) | undefined
+  try {
+    const systemPrompt = (typeof ctx?.get === 'function' ? ctx?.get('systemPrompt') : undefined) ?? ctx?.systemPrompt
+    if (systemPrompt && typeof systemPrompt.section === 'function') {
+      offQuoteSection = systemPrompt.section({
+        name: 'assistant:secretary-card-quote',
+        order: SECRETARY_QUOTE_SECTION_ORDER, // 1785（语音输入）与 1790（派活分层）之间，不并入任何既有段落
+        text: (context: any) => {
+          const sessionId = String(context?.agent?.session?.id ?? '')
+          if (sessionId === '' || sessionId !== activeSessionId) return ''
+          const record = quoteState[sessionId]
+          if (record === undefined) return ''
+          if (!quoteAlive(record)) {
+            delete quoteState[sessionId]
+            void persistQuoteState().catch(() => void 0)
+            return ''
+          }
+          return secretaryQuoteInjectionText(record)
+        },
+      })
+    }
+  } catch {
+    offQuoteSection = undefined
+  }
+
   return () => {
     try { offToolGate?.() } catch {}
     try { offNoticeReset?.() } catch {}
     try { offStepGate?.() } catch {}
     try { if (typeof offSpeechStyle === 'function') offSpeechStyle() } catch {}
     try { if (typeof offVoiceInput === 'function') offVoiceInput() } catch {}
+    try { if (typeof offQuoteSection === 'function') offQuoteSection() } catch {}
     try { routes.dispose() } catch {}
   }
 }
@@ -841,4 +1097,14 @@ export const assistantSecretaryTestSurface = {
   compressSessionLogText,
   decompressSessionLogBytes,
   parseSecretaryRequestQuery,
+  ASSISTANT_SECRETARY_QUOTE_ROUTE,
+  SECRETARY_QUOTE_SECTION_ORDER,
+  QUOTE_TTL_MS,
+  QUOTE_PREVIEW_MAX_CHARS,
+  normalizeQuoteCardKey,
+  normalizeQuoteSessionIds,
+  normalizeQuoteRecord,
+  quoteAlive,
+  normalizeSecretaryQuoteState,
+  secretaryQuoteInjectionText,
 }
