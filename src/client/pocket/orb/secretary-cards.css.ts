@@ -14,11 +14,17 @@
  *   - 底部操作栏右对齐：**引用 → 时间（HH:MM）紧贴复制按钮左侧** → 复制 → 分隔线 → 展开全文；
  *   - ≤520px：卡片 100%，脚部时间仍然显示，朗读按钮仍在右上角。
  *
- * 只对个人秘书固定会话生效：原始 markdown 气泡、过程信息行、消息操作行与空壳都被隐藏。
+ * 只对个人秘书固定会话生效：原始 markdown 气泡、过程信息行（含 reasoning 分组行，2026-11-24 起一律不出图）、
+ * 消息操作行与空壳都被隐藏；对话流里只剩卡片（秘书回复卡 / 用户卡 / 通知卡 / 折叠行）。
  */
 export const SECRETARY_CARD_CSS = `
-/* 原始 markdown 气泡：秘书回复统一走卡片 */
-body[data-dsh-secretary="1"] [data-chat-flow-kind="assistant-step"]:not([data-chat-group-part="reasoning"]) {
+/* 原始 markdown 气泡 + 过程行：秘书回复统一走卡片，assistant-step 一律不出图。
+ * 2026-11-24 用户实报（安卓 10:09 截图）：旧规则用 :not([data-chat-group-part="reasoning"])
+ * 把 reasoning 分组行放了过来，那正是带放大镜的「已搜索代码并调用工具」「已搜索代码，已读取文件，已调用工具等」。
+ * 用户口径是「个人秘书页面只显示卡片消息，过程消息一条都不能有」→ 去掉 :not 排除；
+ * 再按 group-part 属性兜一条，宿主以后把 reasoning 拆成别的 kind 时同样压掉。 */
+body[data-dsh-secretary="1"] [data-chat-flow-kind="assistant-step"],
+body[data-dsh-secretary="1"] [data-chat-group-part="reasoning"] {
   display: none !important;
 }
 /* 过程信息行：已完成/用时/处理失败/已重试模型请求/本轮运行失败 —— 渲染层真正不输出 */
@@ -62,6 +68,12 @@ body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard=
   display: none !important;
 }
 body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard="card"][data-dsh-scard-kind="user"], > [data-dsh-scard="card"][data-dsh-scard-kind="notice"], > [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="user"], > [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="notice"]) [data-slot="conversation.user.text.node"] > span:not([data-dsh-scard]) {
+  display: none !important;
+}
+/* 兜底（2026-11-24）：卡片确实在行里、只是被 React 包进更深一层容器时，上面那条「直接子代」判据会漏，
+ * 宿主气泡就冒回来（安卓那次截图里用户消息仍是原生气泡，桌面上同一条消息是卡片）。这条按后代再压一次，
+ * 仍只压纯文本气泡：带附件的行（:has(img)）保留宿主气泡，附件芯片不能丢。 */
+body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has([data-dsh-scard="card"][data-dsh-scard-kind="user"], [data-dsh-scard="card"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"]:not(:has(img)) {
   display: none !important;
 }
 

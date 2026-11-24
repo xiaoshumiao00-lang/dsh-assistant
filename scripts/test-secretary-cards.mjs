@@ -9,9 +9,14 @@
  *   ④ 控制器：默认播放、暂停继续、长按重读、**切 key 停上一条**（只读当前卡片）。
  */
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const lib = await import('../lib/index.js')
 const surface = lib.secretaryCardsTestSurface
+const cardShared = lib.secretCardSharedTestSurface
 
 const cases = []
 
@@ -894,6 +899,30 @@ cases.push(['扫描层打标（第 3 项）：compact 两行按 kind 与文字�
   assert.deepEqual(tagged.filter((item) => item.kind === 'user'), [], '用户卡里出现同样字样不许打标')
   assert.equal(tagged.every((item) => item.name === surface.COMPACT_HINT_ATTRIBUTE && item.value === 'hint'), true, '打的都是那一个标记')
   assert.equal(surface.COMPACT_HINT_ATTRIBUTE, 'data-dsh-scard-compact')
+}])
+
+cases.push(['秘书页只显示卡片：assistant-step（含 reasoning 分组行）一律不出图、放行 reasoning 的 :not 已删、用户消息仍由卡片接管气泡、观感口径 900/600/200 一个没变', () => {
+  const css = readFileSync(join(ROOT, 'src/client/pocket/orb/secretary-cards.css.ts'), 'utf8')
+  // ① 过程行（截图里带放大镜那两行）的根因：旧规则用 :not([data-chat-group-part="reasoning"]) 把 reasoning 分组行放过来了
+  assert.ok(!css.includes('[data-chat-flow-kind="assistant-step"]:not([data-chat-group-part="reasoning"])'),
+    '样式表里不许再留放行 reasoning 分组的 :not 排除——那正是「已搜索代码并调用工具」冒出来的原因')
+  assert.match(css,
+    /body\[data-dsh-secretary="1"\] \[data-chat-flow-kind="assistant-step"\],\s*\nbody\[data-dsh-secretary="1"\] \[data-chat-group-part="reasoning"\] \{\s*\n\s*display: none !important;/,
+    'assistant-step 与 reasoning 分组行都要被 display:none !important 压掉（含 group-part 兜底）')
+  // ② 用户消息必须是卡片：接管判据两条都在（原 :has(> …) 判据一个字不动 + 2026-11-24 加的后代兜底）
+  assert.match(css,
+    /\[data-chat-flow-kind="user"\]:has\(> \[data-dsh-scard="card"\]\[data-dsh-scard-kind="user"\], > \[data-dsh-scard="card"\]\[data-dsh-scard-kind="notice"\], > \[data-dsh-scard="collapsed-row"\]\[data-dsh-scard-kind="user"\], > \[data-dsh-scard="collapsed-row"\]\[data-dsh-scard-kind="notice"\]\) > \[data-slot="conversation\.chat\.node"\]:not\(:has\(img\)\)/,
+    '带用户卡/通知卡的那条用户行必须把宿主气泡压掉（原 :has(> …) 判据保持不动）')
+  assert.match(css,
+    /\[data-chat-flow-kind="user"\]:has\(\[data-dsh-scard="card"\]\[data-dsh-scard-kind="user"\], \[data-dsh-scard="card"\]\[data-dsh-scard-kind="notice"\]\) > \[data-slot="conversation\.chat\.node"\]:not\(:has\(img\)\)/,
+    '还要有按后代匹配的兜底：卡片被包进更深一层时也不许让原生气泡冒回来')
+  // 带附件的用户行仍保留宿主气泡（附件芯片不能丢）：两条规则都带 :not(:has(img))
+  assert.equal((css.match(/:not\(:has\(img\)\)/g) ?? []).length >= 2, true, '保留带附件行气泡的例外')
+  // ③ 卡片观感口径三个数一个都没变（本批只动过程行隐藏，不许顺手改观感）
+  assert.equal(cardShared.HISTORY_PREVIEW_MAX_CHARS, 900, '列表预览上限仍是 900')
+  assert.equal(surface.QUOTE_PREVIEW_MAX_CHARS, 600, '引用预览上限仍是 600')
+  const registrySource = readFileSync(join(ROOT, 'vendor/computer-use/code-agent-registry-DDJfS2Fl.js'), 'utf8')
+  assert.match(registrySource, /const BOOKMARK_OUTCOME_MAX_CHARS = 200;/, '书签出口仍是 200')
 }])
 
 let failed = 0
