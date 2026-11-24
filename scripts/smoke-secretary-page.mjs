@@ -985,7 +985,7 @@ try {
       && ucard.noticeEllipsis === '…',
       JSON.stringify({ para: ucard.noticeParaSize, title: ucard.noticeTitleSize, maxHeight: ucard.noticeMaxHeightRaw, dot: ucard.noticeDot, ellipsis: ucard.noticeEllipsis }))
   } else {
-    notes.push('通知卡字号现场核对：窗口里的通知卡全都满 10 分钟被收成空壳了，这一段改由后面的新鲜通知卡断言覆盖')
+    notes.push('通知卡字号现场核对：窗口里的通知卡全都活满 10 秒被收成空壳了，这一段改由后面的新鲜通知卡断言覆盖')
   }
   if (ucard.noticeCardedCount >= 1) {
     check('通知卡的 [[session:…]] 引用仍是可点 chip',
@@ -1335,12 +1335,13 @@ try {
       && nowState.dot !== null && nowState.dot.w === 8 && nowState.dot.h === 8 && nowState.dot.bg === 'rgb(216, 58, 43)'
       && nowState.dot.aria === '未读' && (nowState.dot.kind === 'assistant' || nowState.dot.kind === 'notice'),
     JSON.stringify({ unreadCards: nowState.unreadCardCount, dots: nowState.dotCardCount, measured: nowState.dot }))
-  // 第 1 项现场口径：过期通知卡收成空壳（display:none、不带正文、不带红点），「通知卡带红点」这条只适用于没被 10 分钟窗口收掉的卡。
-  check('红点只属于秘书侧卡（assistant/notice）：用户卡一律不带红点、没被 10 分钟收掉的通知卡带红点',
+  // 第 1 项现场口径（2026-11-24 改档 10 秒）：过期通知卡收成空壳（display:none、不带正文、不带红点），「通知卡带红点」这条只适用于没被 10 秒 TTL 收掉的卡。
+  check('红点只属于秘书侧卡（assistant/notice）：用户卡一律不带红点、没被 10 秒收掉的通知卡带红点',
     nowState.userCardsWithDot === 0 && (nowState.noticeCardsTotal === 0 ? nowState.noticeDotCount === 0 : nowState.noticeDotCount >= 1),
     JSON.stringify({ userCardsWithDot: nowState.userCardsWithDot, noticeDotCount: nowState.noticeDotCount, noticeCardsTotal: nowState.noticeCardsTotal, expiredNoticeShells: nowState.expiredNoticeShells, totalDots: nowState.totalDots, unreadCardCount: nowState.unreadCardCount }))
   const noticeAgeProbe = await page.evaluate(async (sessionId) => {
-    const TTL_MS = 10 * 60 * 1000
+    // 2026-11-24 改档：通知卡只活 10 秒（原来是 10 分钟）
+    const TTL_MS = 10 * 1000
     const now = Date.now()
     let items = []
     try {
@@ -1387,7 +1388,7 @@ try {
   if (noticeAgeProbe.old.length + noticeAgeProbe.fresh.length === 0) {
     notes.push('第 1 项现场过期核对：这一段宿主历史里没取到「同时挂在 DOM 上」的通知卡，现场跳过（判据由 scripts/test-secretary-cards.mjs 与视觉套件覆盖）')
   }
-  check('第 1 项现场证据：满 10 分钟的通知卡一律收成空壳（带 expired 属性、display:none、无正文无红点），没满 10 分钟的照旧出图；宿主原生气泡不放回来',
+  check('第 1 项现场证据（改档 10 秒）：过了 10 秒的通知卡一律收成空壳（带 expired 属性、display:none、无正文无红点），还在 10 秒内的照旧出图；宿主原生气泡不放回来',
     oldBad.length === 0 && freshBad.length === 0 && noticeAgeProbe.hiddenShells === noticeAgeProbe.shells
       && noticeAgeProbe.shellBody === 0 && noticeAgeProbe.shellDot === 0 && noticeAgeProbe.bubbleBack === 0,
     JSON.stringify({ historyNoticeItems: noticeAgeProbe.historyNoticeItems, mountedNoticeCards: noticeAgeProbe.mountedNoticeCards, shells: noticeAgeProbe.shells, hiddenShells: noticeAgeProbe.hiddenShells, bubbleBack: noticeAgeProbe.bubbleBack, old: noticeAgeProbe.old.slice(0, 3), oldBad: oldBad.slice(0, 3), freshBad: freshBad.slice(0, 3) }))
@@ -1957,19 +1958,57 @@ try {
         const nowSel = await readCurrentSessionId()
         check('点通知卡片信息行跳进那条 CU 会话（命中目标会话 id）', jumped && nowSel === cuTarget,
           `selection=${nowSel} want=${cuTarget}`)
-        // 通知卡被点引用 chip 后应立刻算已读（红点消失）
+        // 点过引用 chip 的通知卡应立刻算已读（红点消失）。
+        // 2026-11-24 改档 10 秒：从「点 chip → 跳走 → 回来」这一趟本身就可能超过 10 秒，
+        // 回来时原来那张多半已经收成空壳了。所以这里现场补投一条同样的通知来验**点击语义**
+        // （点 chip 当场已读、红点不再出现），既不靠某一条卡的存活时间，也不放松断言：
+        // 已读的真值在宿主已读集合里（`GET /api/assistant/secretary-read`），红点只是它的投影。
         await page.evaluate(() => fetch('/api/assistant/open-assistant', { method: 'POST' }))
         await page.waitForFunction((want) => {
           try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') === want } catch { return false }
         }, currentId, { timeout: 12000 }).catch(() => {})
         await page.waitForTimeout(800)
-        const afterJump = await page.evaluate((title) => {
+        const refreshedNotice = await page.evaluate(async ({ token, sessionId, title }) => {
+          try {
+            const res = await fetch(`/api/assistant/cu-watch/notify?token=${encodeURIComponent(token)}`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ sessionId, title, summary: '冒烟校对：补投一条，验「点引用 chip 当场已读」。' }),
+            })
+            return { status: res.status, ok: res.ok }
+          } catch (error) { return { status: 0, ok: false, error: String(error) } }
+        }, { token: TOKEN, sessionId: cuTarget, title: cuTitle })
+        await page.waitForFunction((title) => {
           const cards = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="notice"]:not([data-empty="1"])')]
-          const hit = cards.find((el) => (el.textContent ?? '').includes(title))
-          return hit ? { dot: hit.querySelector('[data-dsh-scard="unread-dot"]') !== null, unread: hit.getAttribute('data-unread') ?? '' } : null
-        }, cuTitle)
-        check('点过引用 chip 的通知卡当场已读（红点消失、data-unread=0）',
-          afterJump !== null && afterJump.dot === false && afterJump.unread === '0', JSON.stringify(afterJump))
+          return cards.some((el) => (el.textContent ?? '').includes(title))
+        }, cuTitle, { timeout: 20000 }).catch(() => {})
+        const afterJump = await page.evaluate(async ({ title, sessionId }) => {
+          const cards = [...document.querySelectorAll('[data-dsh-scard="card"][data-dsh-scard-kind="notice"]:not([data-empty="1"])')]
+          const hits = cards.filter((el) => (el.textContent ?? '').includes(title))
+          const hit = hits[hits.length - 1] ?? null // 最新那条（补投的那张）
+          if (hit === null) return null
+          const cardKey = hit.getAttribute('data-dsh-scard-key') ?? ''
+          const before = { dot: hit.querySelector('[data-dsh-scard="unread-dot"]') !== null, unread: hit.getAttribute('data-unread') ?? '' }
+          hit.querySelector('[data-dsh-scard="ref"]')?.click()
+          let readList = []
+          for (let i = 0; i < 40; i += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 50))
+            try {
+              const json = await fetch(`/api/assistant/secretary-read?sessionId=${encodeURIComponent(sessionId)}`).then((res) => res.json())
+              readList = Array.isArray(json?.list) ? json.list : []
+            } catch { readList = [] }
+            if (readList.includes(cardKey)) break
+          }
+          return {
+            cardKey,
+            before,
+            after: { dot: hit.querySelector('[data-dsh-scard="unread-dot"]') !== null, unread: hit.getAttribute('data-unread') ?? '' },
+            readListed: readList.includes(cardKey),
+          }
+        }, { title: cuTitle, sessionId: currentId })
+        check('点过引用 chip 的通知卡当场已读（红点不出现、data-unread=0；自动朗读先读过也算）',
+          afterJump !== null && refreshedNotice.ok === true && afterJump.after.dot === false && afterJump.after.unread === '0',
+          JSON.stringify({ refreshed: refreshedNotice, ...(afterJump ?? {}) }))
       }
     }
   } else {
@@ -2064,7 +2103,19 @@ try {
   historyRouteRequests.length = 0
   historyRouteResponses.length = 0
   await page.reload({ waitUntil: 'load' })
-  await page.waitForTimeout(6000)
+  // 刷新会按 localStorage 恢复「上次那条会话」——前面刚点过通知卡里的引用跳到 CU 会话，
+  // 刷新后就可能停在 CU 会话页：那里不是秘书页，插件不挂卡（body 也没有 data-dsh-secretary），
+  // 探针会量到 fullTotal=0 / cardBacked=0 打成假失败（旧代码同样复现，见 tmp6 基线跑）。
+  // 所以刷新后先确保回到固定秘书会话，再等卡片层挂上（2026-11-24 现场修）。
+  await page.evaluate(() => fetch('/api/assistant/open-assistant', { method: 'POST' }))
+  await page.waitForFunction((want) => {
+    try { return String(window.__dshUiWorkspace?.selection?.getSnapshot?.()?.sessionId ?? '') === want } catch { return false }
+  }, currentId, { timeout: 15000 }).catch(() => {})
+  await page.waitForFunction(() => document.querySelector('[data-dsh-secretary="1"]') !== null, { timeout: 15000 }).catch(() => {})
+  // 卡片层挂载等待：固定 6 秒是旧经验值，会长会话（现网 ~470 轮）刷新后宿主排行 + 插件扫描挂卡明显超过 6 秒；
+  // 这里改成「最多等 30 秒，等到第一张卡出现再量」；等不到就照旧按 0 张断言失败，真回归照样红。
+  await page.waitForFunction(() => document.querySelectorAll('[data-dsh-scard="card"]:not([data-empty="1"])').length > 0, { timeout: 30000 }).catch(() => {})
+  await page.waitForTimeout(1500)
   const firstWindow = await pagerProbe()
   check('分页：一次渲染的卡片数 ≤30（秘书卡/用户卡/通知卡都计入）', firstWindow.fullTotal <= 30 && firstWindow.fullTotal > 0,
     JSON.stringify({ fullTotal: firstWindow.fullTotal, assistant: firstWindow.fullAssistant, user: firstWindow.fullUser, notice: firstWindow.fullNotice }))
@@ -2073,7 +2124,7 @@ try {
     JSON.stringify({ fullTotal: firstWindow.fullTotal, collapsedTotal: firstWindow.collapsedTotal }))
   check('分页：折叠行只有一行（时间 + 24 字内短标题，一行量级高度）', firstWindow.collapsedTotal === 0 || firstWindow.collapsedSample.every((item) => item.title !== '' && !item.title.includes('\n') && [...item.title].length <= 25 && item.rowHeight > 0 && item.rowHeight <= 60),
     JSON.stringify(firstWindow.collapsedSample))
-  // 口径改宽一档、并如实写清为什么：满 10 分钟的通知卡现在被收成空壳，首屏可见内容有几率比视口短，
+  // 口径改宽一档、并如实写清为什么：活满 10 秒的通知卡现在被收成空壳，首屏可见内容有几率比视口短，
   // 顶部判据当场就成立 → 客户端会自己补最多两段更旧的卡。仍然是「按 30 张一段、上限 120 张、绝不整条回填」。
   const backfillCount = historyRouteRequests.filter((line) => line.includes('before=')).length
   check('分页：进页面/刷新不自动回填老卡（首屏最多补两段、不按 before 游标铺满整条会话）',
@@ -2224,6 +2275,8 @@ try {
         }
       })
   }, INTERRUPT_TEXT)
+  // 量插话/过程行之前一样先等卡片层挂上（刷新后挂载晚于行出现，量太早会把「还没挂」当成「没卡」）
+  await page.waitForFunction(() => document.querySelectorAll('[data-dsh-scard="card"], [data-dsh-scard="collapsed-row"]').length > 0, { timeout: 30000 }).catch(() => {})
   let interruptFacts = await MEASURE_INTERRUPT_ROWS()
   if ((interruptFacts ?? []).length === 0) {
     interruptFacts = null

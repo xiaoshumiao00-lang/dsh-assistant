@@ -318,8 +318,9 @@ cases.push(['卡片 kind 常量：秘书卡 assistant / 用户卡 user / 通知�
   // 旧的「17px/1.5 标题 + 15px/1.8 正文」那档算出来也是 162px —— 总量口径一个字没动）
   assert.equal(surface.foldCollapsedCapPx({ lineHeight: 26, titleLineHeight: 27, hasTitle: true }), 162)
   assert.equal(surface.foldCollapsedCapPx({ lineHeight: 26, hasTitle: false }), 98)
-  // 通知卡 10 分钟过期口径（第 1 项需求）：同一天的钟面、带日期的钟面、认不出时间，三种判据分开断言
-  assert.equal(surface.NOTICE_CARD_TTL_MS, 10 * 60 * 1000)
+  // 通知卡 10 秒过期口径（2026-11-24 用户改档：原 10 分钟）：同一天的钟面、带日期的钟面、认不出时间，三种判据分开断言
+  // 改档后钟面兜底的误差上界是 59.999 秒（钟面把发送时刻最多往前推一分钟），绝不提前收。
+  assert.equal(surface.NOTICE_CARD_TTL_MS, 10 * 1000, '通知卡 TTL = 10 秒（2026-11-24 改档）')
   {
     const sentAt = new Date(2026, 10, 22, 9, 8, 0, 0).getTime()
     const at908 = sentAt + 1000
@@ -327,13 +328,13 @@ cases.push(['卡片 kind 常量：秘书卡 assistant / 用户卡 user / 通知�
     const at919 = sentAt + 12 * 60 * 1000
     const fresh = surface.noticeExpiryFromClock('9:08', at908)
     assert.equal(fresh.reason, 'same-day')
-    assert.equal(fresh.expired, false, '刚发送的不到 10 分钟不许收')
+    assert.equal(fresh.expired, false, '刚发送的不到 10 秒不许收')
     assert.equal(fresh.expiresAt, sentAt + surface.NOTICE_CLOCK_MINUTE_MS - 1 + surface.NOTICE_CARD_TTL_MS)
-    // 分钟粒度只能估：宁可晚一分钟收，绝不提前一秒——10 分钟整还没到期，11 分钟才铁定到期
-    assert.equal(surface.noticeExpiryFromClock('9:08', sentAt + 10 * 60 * 1000 + 30 * 1000).expired, false, '过 10 分钟整还不收（分钟末口径）')
-    assert.equal(surface.noticeExpiryFromClock('9:08', at918).expired, true, '到点就收（分钟末 + 10 分钟）')
+    // 分钟粒度只能估：宁可晚一句钟收，绝不提前一秒——10 秒整还在钟面那一分钟里，收不了；到「分钟末 + 10 秒」才铁定到期
+    assert.equal(surface.noticeExpiryFromClock('9:08', sentAt + 10 * 1000).expired, false, '满 10 秒也不许提前收（钟面兜底等分钟末）')
+    assert.equal(surface.noticeExpiryFromClock('9:08', at918).expired, true, '到点就收（分钟末 + 10 秒）')
     assert.equal(surface.noticeExpiryFromClock('今天 9:08', at919).expired, true)
-    assert.equal(surface.noticeExpiryFromClock('11月22日 9:08', at908).expired, true, '带日期的钟面必然超过 10 分钟')
+    assert.equal(surface.noticeExpiryFromClock('11月22日 9:08', at908).expired, true, '带日期的钟面必然远超 10 秒')
     assert.equal(surface.noticeExpiryFromClock('昨天 9:08', at908).reason, 'dated-label')
     assert.equal(surface.noticeExpiryFromClock('', at908).expired, false, '认不出时间不动卡）')
     assert.equal(surface.noticeExpiryFromClock('乱码', at908).reason, 'unknown-time')
@@ -544,17 +545,17 @@ cases.push(['已读 store：宿主真值优先、宿主答不上降级 localStor
   assert.equal(none.isRead('assistant:turn:1'), true)
 }])
 
-cases.push(['通知卡过期算术（第 1 项）：10 分钟只从卡片自己那份钟面算', () => {
+cases.push(['通知卡过期算术（2026-11-24 改档 10 秒）：钟面兜底仍然只晚不早', () => {
   const sentAt = new Date(2026, 10, 22, 9, 8, 0, 0).getTime()
   const fresh = surface.noticeExpiryFromClock('9:08', sentAt + 1000)
   assert.equal(fresh.reason, 'same-day')
   assert.equal(fresh.expired, false, '刚发送的不许收')
   assert.equal(fresh.sentAt, sentAt, '发送时刻按那一分钟的起点算')
-  assert.equal(fresh.expiresAt, sentAt + surface.NOTICE_CLOCK_MINUTE_MS - 1 + surface.NOTICE_CARD_TTL_MS, '过期时点宁可晚一分钟，绝不提前')
-  assert.equal(surface.noticeExpiryFromClock('9:08', sentAt + 10 * 60 * 1000).expired, false, '刚好 10 分钟还不收（分钟末口径）')
-  assert.equal(surface.noticeExpiryFromClock('9:08', sentAt + 11 * 60 * 1000).expired, true, '过 11 分钟铁定收')
+  assert.equal(fresh.expiresAt, sentAt + surface.NOTICE_CLOCK_MINUTE_MS - 1 + surface.NOTICE_CARD_TTL_MS, '过期时点宁可晚一句钟，绝不提前')
+  assert.equal(surface.noticeExpiryFromClock('9:08', sentAt + 10 * 1000).expired, false, '刚好 10 秒还不收（钟面兜底等到分钟末 + 10 秒）')
+  assert.equal(surface.noticeExpiryFromClock('9:08', sentAt + 70 * 1000).expired, true, '分钟末 + 10 秒铁定收')
   assert.equal(surface.noticeExpiryFromClock('今天 9:08', sentAt + 11 * 60 * 1000).expired, true, '「今天」写法同一套判据')
-  assert.equal(surface.noticeExpiryFromClock('11月22日 9:08', sentAt).reason, 'dated-label', '带日期即早于 10 分钟')
+  assert.equal(surface.noticeExpiryFromClock('11月22日 9:08', sentAt).reason, 'dated-label', '带日期即远超 10 秒')
   assert.equal(surface.noticeExpiryFromClock('11月22日 9:08', sentAt).expired, true, '带日期的通知卡直接过期')
   assert.equal(surface.noticeExpiryFromClock('昨天 9:08', sentAt).expired, true)
   for (const clock of ['', '乱码', '上午九点']) {
@@ -571,6 +572,64 @@ cases.push(['通知卡过期算术（第 1 项）：10 分钟只从卡片自己�
   const future = surface.noticeExpiryFromClock('23:41', new Date(2026, 10, 22, 9, 0, 0, 0).getTime())
   assert.equal(future.sentAt, new Date(2026, 10, 22, 9, 0, 0, 0).getTime(), '钟面跑到未来（跨午夜/钟面偏差）按现在算，不许算成已过期')
   assert.equal(future.expired, false)
+}])
+
+// 2026-11-24 用户原话「通知的存活时间由 10 分钟改为 10 秒钟」：
+// 分钟粒度的钟面最多会晚 60 秒才收，那不是 10 秒——所以补一条秒级来源（首次观察时刻，落 localStorage），
+// 两条判据都只晚不早，取更早的那个。下面两条用例把「秒级 10 秒」和「只有钟面时不早收」分开锁死。
+cases.push(['通知卡 10 秒（秒级来源）：到达时刻 + 10 秒到点，9.5 秒还在、10.5 秒已收', () => {
+  const storage = (() => { const cache = new Map(); return { getItem: (key) => cache.get(key) ?? null, setItem: (key, value) => { cache.set(key, value) } } })()
+  const arrivals = surface.createSecretaryNoticeArrivalStore({ storage })
+  const sentAt = new Date(2026, 10, 22, 9, 8, 0, 0).getTime()
+  const key = 'notice:16:input-message-cu-01'
+  // 首次观察比真实发送晚 300ms（扫描去抖 120ms + 渲染一帧）：只让过期更晚，绝不更早
+  assert.equal(arrivals.observe(key, sentAt + 300), sentAt + 300, '首次观察即记到达时刻')
+  assert.equal(arrivals.at(key), sentAt + 300)
+  assert.equal(arrivals.observe(key, sentAt + 8000), sentAt + 300, '幂等：再观察一次不许把到达时刻往后挪（更不许往前挪成过期）')
+  const row = { kind: 'notice', clockText: '9:08', key }
+  const arrival = arrivals.at(key)
+  assert.ok(arrival >= sentAt, '到达时刻只会晚于发送时刻')
+  const at9500 = surface.noticeExpiry(row, sentAt + 9500, surface.NOTICE_CARD_TTL_MS, arrival)
+  assert.equal(at9500.precision, 'seconds', '有到达时刻就是秒级判据')
+  assert.equal(at9500.expired, false, '9.5 秒还在（10 秒没到就不许收）')
+  const at10500 = surface.noticeExpiry(row, sentAt + 10500, surface.NOTICE_CARD_TTL_MS, arrival)
+  assert.equal(at10500.expired, true, '10.5 秒已经收了')
+  assert.equal(at10500.expiresAt, arrival + surface.NOTICE_CARD_TTL_MS, '过期时点 = 到达时刻 + 10 秒')
+  assert.equal(surface.noticeCardExpired(row, arrival + 9999, surface.NOTICE_CARD_TTL_MS, arrival), false, '差 1ms 还不收')
+  assert.equal(surface.noticeCardExpired(row, arrival + 10000, surface.NOTICE_CARD_TTL_MS, arrival), true, '整整 10 秒到点就收')
+  assert.equal(surface.noticeCardExpired({ kind: 'user', clockText: '9:08', key }, arrival + 60000, surface.NOTICE_CARD_TTL_MS, arrival), false, '用户卡永不过期')
+  // 挂载层定时器按「到达 + 10 秒」排，不是按「分钟末 + 10 秒」
+  assert.equal(surface.nearestNoticeExpiryMs([row], arrival + 1000, surface.NOTICE_CARD_TTL_MS, () => arrival), arrival + surface.NOTICE_CARD_TTL_MS, '秒级来源可用时按 10 秒排定时器')
+  // 整页刷新：换一个 store 实例读同一份 storage，到达时刻仍在（不需要重读日志）
+  const afterReload = surface.createSecretaryNoticeArrivalStore({ storage })
+  assert.equal(afterReload.at(key), arrival, '刷新后沿用第一次观察到的到达时刻')
+  assert.equal(surface.noticeCardExpired(row, arrival + 10500, surface.NOTICE_CARD_TTL_MS, afterReload.at(key)), true, '刷新后照样按 10 秒收')
+  // 修剪：条目上限照 MAX_NOTICE_ARRIVAL_KEYS 兜住，绝不让缓存无限长
+  assert.equal(surface.MAX_NOTICE_ARRIVAL_KEYS >= 50, true)
+}])
+
+cases.push(['通知卡 10 秒（只有钟面文本）：刚好 3 秒仍显示，误差上界 59.999 秒且只晚不早', () => {
+  const sentAt = new Date(2026, 10, 22, 9, 8, 0, 0).getTime()
+  const row = { kind: 'notice', clockText: '9:08' }
+  const at3s = surface.noticeExpiry(row, sentAt + 3000, surface.NOTICE_CARD_TTL_MS, null)
+  assert.equal(at3s.precision, 'minute', '没有到达时刻就退到钟面判据')
+  assert.equal(at3s.expired, false, '刚好 3 秒必须仍显示（钟面兜底不许提前收）')
+  const trueExpiry = sentAt + surface.NOTICE_CARD_TTL_MS
+  const minuteExpiry = sentAt + surface.NOTICE_CLOCK_MINUTE_MS - 1 + surface.NOTICE_CARD_TTL_MS
+  assert.ok(minuteExpiry >= trueExpiry, '钟面兜底的过期时点只会晚于真实过期时点')
+  assert.ok(minuteExpiry - trueExpiry <= 60000, `误差上界 ≤ 60 秒，实际 ${minuteExpiry - trueExpiry}`)
+  assert.equal(at3s.expiresAt, minuteExpiry)
+  // 认不出钟面 + 没有到达时刻 → 永不过期（没有证据不许把消息收掉）
+  assert.equal(surface.noticeCardExpired({ kind: 'notice', clockText: '' }, sentAt + 3600 * 1000, surface.NOTICE_CARD_TTL_MS, null), false)
+  // 两条判据都在：取更早的那个过期时点；两条都只晚不早，合起来仍然不早
+  const arrival = sentAt + 200
+  const both = surface.noticeExpiry(row, sentAt + 5000, surface.NOTICE_CARD_TTL_MS, arrival)
+  assert.equal(both.expired, false, '一条到点也算不到点：两条都没到就不收')
+  assert.equal(both.expiresAt, arrival + surface.NOTICE_CARD_TTL_MS, '两条取更早的过期时点（到达 + 10 秒）')
+  assert.equal(both.precision, 'seconds', '有秒级来源就按秒级口径报告')
+  // 钟面已经过期时照旧收（钟面那条只会晚于真实过期，所以它说收了就是真收了）
+  const late = surface.noticeExpiry(row, sentAt + 80 * 1000, surface.NOTICE_CARD_TTL_MS, sentAt + 79 * 1000)
+  assert.equal(late.expired, true, '钟面判据已过期就收，不管到达时刻多晚')
 }])
 
 cases.push(['compact 提示判据（第 3 项）：那两行文本按已核实的宿主文字认，别的文字不误伤', () => {

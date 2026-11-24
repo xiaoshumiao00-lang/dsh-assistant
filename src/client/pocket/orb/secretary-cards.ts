@@ -24,9 +24,9 @@
  *      后停在「更早的内容请到轨迹/搜索里看」。取数走宿主 `GET /api/assistant/secretary/history`，
  *      客户端绝不为分页把整条会话读回来（见 createSecretaryPager）。卡计数口径、24 字标题口径、
  *      词数口径都在 src/secretary-card-shared.ts，宿主与客户端共用。
- *   9. 通知卡过期（2026-11-23 第 1 项）：「系统 · 通知」那张卡从发送到消失只存在 10 分钟
- *      （NOTICE_CARD_TTL_MS + noticeExpiryFromClock：只看卡片自己那份宿主时钟文本，
- *      过期只在渲染层收掉，绝不删宿主会话里的消息）。
+ *   9. 通知卡过期（2026-11-24 改档：10 分钟 → 10 秒）：「系统 · 通知」那张卡从到达到消失只存在 10 秒
+ *      （NOTICE_CARD_TTL_MS + noticeExpiry：秒级来源 = 首次观察到达时刻（落 localStorage，刷新不丢），
+ *      钟面文本只作兜底；两条判据都只晚不早；过期只在渲染层收掉，绝不删宿主会话里的消息）。
  *  10. compact 提示抑制（2026-11-23 第 3 项）：按已核实的宿主来源压掉那两行文本，见下。
  *  11. 引用登记（2026-11-23 第 4 项）：createSecretaryQuoteStore 与宿主 `/api/assistant/secretary-quote`
  *      同一套口径（真值在宿主、localStorage 兜底），供卡片脚部那颗「引用」按钮使用。
@@ -1157,9 +1157,12 @@ const CARD_KEY_RE = /^[A-Za-z0-9:._#-]{1,200}$/
  */
 export function buildSecretaryPagerCards(doc: Document): PagerDomCard[] {
   const now = Date.now()
-  // 过了 10 分钟的通知卡不再计入窗口：它已经收成空壳，不该占一个卡位、也不该被折叠行还原出来
+  // 过期的通知卡不再计入窗口：它已经收成空壳，不该占一个卡位、也不该被折叠行还原出来。
+  // 2026-11-24 改档 10 秒后，判据带秒级到达时刻（noticeArrivalStore 里首次观察那一刻），没有记录才退到钟面。
+  const arrivals = noticeArrivalStore()
   const rows = collectSecretaryCardRows(doc)
-    .filter((row) => !noticeCardExpired(row, now))
+    .filter((row) => row.kind !== CARD_KIND_NOTICE
+      || !noticeCardExpired(row, now, NOTICE_CARD_TTL_MS, arrivals.at(noticeCardSpeechKey(row.key, row.turnNo))))
     .map((row) => ({
     cardKey: row.kind === CARD_KIND_NOTICE ? noticeCardSpeechKey(row.key, row.turnNo) : userCardSpeechKey(row.key, row.turnNo),
     kind: row.kind,
@@ -1664,23 +1667,43 @@ export function secretaryPager(): SecretaryPagerStore {
   return cardPager
 }
 
-/* ───────── 9. 通知卡 10 分钟自动消失（2026-11-23 第 1 项需求） ─────────
+/* ───────── 9. 通知卡 10 秒自动消失（2026-11-24 用户改档：原 10 分钟） ─────────
  *
- * 需求：CU 会话进度那类「系统 · 通知」卡从发送到消失只存在 10 分钟，其余过程性消息别留在页面上。
- * 实现口径（**绝不动宿主会话数据**）：
- *   - 时间只从卡片自己那份宿主时钟文本算（`[data-clock]` → 「今天 9:08」/「9:08」/「11月22日 9:08」），
- *     不新建状态文件、不读会话日志、不删任何消息：过期只在**渲染层**收掉这张卡；
- *   - 过期卡换成一张空壳卡（data-dsh-scard-expired）——空壳仍然挂在宿主那条用户行上，
- *     靠上面那条 `:has(> [data-dsh-scard="card"][data-dsh-scard-kind="notice"])` 判据把宿主气泡压住，
-     原文永远冒不出来；
- *   - 分钟粒度的时钟只能估：过期时刻按「那一分钟的最后 + 10 分钟」算，宁可晚一分钟消失，也绝不提前一秒。
+ * 需求原话（2026-11-24）：「个人秘书会话页面的系统通知的存活时间由 10 分钟改为 10 秒钟。」
+ * 实现口径（**绝不动宿主会话数据**，也不新建宿主状态）：
+ *
+ *   ① 精度来源（主判据，秒级）：页面**第一次看到这张通知卡**时，就地把「到达时刻」= Date.now()
+ *      按 cardKey 记进 localStorage（`NOTICE_ARRIVAL_STORAGE_KEY`）。宿主的 `[data-clock]` 只有
+ *      「9:08」这种分钟文本，DOM 上没有任何 epoch 字段（已核实：宿主 MessageIconActions 只渲染
+ *      data-clock=start|end + formatMessageClock 的文本），所以「首次观察时刻」是本页能拿到的最细时间源。
+ *      到达时刻只可能**晚于**真实发送时刻（扫描去抖 120ms + 首帧补扫 400ms），因此
+ *      过期时点 = 到达 + TTL 只会晚于真实过期时点 → **只晚不早**。
+ *      误差上界（秒级路径）：观察延迟 ≤ 0.5 秒 + 挂载层定时器下限 1 秒 ≈ **1.5 秒**（全是晚，不早）。
+ *
+ *   ② 钟面兜底（宿主机钟文本）：没有到达记录时（存储被清、node 环境、别的 profile），
+ *      按「那一分钟的最后 + TTL」算（`noticeExpiryFromClock`，TTL 已是 10 秒）。
+ *      误差上界：钟面把发送时刻最多往前推 59.999 秒 → **最坏晚 59.999 秒**，绝不提前一秒。
+ *
+ *   ③ 两条判据取「谁说到点就到点」（OR）：两个过期时点都只可能晚于真实过期时点，
+ *      取更早的那个仍然不早于真实过期时点 → 全程只晚不早。
+ *
+ *   ④ 认不出钟面文本（空串/乱码）且没有到达记录 → 永不过期（没有证据不许把消息收掉）。
+ *      认不出钟面但有到达记录 → 按秒级 10 秒收（这种情况以前是「永不过期」，现在有依据了）。
+ *
+ *   ⑤ 整页刷新后的退化：到达时刻落在 localStorage，刷新后沿用同一条记录（不重读日志、不改宿主）；
+ *      只有「存储被清 / 换了浏览器 profile / 通知在别的会话页到达而秘书页没开」这几种情况才退到 ②，
+ *      即最坏晚 59.999 秒。到达记录只增不改（幂等），按 MAX_NOTICE_ARRIVAL_KEYS 修剪最旧，写失败静默降级成内存 Map。
  */
 
-/** 通知卡从发送到消失只存在这么久。 */
-export const NOTICE_CARD_TTL_MS = 10 * 60 * 1000
-/** 宿主时钟只给到分钟：一分钟的长度（兜底算过期时点用）。 */
+/** 通知卡从（首次观察到的）到达到消失只存在这么久（2026-11-24 用户改档：10 分钟 → 10 秒）。 */
+export const NOTICE_CARD_TTL_MS = 10 * 1000
+/** 宿主时钟只给到分钟：一分钟的长度（钟面兜底算过期时点用）。 */
 export const NOTICE_CLOCK_MINUTE_MS = 60 * 1000
-/** 带日期的时间文本（宿主机场日历口径：昨天/前天、M月D日、YYYY-MM-DD）——这种一定早于 10 分钟。 */
+/** 到达时刻的本地缓存键（整页刷新后沿用同一条，不需要重读会话日志）。 */
+export const NOTICE_ARRIVAL_STORAGE_KEY = 'dsh.assistant.secretary.notice-arrival'
+/** 到达记录最多留多少条（超出按时间修剪最旧的；通知卡只活 10 秒，留这么多足够任何刷新窗口）。 */
+export const MAX_NOTICE_ARRIVAL_KEYS = 200
+/** 带日期的时间文本（宿主机场日历口径：昨天/前天、M月D日、YYYY-MM-DD）——这种一定早于 10 秒。 */
 const CLOCK_DATED_RE = /(昨天|前天|上周|[01]?\d月[0-3]?\d日|\d{4}[-/.]\d{1,2}[-/.]\d{1,2})/
 /** 「今天 9:08」/「9:08」两种同一天的时间文本。 */
 const CLOCK_TODAY_RE = /^(今天\s+)?([01]?[0-9]|2[0-3]):([0-5][0-9])$/
@@ -1697,9 +1720,9 @@ export interface NoticeExpiry {
 }
 
 /**
- * 通知卡过期判据（纯函数，node 直接测）：
+ * 通知卡过期判据（纯函数，node 直接测）——**只看钟面**这一条（兜底口径）：
  *   - 「9:08」「今天 9:08」→ 按今天的这一分钟算：过期时点 = 分钟起点 + 59.999s + TTL（宁可晚，不提前）；
- *   - 「昨天 9:08」「11月22日 9:08」这类带日期的 → 必然超过 10 分钟 → 过期；
+ *   - 「昨天 9:08」「11月22日 9:08」这类带日期的 → 必然超过 TTL → 过期；
  *   - 认不出时间 → 不过期（保守：没有证据就不许把消息收掉）。
  */
 export function noticeExpiryFromClock(clockText: unknown, now = Date.now(), ttlMs = NOTICE_CARD_TTL_MS): NoticeExpiry {
@@ -1718,23 +1741,175 @@ export function noticeExpiryFromClock(clockText: unknown, now = Date.now(), ttlM
   return { sentAt: null, expiresAt: null, expired: false, reason: 'unknown-time' }
 }
 
+/** 通知卡过期判据的精度来源（测试逐条断言，报告里也按这个口径写误差）。 */
+export type NoticePrecision = 'seconds' | 'minute' | 'none'
+
+export interface NoticeExpiryDetail extends NoticeExpiry {
+  /** 这张卡按哪条判据算的：seconds=有到达时刻（10 秒精度的主判据）；minute=只有钟面文本；none=证据不足。 */
+  precision: NoticePrecision
+}
+
+/**
+ * 通知卡过期判据（合成口径）：**秒级到达时刻** + **钟面兜底**两条判据取更早的那个过期时点。
+ *
+ * 两条判据的过期时点都只可能晚于真实过期时点（到达只会晚、钟面只会往前推），所以
+ * 「谁说到点就到点」不会造成提前收；到期判断永远是「现在 ≥ min(两个时点)」。
+ */
+export function noticeExpiry(
+  row: { kind: string; clockText: string },
+  now = Date.now(),
+  ttlMs = NOTICE_CARD_TTL_MS,
+  arrivalAt: number | null = null,
+): NoticeExpiryDetail {
+  const clock = noticeExpiryFromClock(row.clockText, now, ttlMs)
+  if (row.kind !== CARD_KIND_NOTICE) {
+    // 用户卡与回复卡永不按 TTL 收（只走卡种判据，不看时间）
+    return { sentAt: clock.sentAt, expiresAt: null, expired: false, reason: clock.reason, precision: 'none' }
+  }
+  const secondsAt = typeof arrivalAt === 'number' && Number.isFinite(arrivalAt) && arrivalAt > 0 ? arrivalAt + ttlMs : null
+  // 带日期的钟面是最硬的证据（必然早于 TTL）→ 直接收，不再等秒级判据
+  if (clock.reason === 'dated-label') {
+    return { sentAt: clock.sentAt, expiresAt: secondsAt, expired: true, reason: clock.reason, precision: secondsAt === null ? 'minute' : 'seconds' }
+  }
+  const candidates = [secondsAt, clock.expiresAt].filter((value): value is number => value !== null && Number.isFinite(value))
+  const expiresAt = candidates.length === 0 ? null : Math.min(...candidates)
+  const precision: NoticePrecision = secondsAt !== null ? 'seconds' : (clock.reason === 'same-day' ? 'minute' : 'none')
+  const expired = expiresAt === null ? false : now >= expiresAt
+  return { sentAt: clock.sentAt, expiresAt, expired, reason: clock.reason, precision }
+}
+
 /** 一批通知卡里最近的那个过期时点（没有待过期的一定通知 → null）。挂载层靠它自己排一次定时器。 */
-export function nearestNoticeExpiryMs(rows: readonly { kind: string; clockText: string }[], now = Date.now(), ttlMs = NOTICE_CARD_TTL_MS): number | null {
+export function nearestNoticeExpiryMs(
+  rows: readonly { kind: string; clockText: string; key?: string }[],
+  now = Date.now(),
+  ttlMs = NOTICE_CARD_TTL_MS,
+  arrivalOf: ((row: { kind: string; clockText: string; key?: string }) => number | null) | null = null,
+): number | null {
   let nearest: number | null = null
   for (const row of rows) {
     if (row.kind !== CARD_KIND_NOTICE) continue
-    const expiry = noticeExpiryFromClock(row.clockText, now, ttlMs)
+    const arrivalAt = arrivalOf === null ? null : arrivalOf(row)
+    const expiry = noticeExpiry(row, now, ttlMs, arrivalAt)
     if (expiry.expiresAt === null || expiry.expired) continue
     if (nearest === null || expiry.expiresAt < nearest) nearest = expiry.expiresAt
   }
   return nearest
 }
 
-/** 这张通知卡现在是不是已经过了 10 分钟（用户卡与回复卡永远 false）。 */
-export function noticeCardExpired(row: { kind: string; clockText: string }, now = Date.now(), ttlMs = NOTICE_CARD_TTL_MS): boolean {
+/** 这张通知卡现在是不是已经过了 10 秒（用户卡与回复卡永远 false）。 */
+export function noticeCardExpired(
+  row: { kind: string; clockText: string; key?: string },
+  now = Date.now(),
+  ttlMs = NOTICE_CARD_TTL_MS,
+  arrivalAt: number | null = null,
+): boolean {
   if (row.kind !== CARD_KIND_NOTICE) return false
-  return noticeExpiryFromClock(row.clockText, now, ttlMs).expired
+  return noticeExpiry(row, now, ttlMs, arrivalAt).expired
 }
+
+/** ─── 到达时刻 store（2026-11-24）：秒级来源；localStorage 持久化 + 内存兜底，只增不改 ─── */
+
+export interface SecretaryNoticeArrivalStore {
+  /** 这张卡的到达时刻（epoch ms）；没记过 → null。 */
+  at(cardKey: string): number | null
+  /** 幂等登记：没记过就记成 now，已记过一字不改（绝不把过期时点往后挪，更不许往前挪成提前收）。返回该卡最终到达时刻。 */
+  observe(cardKey: string, now?: number): number
+  /** 批量登记（一次扫描到的那批通知卡）。 */
+  observeAll(cardKeys: readonly string[], now?: number): void
+  /** 修剪：只留最近 MAX_NOTICE_ARRIVAL_KEYS 条（按到达时刻从新到旧）。 */
+  prune(): void
+  /** 只给测试/诊断：当前全量快照（cardKey → 到达时刻）。 */
+  snapshot(): Record<string, number>
+  /** 清空（只给测试）。 */
+  reset(): void
+}
+
+/** 建一个到达时刻 store（storage 缺省 → 内存 Map；宿主 localStorage 抛错时也静默降级）。 */
+export function createSecretaryNoticeArrivalStore(deps: {
+  storage?: { getItem(key: string): string | null; setItem(key: string, value: string): void } | null
+  maxKeys?: number
+} = {}): SecretaryNoticeArrivalStore {
+  const storage = deps.storage ?? null
+  const maxKeys = Math.max(1, Number(deps.maxKeys ?? MAX_NOTICE_ARRIVAL_KEYS))
+  const memory = new Map<string, number>()
+
+  const load = (): void => {
+    if (storage === null) return
+    try {
+      const raw = storage.getItem(NOTICE_ARRIVAL_STORAGE_KEY)
+      if (raw === null || raw === '') return
+      const parsed = JSON.parse(raw) as unknown
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        const ms = Number(value)
+        if (key === '' || !Number.isFinite(ms) || ms <= 0) continue
+        if (!memory.has(key)) memory.set(key, ms)
+      }
+    } catch { /* 坏数据当没有：宁可退到钟面兜底，也不许拿错时间提前收 */ }
+  }
+  const persist = (): void => {
+    if (storage === null) return
+    try {
+      storage.setItem(NOTICE_ARRIVAL_STORAGE_KEY, JSON.stringify(Object.fromEntries(memory)))
+    } catch { /* 写失败：本次会话仍按内存里的到达时刻算 */ }
+  }
+  load()
+
+  const prune = (): void => {
+    if (memory.size <= maxKeys) return
+    const ordered = [...memory.entries()].sort((a, b) => a[1] - b[1])
+    for (const [key] of ordered.slice(0, memory.size - maxKeys)) memory.delete(key)
+  }
+
+  return {
+    at(cardKey) {
+      const key = String(cardKey ?? '')
+      if (key === '') return null
+      const value = memory.get(key)
+      return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null
+    },
+    observe(cardKey, now = Date.now()) {
+      const key = String(cardKey ?? '')
+      if (key === '') return 0
+      const existing = memory.get(key)
+      if (typeof existing === 'number' && existing > 0) return existing
+      memory.set(key, now)
+      prune()
+      persist()
+      return now
+    },
+    observeAll(cardKeys, now = Date.now()) {
+      let changed = false
+      for (const raw of cardKeys) {
+        const key = String(raw ?? '')
+        if (key === '') continue
+        if (memory.has(key)) continue
+        memory.set(key, now)
+        changed = true
+      }
+      if (changed) { prune(); persist() }
+    },
+    prune,
+    snapshot() {
+      return Object.fromEntries(memory)
+    },
+    reset() {
+      memory.clear()
+      persist()
+    },
+  }
+}
+
+/** 进程内单例（浏览器里带 localStorage；node 测试里只有内存）。 */
+let noticeArrivalSingleton: SecretaryNoticeArrivalStore | null = null
+export function noticeArrivalStore(): SecretaryNoticeArrivalStore {
+  if (noticeArrivalSingleton !== null) return noticeArrivalSingleton
+  const g: any = globalThis as any
+  const storage = g.localStorage !== null && g.localStorage !== undefined ? g.localStorage : null
+  noticeArrivalSingleton = createSecretaryNoticeArrivalStore({ storage })
+  return noticeArrivalSingleton
+}
+
 
 /* ───────── 10. compact 提示两行文本（2026-11-23 第 3 项需求） ─────────
  *
@@ -2296,9 +2471,14 @@ export const secretaryCardsTestSurface = {
   cardFoldStyle,
   NOTICE_CARD_TTL_MS,
   NOTICE_CLOCK_MINUTE_MS,
+  NOTICE_ARRIVAL_STORAGE_KEY,
+  MAX_NOTICE_ARRIVAL_KEYS,
   noticeExpiryFromClock,
+  noticeExpiry,
   nearestNoticeExpiryMs,
   noticeCardExpired,
+  createSecretaryNoticeArrivalStore,
+  noticeArrivalStore,
   COMPACT_HINT_ATTRIBUTE,
   COMPACT_SUMMARY_HINT_RE,
   COMPACT_FAILURE_HINT_RE,

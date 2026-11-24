@@ -6,8 +6,9 @@
  *   外壳与秘书回复卡同一套规格（宽 620px、16px 圆角、0.5px #E5E6EB 边、无阴影、脚部 引用 + HH:MM 时间 + 复制），
  *   折叠/字号/点卡展开三种卡一律共用 SecretaryReplyCard.tsx 那一套实现，不许各自漂移。
  *
- * 两条新的口径（2026-11-23）：
- *   - 通知卡发送满 10 分钟只在渲染层收成空壳（noticeCardExpired / NOTICE_CARD_TTL_MS），会话数据一个字都不删；
+ * 两条新的口径：
+ *   - 通知卡活 10 秒（2026-11-24 用户改档，原 10 分钟）只在渲染层收成空壳
+ *     （noticeCardExpired / noticeExpiry / NOTICE_CARD_TTL_MS + 首次观察的到达时刻），会话数据一个字都不删；
  *   - 脚部那颗引用按钮（QuoteCardButton）三种卡都有，挂在时间左边。
  *
  * 挂载与取证：
@@ -34,7 +35,8 @@ import { SecretarySpeakButton } from './SecretarySpeakButton.tsx'
 import {
   assistantCardSpeechKey, buildSecretaryPagerCards, buildUserCardBody, CARD_KIND_NOTICE, CARD_KIND_USER, cardFoldStyle, collectSecretaryCardRows,
   clearSecretaryCompactHintRows, formatClock,
-  latestRealUserCardRef, noticeCardExpired, noticeCardSpeechKey, nearestNoticeExpiryMs, parseNoticeCardBody, parseSessionRefs, parseUserCardBody, secretaryPager,
+  latestRealUserCardRef, noticeArrivalStore, noticeCardExpired, noticeCardSpeechKey, nearestNoticeExpiryMs, NOTICE_CARD_TTL_MS,
+  parseNoticeCardBody, parseSessionRefs, parseUserCardBody, secretaryPager,
   secretaryQuoteStore, stripSessionRefs, tagSecretaryCompactHintRows, userCardSpeechKey, EARLIER_HINT_TEXT, SCROLL_TOP_THRESHOLD_PX,
   scrollAnchorTopPatch, shouldExpandOnScroll,
   type PagerDomCard, type SecretaryCardRow, type UserCardAttachment, type UserCardBodyBlock,
@@ -143,8 +145,8 @@ function toEpoch(clockText: string): string {
 
 /**
  * 一张卡（用户卡 / 通知卡）：与秘书回复卡同一套外壳与折叠实现。
- * 通知卡多一条口径（第 1 项需求）：发送满 10 分钟后这张卡在渲染层收成**空壳**（原文还在宿主会话里，
- * 插件一个字都不删），空壳仍然挂在宿主那条用户行上，把宿主气泡压住不给它冒回来。
+ * 通知卡多一条口径（2026-11-24 改档 10 秒）：从首次观察到到满 10 秒后这张卡在渲染层收成**空壳**
+ * （原文还在宿主会话里，插件一个字都不删），空壳仍然挂在宿主那条用户行上，把宿主气泡压住不给它冒回来。
  */
 function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbApi }): any {
   const contentRef = useRef<HTMLDivElement | null>(null)
@@ -152,7 +154,10 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
   const notice = row.kind === CARD_KIND_NOTICE
   const speechKey = notice ? noticeCardSpeechKey(row.key, row.turnNo) : userCardSpeechKey(row.key, row.turnNo)
   const readKey = notice ? speechKey : ''
-  const noticeExpired = noticeCardExpired(row)
+  // 秒级判据：首次观察到这张通知卡的那一刻（落 localStorage，整页刷新后沿用同一条）；
+  // 没有记录就退回钟面文本兜底（只晚不早，误差上界 59.999 秒）。
+  const noticeArrival = notice ? noticeArrivalStore().at(speechKey) : null
+  const noticeExpired = notice ? noticeCardExpired(row, Date.now(), NOTICE_CARD_TTL_MS, noticeArrival) : false
   const readState = useSecretaryReadState(secretarySessionId())
   // 分页窗口：这张用户卡/通知卡完整渲染还是压成一行折叠行（hooks 一律在条件 return 之前）
   const windowState = useSecretaryCardWindow(speechKey)
@@ -174,7 +179,7 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
   const { foldProps } = useCardFoldRegion(open, overflow, toggle)
   const quoteState = useSecretaryQuoteState(secretarySessionId())
 
-  // 过期通知卡（发送满 10 分钟）：只收成空壳。原文还在宿主会话里，插件一个字都不删；
+  // 过期通知卡（活满 10 秒）：只收成空壳。原文还在宿主会话里，插件一个字都不删；
   // 空壳 kind=notice 仍然撑着那条 :has 判据，宿主气泡不会冒回来。
   if (noticeExpired) {
     return (
@@ -407,6 +412,10 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
       // 第 3 项需求：compact 提示两行只在秘书页压掉（CSS 按 kind + 这里打的标记）
       tagSecretaryCompactHintRows(document)
       const next = collectSecretaryCardRows(document)
+      // 秒级来源（2026-11-24 改档 10 秒）：**第一眼看到**这批通知卡就地记到达时刻（幂等，只增不改）。
+      // 必须在 buildSecretaryPagerCards 之前登记，否则首帧那张卡要等到下一次扫描才有 10 秒起点。
+      const arrivals = noticeArrivalStore()
+      arrivals.observeAll(next.filter((row) => row.kind === CARD_KIND_NOTICE).map((row) => noticeCardSpeechKey(row.key, row.turnNo)))
       const domCards: PagerDomCard[] = buildSecretaryPagerCards(document)
       pager.setSession(secretarySessionId())
       pager.noteDomCards(domCards)
@@ -419,8 +428,10 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
       const missing = next.some((row) => !rowHasCard(row.element))
       setRows((prev) => (sameRows(prev, next) ? prev : next))
       if (missing) setRev((value) => value + 1)
-      // 第 1 项需求：还有没到点的通知卡 → 排一次定时器，到点强制重判（不排就永远等下一次 DOM 变化）
-      const expiresAt = nearestNoticeExpiryMs(next)
+      // 通知卡 10 秒（2026-11-24 改档）：还有没到点的通知卡 → 排一次定时器，到点强制重判
+      // （不排就永远等下一次 DOM 变化）。到达时刻优先（秒级），没有记录才退到钟面兜底。
+      const expiresAt = nearestNoticeExpiryMs(next, Date.now(), NOTICE_CARD_TTL_MS,
+        (row) => noticeArrivalStore().at(noticeCardSpeechKey(row.key ?? '', row.turnNo ?? '')))
       if (expiryTimer !== null) { window.clearTimeout(expiryTimer); expiryTimer = null }
       if (expiresAt !== null) {
         const delay = Math.max(1000, expiresAt - Date.now())

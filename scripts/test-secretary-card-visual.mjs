@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 个人秘书三种卡（assistant 紫 / user 冷蓝 / notice 灰）的浏览器视觉验收。
  *
  * 当前 pocket 局域网入口被 8 位 PIN + dsh web 启动 token 双层拦住，无头 Playwright
@@ -14,7 +14,7 @@
  *     固定上限 foldCollapsedCapPx（标准字号 162px）封顶，CSS 首帧就顶住（治现网「测量前整段平铺」的时序洞）；
  *   - 折叠态行数、卡体点击展开、脚部时间位置、字号（结论 18px/600、详情 14px/26px）、未读红点、已读持久化都断言；
  *   - 第 3 项：compact 那两行（manual-compaction 行、带 data-compaction-icon 的宿主行、扫描层打标的行）在秘书页不出图；
- *   - 第 1 项：满 10 分钟的通知卡收成空壳（外壳仍挂着撑住气泡判据，盒子 display:none）；
+ *   - 第 1 项：活满 10 秒的通知卡收成空壳（外壳仍挂着撑住气泡判据，盒子 display:none）；
  *   - 第 4 项：脚部引用按钮在时间左边、规格与时间右边那棵复制按钮一致。
  *
  * 通过 = 退出码 0；截图：
@@ -276,14 +276,14 @@ ${assistantCard}
   <div data-chat-turn="13" data-chat-flow-kind="command" data-dsh-scard-compact="hint" data-probe="compact-tagged-row">
     <div data-slot="conversation.chat.node"><div class="host-compaction-row">compact·已压缩41条历史记录(19692 tokens)</div></div>
   </div>
-  <!-- 第 1 项需求：发送满 10 分钟的通知卡收成空壳（外壳仍在、盒子不出图） -->
+  <!-- 第 1 项需求（2026-11-24 改档 10 秒）：活满 10 秒的通知卡收成空壳（外壳仍在、盒子不出图） -->
   <div data-chat-turn="14" data-chat-flow-kind="user" data-chat-node-key="16:input-message-cu-03" data-probe="expired-notice-row">
     <div data-slot="conversation.chat.node">
       <div class="host-user-row">
         <div class="host-user-stack">
           <div class="host-bubble">
             <span data-slot="conversation.user.text.node"><span class="host-plain-run">（系统通知，不是用户说的话）
-这一条通知早就过了 10 分钟，按第 1 项需求收掉。</span></span>
+这一条通知已经活满 10 秒，按第 1 项需求收掉。</span></span>
           </div>
         </div>
         <div class="host-actions" data-clock="start"><span>09:08</span></div>
@@ -791,7 +791,7 @@ try {
   pass('第 3 项：普通通知卡与用户行不受影响（仍然出图）',
     compactRows.freshNoticeDisplay !== 'none', JSON.stringify({ freshNoticeDisplay: compactRows.freshNoticeDisplay }))
 
-  // ── 第 1 项：满 10 分钟的通知卡收成空壳（外壳挂着、盒子不出图、宿主气泡也不许冒回来） ──
+  // ── 第 1 项：活满 10 秒的通知卡收成空壳（外壳挂着、盒子不出图、宿主气泡也不许冒回来） ──
   pass('第 1 项：过期通知卡外壳带 data-dsh-scard-expired="1" 且盒子 display:none',
     compactRows.expiredCardHasShellAttr === '1' && compactRows.expiredCardDisplay === 'none',
     JSON.stringify({ expiredCardDisplay: compactRows.expiredCardDisplay, expiredCardHasShellAttr: compactRows.expiredCardHasShellAttr }))
