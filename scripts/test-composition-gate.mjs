@@ -294,7 +294,7 @@ ok('开抽屉 = 插件的扫描/补丁一起让路；且照旧「只升到展开
 })
 
 ok('抽屉布局收掉官方 logoRow 的 toggle（两条判据都限定在抽屉那一列内）', () => {
-  assert.match(MOBILE_CSS, /\[data-mobile-nav="frame"\] > :first-child \[data-window-drag\] button\[class\*="_toggle"\]/)
+  assert.match(MOBILE_CSS, /\[data-mobile-nav="frame"\] > \[class\*="_sidebarCol"\] \[data-window-drag\] button\[class\*="_toggle"\]/)
   assert.match(MOBILE_CSS, /\[data-window-drag\] button\[aria-label="打开侧边栏"\]/)
   assert.match(MOBILE_CSS, /\[data-window-drag\] button\[aria-label="收起侧边栏"\]/)
   // 强制手机布局那份里也要有（scopeRules 加前缀后规则照样存在）

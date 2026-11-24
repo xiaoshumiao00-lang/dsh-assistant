@@ -325,6 +325,18 @@ ${FRAME_SELECTOR}${OPEN} [data-mobile-nav="fab"] {
 `;
 
 /**
+ * 设置面板（宿主 dialog）的锚点。两条身份判据取 OR，任一命中即可：
+ *   - `[aria-modal="true"][data-shortcut-modal="settings"]`：宿主给自己设置对话框打的标记；
+ *   - `[aria-modal="true"]:has([class$="_navList"])`：面板里那条设置 tab 列表（全站唯一），
+ *     CSS-modules 的哈希前缀会变、后缀 `_navList` 跨版本稳定。
+ * 绝不用 `:first-child` / `:nth-child(2)` 定位面板或它的子块：DSH 0.2.2 把 tab 列表从
+ * 标题行里搬进了独立的 `<nav>`，旧的位置门控 `:has(> :first-child > :last-child > button)`
+ * 在 0.2.2 上永远为假 —— 整块手机端设置样式静默失效，手机设置页因此只剩一个桌面尺寸
+ * 的空壳（见 NARROW_RULES 里 Settings sheet 那节实测数字）。
+ */
+const SETTINGS_SHEET = ':is([aria-modal="true"][data-shortcut-modal="settings"], [aria-modal="true"]:has([class$="_navList"]))'
+
+/**
  * 窄屏（自动手机布局）的全部规则文本 —— **单一来源**，在文件末尾输出两遍：
  *   1) 原样包进 @media (max-width: 1023px)；
  *   2) 每条选择器加 body[data-dsh-pocket-layout="mobile"] 祖先前缀（scopeRules），
@@ -822,105 +834,165 @@ const NARROW_RULES = `
     display: none !important;
   }
 
-  /* --- Settings dialog on mobile ---
-     Desktop: 800px two-column flex (188px nav + content). Mobile: a
-     near-full-width sheet — nav tabs wrap into rows on top, option rows
-     stay horizontal (title+description left, control right). Structural
-     selectors are scoped to the unique aria-modal dialog; every
-     settings-specific rule is gated with
-     :has(> :first-child > :last-child > button) — the settings nav tab
-     list holds <button> tabs, so the transient export dialog (the same
-     primitives Modal, header(title+close)+description+body) keeps its
-     official centered card layout. Requires :has() support
-     (Chromium 105+, 2022). */
-  [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])) {
-    position: absolute !important;
-    left: 8px !important;
-    /* Fixed top (no translateY): a transform on the panel combined with the
-       panel overflowing the max-content drawer shifts the fixed overlay's
-       coordinate frame, dragging the whole sidebar content off-screen. The
-       safe-area inset keeps the sheet below the status bar / notch. */
-    top: calc(env(safe-area-inset-top, 0px) + 12px) !important;
+  /* --- Settings sheet on mobile (DSH 0.2.2 dialog structure) ---
+     Live DOM of the settings dialog (measured 2026-11-25, 390×844 phone):
+       div[role=dialog][aria-modal=true][data-shortcut-modal=settings]._panel
+         ├ ._navTitle       ← "设置" caption              (grid row 1, col 1)
+         ├ nav._nav > ._navList > button._navCell          (row 2, spans both)
+         ├ ._header         ← 打开配置文件 + 关闭按钮       (row 1, col 2)
+         └ ._options        ← section content, only scroll (row 3)
+     0.2.1 nested the tab list inside the caption row, so this whole section
+     used to be gated on ":has(> :first-child > :last-child > button)". On
+     0.2.2 the panel's first child is the bare caption, that gate is false and
+     the mobile sheet layer silently stopped applying. Measured on the live
+     page before this fix (390×844):
+       · panel: position relative, 358×844, border-radius 0px, max-height none
+       · tab strip: overflow-x auto, 4 of 6 tabs outside the panel
+         (x = -97 / 15 / 351 / 463 for a panel spanning 16…374)
+       · 「手机访问」card: the nowrap credit column takes 199.4px of a 328px
+         sheet (360×740), squeezing the title/description column to 42.6px —
+         about four characters per line, i.e. "the settings page shows nothing".
+     Every anchor below is identity-based (the host's own data-shortcut-modal
+     marker or the stable _navList / _nav / _navCell / _options class
+     suffixes), never a child position, so a host build that inserts another
+     wrapper cannot shift the sheet off-screen again. */
+  ${SETTINGS_SHEET} {
+    /* A sheet, not a page: 8px gutters, rounded, capped to the viewport. No
+       position / transform override — the host already centers the panel in
+       its body-level overlay, and pinning it with position:absolute is what
+       used to drag the whole dialog off-screen as soon as an ancestor gained a
+       transform (see the drawer note further up). */
     width: calc(100vw - 16px) !important;
     max-width: calc(100vw - 16px) !important;
-    /* Height follows the content (no dead space under a short page); it
-       caps at 100dvh-24 (less the safe-area top) and the options area
-       scrolls only then. */
     height: auto !important;
-    max-height: min(800px, calc(100vh - 24px - env(safe-area-inset-top, 0px))) !important;
-    max-height: min(800px, calc(100dvh - 24px - env(safe-area-inset-top, 0px))) !important;
-    flex-direction: column !important;
+    max-height: calc(100dvh - 24px - env(safe-area-inset-top, 0px)) !important;
+    /* Rows: caption+toolbar / tab strip / content. minmax(0,1fr) lets the
+       content row shrink inside the capped sheet instead of pushing the panel
+       past the viewport (the host fixes these tracks for a 100vh page). The
+       columns must be re-declared too: the host keeps "202px 156px", which is
+       wider than the phone sheet and makes the tab strip overflow by the
+       difference. */
+    grid-template-columns: minmax(0, 1fr) auto !important;
+    grid-template-rows: auto auto minmax(0, 1fr) !important;
+    margin: auto !important;
+    overflow: hidden !important;
     border-radius: 14px !important;
+    /* Never inherit a hidden state from a host build or another plugin: the
+       sheet must always paint. opacity 0 / visibility hidden / pointer-events
+       none here is exactly the "blank settings page" symptom. */
+    visibility: visible !important;
+    opacity: 1 !important;
+    pointer-events: auto !important;
     animation: dsh-mobile-nav-sheet-in .22s var(--ds-ease-out, ease-in-out);
   }
-  /* The settings sheet's dimmed mask fades in with the panel (the mask is
-     the first child of the overlay that directly contains the sheet). */
-  :has(> [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"]))) > :first-child {
+  /* The sheet's dimmed mask fades in with the panel (the mask is the first
+     child of the overlay that directly contains the sheet). */
+  :has(> ${SETTINGS_SHEET}) > :first-child {
     animation: dsh-mobile-nav-fade .18s var(--ds-ease-out, ease-in-out);
   }
   @media (prefers-reduced-motion: reduce) {
-    [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])),
-    :has(> [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"]))) > :first-child {
+    ${SETTINGS_SHEET},
+    :has(> ${SETTINGS_SHEET}) > :first-child {
       animation: none !important;
     }
   }
-  /* The export dialog (not the settings sheet) must never overflow the
-     viewport: the official centered card can be wider than 390px. */
-  [aria-modal="true"]:not(:has(> :first-child > :last-child > button)) {
+  /* Every other dialog (the export sheet, host confirmations) keeps the
+     official centered card; just never let it overflow the viewport. */
+  [aria-modal="true"]:not(${SETTINGS_SHEET}) {
     max-width: calc(100vw - 32px) !important;
   }
-  /* Nav bar: hide the "Settings" caption (redundant on a full-width sheet)
-     and wrap the tab list so every tab is visible — a horizontal scroll cut
-     the last tab ("Plugins") off with no affordance to scroll. */
-  [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])) > :first-child {
+  /* Tab strip: wrap the tabs into an even grid so every section is reachable
+     without a horizontal scroll (auto-fit → 3 per row on a normal phone, 2 on
+     a very narrow one). The strip lives inside <nav>, one level below the
+     panel — never anchor it as "the panel's second child". */
+  ${SETTINGS_SHEET} [class$="_nav"],
+  ${SETTINGS_SHEET} [class$="_navList"] {
     width: 100% !important;
-    flex-direction: row !important;
-    align-items: center !important;
-    gap: 6px !important;
-    padding: 10px 12px 8px !important;
+    min-width: 0 !important;
   }
-  [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])) > :first-child > :first-child {
-    display: none !important;
+  ${SETTINGS_SHEET} [class$="_nav"] {
+    padding: 0 !important;
   }
-  [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])) > :first-child > :last-child {
-    flex-direction: row !important;
-    flex-wrap: wrap !important;
-    width: 100% !important;
+  ${SETTINGS_SHEET} [class$="_navList"] {
+    display: grid !important;
+    grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)) !important;
     gap: 6px !important;
+    box-sizing: border-box !important;
+    padding: 8px 12px !important;
     overflow: visible !important;
   }
-  /* Content toolbar (Open configuration file + close): spread to the edges
-     instead of clustering right with a dead zone on the left. The toolbar
-     children carry official auto-margins that would defeat space-between,
-     so neutralize them. The close button gets a round tappable base so it
-     reads as its own control, not part of the outline button. */
-  [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])) > :last-child > :first-child {
-    justify-content: space-between !important;
+  ${SETTINGS_SHEET} [class$="_navCell"] {
+    min-width: 0 !important;
+    padding: 6px 8px !important;
+    gap: 6px !important;
+    font-size: 13px !important;
+    justify-content: flex-start !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+  }
+  ${SETTINGS_SHEET} [class$="_navCell"] svg {
+    width: 14px !important;
+    height: 14px !important;
+    flex: none !important;
+  }
+  /* Toolbar (打开配置文件 + close) stays on the caption row. */
+  ${SETTINGS_SHEET} [class$="_header"] {
+    justify-content: flex-end !important;
     align-items: center !important;
-    padding: 0 12px !important;
-    min-height: 40px !important;
+    gap: 6px !important;
+    padding: 0 8px !important;
+    min-height: 44px !important;
   }
-  [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])) > :last-child > :first-child > * {
-    margin-left: 0 !important;
-    margin-right: 0 !important;
+  /* Content: the only scrolling region. min-height:0 is what lets the 1fr row
+     shrink inside the capped sheet. */
+  ${SETTINGS_SHEET} [class$="_options"] {
+    min-height: 0 !important;
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch;
+    padding: 0 12px 20px !important;
+    box-sizing: border-box !important;
   }
-  [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])) > :last-child > :first-child > :last-child {
-    width: 32px !important;
-    height: 32px !important;
-    border-radius: 50% !important;
-    display: inline-flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06)) !important;
+  /* The「手机访问」card header: the plugin's row is title-left / credit-right
+     and the credit column is nowrap (开发者 / Star / link). On a phone that
+     squeezes the left column into a vertical strip, so let the row wrap and let
+     the credit column wrap its own lines. Markers come from the plugin's own
+     markup (client/pocket/index.jsx), never from a host class name. */
+  ${SETTINGS_SHEET} [data-dsh-pocket-card="hero"] {
+    flex-wrap: wrap !important;
+    align-items: flex-start !important;
+    gap: 6px 10px !important;
   }
-  /* Appearance mode cards: the official cube row renders three tall
-     vertical cards (~268px) that eat half the sheet. Turn them into a
-     compact horizontal trio (icon + label inline, equal widths).
-     Relies on the official cube-row class name of this version. */
-  [aria-modal="true"] [class$="_cubeRow"] {
+  ${SETTINGS_SHEET} [data-dsh-pocket-card="hero"] > [data-part="intro"] {
+    flex: 1 1 150px !important;
+    min-width: 0 !important;
+  }
+  ${SETTINGS_SHEET} [data-dsh-pocket-card="hero"] > [data-part="credit"] {
+    flex: 0 1 auto !important;
+    min-width: 0 !important;
+    white-space: normal !important;
+    text-align: left !important;
+  }
+  ${SETTINGS_SHEET} [data-dsh-pocket-card="hero"] > [data-part="credit"] > * {
+    white-space: normal !important;
+  }
+  /* Host setting rows: text on top, control below at full width (the desktop
+     label/control split leaves a dead gap on a phone). */
+  ${SETTINGS_SHEET} [class$="_section"] [class$="_row"] {
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 8px !important;
+  }
+  ${SETTINGS_SHEET} [class$="_section"] [class$="_row"] > :first-child,
+  ${SETTINGS_SHEET} [class$="_section"] [class$="_row"] > :last-child {
+    width: 100% !important;
+    max-width: none !important;
+  }
+  /* Appearance mode group: a compact horizontal trio with a consistent border. */
+  ${SETTINGS_SHEET} [class$="_cubeRow"] {
     gap: 6px !important;
   }
-  [aria-modal="true"] [class$="_cubeRow"] > * {
+  ${SETTINGS_SHEET} [class$="_cubeRow"] > * {
     flex: 1 1 0 !important;
     flex-direction: row !important;
     align-items: center !important;
@@ -928,15 +1000,7 @@ const NARROW_RULES = `
     gap: 6px !important;
     padding: 10px 8px !important;
     min-height: 0 !important;
-  }
-  /* Content: the options scroll area gets bottom breathing room so the last
-     row never sits flush against the sheet's rounded corner. */
-  [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])) > :last-child {
-    flex: 1 1 auto !important;
-    min-height: 0 !important;
-  }
-  [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])) > :last-child > :last-child {
-    padding: 0 12px 24px !important;
+    border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, .12)) !important;
   }
 
   /* ---------- dsh-web-ui family compatibility ----------
@@ -1096,49 +1160,12 @@ const NARROW_RULES = `
     min-width: 0 !important;
   }
 
-  /* ---------- dsh-web-ui polish: settings sheet ----------
-     The official dialog is a desktop two-column form; on a phone the
-     label/control split leaves a huge dead gap and long descriptions wrap
-     into tall stacks. Stack each row (text above, control full-width) and
-     compact the nav tabs into an even wrap. */
-
-  /* Nav tabs: a stable 3-per-row grid (two clean rows instead of a ragged
-     wrap) with tighter cells. */
-  [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])) > :first-child > :last-child {
-    display: grid !important;
-    grid-template-columns: repeat(3, 1fr) !important;
-    gap: 6px !important;
-  }
-  [aria-modal="true"] [class$="_navCell"] {
-    padding: 6px 8px !important;
-    gap: 6px !important;
-    font-size: 13px !important;
-    justify-content: flex-start !important;
-  }
-  [aria-modal="true"] [class$="_navCell"] svg {
-    width: 14px !important;
-    height: 14px !important;
-    flex: none !important;
-  }
-  /* Setting rows: text on top, control below at full width. */
-  [aria-modal="true"] [class$="_section"] [class$="_row"] {
-    flex-direction: column !important;
-    align-items: stretch !important;
-    gap: 8px !important;
-  }
-  [aria-modal="true"] [class$="_section"] [class$="_row"] > :first-child {
-    width: 100% !important;
-    max-width: none !important;
-  }
-  [aria-modal="true"] [class$="_section"] [class$="_row"] > :last-child {
-    width: 100% !important;
-    max-width: none !important;
-  }
-  /* Appearance mode group: give the cube row a consistent bordered
-     segmented look (the official borders differ per state). */
-  [aria-modal="true"] [class$="_cubeRow"] > * {
-    border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, .12)) !important;
-  }
+  /* ---------- settings sheet polish: moved ----------
+     The tab strip / option-row / appearance-card rules for the host settings
+     dialog now live in one place: see "Settings sheet on mobile (DSH 0.2.2
+     dialog structure)" above. They were duplicated here and, worse, gated on
+     the positional selector that stopped matching on 0.2.2 — keeping a second
+     copy is how the mobile sheet silently broke last time. */
 
   /* ---------- dsh-web-ui polish: explorer sheet ----------
      The aionui explorer was designed for a desktop side column: compact the

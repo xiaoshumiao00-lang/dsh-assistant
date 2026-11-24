@@ -558,12 +558,18 @@ export function PocketSettingsTab({ rpcCall, t }) {
   };
 
   return h('div', { style: styles.card },
-    h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
-      h('div', null,
+    h('div', {
+      // 手机端设置页的 CSS 用这两个身份标记（mobile.css.ts 的 Settings sheet 一节）：
+      // 标题/说明列在左、开发者/Star 列在右，右列是 nowrap，窄屏会把左列挤成竖排。
+      // 用 data-* 而不是宿主 CSS-modules 类名，宿主换类名也不影响这一条。
+      'data-dsh-pocket-card': 'hero',
+      style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+    },
+      h('div', { 'data-part': 'intro' },
         h('strong', null, t('title')),
         h('div', { style: styles.muted }, t('subtitle')),
       ),
-      h('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary,#8b93a1)', textAlign: 'right' } },
+      h('div', { 'data-part': 'credit', style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary,#8b93a1)', textAlign: 'right' } },
         h('div', { style: { whiteSpace: 'nowrap' } }, t('developer')),
         h('div', { style: { whiteSpace: 'nowrap' } }, t('starAsk')),
         h('a', { href: 'https://github.com/shaobeichen/dsh-pocket', target: '_blank', rel: 'noreferrer', style: { color: 'var(--dsw-alias-brand-primary,#4f6ef7)', fontSize: 12, lineHeight: 1.6, textDecoration: 'underline' } },
