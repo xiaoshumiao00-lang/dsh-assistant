@@ -170,6 +170,16 @@ FAIL 附件回归③：… {"hostNodeDisplay":"block","hostAttachRendered":true,
 ```
 截图：`.tmp\probe-mixed.png`（桌面档）、`.tmp\probe-card-attachment.png`（手机端档）。
 
+### 桌面档现场（1440×900，`node .tmp\probe-card-attachment-desktop.mjs` → `.tmp\probe-desktop-out.txt`）
+
+```json
+{"nodeKey":"13:input-message5d6e3d7b-…","turn":"381","order":["para","attachment"],
+ "paras":["个人秘书为什么会自己建立目标啊…由他们建立目标完成任务才对吧，请你禁用个人秘书建立目标完成任务。"],
+ "thumbLoaded":true,"thumbVisible":true,"thumbBox":{"w":154,"h":140},
+ "hostNodeDisplay":"none","hostAttachRendered":false,"collapsedRow":false}
+```
+现场卡片截图：`.tmp\probe-attachment-card-desktop.png`（621×361，卡片里正文一整段 + 嵌在卡内的缩略图与 `image.png`，脚部仍是「引用 66 · 15:42 · 复制」，卡外没有任何单独的原生附件芯片）、整页 `.tmp\probe-attachment-page-desktop.png`。
+
 smoke 新增的两条现场断言原始输出：
 
 ```
