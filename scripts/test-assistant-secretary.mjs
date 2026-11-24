@@ -91,25 +91,37 @@ cases.push(['POST 原子持久化并回读', async () => {
   const g = await call('GET')
   assert.equal(g.json.sessionId, r.json.sessionId)
 }])
-cases.push(['工具闸：只禁动手类（写/编辑/补丁/终端/屏幕/子代理），纯读与目标类一律放行', async () => {
+cases.push(['工具闸：只禁动手类（写/编辑/补丁/终端/屏幕/子代理）+ 秘书侧 goal 类一律拒绝（2026-11-24 用户明确指令）', async () => {
   for (const name of ['write', 'edit', 'apply_patch', 'pwsh', 'bash', 'terminal', 'computer_use', 'code_agent', 'subagent', 'subagent_fork', 'workflow', 'send_message', 'mcp__desktop__click', 'some_future_tool']) {
     assert.equal(surface.secretaryToolDenied(name), true, `${name} 是动手类，应拒绝`)
   }
-  // 2026-11-23 用户实报：读类与 goal 类曾被误拦（读不到 CU 报告、长任务立不了 goal）。
-  for (const name of ['read', 'glob', 'grep', 'read_image', 'create_goal', 'update_goal', 'get_goal']) {
+  // 2026-11-23 用户实报：读类曾被误拦（读不到 CU 报告）——纯读类必须继续放行。
+  for (const name of ['read', 'glob', 'grep', 'read_image']) {
     assert.equal(surface.secretaryToolDenied(name), false, `${name} 不写本机文件/不动屏幕，不该被只读闸拦`)
+  }
+  // 2026-11-24 用户明确指令「请你禁用个人秘书建立目标完成任务」：goal 三类在固定秘书会话里一律拒绝。
+  for (const name of ['create_goal', 'update_goal', 'get_goal']) {
+    assert.equal(surface.secretaryToolDenied(name), true, `${name} 必须由 Computer Use 会话自己立，秘书侧不许放行`)
   }
   for (const name of ['ask_user_question', 'present', 'mnemon_recall', 'session_search', 'secretary_dispatch', 'web_search', 'web_fetch']) {
     assert.equal(surface.secretaryToolDenied(name), false, `${name} 应放行`)
   }
 }])
-cases.push(['读类与 goal 类真的穿过 tools/pre-execute（不只是谓词层放行）', async () => {
+cases.push(['纯读类真的穿过 tools/pre-execute；goal 类在闸口被拒并给出「派活而不是立目标」的话（2026-11-24）', async () => {
   const session = { id: 'session-11111111-2222-3333-4444-555555555555' }
-  for (const name of ['read', 'glob', 'grep', 'create_goal', 'update_goal', 'get_goal']) {
+  for (const name of ['read', 'glob', 'grep']) {
     let allowed = false
     const result = await preTool({ name, agent: { session } }, async () => { allowed = true; return { kind: 'allow' } })
     assert.equal(allowed, true, `${name} 在秘书会话里必须能跑到，不该被只读闸拒绝`)
     assert.equal(result.kind, 'allow')
+  }
+  for (const name of ['create_goal', 'update_goal', 'get_goal']) {
+    let allowed = false
+    const result = await preTool({ name, agent: { session } }, async () => { allowed = true; return { kind: 'allow' } })
+    assert.equal(allowed, false, `${name} 在固定秘书会话里必须被拒（用户 2026-11-24 明确禁止秘书自己立目标）`)
+    assert.equal(result.kind, 'deny')
+    assert.match(result.reason, /目标由 Computer Use 会话自己立/, `${name} 的拒绝话要说清目标归 Computer Use 会话`)
+    assert.match(result.reason, /secretary_dispatch/, `${name} 的拒绝话要指到派活这条路`)
   }
   for (const name of ['write', 'edit', 'apply_patch', 'pwsh', 'bash', 'computer_use', 'subagent']) {
     let allowed = false

@@ -139,7 +139,7 @@ export function hasTaskIntent(text: string): boolean {
   const tailQuestion = CHAT_TAILS.some((word) => raw.endsWith(word))
   // 没有外部能力线索、也没有明确改写/执行动作的尾问句，才按纯知识随口问处理；
   // 动手类（read 之外的写/终端/屏幕/子代理）在只读闸里禁着，不能以「秘书自己动手」为由留在本会话。
-  // 注意 read/glob/grep 与 goal 类 2026-11-23 起在只读闸里是放行的，别在这里把它们也当成都干不了。
+  // 注意 read/glob/grep 2026-11-23 起在只读闸里是放行的；goal 类（create_goal/update_goal/get_goal）2026-11-24 起在秘书侧一律拒绝，目标归 Computer Use 会话自己立。
   if (tailQuestion && !dispatchSignals(raw).length && !/(把|将).{0,20}(改|写|做|建|跑|生成)/.test(raw)) return false
   return true
 }

@@ -13,7 +13,7 @@
  *   2. 消息形状是宿主认的 user 消息（role/source/content），正文含系统通知说明与会话引用；
  *   3. 拿不到活 agent（宿主没提供 followup）→ 返回 false，绝不退回"自己写事件"；
  *   4. 通知回合只禁动手类：模型不能借通知回合再派活，避免「通知→派活→再通知」的回路；
- *      纯读类（read/glob/grep）与目标类（create_goal/update_goal/get_goal）仍放行——
+ *      纯读类（read/glob/grep）与目标类（create_goal/update_goal/get_goal）2026-11-24 起一律拒绝——
  *      通知原文被截断时读报告文件是唯一补救（2026-11-23 用户实报）。用户真实回合完全不受影响。
  *
  *   node scripts/test-secretary-notice-turn.mjs
@@ -160,8 +160,10 @@ cases.push(['通知回合只禁动手类；用户真实回合恢复放行', asyn
       assert.match(denied.reason, /整理|先给结论/, '闸的措辞要跟上「自己整理、先给结论」的新口径')
     }
 
-    // 2026-11-23 用户实报：读类与 goal 类在通知回合也不该被误伤——截断的原文要靠读报告文件补齐。
-    for (const name of ['read', 'glob', 'grep', 'create_goal', 'update_goal', 'get_goal']) {
+    // 2026-11-23 用户实报：纯读类在通知回合不许被误伤——截断的原文要靠读报告文件补齐。
+    // 2026-11-24 用户明确指令「请你禁用个人秘书建立目标完成任务」：goal 类在通知回合也要被拒。
+    for (const name of ['create_goal', 'update_goal', 'get_goal']) { const deniedGoal = await preTool({ name, agent: { session: { id: 'session-notice-4' } } }, async () => ({ kind: 'allow' })); assert.equal(deniedGoal.kind, 'deny', `${name} 在通知回合必须被拒`); assert.match(deniedGoal.reason, /目标由 Computer Use 会话自己立/, `${name} 的通知回合拒绝话要说清目标归 Computer Use 会话`); assert.match(deniedGoal.reason, /secretary_dispatch/, `${name} 的通知回合拒绝话要指到派活这条路`) }
+    for (const name of ['read', 'glob', 'grep']) {
       let allowed = false
       const result = await preTool({ name, agent: { session: { id: 'session-notice-4' } } }, async () => { allowed = true; return { kind: 'allow' } })
       assert.equal(allowed, true, `${name} 不写不跑不派活，通知回合不该被禁`)
