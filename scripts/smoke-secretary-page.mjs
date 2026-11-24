@@ -895,8 +895,17 @@ try {
     })
     const noticeRows = [...document.querySelectorAll('[data-chat-flow-kind="user"]')]
       .filter((row) => {
-        const run = row.querySelector('[data-slot="conversation.user.text.node"]')
-        return /系统通知/.test(run?.textContent ?? '') || /\[\[session:[^\]]*\]\]/.test(run?.textContent ?? '')
+        // 判据与客户端 collectSecretaryCardRows / isSyntheticNoticeUserText（src/secretary-card-shared.ts）同一套：
+        // 首行是「（系统通知…）」头，或正文里有 [[session:…]] 引用行。
+        // 这里**不许**用「正文里出现系统通知四个字」这种子串判据——用户真消息也可以谈论系统通知
+        //（实测 2026-11-24 用户那句「个人秘书会话页面的系统通知的存活时间…」就被旧判据误当成通知行，
+        //  于是一条正常用户卡永远凑不够 通知行=通知卡+空壳 的等式，把这项断言打成假失败）。
+        const text = (row.querySelector('[data-slot="conversation.user.text.node"]')?.textContent ?? '').trim()
+        if (text === '') return false
+        const lines = text.split('\n').map((line) => line.trim()).filter((line) => line !== '')
+        if (lines.length === 0) return false
+        if (/^\s*[（(【\[]?\s*系统通知/.test(lines[0])) return true
+        return lines.some((line) => /(^|\n)\s*(最后单独一行原样输出：)?\s*\[\[session:[^\]]*\]\]/.test(`\n${line}`))
       })
     const noticeCarded = noticeRows.filter((row) => row.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="notice"]:not([data-dsh-scard-expired="1"])'))
     const noticeCard = noticeCarded[0]?.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="notice"]:not([data-dsh-scard-expired="1"])') ?? null
@@ -969,7 +978,7 @@ try {
   check('每条通知行都归到卡片（没过期的是灰底「系统 · 通知」完整卡，过期的是空壳），不写成用户卡/个人秘书',
     ucard.noticeRowCount >= 1 && ucard.noticeCardedCount + ucard.noticeExpiredShellsCount === ucard.noticeRowCount
       && (ucard.noticeCardedCount === 0 || (ucard.noticeKindAttr === 'notice' && ucard.noticeTag === '系统 · 通知' && ucard.noticeBg === 'rgb(246, 247, 249)')),
-    JSON.stringify({ noticeRows: ucard.noticeRowCount, noticeCarded: ucard.noticeCardedCount, noticeExpiredShells: ucard.noticeExpiredShellsCount, tag: ucard.noticeTag, kind: ucard.noticeKindAttr, bg: ucard.noticeBg }))
+    JSON.stringify({ noticeRows: ucard.noticeRowCount, noticeCarded: ucard.noticeCardedCount, noticeExpiredShells: ucard.noticeExpiredShellsCount, tag: ucard.noticeTag, kind: ucard.noticeKindAttr, bg: ucard.noticeBg, uncarded: ucard.noticeUncardedRows }))
   if (ucard.noticeCardedCount >= 1) {
     check('通知卡字号与折叠跟秘书卡共用一套实现（详情 14px/行高 26px、结论 18px、max-height 是 px 数值、带…标记）',
       ucard.noticeParaSize === '14px' && ucard.noticeTitleSize === '18px' && ucard.noticeMaxHeightPx === true

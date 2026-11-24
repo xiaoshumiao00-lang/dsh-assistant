@@ -667,7 +667,37 @@ cases.push(['数字口径改档（2026-11-24 用户明确批准）：注入段�
   assert.match(text, /不要用 markdown 符号、表格、列表符号、表情符号、代码块/)
   assert.match(text, /英文缩写尽量换成读得出的中文说法/)
   assert.match(text, /车次 G1545/)
-  assert.ok(text.includes('二、') && text.includes('三、') && text.includes('四、'), '注入段仍是那 4 条（顺序与编号不许变）')
+  assert.ok(text.includes('二、') && text.includes('三、') && text.includes('四、'), '注入段原有的二、三、四条仍在（编号顺序不许变，新口径只许往后加）')
+}])
+
+// 2026-11-24 用户原话「太长太累、要结构清晰、结论先行、CU 回执要先自己整理」：
+// 这些必须落成可执行的量化口径，不是口号（每条都断言具体数字/动作，不许写成「尽量简短」）。
+cases.push(['简洁硬约束（2026-11-24）：300 字上限、3 到 5 句、最多 5 个要点、第一句直接回答、禁止照抄', () => {
+  const text = surface.SECRETARY_SPEECH_STYLE_TEXT
+  // 量化长度口径（三处数字缺一条都不算硬约束）
+  assert.match(text, /300 字/, '注入段必须写清一次回复正文约 300 字的上限')
+  assert.match(text, /超过 300 字|超 300 字/, '超过 300 字要有明确判据（超了就是没整理）')
+  assert.match(text, /3 到 5 句/, '默认长度：3 到 5 句')
+  assert.match(text, /最多 5 个要点/, '确需展开时最多 5 个要点')
+  assert.match(text, /每个要点独占一行|每个要点一行/, '要点必须一行一个（不许揉成长段）')
+  // 结论先行：第一句直接回答「用户本条消息问的那件事」
+  assert.match(text, /第一句/, '必须点名「第一句」')
+  assert.match(text, /直接回答/, '第一句是直接回答，不是铺垫')
+  assert.match(text, /问的那件事|问的是哪个任务/, '必须对准用户这条消息问的那件事')
+  assert.match(text, /不许铺垫|不铺垫/, '禁止铺垫')
+  assert.match(text, /不许先复述/, '禁止先复述用户问题再回答')
+  // 禁止照抄 CU 回执：整段转述、表格、长路径、日志一律不许堆进回复
+  assert.match(text, /禁止照抄/, '必须出现「禁止照抄」字样')
+  assert.match(text, /日志/, '回执里的日志原文也不许堆进回复')
+  assert.match(text, /整段转述/, '整段转述 CU 回执同样禁止')
+  // 先读回全文再压缩：只保留硬事实，不许凭被裁摘录作答
+  assert.match(text, /read/, '必须要求按落盘路径 read 回全文')
+  assert.match(text, /落盘路径/, '落盘路径这个词要在注入段里点明')
+  assert.match(text, /硬事实/, '压缩后的短结论只保留硬事实')
+  // 旧口径不许留成「正确断言」：不照抄那条仍然在（它是新口径的上位约束，不是被替换的旧文案）
+  assert.match(text, /不许整大段原封不动照抄/, '「不照抄」这条不能被新口径挤掉')
+  assert.match(text, /数字一律保留阿拉伯写法/, '2026-11-24 的数字口径必须原样保留')
+  for (const old of ['原样转述']) assert.ok(!text.includes(old), `旧口径「${old}」不许回来`)
 }])
 
 let failed = 0
