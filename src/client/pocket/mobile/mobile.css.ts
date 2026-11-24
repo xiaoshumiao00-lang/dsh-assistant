@@ -461,6 +461,15 @@ const NARROW_RULES = `
     pointer-events: none !important;
   }
 
+  /* 兜底（2026-11-25「点会话进详情，页面还是暗的」）：宿主把官方侧栏列收走时
+     （drawer 模式下 data-sidebar-collapsed → 宿主规则 visibility:hidden + translateX(-100%)），
+     抽屉其实已经不在屏上了。这时我们自己的压暗层绝不能再留着 —— 只要 marker 因任何
+     原因（事件丢失 / 竞态 / 别的插件改了宿主状态）还写着 open，这一条就把暗屏掐掉，
+     页面立刻亮，用户不必"再点一下"。压暗层只跟着"真的看得见的抽屉"走。 */
+  ${FRAME_SELECTOR}${OPEN}[data-sidebar-collapsed] [data-mobile-nav="backdrop"] {
+    display: none !important;
+  }
+
   /* --- Host portaled popups must outrank the open drawer (手机端「点左下角头像没反应」)
      The drawer foot holds the host account launcher (asar:
      @deepseek-ai/dsh-client-ui-settings-account/lib/client.js, AccountMenu →
