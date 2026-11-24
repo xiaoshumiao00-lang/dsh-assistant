@@ -642,6 +642,69 @@ cases.push(['compact 提示判据（第 3 项）：那两行文本按已核实�
   assert.equal(surface.isCompactHintText(''), false)
 }])
 
+// 2026-11-24 第 5 项（用户原话「秘书执行任务的过程可以展示，只展示最新用户一条任务」）：
+// 扫描层按 DOM 里最后一条 user/steering 行定位「最新一轮」，把那一轮的过程行打上
+// data-dsh-process-visible="1"；新消息一来标记整体后移，上一轮的标记一个都不许留。
+cases.push(['最新一轮过程行可见（第 5 项）：标记跟着最后一条用户行移动，历史轮次不标', () => {
+  const makeNode = (attrs) => {
+    const a = { ...attrs }
+    return {
+      getAttribute: (name) => (name in a ? a[name] : null),
+      setAttribute: (name, value) => { a[name] = String(value) },
+      removeAttribute: (name) => { delete a[name] },
+      hasAttribute: (name) => name in a,
+      querySelector: () => null,
+      attrs: a,
+    }
+  }
+  const rows = [
+    makeNode({ 'data-chat-turn': '10', 'data-chat-flow-kind': 'user' }),
+    makeNode({ 'data-chat-turn': '10', 'data-chat-flow-kind': 'tool-call' }),
+    makeNode({ 'data-chat-turn': '10', 'data-chat-flow-kind': 'assistant-step' }),
+    makeNode({ 'data-chat-turn': '11', 'data-chat-flow-kind': 'user' }),
+    makeNode({ 'data-chat-turn': '11', 'data-chat-flow-kind': 'tool-call' }),
+    makeNode({ 'data-chat-turn': '11', 'data-chat-flow-kind': 'context' }),
+    makeNode({ 'data-chat-turn': '11', 'data-chat-flow-kind': 'assistant-step', 'data-chat-group-part': 'reasoning' }),
+    makeNode({ 'data-chat-turn': '12', 'data-chat-flow-kind': 'steering' }),
+    makeNode({ 'data-chat-turn': '12', 'data-chat-flow-kind': 'tool-call' }),
+  ]
+  const doc = {
+    querySelectorAll: (selector) => (selector.includes('data-chat-flow-kind]')
+      ? rows
+      : rows.filter((row) => row.hasAttribute('data-dsh-process-visible'))),
+  }
+  const first = surface.tagLatestTurnProcessRows(doc)
+  assert.equal(first.turnNo, '12', '锚点 = 最后一条用户/插话行的轮次，不是写死的号')
+  assert.equal(first.anchorKind, 'steering', '插话行也算用户侧锚点')
+  assert.equal(first.marked, 1, '只标最新一轮的那条过程行')
+  assert.equal(rows[8].hasAttribute('data-dsh-process-visible'), true, '最新一轮的 tool-call 被打标')
+  assert.equal(rows[4].hasAttribute('data-dsh-process-visible'), false, '上一轮的 tool-call 不许标')
+  assert.equal(rows[5].hasAttribute('data-dsh-process-visible'), false, '上一轮的 context 不许标')
+  assert.equal(rows[6].hasAttribute('data-dsh-process-visible'), false, '上一轮 reasoning 叙述也不算最新轮')
+  assert.equal(rows[2].hasAttribute('data-dsh-process-visible'), false, '历史轮的 assistant-step 不许标')
+  assert.equal(rows[0].hasAttribute('data-dsh-process-visible'), false, '用户行自己不打这个标')
+
+  // 追加一条新用户消息 + 它这一轮的过程行 → 标记整体后移，上一轮立刻收回
+  rows.push(makeNode({ 'data-chat-turn': '13', 'data-chat-flow-kind': 'user' }))
+  rows.push(makeNode({ 'data-chat-turn': '13', 'data-chat-flow-kind': 'tool-call' }))
+  rows.push(makeNode({ 'data-chat-turn': '13', 'data-chat-flow-kind': 'turn-process' }))
+  rows.push(makeNode({ 'data-chat-turn': '13', 'data-chat-flow-kind': 'assistant-step' }))
+  const second = surface.tagLatestTurnProcessRows(doc)
+  assert.equal(second.turnNo, '13')
+  assert.equal(second.marked, 2, '新一轮的两条过程行都标上')
+  assert.equal(rows[8].hasAttribute('data-dsh-process-visible'), false, '上一轮（12）的标记必须收回')
+  assert.equal(rows[10].hasAttribute('data-dsh-process-visible'), true)
+  assert.equal(rows[11].hasAttribute('data-dsh-process-visible'), true)
+  assert.equal(rows[12].hasAttribute('data-dsh-process-visible'), false, 'assistant-step（回复正文）永远不标——卡片已经展示同一段文字')
+
+  // 没有任何用户行 → 一个都不标；清标记接口可用
+  const emptyDoc = { querySelectorAll: () => [makeNode({ 'data-chat-flow-kind': 'tool-call' })] }
+  assert.equal(surface.tagLatestTurnProcessRows(emptyDoc).marked, 0)
+  assert.equal(surface.clearLatestTurnProcessTags(doc) >= 2, true, '离开秘书页要能把自己的标记全清掉')
+  assert.equal(rows.filter((row) => row.hasAttribute('data-dsh-process-visible')).length, 0)
+  assert.equal(surface.PROCESS_VISIBLE_ATTRIBUTE, 'data-dsh-process-visible')
+}])
+
 cases.push(['引用登记（第 4 项）：归一 + store 口径 + 宿主真值优先', async () => {
   const base = { cardKey: 'notice:14:msg-cu-01', kind: 'notice', turnNo: '9', preview: '结论：改了三处。', refSessionIds: ['session-cu-1', 'session-cu-1', '带 空 格', 'x'.repeat(130)] }
   const record = surface.normalizeQuoteRecord(base)

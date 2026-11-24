@@ -1971,6 +1971,103 @@ export function clearSecretaryCompactHintRows(doc: Document): number {
   return cleared
 }
 
+/* ───────── 12. 最新一轮的过程行可见（2026-11-24 第 5 项需求） ─────────
+ *
+ * 用户原话：「个人秘书页，在用户发送一条消息之后，个人秘书自己执行任务的过程可以展示，
+ * 不要被屏蔽了。只展示最新用户一条任务的执行过程，其他历史消息的执行过程都不要展示。」
+ *
+ * 实现口径（扫描层打标 + CSS 放行，判据全按 DOM 现状，不写死任何 turn 号）：
+ *   ① 锚点：按文档顺序取**最后一条** `[data-chat-flow-kind]` 是 user / steering 的宿主行
+ *      （插话那一类与真用户行是同一个用户消息视图，见 6127e8e 那批；两类都算「用户这一条」）；
+ *   ② 范围：锚点之后（文档顺序）且 `data-chat-turn` 等于锚点那一轮（锚点没有轮次号时按「其后所有」兜底）
+ *      的过程行：tool-call / context / turn-process / model-retry / turn-error / turn-max-tokens，
+ *      外加带 `data-chat-group-key` 的分组容器与带 `data-turn-process-member` 的分组成员；
+ *      分组里 `data-chat-group-part="reasoning"` 的那种「已搜索代码，已读取文件」也放行；
+ *   ③ 不标：`assistant-step` 且没有 reasoning 分组标记的行 —— 那是**回复正文**（现场 dump 实测行高
+ *      1038px 的整段回答），卡片已经展示同一段文字，再露出来就是重复；manual-compaction 与回合尾部件
+ *      （本回合记忆/技能）也不标，它们是上下文管理，不是任务执行；
+ *   ④ 移动：每次扫描先把上一轮的标记全摘掉再重新打（幂等），新用户消息一来锚点后移，
+ *      上一轮的过程行立刻回到 display:none；
+ *   ⑤ 兜底：容器里挂着我们的卡（`[data-dsh-scard]`）一律不标，绝不把卡片连坐。
+ *
+ * 这个函数**刻意写成自包含**（只依赖 doc 与 options，不引用别的模块常量），
+ * 视觉套件可以直接把它注入页面里跑真实逻辑（见 scripts/test-secretary-card-visual.mjs）。
+ */
+export const PROCESS_VISIBLE_ATTRIBUTE = 'data-dsh-process-visible'
+/** 放行的过程行 kind（不含 assistant-step：那一类要按 reasoning 分组标记单独判）。 */
+export const PROCESS_VISIBLE_KINDS: readonly string[] = ['tool-call', 'context', 'turn-process', 'model-retry', 'turn-error', 'turn-max-tokens']
+
+export interface LatestTurnProcessTagResult {
+  /** 这一次打标的行数。 */
+  marked: number
+  /** 锚点那一轮的 turn 号（锚点没有轮次号时是空串）。 */
+  turnNo: string
+  /** 锚点那一行的 kind（user / steering；没有锚点时空串）。 */
+  anchorKind: string
+}
+
+/**
+ * 把「最新一条用户消息那一轮」的过程行打上 `data-dsh-process-visible="1"`，其余全部摘掉（幂等）。
+ * 每次扫描调用一次即可；标记随最后一条用户行移动。
+ */
+export function tagLatestTurnProcessRows(
+  doc: Document | { querySelectorAll(selector: string): ArrayLike<Element> },
+  options?: { attribute?: string; kinds?: readonly string[] },
+): LatestTurnProcessTagResult {
+  const attribute = options?.attribute ?? PROCESS_VISIBLE_ATTRIBUTE
+  const kinds = options?.kinds ?? PROCESS_VISIBLE_KINDS
+  const anchorKinds = ['user', 'steering']
+  const get = (el: any, name: string): string => String(el.getAttribute(name) ?? '')
+  const empty: LatestTurnProcessTagResult = { marked: 0, turnNo: '', anchorKind: '' }
+  if (doc === null || doc === undefined) return empty
+  // ④ 先把上一轮的标记全摘掉：新消息一来，旧那一轮立刻回到隐藏
+  for (const el of Array.from(doc.querySelectorAll(`[${attribute}]`)) as any[]) {
+    try { el.removeAttribute(attribute) } catch { /* 已被宿主摘掉的节点：跳过 */ }
+  }
+  const list = Array.from(doc.querySelectorAll('[data-chat-flow-kind], [data-chat-group-key], [data-turn-process-member]')) as any[]
+  // ① 锚点 = 文档顺序里最后一条 user / steering 行
+  let anchorIndex = -1
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    if (anchorKinds.includes(get(list[i], 'data-chat-flow-kind'))) { anchorIndex = i; break }
+  }
+  if (anchorIndex < 0) return empty
+  const anchor = list[anchorIndex]
+  const anchorKind = get(anchor, 'data-chat-flow-kind')
+  const turnNo = get(anchor, 'data-chat-turn')
+  let marked = 0
+  for (let i = anchorIndex + 1; i < list.length; i += 1) {
+    const el = list[i]
+    const kind = get(el, 'data-chat-flow-kind')
+    if (anchorKinds.includes(kind)) continue
+    // ② 同轮：两边都有轮次号时必须相等；锚点没有轮次号时按「锚点之后」兜底
+    const rowTurn = get(el, 'data-chat-turn')
+    if (turnNo !== '' && rowTurn !== '' && rowTurn !== turnNo) continue
+    // ⑤ 容器里挂着我们的卡就不动它
+    if (typeof el.querySelector === 'function' && el.querySelector('[data-dsh-scard]') !== null) continue
+    const groupPart = get(el, 'data-chat-group-part')
+    const isProcessRow = kinds.includes(kind)
+      || (kind === 'assistant-step' && groupPart === 'reasoning')
+      || (kind === '' && (el.hasAttribute('data-chat-group-key') || el.hasAttribute('data-turn-process-member')))
+    if (!isProcessRow) continue
+    el.setAttribute(attribute, '1')
+    marked += 1
+  }
+  return { marked, turnNo, anchorKind }
+}
+
+/** 清掉自己打过的「最新一轮过程行」标记（离开秘书页 / 测试复位用）。 */
+export function clearLatestTurnProcessTags(
+  doc: Document | { querySelectorAll(selector: string): ArrayLike<Element> },
+  options?: { attribute?: string },
+): number {
+  const attribute = options?.attribute ?? PROCESS_VISIBLE_ATTRIBUTE
+  let cleared = 0
+  for (const el of Array.from(doc.querySelectorAll(`[${attribute}]`)) as any[]) {
+    try { el.removeAttribute(attribute); cleared += 1 } catch { /* 忽略已摘掉的节点 */ }
+  }
+  return cleared
+}
+
 /* ───────── 11. 引用（2026-11-23 第 4 项需求）：下一条消息挂到这张卡上 ─────────
  *
  * 客户端口径（真值在宿主 `/api/assistant/secretary-quote` → dsh-assistant-secretary-quote.json，
@@ -2485,6 +2582,10 @@ export const secretaryCardsTestSurface = {
   isCompactHintText,
   tagSecretaryCompactHintRows,
   clearSecretaryCompactHintRows,
+  PROCESS_VISIBLE_ATTRIBUTE,
+  PROCESS_VISIBLE_KINDS,
+  tagLatestTurnProcessRows,
+  clearLatestTurnProcessTags,
   ASSISTANT_SECRETARY_QUOTE_ROUTE,
   QUOTE_STORAGE_PREFIX,
   QUOTE_BASELINE_STORAGE_PREFIX,

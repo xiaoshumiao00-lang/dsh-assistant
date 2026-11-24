@@ -458,11 +458,32 @@ try {
     }, { timeout: 120000 }).catch(() => {})
   }
 
-  // ── 过程信息行（需求②）：渲染层真正不输出 ──
+  // ── 过程信息行（第 5 项改档 2026-11-24：最新一轮允许可见、历史轮次一条都不许出图）──
+  // 旧断言直接扫 body.innerText，前提是「过程行一律隐藏」；新口径下最新一轮的
+  // 「已完成，用时 12 秒」那一行是有意可见的（带 data-dsh-process-visible="1"），
+  // 所以改成逐行判：带标记 + 确实在出图 = 允许；没标记却出图 = 泄漏。
   const PROCESS_NOISE = [/已完成，用时/, /处理失败/, /已重试模型请求/, /正在重试模型请求/, /本轮运行失败/, /等待重试模型请求/]
-  const pageTextNow = (await page.evaluate(() => document.body.innerText || '')) + '\n' + (snapshot.texts || []).join('\n')
-  const leakedNoise = PROCESS_NOISE.filter((pattern) => pattern.test(pageTextNow)).map(String)
-  check('无过程信息行（已完成/用时/处理失败/重试/本轮运行失败）', leakedNoise.length === 0, `leaked=${leakedNoise.join(',')}`)
+  const leakedNoise = await page.evaluate((patterns) => {
+    const regexes = patterns.map((pattern) => new RegExp(pattern))
+    const out = []
+    for (const el of document.querySelectorAll('[data-chat-flow-kind], [data-chat-group-key], [data-turn-process-member]')) {
+      const text = String(el.innerText ?? '')
+      if (!regexes.some((regex) => regex.test(text))) continue
+      if (el.getBoundingClientRect().height === 0) continue
+      let node = el
+      let hidden = false
+      while (node && node !== document.body) {
+        if (getComputedStyle(node).display === 'none') { hidden = true; break }
+        node = node.parentElement
+      }
+      if (hidden) continue
+      if (el.getAttribute('data-dsh-process-visible') === '1') continue
+      out.push(String(text).replace(/\s+/g, ' ').trim().slice(0, 40))
+    }
+    return out
+  }, PROCESS_NOISE.map(String))
+  check('无过程信息行：历史轮次一条都不出图（最新一轮那行带 data-dsh-process-visible 才允许可见）',
+    leakedNoise.length === 0, `leaked=${leakedNoise.join(',')}`)
 
   // ── 消息操作行（复制/赞/踩/分享/记忆/时间）：秘书会话渲染层隐藏、不留行高 ──
   const actionRows = await page.evaluate(() => {
@@ -1843,8 +1864,10 @@ try {
   await page.waitForTimeout(1200)
   const afterConsoleIntent = await logSample()
   check('宿主 intent=console 落到控制室（不串进秘书：秘书打开链路没有新增，只多出这条 ball-intent=console）',
-    consoleLanded && afterConsoleIntent.total > logBeforeIntent.total && afterConsoleIntent.openChain === logBeforeIntent.openChain
-      && afterConsoleIntent.lastIntent?.intent === 'console',
+    // 2026-11-24 现场修：宿主那份打开日志是**定长环形**的（实测连续多跑后 total 卡在 40 不再增长），
+    // 所以「total 必须变大」不再是可靠信号；改成验最后一条 ball-intent 的 intent/source 与秘书链路没有增长。
+    consoleLanded && afterConsoleIntent.openChain === logBeforeIntent.openChain
+      && afterConsoleIntent.lastIntent?.intent === 'console' && afterConsoleIntent.lastIntent?.source === 'ball-click',
     JSON.stringify({ before: logBeforeIntent, after: afterConsoleIntent, rooms: await page.locator('.dsh-assistant-cr').count() }))
 
   await page.evaluate(() => fetch('/api/assistant/open-assistant', { method: 'POST' }))
@@ -1858,11 +1881,11 @@ try {
   const afterAssistantSample = await logSample()
   const landedRooms = await page.evaluate(() => document.querySelectorAll('.dsh-assistant-cr').length)
   const landedCurrent = await readCurrentSessionId()
-  check('宿主 intent=assistant 落到秘书固定会话（并收起控制室；打开链路确实新增、这条 intent 是 assistant）',
+  check('宿主 intent=assistant 落到秘书固定会话（并收起控制室；这条 intent 是 assistant）',
+    // 同上：不再要求日志条数增长（定长环形会卡住），验「真的落到了固定秘书会话 + 控制室收起 + 最后一条 intent」。
     assistantLanded && landedCurrent === idBeforeLongPress && landedRooms === 0
-      && afterAssistantSample.total > afterConsoleIntent.total
-      && afterAssistantSample.openChain > afterConsoleIntent.openChain
-      && afterAssistantSample.lastIntent?.intent === 'assistant',
+      && afterAssistantSample.lastIntent?.intent === 'assistant'
+      && afterAssistantSample.lastIntent?.source === 'ball-click',
     JSON.stringify({ rooms: landedRooms, current: landedCurrent, before: afterConsoleIntent, after: afterAssistantSample }))
 
   // ── 普通会话不受影响：切到一条普通会话，消息操作行必须仍然可见 ──
@@ -2175,8 +2198,11 @@ try {
     await page.waitForTimeout(900)
     const afterScroll = await pagerProbe()
     check('分页：上滚最多只取回下一段（≤60 张，且绝不把整条会话塞进 DOM）',
-      afterScroll.fullTotal <= 60 && afterScroll.fullTotal >= firstWindow.fullTotal && afterScroll.domNodes < 20000,
-      JSON.stringify({ before: firstWindow.fullTotal, after: afterScroll.fullTotal, collapsed: afterScroll.collapsedTotal, domNodes: afterScroll.domNodes }))
+      // 2026-11-24 通知卡改 10 秒 TTL 之后，fullTotal 会在两次测量之间因为「通知卡到点收成空壳」掉 1～2 张，
+      // 所以只对不会自然消失的两类卡（秘书卡 + 用户卡）做「不许变少」的断言，通知卡单独记数。
+      afterScroll.fullTotal <= 60 && afterScroll.domNodes < 20000
+        && (afterScroll.fullAssistant ?? 0) + (afterScroll.fullUser ?? 0) >= firstWindow.fullAssistant + firstWindow.fullUser,
+      JSON.stringify({ before: firstWindow.fullTotal, after: afterScroll.fullTotal, beforeAssistantUser: firstWindow.fullAssistant + firstWindow.fullUser, afterAssistantUser: (afterScroll.fullAssistant ?? 0) + (afterScroll.fullUser ?? 0), collapsed: afterScroll.collapsedTotal, domNodes: afterScroll.domNodes }))
     if (afterScroll.fullTotal > firstWindow.fullTotal) {
       check('分页：取回后保持原滚动位置不跳（scroll-anchoring 补回 scrollTop）',
       afterScroll.scrollTop > 0 && afterScroll.scrollHeight > scroller.beforeHeight,
@@ -2336,9 +2362,28 @@ try {
     const rows = [...document.querySelectorAll('[data-chat-flow-key]')]
     const visible = rows.filter((el) => isVisible(el) && el.getBoundingClientRect().height > 0)
     const describe = (el) => `${String(el.getAttribute('data-chat-flow-kind'))}|group=${el.getAttribute('data-chat-group-key')}|member=${el.getAttribute('data-turn-process-member')}|h=${Math.round(el.getBoundingClientRect().height)}|${String(el.innerText ?? '').replace(/\s+/g, ' ').trim().slice(0, 46)}`
+    // 第 5 项（2026-11-24）新口径：只展示「最新一条 user/steering 行那一轮」的执行过程。
+    // 允许可见的过程行必须同时满足：① 带插件标记 data-dsh-process-visible="1"；② 在最后一条用户行之后；
+    // ③ 与它同一轮（轮次号两边都有时必须相等；缺号时按「用户行之后」兜底）。其他过程行一律 display:none。
+    let anchorIndex = -1
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      const kind = rows[i].getAttribute('data-chat-flow-kind')
+      if (kind === 'user' || kind === 'steering') { anchorIndex = i; break }
+    }
+    const anchor = anchorIndex >= 0 ? rows[anchorIndex] : null
+    const anchorTurn = anchor === null ? '' : String(anchor.getAttribute('data-chat-turn') ?? '')
+    const rowIndex = new Map(rows.map((el, index) => [el, index]))
+    const allowed = (el) => {
+      if (anchor === null || el.getAttribute('data-dsh-process-visible') !== '1') return false
+      if ((rowIndex.get(el) ?? -1) <= anchorIndex) return false
+      const turn = String(el.getAttribute('data-chat-turn') ?? '')
+      return anchorTurn === '' || turn === '' || turn === anchorTurn
+    }
+    const processVisible = visible.filter((el) => allowed(el))
     const leakedRows = visible
       .filter((el) => PROCESS_KINDS.includes(el.getAttribute('data-chat-flow-kind')) || el.hasAttribute('data-chat-group-key') || el.hasAttribute('data-turn-process-member'))
       .filter((el) => el.querySelector('[data-dsh-scard]') === null)
+      .filter((el) => !allowed(el))
       .map(describe)
     const tailExtras = [...document.querySelectorAll('[data-slot="conversation.chat.turnTail"]')]
       .flatMap((container) => [...container.children])
@@ -2347,16 +2392,25 @@ try {
       .map(describe)
     const titleLeaks = visible
       .filter((el) => el.querySelector('[data-dsh-scard]') === null)
+      .filter((el) => !allowed(el))
       .map((el) => String(el.innerText ?? '').replace(/\s+/g, ' ').trim())
       .filter((text) => /^(已|正在|准备)(调用工具|读取文件|搜索代码|修改了文件|执行了命令|搜索网页|访问网页|协调子智能体|更新计划)|本回合记忆|本回合技能/.test(text))
     const kindsSeen = [...new Set(rows.map((el) => el.getAttribute('data-chat-flow-kind')).filter((kind) => kind !== null))]
-    return { rowsTotal: rows.length, visibleTotal: visible.length, cardBackedVisible: visible.filter((el) => el.querySelector('[data-dsh-scard]') !== null).length, kindsSeen, leakedRows, tailExtras, titleLeaks }
+    return {
+      rowsTotal: rows.length,
+      visibleTotal: visible.length,
+      cardBackedVisible: visible.filter((el) => el.querySelector('[data-dsh-scard]') !== null).length,
+      anchorTurn,
+      markedVisible: processVisible.length,
+      markedVisibleSample: processVisible.slice(0, 4).map(describe),
+      kindsSeen, leakedRows, tailExtras, titleLeaks,
+    }
   })
   notes.push(`过程行现场事实：${JSON.stringify(leakFacts)}`)
   const leakCount = leakFacts.leakedRows.length + leakFacts.tailExtras.length + leakFacts.titleLeaks.length
-  check('真页现场：卡片之间过程行 0 条（已调用工具并搜索代码 / 已调用工具 / 本回合记忆召回 这类一律不出图）',
+  check('真页现场：过程行只允许「最新一条用户消息那一轮」可见（必须带 data-dsh-process-visible 且同轮），其他轮次过程行与回合尾部件一律不出图',
     leakCount === 0,
-    `visible=${leakFacts.visibleTotal} cardBacked=${leakFacts.cardBackedVisible} kinds=${JSON.stringify(leakFacts.kindsSeen)} leaked=${JSON.stringify(leakFacts.leakedRows.slice(0, 6))} tailExtras=${JSON.stringify(leakFacts.tailExtras.slice(0, 4))} titleLeaks=${JSON.stringify(leakFacts.titleLeaks.slice(0, 4))}`)
+    `anchorTurn=${leakFacts.anchorTurn} markedVisible=${leakFacts.markedVisible} visible=${leakFacts.visibleTotal} cardBacked=${leakFacts.cardBackedVisible} kinds=${JSON.stringify(leakFacts.kindsSeen)} leaked=${JSON.stringify(leakFacts.leakedRows.slice(0, 6))} tailExtras=${JSON.stringify(leakFacts.tailExtras.slice(0, 4))} titleLeaks=${JSON.stringify(leakFacts.titleLeaks.slice(0, 4))}`)
   await page.screenshot({ path: 'tmp-secretary-interrupt-card.png' })
   notes.push('截图: tmp-secretary-interrupt-card.png（插话卡 + 过程行现场）')
 

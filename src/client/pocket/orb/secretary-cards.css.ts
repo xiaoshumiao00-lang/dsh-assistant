@@ -78,6 +78,16 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"][data-empty="1"],
 body[data-dsh-secretary="1"] [data-dsh-speak="wrap"][data-empty="1"] {
   display: none !important;
 }
+/* 2026-11-24 第 5 项（用户原话「秘书执行任务的过程可以展示，只展示最新用户一条任务的执行过程」）：
+ * 上面那些「过程行一律 display:none」的规则照旧管历史轮次；扫描层（secretary-cards.ts 的
+ * tagLatestTurnProcessRows）只给**最后一条 user/steering 行那一轮**的过程行打 data-dsh-process-visible="1"，
+ * 这里把打了标的放出来。判据与卡种无关、与轮次号无关，标记跟着最新一条用户消息移动，
+ * 新消息一来上一轮立刻回到上面那些隐藏规则里。用 revert 回到宿主/UA 自己的 display（分组容器与
+ * 成员行原本就不是同一种 display），不硬写 block。只在秘书页生效。 */
+body[data-dsh-secretary="1"] [data-dsh-process-visible="1"],
+body[data-dsh-secretary="1"] [data-dsh-process-visible="1"]:not([data-dsh-scard]) {
+  display: revert !important;
+}
 
 /* ── 用户卡 / 通知卡接管宿主用户行 ──
  * 真实用户消息与合成通知被做成卡片后，那条气泡本身不再显示（时间/操作行也已在卡片底行里）。

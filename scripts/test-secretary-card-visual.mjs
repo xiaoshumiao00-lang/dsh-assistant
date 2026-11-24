@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 个人秘书三种卡（assistant 紫 / user 冷蓝 / notice 灰）的浏览器视觉验收。
  *
  * 当前 pocket 局域网入口被 8 位 PIN + dsh web 启动 token 双层拦住，无头 Playwright
@@ -319,6 +319,19 @@ ${assistantCard}
   </div>
   <!-- 现场 dump 里漏出来的三类过程行：过程分组行（带分组 key、自身没有语义 kind）、
        工具调用行、上下文行；还有回合尾那一档（我们的卡 + 记忆回合尾部件挂同一个槽容器） -->
+  <!-- 2026-11-24 第 5 项：历史轮（15）的过程行——最新一条用户消息是上面 turn=16 那条插话行，
+       所以这一行必须继续 display:none；同一轮（16）里回复正文那行 assistant-step（没有 reasoning 分组标记）
+       也必须继续不出图（卡片已经展示同一段文字）。 -->
+  <div data-chat-turn="15" data-chat-flow-kind="tool-call" data-probe="old-tool-row">
+    <div data-slot="conversation.chat.node">
+      <div class="host-tool-row"><span>工具调用</span><span class="host-tool-detail">旧一轮：读取 README.md</span></div>
+    </div>
+  </div>
+  <div data-chat-turn="16" data-chat-flow-kind="assistant-step" data-probe="reply-step-row">
+    <div data-slot="conversation.chat.node">
+      <div class="host-step-row"><span>这一轮的回复正文：结论先给出来，细节在后面。</span></div>
+    </div>
+  </div>
   <div data-chat-turn="16" data-chat-group-key='["process","16:assistant-step16:1","reasoning"]' data-chat-flow-key='["process","16:assistant-step16:1","reasoning"]' data-probe="process-group-row">
     <div data-chat-flow-kind="assistant-step" data-chat-group-part="reasoning" data-turn-process-member="true">
       <div class="host-process-row"><span>已搜索代码，已读取文件，已调用工具</span></div>
@@ -1434,7 +1447,7 @@ try {
     && interruptFacts.cardParaCount === 2 && interruptFacts.cardAttachCount === 1
     && /workbuddy 是桌面的软件程序/.test(interruptFacts.cardText) && /插话后面那段文字也不许丢/.test(interruptFacts.cardText),
     JSON.stringify(interruptFacts))
-  pass('过程行 0 条①：分组行（现场 dump 带分组 key 那种）、工具行、上下文行、分组成员标记一律不出图',
+  pass('过程行 0 条①（未打标时）：分组行（现场 dump 带分组 key 那种）、工具行、上下文行、分组成员标记一律不出图',
     interruptFacts.groupDisplay === 'none' && interruptFacts.groupMemberDisplay === 'none' && interruptFacts.groupVisible === false
     && interruptFacts.toolDisplay === 'none' && interruptFacts.toolVisible === false
     && interruptFacts.contextDisplay === 'none' && interruptFacts.contextVisible === false,
@@ -1444,17 +1457,104 @@ try {
     && interruptFacts.mnemonDisplay === 'none' && interruptFacts.mnemonVisible === false
     && interruptFacts.skillDisplay === 'none' && interruptFacts.skillVisible === false,
     JSON.stringify({ tailCardVisible: interruptFacts.tailCardVisible, mnemonDisplay: interruptFacts.mnemonDisplay, skillDisplay: interruptFacts.skillDisplay }))
-  pass('过程行 0 条③：卡片之间的可见行只剩卡（照 dump 的那三类行没有一个在出图）',
-    await page.evaluate(() => {
-      const rendered = (el) => { let node = el; while (node && node !== document.body) { if (getComputedStyle(node).display === 'none') return false; node = node.parentElement } return el.getBoundingClientRect().height > 0 }
-      // 这里的名单只放现场 dump 里真的在出图那三类（工具行/分组行/上下文行）；
-      // 压缩那两类行（kind 为 manual-compaction 与按文字打标那行）由本文件上面两组既有用例单独验，扫描层按文字给它们打的是 data-dsh-scard-compact 标记
-      const PROCESS_KINDS = ['assistant-step', 'tool-call', 'turn-process', 'context', 'model-retry', 'turn-error', 'turn-max-tokens']
-      const rows = [...document.querySelectorAll('[data-chat-turn]')].filter((el) => el.hasAttribute('data-chat-flow-kind') || el.hasAttribute('data-chat-group-key'))
-      const leaked = rows.filter((el) => rendered(el)).filter((el) => PROCESS_KINDS.includes(el.getAttribute('data-chat-flow-kind')) || el.hasAttribute('data-chat-group-key') || el.hasAttribute('data-turn-process-member')).filter((el) => el.querySelector('[data-dsh-scard]') === null)
-      return leaked.length === 0
-    }),
-    '卡片之间一个过程行都没有')
+
+  // ── 第 5 项（2026-11-24）：只展示「最新一条用户消息那一轮」的过程行 ──
+  // 打标器跑的是**真实现**（lib/index.js 里那份 tagLatestTurnProcessRows，注入页面执行），
+  // 所以这里验的是「打标 + CSS 放行」整条链路，不是手写属性。
+  const taggerSource = String(surface.tagLatestTurnProcessRows)
+  const taggerArgs = { src: taggerSource, attribute: surface.PROCESS_VISIBLE_ATTRIBUTE, kinds: [...surface.PROCESS_VISIBLE_KINDS] }
+  const runTagger = () => page.evaluate(({ src, attribute, kinds }) => {
+    const fn = eval(`(${src})`)
+    return fn(document, { attribute, kinds })
+  }, taggerArgs)
+  const latestRound = await runTagger()
+  const processState = await page.evaluate(() => {
+    const cs = (el) => (el === null ? 'missing' : getComputedStyle(el).display)
+    const rendered = (el) => {
+      if (el === null) return false
+      let node = el
+      while (node && node !== document.body) {
+        if (getComputedStyle(node).display === 'none') return false
+        node = node.parentElement
+      }
+      return el.getBoundingClientRect().height > 0
+    }
+    const pick = (probe) => document.querySelector(`[data-probe="${probe}"]`)
+    const marked = (el) => el !== null && el.getAttribute('data-dsh-process-visible') === '1'
+    const probe = (name) => {
+      const el = pick(name)
+      return { probe: name, marked: marked(el), display: cs(el), visible: rendered(el) }
+    }
+    return {
+      // 最新一轮（turn 16 = 最后一条 steering 行那一轮）
+      latest: [probe('process-group-row'), probe('tool-call-row'), probe('context-row')],
+      groupMember: {
+        marked: marked(document.querySelector('[data-chat-flow-kind="assistant-step"][data-chat-group-part="reasoning"]')),
+        display: cs(document.querySelector('[data-chat-flow-kind="assistant-step"][data-chat-group-part="reasoning"]')),
+      },
+      // 历史轮（turn 15）与「同一轮的回复正文」（turn 16 的 assistant-step，没有 reasoning 标记）
+      history: probe('old-tool-row'),
+      replyStep: probe('reply-step-row'),
+      // 压缩行与回合尾部件不许被这一批带出来
+      compactRow: { display: cs(document.querySelector('[data-chat-flow-kind="manual-compaction"], [data-dsh-scard-compact="hint"]')) },
+      tailWidget: { display: cs(document.querySelector('[data-probe="mnemon-tail-widget"]')) },
+    }
+  })
+  pass('第 5 项①：最新一条用户消息那一轮的过程行可见（分组行/工具行/上下文行/分组成员都带 data-dsh-process-visible 且 display 不是 none）',
+    latestRound.marked >= 3 && latestRound.anchorKind === 'steering' && latestRound.turnNo === '16'
+    && processState.latest.every((row) => row.marked && row.display !== 'none' && row.visible)
+    && processState.groupMember.marked === true && processState.groupMember.display !== 'none',
+    JSON.stringify({ latestRound, latest: processState.latest, groupMember: processState.groupMember }))
+  pass('第 5 项②：历史轮次（turn 15）的过程行仍然 display:none、没有标记',
+    processState.history.marked === false && processState.history.display === 'none' && processState.history.visible === false,
+    JSON.stringify(processState.history))
+  pass('第 5 项②b：同一轮里回复正文那行 assistant-step 仍然不出图（卡片已经展示同一段文字），压缩行/回合尾部件也没被带出来',
+    processState.replyStep.marked === false && processState.replyStep.display === 'none' && processState.replyStep.visible === false
+    && processState.compactRow.display === 'none' && processState.tailWidget.display === 'none',
+    JSON.stringify({ replyStep: processState.replyStep, compactRow: processState.compactRow, tailWidget: processState.tailWidget }))
+
+  // ③ 再追加一条新用户消息：标记整体后移，上一轮（16）立刻收回隐藏
+  const movedState = await page.evaluate(({ src, attribute, kinds }) => {
+    const make = (attrs, probe, text) => {
+      const el = document.createElement('div')
+      for (const [name, value] of Object.entries(attrs)) el.setAttribute(name, value)
+      el.setAttribute('data-probe', probe)
+      el.innerHTML = `<div data-slot="conversation.chat.node"><div class="host-tool-row"><span>${text}</span></div></div>`
+      return el
+    }
+    document.body.appendChild(make({ 'data-chat-turn': '18', 'data-chat-flow-kind': 'user' }, 'new-user-row', '用户又发了一条'))
+    document.body.appendChild(make({ 'data-chat-turn': '18', 'data-chat-flow-kind': 'tool-call' }, 'new-tool-row', '新一轮的工具调用'))
+    const fn = eval(`(${src})`)
+    const info = fn(document, { attribute, kinds })
+    const cs = (el) => (el === null ? 'missing' : getComputedStyle(el).display)
+    const rendered = (el) => {
+      if (el === null) return false
+      let node = el
+      while (node && node !== document.body) {
+        if (getComputedStyle(node).display === 'none') return false
+        node = node.parentElement
+      }
+      return el.getBoundingClientRect().height > 0
+    }
+    const pick = (probe) => document.querySelector(`[data-probe="${probe}"]`)
+    const marked = (el) => el !== null && el.getAttribute('data-dsh-process-visible') === '1'
+    return {
+      info,
+      newTool: { marked: marked(pick('new-tool-row')), display: cs(pick('new-tool-row')), visible: rendered(pick('new-tool-row')) },
+      oldTool: { marked: marked(pick('tool-call-row')), display: cs(pick('tool-call-row')), visible: rendered(pick('tool-call-row')) },
+      oldGroup: { marked: marked(pick('process-group-row')), display: cs(pick('process-group-row')) },
+      oldContext: { marked: marked(pick('context-row')), display: cs(pick('context-row')) },
+      oldHistory: { marked: marked(pick('old-tool-row')), display: cs(pick('old-tool-row')) },
+    }
+  }, taggerArgs)
+  pass('第 5 项③：追加一条新用户消息后标记整体后移——新一轮过程行可见，上一轮（16）的过程行重新被隐藏',
+    movedState.info.turnNo === '18' && movedState.info.marked === 1
+    && movedState.newTool.marked === true && movedState.newTool.display !== 'none' && movedState.newTool.visible === true
+    && movedState.oldTool.marked === false && movedState.oldTool.display === 'none' && movedState.oldTool.visible === false
+    && movedState.oldGroup.marked === false && movedState.oldGroup.display === 'none'
+    && movedState.oldContext.marked === false && movedState.oldContext.display === 'none'
+    && movedState.oldHistory.marked === false && movedState.oldHistory.display === 'none',
+    JSON.stringify(movedState))
 
   console.log('')
   console.log(`折叠高度实测：BEFORE(旧实现) max-height=${legacy.collapsedMaxHeight}px 约 ${legacy.lines} 行  →  AFTER(新实现 3 行) max-height=${collapsedCardHeights.assistant.maxHeight} 秘书卡正文高=${collapsedCardHeights.assistant.contentHeight}px 通知卡正文高=${collapsedCardHeights.notice.contentHeight}px`)

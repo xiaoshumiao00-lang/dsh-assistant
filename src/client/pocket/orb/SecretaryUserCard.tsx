@@ -37,7 +37,7 @@ import {
   clearSecretaryCompactHintRows, formatClock,
   latestRealUserCardRef, noticeArrivalStore, noticeCardExpired, noticeCardSpeechKey, nearestNoticeExpiryMs, NOTICE_CARD_TTL_MS,
   parseNoticeCardBody, parseSessionRefs, parseUserCardBody, secretaryPager,
-  secretaryQuoteStore, stripSessionRefs, tagSecretaryCompactHintRows, userCardSpeechKey, EARLIER_HINT_TEXT, SCROLL_TOP_THRESHOLD_PX,
+  secretaryQuoteStore, stripSessionRefs, tagSecretaryCompactHintRows, clearLatestTurnProcessTags, tagLatestTurnProcessRows, userCardSpeechKey, EARLIER_HINT_TEXT, SCROLL_TOP_THRESHOLD_PX,
   scrollAnchorTopPatch, shouldExpandOnScroll,
   type PagerDomCard, type SecretaryCardRow, type UserCardAttachment, type UserCardBodyBlock,
 } from './secretary-cards.ts'
@@ -406,11 +406,16 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
         syncEarlierHint(document, false)
         // 离开秘书页：把自己打过的 compact 标记清干净（宿主行本身一个属性都没动过，只清我们加的）
         clearSecretaryCompactHintRows(document)
+        // 第 5 项：离开秘书页也把「最新一轮过程行」的标记清掉（别的会话页一个都不许留）
+        clearLatestTurnProcessTags(document)
         if (expiryTimer !== null) { window.clearTimeout(expiryTimer); expiryTimer = null }
         return
       }
       // 第 3 项需求：compact 提示两行只在秘书页压掉（CSS 按 kind + 这里打的标记）
       tagSecretaryCompactHintRows(document)
+      // 第 5 项需求（2026-11-24）：只把「最新一条 user/steering 行那一轮」的过程行标成可见。
+      // 每次扫描都重算：标记跟着最新一条用户消息移动，历史轮次自动收回隐藏。
+      tagLatestTurnProcessRows(document)
       const next = collectSecretaryCardRows(document)
       // 秒级来源（2026-11-24 改档 10 秒）：**第一眼看到**这批通知卡就地记到达时刻（幂等，只增不改）。
       // 必须在 buildSecretaryPagerCards 之前登记，否则首帧那张卡要等到下一次扫描才有 10 秒起点。
