@@ -1211,7 +1211,10 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
             const ua = String(req.headers['user-agent'] ?? '');
             const fullPlugins = new URL(req.url ?? '/', 'http://pocket.invalid').searchParams.get('dsh-full-plugins') === '1';
             if (/(?:Android|iPhone|iPad|HarmonyOS|Mobile)/i.test(ua) && !fullPlugins) {
-              const optimized = optimizeMobileBoot(html, { createBatch: mobileBatches.register });
+              // 2026-11-24: DSH 0.2.2 起助手客户端会 require open-in-app / directory-picker-native 等模块，
+            // 精简引导把它们从模块图里剔除后 require 直接抛错，手机端会话详情整块空白。
+            // 先清空剔除名单（仍保留分批加载），确保模块图全量。
+            const optimized = optimizeMobileBoot(html, { omittable: [], createBatch: mobileBatches.register });
               html = optimized.html;
               mobileBootLean = optimized.changed;
             }
