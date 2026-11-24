@@ -876,16 +876,183 @@ export function formatUserCardClock(clockText: unknown): string {
   return match === null ? stripped : stripped
 }
 
+/**
+ * ── 用户消息的「文本 / 附件」块口径（2026-11-24 修「附件后面的文字被截掉」）──────────
+ *
+ * 宿主编排器（asar 里 UserContent / contentParts）按 block 顺序排一条用户消息：
+ *   相邻的纯文本 block 并进气泡 → 遇到图片/文件起一条 `[data-message-attachments]` 行 →
+ *   后面的文字又起**新的气泡**。现网实测那条「文字 + 截图 + 文字」的消息在 DOM 里就是
+ *   气泡 / 附件行 / 气泡 三块（`.tmp/probe-mixed-row.mjs` 的 dump）。
+ * 旧口径只读第一条 `[data-slot="conversation.user.text.node"]`，于是附件之后的文字全丢。
+ * 这里按 document 顺序把块收全，附件也带回来（图片那份 src 是宿主 blob:/data: URL 的快照）。
+ */
+export const USER_TEXT_RUN_SELECTOR = '[data-slot="conversation.user.text.node"]'
+export const USER_ATTACHMENT_ROW_SELECTOR = '[data-message-attachments]'
+export const USER_IMAGES_SLOT_SELECTOR = '[data-slot="conversation.chat.user.images"]'
+/** 宿主那颗图片框的 title 是「查看原图」这种动作说明，不许被当成文件名。 */
+const HOST_IMAGE_FRAME_TITLE = '查看原图'
+
+export interface UserCardAttachment {
+  /** image = 图片附件（卡片里嵌缩略图 + 文件名）；file = 文件附件（文件名 + 大小/类型那行）。 */
+  kind: 'image' | 'file'
+  name: string
+  /** 图片那份 src（宿主 blob: URL 的快照；文件附件留空）。 */
+  src: string
+  /** 文件大小/类型那一行（宿主 fileCard 那份）；图片没有就是空串。 */
+  meta: string
+}
+
+/** 一条用户消息按宿主页面的顺序排出来的块：文本 run 或附件。 */
+export type UserCardRun =
+  | { type: 'text'; text: string }
+  | { type: 'attachment'; attachment: UserCardAttachment }
+
+/** 卡片正文的渲染块：段落（用户原文，不改写）或嵌在卡里的附件。 */
+export interface UserCardBodyBlock {
+  type: 'para' | 'attachment'
+  text?: string
+  attachment?: UserCardAttachment
+}
+
+function elementMatches(el: Element, selector: string): boolean {
+  return typeof el.matches === 'function' ? el.matches(selector) : false
+}
+
+function insideAttachmentRow(el: Element, row: Element): boolean {
+  let node: Element | null = el
+  while (node !== null && node !== row) {
+    if (elementMatches(node, USER_ATTACHMENT_ROW_SELECTOR)) return true
+    node = node.parentElement
+  }
+  return false
+}
+
+/** 这个元素的直接children 里有没有「还带块」的子元素（true = 这一层还得往下走，不是气泡叶子）。 */
+function hasBlockBearingChild(el: Element): boolean {
+  for (const child of Array.from(el.children)) {
+    if (elementMatches(child, USER_ATTACHMENT_ROW_SELECTOR)) return true
+    if (child.querySelectorAll(USER_ATTACHMENT_ROW_SELECTOR).length > 0) return true
+    if (child.querySelectorAll(USER_TEXT_RUN_SELECTOR).length > 0) return true
+  }
+  return false
+}
+
+/** 从这一层往下走，按 document 顺序产出块：气泡叶子 → 一条文本 run（含 chip 那份文字），附件行 → 附件 run。 */
+function runsFromContainer(container: Element, row: Element): UserCardRun[] {
+  const out: UserCardRun[] = []
+  for (const child of Array.from(container.children)) {
+    if (elementMatches(child, USER_ATTACHMENT_ROW_SELECTOR)) {
+      out.push(...attachmentRunsIn(child, row))
+      continue
+    }
+    const attachments = Array.from(child.querySelectorAll(USER_ATTACHMENT_ROW_SELECTOR))
+    const texts = Array.from(child.querySelectorAll(USER_TEXT_RUN_SELECTOR)).filter((anchor) => !insideAttachmentRow(anchor, row))
+    if (attachments.length > 0 && texts.length > 0) {
+      out.push(...runsFromContainer(child, row))
+      continue
+    }
+    if (attachments.length > 0) {
+      for (const attach of attachments) out.push(...attachmentRunsIn(attach, row))
+      continue
+    }
+    if (texts.length === 0) continue
+    if (hasBlockBearingChild(child)) {
+      out.push(...runsFromContainer(child, row))
+      continue
+    }
+    const text = String(child.textContent ?? '')
+    if (text.trim() !== '') out.push({ type: 'text', text })
+  }
+  return out
+}
+
+/**
+ * 一条宿主用户行的块列表：从行根往下走，按页面里的顺序产出文本 run 与附件 run。
+ * 附件前/后的文字各自成块（宿主本来就是两条气泡），谁也不许被丢掉。
+ */
+export function collectUserCardRuns(row: Element): UserCardRun[] {
+  if (row.querySelectorAll(`${USER_TEXT_RUN_SELECTOR}, ${USER_ATTACHMENT_ROW_SELECTOR}`).length === 0) return []
+  return runsFromContainer(row, row)
+}
+/** 附件的名字：宿主 img 的 alt 优先，再退到外面那颗框的 aria-label（「image.png，点击查看原图」）。 */
+function attachmentNameOf(el: Element, row: Element, fallback: string): string {
+  const alt = String(el.getAttribute('alt') ?? '').trim()
+  if (alt !== '') return alt
+  let node: Element | null = el
+  while (node !== null && node !== row) {
+    const label = String(node.getAttribute('aria-label') ?? '').trim()
+    if (label !== '') return label.split('，')[0].trim()
+    node = node.parentElement
+  }
+  const title = String(el.getAttribute('title') ?? '').trim()
+  return title !== '' && title !== HOST_IMAGE_FRAME_TITLE ? title : fallback
+}
+
+/** 一个附件行里的附件条目（一行里可能不止一张图；图片还在加载途中时没有 img，也照样要占一块）。 */
+function attachmentRunsIn(el: Element, row: Element): UserCardRun[] {
+  const out: UserCardRun[] = []
+  for (const img of Array.from(el.querySelectorAll('img'))) {
+    out.push({ type: 'attachment', attachment: { kind: 'image', name: attachmentNameOf(img, row, '图片'), src: String(img.getAttribute('src') ?? ''), meta: '' } })
+  }
+  if (out.length > 0) return out
+  const imageSlot = elementMatches(el, USER_IMAGES_SLOT_SELECTOR) ? el : el.querySelector(USER_IMAGES_SLOT_SELECTOR)
+  if (imageSlot !== null) {
+    for (const frame of Array.from(imageSlot.querySelectorAll('button'))) {
+      out.push({ type: 'attachment', attachment: { kind: 'image', name: attachmentNameOf(frame, row, '图片'), src: String(frame.getAttribute('src') ?? ''), meta: '' } })
+    }
+    if (out.length > 0) return out
+  }
+  for (const card of Array.from(el.querySelectorAll('[title]'))) {
+    const name = String(card.getAttribute('title') ?? '').trim()
+    const text = String(card.textContent ?? '').replace(/\s+/g, ' ').trim()
+    if (name === '' || name === HOST_IMAGE_FRAME_TITLE || text === '') continue
+    const meta = text === name ? '' : text.startsWith(name) ? text.slice(name.length).trim() : text
+    out.push({ type: 'attachment', attachment: { kind: 'file', name, src: '', meta } })
+  }
+  return out
+}
+
+/** 卡片文本口径：只拼文本 run（附件不混进文字，朗读与复制拿的仍是纯文字）。 */
+export function userCardRunText(runs: readonly UserCardRun[]): string {
+  return runs
+    .filter((run) => run.type === 'text')
+    .map((run) => String((run as { text: string }).text ?? '').trim())
+    .filter((text) => text !== '')
+    .join('\n')
+}
+
+/** 卡片附件清单（按页面顺序）。 */
+export function userCardAttachments(runs: readonly UserCardRun[]): UserCardAttachment[] {
+  return runs.filter((run) => run.type === 'attachment').map((run) => (run as { attachment: UserCardAttachment }).attachment)
+}
+
+/**
+ * 卡片正文渲染计划：文本 run 按空行分段、附件块按原位置嵌进去。
+ * 用户原文一个字都不改写、不删、不重排（附件前后的文字都在各自的段落里）。
+ */
+export function buildUserCardBody(runs: readonly UserCardRun[]): UserCardBodyBlock[] {
+  const out: UserCardBodyBlock[] = []
+  for (const run of runs) {
+    if (run.type === 'attachment') { out.push({ type: 'attachment', attachment: run.attachment }); continue }
+    for (const paragraph of parseUserCardBody(run.text)) out.push({ type: 'para', text: paragraph })
+  }
+  return out
+}
+
 export interface SecretaryUserRow {
   /** 卡片要挂进的那条宿主用户行（portal 容器）。 */
   element: Element
   /** 稳定 key（宿主的 data-chat-node-key / data-chat-flow-key，含消息 id）。 */
   key: string
   turnNo: string
-  /** 用户原文（取自宿主纯文本 run）。 */
+  /** 用户原文（宿主这条行的**全部**文本 run，按页面里的顺序拼回来）。 */
   text: string
   /** 宿主操作行上的时间文本（已按卡片规则格式化前）。 */
   clockText: string
+  /** 这条消息按宿主编排顺序的块列表（文本 / 附件 / 文本…）——卡片照它排正文与附件。 */
+  runs: UserCardRun[]
+  /** 这条消息的附件清单（图片/文件），渲染与「卡片有没有内容」判据都看它。 */
+  attachments: UserCardAttachment[]
 }
 
 /** 秘书页里那些「user 角色」行的分类：真实用户输入 → 冷蓝用户卡；插件塞进来的合成通知 → 灰底通知卡。 */
@@ -899,19 +1066,21 @@ export interface SecretaryCardRow extends SecretaryUserRow {
  *   - 只认宿主稳定语义标记 `[data-chat-flow-kind="user"]`；
  *   - 合成通知（系统通知 / `[[session:]]` 引用行）标成 notice（灰底通知卡，带可点引用 chip）；
  *   - 真实用户消息标成 user（冷蓝用户卡）；
- *   - 文本从 `[data-slot="conversation.user.text.node"]` 读，卡片自身挂在行上，不会把自己读回去。
+ *   - 文本按 `collectUserCardRuns` 的块顺序拼（附件前/后的文字都不丢），附件单独带回来；
+ *   - 卡片自身挂在行上，不会把自己读回去（卡里没有 data-slot 与 data-message-attachments）。
  */
 export function collectSecretaryCardRows(doc: Document): SecretaryCardRow[] {
   const out: SecretaryCardRow[] = []
   for (const row of doc.querySelectorAll('[data-chat-flow-kind="user"]')) {
     const key = row.getAttribute('data-chat-node-key') ?? row.getAttribute('data-chat-flow-key') ?? ''
     const turnNo = row.getAttribute('data-chat-turn') ?? ''
-    const textEl = row.querySelector('[data-slot="conversation.user.text.node"]')
-    const text = String(textEl?.textContent ?? '').trim()
-    if (text === '') continue
+    const runs = collectUserCardRuns(row)
+    const attachments = userCardAttachments(runs)
+    const text = userCardRunText(runs)
+    if (text === '' && attachments.length === 0) continue
     const clockEl = row.querySelector('[data-clock]')
-    const kind: SecretaryCardKind = isSyntheticNoticeUserText(text) ? CARD_KIND_NOTICE : CARD_KIND_USER
-    out.push({ element: row, key, turnNo, text, clockText: String(clockEl?.textContent ?? '').trim(), kind })
+    const kind: SecretaryCardKind = text !== '' && isSyntheticNoticeUserText(text) ? CARD_KIND_NOTICE : CARD_KIND_USER
+    out.push({ element: row, key, turnNo, text, clockText: String(clockEl?.textContent ?? '').trim(), kind, runs, attachments })
   }
   return out
 }
@@ -941,7 +1110,7 @@ export function collectSecretaryCardElements(doc: Document): SecretaryScannedCar
     let timeText = ''
     if (kind === CARD_KIND_USER || kind === CARD_KIND_NOTICE) {
       const row = element.closest('[data-chat-flow-kind="user"]') ?? element
-      text = String(row.querySelector('[data-slot="conversation.user.text.node"]')?.textContent ?? '').trim()
+      text = userCardRunText(collectUserCardRuns(row))
       timeText = formatUserCardClock(row.querySelector('[data-clock]')?.textContent ?? '')
     } else {
       text = collectTurnText(doc, turnNo)
@@ -2092,6 +2261,13 @@ export const secretaryCardsTestSurface = {
   collectSecretaryUserRows,
   collectSecretaryCardRows,
   collectSecretaryCardElements,
+  collectUserCardRuns,
+  userCardRunText,
+  userCardAttachments,
+  buildUserCardBody,
+  USER_TEXT_RUN_SELECTOR,
+  USER_ATTACHMENT_ROW_SELECTOR,
+  USER_IMAGES_SLOT_SELECTOR,
   buildSecretaryPagerCards,
   foldClipFromBlocks,
   cardFoldStyle,

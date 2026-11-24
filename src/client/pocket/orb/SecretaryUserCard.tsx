@@ -12,9 +12,10 @@
  *
  * 挂载与取证：
  *   - 卡片内容来自宿主那条用户行本身：`[data-chat-flow-kind="user"]` →
- *     `[data-slot="conversation.user.text.node"]` 的纯文本 run（不是本插件自制的会话页）；
+ *     collectUserCardRuns 的块顺序（文本 run 与附件 run 按页面里的顺序，不是本插件自制的会话页）；
  *   - 卡片经 React portal 挂进宿主用户行，行里出现卡片后 CSS 把宿主气泡收起来
- *     （带附件的行保留气泡，只收纯文本 run，附件芯片不丢）；
+ *     （完整卡接管整条宿主行：气泡与原生附件芯片都不再出图，图片/文件嵌在卡片内部——2026-11-24 附件批次；
+ *     分页窗口外的折叠行仍保留宿主气泡里的附件芯片，老消息的附件不许丢）；
  *   - 三条路径的判据都在 collectSecretaryCardRows（secretary-cards.ts）里，测试逐条断言防止串味。
  *
  * 朗读按钮接现有那套状态机：每张卡自己的 key（user: / notice: 前缀），换卡停上一条、
@@ -30,12 +31,12 @@ import {
 import { CollapsedSecretaryCard, useSecretaryCardWindow, useSecretaryPagerVersion } from './SecretaryCollapsedCard.tsx'
 import { SecretarySpeakButton } from './SecretarySpeakButton.tsx'
 import {
-  assistantCardSpeechKey, buildSecretaryPagerCards, CARD_KIND_NOTICE, CARD_KIND_USER, cardFoldStyle, collectSecretaryCardRows,
+  assistantCardSpeechKey, buildSecretaryPagerCards, buildUserCardBody, CARD_KIND_NOTICE, CARD_KIND_USER, cardFoldStyle, collectSecretaryCardRows,
   clearSecretaryCompactHintRows, formatClock,
   latestRealUserCardRef, noticeCardExpired, noticeCardSpeechKey, nearestNoticeExpiryMs, parseNoticeCardBody, parseSessionRefs, parseUserCardBody, secretaryPager,
   secretaryQuoteStore, stripSessionRefs, tagSecretaryCompactHintRows, userCardSpeechKey, EARLIER_HINT_TEXT, SCROLL_TOP_THRESHOLD_PX,
   scrollAnchorTopPatch, shouldExpandOnScroll,
-  type PagerDomCard, type SecretaryCardRow,
+  type PagerDomCard, type SecretaryCardRow, type UserCardAttachment, type UserCardBodyBlock,
 } from './secretary-cards.ts'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
 import { currentSessionViaBridge } from '../../session-open.ts'
@@ -70,8 +71,50 @@ function sameRows(prev: SecretaryCardRow[], next: SecretaryCardRow[]): boolean {
   return prev.every((row, index) => {
     const other = next[index]
     return row.key === other.key && row.text === other.text && row.clockText === other.clockText &&
-      row.element === other.element && row.kind === other.kind
+      row.element === other.element && row.kind === other.kind && rowSignature(row) === rowSignature(other)
   })
+}
+
+/** 一条用户行的渲染签名：正文文本 + 附件那份 src 的快照（宿主图片晚一拍才 load 出来 → 必须换状态重渲染）。 */
+function rowSignature(row: SecretaryCardRow): string {
+  const attachments = row.attachments ?? []
+  return `${row.text}|${attachments.map((item) => `${item.kind}:${item.name}:${item.meta}:${item.src}`).join(',')}`
+}
+
+/** 嵌在卡片内部的一个附件块：图片出缩略图 + 文件名，文件出文件名 + 大小/类型。 */
+function CardAttachmentBlock({ attachment }: { attachment: UserCardAttachment }): any {
+  const [src, setSrc] = useState(attachment.src)
+  const [broken, setBroken] = useState(false)
+  useEffect(() => { setSrc(attachment.src); setBroken(false) }, [attachment.src])
+  if (attachment.kind === 'image' && src !== '' && !broken) {
+    return (
+      <div data-dsh-scard="attachment" data-dsh-scard-attachment-kind="image" title={attachment.name}>
+        <img data-dsh-scard="attachment-thumb" src={src} alt={attachment.name} loading="lazy" draggable={false} onError={() => setBroken(true)} />
+        <span data-dsh-scard="attachment-name">{attachment.name}</span>
+      </div>
+    )
+  }
+  if (attachment.kind === 'image') {
+    return (
+      <div
+        data-dsh-scard="attachment"
+        data-dsh-scard-attachment-kind="image"
+        data-dsh-scard-attachment-pending={src === '' ? '1' : '0'}
+        title={attachment.name}
+      >
+        <span data-dsh-scard="attachment-icon" aria-hidden="true">IMG</span>
+        <span data-dsh-scard="attachment-name">{attachment.name}</span>
+        <span data-dsh-scard="attachment-status">{src === '' ? '图片还在加载' : '这张图宿主那份地址已经失效'}</span>
+      </div>
+    )
+  }
+  return (
+    <div data-dsh-scard="attachment" data-dsh-scard-attachment-kind="file" title={attachment.name}>
+      <span data-dsh-scard="attachment-icon" aria-hidden="true">📎</span>
+      <span data-dsh-scard="attachment-name">{attachment.name}</span>
+      {attachment.meta !== '' && <span data-dsh-scard="attachment-meta">{attachment.meta}</span>}
+    </div>
+  )
 }
 
 function cardTimeText(row: SecretaryCardRow): string {
@@ -114,14 +157,16 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
   const windowState = useSecretaryCardWindow(speechKey)
   const blocks = notice ? parseNoticeCardBody(row.text) : { title: '', paragraphs: parseUserCardBody(row.text) }
   const refs = notice ? parseSessionRefs(row.text) : []
+  // 用户卡正文：文本段落与附件按宿主页面的顺序排（附件前后的文字都在，附件嵌在卡片内部）
+  const userBody: UserCardBodyBlock[] = notice ? [] : buildUserCardBody(row.runs ?? [{ type: 'text', text: row.text }])
   // 复制拿的永远是这条消息的原文（用户卡不许改写；通知卡复制去掉内部合成标记，方便粘出去用）
   const copyText = notice ? stripSessionRefs(row.text) : row.text
-  const hasBody = notice ? (blocks.title !== '' || blocks.paragraphs.length > 0) : blocks.paragraphs.length > 0
+  const hasBody = notice ? (blocks.title !== '' || blocks.paragraphs.length > 0) : userBody.length > 0
   const unread = notice && readKey !== '' && !readState.isRead(readKey)
   const timeText = cardTimeText(row)
 
   // 折叠态：与秘书回复卡共用同一套测量与补测（正文最多 3 行、卡标题最多 2 行、固定高度）
-  const { overflow, collapsedMaxHeight, measured } = useCardFoldMeasure(contentRef, true, open, `${row.text}|${blocks.paragraphs.length}|${refs.length}`)
+  const { overflow, collapsedMaxHeight, measured } = useCardFoldMeasure(contentRef, true, open, `${row.text}|${blocks.paragraphs.length}|${userBody.length}|${refs.length}|${rowSignature(row)}`)
 
   const markRead = (): void => { if (readKey !== '') readState.markRead(readKey) }
   const toggle = (): void => { setOpen((value) => !value); markRead() }
@@ -207,9 +252,13 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
       <div {...foldProps}>
         <div data-dsh-scard="content" ref={contentRef as any} style={bodyStyle}>
           {notice && blocks.title !== '' && <h1 data-dsh-scard="title">{inlineAnswerText(blocks.title)}</h1>}
-          {blocks.paragraphs.map((block, index) => (
-            <p key={`para:${index}`} data-dsh-scard="para">{notice ? inlineAnswerText(block) : block}</p>
-          ))}
+          {notice
+            ? blocks.paragraphs.map((block, index) => (
+              <p key={`para:${index}`} data-dsh-scard="para">{inlineAnswerText(block)}</p>
+            ))
+            : userBody.map((block, index) => (block.type === 'attachment' && block.attachment !== undefined
+              ? <CardAttachmentBlock key={`attach:${index}`} attachment={block.attachment} />
+              : <p key={`para:${index}`} data-dsh-scard="para">{block.text}</p>))}
           {refs.map((ref) => (
             <button
               key={ref.sessionId}
@@ -393,7 +442,7 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['data-dsh-secretary', 'data-chat-turn', 'class'],
+      attributeFilter: ['data-dsh-secretary', 'data-chat-turn', 'class', 'src'],
     })
     return () => {
       alive = false

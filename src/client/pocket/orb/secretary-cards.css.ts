@@ -62,9 +62,9 @@ body[data-dsh-secretary="1"] [data-dsh-speak="wrap"][data-empty="1"] {
 
 /* ── 用户卡 / 通知卡接管宿主用户行 ──
  * 真实用户消息与合成通知被做成卡片后，那条气泡本身不再显示（时间/操作行也已在卡片底行里）。
- * 带附件的行保留宿主气泡（附件芯片不能丢），只把纯文本 run 收起来。
+ * 完整卡（2026-11-24 附件批次改了口径）接管整条宿主行：图片/文件嵌进卡片内部，原生附件芯片不再出图；
  * 分页窗口外的那一行（折叠行）也接管气泡：老卡压成一行时同样不许冒原文。 */
-body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard="card"][data-dsh-scard-kind="user"], > [data-dsh-scard="card"][data-dsh-scard-kind="notice"], > [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="user"], > [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"]:not(:has(img)) {
+body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard="card"][data-dsh-scard-kind="user"], > [data-dsh-scard="card"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"] { display: none !important; } body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="user"], > [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"]:not(:has(img)) {
   display: none !important;
 }
 body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard="card"][data-dsh-scard-kind="user"], > [data-dsh-scard="card"][data-dsh-scard-kind="notice"], > [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="user"], > [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="notice"]) [data-slot="conversation.user.text.node"] > span:not([data-dsh-scard]) {
@@ -72,8 +72,8 @@ body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard=
 }
 /* 兜底（2026-11-24）：卡片确实在行里、只是被 React 包进更深一层容器时，上面那条「直接子代」判据会漏，
  * 宿主气泡就冒回来（安卓那次截图里用户消息仍是原生气泡，桌面上同一条消息是卡片）。这条按后代再压一次，
- * 仍只压纯文本气泡：带附件的行（:has(img)）保留宿主气泡，附件芯片不能丢。 */
-body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has([data-dsh-scard="card"][data-dsh-scard-kind="user"], [data-dsh-scard="card"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"]:not(:has(img)) {
+ * 完整卡整条压掉（附件已嵌进卡片内部），折叠行那种仍带 :not(:has(img)) 例外——老消息的附件芯片照旧留着。 */
+body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has([data-dsh-scard="card"][data-dsh-scard-kind="user"], [data-dsh-scard="card"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"] { display: none !important; } body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has([data-dsh-scard="collapsed-row"][data-dsh-scard-kind="user"], [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"]:not(:has(img)) {
   display: none !important;
 }
 
@@ -258,6 +258,7 @@ body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has([data-dsh-scard="c
    不是把块挤成 0 高（实测 flex-shrink 默认 1 会让 -webkit-box 的标题块塌成 0 高）。 */
 [data-dsh-scard="content"] > [data-dsh-scard="title"],
 [data-dsh-scard="content"] > [data-dsh-scard="para"],
+[data-dsh-scard="content"] > [data-dsh-scard="attachment"],
 [data-dsh-scard="content"] > [data-dsh-scard="ref"] {
   flex: 0 0 auto;
 }
@@ -352,6 +353,53 @@ body[data-dsh-secretary="1"] [data-dsh-scard="card"] [data-dsh-scard="body"] [da
   cursor: pointer;
 }
 [data-dsh-scard="ref"]:hover { background: var(--dsh-card-accent-wash-deep); }
+/* 附件嵌在卡片内部（2026-11-24 附件批次）：图片出缩略图 + 文件名，文件出文件名 + 大小/类型那行。
+ * 卡片自己的圆角、间距与配色变量（跟正文同一档 14px/20px），不新增观感口径，也不动折叠预算。 */
+body[data-dsh-secretary="1"] [data-dsh-scard="attachment"] {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 0.5px solid var(--dsh-card-accent-line);
+  border-radius: 10px;
+  background: var(--dsh-card-accent-wash);
+  color: var(--dsh-card-text-soft);
+  font-size: 14px;
+  line-height: 20px;
+  max-width: 100%;
+}
+body[data-dsh-secretary="1"] [data-dsh-scard="attachment-thumb"] {
+  flex: 0 0 auto;
+  width: auto;
+  max-width: 220px;
+  max-height: 140px;
+  border-radius: 8px;
+  object-fit: contain;
+  background: var(--dsh-card-surface);
+}
+body[data-dsh-secretary="1"] [data-dsh-scard="attachment-name"] {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsh-card-accent-deep);
+}
+body[data-dsh-secretary="1"] [data-dsh-scard="attachment-meta"],
+body[data-dsh-secretary="1"] [data-dsh-scard="attachment-status"] {
+  flex: 0 0 auto;
+  color: var(--dsh-card-text-muted);
+  font-size: 12px;
+}
+body[data-dsh-secretary="1"] [data-dsh-scard="attachment-icon"] {
+  flex: 0 0 auto;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--dsh-card-accent);
+}
+@media (max-width: 420px) {
+  body[data-dsh-secretary="1"] [data-dsh-scard="attachment-thumb"] { max-width: 148px; max-height: 108px; }
+}
 [data-dsh-scard="ref-icon"] { flex: none; }
 [data-dsh-scard="ref-title"] {
   overflow: hidden;

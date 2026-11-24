@@ -153,6 +153,24 @@ const noticeCard = cardHtml({
   footCopyLabel: '复制这条通知',
 })
 
+/** 附件嵌在卡片内部（2026-11-24 附件批次）：文本 / 图片 / 文本 三块按原顺序排在正文区里 */
+const MIXED_ATTACH_PNG = 'data:image/svg+xml;base64,' + Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="76" height="52"><rect width="76" height="52" fill="#184a80"/></svg>').toString('base64')
+const mixedAttachBody = [
+  '<p data-dsh-scard="para">我看个人秘书回复的文本，把数字用汉字表示的，</p>',
+  `<div data-dsh-scard="attachment" data-dsh-scard-attachment-kind="image" title="image.png">`,
+  `<img data-dsh-scard="attachment-thumb" src="${MIXED_ATTACH_PNG}" alt="image.png" loading="lazy">`,
+  `<span data-dsh-scard="attachment-name">image.png</span>`,
+  `</div>`,
+  '<p data-dsh-scard="para">，这样阅读起来很吃力，我建议还是保留为数字。</p>',
+].join('\n')
+const mixedUserCard = cardHtml({
+  kind: 'user', key: 'user:15:input-message-mix-01', unread: false, timeText: '15:12',
+  head: { mark: markUser, tag: '用户消息', name: '<span data-dsh-scard="name">你</span>', speakLabel: '朗读这条消息' },
+  paras: { title: '', body: mixedAttachBody },
+  refs: [],
+  footCopyLabel: '复制这条消息',
+})
+
 const pageHtml = `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -179,6 +197,32 @@ ${assistantCard}
       </div>
     </div>
     ${userCard}
+  </div>
+  <!-- 附件回归（2026-11-24）：宿主把一条文字+图片+文字的消息排成 气泡/附件行/气泡，卡片必须整条收全 -->
+  <div data-chat-turn="15" data-chat-flow-kind="user" data-chat-node-key="13:input-message-mix-01" data-probe="mixed-attach-row">
+    <div data-slot="conversation.chat.node">
+      <div class="host-user-row">
+        <div class="host-user-stack">
+          <div class="host-bubble">
+            <span data-slot="conversation.user.text.node"><span class="host-plain-run">我看个人秘书回复的文本，把数字用汉字表示的，</span></span>
+          </div>
+          <div class="host-attachment-row" data-message-attachments="true">
+            <div data-slot="conversation.chat.user.images">
+              <div class="host-gallery" data-align="end">
+                <button type="button" class="host-frame" data-variant="single" title="查看原图" aria-label="image.png，点击查看原图">
+                  <img src="${MIXED_ATTACH_PNG}" alt="image.png">
+                </button>
+              </div>
+            </div>
+          </div>
+          <div class="host-bubble">
+            <span data-slot="conversation.user.text.node"><span class="host-plain-run">，这样阅读起来很吃力，我建议还是保留为数字。</span></span>
+          </div>
+        </div>
+        <div class="host-actions" data-clock="start"><span>15:12</span></div>
+      </div>
+    </div>
+    ${mixedUserCard}
   </div>
   <div data-chat-turn="9" data-chat-flow-kind="user" data-chat-node-key="14:input-message-cu-01" data-probe="notice-row">
     <div data-slot="conversation.chat.node">
@@ -845,7 +889,7 @@ try {
   })
 
   pass('三种卡存在（紫 assistant / 冷蓝 user / 灰 notice）',
-    dual.userExists && dual.noticeExists && dual.userKindCount === 1 && dual.noticeKindCount === 1 && dual.shell.assistantMaxWidth === dual.shell.maxWidth,
+    dual.userExists && dual.noticeExists && dual.userKindCount >= 1 && dual.noticeKindCount === 1 && dual.shell.assistantMaxWidth === dual.shell.maxWidth,
     JSON.stringify({ userKindCount: dual.userKindCount, noticeKindCount: dual.noticeKindCount }))
   pass('三种卡的 --dsh-card-* 主题变量两两不同',
     Object.keys(dual.assistantTheme).length === 8 && Object.keys(dual.assistantTheme).every((name) =>
@@ -1223,6 +1267,50 @@ try {
     Object.values(desktopTime).every((item) => item.display !== 'none' && item.size === '12px' && item.gap >= 0 && item.gap <= 12)
       && (await page.evaluate(() => Math.max(...[...document.querySelectorAll('[data-dsh-scard="card"]')].map((el) => el.getBoundingClientRect().width)))) <= 620,
     JSON.stringify(desktopTime))
+
+  // ── 附件回归（2026-11-24 bug）：文字 + 图片 + 文字 的宿主行必须整条进卡片，附件嵌在卡片内部 ──
+  const mixed = await page.evaluate(() => {
+    const row = document.querySelector('[data-probe="mixed-attach-row"]')
+    const card = row?.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="user"]') ?? null
+    const content = card?.querySelector('[data-dsh-scard="content"]') ?? null
+    const blocks = content ? [...content.querySelectorAll('[data-dsh-scard="para"], [data-dsh-scard="attachment"]')]
+      .map((el) => ({ sc: el.getAttribute('data-dsh-scard'), text: (el.textContent ?? '').replace(/\s+/g, ' ').trim() })) : []
+    const thumb = content?.querySelector('[data-dsh-scard="attachment-thumb"]') ?? null
+    const nameEl = content?.querySelector('[data-dsh-scard="attachment-name"]') ?? null
+    const hostNode = row ? row.querySelector('[data-slot="conversation.chat.node"]') : null
+    const hostAttach = row ? row.querySelector('[data-message-attachments]') : null
+    const hostRun = row ? row.querySelector('[data-slot="conversation.user.text.node"]') : null
+    return {
+      blocks,
+      thumb: thumb === null ? null : {
+        display: getComputedStyle(thumb).display,
+        width: Math.round(thumb.getBoundingClientRect().width),
+        height: Math.round(thumb.getBoundingClientRect().height),
+        loaded: thumb.complete === true && thumb.naturalWidth > 0,
+        inCard: thumb.offsetParent !== null,
+        src: String(thumb.getAttribute('src') ?? '').slice(0, 12),
+      },
+      name: nameEl?.textContent?.trim() ?? '',
+      nameVisible: nameEl !== null && nameEl.offsetParent !== null,
+      hostNodeDisplay: hostNode === null ? '' : getComputedStyle(hostNode).display,
+      hostAttachRendered: hostAttach !== null && hostAttach.offsetParent !== null,
+      hostRunVisible: hostRun !== null && hostRun.offsetParent !== null,
+    }
+  })
+  pass('附件回归①：卡片正文按原顺序收全三段（附件前文字 + 附件块 + 附件后文字，一个字都不许丢）',
+    mixed.blocks.length === 3
+      && mixed.blocks[0]?.sc === 'para' && /把数字用汉字表示的，$/.test(mixed.blocks[0]?.text ?? '')
+      && mixed.blocks[1]?.sc === 'attachment'
+      && mixed.blocks[2]?.sc === 'para' && /保留为数字。$/.test(mixed.blocks[2]?.text ?? ''),
+    JSON.stringify(mixed.blocks))
+  pass('附件回归②：图片缩略图嵌在卡片内部（真加载出来、有尺寸、带文件名）',
+    mixed.thumb !== null && mixed.thumb.inCard === true && mixed.thumb.loaded === true
+      && mixed.thumb.width >= 60 && mixed.thumb.height >= 40 && mixed.thumb.display !== 'none'
+      && mixed.name === 'image.png' && mixed.nameVisible === true,
+    JSON.stringify({ thumb: mixed.thumb, name: mixed.name, nameVisible: mixed.nameVisible }))
+  pass('附件回归③：宿主那条原生附件行不再单独出图（整条宿主行由卡片接管，气泡/附件芯片都不渲染）',
+    mixed.hostNodeDisplay === 'none' && mixed.hostAttachRendered === false && mixed.hostRunVisible === false,
+    JSON.stringify({ hostNodeDisplay: mixed.hostNodeDisplay, hostAttachRendered: mixed.hostAttachRendered, hostRunVisible: mixed.hostRunVisible }))
 
   console.log('')
   console.log(`折叠高度实测：BEFORE(旧实现) max-height=${legacy.collapsedMaxHeight}px 约 ${legacy.lines} 行  →  AFTER(新实现 3 行) max-height=${collapsedCardHeights.assistant.maxHeight} 秘书卡正文高=${collapsedCardHeights.assistant.contentHeight}px 通知卡正文高=${collapsedCardHeights.notice.contentHeight}px`)

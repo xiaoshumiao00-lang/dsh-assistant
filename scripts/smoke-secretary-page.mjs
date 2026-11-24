@@ -985,6 +985,51 @@ try {
   check('卡片化用户行不留下重复文本（宿主气泡已收起）',
     ucard.duplicatedCount === 0, JSON.stringify({ cardedDuplicated: ucard.duplicatedCount, keys: ucard.userKeys }))
 
+  // 附件批次（2026-11-24）：现网那条「文字 + 截图 + 文字」的真实用户消息，卡片里必须
+  // ① 三段文字全在、顺序没乱，② 缩略图嵌在卡片内部出图，③ 宿主那条原生附件行不再出图。
+  const attachProbe = await page.evaluate(() => {
+    const hits = []
+    for (const row of document.querySelectorAll('[data-chat-flow-kind="user"]')) {
+      const content = row.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="user"] [data-dsh-scard="content"]')
+      const attachment = content === null ? null : content.querySelector('[data-dsh-scard="attachment"]')
+      if (attachment === null) continue
+      const blocks = [...content.querySelectorAll('[data-dsh-scard="para"], [data-dsh-scard="attachment"]')]
+      const order = blocks.map((el) => el.getAttribute('data-dsh-scard'))
+      const firstPara = order.indexOf('para')
+      const lastPara = order.lastIndexOf('para')
+      const attachIndex = order.indexOf('attachment')
+      const paras = order.filter((name) => name === 'para').length
+      const img = attachment.querySelector('[data-dsh-scard="attachment-thumb"]')
+      const hostNode = row.querySelector('[data-slot="conversation.chat.node"]')
+      const hostAttach = row.querySelector('[data-message-attachments]')
+      hits.push({
+        nodeKey: row.getAttribute('data-chat-node-key') ?? '',
+        order,
+        texts: blocks.map((el) => (el.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 48)),
+        orderRelOk: paras < 2 || (attachIndex > firstPara && attachIndex < lastPara),
+        thumbLoaded: img !== null && img.complete === true && img.naturalWidth > 0,
+        thumbVisible: img !== null && img.offsetParent !== null,
+        thumbBox: img === null ? null : { w: Math.round(img.getBoundingClientRect().width), h: Math.round(img.getBoundingClientRect().height) },
+        attachmentName: (attachment.querySelector('[data-dsh-scard="attachment-name"]')?.textContent ?? '').trim(),
+        hostNodeDisplay: hostNode === null ? '' : getComputedStyle(hostNode).display,
+        hostAttachRendered: hostAttach !== null && hostAttach.offsetParent !== null,
+      })
+    }
+    return hits
+  })
+  if (attachProbe.length === 0) {
+    notes.push('附件卡片现场核对：窗口里当时没有带附件的用户消息卡（断言由 test-secretary-cards 四条 + 视觉套件三条覆盖）')
+  }
+  for (const item of attachProbe.slice(0, 3)) {
+    check('带附件的用户消息卡（现网现场）：缩略图嵌在卡片内部、宿主原生附件行不再出图、文件名在卡里',
+      item.hostNodeDisplay === 'none' && item.hostAttachRendered === false && item.thumbVisible === true
+      && item.thumbLoaded === true && item.thumbBox !== null && item.thumbBox.w >= 40 && item.attachmentName !== '',
+      JSON.stringify({ nodeKey: item.nodeKey, thumb: item.thumbBox, name: item.attachmentName, hostNodeDisplay: item.hostNodeDisplay, hostAttachRendered: item.hostAttachRendered }))
+    check('带附件的用户消息卡（现网现场）：附件前后文字都留在卡片里、块顺序没乱',
+      item.orderRelOk === true && item.order.includes('attachment') && item.order.includes('para'),
+      JSON.stringify({ order: item.order, texts: item.texts }))
+  }
+
   // 历史会话可能带着上一条合成通知留下的空白尾轮，旧卡不会再次自动朗读。
   // 此时必须真发一条新回复来验「新卡出现即自动读」，不能把手动点击算作自动请求。
   let autoReadObserved = ttsRequests >= 1

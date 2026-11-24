@@ -380,16 +380,11 @@ cases.push(['新措辞的通知正文照旧解析成通知卡（模板改了行�
 
 cases.push(['三种行分类不串味：真实用户行=user、合成通知行=notice、助手回答行不是用户行', () => {
   function fakeRow(text, kind) {
-    return {
-      getAttribute: (name) => (name === 'data-chat-flow-kind' ? kind
-        : name === 'data-clock' ? '20:24'
-          : name === 'data-chat-turn' ? '7'
-            : name === 'data-chat-node-key' ? `13:${text.slice(0, 4)}` : null),
-      textContent: text,
-      querySelector: (sel) => (sel === '[data-slot="conversation.user.text.node"]'
-        ? { querySelectorAll: () => [{ nodeType: 3, textContent: text }], textContent: text }
-        : sel === '[data-clock]' ? { textContent: '20:24' } : null),
-    }
+    // 2026-11-24 附件批次之后扫描层读的是块顺序，这条老用例改成宿主机械的假行（正文文本照旧）
+    const bubble = fakeTextBubble(text)
+    const clock = fakeEl('div', { 'data-clock': 'start' }, ['20:24'])
+    const chat = fakeEl('div', { 'data-slot': 'conversation.chat.node' }, [fakeEl('div', {}, [bubble, clock])])
+    return fakeEl('div', { 'data-chat-flow-kind': kind, 'data-chat-node-key': `13:${text.slice(0, 4)}`, 'data-chat-turn': '7' }, [chat])
   }
   const doc = { querySelectorAll: (sel) => (sel.includes('data-chat-flow-kind="user"')
     ? [
@@ -865,16 +860,8 @@ cases.push(['过期通知卡不进卡片窗口（第 1 项）：buildSecretaryPa
 }])
 
 function fakeUserRow(nodeKey, turnNo, text, clockText) {
-  return {
-    getAttribute: (name) => (name === 'data-chat-flow-kind' ? 'user'
-      : name === 'data-chat-node-key' ? nodeKey
-        : name === 'data-chat-turn' ? turnNo : null),
-    querySelector: (selector) => {
-      if (selector === '[data-slot="conversation.user.text.node"]') return { textContent: text }
-      if (selector === '[data-clock]') return { textContent: clockText }
-      return null
-    },
-  }
+  // 2026-11-24 附件批次之后，扫描层读的是「块列表」，这条老用例改成宿主机械的假行（正文文本照旧）
+  return fakeHostUserRow(nodeKey, turnNo, clockText, [fakeTextBubble(text)])
 }
 
 cases.push(['扫描层打标（第 3 项）：compact 两行按 kind 与文字判据打标，我们的卡一律不碰', () => {
@@ -909,20 +896,167 @@ cases.push(['秘书页只显示卡片：assistant-step（含 reasoning 分组行
   assert.match(css,
     /body\[data-dsh-secretary="1"\] \[data-chat-flow-kind="assistant-step"\],\s*\nbody\[data-dsh-secretary="1"\] \[data-chat-group-part="reasoning"\] \{\s*\n\s*display: none !important;/,
     'assistant-step 与 reasoning 分组行都要被 display:none !important 压掉（含 group-part 兜底）')
-  // ② 用户消息必须是卡片：接管判据两条都在（原 :has(> …) 判据一个字不动 + 2026-11-24 加的后代兜底）
+  // ② 用户消息必须是卡片（2026-11-24 附件批次改了口径）：
+  //   - 完整卡（用户卡/通知卡）现在接管**整条**宿主行：原生气泡与原生附件芯片都不许再出图，
+  //     因为图片/文件已经嵌进卡片内部（见本文件末那两组附件回归用例）；
+  //   - 分页窗口外压成折叠行的那些老卡仍保留宿主气泡里的附件芯片（:not(:has(img)) 例外不许摘掉，
+  //     否则老消息的附件就彻底看不见了）。
   assert.match(css,
-    /\[data-chat-flow-kind="user"\]:has\(> \[data-dsh-scard="card"\]\[data-dsh-scard-kind="user"\], > \[data-dsh-scard="card"\]\[data-dsh-scard-kind="notice"\], > \[data-dsh-scard="collapsed-row"\]\[data-dsh-scard-kind="user"\], > \[data-dsh-scard="collapsed-row"\]\[data-dsh-scard-kind="notice"\]\) > \[data-slot="conversation\.chat\.node"\]:not\(:has\(img\)\)/,
-    '带用户卡/通知卡的那条用户行必须把宿主气泡压掉（原 :has(> …) 判据保持不动）')
+    /\[data-chat-flow-kind="user"\]:has\(> \[data-dsh-scard="card"\]\[data-dsh-scard-kind="user"\], > \[data-dsh-scard="card"\]\[data-dsh-scard-kind="notice"\]\) > \[data-slot="conversation\.chat\.node"\] \{/,
+    '完整卡必须把宿主用户行整个压掉（这一条不许带 :not(:has(img)) 例外）')
   assert.match(css,
-    /\[data-chat-flow-kind="user"\]:has\(\[data-dsh-scard="card"\]\[data-dsh-scard-kind="user"\], \[data-dsh-scard="card"\]\[data-dsh-scard-kind="notice"\]\) > \[data-slot="conversation\.chat\.node"\]:not\(:has\(img\)\)/,
-    '还要有按后代匹配的兜底：卡片被包进更深一层时也不许让原生气泡冒回来')
-  // 带附件的用户行仍保留宿主气泡（附件芯片不能丢）：两条规则都带 :not(:has(img))
-  assert.equal((css.match(/:not\(:has\(img\)\)/g) ?? []).length >= 2, true, '保留带附件行气泡的例外')
+    /\[data-chat-flow-kind="user"\]:has\(\[data-dsh-scard="card"\]\[data-dsh-scard-kind="user"\], \[data-dsh-scard="card"\]\[data-dsh-scard-kind="notice"\]\) > \[data-slot="conversation\.chat\.node"\] \{/,
+    '还要有按后代匹配的兜底：卡片被包进更深一层时也不许让原生气泡与附件冒回来')
+  assert.match(css,
+    /\[data-dsh-scard="collapsed-row"\]\[data-dsh-scard-kind="user"\][^\n]*\n?[^\n{]*:not\(:has\(img\)\)/,
+    '折叠行那一条仍带 :not(:has(img)) 例外：窗口外老卡的附件芯片不许丢')
+  // 带附件的用户行只在「折叠行」那种情况下才保留宿主气泡：:not(:has(img)) 至少还留着两处
+  assert.equal((css.match(/:not\(:has\(img\)\)/g) ?? []).length >= 2, true, '折叠行保留带附件行气泡的例外')
   // ③ 卡片观感口径三个数一个都没变（本批只动过程行隐藏，不许顺手改观感）
   assert.equal(cardShared.HISTORY_PREVIEW_MAX_CHARS, 900, '列表预览上限仍是 900')
   assert.equal(surface.QUOTE_PREVIEW_MAX_CHARS, 600, '引用预览上限仍是 600')
   const registrySource = readFileSync(join(ROOT, 'vendor/computer-use/code-agent-registry-DDJfS2Fl.js'), 'utf8')
   assert.match(registrySource, /const BOOKMARK_OUTCOME_MAX_CHARS = 200;/, '书签出口仍是 200')
+}])
+
+// ── 用户卡附件回归（2026-11-24 bug）：宿主把一条用户消息按 block 顺序渲染成
+//    「文本气泡 / 附件行 / 文本气泡」，卡片必须把三段文字全收下来、顺序不错，
+//    并把图片/文件嵌在卡片内部（不再单独出附件卡）。DOM 形状照 2026-11-24 现网 dump：
+//    flowItem > [data-slot=conversation.chat.node] > userRow > userStack > (bubble|attachmentRow) > …
+function fakeEl(tag, attrs, kids) {
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    attrs: { ...(attrs ?? {}) },
+    children: [],
+    parentElement: null,
+    getAttribute(name) { return Object.prototype.hasOwnProperty.call(node.attrs, name) ? String(node.attrs[name]) : null },
+    hasAttribute(name) { return Object.prototype.hasOwnProperty.call(node.attrs, name) },
+    matches(raw) { return selectorMatches(node, raw) },
+    querySelectorAll(raw) { return descendantsMatching(node, raw) },
+    querySelector(raw) { return node.querySelectorAll(raw)[0] ?? null },
+    get textContent() {
+      return (kids ?? []).map((child) => (typeof child === 'string' ? child : child.textContent)).join('')
+    },
+  }
+  for (const child of kids ?? []) {
+    if (typeof child === 'string') continue
+    child.parentElement = node
+    node.children.push(child)
+  }
+  return node
+}
+
+function selectorMatches(node, raw) {
+  for (const part of String(raw).split(',')) {
+    const sel = part.trim()
+    if (sel === '') continue
+    const attr = /^\[([^\]=]+)(?:="([^"]*)")?\]$/.exec(sel)
+    if (attr !== null) {
+      const name = attr[1]
+      if (attr[2] === undefined) { if (node.hasAttribute(name)) return true } else if (node.getAttribute(name) === attr[2]) return true
+      continue
+    }
+    if (node.tagName === sel.toUpperCase()) return true
+  }
+  return false
+}
+
+function descendantsMatching(node, raw) {
+  const out = []
+  const walk = (el) => { for (const child of el.children) { if (child.matches(raw)) out.push(child); walk(child) } }
+  walk(node)
+  return out
+}
+
+/** 宿主文本气泡：bubble > rootSpan > span[data-slot="conversation.user.text.node"]（一条气泡里可能不止一个 run） */
+function fakeTextBubble(text) {
+  return fakeEl('div', {}, [fakeEl('span', {}, [fakeEl('span', { 'data-slot': 'conversation.user.text.node' }, [text])])])
+}
+/** 宿主图片附件行：照现网 dump（attachmentRow > images 槽 > gallery > button[title] > img[src][alt]） */
+function fakeImageAttach(src, alt) {
+  return fakeEl('div', { 'data-message-attachments': 'true' }, [
+    fakeEl('div', { 'data-slot': 'conversation.chat.user.images' }, [
+      fakeEl('div', { 'data-align': 'end' }, [
+        fakeEl('button', { title: '查看原图', 'aria-label': `${alt}，点击查看原图` }, [fakeEl('img', { src, alt })]),
+      ]),
+    ]),
+  ])
+}
+/** 宿主文件附件行：fileCard[title=文件名] > fileName + fileMeta */
+function fakeFileAttach(name, meta) {
+  return fakeEl('div', { 'data-message-attachments': 'true' }, [
+    fakeEl('span', { title: name }, [fakeEl('span', {}, [name]), fakeEl('span', {}, [meta])]),
+  ])
+}
+/** 整条宿主用户行（真实结构：flowItem > chat.node > userRow > userStack > 块… + actions[data-clock]） */
+function fakeHostUserRow(nodeKey, turnNo, clockText, blocks) {
+  const stack = fakeEl('div', {}, blocks)
+  const userRow = fakeEl('div', {}, [stack, fakeEl('div', { 'data-clock': 'start' }, [clockText])])
+  return fakeEl('div', { 'data-chat-flow-kind': 'user', 'data-chat-node-key': nodeKey, 'data-chat-turn': turnNo }, [
+    fakeEl('div', { 'data-slot': 'conversation.chat.node' }, [userRow]),
+  ])
+}
+const fakeHostDoc = (rows) => ({ querySelectorAll: (selector) => (selector === '[data-chat-flow-kind="user"]' ? rows : []) })
+
+cases.push(['附件回归①：文字 + 图片 + 后续文字 → 卡片拿到全部三段文字（顺序不错、字也不丢）', () => {
+  const row = fakeHostUserRow('13:input-messagee74d0783', '361', '15:12', [
+    fakeTextBubble('我看个人秘书回复的文本，把数字用汉字表示的，'),
+    fakeImageAttach('blob:http://127.0.0.1:3081/c7cd64d5', 'image.png'),
+    fakeTextBubble('，这样阅读起来很吃力，我建议还是保留为数字。'),
+  ])
+  const rows = surface.collectSecretaryCardRows(fakeHostDoc([row]))
+  assert.equal(rows.length, 1, '这条带附件的用户行必须出卡片')
+  const text = rows[0].text
+  assert.ok(text.includes('我看个人秘书回复的文本，把数字用汉字表示的，'), '附件之前的文字必须在')
+  assert.ok(text.includes('我建议还是保留为数字。'), '附件后面的文字也不许再被截掉')
+  assert.ok(text.indexOf('把数字用汉字') < text.indexOf('保留为数字'), '顺序必须还是「前段 → 后段」')
+  const runs = rows[0].runs
+  assert.deepEqual(runs.map((run) => run.type), ['text', 'attachment', 'text'], '块顺序照宿主页面的顺序：文本/附件/文本')
+  const body = surface.buildUserCardBody(runs)
+  assert.deepEqual(body.map((block) => block.type), ['para', 'attachment', 'para'], '卡片正文按原顺序排布')
+  assert.equal(body[0].text, '我看个人秘书回复的文本，把数字用汉字表示的，')
+  assert.equal(body[2].text, '，这样阅读起来很吃力，我建议还是保留为数字。')
+  assert.equal(body[1].attachment.kind, 'image', '图片附件嵌在卡片内部')
+  assert.equal(body[1].attachment.name, 'image.png', '文件名要从宿主那张 img 的 alt 读出来')
+  assert.equal(body[1].attachment.src, 'blob:http://127.0.0.1:3081/c7cd64d5', '缩略图用宿主那份 src')
+}])
+
+cases.push(['附件回归②：文字 + 文件附件 + 后续文字 → 卡片里文件名与大小都在、附件只嵌在卡内', () => {
+  const row = fakeHostUserRow('13:input-message-file-1', '363', '15:20', [
+    fakeTextBubble('前面这段话'),
+    fakeFileAttach('方案报告.pdf', 'PDF 1.2 MB'),
+    fakeTextBubble('后面这段话也不许丢'),
+  ])
+  const rows = surface.collectSecretaryCardRows(fakeHostDoc([row]))
+  const body = surface.buildUserCardBody(rows[0].runs)
+  assert.deepEqual(body.map((block) => block.type), ['para', 'attachment', 'para'])
+  assert.equal(body[1].attachment.kind, 'file', '文件附件也嵌在卡片内部')
+  assert.equal(body[1].attachment.name, '方案报告.pdf')
+  assert.equal(body[1].attachment.meta, 'PDF 1.2 MB', '大小与类型按宿主 fileCard 那份')
+  assert.ok(rows[0].text.includes('后面这段话也不许丢'), '文件附件后面的文字也要在')
+  assert.deepEqual(rows[0].attachments.map((item) => item.name), ['方案报告.pdf'], '附件清单挂在这张卡上')
+}])
+
+cases.push(['附件回归③：只有附件没有文字 → 也要出卡片（不许因为正文空就丢掉）', () => {
+  const row = fakeHostUserRow('13:input-message-only-image', '364', '15:22', [fakeImageAttach('blob:http://127.0.0.1:3081/xyz', '照片.png')])
+  const rows = surface.collectSecretaryCardRows(fakeHostDoc([row]))
+  assert.equal(rows.length, 1, '纯附件消息也要挂卡片')
+  assert.equal(rows[0].kind, surface.CARD_KIND_USER, '没有文字也不算通知')
+  assert.equal(rows[0].text, '', '正文文本口径仍是纯文本（附件不混进文字）')
+  const body = surface.buildUserCardBody(rows[0].runs)
+  assert.deepEqual(body.map((block) => block.type), ['attachment'], '卡片正文只剩附件那一块')
+  assert.equal(body[0].attachment.name, '照片.png')
+}])
+
+cases.push(['附件回归④：一条气泡里多个 run（引用 chip 切开的那种）不许被拆成多段', () => {
+  const bubble = fakeEl('div', {}, [fakeEl('span', {}, [
+    fakeEl('span', { 'data-slot': 'conversation.user.text.node' }, ['前面 ']),
+    fakeEl('span', { title: '另一个会话' }, ['@[会话]']),
+    fakeEl('span', { 'data-slot': 'conversation.user.text.node' }, ['后面']),
+  ])])
+  const rows = surface.collectSecretaryCardRows(fakeHostDoc([fakeHostUserRow('13:input-message-multi-run', '365', '15:24', [bubble])]))
+  assert.equal(rows[0].text, '前面 @[会话]后面', '同一条气泡里的片段必须拼回一段')
+  assert.deepEqual(surface.buildUserCardBody(rows[0].runs).map((block) => block.type), ['para'], '不许因为 chip 生成第二段正文')
 }])
 
 let failed = 0
