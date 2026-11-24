@@ -18,6 +18,9 @@
  *   7. 项目卡片数据源合并：注册表条目给显示名、removed/hidden 排除、会话归并补集。
  */
 import assert from 'node:assert/strict'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 const lib = await import('../lib/index.js')
 const watch = lib.assistantCuWatchTestSurface
@@ -235,29 +238,120 @@ cases.push(['控制器：长报告整段落进通知（收集端不再按 900 �
   assert.equal(summary.length, blockA.length + blockB.length + blockC.length + blockD.length + 6,
     '整段拼接：三段之间与两段消息之间只隔一个空行（6 个字符）')
   assert.ok(summary.length > 4000, `拼接后的整段长度该超过 4000 字，实际 ${summary.length}`)
-  // 真正超出新上限的极端长报告：只在这种情况下才截尾，且通知正文要如实标注截断
-  const overflow = watch.summarizeCompletion('戊'.repeat(watch.CU_NOTICE_RESULT_MAX_CHARS + 5000))
-  assert.equal(overflow.length, watch.CU_NOTICE_RESULT_MAX_CHARS + 1, '超出新上限才截尾')
-  const overflowNotice = watch.buildCompletionNotice({ sessionId: 'cu-long', title: '长报告', summary: overflow })
-  assert.match(overflowNotice, /按插件上限截断到 20000 字/, '截断要在通知正文里如实标注')
-  assert.match(overflowNotice, /后半段不在通知里/, '要说清后半段不在通知里（秘书得去读报告文件补）')
+  // 真正超出上限的极端长报告：保留头 + 保留尾，中间省略并写明省略字数与位置
+  const overflowFull = '戊'.repeat(watch.CU_NOTICE_RESULT_MAX_CHARS + 5000)
+  const overflow = watch.digestCuCompletion(overflowFull)
+  assert.equal(overflow.truncated, true, '超出上限必须走裁切')
+  assert.equal(overflow.originalChars, overflowFull.length)
+  assert.equal(overflow.keptHeadChars, watch.CU_NOTICE_HEAD_KEEP_CHARS)
+  assert.equal(overflow.keptTailChars, watch.CU_NOTICE_TAIL_KEEP_CHARS)
+  assert.equal(overflow.omittedChars, overflowFull.length - watch.CU_NOTICE_HEAD_KEEP_CHARS - watch.CU_NOTICE_TAIL_KEEP_CHARS)
+  assert.ok(overflow.text.length <= watch.CU_NOTICE_RESULT_MAX_CHARS + 300,
+    `头 + 尾 + 省略标注的总长要贴着上限：${overflow.text.length}`)
+  const overflowNotice = watch.buildCompletionNotice({ sessionId: 'cu-long', title: '长报告', summary: overflow.text, truncation: overflow })
+  assert.match(overflowNotice, /中间省略 5000 字/, '省略字数要写进通知')
+  assert.match(overflowNotice, /第 15001–20000 字/, '省略位置要写进通知')
+  assert.match(overflowNotice, /已被裁/, '要标注已被裁')
   const wholeNotice = watch.buildCompletionNotice({ sessionId: 'cu-long', title: '长报告', summary: summary })
   assert.match(wholeNotice, /完整照录/, '没被截断时正文要写「完整照录」')
-  assert.ok(!wholeNotice.includes('按插件上限截断到'), '没截断就不该带截断标注')
+  assert.ok(!wholeNotice.includes('中间省略'), '没截断就不该带省略标注')
+}])
+
+cases.push(['长通知保留头 + 保留尾：结论段与末尾路径都不被吃掉，并写明省略多少字、省略在哪', () => {
+  const tailPath = 'D:\\<PRIVATE-ARCHIVE-ROOT>\\03T-基金申报\\联合基金\\联合基金申请-终稿.docx'
+  const rows = []
+  let i = 0
+  while (rows.join('\n').length < 26000) {
+    i += 1
+    rows.push(`第 ${i} 行：核对通过，字数 ${i * 37}，对应文件 ${tailPath}`)
+  }
+  const conclusion = '结论：三处必改已全部改完，判据是 npm test 全绿、报告 346 行。'
+  const full = `${rows.join('\n')}\n\n${conclusion}\n\n末尾路径：${tailPath}`
+  assert.ok(full.length > watch.CU_NOTICE_RESULT_MAX_CHARS, `样本必须超过上限才谈得上裁切：${full.length}`)
+  const digest = watch.digestCuCompletion(full)
+  assert.equal(digest.truncated, true)
+  assert.ok(digest.text.startsWith(full.slice(0, watch.CU_NOTICE_HEAD_KEEP_CHARS)),
+    '头部 15000 字必须原样保留')
+  assert.ok(digest.text.endsWith(full.slice(-watch.CU_NOTICE_TAIL_KEEP_CHARS)),
+    '尾部 5000 字必须原样保留（改前只裁尾的口径正好把这一段切掉）')
+  assert.ok(digest.text.includes(conclusion), '结论段落在尾部保留范围里，不许被裁掉')
+  assert.ok(digest.text.includes(tailPath), '末尾路径不许被吃掉')
+  assert.ok(digest.text.includes('中间省略'), '中间要留省略标注')
+  assert.ok(digest.text.includes(`省略 ${digest.omittedChars} 字`), '标注要写清省略了多少字')
+  assert.ok(digest.text.includes(`第 ${digest.omittedFromChar}–${digest.omittedToChar} 字`), '标注要写清省略位置')
+  assert.ok(digest.text.length < full.length, '裁切后必须比原文短')
+  assert.ok(digest.text.length <= watch.CU_NOTICE_RESULT_MAX_CHARS + 300,
+    `头 + 尾 + 标注贴着上限：${digest.text.length}`)
+  const notice = watch.buildCompletionNotice({ sessionId: 'cu-long', title: '联合基金报告', summary: digest.text, truncation: digest })
+  assert.match(notice, /头 15000 字 \+ 后 5000 字/, '通知正文要写清头尾各保留多少字')
+  assert.match(notice, /中间省略 \d+ 字/, '通知正文要写清省略多少字')
+  assert.ok(notice.includes(tailPath), '通知正文里同样带着末尾路径')
+}])
+
+cases.push(['超上限时落盘完整原文：文件真存在、内容完整、通知里带绝对路径', async () => {
+  const sent = []
+  const root = mkdtempSync(join(tmpdir(), 'cu-notice-dump-'))
+  try {
+    const ctl = watch.createCuWatch({
+      presetOf: (session) => session.preset,
+      titleOf: (session) => session.header.title,
+      secretaryId: () => 'sec-1',
+      dumpDirOf: () => root,
+      notify: (payload) => { sent.push(payload) },
+    })
+    const rows = []
+    let n = 0
+    while (rows.join('\n').length < 24000) {
+      n += 1
+      rows.push(`明细 ${n}：链接 https://example.org/item/${n} 复核通过`)
+    }
+    const finalLine = '末行：完整清单已写到 D:\\<PRIVATE-ARCHIVE-ROOT>\\03T-基金申报\\联合基金\\清单.md'
+    const fullText = `${rows.join('\n')}\n${finalLine}`
+    const cu = { id: 'cu-dump', preset: 'computer-use', header: { title: '联合基金报告', cwd: root } }
+    ctl.handleSessionEvent(cu, { type: 'assistant/message', data: { turn: 12, message: { content: [{ type: 'text', text: fullText }] } } })
+    ctl.handleSessionEvent(cu, { type: 'turn/end', data: { turn: 12, reason: { kind: 'completed' } } })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(sent.length, 1)
+    const payload = sent[0]
+    assert.ok(payload.truncation !== undefined, '超上限的汇报要带裁切元数据')
+    const path = payload.truncation.fullTextPath
+    assert.ok(path !== '', `落盘失败：${path}`)
+    assert.ok(existsSync(path), `落盘文件必须真的存在：${path}`)
+    assert.match(path, /cu-notice-full-\d{8}-\d{6}\.md$/, '文件名要带时间戳')
+    assert.ok(path.startsWith(root), '要落在该 CU 会话的项目目录（测试注入的目录）下')
+    const content = readFileSync(path, 'utf8')
+    assert.ok(content.includes(fullText), '落盘文件必须整段完整（不是被裁的那一截）')
+    assert.ok(content.includes(finalLine), '末行也要在落盘文件里')
+    const noticeText = watch.buildCompletionNotice({ ...payload })
+    assert.ok(noticeText.includes(path), '通知正文里要直接给出该文件的绝对路径')
+    assert.match(noticeText, /已被裁/, '通知正文要标注已被裁')
+    assert.match(noticeText, /中间省略/, '通知正文要写明省略多少字')
+    assert.ok(!noticeText.includes(fullText), '通知正文里不该再塞整段原文')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 }])
 
 /* ---------- 4. 通知正文（长度口径与转述口径） ---------- */
-cases.push(['通知正文：完整转述口径（撤掉「一两句」长度限制）+ 末尾可点跳引用标记', () => {
+cases.push(['通知正文：整理不照抄口径（2026-11-24 反转 11-22 的「原样转述」）+ 末尾可点跳引用标记', () => {
   const text = watch.buildCompletionNotice({ sessionId: 'cu-9', title: '门店详情页', summary: '白屏修好了。' })
   assert.match(text, /门店详情页/)
   assert.match(text, /这一轮已经完成/)
   assert.ok(text.includes('[[session:cu-9|门店详情页]]'), '含会话引用标记（卡片渲染成跳转信息行）')
-  // 新措辞：要求完整、原样转述，并点名必须保住的信息类别
-  assert.match(text, /完整展示/, '要写清「完整展示」')
-  assert.match(text, /原样转述/, '要写清「原样转述」')
-  assert.match(text, /不许精简/, '要禁止为精简而删')
-  assert.match(text, /文件名、路径、命令、数字、版本号、提交号、判据、结论/, '关键信息类别要逐条列出')
-  assert.match(text, /被截断（末尾带 …）就照实说明/, '截断要照实说，不许补写')
+  // 2026-11-24 口径：秘书自己整理成简短中文，先给结论，禁止整大段照抄
+  assert.match(text, /先给结论/, '要写清「先给结论」')
+  assert.match(text, /自己整理成简短/, '要写清「自己整理成简短中文回复」')
+  assert.match(text, /保留关键硬事实/, '要点名保留关键硬事实')
+  assert.match(text, /文件名、大小、哈希、数字、提交号、判据、结论、待办/, '硬事实类别要逐条列出')
+  assert.match(text, /禁止整大段原封不动照抄/, '必须禁止整大段照抄 CU 回复')
+  assert.match(text, /禁止照抄表格与长路径/, '同样禁止照抄表格与长路径')
+  assert.match(text, /禁止重复通知原文/, '禁止把通知原文再抄一遍')
+  assert.match(text, /必须先拿到完整内容再整理/, '必须先拿到完整内容再整理')
+  assert.match(text, /不许只依据被裁的摘录作答/, '不许只依据被裁的摘录作答')
+  // 2026-11-22 的旧口径必须已经不在正文里
+  assert.ok(!text.includes('原样转述'), `通知正文里还留着「原样转述」：${text}`)
+  assert.ok(!text.includes('不许精简'), `通知正文里还留着「不许精简」：${text}`)
+  assert.ok(!text.includes('完整展示'), `通知正文里还留着「完整展示」：${text}`)
   // 旧的精简口径必须已经不在正文里
   assert.ok(!text.includes('一两句'), `通知正文里还留着「一两句」限制：${text}`)
   assert.ok(!text.includes('口语向用户汇报'), `旧措辞还在：${text}`)
@@ -275,10 +369,16 @@ cases.push(['通知正文：完整转述口径（撤掉「一两句」长度限�
   assert.equal(watch.summarizeCompletion(multiSentence), multiSentence, '整段照录，不再只取首句')
   const multiline = watch.summarizeCompletion('结论：\n改了 a.ts\ncommit 259e27d')
   assert.ok(multiline.includes('\n'), '换行保留（卡片按段落解析）')
-  const huge = watch.summarizeCompletion('字'.repeat(watch.CU_NOTICE_RESULT_MAX_CHARS + 300))
-  assert.equal(huge.length, watch.CU_NOTICE_RESULT_MAX_CHARS + 1, '只有超出上限才截尾')
-  assert.ok(huge.endsWith('…'), '截尾要留省略号（通知里要求照实说明）')
+  const hugeDigest = watch.digestCuCompletion('字'.repeat(watch.CU_NOTICE_RESULT_MAX_CHARS + 300))
+  assert.equal(hugeDigest.truncated, true, '只有超出上限才裁切')
+  assert.equal(hugeDigest.text, watch.summarizeCompletion('字'.repeat(watch.CU_NOTICE_RESULT_MAX_CHARS + 300)),
+    'summarizeCompletion 与 digestCuCompletion 同一口径')
+  assert.ok(!hugeDigest.text.endsWith('…'), '裁切后保留的是尾部原文，不再以省略号结尾')
   assert.equal(watch.CU_NOTICE_RESULT_MAX_CHARS, 20000, '新的唯一长度口径（旧 900 已废弃，长报告整段落进通知）')
+  assert.equal(watch.CU_NOTICE_HEAD_KEEP_CHARS, 15000, '保留头 15000 字')
+  assert.equal(watch.CU_NOTICE_TAIL_KEEP_CHARS, 5000, '保留尾 5000 字')
+  assert.equal(watch.CU_NOTICE_HEAD_KEEP_CHARS + watch.CU_NOTICE_TAIL_KEEP_CHARS, watch.CU_NOTICE_RESULT_MAX_CHARS,
+    '头 + 尾 = 上限，超上限才裁切')
   assert.ok(watch.CU_NOTICE_RESULT_MAX_CHARS > 900, '不许退回旧的 900 字口径')
   // 一万字量级的长报告（逐条核实参考文献那种）必须整段带全
   const longReport = watch.summarizeCompletion('字'.repeat(12000))

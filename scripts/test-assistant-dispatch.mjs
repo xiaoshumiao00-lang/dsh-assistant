@@ -213,6 +213,19 @@ cases.push(['提示词段落：A/B/C 分层 + 新项目父目录 + 项目清单'
   assert.match(text, /先.*secretary_dispatch.*再.*已派|先派.*再.*已派/)
 }])
 
+cases.push(['派活驱动目标：立目标必须写明动手部分由 secretary_dispatch 完成、秘书只做读回与汇报，不许亲自逐步跑完', () => {
+  const text = surface.dispatchPromptSection({}, projects)
+  assert.match(text, /派活驱动/, '立目标的语义必须是「派活驱动」')
+  assert.match(text, /objective/, '要点明 create_goal 的 objective 要怎么写')
+  assert.match(text, /secretary_dispatch/, 'objective 里要写明动手部分由 secretary_dispatch 完成')
+  assert.match(text, /Computer Use 会话完成|派 Computer Use 会话/, '要写清动手部分交给 Computer Use 会话')
+  assert.match(text, /只做读回与汇报|只做读回汇报/, '要写清秘书自己只做读回与汇报')
+  assert.match(text, /不许.*亲自.*(逐步|一步步)/, '要禁止秘书在秘书会话里亲自逐步跑完')
+  assert.match(text, /先派再读|先派.*再读/, '复杂任务必须先派再读')
+  // 旧口径必须消失：把「立目标」当成可以自己长跑、吃 goal-round-driver 续跑的理由
+  assert.ok(!text.includes('预计几十轮工具调用的长任务先立目标'), `旧口径还在：${text}`)
+}])
+
 cases.push(['用户 QQ 原话：工具产生 computer-use 派活并投递原话', async () => {
   lib.assistantSecretaryTestSurface.secretarySessionRef.id = 'sec-1'
   const calls = []

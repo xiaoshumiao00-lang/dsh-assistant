@@ -156,6 +156,8 @@ cases.push(['通知回合只禁动手类；用户真实回合恢复放行', asyn
       assert.ok(!denied.reason.includes('一两句'), `闸的措辞里还留着长度限制：${denied.reason}`)
       assert.match(denied.reason, /动手类工具已禁用/)
       assert.match(denied.reason, /read\/glob\/grep/, '要告诉模型读文件是这一轮允许的补救手段')
+      assert.ok(!denied.reason.includes('原样转述'), `闸的措辞还在要求「原样转述」，与 2026-11-24 整理不照抄口径冲突：${denied.reason}`)
+      assert.match(denied.reason, /整理|先给结论/, '闸的措辞要跟上「自己整理、先给结论」的新口径')
     }
 
     // 2026-11-23 用户实报：读类与 goal 类在通知回合也不该被误伤——截断的原文要靠读报告文件补齐。
@@ -185,7 +187,10 @@ cases.push(['摘要带整段原文（不再只取首句）、缺标题时兜底'
   const bare = watch.buildCompletionNotice({ sessionId: 'cu-1', title: '', summary: '' })
   assert.ok(bare.includes('[[session:cu-1|电脑上的任务]]'))
   assert.match(bare, /没有留下文字结果/)
-  assert.match(bare, /完整展示/, '正文要求完整展示这条结果')
+  assert.match(bare, /先给结论/, '正文要求先给结论、自己整理')
+  assert.match(bare, /禁止整大段原封不动照抄/, '正文禁止整大段照抄 CU 回复')
+  assert.ok(!bare.includes('完整展示'), `正文里不该再要求「完整展示」：${bare}`)
+  assert.ok(!bare.includes('原样转述'), `正文里不该再要求「原样转述」：${bare}`)
   assert.ok(!bare.includes('一两句'), `正文里不该再有「一两句」限制：${bare}`)
   assert.match(bare, /动手类工具已禁用/, '工具禁用约束句保留（与硬闸同口径）')
 }])

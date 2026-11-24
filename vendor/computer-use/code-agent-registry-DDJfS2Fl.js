@@ -1,4 +1,6 @@
 import { boundContextSummary, createUserMessage } from "@deepseek-ai/dsh-llm";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join as pathJoin, resolve as pathResolve } from "node:path";
 const NO_ASSISTANT = "The Code agent session ended without a final assistant message.";
 /**
 * Appended when another Computer Use session holds a turn at delivery time. Without it the woken
@@ -49,7 +51,7 @@ async function runWatch(watch, signal) {
 		watch.caller.followup(createUserMessage({
 			content: [{
 				type: "text",
-				text: completionNoticeText(watch.sessionId, watch.task, outcome, anotherComputerUseRunning(watch), userStopped, stillRunning)
+				text: completionNoticeText(watch.sessionId, watch.task, outcome, anotherComputerUseRunning(watch), userStopped, stillRunning, { dumpDir: noticeDumpDirOf(watch) })
 			}],
 			source: {
 				kind: "computer-use",
@@ -280,23 +282,97 @@ function presetOf(agent) {
 /**
  * 通知正文里 Code 会话结果那一段的长度口径。
  * 与插件侧秘书通知同一套口径（见 src/assistant-cu-watch.ts 的 CU_NOTICE_RESULT_MAX_CHARS = 20000）。
- * 改前是 4e3：逐条核实参考文献、批量改稿那种长报告普遍上万字，4000 一刀把报告拦腰截掉，
- * 前台 Computer Use 只能依据半截的摘录往下走。宿主这条通道本身不裁正文
- * （@deepseek-ai/dsh-agent-loop `send` 只做 `inbox.splice`，:800-808），所以放大上限即可，
- * 不需要多条通知分段送达。卡片那一行的一行话另有口径：@deepseek-ai/dsh-llm
- * `CONTEXT_SUMMARY_MAX_CHARS = 120`（`boundContextSummary`）与书签列表的 200（`BOOKMARK_OUTCOME_MAX_CHARS`），
- * 那两个是观感口径，不裁模型看到的正文。
+ *
+ * 2026-11-24 用户定案：只裁尾会把结论与末尾路径一起丢掉（346 行的联合基金报告就被切在
+ * 路径中段），所以改成**保留头 + 保留尾**：头 15000 + 尾 5000，中间换成「省略多少字、
+ * 省略在第几字到第几字」的标注；整段仍超上限时，把裁切前的完整原文落盘（该 CU 会话的
+ * 项目目录下 .dsh-cu-notices/），通知正文直接给绝对路径，让前台把整段读回来。
+ * 卡片那一行的一行话另有口径：@deepseek-ai/dsh-llm `CONTEXT_SUMMARY_MAX_CHARS = 120` 与
+ * 书签列表的 200（`BOOKMARK_OUTCOME_MAX_CHARS`），那两个是观感口径，不裁模型看到的正文。
  */
 const CODE_AGENT_NOTICE_MAX_CHARS = 20000;
-function capNoticeOutcome(text) {
+const CODE_AGENT_NOTICE_HEAD_CHARS = 15000;
+const CODE_AGENT_NOTICE_TAIL_CHARS = 5000;
+const CODE_AGENT_NOTICE_DUMP_DIR = ".dsh-cu-notices";
+function digestNoticeOutcome(text) {
 	const value = String(text ?? "");
-	if (value.length <= CODE_AGENT_NOTICE_MAX_CHARS) return { text: value, truncated: false };
-	return { text: `${value.slice(0, CODE_AGENT_NOTICE_MAX_CHARS)}…`, truncated: true };
+	const originalChars = value.length;
+	if (originalChars <= CODE_AGENT_NOTICE_MAX_CHARS) {
+		return {
+			text: value,
+			fullText: value,
+			truncated: false,
+			originalChars,
+			keptHeadChars: originalChars,
+			keptTailChars: 0,
+			omittedChars: 0,
+			omittedFromChar: 0,
+			omittedToChar: 0
+		};
+	}
+	const headChars = Math.min(CODE_AGENT_NOTICE_HEAD_CHARS, Math.max(1, Math.round(CODE_AGENT_NOTICE_MAX_CHARS * 3 / 4)));
+	const tailChars = Math.min(CODE_AGENT_NOTICE_TAIL_CHARS, Math.max(1, CODE_AGENT_NOTICE_MAX_CHARS - headChars));
+	const head = value.slice(0, headChars);
+	const tail = value.slice(value.length - tailChars);
+	const omittedFromChar = headChars + 1;
+	const omittedToChar = value.length - tailChars;
+	const omittedChars = omittedToChar - omittedFromChar + 1;
+	const marker = `\n\n...[${omittedChars} characters omitted (chars ${omittedFromChar}-${omittedToChar}); the conclusion and the final paths are kept in the tail below, and the full text is in the dumped file]...\n\n`;
+	return {
+		text: `${head}${marker}${tail}`,
+		fullText: value,
+		truncated: true,
+		originalChars,
+		keptHeadChars: headChars,
+		keptTailChars: tailChars,
+		omittedChars,
+		omittedFromChar,
+		omittedToChar
+	};
 }
-function completionNoticeText(sessionId, task, outcome, screenBusy, userStopped, stillRunning = false) {
+function capNoticeOutcome(text) {
+	return digestNoticeOutcome(text);
+}
+/** 落盘文件名：cu-notice-full-YYYYMMDD-HHMMSS.md（本地时区）。 */
+function noticeDumpFileName(now = new Date()) {
+	const pad = (value) => String(value).padStart(2, "0");
+	return `cu-notice-full-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.md`;
+}
+/** 把裁切前的完整原文写成一份文件；落盘失败返回 null（通知里不编造路径）。 */
+function writeCodeAgentNoticeDump(dir, text, now = new Date()) {
+	const base = String(dir ?? "").trim();
+	if (base === "") return null;
+	const body = String(text ?? "");
+	try {
+		mkdirSync(base, { recursive: true });
+		const file = pathResolve(base, noticeDumpFileName(now));
+		writeFileSync(file, [
+			"# Background Code session full text (dumped by the plugin before the notice cut it)",
+			"",
+			`- Written at: ${now.toISOString()}`,
+			`- Total characters: ${body.length}`,
+			`- Notice cap: ${CODE_AGENT_NOTICE_MAX_CHARS} chars (keeps head ${CODE_AGENT_NOTICE_HEAD_CHARS} + tail ${CODE_AGENT_NOTICE_TAIL_CHARS})`,
+			"",
+			"---",
+			"",
+			body
+		].join("\n"), "utf8");
+		return file;
+	} catch {
+		return null;
+	}
+}
+/** 落盘目录：CU 会话的项目目录下 .dsh-cu-notices/；没有 cwd 就不落盘（不退回进程 cwd）。 */
+function noticeDumpDirOf(watch) {
+	const cwd = String(watch?.cwd ?? watch?.code?.session?.header?.cwd ?? "").trim();
+	return cwd === "" ? "" : pathJoin(cwd, CODE_AGENT_NOTICE_DUMP_DIR);
+}
+function completionNoticeText(sessionId, task, outcome, screenBusy, userStopped, stillRunning = false, options = {}) {
 	const capped = capNoticeOutcome(outcome);
+	const fullTextPath = capped.truncated ? writeCodeAgentNoticeDump(String(options?.dumpDir ?? "").trim(), capped.fullText) : null;
 	const body = userStopped ? `The user stopped background Code agent session ${sessionId} from the main window:\n${task}\n\nLast output before it stopped:\n${capped.text}` : `Background Code agent session ${sessionId} ${stillRunning ? "completed the stretch you dispatched (its own turns are still running)" : "finished this task"}:\n${task}\n\n${capped.text}`;
-	return `${body}${capped.truncated ? `\n\nThat reply is cut here at ${CODE_AGENT_NOTICE_MAX_CHARS} characters (the tail after the \`…\` is missing). Do not conclude from the excerpt alone: read the full text back from the file that Code session wrote, or open session ${sessionId} in the app. Dispatch another stretch to that session only when the user asked you to.` : ""}${userStopped ? "\n\nDo not restart this task and do not call code_agent for it again unless the user asks." : stillRunning ? "\n\nThat Code session is still working on later rounds. Use this result to decide your next step now; call code_agent_status to check progress, and only dispatch another stretch to the same session_id when this one is not the answer you needed." : ""}${screenBusy ? `\n\n${SCREEN_BUSY_SUFFIX}` : ""}`;
+	const cutSuffix = capped.truncated ? `\n\nThat reply is ${capped.originalChars} characters; this notice keeps the first ${capped.keptHeadChars} and last ${capped.keptTailChars} characters, omits ${capped.omittedChars} in the middle (chars ${capped.omittedFromChar}-${capped.omittedToChar}), so the conclusion and the final paths are still in the tail. The full text was cut from this notice${fullTextPath !== null ? ` and written to ${fullTextPath}` : ""} — read the full text back ${fullTextPath !== null ? "from that file" : "from the file that Code session wrote"}, or open session ${sessionId} in the app; do not conclude from the excerpt alone. Dispatch another stretch to that session only when the user asked you to.` : "";
+	return `${body}${cutSuffix}${userStopped ? "\n\nDo not restart this task and do not call code_agent for it again unless the user asks." : stillRunning ? "\n\nThat Code session is still working on later rounds. Use this result to decide your next step now; call code_agent_status to check progress, and only dispatch another stretch to the same session_id when this one is not the answer you needed." : ""}${screenBusy ? `\n\n${SCREEN_BUSY_SUFFIX}` : ""}`;
 }
 //#endregion
 //#region src/code-agent-registry.ts

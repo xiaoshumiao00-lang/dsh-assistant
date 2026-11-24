@@ -12,17 +12,24 @@
  *   - 回传次数有上限，防止后台反复来回。
  */
 import assert from 'node:assert/strict'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   COMPUTER_USE_TOOL,
   buildHandoffText,
   capText,
   createComputerUseBridgeTool,
+  digestText,
   firstAssistantTextAfter,
   isQueued,
   lastAssistantText,
   MAX_RESULT_CHARS,
   resetBridgeQueues,
-  resolveCallerId
+  RESULT_HEAD_KEEP_CHARS,
+  RESULT_TAIL_KEEP_CHARS,
+  resolveCallerId,
+  writeBridgeDump
 } from '../src/cu-bridge-core.mjs'
 import { createWindowsDesktopBackend, windowSurfaceRect } from '../vendor/computer-use/backend-18yEf5Jq.js'
 
@@ -146,17 +153,29 @@ cases.push(['请求文本带任务、只做一步、回结果、不要再转 cod
   assert.match(text, /ask_user_question/)
 }])
 
-cases.push(['capText 新口径：结果整段带全（不再 4000 拦腰截），保留结尾；lastAssistantText 支持只看注入之后的消息', async () => {
+cases.push(['capText 新口径：保留头 + 保留尾（不再只裁尾），结论与末尾路径都留下；lastAssistantText 支持只看注入之后的消息', async () => {
   assert.equal(MAX_RESULT_CHARS, 20000, '与秘书/CU 通知同一长度口径（旧 4000 已废弃）')
-  assert.ok(MAX_RESULT_CHARS > 4000, '不许退回旧的 4000')
+  assert.equal(RESULT_HEAD_KEEP_CHARS, 15000, '保留头 15000 字')
+  assert.equal(RESULT_TAIL_KEEP_CHARS, 5000, '保留尾 5000 字')
+  assert.equal(RESULT_HEAD_KEEP_CHARS + RESULT_TAIL_KEEP_CHARS, MAX_RESULT_CHARS, '头 + 尾 = 上限')
   assert.equal(capText('abc'), 'abc')
   const long = capText('x'.repeat(12000))
   assert.equal(long.length, 12000, '12000 字的结果不许被截断')
-  assert.ok(!long.startsWith('…'), '没超上限不该留省略号')
-  const cut = capText('x'.repeat(MAX_RESULT_CHARS + 500), 200)
-  assert.ok(cut.startsWith('…'), '超出上限才截，且保留结尾（结果通常比开头有用）')
-  assert.equal(cut.length, 200)
-  assert.ok(cut.endsWith('x'))
+  const headPart = '甲'.repeat(10000)
+  const middlePart = '乙'.repeat(10000)
+  const tailPath = 'D:\\<PRIVATE-ARCHIVE-ROOT>\\结论.txt'
+  const tailPart = `${'丙'.repeat(5000)}${tailPath}`
+  const cut = capText(`${headPart}${middlePart}${tailPart}`)
+  assert.ok(cut.startsWith(headPart), '头部 15000 字必须原样保留')
+  assert.ok(cut.endsWith(tailPath), '尾部路径必须留在尾段（改前只裁尾会把它整段切掉）')
+  assert.match(cut, /中间省略 \d+ 字/, '要写明省略了多少字')
+  assert.match(cut, /第 15001–\d+ 字/, '要写明省略位置')
+  assert.ok(cut.length <= MAX_RESULT_CHARS + 300, `头 + 尾 + 标注贴着上限：${cut.length}`)
+  const digest = digestText(`${headPart}${middlePart}${tailPart}`)
+  assert.equal(digest.truncated, true)
+  assert.equal(digest.originalChars, headPart.length + middlePart.length + tailPart.length)
+  assert.equal(cut, digest.text, 'capText 与 digestText 同一口径')
+  assert.equal(capText('x'.repeat(MAX_RESULT_CHARS + 500), 200).length <= 200 + 300, true, '自定义上限同样走头 + 尾口径')
   const agent = makeAgent()
   agent.messages.push({ role: 'assistant', content: [{ type: 'text', text: 'old' }] })
   agent.messages.push({ role: 'user', content: [{ type: 'text', text: 'notice' }] })
@@ -165,6 +184,40 @@ cases.push(['capText 新口径：结果整段带全（不再 4000 拦腰截）�
   assert.equal(lastAssistantText(agent, { after: 2 }), 'new')
   assert.equal(lastAssistantText(agent, { after: 3 }), '')
   assert.equal(lastAssistantText({ session: { deriveMessages: () => [] } }), '')
+}])
+
+cases.push(['回传结果超上限时落盘完整原文：文件真存在、内容完整、工具结果里带绝对路径', async () => {
+  resetBridgeQueues()
+  const root = mkdtempSync(join(tmpdir(), 'cu-bridge-dump-'))
+  try {
+    const rows = []
+    let n = 0
+    while (rows.join('\n').length < 24000) {
+      n += 1
+      rows.push(`第 ${n} 步：窗口标题「文件传输助手」，数量 ${n}`)
+    }
+    const finalLine = '末尾：清单已写到 D:\\<PRIVATE-ARCHIVE-ROOT>\\微信\\清单.md'
+    const answer = `${rows.join('\n')}\n${finalLine}`
+    const parent = makeAgent({ answer: () => answer })
+    const background = makeAgent({ id: 'bg-1' })
+    const tool = buildTool(parent, background, { dumpDir: root })
+    const value = await tool.execute({ task: '导出清单' }, { agent: background })
+    assert.equal(value.ok, true)
+    assert.ok(value.result.includes(answer), 'result 里保留前台整段答复（不在这里裁）')
+    const pathMatch = value.result.match(/完整全文已落盘：(.+?)。/)
+    assert.ok(pathMatch !== null, `工具结果里要带落盘路径：${value.result.slice(-300)}`)
+    const path = pathMatch[1].trim()
+    assert.ok(existsSync(path), `落盘文件必须真存在：${path}`)
+    assert.match(path, /cu-notice-full-\d{8}-\d{6}\.md$/, '文件名带时间戳')
+    assert.ok(path.startsWith(root), '要落在注入的项目目录下')
+    const content = readFileSync(path, 'utf8')
+    assert.ok(content.includes(answer), '落盘文件必须整段完整（不是被裁的那截）')
+    const rendered = tool.output.render({}, value)
+    assert.ok(rendered[0].text.includes(path), '模型看到的那段文本里也要有路径')
+    assert.ok(rendered[0].text.includes(finalLine), '末尾那一行不许被裁掉')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 }])
 
 cases.push(['firstAssistantTextAfter：notice 之后的几整段按顺序拼接（改前只取第一条），用户插话仍是硬边界', async () => {

@@ -622,6 +622,22 @@ cases.push(['引用登记段（第 4 项）：路由形状、落盘、吃掉一�
   }
 }])
 
+cases.push(['朗读规范补「不照抄、要整理」：先给结论、禁止整大段照抄 CU 回复、硬事实保留、先读完整再整理', () => {
+  const text = surface.SECRETARY_SPEECH_STYLE_TEXT
+  assert.match(text, /先给结论/)
+  assert.match(text, /自己整理|整理成简短/)
+  assert.match(text, /不许整大段原封不动照抄/)
+  assert.match(text, /禁止照抄表格|禁止照抄表格与长路径/)
+  assert.match(text, /文件名.*大小.*哈希.*数字.*提交号.*判据.*结论.*待办/)
+  assert.match(text, /必须先拿到完整内容再整理/)
+  assert.match(text, /不许只依据被裁的摘录作答/)
+  assert.ok(!text.includes('原样转述'), '旧「原样转述」口径必须撤掉')
+  // 原有的口语化与朗读规则一条都不许丢
+  assert.match(text, /口语化短句/)
+  assert.match(text, /不要用 markdown 符号、表格、列表符号/)
+  assert.match(text, /\[\[session:会话id\|会话标题\]\]/)
+}])
+
 let failed = 0
 for (const [name, fn] of cases) {
   try {

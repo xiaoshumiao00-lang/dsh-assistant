@@ -19,20 +19,22 @@
  *     真超上限才截尾并在正文里照实标注「cut here … tail is missing」。
  */
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve as pathResolve } from 'node:path'
 
 const registryPath = new URL('../vendor/computer-use/code-agent-registry-DDJfS2Fl.js', import.meta.url)
 const source = readFileSync(registryPath, 'utf8')
-// 这份 vendored 模块只 import @deepseek-ai/dsh-llm（宿主侧才有），测试里换成本地桩。
+// 这份 vendored 模块只 import @deepseek-ai/dsh-llm（宿主侧才有）与 node 内置，测试里换成本地桩。
 const body = source
-  .replace(/^import[^\n]*\n/m, '')
+  .replace(/^import[^\n]*\n/gm, '')
   .replace(/^export \{[^\n]*\n?/m, '')
-const factory = new Function('boundContextSummary', 'createUserMessage', `${body}\nreturn { runWatch, raceCompletionSignals, completionNoticeText, lastAssistantText, lastTurnEndIndex, anotherComputerUseRunning, CODE_AGENT_NOTICE_MAX_CHARS, NO_ASSISTANT, SCREEN_BUSY_SUFFIX };`)
+const factory = new Function('boundContextSummary', 'createUserMessage', 'mkdirSync', 'writeFileSync', 'pathResolve', `${body}\nreturn { runWatch, raceCompletionSignals, completionNoticeText, capNoticeOutcome, digestNoticeOutcome, writeCodeAgentNoticeDump, lastAssistantText, lastTurnEndIndex, anotherComputerUseRunning, CODE_AGENT_NOTICE_MAX_CHARS, CODE_AGENT_NOTICE_HEAD_CHARS, CODE_AGENT_NOTICE_TAIL_CHARS, NO_ASSISTANT, SCREEN_BUSY_SUFFIX };`)
 const stubs = {
   boundContextSummary: (text) => String(text).slice(0, 120),
   createUserMessage: (message) => message,
 }
-const registry = factory(stubs.boundContextSummary, stubs.createUserMessage)
+const registry = factory(stubs.boundContextSummary, stubs.createUserMessage, mkdirSync, writeFileSync, pathResolve)
 
 const cases = []
 
@@ -197,30 +199,61 @@ cases.push(['lastTurnEndIndex：只数真正关闭的轮，缺 snapshotEvents �
   assert.equal(registry.lastTurnEndIndex({ session: undefined }), -1)
 }])
 
-cases.push(['completionNoticeText 新口径：后台长结果整段带全（不再 4000 拦腰截），真超上限才截尾并照实标注', () => {
+cases.push(['completionNoticeText 新口径：后台长结果保留头 + 保留尾（不再只裁尾），中间省略写明字数与位置', () => {
   const cap = registry.CODE_AGENT_NOTICE_MAX_CHARS
   assert.equal(cap, 20000, '与秘书通知那条唯一口径（CU_NOTICE_RESULT_MAX_CHARS）对齐')
-  assert.ok(cap > 4000, '不许退回旧的 4000 上限')
+  assert.equal(registry.CODE_AGENT_NOTICE_HEAD_CHARS, 15000, '保留头 15000 字')
+  assert.equal(registry.CODE_AGENT_NOTICE_TAIL_CHARS, 5000, '保留尾 5000 字')
+  assert.equal(registry.CODE_AGENT_NOTICE_HEAD_CHARS + registry.CODE_AGENT_NOTICE_TAIL_CHARS, cap, '头 + 尾 = 上限')
   // 改前这条会拦腰砍：12000 字后台结果 → 只带 4000 字
   const long = 'x'.repeat(12000)
   const whole = registry.completionNoticeText('code-1', '任务', long, false, false, false)
   assert.ok(whole.includes(long), '12000 字的结果要整段带全')
   assert.ok(!whole.endsWith('…'), '整段带全时不许留省略号')
-  assert.ok(!whole.includes('cut here'), '没截断就不许带截断标注')
-  // 真正超出新上限的极端长结果：截尾 + 省略号 + 明确说后半段不在通知里
-  const overflow = registry.completionNoticeText('code-1', '任务', 'y'.repeat(cap + 5000), false, false, false)
-  assert.ok(overflow.includes('y'.repeat(cap)), '截断前的一半必须完整带出')
-  assert.ok(!overflow.includes('y'.repeat(cap + 1)), '超出上限的那部分不该带出')
-  assert.match(overflow, /That reply is cut here at 20000 characters/, '截断要在通知正文里如实标注')
-  assert.match(overflow, /the tail after the .…. is missing/, '要说清后半段不在通知里')
+  assert.ok(!whole.includes('characters omitted'), '没截断就不许带省略标注')
+  // 真正超出上限的极端长结果：头尾都留，中间省略，并写明省略字数与位置
+  const headPart = '甲'.repeat(15000)
+  const middlePart = '乙'.repeat(5000)
+  const tailPart = '丙'.repeat(5000)
+  const overflowText = `${headPart}${middlePart}${tailPart}`
+  const overflow = registry.completionNoticeText('code-1', '任务', overflowText, false, false, false)
+  assert.ok(overflow.includes(headPart), '头部 15000 字必须完整带出')
+  assert.ok(overflow.includes(tailPart), '尾部 5000 字必须完整带出（改前只裁尾会让结论与末尾路径全丢）')
+  assert.ok(!overflow.includes(middlePart), '中间那 5000 字正是被省略的部分')
+  assert.match(overflow, /keeps the first 15000 and last 5000 characters/, '要写明头尾各保留多少字')
+  assert.match(overflow, /omits 5000 in the middle \(chars 15001-20000\)/, '要写明省略多少字、省略位置')
+  assert.match(overflow, /The full text was cut from this notice/, '要标注已被裁')
   assert.match(overflow, /read the full text back from the file that Code session wrote/, '要给出补救办法（读回整段 / 开那条会话）')
   assert.match(overflow, /Dispatch another stretch to that session only when the user asked you to/, '截断补救不许自己造「通知→再派活→再通知」回路')
-  assert.ok(overflow.length < cap + 5000 + 400, '正文里除了上限本身不该再塞全量结果')
   // stopped 与 busy 两条支路互不干扰（旧口径保留）
   const stopped = registry.completionNoticeText('code-1', '任务', '结果', true, true, true)
   assert.match(stopped, /The user stopped/)
   assert.match(stopped, new RegExp(registry.SCREEN_BUSY_SUFFIX.slice(0, 20)))
   assert.ok(!stopped.includes('still working'))
+}])
+
+cases.push(['后台通知超上限时落盘完整原文：文件真存在、内容完整、通知里带绝对路径', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cu-code-notice-dump-'))
+  try {
+    const headPart = '甲'.repeat(15000)
+    const middlePart = '乙'.repeat(5000)
+    const tailPart = '丙'.repeat(5000)
+    const fullText = `${headPart}${middlePart}${tailPart}`
+    const text = registry.completionNoticeText('code-1', '任务', fullText, false, false, false, { dumpDir: root })
+    const match = text.match(/written to ([^\s—]+)/)
+    assert.ok(match !== null, `通知里要带落盘路径：${text.slice(-400)}`)
+    const path = match[1]
+    assert.match(path, /cu-notice-full-\d{8}-\d{6}\.md$/, '文件名带时间戳')
+    assert.ok(path.startsWith(root), '要落在注入的项目目录下')
+    const content = readFileSync(path, 'utf8')
+    assert.ok(content.includes(fullText), '落盘文件必须整段完整（不是被裁的那截）')
+    // 没有注入目录时退回旧措辞，不假装有路径
+    const noDir = registry.completionNoticeText('code-1', '任务', fullText, false, false, false)
+    assert.ok(!noDir.includes('written to'), '没有落盘目录时不许给出假路径')
+    assert.match(noDir, /read the full text back from the file that Code session wrote/, '仍要给出补救办法')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 }])
 
 cases.push(['后台结果跨消息交回时按顺序拼接进通知（改前只取最新一条 assistant，前面几整段丢掉）', async () => {

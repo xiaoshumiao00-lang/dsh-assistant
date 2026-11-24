@@ -15,17 +15,31 @@
  *   - 只处理文字结果：截图留在 CU 会话里，后台模型不需要视觉能力。
  */
 
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+
 /** 模型可见的工具名。 */
 export const COMPUTER_USE_TOOL = 'computer_use'
 
 /**
  * 一次回传结果最多带回多少字符。
- * 2026-11-23 修第四个 bug：这条口径原来也是 4000，前台做完一步把长结果交回后台会话时，
- * 后台只收到半截（与 code_agent 完成通知同源的第二条链路）。现在对齐秘书/通知那条唯一口径
- * （src/assistant-cu-watch.ts 的 CU_NOTICE_RESULT_MAX_CHARS = 20000，宿主 followup 通道不裁正文）。
- * capText 保留结尾的语义不变：整段能带全就原样带，超出上限才留「…」。
+ *
+ * 2026-11-24 口径（与秘书通知、code_agent 完成通知同一条）：整段能带全就整段带；超上限时
+ * **保留头 + 保留尾**（头 15000 + 尾 5000），中间换成「省略多少字、省略在第几字到第几字」的
+ * 标注；同时把裁切前的完整原文落盘（该 CU 会话项目目录下 .dsh-cu-notices/），
+ * 工具结果里直接给出绝对路径，后台用 read 整段读回。
+ * 改前是「只保留结尾、开头全丢」：结论在前、末尾路径在后，两头都需要。
  */
 export const MAX_RESULT_CHARS = 20000
+
+/** 裁切时原样保留的头部字数。 */
+export const RESULT_HEAD_KEEP_CHARS = 15000
+
+/** 裁切时原样保留的尾部字数（结论、末尾路径、提交号都在这一段）。 */
+export const RESULT_TAIL_KEEP_CHARS = 5000
+
+/** 完整原文落盘的目录名。 */
+export const BRIDGE_DUMP_DIR_NAME = '.dsh-cu-notices'
 
 /** 默认等待上限：20 分钟。GUI 步骤通常几秒，留足用户在场决策的时间。 */
 export const DEFAULT_HANDOFF_TIMEOUT_MS = 20 * 60 * 1000
@@ -66,11 +80,92 @@ function sleep(ms, signal) {
   })
 }
 
-/** 按字符上限截断，保留结尾（结果通常比开头有用）。 */
-export function capText(text, max = MAX_RESULT_CHARS) {
+/** 一段回传文本的裁切结果（头 + 尾 + 省略标注；fullText 是裁切前的整段，落盘用）。 */
+export function digestText(text, max = MAX_RESULT_CHARS) {
   const value = String(text ?? '').trim()
-  if (value.length <= max) return value
-  return `…${value.slice(value.length - (max - 1))}`
+  const originalChars = value.length
+  if (originalChars <= max) {
+    return {
+      text: value,
+      fullText: value,
+      truncated: false,
+      originalChars,
+      keptHeadChars: originalChars,
+      keptTailChars: 0,
+      omittedChars: 0,
+      omittedFromChar: 0,
+      omittedToChar: 0
+    }
+  }
+  const headChars = Math.min(RESULT_HEAD_KEEP_CHARS, Math.max(1, Math.round((max * 3) / 4)))
+  const tailChars = Math.min(RESULT_TAIL_KEEP_CHARS, Math.max(1, max - headChars))
+  const head = value.slice(0, headChars)
+  const tail = value.slice(value.length - tailChars)
+  const omittedFromChar = headChars + 1
+  const omittedToChar = value.length - tailChars
+  const omittedChars = omittedToChar - omittedFromChar + 1
+  const marker = `\n\n…〔中间省略 ${omittedChars} 字：第 ${omittedFromChar}–${omittedToChar} 字；结论与末尾路径都在下面这段原文里，完整原文见落盘文件〕…\n\n`
+  return {
+    text: `${head}${marker}${tail}`,
+    fullText: value,
+    truncated: true,
+    originalChars,
+    keptHeadChars: headChars,
+    keptTailChars: tailChars,
+    omittedChars,
+    omittedFromChar,
+    omittedToChar
+  }
+}
+
+/** 按字符上限裁切：整段能带全就原样带；超上限保留头 + 尾，中间省略（不再只留结尾）。 */
+export function capText(text, max = MAX_RESULT_CHARS) {
+  return digestText(text, max).text
+}
+
+/** 落盘文件名：cu-notice-full-YYYYMMDD-HHMMSS.md（本地时区）。 */
+export function bridgeDumpFileName(now = new Date()) {
+  const pad = (value) => String(value).padStart(2, '0')
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`
+    + `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+  return `cu-notice-full-${stamp}.md`
+}
+
+/** 把裁切前的完整原文写成一份文件；落盘失败返回 null（绝不编造路径）。 */
+export function writeBridgeDump(dir, text, options = {}) {
+  const base = String(dir ?? '').trim()
+  if (base === '') return null
+  const body = String(text ?? '')
+  const now = options.now ?? new Date()
+  try {
+    mkdirSync(base, { recursive: true })
+    const file = join(base, bridgeDumpFileName(now))
+    const header = [
+      '# Computer Use 回传结果完整原文（插件落盘，通知/结果被裁前的全文）',
+      '',
+      `- 落盘时间：${now.toISOString()}`,
+      `- 原文总字数：${body.length}`,
+      `- 回传口径：单条上限 ${MAX_RESULT_CHARS} 字；超出时只带前 ${RESULT_HEAD_KEEP_CHARS} 字 + 后 ${RESULT_TAIL_KEEP_CHARS} 字`,
+      '',
+      '---',
+      '',
+    ].join('\n')
+    writeFileSync(file, `${header}${body}`, 'utf8')
+    return file
+  } catch {
+    return null
+  }
+}
+
+/** 落盘目录：前台 CU 会话的项目目录下 .dsh-cu-notices/；拿不到 cwd 就不落盘。 */
+function bridgeDumpDirOf(parent) {
+  const cwd = String(parent?.session?.header?.cwd ?? '').trim()
+  return cwd === '' ? '' : join(cwd, BRIDGE_DUMP_DIR_NAME)
+}
+
+/** 超上限时附在工具结果末尾的那段交代：原文多少字、省略多少、完整原文在哪个文件。 */
+export function oversizedResultNotice(path, digest) {
+  return `（完整原文共 ${digest.originalChars} 字，超过回传上限 ${MAX_RESULT_CHARS} 字，已被裁：只保留头 ${digest.keptHeadChars} 字 + 尾 ${digest.keptTailChars} 字，中间省略 ${digest.omittedChars} 字（约在第 ${digest.omittedFromChar}–${digest.omittedToChar} 字之间）。完整全文已落盘：${path}。需要用 read 整段读回，不许只依据头尾作答。）`
 }
 
 /**
@@ -275,11 +370,11 @@ function waitForSettle(agent, options) {
  * 把一个 GUI 步骤交给前台 CU 会话并等结果。
  * @param parent - 前台 CU agent（必须 live）
  * @param task - 模型写的一步 GUI 任务
- * @param options - createUserMessage / boundContextSummary / signal / timeoutMs
+ * @param options - createUserMessage / boundContextSummary / signal / timeoutMs / dumpDir
  * @returns {Promise<{ ok: boolean, result: string }>}
  */
 export async function handoffToComputerUse(parent, task, options) {
-  const { createUserMessage, boundContextSummary, signal, timeoutMs } = options
+  const { createUserMessage, boundContextSummary, signal, timeoutMs, dumpDir } = options
   const hasEvents = typeof parent.session?.snapshotEvents === 'function'
   const message = createUserMessage({
     content: [{ type: 'text', text: buildHandoffText(task) }],
@@ -337,7 +432,14 @@ export async function handoffToComputerUse(parent, task, options) {
   // 真实会话用「notice 之后的第一条 assistant」精确取答复；老会话没有事件快照时
   // 才退回整段历史的最后一条文字（可能被用户后来那轮覆盖，只作兜底）。
   const outcome = hasEvents ? firstAssistantTextAfter(parent, message.id) : lastAssistantText(parent)
-  return { ok: true, result: outcome }
+  // 2026-11-24：回传结果超上限时不再只留结尾，也不把整段硬塞回去——头尾都留，
+  // 并把裁切前的完整原文落盘，工具结果里给出绝对路径。
+  const digest = digestText(outcome)
+  if (!digest.truncated) return { ok: true, result: outcome }
+  const dumpDirResolved = String(dumpDir ?? '').trim() || bridgeDumpDirOf(parent)
+  const path = writeBridgeDump(dumpDirResolved, digest.fullText)
+  if (path === null) return { ok: true, result: outcome }
+  return { ok: true, result: `${outcome}\n\n${oversizedResultNotice(path, digest)}` }
 }
 
 /** 解析这次调用该找哪个前台 CU 会话：优先用 code-agent registry 里最新的归属。 */
@@ -443,7 +545,8 @@ export function createComputerUseBridgeTool(options) {
             boundContextSummary: boundContextSummary ?? ((summary) => summary),
             signal: exec?.signal,
             timeoutMs: options.timeoutMs,
-            startWaitMs: options.startWaitMs
+            startWaitMs: options.startWaitMs,
+            dumpDir: options.dumpDir
           })
         )
       } catch (error) {

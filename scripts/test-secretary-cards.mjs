@@ -362,7 +362,7 @@ cases.push(['新措辞的通知正文照旧解析成通知卡（模板改了行�
   assert.ok(stripped.includes('src/a.ts') && stripped.includes('259e27d'), 'CU 原文里的文件名与提交号留在通知卡正文里')
   const parsed = surface.parseNoticeCardBody(raw)
   assert.equal(parsed.title, '电脑操作会话「派活：帮我看一下磷石膏 SCI」这一轮已经完成。')
-  assert.ok(parsed.paragraphs.some((p) => p.includes('完整展示') && p.includes('不许精简')), '完整转述口径那行进了卡片正文')
+  assert.ok(parsed.paragraphs.some((p) => p.includes('禁止整大段原封不动照抄') && p.includes('先给结论')), '整理不照抄口径那行进了卡片正文')
   assert.ok(parsed.paragraphs.some((p) => p.includes('动手类工具已禁用')), '工具禁用那行也照实显示')
   const refs = surface.parseSessionRefs(raw)
   assert.equal(refs.length, 1, '末尾引用仍被抽成可点跳 chip')
