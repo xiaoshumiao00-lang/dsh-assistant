@@ -638,6 +638,26 @@ cases.push(['朗读规范补「不照抄、要整理」：先给结论、禁止�
   assert.match(text, /\[\[session:会话id\|会话标题\]\]/)
 }])
 
+cases.push(['数字口径改档（2026-11-24 用户明确批准）：注入段数字一律阿拉伯写法、汉字数字示例清零', () => {
+  const text = surface.SECRETARY_SPEECH_STYLE_TEXT
+  assert.match(text, /数字一律保留阿拉伯写法/, '新口径必须在注入段里说清「数字一律保留阿拉伯写法」')
+  assert.match(text, /27458/, '阿拉伯数字示例：字符数')
+  assert.match(text, /49915/, '阿拉伯数字示例：token 数')
+  assert.match(text, /2617×1215/, '阿拉伯数字示例：画布比例（带乘号那份）')
+  assert.match(text, /9761427/, '阿拉伯数字示例：字节数')
+  assert.match(text, /8 到 14 摄氏度/, '带单位的写法照阿拉伯数字 + 中文单位')
+  assert.match(text, /禁止[^。]*汉字数字|不许[^。]*汉字数字/, '必须明确禁止把数字转写成汉字数字')
+  for (const old of ['念得出来', '八点十二分', '三公里', '两公斤']) {
+    assert.ok(!text.includes(old), `旧汉字数字口径「${old}」必须从注入段清零`)
+  }
+  // 这条只改数字口径，其它规则一个字都不许动
+  assert.match(text, /口语化短句，先给结论/)
+  assert.match(text, /不要用 markdown 符号、表格、列表符号、表情符号、代码块/)
+  assert.match(text, /英文缩写尽量换成读得出的中文说法/)
+  assert.match(text, /车次 G1545/)
+  assert.ok(text.includes('二、') && text.includes('三、') && text.includes('四、'), '注入段仍是那 4 条（顺序与编号不许变）')
+}])
+
 let failed = 0
 for (const [name, fn] of cases) {
   try {
