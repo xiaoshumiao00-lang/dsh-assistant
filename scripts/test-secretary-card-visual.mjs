@@ -171,6 +171,23 @@ const mixedUserCard = cardHtml({
   footCopyLabel: '复制这条消息',
 })
 
+/* 2026-11-24 插话批次：跑任务途中的插话（现场 dump 的 kind 值）做的是一张与用户卡完全同一规格的冷蓝卡 */
+const steeringAttachBody = [
+  '<p data-dsh-scard="para">workbuddy 是桌面的软件程序</p>',
+  `<div data-dsh-scard="attachment" data-dsh-scard-attachment-kind="image" title="插话截图.png">`,
+  `<img data-dsh-scard="attachment-thumb" src="${MIXED_ATTACH_PNG}" alt="插话截图.png" loading="lazy">`,
+  `<span data-dsh-scard="attachment-name">插话截图.png</span>`,
+  `</div>`,
+  '<p data-dsh-scard="para">插话后面那段文字也不许丢</p>',
+].join('\n')
+const steeringCard = cardHtml({
+  kind: 'user', key: 'user:16:input-message-steer-01', unread: false, timeText: '17:22',
+  head: { mark: markUser, tag: '用户消息', name: '<span data-dsh-scard="name">你</span>', speakLabel: '朗读这条消息' },
+  paras: { title: '', body: steeringAttachBody },
+  refs: [],
+  footCopyLabel: '复制这条消息',
+})
+
 const pageHtml = `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -273,6 +290,60 @@ ${assistantCard}
       </div>
     </div>
     <article data-dsh-scard="card" data-dsh-scard-kind="notice" data-dsh-scard-key="notice:16:input-message-cu-03" data-dsh-scard-turn="14" data-dsh-scard-expired="1" data-empty="1" aria-hidden="true"></article>
+  </div>
+  <!-- 2026-11-24 插话批次（现场 dump 的 kind 值照搬）：秘书跑任务途中用户插话 → 卡片接管整条宿主行 -->
+  <div data-chat-turn="16" data-chat-flow-kind="steering" data-chat-node-key="13:input-message-steer-01" data-probe="steering-row">
+    <div data-slot="conversation.chat.node">
+      <div class="host-user-row">
+        <div class="host-user-stack">
+          <div class="host-bubble">
+            <span data-slot="conversation.user.text.node"><span class="host-plain-run">workbuddy 是桌面的软件程序</span></span>
+          </div>
+          <div class="host-attachment-row" data-message-attachments="true">
+            <div data-slot="conversation.chat.user.images">
+              <div class="host-gallery" data-align="end">
+                <button type="button" class="host-frame" data-variant="single" title="查看原图" aria-label="插话截图.png，点击查看原图">
+                  <img src="${MIXED_ATTACH_PNG}" alt="插话截图.png">
+                </button>
+              </div>
+            </div>
+          </div>
+          <div class="host-bubble">
+            <span data-slot="conversation.user.text.node"><span class="host-plain-run">插话后面那段文字也不许丢</span></span>
+          </div>
+        </div>
+        <div class="host-actions" data-clock="start"><span>17:22</span></div>
+      </div>
+    </div>
+    ${steeringCard}
+  </div>
+  <!-- 现场 dump 里漏出来的三类过程行：过程分组行（带分组 key、自身没有语义 kind）、
+       工具调用行、上下文行；还有回合尾那一档（我们的卡 + 记忆回合尾部件挂同一个槽容器） -->
+  <div data-chat-turn="16" data-chat-group-key='["process","16:assistant-step16:1","reasoning"]' data-chat-flow-key='["process","16:assistant-step16:1","reasoning"]' data-probe="process-group-row">
+    <div data-chat-flow-kind="assistant-step" data-chat-group-part="reasoning" data-turn-process-member="true">
+      <div class="host-process-row"><span>已搜索代码，已读取文件，已调用工具</span></div>
+    </div>
+  </div>
+  <div data-chat-turn="16" data-chat-flow-kind="tool-call" data-turn-process-member="true" data-probe="tool-call-row">
+    <div data-slot="conversation.chat.node">
+      <div class="host-tool-row"><span>工具调用</span><span class="host-tool-detail">读取 package.json</span></div>
+    </div>
+  </div>
+  <div data-chat-turn="16" data-chat-flow-kind="context" data-probe="context-row">
+    <div data-slot="conversation.chat.node">
+      <div class="host-context-row"><span>跨会话召回</span><span>3</span></div>
+    </div>
+  </div>
+  <div data-chat-turn="17" data-chat-flow-kind="turn-tail" data-probe="turn-tail-row">
+    <div data-slot="conversation.chat.turnTail" style="display:contents">
+      <div data-dsh-scard="collapsed-row" data-dsh-scard-kind="assistant" data-dsh-scard-key="assistant:turn:17" data-dsh-scard-turn="17" data-probe="tail-card-row">
+        <span data-dsh-scard="collapsed-badge">💜</span>
+        <span data-dsh-scard="collapsed-title">插话那一轮的秘书卡必须还挂在回合尾</span>
+        <span data-dsh-scard="collapsed-time">17:26</span>
+      </div>
+      <div class="host-plugin-tail" data-probe="mnemon-tail-widget"><span>本回合记忆</span><span>召回 1</span></div>
+      <div class="host-plugin-tail" data-probe="skill-tail-widget"><span>本回合技能</span><span>1</span></div>
+    </div>
   </div>
 </div>
 <script>
@@ -1311,6 +1382,79 @@ try {
   pass('附件回归③：宿主那条原生附件行不再单独出图（整条宿主行由卡片接管，气泡/附件芯片都不渲染）',
     mixed.hostNodeDisplay === 'none' && mixed.hostAttachRendered === false && mixed.hostRunVisible === false,
     JSON.stringify({ hostNodeDisplay: mixed.hostNodeDisplay, hostAttachRendered: mixed.hostAttachRendered, hostRunVisible: mixed.hostRunVisible }))
+
+  // ── 2026-11-24 插话批次 + 过程行 0 条（现场 DOM dump 的 kind 值照搬进行物）──
+  const interruptFacts = await page.evaluate(() => {
+    const cs = (el) => (el === null ? null : getComputedStyle(el))
+    const rendered = (el) => el !== null && el.offsetParent !== null && el.getBoundingClientRect().height > 0
+    const row = document.querySelector('[data-chat-flow-kind="steering"][data-probe="steering-row"]')
+    const card = row.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="user"]')
+    const head = card.querySelector('[data-dsh-scard="head"]')
+    const tail = document.querySelector('[data-probe="turn-tail-row"]')
+    const group = document.querySelector('[data-probe="process-group-row"]')
+    return {
+      steeringRowCount: document.querySelectorAll('[data-chat-flow-kind="steering"]').length,
+      rowHeight: Math.round(row.getBoundingClientRect().height),
+      rowCardCount: row.querySelectorAll('[data-dsh-scard="card"]').length,
+      hostNodeDisplay: cs(row.querySelector('[data-slot="conversation.chat.node"]')).display,
+      hostRunVisible: rendered(row.querySelector('.host-plain-run')),
+      hostAttachVisible: rendered(row.querySelector('.host-attachment-row')),
+      cardVisible: rendered(card),
+      cardBg: cs(card).backgroundColor,
+      cardSurfaceVar: cs(card).getPropertyValue('--dsh-card-surface').trim(),
+      nameText: head.querySelector('[data-dsh-scard="name"]').textContent.trim(),
+      tagText: head.querySelector('[data-dsh-scard="tag"]').textContent.trim(),
+      cardText: card.querySelector('[data-dsh-scard="content"]').textContent.replace(/\s+/g, ' ').trim(),
+      cardParaCount: card.querySelectorAll('[data-dsh-scard="para"]').length,
+      cardAttachCount: card.querySelectorAll('[data-dsh-scard="attachment"]').length,
+      speakSize: Math.round(card.querySelector('[data-dsh-speak="button"]').getBoundingClientRect().height),
+      footTime: card.querySelector('[data-dsh-scard="time"]').textContent.trim(),
+      copyButton: card.querySelector('[data-dsh-scard="copy"]') !== null,
+      groupDisplay: cs(group).display,
+      groupMemberDisplay: cs(group.querySelector('[data-turn-process-member]')).display,
+      groupVisible: rendered(group),
+      toolDisplay: cs(document.querySelector('[data-chat-flow-kind="tool-call"]')).display,
+      toolVisible: rendered(document.querySelector('[data-chat-flow-kind="tool-call"]')),
+      contextDisplay: cs(document.querySelector('[data-chat-flow-kind="context"]')).display,
+      contextVisible: rendered(document.querySelector('[data-chat-flow-kind="context"]')),
+      tailCardVisible: rendered(tail.querySelector('[data-dsh-scard="card"], [data-dsh-scard="collapsed-row"]')),
+      tailRowVisible: rendered(tail),
+      mnemonDisplay: cs(document.querySelector('[data-probe="mnemon-tail-widget"]')).display,
+      mnemonVisible: rendered(document.querySelector('[data-probe="mnemon-tail-widget"]')),
+      skillDisplay: cs(document.querySelector('[data-probe="skill-tail-widget"]')).display,
+      skillVisible: rendered(document.querySelector('[data-probe="skill-tail-widget"]')),
+    }
+  })
+  pass('插话卡片化：跑任务途中的插话（现场 dump 的 steering 那一类行）做成冷蓝用户卡、原话与附件都收进卡片、整条宿主行被接管',
+    interruptFacts.steeringRowCount === 1 && interruptFacts.rowCardCount === 1 && interruptFacts.cardVisible
+    && interruptFacts.hostNodeDisplay === 'none' && interruptFacts.hostRunVisible === false && interruptFacts.hostAttachVisible === false
+    && (interruptFacts.cardBg === 'rgb(238, 244, 255)' || interruptFacts.cardSurfaceVar === '#eef4ff')
+    && interruptFacts.nameText === '你' && interruptFacts.tagText === '用户消息'
+    && interruptFacts.speakSize === 34 && interruptFacts.footTime === '17:22' && interruptFacts.copyButton
+    && interruptFacts.cardParaCount === 2 && interruptFacts.cardAttachCount === 1
+    && /workbuddy 是桌面的软件程序/.test(interruptFacts.cardText) && /插话后面那段文字也不许丢/.test(interruptFacts.cardText),
+    JSON.stringify(interruptFacts))
+  pass('过程行 0 条①：分组行（现场 dump 带分组 key 那种）、工具行、上下文行、分组成员标记一律不出图',
+    interruptFacts.groupDisplay === 'none' && interruptFacts.groupMemberDisplay === 'none' && interruptFacts.groupVisible === false
+    && interruptFacts.toolDisplay === 'none' && interruptFacts.toolVisible === false
+    && interruptFacts.contextDisplay === 'none' && interruptFacts.contextVisible === false,
+    JSON.stringify({ groupDisplay: interruptFacts.groupDisplay, groupMemberDisplay: interruptFacts.groupMemberDisplay, toolDisplay: interruptFacts.toolDisplay, contextDisplay: interruptFacts.contextDisplay }))
+  pass('过程行 0 条②：回合尾那一档只压没卡片标记的部件——秘书卡照旧出图，记忆/技能回合尾部件（截图那行「本回合记忆召回 1」）不出图',
+    interruptFacts.tailCardVisible === true && interruptFacts.tailRowVisible === true
+    && interruptFacts.mnemonDisplay === 'none' && interruptFacts.mnemonVisible === false
+    && interruptFacts.skillDisplay === 'none' && interruptFacts.skillVisible === false,
+    JSON.stringify({ tailCardVisible: interruptFacts.tailCardVisible, mnemonDisplay: interruptFacts.mnemonDisplay, skillDisplay: interruptFacts.skillDisplay }))
+  pass('过程行 0 条③：卡片之间的可见行只剩卡（照 dump 的那三类行没有一个在出图）',
+    await page.evaluate(() => {
+      const rendered = (el) => { let node = el; while (node && node !== document.body) { if (getComputedStyle(node).display === 'none') return false; node = node.parentElement } return el.getBoundingClientRect().height > 0 }
+      // 这里的名单只放现场 dump 里真的在出图那三类（工具行/分组行/上下文行）；
+      // 压缩那两类行（kind 为 manual-compaction 与按文字打标那行）由本文件上面两组既有用例单独验，扫描层按文字给它们打的是 data-dsh-scard-compact 标记
+      const PROCESS_KINDS = ['assistant-step', 'tool-call', 'turn-process', 'context', 'model-retry', 'turn-error', 'turn-max-tokens']
+      const rows = [...document.querySelectorAll('[data-chat-turn]')].filter((el) => el.hasAttribute('data-chat-flow-kind') || el.hasAttribute('data-chat-group-key'))
+      const leaked = rows.filter((el) => rendered(el)).filter((el) => PROCESS_KINDS.includes(el.getAttribute('data-chat-flow-kind')) || el.hasAttribute('data-chat-group-key') || el.hasAttribute('data-turn-process-member')).filter((el) => el.querySelector('[data-dsh-scard]') === null)
+      return leaked.length === 0
+    }),
+    '卡片之间一个过程行都没有')
 
   console.log('')
   console.log(`折叠高度实测：BEFORE(旧实现) max-height=${legacy.collapsedMaxHeight}px 约 ${legacy.lines} 行  →  AFTER(新实现 3 行) max-height=${collapsedCardHeights.assistant.maxHeight} 秘书卡正文高=${collapsedCardHeights.assistant.contentHeight}px 通知卡正文高=${collapsedCardHeights.notice.contentHeight}px`)

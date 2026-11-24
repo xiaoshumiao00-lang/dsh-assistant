@@ -711,7 +711,11 @@ cases.push(['引用吃掉判据（追加需求）：轮次号可比按轮次号�
   assert.equal(surface.quoteTurnNumber('abc'), null)
 
   const fakeDoc = (rowList) => ({
-    querySelectorAll: (selector) => (selector === '[data-chat-flow-kind="user"]' ? rowList : []),
+    // 与 collectSecretaryCardRows 共用同一份 kind 白名单（写死旧选择器会让这条用例瞎掉）
+    querySelectorAll: (selector) => {
+      const kinds = [...String(selector).matchAll(/data-chat-flow-kind="([^"]+)"/g)].map((match) => match[1])
+      return rowList.filter((row) => kinds.includes(row.getAttribute('data-chat-flow-kind')))
+    },
   })
   const userElements = [
     fakeUserRow('msg-1', '7', '真实用户消息一条', '11:01'),
@@ -846,7 +850,8 @@ cases.push(['过期通知卡不进卡片窗口（第 1 项）：buildSecretaryPa
   ]
   const doc = {
     querySelectorAll: (selector) => {
-      if (selector === '[data-chat-flow-kind="user"]') return rows
+      const kinds = [...String(selector).matchAll(/data-chat-flow-kind="([^"]+)"/g)].map((match) => match[1])
+      if (kinds.length > 0) return rows.filter((row) => kinds.includes(row.getAttribute('data-chat-flow-kind')))
       if (selector === '[data-chat-turn]') return [{ getAttribute: () => '8' }]
       if (selector.includes('data-dsh-scard')) return []
       return []
@@ -932,6 +937,14 @@ function fakeEl(tag, attrs, kids) {
     getAttribute(name) { return Object.prototype.hasOwnProperty.call(node.attrs, name) ? String(node.attrs[name]) : null },
     hasAttribute(name) { return Object.prototype.hasOwnProperty.call(node.attrs, name) },
     matches(raw) { return selectorMatches(node, raw) },
+    closest(raw) {
+      let step = node
+      while (step !== null && step !== undefined) {
+        if (step.matches(raw)) return step
+        step = step.parentElement
+      }
+      return null
+    },
     querySelectorAll(raw) { return descendantsMatching(node, raw) },
     querySelector(raw) { return node.querySelectorAll(raw)[0] ?? null },
     get textContent() {
@@ -990,13 +1003,30 @@ function fakeFileAttach(name, meta) {
 }
 /** 整条宿主用户行（真实结构：flowItem > chat.node > userRow > userStack > 块… + actions[data-clock]） */
 function fakeHostUserRow(nodeKey, turnNo, clockText, blocks) {
+  return fakeFlowRow('user', nodeKey, turnNo, clockText, blocks)
+}
+/**
+ * 同上，但 flow-kind 可给。现场 dump（2026-11-24，.tmp/dom-dump-live3.txt / dom-dump-live4.txt）：
+ * 跑任务途中那条插话宿主持的是 `data-chat-flow-kind="steering"`（宿主在 conversation.chat.node 上
+ * key="user" 与 key="steering" 注册的是同一个 UserMessageNodeView，内层 userRow/bubble 完全同一套）。
+ */
+function fakeFlowRow(flowKind, nodeKey, turnNo, clockText, blocks) {
   const stack = fakeEl('div', {}, blocks)
   const userRow = fakeEl('div', {}, [stack, fakeEl('div', { 'data-clock': 'start' }, [clockText])])
-  return fakeEl('div', { 'data-chat-flow-kind': 'user', 'data-chat-node-key': nodeKey, 'data-chat-turn': turnNo }, [
+  return fakeEl('div', { 'data-chat-flow-kind': flowKind, 'data-chat-node-key': nodeKey, 'data-chat-turn': turnNo }, [
     fakeEl('div', { 'data-slot': 'conversation.chat.node' }, [userRow]),
   ])
 }
-const fakeHostDoc = (rows) => ({ querySelectorAll: (selector) => (selector === '[data-chat-flow-kind="user"]' ? rows : []) })
+/** 假对话流文档：按收集器实际问到的 kind 列表放行（写死「只有 user」时插话那条会被漏掉 → RED）。 */
+const fakeHostDoc = (rows) => ({
+  querySelectorAll: (selector) => {
+    const kinds = [...String(selector).matchAll(/data-chat-flow-kind="([^"]+)"/g)].map((match) => match[1])
+    return rows.filter((row) => {
+      const kind = row.getAttribute('data-chat-flow-kind')
+      return kind !== null && kind !== '' && kinds.includes(kind)
+    })
+  },
+})
 
 cases.push(['附件回归①：文字 + 图片 + 后续文字 → 卡片拿到全部三段文字（顺序不错、字也不丢）', () => {
   const row = fakeHostUserRow('13:input-messagee74d0783', '361', '15:12', [
@@ -1057,6 +1087,117 @@ cases.push(['附件回归④：一条气泡里多个 run（引用 chip 切开的
   const rows = surface.collectSecretaryCardRows(fakeHostDoc([fakeHostUserRow('13:input-message-multi-run', '365', '15:24', [bubble])]))
   assert.equal(rows[0].text, '前面 @[会话]后面', '同一条气泡里的片段必须拼回一段')
   assert.deepEqual(surface.buildUserCardBody(rows[0].runs).map((block) => block.type), ['para'], '不许因为 chip 生成第二段正文')
+}])
+
+/* ═════════ 2026-11-24「秘书执行任务期间用户插话」两个显示 bug（现场 DOM dump 取证）═════════
+ * 现场证据（scripts 的连接口径，真页 http://127.0.0.1:3081，落盘 .tmp/dom-dump-live3.txt、dom-dump-live4.txt）：
+ *   ① 插话行：data-chat-flow-kind="steering" / data-chat-flow-key="13:input-message08ae5714-…"
+ *     data-chat-node-key 同 key / data-chat-turn="390" / 行高 398px / hasCard=false（原生气泡冒了出来）
+ *   ② 漏出来的过程行（三种，都在 [data-slot="conversation.chat.flow"] 那一层里，跟卡片行是兄弟）：
+ *     · 过程分组行：class="_9YPp_G_root"、data-chat-group-key=["process","14:assistant-step390:1","reasoning"]
+ *       这种行本身没有 data-chat-flow-kind，行高 20px，文字就是「已读取文件」「已搜索代码，已读取文件，已调用工具」；
+ *     · 单条工具行：data-chat-flow-kind="tool-call" + data-turn-process-member="true"，行高 28px；
+ *     · 回合尾槽 [data-slot="conversation.chat.turnTail"]：同一个容器里既挂我们的 assistant 卡（kind=turn-tail 行），
+ *       也挂 dsh-mnemon 的「本回合记忆 / 召回 1」widget（截图那行「本回合记忆召回 1」），一压就连带把卡压没了。
+ */
+
+cases.push(['插话卡片化①：宿主执行中把用户插话挂成 kind="steering" 的行（现场 dump 的那个 kind）必须被收集器收成一条 user 卡行', () => {
+  const interrupt = fakeFlowRow('steering', '13:input-message08ae5714-059e-407d-8ae0-40df53983508', '390', '今天 17:22', [
+    fakeTextBubble('workbuddy 是桌面的软件程序'),
+  ])
+  const normal = fakeHostUserRow('13:input-message-normal-1', '391', '17:25', [fakeTextBubble('普通用户消息')])
+  const rows = surface.collectSecretaryCardRows(fakeHostDoc([interrupt, normal]))
+  assert.equal(rows.length, 2, '插话行与普通用户行都得收成卡行（现网漏的就是插话那条）')
+  const card = rows.find((row) => row.key === '13:input-message08ae5714-059e-407d-8ae0-40df53983508')
+  assert.ok(card !== undefined, 'steering 行必须有自己的卡片行')
+  assert.equal(card.kind, surface.CARD_KIND_USER, '插话是真实用户消息，必须是冷蓝用户卡（不是灰底通知卡、也不是只有气泡）')
+  assert.equal(card.text, 'workbuddy 是桌面的软件程序', '原话照搬进卡片，不改写')
+  assert.equal(card.turnNo, '390', '插话挂在进行中那一轮，轮次号必须带回来（卡片底行与朗读 key 都要用）')
+  assert.deepEqual(surface.collectSecretaryUserRows(fakeHostDoc([interrupt])).map((row) => row.key),
+    ['13:input-message08ae5714-059e-407d-8ae0-40df53983508'], '只取真实用户行的那条路径也要认 steering')
+}])
+
+cases.push(['插话卡片化②：steering 行走「文本 run + 附件」的同一套块口径（附件前后的文字一样不许丢）', () => {
+  const interrupt = fakeFlowRow('steering', '13:input-message-steer-att-1', '392', '17:31', [
+    fakeTextBubble('插话前面这段'),
+    fakeImageAttach('blob:http://127.0.0.1:3081/steer-img', '截图.png'),
+    fakeTextBubble('插话后面这段也不许丢'),
+  ])
+  const rows = surface.collectSecretaryCardRows(fakeHostDoc([interrupt]))
+  assert.equal(rows.length, 1, '带附件的插话行也要出卡片')
+  const body = surface.buildUserCardBody(rows[0].runs)
+  assert.deepEqual(body.map((block) => block.type), ['para', 'attachment', 'para'], '块顺序与真 user 行同一套')
+  assert.equal(body[1].attachment.name, '截图.png', '图片嵌在卡片内部')
+  assert.equal(surface.userCardAttachments(rows[0].runs).length, 1, '附件清单也要带回来')
+}])
+
+cases.push(['插话卡片化③：卡片必须接管 steering 行的原生气泡（CSS 那一套 :has 判据要给 steering 也写一份，带后代兜底）', () => {
+  const css = readFileSync(join(ROOT, 'src/client/pocket/orb/secretary-cards.css.ts'), 'utf8')
+  assert.match(css,
+    /\[data-chat-flow-kind="steering"\]:has\([^)]*\[data-dsh-scard="card"\]\[data-dsh-scard-kind="user"\][^)]*\)\s*>\s*\[data-slot="conversation\.chat\.node"\]/,
+    'steering 行挂了用户卡以后，宿主那条气泡必须 display:none（现场 dump 里它行高 398px 就是原生气泡）')
+  assert.ok((css.match(/\[data-chat-flow-kind="steering"\]/g) ?? []).length >= 2,
+    '直接子代判据与按后代兜底的判据都要有（React 把卡包进更深一层时不许漏）')
+}])
+
+cases.push(['插话卡片化④：扫描层（分页窗口/朗读 key）也要认出挂在 steering 行里的卡', () => {
+  const interrupt = fakeFlowRow('steering', '13:input-message-steer-1', '393', '17:33', [fakeTextBubble('插话的原话')])
+  const card = fakeEl('article', { 'data-dsh-scard': 'card', 'data-dsh-scard-kind': 'user', 'data-dsh-scard-key': 'user:13:input-message-steer-1', 'data-dsh-scard-turn': '393' }, [fakeEl('p', { 'data-dsh-scard': 'para' }, ['插话的原话'])])
+  interrupt.children[0].children.push(card)
+  card.parentElement = interrupt.children[0]
+  const scanned = surface.collectSecretaryCardElements({ querySelectorAll: () => [card] })
+  assert.equal(scanned.length, 1, '扫描层必须把这张插话卡算进去（分页窗口与朗读都靠它）')
+  assert.equal(scanned[0].text, '插话的原话', '卡的文本要从它挂着的那条 steering 行读回来，不许因为找不到行而变空')
+  assert.equal(scanned[0].timeText, '17:33', '底行时间也要从那条 steering 行的 [data-clock] 读回来（找不到行就是空 → RED）')
+}])
+
+cases.push(['过程行隐藏①：单条工具行（现场 dump 的 kind="tool-call"）与上下文行一律不出图', () => {
+  const css = readFileSync(join(ROOT, 'src/client/pocket/orb/secretary-cards.css.ts'), 'utf8')
+  assert.match(css,
+    /body\[data-dsh-secretary="1"\] \[data-chat-flow-kind="tool-call"\]/,
+    'dump 出来 display=block、行高 28px 的那一类就是 kind="tool-call"，必须补进隐藏列表')
+  assert.match(css,
+    /body\[data-dsh-secretary="1"\] \[data-chat-flow-kind="context"\]/,
+    '宿主 kind="context"（跨会话召回/上下文注入那类行）同样算过程行，秘书页一律不出图')
+}])
+
+cases.push(['过程行隐藏②：过程分组行（[data-chat-group-key]，截图那 3 行的第一行就是它的标题）压掉，但带卡的行不许顺手压掉', () => {
+  const css = readFileSync(join(ROOT, 'src/client/pocket/orb/secretary-cards.css.ts'), 'utf8')
+  assert.match(css,
+    /body\[data-dsh-secretary="1"\] \[data-chat-group-key\]:not\(:has\(\[data-dsh-scard\]\)\)/,
+    '现场 dump：分组行 class=_9YPp_G_root 带 data-chat-group-key、没有 data-chat-flow-kind，文字就是「已读取文件」「已搜索代码，已读取文件，已调用工具」')
+  assert.ok(css.includes(':not(:has([data-dsh-scard]))'),
+    '分组行与分组成员两条判据都要带 :not(:has([data-dsh-scard])) 兜底：卡片挂在哪一档都不许被顺手压没')
+}])
+
+cases.push(['过程行隐藏③：分组成员标记 data-turn-process-member 也压掉（现场 dump：tool-call 行都带 data-turn-process-member="true"，turn-tail 行一个都不带）', () => {
+  const css = readFileSync(join(ROOT, 'src/client/pocket/orb/secretary-cards.css.ts'), 'utf8')
+  assert.match(css,
+    /body\[data-dsh-secretary="1"\] \[data-turn-process-member\]:not\(:has\(\[data-dsh-scard\]\)\)/,
+    '宿主自己的分组成员标记是兜底判据（以后宿主换 kind 也照样压得住）')
+}])
+
+cases.push(['过程行隐藏④：回合尾那一档只压非卡子代——assistant 卡照旧挂着，dsh-mnemon「本回合记忆 召回 1」与 skill turn-tail 一律不出图', () => {
+  const css = readFileSync(join(ROOT, 'src/client/pocket/orb/secretary-cards.css.ts'), 'utf8')
+  assert.match(css,
+    /body\[data-dsh-secretary="1"\] \[data-slot="conversation\.chat\.turnTail"\] > :not\(\[data-dsh-scard\]\)/,
+    '现场 dump：assistant 卡与 mnemon/skill 的回合尾 widget 挂在同一个 [data-slot="conversation.chat.turnTail"] 里，只能压没带 data-dsh-scard 标记以外的子代')
+}])
+
+cases.push(['硬约束确认：折叠预算 3/2/10、首帧上限 162px、朗读 34px 与标识 32px、观感口径 900/600/200 一个都不许动', () => {
+  assert.equal(surface.FOLD_BODY_LINE_BUDGET, 3, '折叠态正文预算仍是 3 行')
+  assert.equal(surface.FOLD_TITLE_LINE_BUDGET, 2, '卡标题预算仍是 2 行')
+  assert.equal(surface.FOLD_BLOCK_GAP, 10, '块间距仍是 10')
+  const css = readFileSync(join(ROOT, 'src/client/pocket/orb/secretary-cards.css.ts'), 'utf8')
+  assert.ok(css.includes('max-height: var(--dsh-card-fold-cap, 162px)'), '折叠首帧上限 162px 不许换')
+  assert.equal(surface.foldCollapsedCapPx({ lineHeight: 26, titleLineHeight: 27, hasTitle: true, budget: 3, titleBudget: 2 }), 162, 'cap 算出来还是 162')
+  assert.ok(css.includes('height: 34px') && css.includes('width: 32px'), '朗读按钮 34px 与 32px 标识尺寸不许动')
+  assert.equal(cardShared.HISTORY_PREVIEW_MAX_CHARS, 900)
+  assert.equal(surface.QUOTE_PREVIEW_MAX_CHARS, 600)
+  // 新加的隐藏规则一律只作用于秘书页那一档，别的会话页面一个字都不动
+  const newHiddenLines = css.split('\n').filter((line) => /tool-call|data-chat-group-key|turn-process-member|turnTail|flow-kind="steering"/.test(line))
+  assert.ok(newHiddenLines.length >= 5, `新加的隐藏规则行数不够（现场 dump 的那几类都得覆盖）：${newHiddenLines.length}`)
+  assert.ok(newHiddenLines.every((line) => line.includes('body[data-dsh-secretary="1"]')), '每一条新隐藏规则都必须带 body[data-dsh-secretary="1"] 限定符')
 }])
 
 let failed = 0

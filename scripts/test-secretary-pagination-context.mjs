@@ -825,7 +825,22 @@ cases.push(['真会话 surface 折叠读回：宿主压缩 shadow 的旧轮不�
   // 秘书页卡片源（原始事件 → 卡片口径）在压缩后必须一张不丢
   const cardsBefore = shared.historyItemsFromEvents(realEvents).length
   const messageEvents = realEvents.filter((event) => ['assistant/message', 'user/message'].includes(String(event?.type ?? '')))
-  assert.ok(cardsBefore >= messageEvents.length * 0.9, '卡片取数不受 compaction 影响')
+  // 口径纠正（2026-11-24 现场实测）：原先的分母是「全部 assistant+user 事件」，但现网里 assistant 事件有一大块
+  // 是「只有工具调用、正文为空」的步（实测 464/886 条），同一轮内多步又塌成一张卡——这两类本来就不该出卡，
+  // 混进分母把比例压到 0.83、断言 0.9 就误判 FAIL。分母改按「本该出卡的事件」算：
+  // 带正文的 user/message 全数 + 带正文的 assistant/message 按轮次去重后的轮数。
+  const userCardableCount = messageEvents.filter((event) => event?.type === 'user/message' && shared.eventText(event) !== '').length
+  const assistantTurnsWithText = new Set()
+  for (const event of messageEvents) {
+    if (event?.type !== 'assistant/message') continue
+    if (shared.eventText(event) === '') continue
+    const turn = String(event?.data?.turn ?? '').trim()
+    if (turn === '') continue
+    assistantTurnsWithText.add(turn)
+  }
+  const shouldCardCount = userCardableCount + assistantTurnsWithText.size
+  log(`  卡片取数现场核对：message 事件 ${messageEvents.length} 条（其中空正文的 assistant 事件 ${messageEvents.filter((event) => event?.type === 'assistant/message' && shared.eventText(event) === '').length} 条、带正文 assistant 轮去重 ${assistantTurnsWithText.size} 轮），该出卡 ${shouldCardCount} 条 → 取回 ${cardsBefore} 张`)
+  assert.ok(cardsBefore >= shouldCardCount * 0.9, `卡片取数不受 compaction 影响（该出卡 ${shouldCardCount} 条、取回 ${cardsBefore} 张）`)
   const visibleMessages = realEvents.filter((event) => onSurface.has(Number(event?.seq)) && ['system/message', 'user/message', 'assistant/message'].includes(String(event?.type ?? '')))
   log(`  现网 surface 投影消息 ${visibleMessages.length} 条（shadow ${shadowedMessages.length} 条不进模型上下文，事件全部留在日志）`)
 }])

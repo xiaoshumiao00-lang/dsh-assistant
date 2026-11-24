@@ -1422,6 +1422,21 @@ try {
     quoteProbe.cards >= 1 && quoteProbe.buttonsWithoutCard === 0 && quoteProbe.collapsedRowsWithButton === 0
       && quoteProbe.cardsWithButton === quoteProbe.cards && quoteProbe.order.every((line) => line === 'quote,time,actions'),
     JSON.stringify({ cards: quoteProbe.cards, cardsWithButton: quoteProbe.cardsWithButton, buttons: quoteProbe.buttons, collapsedRowsWithButton: quoteProbe.collapsedRowsWithButton, order: quoteProbe.order }))
+  // 现场核对（不给断言添花活）：哪张完整卡没带引用按钮、它挂在哪个 kind 的宿主行上
+  const missingQuote = await page.evaluate(() => {
+    const cards = [...document.querySelectorAll('[data-dsh-scard="card"]:not([data-dsh-scard-expired="1"])')]
+    return cards.filter((el) => el.querySelector('[data-dsh-scard="quote"]') === null).map((el) => {
+      const hostRow = el.closest('[data-chat-flow-kind]') ?? el.closest('[data-chat-group-key]')
+      const foot = el.querySelector('[data-dsh-scard="foot"]')
+      return {
+        kind: el.getAttribute('data-dsh-scard-kind'), key: el.getAttribute('data-dsh-scard-key'), turn: el.getAttribute('data-dsh-scard-turn'),
+        hostKind: hostRow === null ? null : hostRow.getAttribute('data-chat-flow-kind'), hostKey: hostRow === null ? null : hostRow.getAttribute('data-chat-flow-key'),
+        footChildren: foot === null ? [] : [...foot.children].map((child) => child.getAttribute('data-dsh-scard') ?? ''),
+        text: String(el.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 36),
+      }
+    })
+  })
+  notes.push(`引用按钮现场：没有引用按钮的完整卡=${JSON.stringify(missingQuote)}`)
 
   check('读掉之后红点彻底消失（不留灰点、不淡出成长条）：最新卡已读、全页红点数=未读卡数',
     nowState.lastKey !== '' && nowState.lastUnread === '0' && nowState.lastDot === false && nowState.totalDots === nowState.unreadCardCount,
@@ -2157,6 +2172,131 @@ try {
   check('无未捕获异常', pageErrors.length === 0, JSON.stringify(pageErrors.slice(0, 3)))
   check('无（非既有噪声的）console error', consoleErrors.length === 0, JSON.stringify(consoleErrors.slice(0, 3)))
   check('没有意外的失败请求（只允许既有的项目探测 4xx）', failedRequests.length === 0, JSON.stringify(failedRequests.slice(0, 5)))
+
+  /* ── 2026-11-24 现场取证（放在最后跑，前面那些既有用例不许被它打扰）──
+   * 需求①：秘书正在跑任务时用户再插话，那条插话必须出用户卡，不给它留原生气泡。
+   * 现场 dump 里的语义 kind 是 steering（宿主 ChatView 那套判据：插话挂 steering、
+   * 排队挂 queued，两者用的是同一张节点视图），本批修的就是这一类行。
+   * 取证走页面自己的输入框：先起一条要跑起来的任务，等宿主出过程行，再把插话原话打进 composer 按 Enter。
+   * 现场本来就有的插话行先量、没有才合成，而且最多合成两回，别把会话灌进太多消息。
+   */
+  // 注入的样本话术带上脚本自己那套「（冒烟测试）」标记、也不带长英文词：
+  // 不带上标记，后面那些现场断言量到的正是窗口里第一张用户卡（它们要求正文带「冒烟测试」）就会被我这条取证卡顶掉；
+  // 带上长英文词（现场实测：'workbuddy' 这种不许换行的长词会让摘要那一行折成三行，把引用提示撑到 88px，
+  // 越过既有用例校准的 72px 上限），同样会打扰既有用例。
+  const INTERRUPT_TEXT = '（冒烟测试）跑任务途中插的那句话：桌面的软件程序这件事记一下'
+  const TASK_TEXT = '（冒烟测试）插话取证这一轮请调用网页检索查「武汉 后天 空气质量 预报」，查完再回答。'
+  const MEASURE_INTERRUPT_ROWS = () => page.evaluate((needle) => {
+    const isVisible = (el) => { let node = el; while (node && node !== document.body) { if (getComputedStyle(node).display === 'none') return false; node = node.parentElement } return node ? true : false }
+    const cs = (el) => (el === null ? null : getComputedStyle(el))
+    const rectOf = (el) => (el === null ? null : el.getBoundingClientRect())
+    return [...document.querySelectorAll('[data-chat-flow-kind="steering"], [data-chat-flow-kind="user"]')]
+      .filter((row) => String(row.innerText ?? '').includes(needle))
+      .map((row) => {
+        const card = row.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="user"], [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="user"]')
+        const head = card === null ? null : card.querySelector('[data-dsh-scard="head"]')
+        const foot = card === null ? null : card.querySelector('[data-dsh-scard="foot"]')
+        const bubble = row.querySelector('[data-slot="conversation.chat.node"]')
+        const speak = card === null ? null : card.querySelector('[data-dsh-speak="button"]')
+        const speakRect = rectOf(speak)
+        return {
+          flowKind: row.getAttribute('data-chat-flow-kind'), rowKey: row.getAttribute('data-chat-flow-key'), rowTurn: row.getAttribute('data-chat-turn'),
+          rowVisible: isVisible(row) && rectOf(row).height > 0, rowHeight: Math.round(rectOf(row)?.height ?? 0),
+          rowText: String(row.innerText ?? '').replace(/\s+/g, ' ').trim().slice(0, 44),
+          hasUserCard: card !== null, cardKind: card === null ? null : card.getAttribute('data-dsh-scard-kind'),
+          cardBg: card === null ? null : cs(card).backgroundColor, cardSurfaceVar: card === null ? null : cs(card).getPropertyValue('--dsh-card-surface').trim(),
+          nameText: head === null ? '' : head.querySelector('[data-dsh-scard="name"]')?.textContent?.trim() ?? '',
+          tagText: head === null ? '' : head.querySelector('[data-dsh-scard="tag"]')?.textContent?.trim() ?? '',
+          speakSize: speakRect === null ? 0 : Math.round(speakRect.height),
+          footTimeText: foot === null ? '' : foot.querySelector('[data-dsh-scard="time"]')?.textContent?.trim() ?? '',
+          footCopy: foot !== null && foot.querySelector('[data-dsh-scard="copy"]') !== null,
+          bubbleDisplay: bubble === null ? '(无气泡节点)' : cs(bubble).display, bubbleHeight: Math.round(rectOf(bubble)?.height ?? -1),
+          nativeRunText: row.querySelector('[data-slot="conversation.user.text.node"]')?.textContent?.trim().slice(0, 30) ?? '',
+        }
+      })
+  }, INTERRUPT_TEXT)
+  let interruptFacts = await MEASURE_INTERRUPT_ROWS()
+  if ((interruptFacts ?? []).length === 0) {
+    interruptFacts = null
+    for (let attempt = 0; attempt < 2 && interruptFacts === null; attempt += 1) {
+      await page.evaluate(async ({ id, body }) => {
+        try { await window.__dshPromptIntoSession(id, body) } catch { /* 投递失败由现场事实说明 */ }
+      }, { id: currentId, body: TASK_TEXT })
+      const running = await page.waitForFunction(() => document.querySelector('[data-chat-flow-kind="assistant-step"], [data-chat-flow-kind="tool-call"], [data-chat-group-key], [data-chat-flow-kind="turn-process"]') !== null, { timeout: 25000 })
+        .then(() => true).catch(() => false)
+      if (!running) { notes.push(`插话取证第 ${attempt + 1} 次：任务没跑起来（没等到过程行），跳过打字`); continue }
+      const editBox = await page.$('[contenteditable="true"], textarea')
+      if (editBox === null) { notes.push('插话取证：页面上找不到 composer，跳过打字取证'); break }
+      await editBox.click()
+      await page.keyboard.type(INTERRUPT_TEXT, { delay: 12 })
+      await page.keyboard.press('Enter')
+      const stayed = await page.evaluate((needle) => {
+        const el = document.querySelector('[contenteditable="true"], textarea')
+        return el !== null && String(el.innerText ?? el.value ?? '').includes(needle)
+      }, INTERRUPT_TEXT)
+      if (stayed) {
+        const sendButton = await page.$('button[title*="发送"], button[aria-label*="发送"], [data-dsh-send="button"]')
+        if (sendButton !== null) await sendButton.click().catch(() => {})
+      }
+      const appeared = await page.waitForFunction((needle) => {
+        const isVisible = (el) => { let node = el; while (node && node !== document.body) { if (getComputedStyle(node).display === 'none') return false; node = node.parentElement } return true }
+        return [...document.querySelectorAll('[data-chat-flow-kind="steering"], [data-chat-flow-kind="user"]')]
+          .some((el) => isVisible(el) && el.getBoundingClientRect().height > 0 && String(el.innerText ?? '').includes(needle))
+      }, INTERRUPT_TEXT, { timeout: 40000 }).then(() => true).catch(() => false)
+      if (!appeared) continue
+      // 等卡片真的接管那条插话行：挂载层有防抖，行刚出来那一瞬还没挂卡，量太早会把「没卡」当成结论
+      const carded = await page.waitForFunction((needle) => {
+        const rows = [...document.querySelectorAll('[data-chat-flow-kind="steering"], [data-chat-flow-kind="user"]')]
+          .filter((el) => String(el.innerText ?? '').includes(needle))
+        return rows.some((el) => el.querySelector('[data-dsh-scard="card"][data-dsh-scard-kind="user"], [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="user"]') !== null)
+      }, INTERRUPT_TEXT, { timeout: 20000 }).then(() => true).catch(() => false)
+      if (!carded) notes.push(`插话取证第 ${attempt + 1} 次：插话行出来了，但 20 秒内等不到卡片接管它`)
+      await page.waitForTimeout(1500)
+      interruptFacts = await MEASURE_INTERRUPT_ROWS()
+    }
+  }
+  const steeringFacts = (interruptFacts ?? []).filter((fact) => fact.flowKind === 'steering')
+  const allInterruptFacts = interruptFacts ?? []
+  const interruptFact = steeringFacts.length > 0 ? steeringFacts[steeringFacts.length - 1] : (allInterruptFacts.length > 0 ? allInterruptFacts[allInterruptFacts.length - 1] : null)
+  notes.push(`插话现场事实：${JSON.stringify({ 现场kind: allInterruptFacts.map((fact) => fact.flowKind), facts: interruptFacts })}`)
+  check('真页现场：秘书跑任务途中用户插话出用户卡（浅蓝卡 + 「你」+「用户消息」芯片 + 朗读 + 底行时间/复制），原生气泡不给它出图',
+    interruptFact !== null && interruptFact.rowVisible && interruptFact.hasUserCard
+    && interruptFact.cardKind === 'user'
+    && (interruptFact.cardBg === 'rgb(238, 244, 255)' || interruptFact.cardSurfaceVar === '#eef4ff')
+    && interruptFact.nameText === '你' && interruptFact.tagText === '用户消息'
+    && interruptFact.speakSize === 34 && interruptFact.footTimeText !== '' && interruptFact.footCopy
+    && interruptFact.bubbleDisplay === 'none',
+    JSON.stringify(interruptFact))
+
+  const leakFacts = await page.evaluate(() => {
+    const isVisible = (el) => { let node = el; while (node && node !== document.body) { if (getComputedStyle(node).display === 'none') return false; node = node.parentElement } return node ? true : false }
+    const PROCESS_KINDS = ['assistant-step', 'tool-call', 'turn-process', 'model-retry', 'turn-error', 'turn-max-tokens', 'compaction', 'manual-compaction', 'context', 'command']
+    const rows = [...document.querySelectorAll('[data-chat-flow-key]')]
+    const visible = rows.filter((el) => isVisible(el) && el.getBoundingClientRect().height > 0)
+    const describe = (el) => `${String(el.getAttribute('data-chat-flow-kind'))}|group=${el.getAttribute('data-chat-group-key')}|member=${el.getAttribute('data-turn-process-member')}|h=${Math.round(el.getBoundingClientRect().height)}|${String(el.innerText ?? '').replace(/\s+/g, ' ').trim().slice(0, 46)}`
+    const leakedRows = visible
+      .filter((el) => PROCESS_KINDS.includes(el.getAttribute('data-chat-flow-kind')) || el.hasAttribute('data-chat-group-key') || el.hasAttribute('data-turn-process-member'))
+      .filter((el) => el.querySelector('[data-dsh-scard]') === null)
+      .map(describe)
+    const tailExtras = [...document.querySelectorAll('[data-slot="conversation.chat.turnTail"]')]
+      .flatMap((container) => [...container.children])
+      .filter((child) => !child.hasAttribute('data-dsh-scard'))
+      .filter((el) => isVisible(el) && el.getBoundingClientRect().height > 0)
+      .map(describe)
+    const titleLeaks = visible
+      .filter((el) => el.querySelector('[data-dsh-scard]') === null)
+      .map((el) => String(el.innerText ?? '').replace(/\s+/g, ' ').trim())
+      .filter((text) => /^(已|正在|准备)(调用工具|读取文件|搜索代码|修改了文件|执行了命令|搜索网页|访问网页|协调子智能体|更新计划)|本回合记忆|本回合技能/.test(text))
+    const kindsSeen = [...new Set(rows.map((el) => el.getAttribute('data-chat-flow-kind')).filter((kind) => kind !== null))]
+    return { rowsTotal: rows.length, visibleTotal: visible.length, cardBackedVisible: visible.filter((el) => el.querySelector('[data-dsh-scard]') !== null).length, kindsSeen, leakedRows, tailExtras, titleLeaks }
+  })
+  notes.push(`过程行现场事实：${JSON.stringify(leakFacts)}`)
+  const leakCount = leakFacts.leakedRows.length + leakFacts.tailExtras.length + leakFacts.titleLeaks.length
+  check('真页现场：卡片之间过程行 0 条（已调用工具并搜索代码 / 已调用工具 / 本回合记忆召回 这类一律不出图）',
+    leakCount === 0,
+    `visible=${leakFacts.visibleTotal} cardBacked=${leakFacts.cardBackedVisible} kinds=${JSON.stringify(leakFacts.kindsSeen)} leaked=${JSON.stringify(leakFacts.leakedRows.slice(0, 6))} tailExtras=${JSON.stringify(leakFacts.tailExtras.slice(0, 4))} titleLeaks=${JSON.stringify(leakFacts.titleLeaks.slice(0, 4))}`)
+  await page.screenshot({ path: 'tmp-secretary-interrupt-card.png' })
+  notes.push('截图: tmp-secretary-interrupt-card.png（插话卡 + 过程行现场）')
 
   await page.evaluate(() => {
     try {

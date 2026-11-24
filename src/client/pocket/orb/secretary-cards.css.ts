@@ -49,6 +49,25 @@ body[data-dsh-secretary="1"] [data-dsh-scard-compact="hint"],
 body[data-dsh-secretary="1"] [data-chat-flow-kind]:has(> [data-slot="conversation.chat.node"] [data-compaction-icon]) {
   display: none !important;
 }
+/* 2026-11-24 现场 DOM dump（真页 http://127.0.0.1:3081，用户截图里那几行遗留过程消息）——补上漏掉的三类：
+ *  1) 工具调用那一类行：宿主语义标记给的是「工具调用」kind，现场行高 28px、还带分组成员标记属性；
+ *  2) 过程分组行：分组容器带分组 key 属性、自身没有对话流的语义 kind 属性（现场行高 20px，
+ *     文字就是「已读取文件」「已搜索代码，已读取文件，已调用工具」）——旧规则全按语义 kind 匹配，
+ *     这一类从来没有被压过，这就是截图里过程消息冒出来的直接原因；
+ *  3) 上下文行：宿主语义标记给的是「上下文」kind（跨会话召回、注入的上下文那一类），同样算过程行。
+ * 判据一律带「这一档里挂着我们的卡就不动它」的兜底，卡片不会被顺手压没。 */
+body[data-dsh-secretary="1"] [data-chat-flow-kind="tool-call"],
+body[data-dsh-secretary="1"] [data-chat-flow-kind="context"],
+body[data-dsh-secretary="1"] [data-chat-group-key]:not(:has([data-dsh-scard])),
+body[data-dsh-secretary="1"] [data-turn-process-member]:not(:has([data-dsh-scard])) {
+  display: none !important;
+}
+/* 回合尾那一档：秘书回复卡与回合尾原生小部件挂在同一个槽容器里（现场 dump 里两者都是它的直接子代），
+ * 所以整档不能一刀压掉——只压「没有卡片标记」的直接子代：记忆回合尾部件（截图那行「本回合记忆召回 1」，
+ * 来自 dsh-mnemon 插件）、技能回合尾部件、宿主自己的回合尾部件一律不出图，卡片与折叠行照旧出图。 */
+body[data-dsh-secretary="1"] [data-slot="conversation.chat.turnTail"] > :not([data-dsh-scard]) {
+  display: none !important;
+}
 /* 消息下方原生操作行（复制/赞/踩/分享/记忆/时间，宿主 MessageIconActions 根节点带 data-clock）：
  * 渲染层隐藏、不留行高；时间已在卡片底行里，不重复显示 */
 body[data-dsh-secretary="1"] [data-clock] {
@@ -74,6 +93,23 @@ body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has(> [data-dsh-scard=
  * 宿主气泡就冒回来（安卓那次截图里用户消息仍是原生气泡，桌面上同一条消息是卡片）。这条按后代再压一次，
  * 完整卡整条压掉（附件已嵌进卡片内部），折叠行那种仍带 :not(:has(img)) 例外——老消息的附件芯片照旧留着。 */
 body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has([data-dsh-scard="card"][data-dsh-scard-kind="user"], [data-dsh-scard="card"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"] { display: none !important; } body[data-dsh-secretary="1"] [data-chat-flow-kind="user"]:has([data-dsh-scard="collapsed-row"][data-dsh-scard-kind="user"], [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"]:not(:has(img)) {
+  display: none !important;
+}
+/* 2026-11-24 现场 DOM dump（用户实报「秘书跑任务途中插话没有以卡片形式展示」）：宿主把跑任务途中的插话
+ * 挂成语义 kind 为「steering」那一类行，宿主在渲染注册表里给这一类与真用户行注册的是**同一个**用户消息视图
+ * （同一套 userRow / bubble / 附件行），插件此前只收真用户行 → 插话那条从来没有卡片接管它，
+ * 原生气泡就自己冒出来了（现场行高 398px、hasCard=false）。判据与用户行同一套：直接子代 + 后代兜底两条都写，
+ * 完整卡整条压掉（附件嵌进卡片内部），折叠行那条保留 :not(:has(img)) 例外。 */
+body[data-dsh-secretary="1"] [data-chat-flow-kind="steering"]:has(> [data-dsh-scard="card"][data-dsh-scard-kind="user"], > [data-dsh-scard="card"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"] {
+  display: none !important;
+}
+body[data-dsh-secretary="1"] [data-chat-flow-kind="steering"]:has(> [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="user"], > [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"]:not(:has(img)) {
+  display: none !important;
+}
+body[data-dsh-secretary="1"] [data-chat-flow-kind="steering"]:has(> [data-dsh-scard="card"][data-dsh-scard-kind="user"], > [data-dsh-scard="card"][data-dsh-scard-kind="notice"], > [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="user"], > [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="notice"]) [data-slot="conversation.user.text.node"] > span:not([data-dsh-scard]) {
+  display: none !important;
+}
+body[data-dsh-secretary="1"] [data-chat-flow-kind="steering"]:has([data-dsh-scard="card"][data-dsh-scard-kind="user"], [data-dsh-scard="card"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"] { display: none !important; } body[data-dsh-secretary="1"] [data-chat-flow-kind="steering"]:has([data-dsh-scard="collapsed-row"][data-dsh-scard-kind="user"], [data-dsh-scard="collapsed-row"][data-dsh-scard-kind="notice"]) > [data-slot="conversation.chat.node"]:not(:has(img)) {
   display: none !important;
 }
 

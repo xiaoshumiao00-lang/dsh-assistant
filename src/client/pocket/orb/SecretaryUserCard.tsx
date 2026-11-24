@@ -11,7 +11,8 @@
  *   - 脚部那颗引用按钮（QuoteCardButton）三种卡都有，挂在时间左边。
  *
  * 挂载与取证：
- *   - 卡片内容来自宿主那条用户行本身：`[data-chat-flow-kind="user"]` →
+ *   - 卡片内容来自宿主那条用户行本身：`[data-chat-flow-kind="user"]` 与「跑任务途中插话」那一类
+ *     `[data-chat-flow-kind="steering"]`（2026-11-24 现场 dump 的两种 kind，共用 SECRETARY_USER_ROW_SELECTOR）→
  *     collectUserCardRuns 的块顺序（文本 run 与附件 run 按页面里的顺序，不是本插件自制的会话页）；
  *   - 卡片经 React portal 挂进宿主用户行，行里出现卡片后 CSS 把宿主气泡收起来
  *     （完整卡接管整条宿主行：气泡与原生附件芯片都不再出图，图片/文件嵌在卡片内部——2026-11-24 附件批次；
@@ -371,7 +372,7 @@ export function syncEarlierHint(doc: Document, visible: boolean): void {
 }
 
 /**
- * 挂载层（挂在 shell.overlay，整页常驻）：扫对话流里的 user 角色行，
+ * 挂载层（挂在 shell.overlay，整页常驻）：扫对话流里的 user 角色行（含 2026-11-24 补的「跑任务途中插话」那一类行），
  * 真实用户行 portal 一张冷蓝用户卡、合成通知行 portal 一张灰底通知卡；
  * 行被宿主重画、卡片被外间改动抹掉时靠 MutationObserver 自愈。
  *

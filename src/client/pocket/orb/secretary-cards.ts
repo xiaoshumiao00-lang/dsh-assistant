@@ -1062,16 +1062,35 @@ export interface SecretaryCardRow extends SecretaryUserRow {
 }
 
 /**
+ * 宿主对话流给「用户角色的行」打的语义 kind（现场 dump 2026-11-24，
+ * 见 scripts 冒烟同一套连接口径拿到的 .tmp/dom-dump-live3.txt / dom-dump-live4.txt）：
+ *   - `data-chat-flow-kind="user"`     —— 正常发送的用户消息（转写记录那一类）；
+ *   - `data-chat-flow-kind="steering"` —— **秘书正在跑任务时用户的插话**：宿主 ChatView 把
+ *     running 中的 steer 输入挂成 steering 节点（宿主 app.asar 里 `input.mode === "steer" ? "steering" : "queued"`，
+ *     并且 `conversation.chat.node` 的 key="user" 与 key="steering" 注册的是同一个 UserMessageNodeView，
+ *     内层 userRow/bubble/附件行完全同一套）。
+ * 卡片收集器与 CSS 必须共用这一份白名单：只有 user 的话，插话那条就变回原生气泡（本批 bug ①）。
+ */
+export const USER_FLOW_KIND_USER = 'user'
+export const USER_FLOW_KIND_STEERING = 'steering'
+export const SECRETARY_USER_FLOW_KINDS = [USER_FLOW_KIND_USER, USER_FLOW_KIND_STEERING]
+/** 收集器与 CSS 共用的行选择器（顺序无关，两个 kind 都要在里面）。 */
+export const SECRETARY_USER_ROW_SELECTOR = SECRETARY_USER_FLOW_KINDS
+  .map((kind) => `[data-chat-flow-kind="${kind}"]`)
+  .join(', ')
+
+/**
  * 收集秘书页对话流里**所有 user 角色的行**并分类：
- *   - 只认宿主稳定语义标记 `[data-chat-flow-kind="user"]`；
+ *   - 认宿主稳定语义标记 `[data-chat-flow-kind="user"]` 与 `[data-chat-flow-kind="steering"]`
+ *     （后者 = 跑任务途中的插话，卡片化判据与 user 行完全同一套）；
  *   - 合成通知（系统通知 / `[[session:]]` 引用行）标成 notice（灰底通知卡，带可点引用 chip）；
- *   - 真实用户消息标成 user（冷蓝用户卡）；
+ *   - 真实用户消息与插话标成 user（冷蓝用户卡）；
  *   - 文本按 `collectUserCardRuns` 的块顺序拼（附件前/后的文字都不丢），附件单独带回来；
  *   - 卡片自身挂在行上，不会把自己读回去（卡里没有 data-slot 与 data-message-attachments）。
  */
 export function collectSecretaryCardRows(doc: Document): SecretaryCardRow[] {
   const out: SecretaryCardRow[] = []
-  for (const row of doc.querySelectorAll('[data-chat-flow-kind="user"]')) {
+  for (const row of doc.querySelectorAll(SECRETARY_USER_ROW_SELECTOR)) {
     const key = row.getAttribute('data-chat-node-key') ?? row.getAttribute('data-chat-flow-key') ?? ''
     const turnNo = row.getAttribute('data-chat-turn') ?? ''
     const runs = collectUserCardRuns(row)
@@ -1109,7 +1128,7 @@ export function collectSecretaryCardElements(doc: Document): SecretaryScannedCar
     let text = ''
     let timeText = ''
     if (kind === CARD_KIND_USER || kind === CARD_KIND_NOTICE) {
-      const row = element.closest('[data-chat-flow-kind="user"]') ?? element
+      const row = element.closest(SECRETARY_USER_ROW_SELECTOR) ?? element
       text = userCardRunText(collectUserCardRuns(row))
       timeText = formatUserCardClock(row.querySelector('[data-clock]')?.textContent ?? '')
     } else {
@@ -2260,6 +2279,10 @@ export const secretaryCardsTestSurface = {
   formatUserCardClock,
   collectSecretaryUserRows,
   collectSecretaryCardRows,
+  SECRETARY_USER_ROW_SELECTOR,
+  SECRETARY_USER_FLOW_KINDS,
+  USER_FLOW_KIND_USER,
+  USER_FLOW_KIND_STEERING,
   collectSecretaryCardElements,
   collectUserCardRuns,
   userCardRunText,
