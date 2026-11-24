@@ -91,6 +91,44 @@ export function collectSecretaryCardRows(doc: Document): SecretaryCardRow[] {
 
 → 现场 dump 里 `kind="steering"` 的行 `hasCard=false`、行高 398/450px，宿主气泡（`DuJD4G_bubble`）照旧出图。
 
+### 那几行过程消息的真实 kind/part 值（现场 dump 实测）
+
+插话那条行现场实测到的属性（`.tmp\dom-dump-live5.txt`，逐字）：
+
+```text
+data-chat-flow-kind="steering"          ← 插话就是这个 kind，不是 "user"
+data-chat-node-key="13:input-message25a8362a-…"
+data-chat-flow-key="13:input-message25a8362a-…"
+data-chat-anchor-key="13:input-message25a8362a-…"
+data-chat-turn="410"
+data-chat-paging-anchor="true"
+data-chat-group-part 没有
+data-turn-process-member 没有（它不是过程成员）
+```
+
+现场实测三类过程行的 kind/part（`.tmp\dom-dump-live3.txt` / `dom-dump-live4.txt` / `red-smoke.txt`，逐字）：
+
+```text
+1) 分组标题行「已读取文件」「已搜索代码，已读取文件，已调用工具」「已调用工具并搜索代码」
+   class=_9YPp_G_root  data-chat-group-key=["process","14:assistant-step390:1","reasoning"]  data-chat-turn=390
+   → 这一类行没有 data-chat-flow-kind（现场扫描里 kind=null），h=20、hasCard=false、display=block
+   → 同一份 group-key 数组里第三个值就是 part 值 "reasoning"；早一批 CSS 只按 [data-chat-group-part="reasoning"]
+     压折叠档（css.ts 第 27 行），没压这种「只带分组 key、没有 kind」的标题行 → 本批新增 [data-chat-group-key]:not(:has([data-dsh-scard]))
+
+2) 工具行（截图里单独一行「已调用工具」）
+   data-chat-flow-kind="tool-call" + data-turn-process-member="true" + data-chat-anchor-key=9:tool-callcall_bf…
+   → 现场扫描 5 条 h=28 全在出图：HEAD 版既没有 tool-call 这一条 kind 规则，也没有按 data-turn-process-member 压
+
+3) 「本回合记忆」「召回 1」（现场实测 2 条，dom-dump-live4.txt 的 DUMP4 leaked 计数）
+   宿主 dsh-mnemon 挂在 kind="turn-tail" 那一行的 data-slot="conversation.chat.turnTail"（style="display: contents"）里
+   → 该槽容器里除秘书卡（data-dsh-scard="card"）外没有任何 kind 规则、也没有 :not([data-dsh-scard]) 兜底 → 现补第 68 行规则
+
+现场还实测到的 kind 全集：user、steering、assistant-step、turn-process、turn-tail、manual-compaction、tool-call（宿主注册另有 context）
+现场实测到的 part 值：data-chat-group-part="reasoning"、data-chat-group-part="response"（assistant-step 行）、tool-call 行没有 part
+```
+
+「正在调用工具 / 已调用工具 / 已搜索代码 / 已读取文件」这些字面文案是宿主对话流的 i18n 行，两条用「并」join、三条加「等」——**这条口径是日志/宿主推断，不是现场 dump 的一部分**：实测本仓库里没有 `src/i18n/locales/zh-CN.ts` 这条路径（Select-String 报路径不存在），插件源码里也没有那套 `data-chat-turn-process-title` 属性（grep 无命中），所以判据只按现场实测的 kind/part/属性写，宿主文案不进插件源码。
+
 ### 根因 ②：CSS 全按 kind 匹配，漏了 4 类过程行
 
 `src/client/pocket/orb/secretary-cards.css.ts`（HEAD 版）里只有：
