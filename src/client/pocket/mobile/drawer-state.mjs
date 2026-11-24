@@ -32,7 +32,7 @@ export const OFFICIAL_COLLAPSED_ATTR = 'data-sidebar-collapsed'
 export const FRAME_SELECTOR = '[data-mobile-nav="frame"]'
 
 /** 抽屉本体：被拉成离屏抽屉的侧栏列（frame 的第一个网格子元素）。 */
-export const DRAWER_SELECTOR = `${FRAME_SELECTOR} > :first-child`
+export const DRAWER_SELECTOR = `${FRAME_SELECTOR} > [class*="_sidebarCol"]`
 
 /** 开态完整选择器：JS 侧守卫（点抽屉外 / 点导航行）用它判断"抽屉是否开着"。 */
 export const DRAWER_OPEN_SELECTOR = `${FRAME_SELECTOR}[${DRAWER_MARKER_ATTR}="open"]`

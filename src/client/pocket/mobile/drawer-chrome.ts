@@ -150,7 +150,7 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
 
   /** 抽屉那一列（frame 的第一个网格子元素）：CSS 的 transform 过渡打在它身上。 */
   const drawerColumn = (): HTMLElement | null => {
-    const child = frame?.firstElementChild ?? null
+    const child = frame?.querySelector(':scope > [class*="_sidebarCol"]') ?? null
     return child === null ? null : (child as HTMLElement)
   }
 
@@ -275,7 +275,7 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
     /* 抽屉里的点击（导航行 / 会话行 / 抽屉页脚）先判：这条比 [aria-modal] 的全页
        querySelector 便宜得多，放前面。长会话详情有 ~2 万节点，整页扫描每次点击都要
        花掉几毫秒，正是抽屉开合时卡顿的组成部分。 */
-    if (target.closest(`[${DRAWER_MARKER_ATTR}="open"] > :first-child`) !== null) return
+    if (target.closest(`[${DRAWER_MARKER_ATTR}="open"] > [class*="_sidebarCol"]`) !== null) return
     /* A modal dialog (the host settings sheet, the export dialog) owns the
        screen while it is up: its scrim swallows the tap anyway, and sliding the
        drawer out from under it would leave the user back at the conversation

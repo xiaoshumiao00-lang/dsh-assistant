@@ -5,7 +5,7 @@
  * 抽屉本体：AppFrame 的第一个网格子元素，即被拉成抽屉的侧边栏列。
  * @type {string}
  */
-export const DRAWER_SELECTOR = '[data-mobile-nav="frame"] > :first-child'
+export const DRAWER_SELECTOR = '[data-mobile-nav="frame"] > [class*="_sidebarCol"]'
 
 /** 抽屉开关（会话头部那颗按钮）——点它不该被"点抽屉外就关"二次触发。 */
 export const TOGGLE_SELECTOR = '[data-mobile-nav="toggle"]'

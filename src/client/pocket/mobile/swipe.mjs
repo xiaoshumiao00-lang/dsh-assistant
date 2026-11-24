@@ -198,7 +198,7 @@ export function mountDrawerSwipe({
   isDrawerOpen,
   onOpen,
   onClose,
-  drawerSelector = '[data-mobile-nav="frame"] > :first-child',
+  drawerSelector = '[data-mobile-nav="frame"] > [class*="_sidebarCol"]',
   edgeZone = SWIPE_EDGE_ZONE,
   doc = globalThis.document,
   win = globalThis.window,

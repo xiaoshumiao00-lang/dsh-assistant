@@ -365,7 +365,7 @@ const NARROW_RULES = `
      网格被压缩成 [1fr, 0, 0] 后它会落在 0px 的第 2 轨，整个主界面被挤出
      视口（只剩背景图）。必须显式把它拉回第 1 轨（issue #5）。
      第 3 列（details）保持 0 轨即可，无需处理。 */
-  [data-mobile-nav="frame"] > :nth-child(2) {
+  [data-mobile-nav="frame"] > [class*="_centerCol"] {
     grid-column: 1 !important;
     grid-row: 1 !important;
     min-width: 0 !important;
@@ -394,7 +394,7 @@ const NARROW_RULES = `
      #67: that mask sat on top of the 600 drawer and ate every tap). Still
      far under the fixed-position banners/toasts (z 9999) that float at the
      viewport level. */
-  [data-mobile-nav="frame"] > :first-child {
+  [data-mobile-nav="frame"] > [class*="_sidebarCol"] {
     position: absolute !important;
     inset: 0 auto 0 0 !important;
     width: max-content !important;
@@ -422,13 +422,13 @@ const NARROW_RULES = `
      判据两条：CSS-modules 的稳定后缀 _toggle（哈希前缀每次构建都变，只匹配后缀），
      外加 aria-label 兜底（万一宿主换了 class 命名法）。两条都限定在抽屉那一列的
    logoRow（data-window-drag）里面，绝不碰会话列表行、也不碰输入框。 */
-  [data-mobile-nav="frame"] > :first-child [data-window-drag] button[class*="_toggle"] {
+  [data-mobile-nav="frame"] > [class*="_sidebarCol"] [data-window-drag] button[class*="_toggle"] {
     display: none !important;
   }
-  [data-mobile-nav="frame"] > :first-child [data-window-drag] button[aria-label="打开侧边栏"] {
+  [data-mobile-nav="frame"] > [class*="_sidebarCol"] [data-window-drag] button[aria-label="打开侧边栏"] {
     display: none !important;
   }
-  [data-mobile-nav="frame"] > :first-child [data-window-drag] button[aria-label="收起侧边栏"] {
+  [data-mobile-nav="frame"] > [class*="_sidebarCol"] [data-window-drag] button[aria-label="收起侧边栏"] {
     display: none !important;
   }
 
@@ -445,7 +445,7 @@ const NARROW_RULES = `
      overflow:hidden drawer to scrollLeft=102, and every static child (plus the
      fixed overlay) shifts 102px off-screen. With transform:none the overlay is
      viewport-anchored: it dims the full screen and the sheet sits at left:8. */
-  ${FRAME_SELECTOR}${OPEN} > :first-child {
+  ${FRAME_SELECTOR}${OPEN} > [class*="_sidebarCol"] {
     transform: none !important;
   }
 
@@ -1390,17 +1390,17 @@ export const MOBILE_CSS = [
   // 这里把抽屉里的按钮行统一压到 30 px、缩小图标与行内边距，把高度还给会话列表；
   // 只在 max-height:660px 生效，手机竖屏（≥700px 高）完全不受影响。
   `@media (max-height: 660px) and (max-width: 1023px) {
-    [data-mobile-nav="frame"] > :first-child button:not([class*="brand"]) {
+    [data-mobile-nav="frame"] > [class*="_sidebarCol"] button:not([class*="brand"]) {
       min-height: 0 !important;
       height: 30px !important;
       padding-top: 1px !important;
       padding-bottom: 1px !important;
     }
-    [data-mobile-nav="frame"] > :first-child button:not([class*="brand"]) svg {
+    [data-mobile-nav="frame"] > [class*="_sidebarCol"] button:not([class*="brand"]) svg {
       width: 15px !important;
       height: 15px !important;
     }
-    [data-mobile-nav="frame"] > :first-child [class*="sessionRow"] {
+    [data-mobile-nav="frame"] > [class*="_sidebarCol"] [class*="sessionRow"] {
       height: 28px !important;
       min-height: 0 !important;
     }
