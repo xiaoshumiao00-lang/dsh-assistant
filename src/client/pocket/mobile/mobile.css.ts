@@ -448,6 +448,18 @@ const NARROW_RULES = `
   ${FRAME_SELECTOR}${OPEN} > [class*="_sidebarCol"] {
     transform: none !important;
   }
+  /* DSH 0.2.2 新增的原厂抽屉遮罩 div.drawerMask：助手自己的抽屉关着时必须隐掉，官方规则
+     [data-sidebar-drawer]:not([data-sidebar-collapsed]) .drawerMask{opacity:1} 会一直用半透明底 + 模糊
+     盖住整页，表现为「刚打开很暗，点一下页面才正常」。 */
+  ${FRAME_SELECTOR}:not(${OPEN}) > [data-sidebar-mask] {
+    display: none !important;
+  }
+
+  /* 抽屉开着时保留原厂压暗层，但不让它响应点击：它的 onClick 是官方 toggleSidebar，
+     会把侧栏折成图标 rail；点外部关闭交给助手自己的 overlay。 */
+  ${FRAME_SELECTOR}${OPEN} > [data-sidebar-mask] {
+    pointer-events: none !important;
+  }
 
   /* --- Host portaled popups must outrank the open drawer (手机端「点左下角头像没反应」)
      The drawer foot holds the host account launcher (asar:
