@@ -1360,6 +1360,10 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
     };
 
     const headers = loopbackAuthority({ ...req.headers }, upstream);
+    // 0.2.2 起上游 dsh web 默认协商 permessage-deflate（101 回 Sec-WebSocket-Extensions）。
+    // 手机这条腿的压缩由本代理自己协商（下方 wsDeflateValue），上游这条腿必须保持明文：
+    // 否则 101 里会出现两个 Sec-WebSocket-Extensions，手机 WebView 判定协议错误立即断连。
+    delete headers['sec-websocket-extensions'];
     const proxyReq = httpRequest({
       // 同样清掉历史遗留的 dsh-desktop-* 参数（issue #75）
       host: upstream.host, port: upstream.port, method: req.method, path: stripDesktopMarkers(req.url), headers, agent: false,
@@ -1369,6 +1373,7 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
       // 原样回传上游的 upgrade 头（Sec-WebSocket-Accept 等）
       const raw = [];
       for (const [k, v] of Object.entries(proxyRes.headers)) {
+        if (k.toLowerCase() === 'sec-websocket-extensions') continue; // 丢弃上游 0.2.2 回的扩展头，只保留本代理追加的那个
         raw.push(`${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
       }
       // permessage-deflate（2026-10-25）：手机打开长会话详情时，dsh web 会把整段会话
