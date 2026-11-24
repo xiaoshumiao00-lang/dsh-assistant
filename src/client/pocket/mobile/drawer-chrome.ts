@@ -18,7 +18,7 @@ import {
   OFFICIAL_COLLAPSED_ATTR,
   writeDrawerPref,
 } from './drawer-state.mjs'
-import { isOverlayTap } from './nav-targets.mjs'
+import { isOverlayTap, navTargetFor } from './nav-targets.mjs'
 import { classifyToggleTap, isInToggleZone, mountDrawerSwipe, toggleHitZone } from './swipe.mjs'
 import { domGate, INTERACTION_PAUSE_MS } from '../../compositionGate.ts'
 
@@ -26,6 +26,12 @@ import { domGate, INTERACTION_PAUSE_MS } from '../../compositionGate.ts'
 export const FRAME_MARKER_ATTR = 'data-mobile-nav'
 /** The official overlay layer that hosts the backdrop / FAB / hamburger. */
 export const OVERLAY_SELECTOR = '[data-shell-overlay]'
+/**
+ * 抽屉右上角的收起按钮（我们自己的状态机）：点它只调 closeDrawer()，绝不调宿主
+ * toggleSidebar() —— 后者会把侧栏折成 48px 图标 rail，抽屉里就没有列表了。
+ * CSS/测试都只认这个属性，不认宿主每次构建都变的哈希类名。
+ */
+export const DRAWER_CLOSE_SELECTOR = '[data-mobile-nav="drawer-close"]'
 /** One-shot "layout was healed" toast, removed after HEAL_TOAST_MS. */
 export const HEAL_TOAST_ATTR = 'data-dshp-heal-toast'
 export const HEAL_TOAST_MS = 6000
@@ -54,12 +60,17 @@ const LOG_ICON =
   '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" focusable="false">' +
   '<path d="M8 2.5v7.2M4.9 6.9 8 10l3.1-3.1M3 12.5h10" stroke="currentColor" ' +
   'stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>'
+/** 抽屉右上角收起按钮的 ×（16×16，线宽 1.8，比汉堡略粗一档，缩到 40px 按钮里仍然清楚）。 */
+const CLOSE_ICON =
+  '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" focusable="false">' +
+  '<path d="M3.6 3.6l8.8 8.8M12.4 3.6l-8.8 8.8" stroke="currentColor" ' +
+  'stroke-width="1.8" stroke-linecap="round" fill="none"/></svg>'
 
 export interface DrawerChromeOptions {
   findFrame: () => HTMLElement | null
   /** Upgrade the official collapsed rail into the full menu (never downgrade). */
   expandSidebar?: () => void
-  labels: { menu: string; sessionLog: string }
+  labels: { menu: string; sessionLog: string; close?: string }
   onDownloadSessionLog?: () => void
   /** 一次开抽屉的打点：ms = 点击到「那一帧真的开始滑」；upgrade = 这次是否补做了宿主升级。 */
   onMeasure?: (info: { ms: number; upgrade: boolean; src?: string }) => void
@@ -83,6 +94,8 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
   let backdrop: HTMLElement | null = null
   let toggle: HTMLButtonElement | null = null
   let logButton: HTMLButtonElement | null = null
+  /** 抽屉右上角的收起按钮（挂在抽屉那一列里；关着时 display:none）。 */
+  let closeButton: HTMLButtonElement | null = null
   let retryTimer: ReturnType<typeof setTimeout> | null = null
   let tries = 0
   let disposed = false
@@ -145,6 +158,7 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
     // DOM means we must toggle visibility ourselves, or the whole page stays
     // dimmed while the drawer is closed.
     if (backdrop !== null) backdrop.style.display = open ? 'block' : 'none'
+    syncCloseButton()
     writeDrawerPref(open, storage)
   }
 
@@ -152,6 +166,92 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
   const drawerColumn = (): HTMLElement | null => {
     const child = frame?.querySelector(':scope > [class*="_sidebarCol"]') ?? null
     return child === null ? null : (child as HTMLElement)
+  }
+
+  /**
+   * 现在是不是真在走抽屉布局（宿主 <768px 的 drawer 模式，或设置页/三态开关强制抽屉）。
+   * 电脑布局下绝不往侧栏里塞收起按钮 —— 那会在 ≥1024 的宽屏侧栏里露出一个没头没脑的 ×。
+   */
+  const drawerModeActive = (): boolean => {
+    if (frame === null) return false
+    if (frame.hasAttribute('data-sidebar-drawer')) return true
+    const scope = doc.body?.getAttribute('data-dsh-pocket-layout') ?? ''
+    return scope === 'mobile'
+  }
+
+  /**
+   * 抽屉右上角的收起按钮。用户原话：「侧边栏右上角也没有收起按钮，不知道怎么把侧边栏收起来」
+   * —— 宿主 logoRow 里那颗官方 toggle 被我们的 CSS 藏掉了（它调的是 toggleSidebar，
+   * 会把侧栏折成图标 rail），所以这里给抽屉自己配一颗 ×，只调 closeDrawer()。
+   *
+   * 挂载点：抽屉那一列本身（不是 [data-shell-overlay] —— 那一层的规则会隐藏我们的控件）。
+   * 位置用绝对定位钉在抽屉右上角，上边距自己再加一遍环境安全区：抽屉列的 padding-box
+   * 从边框内侧算起，宿主的 padding-top: env(safe-area-inset-top) 不会带到绝对定位子元素。
+   */
+  const ensureCloseButton = (): void => {
+    const column = drawerColumn()
+    if (column === null || !drawerModeActive()) {
+      if (closeButton !== null) closeButton.style.display = 'none'
+      return
+    }
+    if (closeButton === null) {
+      const button = doc.createElement('button')
+      button.type = 'button'
+      button.setAttribute('data-mobile-nav', 'drawer-close')
+      button.setAttribute('aria-label', options.labels.close ?? '收起菜单')
+      button.innerHTML = CLOSE_ICON
+      button.style.cssText = [
+        'position:absolute',
+        'top:calc(env(safe-area-inset-top, 0px) + 8px)',
+        'right:8px',
+        'z-index:5',
+        'display:inline-flex',
+        'align-items:center',
+        'justify-content:center',
+        'width:40px',
+        'height:40px',
+        'padding:0',
+        'border:1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, .12))',
+        'border-radius:50%',
+        'background:var(--dsw-alias-button-floating-fill, #ffffff)',
+        'color:var(--dsw-alias-label-primary, inherit)',
+        'box-shadow:0 2px 10px rgba(0, 0, 0, .16)',
+        '-webkit-tap-highlight-color:transparent',
+        'cursor:pointer',
+      ].join(';')
+      /* 只认我们自己的状态机：宿主 toggleSidebar 会把侧栏折成 48px 图标 rail。 */
+      button.addEventListener('click', () => { closeDrawer() })
+      closeButton = button
+    }
+    if (closeButton.parentElement !== column) column.appendChild(closeButton)
+    closeButton.style.display = 'inline-flex'
+  }
+
+  /** 收起按钮跟着开态走；关着 / 不在抽屉布局时藏起来（电脑侧栏里不许露 ×）。 */
+  const syncCloseButton = (): void => {
+    if (!open) {
+      if (closeButton !== null) closeButton.style.display = 'none'
+      return
+    }
+    ensureCloseButton()
+  }
+
+  /**
+   * 抽屉**之外**是否有一个真模态框（宿主设置面板 / 导出面板 / 账号菜单里的对话框）。
+   * 抽屉自己的 `role="dialog" aria-modal="true"`（DSH 0.2.2 原厂侧栏）不算 ——
+   * 它是抽屉本体，把它当模态就会用"浮层掌屏"把每一次点空白都吃掉（本轮 bug）。
+   */
+  const modalOutsideDrawer = (drawerEl: HTMLElement | null): boolean => {
+    let modals: ArrayLike<Element>
+    try {
+      modals = doc.querySelectorAll('[aria-modal="true"]')
+    } catch {
+      return false
+    }
+    for (const modal of Array.from(modals)) {
+      if (drawerEl === null || !drawerEl.contains(modal)) return true
+    }
+    return false
   }
 
   /**
@@ -259,11 +359,29 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
     if (!open) return
     const target = event.target
     if (!(target instanceof Element)) return
+    /* 宿主重渲染可能把我们的按钮摘掉（侧栏子树归 React）：每次点按顺手补挂，
+       丢掉它等于用户又回到「不知道怎么收起」的状态。 */
+    if (closeButton !== null && !closeButton.isConnected) ensureCloseButton()
     if (backdrop !== null && target === backdrop) return
     /* 汉堡钮自己（含里面的 <svg>/<path> 图标）：只比引用相等会漏判图标 ——
        点开着的抽屉时，先按"点抽屉外"关掉、再被按钮的 click 重新打开，等于关不掉。
        所以这里用 contains，把图标子树一并豁免。 */
     if (toggle !== null && (target === toggle || toggle.contains(target))) return
+    /* 收起按钮自己（含里面的 <svg>/<path>）：它有自己的 click → closeDrawer，
+       这里不重复关一次（重复关是幂等的，但会让"点在抽屉里"这条判据先跑）。 */
+    if (closeButton !== null && (target === closeButton || closeButton.contains(target))) return
+    const drawerEl = drawerColumn()
+    /* 抽屉里的点击（导航行 / 会话行 / 抽屉页脚）先判，而且必须排在 isOverlayTap 前面：
+       DSH 0.2.2 的侧栏根节点本身就是 `role="dialog"`，落在它里面的每个点击都会被
+       `closest('[role="dialog"]')` 命中 —— 先判浮层豁免会把整个抽屉放过去。
+       这条也比 [aria-modal] 的全页 querySelector 便宜得多：长会话详情有 ~2 万节点，
+       整页扫描每次点击都要花掉几毫秒，正是抽屉开合时卡顿的组成部分。 */
+    if (drawerEl !== null && drawerEl.contains(target)) {
+      /* 抽屉内不在这里关：导航行用 click 关（让 React 先收到这次点击，见
+         onDocumentClick），行内 kebab 菜单不关（菜单弹出后抽屉一滑走，菜单随侧栏
+         卸载，点的第一下就白点了 —— issue #72）。 */
+      return
+    }
     /* Portaled popups (account menu / workspace menus / session kebab) are
        children of document.body, i.e. outside the drawer DOM. Without this
        exemption the first tap on a menu item closes the drawer — and the sheet
@@ -272,16 +390,35 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
        Issue #72's guard, re-armed here because the drawer chrome is plain DOM
        now, not the old MobileNavOverlay. */
     if (isOverlayTap(target)) return
-    /* 抽屉里的点击（导航行 / 会话行 / 抽屉页脚）先判：这条比 [aria-modal] 的全页
-       querySelector 便宜得多，放前面。长会话详情有 ~2 万节点，整页扫描每次点击都要
-       花掉几毫秒，正是抽屉开合时卡顿的组成部分。 */
-    if (target.closest(`[${DRAWER_MARKER_ATTR}="open"] > [class*="_sidebarCol"]`) !== null) return
     /* A modal dialog (the host settings sheet, the export dialog) owns the
        screen while it is up: its scrim swallows the tap anyway, and sliding the
        drawer out from under it would leave the user back at the conversation
        when they only meant to dismiss the sheet. Same guard the old
-       MobileNavOverlay carried. */
-    if (doc.querySelector('[aria-modal="true"]') !== null) return
+       MobileNavOverlay carried.
+       ⚠️ DSH 0.2.2 起，**抽屉自己就是**一个 aria-modal 对话框：宿主把侧栏根节点渲染成
+       `<div role="dialog" aria-modal="true" data-shortcut-modal="sidebar">`。旧判据
+       `document.querySelector('[aria-modal="true"]')` 因此对每一次"点抽屉外"都命中 →
+       直接 return，closeDrawer 永远不执行 = 手机上「点右侧空白抽屉不消失」（2026-11-25
+       用户报障的真根因，真机 elementFromPoint/监听探针已证）。
+       所以不能只看"存在哪个 aria-modal"，要看**抽屉之外**有没有：设置面板是 body 级
+       portal，跟侧栏同时在屏时 querySelector 第一个命中的往往还是侧栏自己。 */
+    if (modalOutsideDrawer(drawerEl)) return
+    closeDrawer()
+  }
+
+  /**
+   * 抽屉内点一下导航行（会话 / 新会话 / 文件入口…）就把屏幕让给它刚打开的内容。
+   * 用 click 而不是 pointerdown：按下时先把行的按压态 / 行内菜单手势留给宿主，
+   * 捕获阶段关抽屉不影响这次点击继续派发给 React（抽屉只是 transform 滑走，DOM 还在）。
+   * 行内 kebab 按钮不算导航（nav-targets.mjs 的 NAV_EXCLUDE），否则菜单一弹出抽屉就没了。
+   */
+  const onDocumentClick = (event: Event): void => {
+    if (!open) return
+    const target = event.target
+    if (!(target instanceof Element)) return
+    const drawerEl = drawerColumn()
+    if (drawerEl === null || !drawerEl.contains(target)) return
+    if (navTargetFor(target) === null) return
     closeDrawer()
   }
 
@@ -415,6 +552,8 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
       releaseOverlayWaiter()
       buildChrome(layer)
       armPreUpgrade()
+      /* 抽屉列是宿主 React 渲染的：壳层晚于抽屉挂上时，收起按钮在这里补一次。 */
+      syncCloseButton()
       return
     }
     armOverlayWaiter()
@@ -445,6 +584,7 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
 
   doc.addEventListener('keydown', onKeyDown)
   doc.addEventListener('pointerdown', onDocumentPointerDown, true)
+  doc.addEventListener('click', onDocumentClick, true)
   doc.addEventListener(downEvent, onZoneDown, true)
   doc.addEventListener(upEvent, onZoneUp, true)
   doc.addEventListener(cancelEvent, onZoneCancel, true)
@@ -465,12 +605,15 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
     stopSwipe?.()
     doc.removeEventListener('keydown', onKeyDown)
     doc.removeEventListener('pointerdown', onDocumentPointerDown, true)
+    doc.removeEventListener('click', onDocumentClick, true)
     doc.removeEventListener(downEvent, onZoneDown, true)
     doc.removeEventListener(upEvent, onZoneUp, true)
     doc.removeEventListener(cancelEvent, onZoneCancel, true)
     backdrop?.remove()
     toggle?.remove()
     logButton?.remove()
+    closeButton?.remove()
+    closeButton = null
     if (frame !== null) frame.removeAttribute(FRAME_MARKER_ATTR)
   }
 }

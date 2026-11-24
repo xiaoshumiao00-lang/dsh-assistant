@@ -317,6 +317,8 @@ export function mobileApply(ctx): void {
     labels: {
       menu: pocketTranslate(ctx, 'drawerMenuAria'),
       sessionLog: pocketTranslate(ctx, 'drawerSessionLogAria'),
+      /* 抽屉右上角那颗 × 的无障碍名字（mobileNav 'close' = 收起目录）。 */
+      close: navT('close'),
     },
     onDownloadSessionLog: () => {
       const sessionId = currentSessionId()
