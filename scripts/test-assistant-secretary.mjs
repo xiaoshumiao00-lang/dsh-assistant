@@ -700,6 +700,126 @@ cases.push(['简洁硬约束（2026-11-24）：300 字上限、3 到 5 句、最
   for (const old of ['原样转述']) assert.ok(!text.includes(old), `旧口径「${old}」不许回来`)
 }])
 
+// ── 2026-11-25 用户实报的「引用不生效」失效现场（取证见 D:\dsh-assistant\secretary-quote-miss-20261125.md）──
+// 现场判据不是「引用没登记」：模型那一轮的 prompt 里 1783 段是在的、内容也对（引用的就是那张卡）。
+// 真正的失效点是两点：① 引用段只贴在派活分层(1790)之前，离这条用户消息还有一大段派活规则；
+// ② 正文写的是「用户接下来那条消息」——未来时，模型这一轮手里已经握着这条消息，等于没被钉住。
+// 下面这条测试钉住修法：必须有一张贴在派活分层之后的硬锚点段，正文不许再用未来时口径。
+cases.push(['引用硬锚点段（复现 2026-11-25 失效现场）：贴在派活分层(1790)之后、正文点名被引用卡、不许把这条消息接到别的任务', async () => {
+  const anchorRoot = mkdtempSync(join(tmpdir(), 'assistant-secretary-quote-anchor-'))
+  const anchorServer = fakeServer()
+  const anchorSections = []
+  const anchorHooks = new Map()
+  const anchorCtx = {
+    webServer: anchorServer,
+    get(name) {
+      if (name === 'profileContext') return { dir: anchorRoot }
+      if (name === 'systemPrompt') return { section(definition) { anchorSections.push(definition); return () => {} } }
+      return undefined
+    },
+    on(name, fn) { anchorHooks.set(name, fn); return () => { if (anchorHooks.get(name) === fn) anchorHooks.delete(name) } },
+  }
+  const disposeAnchor = surface.registerAssistantSecretary(anchorCtx)
+  {
+    const res = fakeRes()
+    await anchorServer.exact.get(surface.ASSISTANT_SECRETARY_ROUTE).handler(fakeReq('POST', JSON.stringify({ sessionId: 'session-anchor-1' })), res)
+  }
+  const anchorQuoteRoute = anchorServer.exact.get(surface.ASSISTANT_SECRETARY_QUOTE_ROUTE)
+  assert.ok(anchorQuoteRoute, '没注册 /api/assistant/secretary-quote')
+  const callAnchorQuote = async (method, payload, urlSuffix = '') => {
+    const res = fakeRes()
+    const req = fakeReq(method, payload === undefined ? undefined : JSON.stringify(payload))
+    req.url = `${surface.ASSISTANT_SECRETARY_QUOTE_ROUTE}${urlSuffix}`
+    await anchorQuoteRoute.handler(req, res)
+    let json = null
+    try { json = JSON.parse(res.body) } catch { json = null }
+    return { status: res.status, json }
+  }
+  const anchorSessionEvent = anchorHooks.get('session/event')
+  const anchorPreStep = anchorHooks.get('agent/pre-step')
+  assert.equal(typeof anchorSessionEvent, 'function', '没注册 session/event')
+  assert.equal(typeof anchorPreStep, 'function', '没注册 agent/pre-step')
+  const session = { id: 'session-anchor-1' }
+  try {
+    // 引用卡现场原样：用户按引用的那张（584 轮的用户消息卡，正文就是那句「本地部署的大模型为什么执行任务时出现这个错误」）
+    const marked = await callAnchorQuote('POST', {
+      sessionId: 'session-anchor-1',
+      mark: 'quote',
+      cardKey: 'user:13:input-anchor',
+      kind: 'user',
+      turnNo: '584',
+      preview: '本地部署的大模型为什么执行任务时出现这个错误[图1:image.png]',
+      refSessionIds: [],
+    })
+    assert.equal(marked.status, 200, '引用要登记得上（这条测试的前提是登记成功）')
+
+    const quoteSection = anchorSections.find((item) => item.name === 'assistant:secretary-card-quote')
+    assert.ok(quoteSection, '既有引用登记段（1783）被拆掉了')
+    assert.equal(quoteSection.order, 1783, '既有 1783 的位置口径原样保留（这条修法不许动既有段）')
+
+    // ① 必须有贴在这条用户消息之前的硬锚点段：排在派活分层(1790)之后
+    const anchorSection = anchorSections.find((item) => item.name === 'assistant:secretary-card-quote-anchor')
+    assert.ok(anchorSection, '没注册 assistant:secretary-card-quote-anchor 段——引用只贴在派活分层之前，模型这一轮没被钉住，这就是用户报的失效现场')
+    assert.equal(anchorSection.order, surface.SECRETARY_QUOTE_ANCHOR_SECTION_ORDER, '锚点段位置要有导出常量')
+    assert.ok(anchorSection.order > 1790, `锚点段必须排在派活分层(1790)之后、贴近这条用户消息，实际 ${anchorSection.order}`)
+    assert.ok(anchorSection.order < 1900, `锚点段不许跑到宿主自己的段之后，实际 ${anchorSection.order}`)
+    assert.ok(anchorSection.order > quoteSection.order, '锚点段必须比引用登记段更靠近这条用户消息')
+
+    // ② 锚点正文必须点名被引用的那张卡（现场原样：cardKey + kind + 轮次 + 摘录内容）
+    const anchorText = anchorSection.text({ agent: { session } })
+    assert.ok(anchorText !== '', '本会话这条引用活着时锚点段必须有字')
+    assert.ok(anchorText.includes('user:13:input-anchor'), '锚点必须带卡片定位 cardKey')
+    assert.ok(anchorText.includes('kind=user') && anchorText.includes('轮次 584'), '锚点要写清 kind 与轮次')
+    assert.ok(anchorText.includes('本地部署的大模型为什么执行任务时出现这个错误'), '锚点要带上被引用卡的正文，不许只留个空壳定位')
+    assert.ok(anchorText.includes('用户消息卡'), '锚点也要有 kind 的中文标签')
+
+    // ③ 措辞必须是不许改口的硬要求：这条消息里的指代一律钉在这张卡上，不许改接到别的任务
+    assert.match(anchorText, /一律[^。]*这张卡|这张卡[^。]*一律/, '锚点必须把这条消息里的指代钉到这张卡')
+    assert.match(anchorText, /先回答[^。]*这张卡|先接[^。]*这张卡/, '锚点必须要求先回答被引用的这张卡')
+    assert.match(anchorText, /不许把这条消息接到最近那条派活|不许把这条消息接到最近那条系统通知|不许把这条消息接到别的任务/, '锚点必须禁止把这条消息接到最近那条派活/通知/别的任务')
+    assert.match(anchorText, /不许因为摘录短/, '锚点必须保住「摘录短不许吞掉用户要求」这条既有口径')
+    assert.match(anchorText, /不改变任何派活与工具规则|不改变派活与工具规则/, '锚点必须照旧说明引用不改派活与工具规则')
+
+    // ④ 既有登记段不许再用未来时口径（现场正文是「用户接下来那条消息」，模型这一轮已经握着这条消息）
+    const injected = quoteSection.text({ agent: { session } })
+    assert.ok(!injected.includes('接下来那条消息'), '引用登记段不许再写「用户接下来那条消息」（未来时口径就是模型没接上的原因之一）')
+    assert.ok(injected.includes('这条消息'), '引用登记段必须把话说成本轮这条消息')
+    assert.ok(injected.includes('引用登记只说明') && injected.includes('不是完整汇报'), '既有口径一个字都不许丢')
+    assert.ok(injected.includes('kind=user') && injected.includes('轮次 584') && injected.includes('user:13:input-anchor'), '既有定位口径不许丢')
+
+    // ⑤ 锚点段只喂这一条会话：别会话、没有会话 id 的都不许沾
+    assert.equal(anchorSection.text({ agent: { session: { id: 'session-other-4' } } }), '', '别的会话不许沾到这条引用锚点')
+    assert.equal(anchorSection.text({ agent: { session: { id: '' } } }), '', '没有会话 id 时锚点段必须空')
+    assert.equal(anchorSection.text({ agent: { session } }), anchorText)
+
+    // ⑥ 纯函数口径（旧代码没这段，逐条断言）
+    assert.equal(surface.secretaryQuoteAnchorText(null), '', '没有引用时锚点正文必须是空串')
+    const pureAnchor = surface.secretaryQuoteAnchorText({ cardKey: 'notice:14:msg-cu-01', kind: 'notice', turnNo: '', preview: '结论：改了三处。', refSessionIds: ['session-cu-1'] })
+    assert.ok(pureAnchor.includes('kind=notice') && pureAnchor.includes('轮次 未知') && pureAnchor.includes('系统通知卡'), '没有轮次的通知卡要说清轮次未知、种类有中文标签')
+    assert.ok(pureAnchor.includes('notice:14:msg-cu-01') && pureAnchor.includes('结论：改了三处。'), '锚点纯函数要带定位与被引用正文')
+
+    // ⑦ 吃掉一轮就收：真实用户消息那轮 turn/end 之后，登记段与锚点段一起收掉
+    await anchorPreStep({ agent: { session }, messages: [{ id: 'user-message-anchor-1', text: '这个任务完成了吗？' }] }, async () => null)
+    anchorSessionEvent(session, { type: 'turn/end' })
+    const afterConsumed = await callAnchorQuote('GET', undefined, '?sessionId=session-anchor-1')
+    assert.equal(afterConsumed.json.quote, null, '引用只能被一条真实用户消息吃掉')
+    assert.equal(anchorSection.text({ agent: { session } }), '', '吃掉一轮以后锚点段也要收掉（不许留着误导下一轮）')
+    assert.equal(quoteSection.text({ agent: { session } }), '', '吃掉一轮以后登记段也要收掉')
+  } finally {
+    try { disposeAnchor() } catch {}
+    rmSync(anchorRoot, { recursive: true, force: true })
+  }
+}])
+
+cases.push(['引用锚点段与既有段互不干扰：语音输入(1785)、派活分层(1790)、朗读规范(1780)位置原样不动', () => {
+  assert.equal(surface.SECRETARY_QUOTE_SECTION_ORDER, 1783, '既有引用登记段位置不许动')
+  assert.equal(surface.SECRETARY_SPEECH_STYLE_TEXT.includes('# 输出与朗读'), true, '朗读段还在')
+  assert.equal(surface.SECRETARY_VOICE_INPUT_TEXT.includes('# 语音输入'), true, '语音段还在')
+  assert.ok(typeof surface.SECRETARY_QUOTE_ANCHOR_SECTION_ORDER === 'number', '锚点段位置常量要导出（判据：贴在派活分层之后）')
+  assert.ok(surface.SECRETARY_QUOTE_ANCHOR_SECTION_ORDER > 1790 && surface.SECRETARY_QUOTE_ANCHOR_SECTION_ORDER < 1900, `锚点段必须排在派活分层(1790)之后，实际 ${surface.SECRETARY_QUOTE_ANCHOR_SECTION_ORDER}`)
+  assert.ok(surface.SECRETARY_QUOTE_ANCHOR_SECTION_ORDER > surface.SECRETARY_QUOTE_SECTION_ORDER, '锚点段要比引用登记段更靠近这条用户消息')
+}])
+
 let failed = 0
 for (const [name, fn] of cases) {
   try {

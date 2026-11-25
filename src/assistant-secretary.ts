@@ -311,6 +311,14 @@ export const QUOTE_PREVIEW_MAX_CHARS = 600
 export const QUOTE_CARD_KINDS = ['assistant', 'user', 'notice'] as const
 /** 引用注入段的段落号（1785 语音输入段、1790 派活分层段之间；不并入任何既有段落）。 */
 export const SECRETARY_QUOTE_SECTION_ORDER = 1783
+/**
+ * 引用硬锚点段的段落号（2026-11-25 用户实报「引用不生效」的修法）：
+ * 失效现场判据不是「引用没登记」——模型那一轮 prompt 里 1783 段是在的、内容也对，
+ * 但它贴在派活分层(1790)之前，离这条用户消息还隔着一大段派活规则，且正文写的是
+ * 「用户接下来那条消息」（未来时），模型这一轮手里已经握着这条消息，等于没被钉住。
+ * 所以加一张贴在派活分层(1790)之后、最靠近这条用户消息的硬锚点段：既有 1783 段原样保留。
+ */
+export const SECRETARY_QUOTE_ANCHOR_SECTION_ORDER = 1791
 
 export interface SecretaryQuoteRecord {
   cardKey: string
@@ -388,14 +396,31 @@ export function secretaryQuoteInjectionText(record: SecretaryQuoteRecord | null)
   const kindLabel = QUOTE_KIND_LABELS[record.kind] ?? '卡片'
   const lines = [
     '# 卡片引用（个人秘书）',
-    `用户刚在会话页上按了「引用」，引用的就是下面这张${kindLabel}；用户接下来那条消息就是要接着它说的内容。`,
+    `用户刚在会话页上按了「引用」，引用的就是下面这张${kindLabel}；用户这条消息就是要接着它说的内容。`,
     `定位：kind=${record.kind}｜轮次 ${record.turnNo === '' ? '未知' : record.turnNo}｜cardKey=${record.cardKey}`,
     `卡片正文摘录（不是完整汇报，只用来定位引用的是哪段话）：${record.preview}`,
   ]
   if (record.refSessionIds.length > 0) {
     lines.push(`这张卡里引用的会话 id：${record.refSessionIds.join('、')}——接着这件事要继续，就用 secretary_dispatch kind=existing 落到那条会话所在的项目目录。`)
   }
-  lines.push('处理要求：把用户这条消息当作对这张卡的回应；不许因为摘录短就把用户那条消息里的要求吞掉，也不许把这张卡的原有内容改写成别的说法。引用登记只说明「接着哪张卡说」，不改变任何派活与工具规则。')
+  lines.push('处理要求：把用户这条消息当作对这张卡的回应；不许因为摘录短就把用户这条消息里的要求吞掉，也不许把这张卡的原有内容改写成别的说法。引用登记只说明「接着哪张卡说」，不改变任何派活与工具规则。')
+  return lines.join('\n')
+}
+
+/**
+ * 引用硬锚点段正文（纯函数，测试逐条断言；2026-11-25 用户实报「引用不生效」的修法）。
+ * 与 1783 登记段分工：登记段说「引用的是哪张卡」，锚点段贴在这条用户消息之前，
+ * 用不许改口的硬要求把这条消息里的指代钉在这张卡上——先回答这张卡，不许接到别的任务。
+ */
+export function secretaryQuoteAnchorText(record: SecretaryQuoteRecord | null): string {
+  if (record === null) return ''
+  const kindLabel = QUOTE_KIND_LABELS[record.kind] ?? '卡片'
+  const lines = [
+    '# 引用锚点（个人秘书）',
+    `这条用户消息引用的就是这张${kindLabel}：cardKey=${record.cardKey}｜kind=${record.kind}｜轮次 ${record.turnNo === '' ? '未知' : record.turnNo}。`,
+    `被引用卡正文：${record.preview}`,
+    '处理要求：这条消息里的指代（这个、那张、它、这条任务）一律指向这张卡；先回答这张卡接着的那件事，不许把这条消息接到最近那条派活、最近那条系统通知或别的任务上；不许因为摘录短就吞掉这条消息里的要求。引用锚点只说明「接着哪张卡说」，不改变任何派活与工具规则。',
+  ]
   return lines.join('\n')
 }
 
@@ -899,6 +924,34 @@ export function registerAssistantSecretary(ctx: any): () => void {
     offQuoteSection = undefined
   }
 
+  // 引用硬锚点段（2026-11-25 修法）：与 1783 登记段同一条引用、同一道门（只喂固定秘书会话、
+  // 过期即清、真实用户消息那轮 turn/end 一起收掉），但贴在派活分层(1790)之后——
+  // 最靠近这条用户消息，用硬要求把指代钉在被引用的那张卡上。
+  let offQuoteAnchorSection: (() => void) | undefined
+  try {
+    const systemPrompt = (typeof ctx?.get === 'function' ? ctx?.get('systemPrompt') : undefined) ?? ctx?.systemPrompt
+    if (systemPrompt && typeof systemPrompt.section === 'function') {
+      offQuoteAnchorSection = systemPrompt.section({
+        name: 'assistant:secretary-card-quote-anchor',
+        order: SECRETARY_QUOTE_ANCHOR_SECTION_ORDER, // 派活分层(1790)之后，最靠近这条用户消息
+        text: (context: any) => {
+          const sessionId = String(context?.agent?.session?.id ?? '')
+          if (sessionId === '' || sessionId !== activeSessionId) return ''
+          const record = quoteState[sessionId]
+          if (record === undefined) return ''
+          if (!quoteAlive(record)) {
+            delete quoteState[sessionId]
+            void persistQuoteState().catch(() => void 0)
+            return ''
+          }
+          return secretaryQuoteAnchorText(record)
+        },
+      })
+    }
+  } catch {
+    offQuoteAnchorSection = undefined
+  }
+
   return () => {
     try { offToolGate?.() } catch {}
     try { offNoticeReset?.() } catch {}
@@ -906,6 +959,7 @@ export function registerAssistantSecretary(ctx: any): () => void {
     try { if (typeof offSpeechStyle === 'function') offSpeechStyle() } catch {}
     try { if (typeof offVoiceInput === 'function') offVoiceInput() } catch {}
     try { if (typeof offQuoteSection === 'function') offQuoteSection() } catch {}
+    try { if (typeof offQuoteAnchorSection === 'function') offQuoteAnchorSection() } catch {}
     try { routes.dispose() } catch {}
   }
 }
@@ -1151,6 +1205,7 @@ export const assistantSecretaryTestSurface = {
   parseSecretaryRequestQuery,
   ASSISTANT_SECRETARY_QUOTE_ROUTE,
   SECRETARY_QUOTE_SECTION_ORDER,
+  SECRETARY_QUOTE_ANCHOR_SECTION_ORDER,
   QUOTE_TTL_MS,
   QUOTE_PREVIEW_MAX_CHARS,
   normalizeQuoteCardKey,
@@ -1159,4 +1214,5 @@ export const assistantSecretaryTestSurface = {
   quoteAlive,
   normalizeSecretaryQuoteState,
   secretaryQuoteInjectionText,
+  secretaryQuoteAnchorText,
 }
