@@ -1980,9 +1980,11 @@ export function clearSecretaryCompactHintRows(doc: Document): number {
  *   ① 锚点：按文档顺序取**最后一条** `[data-chat-flow-kind]` 是 user / steering 的宿主行
  *      （插话那一类与真用户行是同一个用户消息视图，见 6127e8e 那批；两类都算「用户这一条」）；
  *   ② 范围：锚点之后（文档顺序）且 `data-chat-turn` 等于锚点那一轮（锚点没有轮次号时按「其后所有」兜底）
- *      的过程行：tool-call / context / turn-process / model-retry / turn-error / turn-max-tokens，
+ *      的过程行：tool-call / context / model-retry / turn-error / turn-max-tokens，
  *      外加带 `data-chat-group-key` 的分组容器与带 `data-turn-process-member` 的分组成员；
  *      分组里 `data-chat-group-part="reasoning"` 的那种「已搜索代码，已读取文件」也放行；
+ *      （2026-11-25 起 turn-process 不再放行：那行只在轮次关闭后才渲染，就是用户要隐藏的
+ *      「已完成，用时 N 秒」完成行；进行态根本没有这行，放行名单动不到执行过程。）
  *   ③ 不标：`assistant-step` 且没有 reasoning 分组标记的行 —— 那是**回复正文**（现场 dump 实测行高
  *      1038px 的整段回答），卡片已经展示同一段文字，再露出来就是重复；manual-compaction 与回合尾部件
  *      （本回合记忆/技能）也不标，它们是上下文管理，不是任务执行；
@@ -1994,8 +1996,16 @@ export function clearSecretaryCompactHintRows(doc: Document): number {
  * 视觉套件可以直接把它注入页面里跑真实逻辑（见 scripts/test-secretary-card-visual.mjs）。
  */
 export const PROCESS_VISIBLE_ATTRIBUTE = 'data-dsh-process-visible'
-/** 放行的过程行 kind（不含 assistant-step：那一类要按 reasoning 分组标记单独判）。 */
-export const PROCESS_VISIBLE_KINDS: readonly string[] = ['tool-call', 'context', 'turn-process', 'model-retry', 'turn-error', 'turn-max-tokens']
+/**
+ * 放行的过程行 kind（不含 assistant-step：那一类要按 reasoning 分组标记单独判）。
+ * 2026-11-25 用户原话：「个人秘书页，如果是已经完成了，这行提示就不要留着了，隐藏掉；
+ * 如果是正常执行中的要保留执行过程。」—— turn-process 移出放行名单：
+ * 那行「已完成，用时 N 秒 ⌄」是宿主 TurnProcessNodeView 的 kind="turn-process" 行，
+ * 宿主只在轮次关闭（closed）后才渲染它（进行中 TurnProcessNodeView 返回 null，这行根本不存在），
+ * 进行态的「深度求索中，用时 N 秒 ···」是另一条 [data-chat-running]（RunningStatus），不在本名单也不受影响。
+ * 所以从名单去掉它 = 完成行回到 CSS 隐藏规则、进行态一个像素都不变。
+ */
+export const PROCESS_VISIBLE_KINDS: readonly string[] = ['tool-call', 'context', 'model-retry', 'turn-error', 'turn-max-tokens']
 
 export interface LatestTurnProcessTagResult {
   /** 这一次打标的行数。 */

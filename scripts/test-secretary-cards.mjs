@@ -691,16 +691,19 @@ cases.push(['最新一轮过程行可见（第 5 项）：标记跟着最后一�
   rows.push(makeNode({ 'data-chat-turn': '13', 'data-chat-flow-kind': 'assistant-step' }))
   const second = surface.tagLatestTurnProcessRows(doc)
   assert.equal(second.turnNo, '13')
-  assert.equal(second.marked, 2, '新一轮的两条过程行都标上')
+  assert.equal(second.marked, 1, '新一轮只标 tool-call 那一条过程行')
   assert.equal(rows[8].hasAttribute('data-dsh-process-visible'), false, '上一轮（12）的标记必须收回')
   assert.equal(rows[10].hasAttribute('data-dsh-process-visible'), true)
-  assert.equal(rows[11].hasAttribute('data-dsh-process-visible'), true)
+  // 2026-11-25 用户原话「已经完成了，这行提示就不要留着了」：turn-process 移出放行名单——
+  // 宿主只在轮次关闭后才渲染这行（「已完成，用时 N 秒」），进行态根本没有它，不标 = 完成行回隐藏
+  assert.equal(rows[11].hasAttribute('data-dsh-process-visible'), false, 'turn-process（已完成行）永不打标——完成态隐藏、进行态本来就没这行')
+  assert.equal(surface.PROCESS_VISIBLE_KINDS.includes('turn-process'), false, '放行名单里不许再有 turn-process')
   assert.equal(rows[12].hasAttribute('data-dsh-process-visible'), false, 'assistant-step（回复正文）永远不标——卡片已经展示同一段文字')
 
   // 没有任何用户行 → 一个都不标；清标记接口可用
   const emptyDoc = { querySelectorAll: () => [makeNode({ 'data-chat-flow-kind': 'tool-call' })] }
   assert.equal(surface.tagLatestTurnProcessRows(emptyDoc).marked, 0)
-  assert.equal(surface.clearLatestTurnProcessTags(doc) >= 2, true, '离开秘书页要能把自己的标记全清掉')
+  assert.equal(surface.clearLatestTurnProcessTags(doc) >= 1, true, '离开秘书页要能把自己的标记全清掉（2026-11-25 起 turn-process 不打标，标记数随放行名单收窄）')
   assert.equal(rows.filter((row) => row.hasAttribute('data-dsh-process-visible')).length, 0)
   assert.equal(surface.PROCESS_VISIBLE_ATTRIBUTE, 'data-dsh-process-visible')
 }])

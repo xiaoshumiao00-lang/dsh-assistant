@@ -83,10 +83,24 @@ body[data-dsh-secretary="1"] [data-dsh-speak="wrap"][data-empty="1"] {
  * tagLatestTurnProcessRows）只给**最后一条 user/steering 行那一轮**的过程行打 data-dsh-process-visible="1"，
  * 这里把打了标的放出来。判据与卡种无关、与轮次号无关，标记跟着最新一条用户消息移动，
  * 新消息一来上一轮立刻回到上面那些隐藏规则里。用 revert 回到宿主/UA 自己的 display（分组容器与
- * 成员行原本就不是同一种 display），不硬写 block。只在秘书页生效。 */
+ * 成员行原本就不是同一种 display），不硬写 block。只在秘书页生效。
+ * 2026-11-25 起 turn-process（「已完成，用时 N 秒」完成行）不再打标，打了标的也被下面那条
+ * 专门的 turn-process 规则压回去——完成行一律不出图，进行态不受影响。 */
 body[data-dsh-secretary="1"] [data-dsh-process-visible="1"],
 body[data-dsh-secretary="1"] [data-dsh-process-visible="1"]:not([data-dsh-scard]) {
   display: revert !important;
+}
+/* 2026-11-25 用户原话：「个人秘书页，如果是已经完成了，这行提示就不要留着了，隐藏掉；
+ * 如果是正常执行中的要保留执行过程。」红框那行「已完成，用时 N 秒 ⌄」是宿主
+ * TurnProcessNodeView 的 kind="turn-process" 行——宿主只在轮次关闭（closed）后才渲染它
+ * （进行中它返回 null，这行根本不存在），所以「这行存在」本身就是完成态判据，不靠文本猜时间。
+ * 进行态的「深度求索中，用时 N 秒 ···」是另一条 [data-chat-running]（RunningStatus），
+ * 本规则与放行名单都碰不到它；最新轮过程行（工具调用/上下文行等）照旧放行。
+ * 打标器已把 turn-process 移出放行名单，这条再兜一层：就算旧标记残留，完成行也一律不出图。
+ * 它是用户卡/通知卡与秘书卡之间的一条独立兄弟行，不是卡片脚部容器，隐藏它不连带
+ * 「展开全文」、复制按钮、字数与时间戳。 */
+body[data-dsh-secretary="1"] [data-chat-flow-kind="turn-process"][data-dsh-process-visible="1"] {
+  display: none !important;
 }
 
 /* ── 用户卡 / 通知卡接管宿主用户行 ──
