@@ -809,39 +809,6 @@ export function PocketSettingsTab({ rpcCall, t }) {
 
     error ? h('div', { style: { color: 'var(--dsw-alias-state-error-primary,#dc2626)', fontSize: 12, marginTop: 8 } }, `❌ ${errText(error)}`) : null,
 
-    // 界面布局三态（issue #74 + 本次 P0）：自动 / 抽屉 / 电脑。
-    // 这个控件是"手机上被残留的 desktop 值卡死"的第二道逃生舱（第一道是
-    // layout-mode.mjs 的 auto-heal，第三道是右下角常驻布局徽章）。
-    h('div', { style: styles.block },
-      h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' } },
-        h('span', { style: { fontWeight: 600, fontSize: 13 } }, t('layoutSection')),
-        h('div', { style: { display: 'inline-flex', border: '1px solid var(--dsw-alias-border-l2,#d1d5db)', borderRadius: 999, overflow: 'hidden' } },
-          LAYOUT_OPTIONS.map((option) => h('button', {
-            key: option.value === '' ? 'auto' : option.value,
-            type: 'button',
-            'aria-pressed': layoutChoice === option.value,
-            onClick: () => pickLayout(option.value),
-            style: { ...modeBtnStyle(layoutChoice === option.value), border: 'none', borderRadius: 0 },
-          }, t(option.key))),
-        ),
-      ),
-      // 窄于 1024（官方 SIDEBAR_AUTO_COLLAPSE 那条线）时选「电脑」要先就地二次确认。
-      // 不用 window.confirm：手机 WebView 里阻塞、样式不可控，还容易被内置浏览器吞掉。
-      layoutConfirm ? h('div', { style: { ...styles.warn, marginTop: 8, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
-        h('span', null, fmt(t, 'layoutNarrowConfirm', { width: String(PHONE_STUCK_VIEWPORT) })),
-        h('button', { style: { ...styles.primary, height: 28, padding: '0 12px', fontSize: 12 }, onClick: () => commitLayout('desktop') }, t('layoutNarrowConfirmOk')),
-        h('button', { style: { ...styles.btn, height: 28, padding: '0 12px', fontSize: 12 }, onClick: () => setLayoutConfirm(false) }, t('layoutNarrowConfirmCancel')),
-      ) : null,
-      h('div', { style: { ...styles.muted, marginTop: 6 } }, t('layoutHint')),
-      h('div', { style: { ...styles.muted, marginTop: 4 } }, fmt(t, 'layoutEffective', { mode: t(APPLIED_LAYOUT_KEYS[readAppliedLayout()] ?? 'layoutAuto') })),
-      layoutChoice === 'desktop' ? h('div', { style: { ...styles.warn, marginTop: 4 } }, t('layoutDesktopWarn')) : null,
-      // 布局是启动期决议（哪些组件挂不挂在加载时就定了），所以必须刷新才完全生效。
-      layoutDirty ? h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, flexWrap: 'wrap' } },
-        h('span', { style: styles.warn }, t('layoutReloadHint')),
-        h('button', { style: { ...styles.primary, height: 28, padding: '0 12px', fontSize: 12 }, onClick: () => { try { location.reload(); } catch { /* 忽略 */ } } }, t('layoutReload')),
-      ) : null,
-    ),
-
     // 恢复出厂设置：设置出问题时的临时兜底（最底部，避免误触）
     h('div', { style: styles.block },
       h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
