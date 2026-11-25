@@ -16,6 +16,7 @@ import { peekSecretarySessionId } from '../../assistant-entry.ts'
 import { NS, zh, en, type OrbKey } from './locales.ts'
 import { makeOrbApi } from './orb-api.ts'
 import { PcFileCommandIcon, PcFileInputBridge, PcFilePickerOverlay, hasPcFileComposer, isPhoneComposerLayout, pcFilePickerStore } from './PcFileAttach.tsx'
+import { ComposerInlineImageBridge } from './ComposerInlineImageBridge.tsx'
 import { sessionCwdOf, hoistPcFileMenuItem } from '../../pcFile.ts'
 
 export function orbApply(ctx: any): void {
@@ -56,6 +57,21 @@ export function orbApply(ctx: any): void {
         inject: (sessionId: string | undefined) => ({ sessionId }),
       },
       PcFileInputBridge,
+    ),
+  )
+
+  // 图片光标标记（2026-11-25 需求）：图片插进输入框时在光标处落 `[图N:名字]` 标记，
+  // 让「第 N 张图」对上 wire 里的第 N 个图片块；删图后自动重编号/清残标。
+  // 与 PcFileInputBridge 同一不可见槽位，逻辑全在 composerInlineImage.ts（离线可测）。
+  ctx.slots.inject('conversation.input.left', () =>
+    ctx.slots.register(
+      {
+        name: 'conversation.input.left',
+        id: 'assistant-composer-inline-image',
+        order: 40,
+        inject: (sessionId: string | undefined) => ({ sessionId, conversationApi }),
+      },
+      ComposerInlineImageBridge,
     ),
   )
 
