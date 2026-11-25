@@ -292,6 +292,8 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
           kind={notice ? CARD_KIND_NOTICE : CARD_KIND_USER}
           turnNo={row.turnNo}
           preview={copyText}
+          body={copyText}
+          attachments={notice ? [] : (row.attachments ?? []).map((item) => ({ name: item.name, kind: item.kind, meta: item.meta }))}
           refSessionIds={refs.map((ref) => ref.sessionId)}
           onToggled={markRead}
         />

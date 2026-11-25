@@ -964,6 +964,95 @@ cases.push(['刷新页面不复活已发出去的引用（追加需求）：基�
   assert.equal(JSON.parse(cache.get(surface.QUOTE_STORAGE_PREFIX + 'session-404')), null, '本地那份也收干净')
 }])
 
+// ── 2026-11-25 第 2 次报障（引用不生效）：登记侧要把「卡正文全文 + 附件」一起带到宿主 ──
+cases.push(['引用登记带全文与附件（第 2 次报障）：body 不截 600、附件只传文件信息，缓存/宿主 POST/回读三处都在', async () => {
+  const longBody = `${'第一段正文。'.repeat(120)}卡正文最后一句。`
+  assert.ok(longBody.length > 600, '这条用例的前提是卡正文超过 600 字')
+  const record = surface.normalizeQuoteRecord({
+    cardKey: 'user:13:input-message620571e4',
+    kind: 'user',
+    turnNo: '584',
+    preview: longBody.slice(0, 600),
+    body: longBody,
+    attachments: [{ name: 'image.png', kind: 'image', meta: '', src: 'blob:http://127.0.0.1/abc' }, { name: '报告.pdf', kind: 'file', meta: '12 KB · application/pdf' }, { name: '', kind: 'file' }],
+    updatedAt: Date.now(),
+  })
+  assert.equal(record.body, longBody, 'body 必须整段留下（600 只是摘录/展示口径）')
+  assert.equal(record.preview.length, surface.QUOTE_PREVIEW_MAX_CHARS, 'preview 仍按 600 截（不变）')
+  assert.deepEqual(record.attachments, [{ name: 'image.png', kind: 'image', meta: '' }, { name: '报告.pdf', kind: 'file', meta: '12 KB · application/pdf' }], '附件只留文件信息、坏值丢、src 不许带进宿主')
+  assert.equal(surface.QUOTE_PREVIEW_MAX_CHARS, 600, '卡片摘录上限没被放宽')
+
+  const cache = new Map()
+  const storage = { getItem: (key) => cache.get(key) ?? null, setItem: (key, value) => { cache.set(key, value) } }
+  const posted = []
+  const hostQuote = new Map()
+  const fetchImpl = async (url, init) => {
+    if (!url.startsWith(surface.ASSISTANT_SECRETARY_QUOTE_ROUTE)) return { ok: false }
+    if (init?.method === 'POST') {
+      const body = JSON.parse(init.body)
+      posted.push(body)
+      if (body.mark === 'clear') hostQuote.delete(body.sessionId)
+      else hostQuote.set(body.sessionId, { ...body })
+      return { ok: true }
+    }
+    return { ok: true, json: async () => ({ ok: true, quote: hostQuote.get(decodeURIComponent(String(url).split('sessionId=')[1] ?? '')) ?? null }) }
+  }
+  const store = surface.createSecretaryQuoteStore({ fetchImpl, storage })
+  store.setSession('session-quote-body')
+  assert.equal(store.setQuote({ cardKey: 'user:13:input-message620571e4', kind: 'user', turnNo: '584', preview: longBody, body: longBody, attachments: record.attachments, refSessionIds: [] }), true)
+  assert.equal(posted.length, 1, '登记要落宿主一次')
+  assert.equal(posted[0].body, longBody, 'POST 里要带卡正文全文')
+  assert.equal(posted[0].attachments.length, 2, 'POST 里要带附件文件信息')
+  assert.equal(String(posted[0].attachments[0].src ?? ''), '', '附件 src（blob/data URL）不许带到宿主')
+  const cached = JSON.parse(cache.get(surface.QUOTE_STORAGE_PREFIX + 'session-quote-body'))
+  assert.equal(cached.body, longBody, '本地缓存也要带全文（刷新页面后还在）')
+  assert.equal(cached.attachments.length, 2, '本地缓存也要带附件')
+  assert.equal(store.active().body, longBody)
+  // 宿主回读（GET）也带全文与附件：刷新/换设备时不会退化成只剩 600 摘录
+  const reloaded = surface.createSecretaryQuoteStore({ fetchImpl, storage: null })
+  reloaded.setSession('session-quote-body')
+  await reloaded.hydrate()
+  assert.equal(reloaded.active().body, longBody, '宿主回读要把全文带回来')
+  assert.equal(reloaded.active().attachments[0].name, 'image.png')
+}])
+
+// ── 2026-11-25 第 2 次报障（登记侧静默丢）：登记没落宿主就没有引用段，必须有补发/重试 ──
+cases.push(['引用登记不许静默丢（第 2 次报障登记侧）：会话 id 还没到手先记待发、setSession 后补发；POST 失败后下一次登记照旧重试', async () => {
+  // ① 会话 id 还没到手：本地立刻生效，但不能把登记丢掉
+  const posted = []
+  const fetchImpl = async (url, init) => {
+    posted.push(JSON.parse(init.body))
+    return { ok: true }
+  }
+  const early = surface.createSecretaryQuoteStore({ fetchImpl, storage: null })
+  assert.equal(early.setQuote({ cardKey: 'user:13:input-early', kind: 'user', turnNo: '584', preview: '本地部署的大模型为什么执行任务时出现这个错误', body: '本地部署的大模型为什么执行任务时出现这个错误[图1:image.png]', refSessionIds: [] }), true)
+  assert.equal(posted.length, 0, '会话 id 没到手时先不 POST（但也不许丢）')
+  assert.equal(early.isQuoted('user:13:input-early'), true, '本地要先生效（输入框那颗「带引用」当场出来）')
+  early.setSession('session-early-1')
+  assert.equal(posted.length, 1, 'setSession 拿到 id 后必须把刚才那次登记补发到宿主（否则宿主 prompt 里一个字都没有）')
+  assert.equal(posted[0].sessionId, 'session-early-1')
+  assert.equal(posted[0].cardKey, 'user:13:input-early')
+
+  // ② 上一次 POST 失败（宿主重载/网络抖动）：不许永久锁死，下一次登记必须重试
+  let failNext = true
+  const retried = []
+  const flaky = async (url, init) => {
+    const body = JSON.parse(init.body)
+    retried.push(body.cardKey ?? body.mark)
+    if (failNext) { failNext = false; throw new Error('宿主刚好在重载') }
+    return { ok: true }
+  }
+  const store = surface.createSecretaryQuoteStore({ fetchImpl: flaky, storage: null })
+  store.setSession('session-retry')
+  store.setQuote({ cardKey: 'assistant:turn:590', kind: 'assistant', turnNo: '590', preview: '第一次', body: '第一次', refSessionIds: [] })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(retried.length, 1, '第一次登记发起过 POST（失败被吞）')
+  store.setQuote({ cardKey: 'assistant:turn:591', kind: 'assistant', turnNo: '591', preview: '第二次', body: '第二次', refSessionIds: [] })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(retried.length, 2, 'POST 失败以后不许永久 hostBroken 静默吞掉下一次登记（现场就是「点了引用，宿主什么都没有」）')
+  assert.equal(retried[1], 'assistant:turn:591')
+}])
+
 cases.push(['过期通知卡不进卡片窗口（第 1 项）：buildSecretaryPagerCards 只数还没到点的通知', () => {
   const now = Date.now()
   const pad = (value) => String(value).padStart(2, '0')

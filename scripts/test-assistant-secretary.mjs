@@ -820,6 +820,164 @@ cases.push(['引用锚点段与既有段互不干扰：语音输入(1785)、派�
   assert.ok(surface.SECRETARY_QUOTE_ANCHOR_SECTION_ORDER > surface.SECRETARY_QUOTE_SECTION_ORDER, '锚点段要比引用登记段更靠近这条用户消息')
 }])
 
+// ── 2026-11-25 第 2 次实报「引用不生效」：软约束不够，必须把被引用卡结构化并入本轮 prompt ──
+// 现场证据（报告 secretary-quote-miss-2-20261125.md）：602 轮 prompt 里 1783 + 1791 两段都在、内容也对，
+// 模型仍把「这个任务完成了吗」接到最近那条引用修复任务上；603 轮则连引用段都没有（这条消息压根没登记）。
+// 所以这一条钉住硬手段：有活引用 → 系统提示最末必须有一块「本轮必须回答的卡」，含卡正文全文与附件表示。
+cases.push(['引用结构化卡块（第 2 次报障硬手段）：有活引用时本轮 prompt 最末产出「本轮必须回答的卡」，含全文（不截 600）+ 附件 + 三条禁令', async () => {
+  const cardRoot = mkdtempSync(join(tmpdir(), 'assistant-secretary-quote-card-'))
+  const cardServer = fakeServer()
+  const cardSections = []
+  const cardHooks = new Map()
+  const cardCtx = {
+    webServer: cardServer,
+    get(name) {
+      if (name === 'profileContext') return { dir: cardRoot }
+      if (name === 'systemPrompt') return { section(definition) { cardSections.push(definition); return () => {} } }
+      return undefined
+    },
+    on(name, fn) { cardHooks.set(name, fn); return () => { if (cardHooks.get(name) === fn) cardHooks.delete(name) } },
+  }
+  const disposeCard = surface.registerAssistantSecretary(cardCtx)
+  try {
+    {
+      const res = fakeRes()
+      await cardServer.exact.get(surface.ASSISTANT_SECRETARY_ROUTE).handler(fakeReq('POST', JSON.stringify({ sessionId: 'session-card-1' })), res)
+    }
+    const quoteRoute = cardServer.exact.get(surface.ASSISTANT_SECRETARY_QUOTE_ROUTE)
+    assert.ok(quoteRoute, '没注册 /api/assistant/secretary-quote')
+    const callQuote = async (method, payload, urlSuffix = '') => {
+      const res = fakeRes()
+      const req = fakeReq(method, payload === undefined ? undefined : JSON.stringify(payload))
+      req.url = `${surface.ASSISTANT_SECRETARY_QUOTE_ROUTE}${urlSuffix}`
+      await quoteRoute.handler(req, res)
+      let json = null
+      try { json = JSON.parse(res.body) } catch { json = null }
+      return { status: res.status, json }
+    }
+    const session = { id: 'session-card-1' }
+    const cardPreStep = cardHooks.get('agent/pre-step')
+    const cardSessionEvent = cardHooks.get('session/event')
+    assert.equal(typeof cardPreStep, 'function', '没注册 agent/pre-step')
+    assert.equal(typeof cardSessionEvent, 'function', '没注册 session/event')
+
+    // 现场原样：584 轮那张用户卡（正文短、带 image.png 附件）。再给一段超过 600 字的长卡测「全文不许被摘录上限截掉」。
+    // 正文 682 字（超过 600 摘录上限）、preview 只放前 500 字：整条请求压在旧代码 4KB 以内，
+    // 这样旧代码能登记成功，FAIL 会精确落在「没注册结构化卡块段」上，而不是先被 413 挡住。
+    const longBody = `本地部署的大模型为什么执行任务时出现这个错误[图1:image.png]\n${'乙'.repeat(650)}卡正文最后一句。`
+    assert.ok(longBody.length > 600, '这条用例的前提是卡正文超过 600 字')
+    const marked = await callQuote('POST', {
+      sessionId: 'session-card-1',
+      mark: 'quote',
+      cardKey: 'user:13:input-message620571e4-fd4b-418f-952f-1aec0512b770',
+      kind: 'user',
+      turnNo: '584',
+      preview: longBody.slice(0, 600),
+      body: longBody,
+      attachments: [{ name: 'image.png', kind: 'image', meta: '' }],
+      refSessionIds: [],
+    })
+    assert.equal(marked.status, 200, '引用要登记得上（这条测试的前提是登记成功）')
+    assert.equal(marked.json.quote.body, longBody, '宿主要把卡正文全文原样存下来（不许按 600 摘录截）')
+    assert.equal(marked.json.quote.attachments.length, 1, '附件信息要一起存下来')
+
+    const cardSection = cardSections.find((item) => item.name === 'assistant:secretary-card-quote-card')
+    assert.ok(cardSection, '没注册 assistant:secretary-card-quote-card 段——有引用时本轮 prompt 里没有被引用卡的结构化块，这就是「软约束不够」那条失效现场')
+    assert.equal(cardSection.order, surface.SECRETARY_QUOTE_CARD_SECTION_ORDER, '结构化卡块的位置要有导出常量')
+    assert.ok(cardSection.order > surface.SECRETARY_QUOTE_ANCHOR_SECTION_ORDER, '结构化卡块必须比 1791 锚点段更靠近这条用户消息')
+    assert.ok(cardSection.order > 10200 && cardSection.order < 11000, `结构化卡块要排在宿主最后一节（部署人格后缀 10200）之后、整段系统提示的最末，实际 ${cardSection.order}`)
+
+    const block = cardSection.text({ agent: { session } })
+    assert.ok(block !== '', '本会话这条引用活着时结构化卡块必须有字')
+    assert.ok(block.startsWith('# 本轮必须回答的卡'), '卡块要有固定标题，便于逐轮核对')
+    assert.ok(block.includes('user:13:input-message620571e4-fd4b-418f-952f-1aec0512b770'), '卡块必须点名被引用卡的 cardKey')
+    assert.ok(block.includes('轮次 584') && block.includes('用户消息卡'), '卡块要写清轮次与卡片种类')
+    // 全文口径：600 字以后的正文必须在，且整段一字不差
+    assert.ok(block.includes(longBody), '卡块必须带被引用卡的正文全文（不许截成 600 字摘录）')
+    assert.ok(block.includes('卡正文最后一句。'), '卡正文末尾那句必须在（说明没有按摘录上限截断）')
+    assert.ok(!block.includes('…'), '卡正文全文里不许出现摘录省略号')
+    // 附件表示
+    assert.ok(block.includes('image.png'), '卡块必须带上卡里的附件名')
+    assert.ok(block.includes('附件'), '卡块要有一段附件说明')
+    assert.ok(/图片本体没有随/.test(block), '附件口径要写明图片本体没有随引用注入（不许假装看过图）')
+    // 三条禁令
+    assert.match(block, /不许把本条消息接到最近那条派活/, '必须禁止把本条消息接到最近那条派活上')
+    assert.match(block, /不许接到最近那条系统通知/, '必须禁止接到最近那条系统通知上')
+    assert.match(block, /不许在多个候选任务里自己挑/, '必须禁止在多个候选里自选')
+    assert.match(block, /唯一对象|唯一/, '必须写明这张卡是本轮回复的唯一对象')
+    assert.match(block, /不改变任何派活与工具规则/, '引用块只说明回答哪张卡，不改派活与工具规则')
+
+    // 只喂这一条会话；没有引用 → 空串；吃掉一轮 → 一起收掉
+    assert.equal(cardSection.text({ agent: { session: { id: 'session-other-9' } } }), '', '别的会话不许沾到结构化卡块')
+    assert.equal(cardSection.text({ agent: { session: { id: '' } } }), '', '没有会话 id 时卡块必须空')
+    assert.equal(surface.secretaryQuoteCardBlockText(null), '', '没有引用时卡块纯函数回空串')
+    const pureBlock = surface.secretaryQuoteCardBlockText({ cardKey: 'notice:14:msg-cu-01', kind: 'notice', turnNo: '', preview: '结论：改了三处。', body: '', attachments: [], refSessionIds: [] })
+    assert.ok(pureBlock.includes('系统通知卡') && pureBlock.includes('轮次 未知'), '没有轮次的通知卡要说清轮次未知、种类有中文标签')
+    assert.ok(pureBlock.includes('结论：改了三处。'), 'body 为空时退回 preview（通知卡老记录没有全文）')
+    assert.ok(pureBlock.includes('这张卡没有附件'), '卡里没附件也要明说，不许留空')
+
+    await cardPreStep({ agent: { session }, messages: [{ id: 'user-message-card-1', text: '这个任务完成了吗？' }] }, async () => null)
+    cardSessionEvent(session, { type: 'turn/end' })
+    assert.equal(cardSection.text({ agent: { session } }), '', '吃掉一轮以后结构化卡块也要收掉（不许留着误导下一轮）')
+  } finally {
+    try { disposeCard() } catch {}
+    rmSync(cardRoot, { recursive: true, force: true })
+  }
+}])
+
+cases.push(['引用正文全文口径：body 不按 600 摘录截断、超 20000 字才截断且截断可见；preview 仍是 600，卡片展示预算不动', async () => {
+  // 纯函数口径
+  const body900 = '甲'.repeat(900)
+  const record900 = surface.normalizeQuoteRecord({ cardKey: 'user:1:x', kind: 'user', preview: '摘录'.repeat(400), body: body900, updatedAt: Date.now() })
+  assert.equal(record900.body.length, 900, '900 字的卡正文必须整段留下（600 只是摘录上限）')
+  assert.equal(record900.preview.length, surface.QUOTE_PREVIEW_MAX_CHARS, 'preview 仍按 600 截（chip/定位口径不动）')
+  assert.ok(record900.body.includes('甲'.repeat(900)), 'body 一字不差')
+  const over = surface.normalizeQuoteRecord({ cardKey: 'user:1:y', kind: 'user', body: '乙'.repeat(surface.QUOTE_BODY_MAX_CHARS + 500) })
+  assert.ok(over.body.startsWith('乙'.repeat(surface.QUOTE_BODY_MAX_CHARS)), '超上限时保留到上限')
+  assert.match(over.body, /超过 20000 字/, '超上限必须显式标注截断（截断要看得见）')
+  assert.ok(over.body.length < surface.QUOTE_BODY_MAX_CHARS + 200, '标注本身不许把正文撑爆')
+  assert.deepEqual(surface.normalizeQuoteAttachments([{ name: 'a.png', kind: 'image', meta: '' }, { name: '', kind: 'file' }, { name: 'a.png', kind: 'image' }]), [{ name: 'a.png', kind: 'image', meta: '' }], '附件坏值丢、重复去重')
+  assert.deepEqual(surface.normalizeQuoteAttachments('not-array'), [], '坏形状回空数组')
+  assert.equal(surface.QUOTE_PREVIEW_MAX_CHARS, 600, '卡片摘录上限仍是 600（展示预算不动）')
+
+  // 路由口径：>4KB 的卡正文也要登记得上（不借用普通 4KB 请求体上限），GET 能读回全文
+  const bigRoot = mkdtempSync(join(tmpdir(), 'assistant-secretary-quote-big-'))
+  const bigServer = fakeServer()
+  const bigCtx = {
+    webServer: bigServer,
+    get(name) { return name === 'profileContext' ? { dir: bigRoot } : undefined },
+    on() { return () => void 0 },
+  }
+  const disposeBig = surface.registerAssistantSecretary(bigCtx)
+  try {
+    {
+      const res = fakeRes()
+      await bigServer.exact.get(surface.ASSISTANT_SECRETARY_ROUTE).handler(fakeReq('POST', JSON.stringify({ sessionId: 'session-big-1' })), res)
+    }
+    const quoteRoute = bigServer.exact.get(surface.ASSISTANT_SECRETARY_QUOTE_ROUTE)
+    const callQuote = async (method, payload, urlSuffix = '') => {
+      const res = fakeRes()
+      const req = fakeReq(method, payload === undefined ? undefined : JSON.stringify(payload))
+      req.url = `${surface.ASSISTANT_SECRETARY_QUOTE_ROUTE}${urlSuffix}`
+      await quoteRoute.handler(req, res)
+      let json = null
+      try { json = JSON.parse(res.body) } catch { json = null }
+      return { status: res.status, json }
+    }
+    const bigBody = '丙'.repeat(9000)
+    const posted = await callQuote('POST', { sessionId: 'session-big-1', mark: 'quote', cardKey: 'assistant:turn:590', kind: 'assistant', turnNo: '590', preview: '摘录', body: bigBody, attachments: [{ name: 'report.md', kind: 'file', meta: '12 KB · text/markdown' }] })
+    assert.equal(posted.status, 200, '9000 字的卡正文要登记得上（请求体上限不能被普通 4KB 卡住）')
+    const readBack = await callQuote('GET', undefined, '?sessionId=session-big-1')
+    assert.equal(readBack.json.quote.body, bigBody, 'GET 要能把全文读回来')
+    assert.equal(readBack.json.quote.attachments[0].name, 'report.md')
+    assert.equal(readBack.json.quote.attachments[0].meta, '12 KB · text/markdown')
+  } finally {
+    try { disposeBig() } catch {}
+    rmSync(bigRoot, { recursive: true, force: true })
+  }
+}])
+
+
 let failed = 0
 for (const [name, fn] of cases) {
   try {

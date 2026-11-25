@@ -22,7 +22,7 @@ import {
   answerInlineTokens, assistantCardSpeechKey, collectTurnText, foldClipFromBlocks, foldCollapsedCapPx, formatClock, latestReplyTurnNo, parseAnswerBody,
   parseSessionRefs, stripSessionRefs, normalizeForSpeech, secretaryReadStore, secretaryQuoteStore, QUOTE_PREVIEW_MAX_CHARS,
   CARD_KIND_ASSISTANT, CARD_KIND_NOTICE, CARD_KIND_USER, FOLD_BODY_LINE_BUDGET, FOLD_BLOCK_GAP, FOLD_TITLE_LINE_BUDGET, FOLD_FALLBACK_LINE_HEIGHT_PX, cardFoldStyle,
-  type FoldBlockBox, type FoldGeometryOut,
+  type FoldBlockBox, type FoldGeometryOut, type SecretaryQuoteAttachment,
 } from './secretary-cards.ts'
 import { secretarySpeech } from './secretary-speech.ts'
 import { SecretarySpeakButton } from './SecretarySpeakButton.tsx'
@@ -149,11 +149,15 @@ export function useSecretaryQuoteState(sessionId: string): {
  * 点一次 = 把这张卡登记成「下一条消息要回复的对象」（宿主引用注入段随后就把这张卡喂给秘书模型）；
  * 再点一次 = 取消登记。卡片带 `[[session:…]]` 引用时把那条会话 id 一起登记进去。
  */
-export function QuoteCardButton({ cardKey, kind, turnNo = '', preview = '', refSessionIds = [], onToggled }: {
+export function QuoteCardButton({ cardKey, kind, turnNo = '', preview = '', body = '', attachments = [], refSessionIds = [], onToggled }: {
   cardKey: string
   kind: string
   turnNo?: string
   preview?: string
+  /** 卡片正文全文（引用链路自己的字段：不截成 QUOTE_PREVIEW_MAX_CHARS，宿主那段「必须回答的卡」用它）。 */
+  body?: string
+  /** 卡片里的附件（只有文件信息；图片本体不随引用注入）。 */
+  attachments?: SecretaryQuoteAttachment[]
   refSessionIds?: string[]
   onToggled?: (quoted: boolean) => void
 }): any {
@@ -180,7 +184,7 @@ export function QuoteCardButton({ cardKey, kind, turnNo = '', preview = '', refS
       if (typeof onToggled === 'function') onToggled(false)
       return
     }
-    store.setQuote({ cardKey, kind, turnNo, preview: truncateQuotePreview(preview), refSessionIds })
+    store.setQuote({ cardKey, kind, turnNo, preview: truncateQuotePreview(preview), body, attachments, refSessionIds })
     show('on')
     if (typeof onToggled === 'function') onToggled(true)
   }
@@ -548,6 +552,7 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
           kind={CARD_KIND_ASSISTANT}
           turnNo={turnNo}
           preview={display}
+          body={display}
           refSessionIds={refs.map((ref) => ref.sessionId)}
           onToggled={() => { if (turnNo !== '') readState.markRead(key) }}
         />

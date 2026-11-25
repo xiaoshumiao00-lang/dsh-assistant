@@ -2241,6 +2241,21 @@ export function quoteExpiryDelayMs(record: SecretaryQuoteRecord | null, now = Da
   return Math.min(Math.max(1, Math.trunc(left)), 2147483647)
 }
 
+/** 引用里连附件一起记：只有文件信息（名字/种类/大小那类说明），不带图片本体（2026-11-25 第二次修法）。 */
+export interface SecretaryQuoteAttachment {
+  name: string
+  /** 'image' | 'file'（与 UserCardAttachment.kind 同一组字面量）。 */
+  kind: string
+  meta: string
+}
+
+/** 引用正文全文上限：只属于引用链路（卡片展示预算 900/600/200 一字不动）。 */
+export const QUOTE_BODY_MAX_CHARS = 20_000
+/** 一条引用最多带多少个附件。 */
+export const QUOTE_ATTACHMENT_MAX = 12
+/** 附件名/附件说明上限。 */
+export const QUOTE_ATTACHMENT_TEXT_MAX = 160
+
 export interface SecretaryQuoteRecord {
   /** 卡片 key（沿用已读/朗读那套 cardKey 口径：assistant: / user: / notice: 前缀）。 */
   cardKey: string
@@ -2248,8 +2263,12 @@ export interface SecretaryQuoteRecord {
   kind: string
   /** 该卡所属轮次（回复卡靠它定位）。 */
   turnNo: string
-  /** 卡片正文摘录（喂给模型，最多 QUOTE_PREVIEW_MAX_CHARS）。 */
+  /** 卡片正文摘录（输入框 chip 与定位用，最多 QUOTE_PREVIEW_MAX_CHARS）。 */
   preview: string
+  /** 卡片正文全文（喂给模型，最多 QUOTE_BODY_MAX_CHARS；不截成 600）。 */
+  body: string
+  /** 卡片里带的附件（只有文件信息）。 */
+  attachments: SecretaryQuoteAttachment[]
   /** 卡片带 `[[session:id|标题]]` 时被引用的那条会话。 */
   refSessionIds: string[]
   /** 本地写入时刻（epoch ms），客户端算 TTL 用。 */
@@ -2272,6 +2291,31 @@ export function normalizeQuoteSessionIds(raw: unknown): string[] {
   return out
 }
 
+/** 归一引用附件：坏值丢、按序去重（name+kind）、截到上限（与服务端 normalizeQuoteAttachments 同一口径）。 */
+export function normalizeQuoteAttachments(raw: unknown): SecretaryQuoteAttachment[] {
+  const list = Array.isArray(raw) ? raw : []
+  const out: SecretaryQuoteAttachment[] = []
+  for (const item of list) {
+    if (item === null || typeof item !== 'object') continue
+    const source = item as Record<string, unknown>
+    const name = String(source.name ?? '').trim().slice(0, QUOTE_ATTACHMENT_TEXT_MAX)
+    if (name === '') continue
+    const kind = String(source.kind ?? '').trim() === 'image' ? 'image' : 'file'
+    const meta = String(source.meta ?? '').trim().slice(0, QUOTE_ATTACHMENT_TEXT_MAX)
+    if (out.some((existing) => existing.name === name && existing.kind === kind)) continue
+    out.push({ name, kind, meta })
+    if (out.length >= QUOTE_ATTACHMENT_MAX) break
+  }
+  return out
+}
+
+/** 归一卡正文全文：默认全文照录；只有超上限才截断并显式标注（与服务端口径一致）。 */
+export function normalizeQuoteBody(raw: unknown): string {
+  const text = String(raw ?? '').trim()
+  if (text.length <= QUOTE_BODY_MAX_CHARS) return text
+  return `${text.slice(0, QUOTE_BODY_MAX_CHARS)}\n（卡正文超过 ${QUOTE_BODY_MAX_CHARS} 字，引用链路只保到这里；后面还有 ${text.length - QUOTE_BODY_MAX_CHARS} 字未注入）`
+}
+
 /** 归一宿主/缓存送来的引用记录；形状不对就整条丢掉（宁可不注入也不乱注入）。 */
 export function normalizeQuoteRecord(raw: unknown, now = Date.now()): SecretaryQuoteRecord | null {
   const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : null
@@ -2288,6 +2332,8 @@ export function normalizeQuoteRecord(raw: unknown, now = Date.now()): SecretaryQ
     kind,
     turnNo: String(source.turnNo ?? '').trim(),
     preview,
+    body: normalizeQuoteBody(source.body),
+    attachments: normalizeQuoteAttachments(source.attachments),
     refSessionIds: normalizeQuoteSessionIds(source.refSessionIds),
     updatedAt,
   }
@@ -2314,7 +2360,7 @@ export interface SecretaryQuoteStore {
   active(): SecretaryQuoteRecord | null
   isQuoted(cardKey: string): boolean
   /** 登记引用：立刻本地生效（按钮当场变成引用态），再写缓存 + 落宿主；宿主失败不阻塞。 */
-  setQuote(record: { cardKey: string; kind: string; turnNo?: string; preview?: string; refSessionIds?: string[] }): boolean
+  setQuote(record: { cardKey: string; kind: string; turnNo?: string; preview?: string; body?: string; attachments?: SecretaryQuoteAttachment[]; refSessionIds?: string[] }): boolean
   /** 取消引用（cardKey 不匹配当前引用时什么都不动）。用户主动按取消 → 服务端那份也一起清。 */
   clearQuote(cardKey?: string): boolean
   /**
@@ -2402,9 +2448,17 @@ export function createSecretaryQuoteStore(deps: SecretaryQuoteDeps = {}): Secret
     if (persistHost) void postQuote(record)
   }
 
+  /**
+   * 登记要落宿主：宿主那次 POST 是引用能不能生效的唯一真值，**不许静默丢**（2026-11-25 第二次修法的登记侧）：
+   *   - 会话 id 还没到手（store 刚创建/页面刚刷新）→ 记成待发，setSession 一拿到 id 就补发；
+   *   - 上一次 POST 失败（宿主重载/网络抖动）→ 不永久锁死，下一次登记照旧重试，成功即解除。
+   */
+  let pendingPost: { record: SecretaryQuoteRecord | null } | null = null
   const postQuote = (record: SecretaryQuoteRecord | null): Promise<void> => {
     const fetchImpl = deps.fetchImpl
-    if (hostBroken || session === '' || typeof fetchImpl !== 'function') return Promise.resolve()
+    if (typeof fetchImpl !== 'function') return Promise.resolve()
+    if (session === '') { pendingPost = { record }; return Promise.resolve() }
+    pendingPost = null
     const body = record === null
       ? { sessionId: session, mark: 'clear' }
       : { sessionId: session, mark: 'quote', ...record }
@@ -2412,7 +2466,7 @@ export function createSecretaryQuoteStore(deps: SecretaryQuoteDeps = {}): Secret
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
-    }).then(() => void 0, () => { hostBroken = true })
+    }).then(() => { hostBroken = false }, () => { hostBroken = true })
   }
 
   return {
@@ -2425,18 +2479,22 @@ export function createSecretaryQuoteStore(deps: SecretaryQuoteDeps = {}): Secret
       baseline = readBaselineCache()
       scheduleExpiry(active)
       bump()
+      // 会话 id 迟到的登记在这里补发一次（否则那颗引用永远只活在本地，宿主 prompt 里一个字都没有）
+      if (pendingPost !== null) { const queued = pendingPost.record; pendingPost = null; void postQuote(queued) }
     },
     active(): SecretaryQuoteRecord | null { return quoteAlive(active, Date.now(), ttlMs) ? active : null },
     isQuoted(cardKey: string): boolean {
       const current = quoteAlive(active, Date.now(), ttlMs) ? active : null
       return current !== null && current.cardKey === normalizeCardKey(cardKey)
     },
-    setQuote(record: { cardKey: string; kind: string; turnNo?: string; refSessionIds?: string[], preview?: string }): boolean {
+    setQuote(record: { cardKey: string; kind: string; turnNo?: string; refSessionIds?: string[], preview?: string; body?: string; attachments?: SecretaryQuoteAttachment[] }): boolean {
       const next = normalizeQuoteRecord({
         cardKey: record.cardKey,
         kind: record.kind,
         turnNo: record.turnNo ?? '',
         preview: record.preview ?? '',
+        body: record.body ?? '',
+        attachments: record.attachments ?? [],
         refSessionIds: record.refSessionIds ?? [],
         updatedAt: Date.now(),
       })
@@ -2601,12 +2659,16 @@ export const secretaryCardsTestSurface = {
   QUOTE_BASELINE_STORAGE_PREFIX,
   QUOTE_TTL_MS,
   QUOTE_PREVIEW_MAX_CHARS,
+  QUOTE_BODY_MAX_CHARS,
+  QUOTE_ATTACHMENT_MAX,
   QUOTE_CHIP_FLAG_TEXT,
   QUOTE_CHIP_CANCEL_TEXT,
   QUOTE_CHIP_PREVIEW_MAX_CHARS,
   QUOTE_CHIP_KIND_LABELS,
   normalizeQuoteRecord,
   normalizeQuoteSessionIds,
+  normalizeQuoteAttachments,
+  normalizeQuoteBody,
   quoteAlive,
   quoteTurnNumber,
   quoteConsumedByUserRow,

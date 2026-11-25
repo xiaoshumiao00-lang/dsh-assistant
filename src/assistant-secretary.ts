@@ -256,17 +256,17 @@ function sendJson(res: any, status: number, body: unknown): void {
   res.end(payload)
 }
 
-function readJsonBody(req: any): Promise<any> {
+function readJsonBody(req: any, maxBytes = MAX_BODY_BYTES): Promise<any> {
   return new Promise((resolve) => {
     let raw = ''
     let size = 0
     req.on('data', (chunk: any) => {
       const text = String(chunk ?? '')
       size += Buffer.byteLength(text)
-      if (size <= MAX_BODY_BYTES) raw += text
+      if (size <= maxBytes) raw += text
     })
     req.on('end', () => {
-      if (size > MAX_BODY_BYTES) { resolve({ __tooLarge: true }); return }
+      if (size > maxBytes) { resolve({ __tooLarge: true }); return }
       try { resolve(JSON.parse(raw || '{}')) } catch { resolve(null) }
     })
     req.on('error', () => resolve(null))
@@ -307,6 +307,8 @@ const QUOTE_STATE_FILENAME = 'dsh-assistant-secretary-quote.json'
 export const QUOTE_TTL_MS = 30 * 60 * 1000
 /** 引用摘录上限：只用于告诉模型「引用的是哪段话」，不是完整汇报口径。 */
 export const QUOTE_PREVIEW_MAX_CHARS = 600
+/** 引用登记的上限：base64 一律不认，但卡正文全文 + 附件信息要装得下（不借用普通 4KB 上限）。 */
+const QUOTE_MAX_BODY_BYTES = 256 * 1024
 /** 三种卡片种类（与客户端 CARD_KIND_* 同一组字面量）。 */
 export const QUOTE_CARD_KINDS = ['assistant', 'user', 'notice'] as const
 /** 引用注入段的段落号（1785 语音输入段、1790 派活分层段之间；不并入任何既有段落）。 */
@@ -319,12 +321,46 @@ export const SECRETARY_QUOTE_SECTION_ORDER = 1783
  * 所以加一张贴在派活分层(1790)之后、最靠近这条用户消息的硬锚点段：既有 1783 段原样保留。
  */
 export const SECRETARY_QUOTE_ANCHOR_SECTION_ORDER = 1791
+/**
+ * 引用「结构化卡块」段的段落号（2026-11-25 第 2 次实报「引用不生效」的硬手段）：
+ * 上一轮加的 1791 锚点段仍只是**措辞**约束（模型在 602 轮看着两段引用，还是把
+ * 「这个任务完成了吗」接到了最近那条派活上）——措辞不够，必须把被引用卡**结构化并入**本轮 prompt。
+ * 所以再加一段按「本轮必须回答的卡」组织的硬块：全文 + 附件 + 禁止另指。
+ * 位置：宿主 `systemPrompt` 的段落号是纯数字排序（dsh-system-prompt 的 SECTION_ORDERS，
+ * 最大一项 DEPLOYMENT_PERSONA_SUFFIX = 10200），10250 排在它之后 → 整段系统提示的最末，
+ * 紧贴这条用户消息（这是插件能拿到的、离消息最近的注入点）。
+ */
+export const SECRETARY_QUOTE_CARD_SECTION_ORDER = 10250
+/**
+ * 引用正文（body）的上限：**只属于引用链路**，不是卡片展示预算。
+ * 卡片折叠/摘录那套 900/600/200 是渲染预算，一个字都不动；这里保的是「喂给模型的卡正文」——
+ * 默认全文照录，只有超过 20000 字这种异常长卡才截断并显式标注（截断要看得见）。
+ */
+export const QUOTE_BODY_MAX_CHARS = 20_000
+/** 一条引用最多带多少个附件（卡片脚部引用时登记的附件信息）。 */
+export const QUOTE_ATTACHMENT_MAX = 12
+/** 引用里附件名/附件说明各自的上限（防把超长文件名塞进 prompt）。 */
+export const QUOTE_ATTACHMENT_TEXT_MAX = 160
+
+/** 引用里连附件一起记：只有文件信息（名字/种类/大小那类说明），不带图片本体。 */
+export interface SecretaryQuoteAttachment {
+  name: string
+  /** 'image' | 'file'（与客户端 UserCardAttachment.kind 同一组字面量）。 */
+  kind: string
+  /** 文件大小/类型那类说明（图片可能为空）。 */
+  meta: string
+}
 
 export interface SecretaryQuoteRecord {
   cardKey: string
   kind: string
   turnNo: string
+  /** 卡片正文摘录（定位用，最多 QUOTE_PREVIEW_MAX_CHARS；引用 chip 也用它）。 */
   preview: string
+  /** 卡片正文全文（喂模型用，最多 QUOTE_BODY_MAX_CHARS；引用链路自己的字段，不借卡片展示预算）。 */
+  body: string
+  /** 卡片里带的附件（只有文件信息；图片本体不随引用注入）。 */
+  attachments: SecretaryQuoteAttachment[]
   refSessionIds: string[]
   /** 客户端写入时刻（epoch ms）；TTL 就按它算。 */
   updatedAt: number
@@ -348,6 +384,35 @@ export function normalizeQuoteSessionIds(raw: unknown): string[] {
   return out
 }
 
+/** 归一引用里的附件：坏值丢、按序去重（name+kind）、截到上限；图片本体一律不认（只留文件信息）。 */
+export function normalizeQuoteAttachments(raw: unknown): SecretaryQuoteAttachment[] {
+  const list = Array.isArray(raw) ? raw : []
+  const out: SecretaryQuoteAttachment[] = []
+  for (const item of list) {
+    if (item === null || typeof item !== 'object') continue
+    const source = item as Record<string, unknown>
+    const name = String(source.name ?? '').trim().slice(0, QUOTE_ATTACHMENT_TEXT_MAX)
+    if (name === '') continue
+    const kind = String(source.kind ?? '').trim() === 'image' ? 'image' : 'file'
+    const meta = String(source.meta ?? '').trim().slice(0, QUOTE_ATTACHMENT_TEXT_MAX)
+    if (out.some((existing) => existing.name === name && existing.kind === kind)) continue
+    out.push({ name, kind, meta })
+    if (out.length >= QUOTE_ATTACHMENT_MAX) break
+  }
+  return out
+}
+
+/**
+ * 归一卡片正文全文：默认全文照录；只有超过 QUOTE_BODY_MAX_CHARS 才截断，并在末尾**显式**写出截断事实
+ * （截断要看得见，不许悄悄少半截）。空串回空串，注入时再退回 preview。
+ */
+export function normalizeQuoteBody(raw: unknown): string {
+  const text = String(raw ?? '').trim()
+  if (text.length <= QUOTE_BODY_MAX_CHARS) return text
+  const cut = text.slice(0, QUOTE_BODY_MAX_CHARS)
+  return `${cut}\n（卡正文超过 ${QUOTE_BODY_MAX_CHARS} 字，引用链路只保到这里；后面还有 ${text.length - QUOTE_BODY_MAX_CHARS} 字未注入）`
+}
+
 /** 归一条引用记录：形状不对整条丢（宁可不注入也不乱注入；与客户端 normalizeQuoteRecord 同一口径）。 */
 export function normalizeQuoteRecord(raw: unknown, now = Date.now()): SecretaryQuoteRecord | null {
   const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : null
@@ -359,7 +424,16 @@ export function normalizeQuoteRecord(raw: unknown, now = Date.now()): SecretaryQ
   const preview = previewRaw.length > QUOTE_PREVIEW_MAX_CHARS ? `${previewRaw.slice(0, QUOTE_PREVIEW_MAX_CHARS - 1)}…` : previewRaw
   const updatedAtRaw = Number(source.updatedAt)
   const updatedAt = Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? updatedAtRaw : now
-  return { cardKey, kind, turnNo: String(source.turnNo ?? '').trim(), preview, refSessionIds: normalizeQuoteSessionIds(source.refSessionIds), updatedAt }
+  return {
+    cardKey,
+    kind,
+    turnNo: String(source.turnNo ?? '').trim(),
+    preview,
+    body: normalizeQuoteBody(source.body),
+    attachments: normalizeQuoteAttachments(source.attachments),
+    refSessionIds: normalizeQuoteSessionIds(source.refSessionIds),
+    updatedAt,
+  }
 }
 
 /** 这条引用还在不在（与客户端 quoteAlive 同一口径）。 */
@@ -404,6 +478,7 @@ export function secretaryQuoteInjectionText(record: SecretaryQuoteRecord | null)
     lines.push(`这张卡里引用的会话 id：${record.refSessionIds.join('、')}——接着这件事要继续，就用 secretary_dispatch kind=existing 落到那条会话所在的项目目录。`)
   }
   lines.push('处理要求：把用户这条消息当作对这张卡的回应；不许因为摘录短就把用户这条消息里的要求吞掉，也不许把这张卡的原有内容改写成别的说法。引用登记只说明「接着哪张卡说」，不改变任何派活与工具规则。')
+  lines.push('本轮系统提示最末还有一段「本轮必须回答的卡（个人秘书）」：那里是这张卡的正文全文与附件信息，回答口径以那一段为准（本段的摘录只用来定位）。')
   return lines.join('\n')
 }
 
@@ -419,7 +494,36 @@ export function secretaryQuoteAnchorText(record: SecretaryQuoteRecord | null): s
     '# 引用锚点（个人秘书）',
     `这条用户消息引用的就是这张${kindLabel}：cardKey=${record.cardKey}｜kind=${record.kind}｜轮次 ${record.turnNo === '' ? '未知' : record.turnNo}。`,
     `被引用卡正文：${record.preview}`,
-    '处理要求：这条消息里的指代（这个、那张、它、这条任务）一律指向这张卡；先回答这张卡接着的那件事，不许把这条消息接到最近那条派活、最近那条系统通知或别的任务上；不许因为摘录短就吞掉这条消息里的要求。引用锚点只说明「接着哪张卡说」，不改变任何派活与工具规则。',
+    '处理要求：这条消息里的指代（这个、那张、它、这条任务）一律指向这张卡；先回答这张卡接着的那件事，不许把这条消息接到最近那条派活、最近那条系统通知或别的任务上；不许因为摘录短就吞掉这条消息里的要求；不许在多个候选任务里自己挑一个来接。引用锚点只说明「接着哪张卡说」，不改变任何派活与工具规则。',
+  ]
+  return lines.join('\n')
+}
+
+/**
+ * 引用「结构化卡块」正文（2026-11-25 第 2 次实报的硬手段；纯函数，测试逐条断言）。
+ * 与 1783/1791 的分工：那两段是「说明引用的是哪张卡」，这一段是本轮回答对象的**结构化并入**——
+ * 卡正文全文（不截成 600）、附件表示、硬要求与三条禁令，排在系统提示最末（紧贴用户消息）。
+ */
+export function secretaryQuoteCardBlockText(record: SecretaryQuoteRecord | null): string {
+  if (record === null) return ''
+  const kindLabel = QUOTE_KIND_LABELS[record.kind] ?? '卡片'
+  const body = record.body.trim() === '' ? record.preview : record.body
+  const attachments = record.attachments.length === 0
+    ? '（这张卡没有附件）'
+    : record.attachments.map((item) => `${item.name}｜${item.kind === 'image' ? '图片' : '文件'}${item.meta === '' ? '' : `｜${item.meta}`}`).join('；')
+  const lines = [
+    '# 本轮必须回答的卡（个人秘书）',
+    '用户这条消息是按了「引用」之后发的：它引用的就是下面这张卡，本轮回复的唯一对象就是这张卡。',
+    `卡：${kindLabel}｜轮次 ${record.turnNo === '' ? '未知' : record.turnNo}｜cardKey=${record.cardKey}`,
+    '卡正文（全文，没有截成摘录）：',
+    '—— 卡正文开始 ——',
+    body,
+    '—— 卡正文结束 ——',
+    `卡里带的附件（只有文件信息，图片本体没有随这段注入送来）：${attachments}`,
+    '【硬要求】本轮第一句就直接针对上面这段卡正文作答：卡里是提问就回答那个提问，卡里是报错就先定位那个报错，卡里是一个结论就接着它办。',
+    '【禁令】不许把本条消息接到最近那条派活上；不许接到最近那条系统通知上；不许接到最近一轮的任务进度上；不许在多个候选任务里自己挑一个来接；不许用「已完成」「已修好」「已提交」去回答这张卡没问的事。',
+    '【附件口径】附件只有名字与种类：图里的内容没有随引用注入，不许编造图里没写的细节，也不许假装看过这张图；要回答图里的东西，只能依据卡正文里已经写出来的信息。',
+    '引用卡块只说明「回答哪张卡」，不改变任何派活与工具规则。',
   ]
   return lines.join('\n')
 }
@@ -690,7 +794,7 @@ export function registerAssistantSecretary(ctx: any): () => void {
       const method = String(req.method ?? 'GET').toUpperCase()
       try {
         if (method === 'POST' || method === 'PUT') {
-          const body = await readJsonBody(req)
+          const body = await readJsonBody(req, QUOTE_MAX_BODY_BYTES)
           if (body?.__tooLarge === true) { sendJson(res, 413, { ok: false, error: 'too-large' }); return }
           const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : ''
           if (!SESSION_ID_RE.test(sessionId)) { sendJson(res, 400, { ok: false, error: 'invalid-session-id' }); return }
@@ -709,6 +813,8 @@ export function registerAssistantSecretary(ctx: any): () => void {
             kind: body?.kind,
             turnNo: body?.turnNo,
             preview: body?.preview,
+            body: body?.body,
+            attachments: body?.attachments,
             refSessionIds: body?.refSessionIds,
             updatedAt: typeof body?.updatedAt === 'number' ? body.updatedAt : Date.now(),
           })
@@ -952,6 +1058,35 @@ export function registerAssistantSecretary(ctx: any): () => void {
     offQuoteAnchorSection = undefined
   }
 
+  // 引用「结构化卡块」段（2026-11-25 第 2 次修法，硬手段）：有活引用时，本轮 prompt 最末（整段系统提示
+  // 最后一个段，紧贴这条用户消息）产出一块「本轮必须回答的卡」——卡正文全文（不截成 600 摘录）、
+  // 附件文件信息、硬要求与三条禁令。措辞约束不够，这里是结构化并入。
+  // 门与 1783/1791 完全同源：只喂固定秘书会话、过期即清并落盘、真实用户消息那轮 turn/end 一起收掉。
+  let offQuoteCardSection: (() => void) | undefined
+  try {
+    const systemPrompt = (typeof ctx?.get === 'function' ? ctx.get('systemPrompt') : undefined) ?? ctx?.systemPrompt
+    if (systemPrompt && typeof systemPrompt.section === 'function') {
+      offQuoteCardSection = systemPrompt.section({
+        name: 'assistant:secretary-card-quote-card',
+        order: SECRETARY_QUOTE_CARD_SECTION_ORDER, // 宿主最后一节（10200 部署人格后缀）之后：整段提示的最末
+        text: (context: any) => {
+          const sessionId = String(context?.agent?.session?.id ?? '')
+          if (sessionId === '' || sessionId !== activeSessionId) return ''
+          const record = quoteState[sessionId]
+          if (record === undefined) return ''
+          if (!quoteAlive(record)) {
+            delete quoteState[sessionId]
+            void persistQuoteState().catch(() => void 0)
+            return ''
+          }
+          return secretaryQuoteCardBlockText(record)
+        },
+      })
+    }
+  } catch {
+    offQuoteCardSection = undefined
+  }
+
   return () => {
     try { offToolGate?.() } catch {}
     try { offNoticeReset?.() } catch {}
@@ -960,6 +1095,7 @@ export function registerAssistantSecretary(ctx: any): () => void {
     try { if (typeof offVoiceInput === 'function') offVoiceInput() } catch {}
     try { if (typeof offQuoteSection === 'function') offQuoteSection() } catch {}
     try { if (typeof offQuoteAnchorSection === 'function') offQuoteAnchorSection() } catch {}
+    try { if (typeof offQuoteCardSection === 'function') offQuoteCardSection() } catch {}
     try { routes.dispose() } catch {}
   }
 }
@@ -1206,13 +1342,20 @@ export const assistantSecretaryTestSurface = {
   ASSISTANT_SECRETARY_QUOTE_ROUTE,
   SECRETARY_QUOTE_SECTION_ORDER,
   SECRETARY_QUOTE_ANCHOR_SECTION_ORDER,
+  SECRETARY_QUOTE_CARD_SECTION_ORDER,
   QUOTE_TTL_MS,
   QUOTE_PREVIEW_MAX_CHARS,
+  QUOTE_BODY_MAX_CHARS,
+  QUOTE_ATTACHMENT_MAX,
+  QUOTE_CARD_KINDS,
   normalizeQuoteCardKey,
   normalizeQuoteSessionIds,
+  normalizeQuoteAttachments,
+  normalizeQuoteBody,
   normalizeQuoteRecord,
   quoteAlive,
   normalizeSecretaryQuoteState,
   secretaryQuoteInjectionText,
   secretaryQuoteAnchorText,
+  secretaryQuoteCardBlockText,
 }
