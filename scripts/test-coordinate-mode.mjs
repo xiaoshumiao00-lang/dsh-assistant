@@ -50,7 +50,8 @@ async function call(handler, method, body) {
   return { status, body: raw ? JSON.parse(raw) : null }
 }
 
-const platformDefault = process.platform === 'win32'
+// 2026-11-25 起缺省不再是「Windows 用千分比」：所有平台（含 win32）默认像素。
+const platformDefault = false
 const cases = []
 
 cases.push(['无配置文件 → 平台缺省 + GET 读回', async () => {

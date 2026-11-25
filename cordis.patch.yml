@@ -81,8 +81,8 @@
             name: 'dsh-assistant/computer-use'
             config:
               postActionWaitMs: 600
-              # 观察面截图长边上限（像素）：每步回喂的图越大，模型 prefill 越贵。0 = 不缩放。
-              captureMaxEdgePx: 1280
+              # 观察面截图长边上限（像素）：每步回喂的图越大，模型 prefill 越贵。0 = 不缩放；2026-11-25 起由 1280 放宽到 1920（1920 长边够读 2560×1440 屏的文字，仍比原图省）。
+              captureMaxEdgePx: 1920
               # 观察面 owner 的最小边长；助手自己的悬浮球与覆盖条带一律不当观察面。
               ownerMinEdgePx: 64
               # 额外的助手自身窗口标题标记（内置标记之外，可按需追加）：

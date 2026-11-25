@@ -4,7 +4,7 @@
  *
  * 对着 2026-11-20「录入店铺到轰趴后台」那次实录立的规矩：124 步回喂了 58 张全尺寸 PNG
  * （中位 157 KB、最大 652 KB），每步的 prefill 都按原始分辨率算 token。
- * 现在按长边上限降采样（`captureMaxEdgePx`，默认 1280，0 = 关掉）。
+ * 现在按长边上限降采样（`captureMaxEdgePx`，默认 1920，0 = 关掉）。
  *
  * 固定这几条边界：
  *   - 尺寸已经小于上限时一帧都不动（`fitCaptureSize` 返回 undefined，走原来的全尺寸编码）；
@@ -116,15 +116,15 @@ function readPixel(buffer, width, row, column) {
   ]
 }
 
-cases.push(['默认上限是 1280；0 表示关掉缩放；非数字与负数都回默认', () => {
-  assert.equal(resolveCaptureMaxEdge(undefined), 1280)
+cases.push(['默认上限是 1920；0 表示关掉缩放；非数字与负数都回默认', () => {
+  assert.equal(resolveCaptureMaxEdge(undefined), 1920)
   assert.equal(resolveCaptureMaxEdge(0), 0, '0 是「不缩放」，不是「缩成 0 像素」')
   assert.equal(resolveCaptureMaxEdge(1600), 1600)
   assert.equal(resolveCaptureMaxEdge(1920.6), 1921, '取整')
-  assert.equal(resolveCaptureMaxEdge(-3), 1280)
-  assert.equal(resolveCaptureMaxEdge(Number.NaN), 1280)
-  assert.equal(resolveCaptureMaxEdge(Number.POSITIVEInfinity), 1280)
-  assert.equal(resolveCaptureMaxEdge('1280'), 1280)
+  assert.equal(resolveCaptureMaxEdge(-3), 1920)
+  assert.equal(resolveCaptureMaxEdge(Number.NaN), 1920)
+  assert.equal(resolveCaptureMaxEdge(Number.POSITIVEInfinity), 1920)
+  assert.equal(resolveCaptureMaxEdge('1280'), 1920, '字符串不算数字，回默认')
 }])
 
 cases.push(['已经小于上限的面板一帧都不动（不重编码）', () => {

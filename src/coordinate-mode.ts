@@ -38,9 +38,9 @@ function profileDir(ctx: any): string {
   return process.env.DSH_HOME || process.cwd()
 }
 
-/** 与 dsh-orb 相同的缺省：Windows 用千分比，其它平台用像素。 */
+/** 缺省关掉千分比：含 Windows 在内全部平台走截图原始像素（2026-11-25 起）。 */
 function defaultMillifraction(): boolean {
-  return process.platform === 'win32'
+  return false
 }
 
 function readMillifraction(file: string): boolean {
