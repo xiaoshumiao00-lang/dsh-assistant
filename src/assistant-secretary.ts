@@ -322,15 +322,11 @@ export const SECRETARY_QUOTE_SECTION_ORDER = 1783
  */
 export const SECRETARY_QUOTE_ANCHOR_SECTION_ORDER = 1791
 /**
- * 引用「结构化卡块」段的段落号（2026-11-25 第 2 次实报「引用不生效」的硬手段）：
- * 上一轮加的 1791 锚点段仍只是**措辞**约束（模型在 602 轮看着两段引用，还是把
- * 「这个任务完成了吗」接到了最近那条派活上）——措辞不够，必须把被引用卡**结构化并入**本轮 prompt。
- * 所以再加一段按「本轮必须回答的卡」组织的硬块：全文 + 附件 + 禁止另指。
- * 位置：宿主 `systemPrompt` 的段落号是纯数字排序（dsh-system-prompt 的 SECTION_ORDERS，
- * 最大一项 DEPLOYMENT_PERSONA_SUFFIX = 10200），10250 排在它之后 → 整段系统提示的最末，
- * 紧贴这条用户消息（这是插件能拿到的、离消息最近的注入点）。
+ * 拼进「本轮用户消息本体」的那块正文的固定开头标记（2026-11-25 第 3 次修法）。
+ * 两个用途：① 给模型一个能一眼认出的边界（这段就是被引用的那张卡）；
+ * ② 给「已经拼过」一个幂等判据——重试或重复 pre-step 不会把同一块拼第二遍。
  */
-export const SECRETARY_QUOTE_CARD_SECTION_ORDER = 10250
+export const QUOTE_MESSAGE_BLOCK_OPEN = '【引用卡｜本轮必须回答的卡（个人秘书）】'
 /**
  * 引用正文（body）的上限：**只属于引用链路**，不是卡片展示预算。
  * 卡片折叠/摘录那套 900/600/200 是渲染预算，一个字都不动；这里保的是「喂给模型的卡正文」——
@@ -478,7 +474,7 @@ export function secretaryQuoteInjectionText(record: SecretaryQuoteRecord | null)
     lines.push(`这张卡里引用的会话 id：${record.refSessionIds.join('、')}——接着这件事要继续，就用 secretary_dispatch kind=existing 落到那条会话所在的项目目录。`)
   }
   lines.push('处理要求：把用户这条消息当作对这张卡的回应；不许因为摘录短就把用户这条消息里的要求吞掉，也不许把这张卡的原有内容改写成别的说法。引用登记只说明「接着哪张卡说」，不改变任何派活与工具规则。')
-  lines.push('本轮系统提示最末还有一段「本轮必须回答的卡（个人秘书）」：那里是这张卡的正文全文与附件信息，回答口径以那一段为准（本段的摘录只用来定位）。')
+  lines.push('这张卡的正文全文与附件信息已经拼进本条用户消息的正文末尾（「引用卡」开头的那一块，不是系统提示里的一段说明）：回答口径以那条消息里的卡正文为准，本段的摘录只用来定位。')
   return lines.join('\n')
 }
 
@@ -500,9 +496,12 @@ export function secretaryQuoteAnchorText(record: SecretaryQuoteRecord | null): s
 }
 
 /**
- * 引用「结构化卡块」正文（2026-11-25 第 2 次实报的硬手段；纯函数，测试逐条断言）。
- * 与 1783/1791 的分工：那两段是「说明引用的是哪张卡」，这一段是本轮回答对象的**结构化并入**——
- * 卡正文全文（不截成 600）、附件表示、硬要求与三条禁令，排在系统提示最末（紧贴用户消息）。
+ * 引用卡「拼进用户消息本体」的那一块正文（2026-11-25 第 3 次实报的修法；纯函数，测试逐条断言）。
+ * 与前两轮的分工：1783/1791 两段只是系统提示里的说明文字；这一段由 `agent/pre-step` 直接拼到
+ * **本轮用户消息的正文末尾**——宿主 asar 里 `dsh-agent-loop/lib/index.js:699-711` 把这个 step 的
+ * messages 交出来，`:873-880` 把返回的 decision.messages 原样 append 成 user/message，所以这里
+ * 拼进去的就是模型真正读到的那条用户消息本体，不是另一个 system 段。
+ * 写法按用户原话钉死：① 优先级最高 ② 忽略无关的最近上下文 ③ 禁止多候选自选 ④ 模糊指代指向引用卡。
  */
 export function secretaryQuoteCardBlockText(record: SecretaryQuoteRecord | null): string {
   if (record === null) return ''
@@ -512,20 +511,71 @@ export function secretaryQuoteCardBlockText(record: SecretaryQuoteRecord | null)
     ? '（这张卡没有附件）'
     : record.attachments.map((item) => `${item.name}｜${item.kind === 'image' ? '图片' : '文件'}${item.meta === '' ? '' : `｜${item.meta}`}`).join('；')
   const lines = [
-    '# 本轮必须回答的卡（个人秘书）',
-    '用户这条消息是按了「引用」之后发的：它引用的就是下面这张卡，本轮回复的唯一对象就是这张卡。',
-    `卡：${kindLabel}｜轮次 ${record.turnNo === '' ? '未知' : record.turnNo}｜cardKey=${record.cardKey}`,
-    '卡正文（全文，没有截成摘录）：',
+    QUOTE_MESSAGE_BLOCK_OPEN,
+    `这张卡是用户这条消息按「引用」选中的${kindLabel}（轮次 ${record.turnNo === '' ? '未知' : record.turnNo}｜cardKey=${record.cardKey}）：正文全文已经拼在下面，它是本轮唯一的回答对象。`,
     '—— 卡正文开始 ——',
     body,
     '—— 卡正文结束 ——',
-    `卡里带的附件（只有文件信息，图片本体没有随这段注入送来）：${attachments}`,
-    '【硬要求】本轮第一句就直接针对上面这段卡正文作答：卡里是提问就回答那个提问，卡里是报错就先定位那个报错，卡里是一个结论就接着它办。',
-    '【禁令】不许把本条消息接到最近那条派活上；不许接到最近那条系统通知上；不许接到最近一轮的任务进度上；不许在多个候选任务里自己挑一个来接；不许用「已完成」「已修好」「已提交」去回答这张卡没问的事。',
-    '【附件口径】附件只有名字与种类：图里的内容没有随引用注入，不许编造图里没写的细节，也不许假装看过这张图；要回答图里的东西，只能依据卡正文里已经写出来的信息。',
-    '引用卡块只说明「回答哪张卡」，不改变任何派活与工具规则。',
+    `卡里带的附件（只有文件信息，图片本体没有随引用送来）：${attachments}`,
+    '【硬指令｜按优先级执行】',
+    '① 这张引用卡的内容优先级最高，本轮回答必须针对它。',
+    '② 忽略与引用无关的最近对话上下文（包括上一条任务、系统通知、待办提醒）：不许把本条消息接到最近那条派活上，也不许接到最近那条系统通知上，也不许接到最近一轮的任务进度上。',
+    '③ 禁止在多个候选任务里自己挑一个来接。',
+    '④ 用户这句模糊指代（这个、那张、它、这条任务、这个任务）一律指向这张引用卡。',
+    '【附件口径】附件只有名字与种类：图里的内容没有随引用注入，不许编造图里没写的细节，也不许假装看过这张图。',
+    '引用卡只说明回答哪张卡，不改变任何派活与工具规则。',
   ]
   return lines.join('\n')
+}
+
+/** 把引用卡块贴到消息最后一个 text 块后面（没有 text 块就补在末尾；附件块顺序一个都不动）。 */
+function contentWithQuoteBlock(content: readonly any[], block: string): any[] | null {
+  const blocks = Array.isArray(content) ? content.slice() : []
+  if (blocks.length === 0) return null
+  let lastText = -1
+  for (let index = 0; index < blocks.length; index += 1) {
+    const item = blocks[index]
+    if (item !== null && typeof item === 'object' && item.type === 'text' && typeof item.text === 'string') lastText = index
+  }
+  if (lastText >= 0) blocks[lastText] = { ...blocks[lastText], text: `${blocks[lastText].text}\n\n${block}` }
+  else blocks.push({ type: 'text', text: block })
+  return blocks
+}
+
+/**
+ * 把被引用卡的正文拼进本轮用户消息**本体**（2026-11-25 第 3 次修法；纯函数，测试逐条断言）。
+ * 挑哪条：从后往前第一条「真实用户消息」——user 角色、有 content、不是插件登记的通知卡、
+ * 不是宿主的运行时上下文快照。用户原话一个字不改，卡块贴在它后面（同一条消息里连续相邻）。
+ * 幂等：消息里已经有 {@link QUOTE_MESSAGE_BLOCK_OPEN} 就不再拼第二遍（重试/重复 pre-step 不叠加）。
+ * @param messages - `agent/pre-step` 交给插件的那一批（`decision.messages`，即将被 append 成 user/message）。
+ * @param record - 当前会话活着的引用记录；null/空串视为没有引用。
+ * @returns 新数组（不改入参）与「这次到底拼没拼」。
+ */
+export function spliceQuoteIntoUserMessage(
+  messages: readonly unknown[] | null | undefined,
+  record: SecretaryQuoteRecord | null,
+): { messages: any[]; spliced: boolean } {
+  const list = Array.isArray(messages) ? messages.slice() : []
+  if (record === null) return { messages: list, spliced: false }
+  const block = secretaryQuoteCardBlockText(record)
+  if (block === '') return { messages: list, spliced: false }
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const message = list[index] as any
+    if (message === null || typeof message !== 'object') continue
+    if (message.role !== 'user') continue
+    if (String(message.source?.kind ?? '') === 'runtime-context') continue
+    if (isNoticeMessageId(message.id)) continue
+    const content = Array.isArray(message.content) ? message.content : []
+    if (content.length === 0) continue
+    const already = content.some((item: any) => item !== null && typeof item === 'object'
+      && item.type === 'text' && typeof item.text === 'string' && item.text.includes(QUOTE_MESSAGE_BLOCK_OPEN))
+    if (already) return { messages: list, spliced: false }
+    const nextContent = contentWithQuoteBlock(content, block)
+    if (nextContent === null) continue
+    list[index] = { ...message, content: nextContent }
+    return { messages: list, spliced: true }
+  }
+  return { messages: list, spliced: false }
 }
 
 
@@ -916,11 +966,14 @@ export function registerAssistantSecretary(ctx: any): () => void {
     offToolGate = undefined
   }
 
-  // 「发送时的权限闸」：标准会话页的发送由宿主处理，插件不能像以前那样在组件里拦消息，
-  // 所以在**每一轮开始前**（agent/pre-step）确认这条会话真的还在只读档：
-  //   - 读得到策略且确实 read-only → 放行；
-  //   - 读得到策略但不是 read-only → 拦下这一轮，并给出人话原因（= 权限确认失败才阻止）；
-  //   - 宿主没有 sandboxPolicy 服务（找不到判据）→ 放行并告警一次，绝不因为探测失败把秘书锁死。
+  // 「发送时的权限闸」+ 「引用卡正文拼进用户消息本体」（2026-11-25 第 3 次修法）：
+  //   - 权限：标准会话页的发送由宿主处理，插件不能像以前那样在组件里拦消息，所以在**每一轮开始前**
+  //     （agent/pre-step）确认这条会话真的还在只读档：读得到策略且确实 read-only → 放行；读得到策略
+  //     但不是 read-only → 拦下这一轮并给人话原因；宿主没有 sandboxPolicy 服务 → 放行并告警一次。
+  //   - 引用：这是宿主唯一合法的「改这一轮用户消息」的点——`agent/pre-step` 把这批被 claim 的消息
+  //     交出来，返回的 decision.messages 会被原样 append 成 user/message（宿主 asar
+  //     `dsh-agent-loop/lib/index.js:873-880`），所以在这里把被引用卡的正文拼到最后一条真实用户消息
+  //     的末尾 = 真拼进本体，而不是再往系统提示里塞一段（10250 段已在本次修法里撤掉）。
   let offStepGate: (() => void) | undefined
   let warnedNoPolicy = false
   try {
@@ -951,13 +1004,25 @@ export function registerAssistantSecretary(ctx: any): () => void {
           warnedNoPolicy = true
           ctx?.logger?.warn?.('[dsh-assistant] 读不到 sandboxPolicy：秘书会话的只读确认这一轮跳过（不会因此锁死）')
         }
-        return next()
+      } else if (!(mode === 'read-only' || mode === 'readonly')) {
+        return {
+          kind: 'deny',
+          reason: `个人秘书会话没在只读档（当前 ${mode}），这条消息先拦下了。后台会继续把它切回「仅可查看」，确认后再发即可。`,
+        }
       }
-      if (mode === 'read-only' || mode === 'readonly') return next()
-      return {
-        kind: 'deny',
-        reason: `个人秘书会话没在只读档（当前 ${mode}），这条消息先拦下了。后台会继续把它切回「仅可查看」，确认后再发即可。`,
+      const decision = await next()
+      if (decision === null || typeof decision !== 'object' || decision.kind !== 'enter') return decision
+      // 门与 1783/1791 完全同源：只喂固定秘书会话、过期即清并落盘、真实用户消息那轮 turn/end 一起收掉。
+      const record = quoteState[sessionId]
+      if (record === undefined) return decision
+      if (!quoteAlive(record)) {
+        delete quoteState[sessionId]
+        void persistQuoteState().catch(() => void 0)
+        return decision
       }
+      const { messages: splicedMessages, spliced } = spliceQuoteIntoUserMessage(decision.messages, record)
+      if (!spliced) return decision
+      return { ...decision, messages: splicedMessages }
     })
   } catch {
     offStepGate = undefined
@@ -1058,34 +1123,10 @@ export function registerAssistantSecretary(ctx: any): () => void {
     offQuoteAnchorSection = undefined
   }
 
-  // 引用「结构化卡块」段（2026-11-25 第 2 次修法，硬手段）：有活引用时，本轮 prompt 最末（整段系统提示
-  // 最后一个段，紧贴这条用户消息）产出一块「本轮必须回答的卡」——卡正文全文（不截成 600 摘录）、
-  // 附件文件信息、硬要求与三条禁令。措辞约束不够，这里是结构化并入。
-  // 门与 1783/1791 完全同源：只喂固定秘书会话、过期即清并落盘、真实用户消息那轮 turn/end 一起收掉。
-  let offQuoteCardSection: (() => void) | undefined
-  try {
-    const systemPrompt = (typeof ctx?.get === 'function' ? ctx.get('systemPrompt') : undefined) ?? ctx?.systemPrompt
-    if (systemPrompt && typeof systemPrompt.section === 'function') {
-      offQuoteCardSection = systemPrompt.section({
-        name: 'assistant:secretary-card-quote-card',
-        order: SECRETARY_QUOTE_CARD_SECTION_ORDER, // 宿主最后一节（10200 部署人格后缀）之后：整段提示的最末
-        text: (context: any) => {
-          const sessionId = String(context?.agent?.session?.id ?? '')
-          if (sessionId === '' || sessionId !== activeSessionId) return ''
-          const record = quoteState[sessionId]
-          if (record === undefined) return ''
-          if (!quoteAlive(record)) {
-            delete quoteState[sessionId]
-            void persistQuoteState().catch(() => void 0)
-            return ''
-          }
-          return secretaryQuoteCardBlockText(record)
-        },
-      })
-    }
-  } catch {
-    offQuoteCardSection = undefined
-  }
+  // 引用「结构化卡块」段（2026-11-25 第 2 次修法的系统提示段）已在本轮撤掉：
+  // 17:51 那轮现场证明「10250 排在整段系统提示最末」仍不服从（模型答成最近那条毕设任务），
+  // 卡正文改由 agent/pre-step 直接拼进本轮用户消息本体（spliceQuoteIntoUserMessage）。
+  // 同一张卡只留一个载体，避免两套措辞互相打架。
 
   return () => {
     try { offToolGate?.() } catch {}
@@ -1095,7 +1136,6 @@ export function registerAssistantSecretary(ctx: any): () => void {
     try { if (typeof offVoiceInput === 'function') offVoiceInput() } catch {}
     try { if (typeof offQuoteSection === 'function') offQuoteSection() } catch {}
     try { if (typeof offQuoteAnchorSection === 'function') offQuoteAnchorSection() } catch {}
-    try { if (typeof offQuoteCardSection === 'function') offQuoteCardSection() } catch {}
     try { routes.dispose() } catch {}
   }
 }
@@ -1342,7 +1382,8 @@ export const assistantSecretaryTestSurface = {
   ASSISTANT_SECRETARY_QUOTE_ROUTE,
   SECRETARY_QUOTE_SECTION_ORDER,
   SECRETARY_QUOTE_ANCHOR_SECTION_ORDER,
-  SECRETARY_QUOTE_CARD_SECTION_ORDER,
+  QUOTE_MESSAGE_BLOCK_OPEN,
+  spliceQuoteIntoUserMessage,
   QUOTE_TTL_MS,
   QUOTE_PREVIEW_MAX_CHARS,
   QUOTE_BODY_MAX_CHARS,

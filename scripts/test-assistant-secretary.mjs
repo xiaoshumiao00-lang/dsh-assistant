@@ -820,11 +820,12 @@ cases.push(['引用锚点段与既有段互不干扰：语音输入(1785)、派�
   assert.ok(surface.SECRETARY_QUOTE_ANCHOR_SECTION_ORDER > surface.SECRETARY_QUOTE_SECTION_ORDER, '锚点段要比引用登记段更靠近这条用户消息')
 }])
 
-// ── 2026-11-25 第 2 次实报「引用不生效」：软约束不够，必须把被引用卡结构化并入本轮 prompt ──
-// 现场证据（报告 secretary-quote-miss-2-20261125.md）：602 轮 prompt 里 1783 + 1791 两段都在、内容也对，
-// 模型仍把「这个任务完成了吗」接到最近那条引用修复任务上；603 轮则连引用段都没有（这条消息压根没登记）。
-// 所以这一条钉住硬手段：有活引用 → 系统提示最末必须有一块「本轮必须回答的卡」，含卡正文全文与附件表示。
-cases.push(['引用结构化卡块（第 2 次报障硬手段）：有活引用时本轮 prompt 最末产出「本轮必须回答的卡」，含全文（不截 600）+ 附件 + 三条禁令', async () => {
+// ── 2026-11-25 第 3 次修法：把被引用卡的正文**拼进本轮用户消息本体**，不再只放系统提示 section ──
+// 现场证据（报告 secretary-quote-miss-3-20261125.md）：17:51 那轮 10250「本轮必须回答的卡」硬段确实在
+// （全文 + 附件 + 三条禁令），模型仍答成最近那条毕设任务 ⇒ 系统提示 section 不够，模型不服从。
+// 宿主唯一合法的改写点：agent/pre-step waterfall（dsh-agent-loop/lib/index.js:699-711）把 messages 交出来，
+// 返回的 decision.messages 就是会被 append 成 user/message 的那批（同文件 :873-880），所以这里改的是**本体**。
+cases.push(['引用卡正文拼进用户消息本体（第 3 次报障修法）：卡正文全文 + 四条硬指令贴在用户原话之后、同一条消息里相邻', async () => {
   const cardRoot = mkdtempSync(join(tmpdir(), 'assistant-secretary-quote-card-'))
   const cardServer = fakeServer()
   const cardSections = []
@@ -881,44 +882,91 @@ cases.push(['引用结构化卡块（第 2 次报障硬手段）：有活引用�
     assert.equal(marked.json.quote.body, longBody, '宿主要把卡正文全文原样存下来（不许按 600 摘录截）')
     assert.equal(marked.json.quote.attachments.length, 1, '附件信息要一起存下来')
 
-    const cardSection = cardSections.find((item) => item.name === 'assistant:secretary-card-quote-card')
-    assert.ok(cardSection, '没注册 assistant:secretary-card-quote-card 段——有引用时本轮 prompt 里没有被引用卡的结构化块，这就是「软约束不够」那条失效现场')
-    assert.equal(cardSection.order, surface.SECRETARY_QUOTE_CARD_SECTION_ORDER, '结构化卡块的位置要有导出常量')
-    assert.ok(cardSection.order > surface.SECRETARY_QUOTE_ANCHOR_SECTION_ORDER, '结构化卡块必须比 1791 锚点段更靠近这条用户消息')
-    assert.ok(cardSection.order > 10200 && cardSection.order < 11000, `结构化卡块要排在宿主最后一节（部署人格后缀 10200）之后、整段系统提示的最末，实际 ${cardSection.order}`)
+    // 本轮（2026-11-25 第 3 次）：卡正文必须拼进**本轮用户消息本体**，不再是系统提示里的一段说明。
+    // 旧实现（10250 系统提示段）在这一批断言上 FAIL：decision.messages 一个字节都不变，正文只在 system section 里。
+    const userMessage = {
+      id: 'user-message-quote-1',
+      role: 'user',
+      source: { kind: 'user' },
+      content: [{ type: 'text', text: '这个任务完成了吗？' }],
+    }
+    const decision = await cardPreStep(
+      { agent: { session }, turn: 601, step: 1, messages: [userMessage] },
+      async () => ({ kind: 'enter', messages: [userMessage] }),
+    )
+    assert.equal(decision.kind, 'enter', '引用注入不许把这一轮拦掉')
+    assert.equal(decision.messages.length, 1, '卡正文要拼进这条用户消息本体：不许另起一条消息、inbox 长度不变')
+    const spliced = decision.messages[0]
+    assert.equal(spliced.id, userMessage.id, '拼装后必须保持原消息 id（同一身份，不许换一条消息）')
+    const splicedText = spliced.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n')
+    assert.ok(splicedText.includes(longBody), '卡正文全文必须出现在这条用户消息本体里（不是 system section，也不许截成 600 字）')
+    assert.ok(splicedText.startsWith('这个任务完成了吗？'), '用户原话必须原样留在最前面（卡片预览/朗读口径不动）')
+    assert.ok(splicedText.indexOf(longBody) > splicedText.indexOf('这个任务完成了吗？'), '卡正文要贴在用户原话后面、同一条消息里连续相邻')
+    assert.ok(splicedText.includes('user:13:input-message620571e4-fd4b-418f-952f-1aec0512b770'), '拼装块必须点名被引用卡的 cardKey')
+    assert.ok(splicedText.includes('轮次 584') && splicedText.includes('用户消息卡'), '拼装块要写清轮次与卡片种类')
+    assert.ok(splicedText.includes('卡正文最后一句。'), '卡正文末尾那句必须在（说明没有按摘录上限截断）')
+    assert.ok(splicedText.includes('image.png'), '拼装块必须带上卡里的附件名')
+    assert.ok(/图片本体没有随/.test(splicedText), '附件口径要写明图片本体没有随引用注入（不许假装看过图）')
+    // 用户要求写死的四条硬指令：① 优先级最高 ② 忽略无关最近上下文 ③ 禁止多候选自选 ④ 模糊指代指向引用卡
+    assert.match(splicedText, /优先级最高/, '必须写明这张引用卡优先级最高')
+    assert.match(splicedText, /本轮回答必须针对它/, '必须写明本轮回答必须针对这张卡')
+    assert.match(splicedText, /忽略与引用无关的最近对话上下文/, '必须写明忽略与引用无关的最近上下文')
+    assert.match(splicedText, /待办提醒/, '忽略清单要包含待办提醒')
+    assert.match(splicedText, /不许把本条消息接到最近那条派活/, '必须禁止把本条消息接到最近那条派活上')
+    assert.match(splicedText, /不许接到最近那条系统通知/, '必须禁止接到最近那条系统通知上')
+    assert.match(splicedText, /禁止在多个候选/, '必须禁止在多个候选里自选')
+    assert.match(splicedText, /模糊指代[^。]*一律指向/, '必须写明模糊指代一律指向引用卡')
+    assert.match(splicedText, /唯一/, '必须写明这张卡是本轮回复的唯一对象')
+    assert.match(splicedText, /不改变任何派活与工具规则/, '引用块只说明回答哪张卡，不改派活与工具规则')
 
-    const block = cardSection.text({ agent: { session } })
-    assert.ok(block !== '', '本会话这条引用活着时结构化卡块必须有字')
-    assert.ok(block.startsWith('# 本轮必须回答的卡'), '卡块要有固定标题，便于逐轮核对')
-    assert.ok(block.includes('user:13:input-message620571e4-fd4b-418f-952f-1aec0512b770'), '卡块必须点名被引用卡的 cardKey')
-    assert.ok(block.includes('轮次 584') && block.includes('用户消息卡'), '卡块要写清轮次与卡片种类')
-    // 全文口径：600 字以后的正文必须在，且整段一字不差
-    assert.ok(block.includes(longBody), '卡块必须带被引用卡的正文全文（不许截成 600 字摘录）')
-    assert.ok(block.includes('卡正文最后一句。'), '卡正文末尾那句必须在（说明没有按摘录上限截断）')
-    assert.ok(!block.includes('…'), '卡正文全文里不许出现摘录省略号')
-    // 附件表示
-    assert.ok(block.includes('image.png'), '卡块必须带上卡里的附件名')
-    assert.ok(block.includes('附件'), '卡块要有一段附件说明')
-    assert.ok(/图片本体没有随/.test(block), '附件口径要写明图片本体没有随引用注入（不许假装看过图）')
-    // 三条禁令
-    assert.match(block, /不许把本条消息接到最近那条派活/, '必须禁止把本条消息接到最近那条派活上')
-    assert.match(block, /不许接到最近那条系统通知/, '必须禁止接到最近那条系统通知上')
-    assert.match(block, /不许在多个候选任务里自己挑/, '必须禁止在多个候选里自选')
-    assert.match(block, /唯一对象|唯一/, '必须写明这张卡是本轮回复的唯一对象')
-    assert.match(block, /不改变任何派活与工具规则/, '引用块只说明回答哪张卡，不改派活与工具规则')
+    // 只喂这一条会话：别的会话 pre-step 一个字都不许多
+    const otherUser = { id: 'user-message-other', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '别的会话的消息' }] }
+    const otherDecision = await cardPreStep(
+      { agent: { session: { id: 'session-other-9' } }, turn: 601, step: 1, messages: [otherUser] },
+      async () => ({ kind: 'enter', messages: [otherUser] }),
+    )
+    assert.equal(otherDecision.messages[0].content[0].text, '别的会话的消息', '别的会话不许沾到这条引用')
 
-    // 只喂这一条会话；没有引用 → 空串；吃掉一轮 → 一起收掉
-    assert.equal(cardSection.text({ agent: { session: { id: 'session-other-9' } } }), '', '别的会话不许沾到结构化卡块')
-    assert.equal(cardSection.text({ agent: { session: { id: '' } } }), '', '没有会话 id 时卡块必须空')
-    assert.equal(surface.secretaryQuoteCardBlockText(null), '', '没有引用时卡块纯函数回空串')
+    // 通知批次不许拼（判据与 1783 段同一套：插件登记过的通知 id）
+    const noticeId = 'notice-message-quote-card-1'
+    surface.registerNoticeMessageId(noticeId)
+    const noticeMsg = { id: noticeId, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '（系统通知）' }] }
+    const noticeDecision = await cardPreStep(
+      { agent: { session }, turn: 602, step: 1, messages: [noticeMsg] },
+      async () => ({ kind: 'enter', messages: [noticeMsg] }),
+    )
+    assert.equal(noticeDecision.messages[0].content[0].text, '（系统通知）', '通知批次不许被拼进引用卡')
+
+    // 运行时上下文消息排在最后：要拼到真实用户消息上，上下文那块原样不动
+    const ctxMessage = { id: 'runtime-context-1', role: 'user', source: { kind: 'runtime-context' }, content: [{ type: 'text', text: '运行时上下文' }] }
+    const ctxDecision = await cardPreStep(
+      { agent: { session }, turn: 603, step: 1, messages: [userMessage] },
+      async () => ({ kind: 'enter', messages: [userMessage, ctxMessage] }),
+    )
+    assert.ok(ctxDecision.messages[0].content[0].text.includes(longBody), '有运行时上下文时也要拼进真实用户消息')
+    assert.equal(ctxDecision.messages[1].content[0].text, '运行时上下文', '运行时上下文那块一个字都不许改')
+
+    // 纯函数口径
+    assert.equal(surface.secretaryQuoteCardBlockText(null), '', '没有引用时拼装块纯函数回空串')
     const pureBlock = surface.secretaryQuoteCardBlockText({ cardKey: 'notice:14:msg-cu-01', kind: 'notice', turnNo: '', preview: '结论：改了三处。', body: '', attachments: [], refSessionIds: [] })
     assert.ok(pureBlock.includes('系统通知卡') && pureBlock.includes('轮次 未知'), '没有轮次的通知卡要说清轮次未知、种类有中文标签')
     assert.ok(pureBlock.includes('结论：改了三处。'), 'body 为空时退回 preview（通知卡老记录没有全文）')
     assert.ok(pureBlock.includes('这张卡没有附件'), '卡里没附件也要明说，不许留空')
 
-    await cardPreStep({ agent: { session }, messages: [{ id: 'user-message-card-1', text: '这个任务完成了吗？' }] }, async () => null)
+    // 同一张卡只能有一个载体：系统提示里不许再挂「本轮必须回答的卡」段（否则两套互相打架）
+    assert.equal(
+      cardSections.find((item) => item.name === 'assistant:secretary-card-quote-card'),
+      undefined,
+      '系统提示里不许再挂 assistant:secretary-card-quote-card 段：卡正文只走用户消息本体这一条载体',
+    )
+
+    // turn/end 收掉：下一轮同一批 pre-step 不许再拼（引用一次性语义）
     cardSessionEvent(session, { type: 'turn/end' })
-    assert.equal(cardSection.text({ agent: { session } }), '', '吃掉一轮以后结构化卡块也要收掉（不许留着误导下一轮）')
+    const afterEnd = await cardPreStep(
+      { agent: { session }, turn: 604, step: 1, messages: [userMessage] },
+      async () => ({ kind: 'enter', messages: [userMessage] }),
+    )
+    assert.equal(afterEnd.messages[0].content[0].text, '这个任务完成了吗？', '引用吃掉一轮后在 turn/end 收掉：下一轮不许再拼进用户消息')
   } finally {
     try { disposeCard() } catch {}
     rmSync(cardRoot, { recursive: true, force: true })
