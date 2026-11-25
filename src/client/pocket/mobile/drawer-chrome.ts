@@ -27,8 +27,9 @@ export const FRAME_MARKER_ATTR = 'data-mobile-nav'
 /** The official overlay layer that hosts the backdrop / FAB / hamburger. */
 export const OVERLAY_SELECTOR = '[data-shell-overlay]'
 /**
- * 抽屉右上角的收起按钮（我们自己的状态机）：点它只调 closeDrawer()，绝不调宿主
- * toggleSidebar() —— 后者会把侧栏折成 48px 图标 rail，抽屉里就没有列表了。
+ * 抽屉右上角的收起按钮（我们自己的状态机）：点它只调 closeDrawer()，不直接碰宿主
+ * toggleSidebar()。抽屉模式下 closeDrawer 会经「对账」把官方侧栏收回收起——那只是把
+ * 抽屉滑回屏外（宿主 visibility 延迟到动画播完才 hidden），不是 ≥768px 的图标 rail。
  * CSS/测试都只认这个属性，不认宿主每次构建都变的哈希类名。
  */
 export const DRAWER_CLOSE_SELECTOR = '[data-mobile-nav="drawer-close"]'
@@ -68,8 +69,15 @@ const CLOSE_ICON =
 
 export interface DrawerChromeOptions {
   findFrame: () => HTMLElement | null
-  /** Upgrade the official collapsed rail into the full menu (never downgrade). */
+  /** 抽屉模式下把官方侧栏从收起升成展开（开抽屉时同步补做 + 对账兜底）。 */
   expandSidebar?: () => void
+  /**
+   * 抽屉模式下把官方侧栏从展开收回收起（关抽屉时的对账）。
+   * 只在 frame 带 data-sidebar-drawer 时才会被调：抽屉模式里「收起」只是把抽屉
+   * 滑回屏外（宿主规则 visibility 延迟到滑出动画播完才 hidden），不是 ≥768px 的
+   * 图标 rail —— rail 那条老纪律（绝不替用户折 rail）不受影响。
+   */
+  collapseSidebar?: () => void
   labels: { menu: string; sessionLog: string; close?: string }
   onDownloadSessionLog?: () => void
   /** 一次开抽屉的打点：ms = 点击到「那一帧真的开始滑」；upgrade = 这次是否补做了宿主升级。 */
@@ -134,6 +142,12 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
   let preUpgraded = false
   let preUpgradeTimer: ReturnType<typeof setTimeout> | null = null
   let willChangeTimer: ReturnType<typeof setTimeout> | null = null
+  /** 官方开合对账：延迟到当前事件派发完之后做（躲开宿主 selectPanel / Escape 的同步翻转）。 */
+  let reconcileTimer: ReturnType<typeof setTimeout> | null = null
+  /** 对账兜底次数上限：宿主不理会时不能每 400ms 空转到天荒地老。 */
+  let reconcileAttempts = 0
+  const RECONCILE_RETRY_MS = 400
+  const RECONCILE_MAX_ATTEMPTS = 3
 
   const win: any = options.win ?? (globalThis as any).window
   const nowMs = (): number =>
@@ -160,6 +174,39 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
     if (backdrop !== null) backdrop.style.display = open ? 'block' : 'none'
     syncCloseButton()
     writeDrawerPref(open, storage)
+    reconcileAttempts = 0
+    scheduleReconcile(0)
+  }
+
+  /**
+   * 抽屉模式的铁律：**官方侧栏展开 ⟺ 我们的抽屉开着**。
+   * 宿主 AppFrame 在 drawerOpen（= drawer && !collapsed）时给主内容四列打 inert ——
+   * 官方展开而我们的抽屉关着 = 会话详情永久点不动/滑不动（2026-11-25「过一会就卡死」
+   * 的根因：PRE_UPGRADE 在首屏后把官方展开再没收回来；probe4 页面级实锤：摘掉那 4 个
+   * inert 主内容立刻复活，装回去立刻复冻）。
+   * 所以关抽屉必须对称地把官方收回收起。对账延迟到 setTimeout：点会话行时宿主的
+   * selectPanel 也会收起官方（在我们的捕获监听之后才跑），同步对账会跟它抢着翻转。
+   * 非抽屉模式（宽屏强制手机布局，frame 没有 data-sidebar-drawer）绝不对账 ——
+   * 那里收起官方 = 折成图标 rail，归用户自己管。
+   */
+  const reconcileOfficial = (): void => {
+    reconcileTimer = null
+    if (disposed || frame === null) return
+    if (!frame.hasAttribute('data-sidebar-drawer')) return
+    const expanded = !frame.hasAttribute(OFFICIAL_COLLAPSED_ATTR)
+    if (expanded === open) return
+    const act = open ? options.expandSidebar : options.collapseSidebar
+    if (act === undefined) return
+    try {
+      act()
+    } catch { /* 对账失败不致命：下一次状态变化再对 */ }
+    reconcileAttempts += 1
+    if (reconcileAttempts < RECONCILE_MAX_ATTEMPTS) scheduleReconcile(RECONCILE_RETRY_MS)
+  }
+  const scheduleReconcile = (delayMs: number): void => {
+    if (disposed) return
+    if (reconcileTimer !== null) clearTimeout(reconcileTimer)
+    reconcileTimer = setTimeout(reconcileOfficial, delayMs)
   }
 
   /** 抽屉那一列（frame 的第一个网格子元素）：CSS 的 transform 过渡打在它身上。 */
@@ -334,10 +381,17 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
    * 首屏之后主动做一次官方升级（图标 rail → 完整列表）。
    * 原来这次重渲染挂在第一次点汉堡上：手机上要等 AppFrame 换列 + SidebarRoot 重挂载 +
    * 会话列表重建（几百毫秒）才开始滑 —— 就是「点左侧菜单有点慢」的根因。
+   *
+   * 但**抽屉模式（宿主 <768px）下必须跳过**：那里 SidebarRoot 的 wide=drawer 恒为真，
+   * 会话列表本来就常驻挂载，没有「rail → 列表」的重建要预热；这时把官方侧栏展开
+   * 等于替用户打开了一个永不关闭的宿主 modal —— AppFrame 给主内容四列打上 inert，
+   * 而我们的抽屉是关着的，于是会话详情「过一会就卡死」（2026-11-25 报障根因）。
+   * 非抽屉模式（宽屏强制手机布局）保留原行为：那次 rail → 列表的重建是真的贵。
    */
   const armPreUpgrade = (): void => {
     if (preUpgraded || disposed) return
     if (frame === null) return
+    if (frame.hasAttribute('data-sidebar-drawer')) { preUpgraded = true; return }
     if (!frame.hasAttribute(OFFICIAL_COLLAPSED_ATTR)) { preUpgraded = true; return }
     preUpgraded = true
     preUpgradeTimer = setTimeout(() => {
@@ -554,6 +608,10 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
       armPreUpgrade()
       /* 抽屉列是宿主 React 渲染的：壳层晚于抽屉挂上时，收起按钮在这里补一次。 */
       syncCloseButton()
+      /* chrome 可能是重挂载（上一个实例留下「官方展开 + 抽屉关着」的冻结尾场）：
+         就位后先对一次账，把主内容从宿主 inert 里解放出来。 */
+      reconcileAttempts = 0
+      scheduleReconcile(0)
       return
     }
     armOverlayWaiter()
@@ -597,6 +655,7 @@ export function mountDrawerChrome(options: DrawerChromeOptions): () => void {
     releaseOverlayWaiter()
     if (preUpgradeTimer !== null) { clearTimeout(preUpgradeTimer); preUpgradeTimer = null }
     if (willChangeTimer !== null) { clearTimeout(willChangeTimer); willChangeTimer = null }
+    if (reconcileTimer !== null) { clearTimeout(reconcileTimer); reconcileTimer = null }
     tapStart = null
     try {
       const column = drawerColumn()

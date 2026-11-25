@@ -258,9 +258,11 @@ export function mobileApply(ctx): void {
 
   // 抽屉开合自持（改造 #1/#5）：一个控制器，三个入口（会话头汉堡、浮动按钮、
   // 左边缘手势）共用同一份状态。marker（data-dshp-drawer）+ localStorage
-  // （dsh-pocket.drawer）都是我们自己的；官方 layout store 只在"把只剩图标的
-  // rail 升成完整菜单列表"时调一次 layout 服务上的 toggleSidebar，绝不降回收起 ——
-  // 桌面端那个开关归用户自己，我们不去抢，也不需要它来表达开合。
+  // （dsh-pocket.drawer）都是我们自己的；官方 layout store 只在抽屉模式下跟随
+  // 我们的开合作对称翻转：开 = 展开官方侧栏（宿主 modal 开、主内容 inert 是
+  // 抽屉开着时的正常行为），关 = 收回收起（主内容立刻解冻）。抽屉模式的「收起」
+  // 只是把抽屉滑回屏外，不是 ≥768px 的图标 rail；非抽屉模式（宽屏强制手机布局）
+  // 仍恪守老纪律：只升不降，桌面那个开关归用户自己。
   // 注意：构造控制器不碰 DOM（drawer-state.mjs 里 findFrame 只在调用时解析），
   // mobileApply 跑得比 AppFrame 挂载早，构造期查 DOM 必然拿到 null。
   const drawer = createDrawerController({
@@ -312,6 +314,16 @@ export function mobileApply(ctx): void {
         ctx.layout?.toggleSidebar?.()
       } catch (error) {
         reportMobileError('expandSidebar', error)
+      }
+    },
+    /* 关抽屉的对称另一半：抽屉模式下把官方侧栏收回收起（drawer-chrome 的对账
+       只在 frame 带 data-sidebar-drawer 且官方仍展开时调它；宿主 toggleSidebar
+       是盲翻转，方向由对账前的属性判据保证）。 */
+    collapseSidebar: () => {
+      try {
+        ctx.layout?.toggleSidebar?.()
+      } catch (error) {
+        reportMobileError('collapseSidebar', error)
       }
     },
     labels: {
