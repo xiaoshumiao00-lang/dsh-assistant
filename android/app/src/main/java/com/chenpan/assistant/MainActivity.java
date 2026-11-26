@@ -6,9 +6,11 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
 import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
@@ -514,17 +516,160 @@ public class MainActivity extends Activity {
         fileCallback = null;
     }
 
+    // ---------------------------------------------------------------- 下载
+
+    /**
+     * 秘书回复卡的附件（docx 等）点开后落到这里。
+     *
+     * 2026-11-26 真机 bug「点了 Word 之后通知栏一直正在下载、既打不开也看不到」的根因：
+     * DownloadManager 是**系统下载器**，它不会继承 WebView 的 cookie 罐；而本机 pocket 代理
+     * （转发到 DSH 3081）对没有凭证的请求一律回 401。离线实测（同一份 1,605,373 字节的 docx、
+     * 同一个公网入口 http://***REMOVED***/api/worktable/file）：
+     *   不带 cookie → HTTP/1.1 401、body `{"error":"unauthorized"}`（24 字节、chunked、**无 content-length**）；
+     *   带上 pocket 凭证（`?token=` 与 `dsh_pocket_token` cookie 同一道闸）→ 200 + content-length: 1605373 + 完整 1,605,373 字节。
+     * 401 既没有内容长度、又是 chunked + keep-alive，下载器拿不到大小也没处可写，通知栏就停在 0% 不动。
+     * 所以这里必须把 CookieManager 里该 URL 的 cookie 原样塞进下载请求。
+     */
     private void startDownload(String url, String contentDisposition, String mimeType) {
+        String name = "";
         try {
-            String name = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType);
+            name = fileNameFor(url, contentDisposition, mimeType);
             DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
+            // 唯一必需的一条：没有它代理层直接 401，下载永远到不了 100%
+            String cookies = CookieManager.getInstance().getCookie(url);
+            if (!TextUtils.isEmpty(cookies)) {
+                req.addRequestHeader("Cookie", cookies);
+                req.addRequestHeader("Referer", originOf(url) + "/");
+            }
+            // UA 也照搬 WebView 的：pocket 代理按 UA 判「手机首屏」，系统下载器的默认 UA 不是它
+            if (web != null) {
+                String ua = web.getSettings().getUserAgentString();
+                if (!TextUtils.isEmpty(ua)) req.addRequestHeader("User-Agent", ua);
+            }
+            if (!TextUtils.isEmpty(mimeType) && !"application/octet-stream".equalsIgnoreCase(mimeType)) {
+                req.setMimeType(mimeType);
+            }
             req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            req.setVisibleInDownloadsUi(true);
             req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
             DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
-            if (dm == null) throw new IllegalStateException("no DownloadManager");
-            dm.enqueue(req);
-            } catch (Throwable t) {
-            toast("这个文件要到电脑上下载");
+            if (dm == null) throw new IllegalStateException("没有 DownloadManager");
+            watchDownload(dm.enqueue(req), name);
+        } catch (Throwable t) {
+            // 逐字说明为什么没起来：旧文案「这个文件要到电脑上下载」把真因（鉴权/空间/文件名）全盖住了
+            String why = t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
+            toast("下载没起来：" + why + "\n文件：" + name);
+        }
+    }
+
+    /**
+     * 下载落盘用的文件名：优先 RFC 5987 的 `filename*=UTF-8''…`，其次退回 URLUtil.guessFileName。
+     *
+     * 为什么不能直接信 guessFileName：它只认 `filename=`，而宿主同时给了 ASCII 兜底
+     * `filename="___________2026-2027-1 _____-_______.docx"`（实测响应头就是这样），
+     * 于是中文名会被一串下划线顶掉——文件下到「下载」里也认不出来。
+     */
+    private String fileNameFor(String url, String contentDisposition, String mimeType) {
+        String fallback = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType);
+        try {
+            if (contentDisposition != null) {
+                java.util.regex.Matcher m = java.util.regex.Pattern
+                        .compile("filename\\*\\s*=\\s*UTF-8''([^;]+)", java.util.regex.Pattern.CASE_INSENSITIVE)
+                        .matcher(contentDisposition);
+                if (m.find()) {
+                    String decoded = java.net.URLDecoder.decode(m.group(1).trim(), "UTF-8");
+                    // 落盘名不许带路径分隔符（否则 setDestinationInExternalPublicDir 会抛异常，下载直接起不来）
+                    String safe = decoded.replace('\\', '_').replace('/', '_').replace(':', '_').trim();
+                    if (!safe.isEmpty()) return safe;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 解析失败就用 guessFileName 的兜底名，绝不因此让下载失败
+        }
+        return TextUtils.isEmpty(fallback) ? "download" : fallback;
+    }
+
+    /** 正在等结果的那次下载（只认自己 enqueue 的 id，别去吵系统里别人的下载）。 */
+    private long pendingDownloadId = -1;
+    private String pendingDownloadName = "";
+    private BroadcastReceiver downloadReceiver;
+
+    /**
+     * 下载结果回调。此前失败只留在系统通知里（而且卡在「正在下载」），用户既没有文件也没有错误原因；
+     * 现在成功/失败都会给一句看得见的话。
+     */
+    private void watchDownload(long id, String name) {
+        pendingDownloadId = id;
+        pendingDownloadName = name;
+        if (downloadReceiver != null) return;
+        BroadcastReceiver r = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (intent == null || !DownloadManager.ACTION_DOWNLOAD_COMPLETE.equals(intent.getAction())) return;
+                long done = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1);
+                if (done != pendingDownloadId) return;
+                reportDownload(done, pendingDownloadName);
+            }
+        };
+        IntentFilter filter = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(r, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                registerReceiver(r, filter);
+            }
+            downloadReceiver = r;
+        } catch (Throwable ignored) {
+            // 注册不上只是少一句提示，不影响下载本身
+        }
+    }
+
+    private void reportDownload(long id, String name) {
+        DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+        if (dm == null) return;
+        int status = -1;
+        int reason = -1;
+        android.database.Cursor c = null;
+        try {
+            c = dm.query(new DownloadManager.Query().setFilterById(id));
+            if (c != null && c.moveToFirst()) {
+                status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));
+                reason = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON));
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (c != null) { try { c.close(); } catch (Throwable ignored) { } }
+        }
+        if (status == DownloadManager.STATUS_SUCCESSFUL) {
+            toast("已下载到「下载」：" + name + "\n点通知栏那条可以直接打开");
+        } else {
+            toast("下载失败（" + downloadFailureText(status, reason) + "）\n" + name);
+        }
+    }
+
+    /** DownloadManager 的状态/原因码 → 人话（只翻这条链路上真会遇到的几种）。 */
+    private String downloadFailureText(int status, int reason) {
+        if (status == DownloadManager.STATUS_PAUSED) {
+            return "等待网络，已暂停（code " + reason + "）";
+        }
+        if (status != DownloadManager.STATUS_FAILED) return "状态 " + status;
+        switch (reason) {
+            case DownloadManager.ERROR_INSUFFICIENT_SPACE:
+                return "手机空间不足";
+            case DownloadManager.ERROR_HTTP_DATA_ERROR:
+                return "传输中断";
+            case DownloadManager.ERROR_UNHANDLED_HTTP_CODE:
+                return "服务器回了错误状态（多半是登录态没带上，回页面重开一次）";
+            case DownloadManager.ERROR_TOO_MANY_REDIRECTS:
+                return "跳转太多次";
+            case DownloadManager.ERROR_CANNOT_RESUME:
+                return "不能续传";
+            case DownloadManager.ERROR_FILE_ERROR:
+                return "写文件失败";
+            case DownloadManager.ERROR_UNKNOWN:
+                return "原因不明";
+            default:
+                return "系统下载器报错 code " + reason;
         }
     }
 
@@ -985,6 +1130,10 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         handler.removeCallbacksAndMessages(null);
+        if (downloadReceiver != null) {
+            try { unregisterReceiver(downloadReceiver); } catch (Throwable ignored) { }
+            downloadReceiver = null;
+        }
         if (web != null) {
             web.setWebChromeClient(null);
             web.setWebViewClient(null);
