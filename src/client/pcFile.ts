@@ -1,9 +1,11 @@
 /** 手机端会话输入框「电脑文件」附件的纯逻辑（默认目录、大小、MIME）。
  *  真正读盘由主机 RPC/本地文件路由完成，浏览器只消费字节并交给官方附件管线。 */
 
-/** 与 /api/worktable/file 的读取上限一致；与悬浮球上传的 25 MB 不同，
- *  这里是先下载到手机再交给官方上传，过大文件会明显拖慢手机。 */
-export const PC_FILE_MAX_BYTES = 20 * 1024 * 1024
+/** 与 `/api/worktable/file` 的读取上限同数（服务端那份在 src/index.ts 的 LOCAL_FILE_MAX_BYTES，
+ *  scripts/test-pc-file.mjs 断言两者相等，免得只改一边）。
+ *  2026-11-26 由 20MB 提到 100MB；与悬浮球上传的 25 MB 不同，这里是先下载到手机再交给官方上传，
+ *  100MB 在手机上要占「网络 + 内存」两份，再大就明显拖慢手机。 */
+export const PC_FILE_MAX_BYTES = 100 * 1024 * 1024
 
 /** 会话所在项目文件夹优先；没有 cwd 时返回空串，让主机回退到用户 HOME。 */
 export function pcFileStartPath(cwd: string | null | undefined): string {

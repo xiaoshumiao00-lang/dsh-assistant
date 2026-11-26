@@ -84,6 +84,8 @@ export { secretaryCardsTestSurface } from './client/pocket/orb/secretary-cards.t
 export { secretarySpeechPipelineTestSurface } from './client/pocket/orb/secretary-speech-pipeline.ts'
 /** 本地文件路由的 content-disposition 口径（inline/attachment + RFC 5987 中文名，node 可单测） */
 export { fileDispositionTestSurface } from './file-disposition'
+/** 本地文件路由本体：100MB 上限 + 流式发送（供 scripts/test-local-file-route.mjs 离线直接喂假 req/res） */
+export { localFileRouteTestSurface, LOCAL_FILE_MAX_BYTES } from './index'
 /** 目录 allowlist 与终端环境变量（供 scripts/test-path-guard.mjs 直接验） */
 export { expandHome, defaultAllowedRoots, createPathGuard, minimalTermEnv, isDirectory } from './path-guard'
 /** turn-guard 的判定与状态函数（供 scripts/test-turn-guard.mjs 直接验） */

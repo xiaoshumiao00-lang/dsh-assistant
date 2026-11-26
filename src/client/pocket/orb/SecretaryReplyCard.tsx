@@ -405,7 +405,7 @@ export function useSecretaryReadState(sessionId: string): { isRead: (key: string
 
 /**
  * 附件大小（文件条右端那行）：只发 HEAD 问响应头，宿主 /api/worktable/file 已支持 HEAD + content-length，
- * 不把 20MB 正文读回来。同一地址只问一次（模块级缓存，重渲染/翻页回来不再发请求）；
+ * 不把整份（上限 100MB）正文读回来。同一地址只问一次（模块级缓存，重渲染/翻页回来不再发请求）；
  * 拿不到大小（接口报错、老宿主没有 HEAD）就不显示，绝不写 0 B 误导人。
  */
 const attachSizeCache = new Map<string, string>()

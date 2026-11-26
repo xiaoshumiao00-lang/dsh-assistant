@@ -394,6 +394,80 @@ async function listSkills(ctx: any, cwd: string): Promise<{ skills: SkillEntry[]
   return { skills: scanned.skills, source: 'scan', skipped: scanned.skipped }
 }
 
+/**
+ * 只读文件路由（`/api/worktable/file`）的单文件上限。
+ *
+ * 2026-11-26 由 20MB 提到 100MB（用户需求）：手机端「电脑文件」附件条与秘书回复卡的图片/附件
+ * 都走这条路由，20MB 连一份带图的 Word/PDF 都可能被挡。客户端那份在 `src/client/pcFile.ts`
+ * （PC_FILE_MAX_BYTES），必须与这里同数——`scripts/test-pc-file.mjs` 断言两者相等。
+ */
+export const LOCAL_FILE_MAX_BYTES = 100 * 1024 * 1024
+
+/**
+ * 只读文件路由的处理器（拆成工厂：`scripts/test-local-file-route.mjs` 能直接喂假 req/res，不必启动宿主）。
+ *
+ * 发送方式：stat → 写头（content-length / content-disposition）→ `createReadStream` 流式 pipe，
+ * 不再 readFile 整份进内存。100MB + 手机慢读实测峰值 RSS：readFile 324.7MB → 流式 101.8MB。
+ *
+ * 约定：
+ *   - content-length 用 stat.size，并把流的 end 钉在 size-1：读的过程中文件变大也不会多吐字节；
+ *   - HEAD 仍然只 stat 不给正文（卡片文件条只问大小）；
+ *   - 客户端中途断开 → destroy 流，不留 fd；头已发出后流报错只能 destroy 连接（无法再改状态码）；
+ *   - 目录/不存在仍回 404，`denyOutside` 的目录边界判定一字未动。
+ */
+export function createLocalFileHandler(deps: {
+  denyOutside: (res: any, rawPath: string, routeName: string) => boolean
+  logger?: any
+}): (req: any, res: any) => Promise<void> {
+  const { denyOutside, logger } = deps
+  return async (req: any, res: any) => {
+    try {
+      const u = new URL(req.url ?? '/', 'http://dsh.internal')
+      const p = u.searchParams.get('path') || ''
+      if (!p) { json(res, 400, { error: 'missing path' }); return }
+      if (denyOutside(res, p, 'file')) return
+      const abs = pathResolve(p)
+      const fsp = await import('node:fs/promises')
+      const stat = await fsp.stat(abs)
+      if (!stat.isFile()) { json(res, 404, { error: 'not a file' }); return }
+      if (stat.size > LOCAL_FILE_MAX_BYTES) {
+        logger?.warn?.(`[${PLUGIN_SELF}] file 超上限拒绝：${stat.size} 字节 > ${LOCAL_FILE_MAX_BYTES}（${abs}）`)
+        json(res, 413, { error: 'file too large', maxBytes: LOCAL_FILE_MAX_BYTES })
+        return
+      }
+      const ext = (abs.split('.').pop() || '').toLowerCase()
+      const headers = {
+        'content-type': FILE_TYPES[ext] ?? 'application/octet-stream',
+        'content-length': String(stat.size),
+        'content-disposition': contentDispositionHeaderFor(abs),
+        'cache-control': 'no-store',
+      }
+      // 只要响应头（卡片上的附件条问大小）：不读文件正文
+      if (String(req.method ?? 'GET').toUpperCase() === 'HEAD') {
+        res.writeHead(200, headers)
+        res.end()
+        return
+      }
+      if (stat.size === 0) { res.writeHead(200, headers); res.end(); return }
+      // 先 open 再写头：文件刚好被删/没权限时还能干净地回 404，而不是发出 200 再断流
+      const handle = await fsp.open(abs, 'r')
+      const body = handle.createReadStream({ start: 0, end: stat.size - 1, autoClose: true })
+      body.on('error', () => { try { res.destroy() } catch { /* 已断开 */ } })
+      res.on('close', () => { if (!body.destroyed) body.destroy() })
+      try {
+        res.writeHead(200, headers)
+      } catch (err) {
+        body.destroy()   // writeHead 失败（连接已断）也要收掉 fd
+        throw err
+      }
+      body.pipe(res)
+    } catch (err) {
+      // 头已发出（流中途出错）时 json() 会抛 ERR_HTTP_HEADERS_SENT：此时连接已由上面 destroy
+      try { json(res, 404, { error: String(err) }) } catch { try { res.destroy() } catch { /* 已断开 */ } }
+    }
+  }
+}
+
 export function apply(ctx: Context) {
   const server = (ctx as any).webServer
   if (!server) {
@@ -449,40 +523,13 @@ export function apply(ctx: Context) {
   //   - 图片 / pdf / svg / 文本 → inline，标签页里直接看；
   //   - docx / xlsx / pptx / zip 等其余 → attachment + 文件名（RFC 5987 带中文名），
   //     手机浏览器这才下载文件、下载完弹系统的「用哪个应用打开」；
-  //   - 顺带给 content-length 并支持 HEAD：卡片上的文件条只问大小，不必把 20MB 文件整份读回来。
-  // 边界（denyOutside 目录 allowlist、20MB 上限）一个字没动。
+  //   - 顺带给 content-length 并支持 HEAD：卡片上的文件条只问大小，不必把整份文件读回来。
+  // 2026-11-26 需求（上限 20MB → 100MB）：常量化 + 改流式发送，处理器见 createLocalFileHandler。
+  // 边界（denyOutside 目录 allowlist）一个字没动。
   webServer.register({
     kind: 'exact',
     path: '/api/worktable/file',
-    handler: async (req: any, res: any) => {
-      try {
-        const u = new URL(req.url ?? '/', 'http://dsh.internal')
-        const p = u.searchParams.get('path') || ''
-        if (!p) { json(res, 400, { error: 'missing path' }); return }
-        if (denyOutside(res, p, 'file')) return
-        const abs = pathResolve(p)
-        const stat = await import('node:fs/promises').then((m) => m.stat(abs))
-        if (stat.size > 20 * 1024 * 1024) { json(res, 413, { error: 'file too large' }); return }
-        const ext = (abs.split('.').pop() || '').toLowerCase()
-        const headers = {
-          'content-type': FILE_TYPES[ext] ?? 'application/octet-stream',
-          'content-length': String(stat.size),
-          'content-disposition': contentDispositionHeaderFor(abs),
-          'cache-control': 'no-store',
-        }
-        // 只要响应头（卡片上的附件条问大小）：不读文件正文
-        if (String(req.method ?? 'GET').toUpperCase() === 'HEAD') {
-          res.writeHead(200, headers)
-          res.end()
-          return
-        }
-        const data = await readFile(abs)
-        res.writeHead(200, headers)
-        res.end(data)
-      } catch (err) {
-        json(res, 404, { error: String(err) })
-      }
-    },
+    handler: createLocalFileHandler({ denyOutside, logger: ctx.logger }),
   })
 
   // 本地站点（目录级静态托管）：点开 index.html 时挂载整个所在目录，
@@ -734,3 +781,7 @@ export function apply(ctx: Context) {
     throw err
   }
 }
+
+/** 供 scripts/test-local-file-route.mjs 离线验「100MB 上限 + 流式发送」 */
+export const localFileRouteTestSurface = { LOCAL_FILE_MAX_BYTES, createLocalFileHandler }
+

@@ -1,6 +1,7 @@
 /** 手机端会话「电脑文件」附件纯逻辑回归：node scripts/test-pc-file.mjs */
 import assert from 'node:assert/strict'
 import { PC_FILE_MAX_BYTES, hoistPcFileMenuItem, isPcFileTooLarge, pcFileMime, pcFileStartPath, sessionCwdOf } from '../src/client/pcFile.ts'
+import { localFileRouteTestSurface } from '../lib/index.js'
 
 const cases = []
 
@@ -24,9 +25,12 @@ cases.push(['会话行 cwd 支持顶层/投影两种宿主形状', () => {
   assert.equal(sessionCwdOf(null), '')
 }])
 
-cases.push(['20MB 边界：等于上限可传，超过 1 字节即拒绝', () => {
+cases.push(['100MB 边界：等于上限可传，超过 1 字节即拒绝，且与服务端同数', () => {
+  assert.equal(PC_FILE_MAX_BYTES, 100 * 1024 * 1024, '2026-11-26 由 20MB 提到 100MB')
+  assert.equal(PC_FILE_MAX_BYTES, localFileRouteTestSurface.LOCAL_FILE_MAX_BYTES, '客户端上限必须与 /api/worktable/file 同数')
   assert.equal(isPcFileTooLarge(PC_FILE_MAX_BYTES), false)
   assert.equal(isPcFileTooLarge(PC_FILE_MAX_BYTES + 1), true)
+  assert.equal(isPcFileTooLarge(20 * 1024 * 1024 + 1), false, '20MB 附近不再被拦')
   assert.equal(isPcFileTooLarge(0), false)
   assert.equal(isPcFileTooLarge(undefined), false)
   assert.equal(isPcFileTooLarge(Number.NaN), false)
