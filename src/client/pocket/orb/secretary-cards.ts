@@ -34,6 +34,9 @@
  *      `noteLatestUserCard`（真实用户消息发出去即吃引用）、TTL 到期自己排定时器收、
  *      以及 `quoteChipParts` 那三段文案（轮次 + 卡片种类 + 正文开头一小段）。渲染落在
  *      src/client/pocket/orb/SecretaryQuoteChip.tsx（宿主 `conversation.input.right` 槽位）。
+ *  13. 附件标记（2026-11-26）：`[[attach:<绝对路径>|<显示名>]]` → parseAttachRefs / stripAttachRefs，
+ *      秘书回复卡把它渲染成缩略图或文件条（图片点开走 /api/worktable/file 的 inline，docx 等走
+ *      attachment 下载后由手机选「打开方式」），展示与朗读都剔除这串标记（见 §2.6）。
  */
 
 import {
@@ -113,7 +116,8 @@ export function stripSessionRefs(text: string): string {
 
 /** 把卡片正文整理成适合朗读的纯文本（纯函数，单测直接验）。 */
 export function normalizeForSpeech(raw: string): string {
-  let text = stripSessionRefs(String(raw ?? ''))
+  // 会话引用与附件标记都不能念出来（附件标记里是 Windows 绝对路径，念出来就是一串字母数字）
+  let text = stripSessionRefs(stripAttachRefs(String(raw ?? '')))
   // 代码块 / 行内代码：直接去掉围栏，保留内容
   text = text.replace(/```[\s\S]*?```/g, ' ')
   text = text.replace(/`([^`]*)`/g, '$1')
@@ -343,6 +347,101 @@ export function parseSessionRefs(raw: string): SessionRef[] {
     if (sessionId !== '') out.push({ sessionId, title: title === '' ? sessionId : title })
   }
   return out
+}
+
+/** ────────────────────────── 2.6 附件标记 ────────────────────────── */
+
+/**
+ * 附件标记（2026-11-26 需求「回复卡里要能附带图片附件、点开用手机默认程序打开」）：
+ * 秘书交付文件或图片时，在正文**最后单独一行**写 `[[attach:<绝对路径>|<显示名>]]`（提示词
+ * SECRETARY_SPEECH_STYLE_TEXT 第八条说明），正文里不再贴裸路径。
+ * 卡片把它渲染成图片缩略图 / 行式文件条，点开走宿主既有的只读路由 `/api/worktable/file?path=`；
+ * 展示文本与朗读文本都必须剔除这串标记（绝不能把 Windows 路径念出来，也不让它在卡片里露出来）。
+ * 写法与 `[[session:…]]` 同一套：解析出数组喂渲染层，剔除靠一条正则。
+ */
+export interface AttachRef {
+  /** 绝对路径（宿主 /api/worktable/file 直接读它）。 */
+  path: string
+  /** 卡片上显示的附件名（模型给的显示名，缺省取文件名）。 */
+  name: string
+}
+
+/** 标记本体：`[[attach:<路径>|<显示名>]]`；显示名缺失时也认（退化取文件名）。 */
+const ATTACH_REF_SOURCE = /\[\[attach:([^\]|]*)(?:\|([^\]]*))?\]\]/g
+
+/** 路径去重口径：Windows 反斜杠与正斜杠视为同一条，大小写也不敏感（同一轮不重复出两个附件块）。 */
+function attachPathKey(path: string): string {
+  return String(path ?? '').replace(/\\/g, '/').replace(/\/+/g, '/').trim().toLowerCase()
+}
+
+/** 路径最后一段（显示名兜底）；两种分隔符都认。 */
+function attachBaseName(path: string): string {
+  const parts = String(path ?? '').replace(/\\/g, '/').split('/').filter((part) => part !== '')
+  return parts.length === 0 ? String(path ?? '') : parts[parts.length - 1]
+}
+
+/** 从正文里解析 `[[attach:<绝对路径>|<显示名>]]`（纯函数；同一轮重复路径只留第一条）。 */
+export function parseAttachRefs(raw: string): AttachRef[] {
+  const out: AttachRef[] = []
+  const seen = new Set<string>()
+  const text = String(raw ?? '')
+  const pattern = new RegExp(ATTACH_REF_SOURCE.source, 'g')
+  let match: RegExpExecArray | null
+  while ((match = pattern.exec(text)) !== null) {
+    const path = String(match[1] ?? '').trim()
+    if (path === '') continue
+    const key = attachPathKey(path)
+    if (key === '' || seen.has(key)) continue
+    seen.add(key)
+    const name = String(match[2] ?? '').trim()
+    out.push({ path, name: name === '' ? attachBaseName(path) : name })
+  }
+  return out
+}
+
+/** 剔除附件标记（展示文本、朗读文本、折叠行兜底文本共用）。 */
+export function stripAttachRefs(text: string): string {
+  return String(text ?? '').replace(ATTACH_REF_SOURCE, '')
+}
+
+/** 图片扩展名：只有这些走内联缩略图，其余一律行式文件条。 */
+export const ATTACH_IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'] as const
+
+/** 路径/文件名的扩展名（小写、不含点；没有回空串）。 */
+export function attachExtensionOf(pathOrName: string): string {
+  const name = attachBaseName(pathOrName)
+  const dot = name.lastIndexOf('.')
+  return dot <= 0 || dot === name.length - 1 ? '' : name.slice(dot + 1).toLowerCase()
+}
+
+/** 这张附件是不是图片（决定缩略图还是文件条）。 */
+export function isAttachImage(pathOrName: string): boolean {
+  return (ATTACH_IMAGE_EXTENSIONS as readonly string[]).includes(attachExtensionOf(pathOrName))
+}
+
+/** 文件条的角标文字：图片/文件类型大写扩展名，没有扩展名就写「文件」。 */
+export function attachTypeBadge(pathOrName: string): string {
+  const ext = attachExtensionOf(pathOrName)
+  if (ext === '') return '文件'
+  if (ext === 'jpeg') return 'JPG'
+  return ext.toUpperCase()
+}
+
+/** 宿主只读文件路由的地址（绝对路径必须 encodeURIComponent，Windows 路径里的 `\` 与中文都要过一遍）。 */
+export function attachFileUrl(path: string): string {
+  return `/api/worktable/file?path=${encodeURIComponent(String(path ?? ''))}`
+}
+
+/** 字节数 → 文件条上那行大小（拿不到大小就不显示，绝不写 0 B）。 */
+export function formatFileSize(bytes: number): string {
+  const value = Number(bytes)
+  if (!Number.isFinite(value) || value < 0) return ''
+  if (value < 1024) return `${Math.round(value)} B`
+  const kb = value / 1024
+  if (kb < 1024) return `${kb < 10 ? kb.toFixed(1) : Math.round(kb)} KB`
+  const mb = kb / 1024
+  if (mb < 1024) return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`
+  return `${(mb / 1024).toFixed(1)} GB`
 }
 
 /** ────────────────────────── 3. 朗读状态机 ────────────────────────── */
@@ -2584,6 +2683,14 @@ export const secretaryCardsTestSurface = {
   normalizeForSpeech,
   stripSessionRefs,
   parseSessionRefs,
+  parseAttachRefs,
+  stripAttachRefs,
+  ATTACH_IMAGE_EXTENSIONS,
+  attachExtensionOf,
+  isAttachImage,
+  attachTypeBadge,
+  attachFileUrl,
+  formatFileSize,
   splitSpeechChunks,
   SPEECH_CHUNK_MIN_CHARS,
   SPEECH_CHUNK_MAX_CHARS,

@@ -11,7 +11,10 @@
  *   4. 卡体正文区域本身可点击/可键盘切换（Enter/Space）展开与收起：role=button + aria-expanded，
  *      内部那颗朗读/复制/展开全文按钮与引用 chip 都 stopPropagation，点卡体不会触发它们；
  *   5. 底部操作栏：**引用按钮（时间左边，与复制按钮同一套规格）→ 时间（HH:MM）紧贴复制按钮左侧 → 复制 → 0.5px 分隔线 → 「展开全文」（仅溢出时）；
- *   6. 朗读按钮只出现在头部，不出在底部。
+ *   6. 朗读按钮只出现在头部，不出在底部；
+ *   7. 附件区（2026-11-26 需求）：正文里的 `[[attach:<绝对路径>|<显示名>]]` 渲染成图片缩略图或行式文件条，
+ *      放在**折叠区之外**（卡体与脚部之间）——始终可见、不参与折叠高度测量；点开走宿主只读路由
+ *      `/api/worktable/file?path=`，手机端由浏览器决定「下载后用哪个应用打开」。
  *
  * TTS 状态机不变：换卡停上一条、单击暂停/继续、长按 600ms 从头重读。
  * 已读判据：这条卡被朗读过（含自动朗读，成功或被中断都算）或用户点过卡体/展开全文/复制 → 立刻写进已读集合。
@@ -21,8 +24,9 @@ import { peekSecretarySessionId } from '../../assistant-entry.ts'
 import {
   answerInlineTokens, assistantCardSpeechKey, collectTurnText, foldClipFromBlocks, foldCollapsedCapPx, formatClock, latestReplyTurnNo, parseAnswerBody,
   parseSessionRefs, stripSessionRefs, normalizeForSpeech, secretaryReadStore, secretaryQuoteStore, QUOTE_PREVIEW_MAX_CHARS,
+  parseAttachRefs, stripAttachRefs, isAttachImage, attachFileUrl, attachTypeBadge, formatFileSize,
   CARD_KIND_ASSISTANT, CARD_KIND_NOTICE, CARD_KIND_USER, FOLD_BODY_LINE_BUDGET, FOLD_BLOCK_GAP, FOLD_TITLE_LINE_BUDGET, FOLD_FALLBACK_LINE_HEIGHT_PX, cardFoldStyle,
-  type FoldBlockBox, type FoldGeometryOut, type SecretaryQuoteAttachment,
+  type AttachRef, type FoldBlockBox, type FoldGeometryOut, type SecretaryQuoteAttachment,
 } from './secretary-cards.ts'
 import { secretarySpeech } from './secretary-speech.ts'
 import { SecretarySpeakButton } from './SecretarySpeakButton.tsx'
@@ -399,6 +403,101 @@ export function useSecretaryReadState(sessionId: string): { isRead: (key: string
   }
 }
 
+/**
+ * 附件大小（文件条右端那行）：只发 HEAD 问响应头，宿主 /api/worktable/file 已支持 HEAD + content-length，
+ * 不把 20MB 正文读回来。同一地址只问一次（模块级缓存，重渲染/翻页回来不再发请求）；
+ * 拿不到大小（接口报错、老宿主没有 HEAD）就不显示，绝不写 0 B 误导人。
+ */
+const attachSizeCache = new Map<string, string>()
+
+function useAttachFileSize(url: string): string {
+  const [text, setText] = useState(() => (url === '' ? '' : (attachSizeCache.get(url) ?? '')))
+  useEffect(() => {
+    if (url === '') { setText(''); return }
+    const cached = attachSizeCache.get(url)
+    if (cached !== undefined) { setText(cached); return }
+    let alive = true
+    void fetch(url, { method: 'HEAD' })
+      .then((res) => {
+        if (!res.ok) return ''
+        const raw = res.headers.get('content-length')
+        return raw === null || raw.trim() === '' ? '' : formatFileSize(Number(raw))
+      })
+      .then((label) => {
+        if (!alive || label === '') return
+        attachSizeCache.set(url, label)
+        setText(label)
+      })
+      .catch(() => { /* 拿不到大小不影响打开，静默降级 */ })
+    return () => { alive = false }
+  }, [url])
+  return text
+}
+
+/** 打开附件：同源只读路由（手机端经 pocket 代理透传，cookie 照旧带过去）。 */
+function openAttachFile(event: any, url: string): void {
+  event.stopPropagation()
+  try {
+    window.open(url, '_blank')
+  } catch {
+    try { window.location.href = url } catch { /* 两个通道都被拦就到此为止，卡片本身不炸 */ }
+  }
+}
+
+/**
+ * 附件区里的一件附件（2026-11-26 需求）：
+ *   - 图片扩展名（png/jpg/jpeg/gif/webp/bmp/svg）→ 内联缩略图（lazy、圆角、最大高 180px、超出裁剪）；
+ *   - 其余（docx/xlsx/pptx/zip/pdf…）→ 行式文件条：类型角标 + 显示名 + 拿得到的大小。
+ * 两种都是 44px 以上触控目标，手机上点得中；点开一律走 /api/worktable/file。
+ */
+export function ReplyAttachmentPiece({ attachment }: { attachment: AttachRef }): any {
+  const url = attachFileUrl(attachment.path)
+  const image = isAttachImage(attachment.path)
+  // 图片读不出来（路径越界被 403、文件被删、宿主还没加载新构建）→ 退化成文件条：名字与「点开」都还在
+  const [broken, setBroken] = useState(false)
+  useEffect(() => { setBroken(false) }, [url])
+  const size = useAttachFileSize(image && !broken ? '' : url)
+  const badge = attachTypeBadge(attachment.path)
+
+  if (image && !broken) {
+    return (
+      <button
+        type="button"
+        data-dsh-scard="attach-image"
+        title={`打开图片：${attachment.name}`}
+        aria-label={`打开图片：${attachment.name}`}
+        onClick={(event: any) => openAttachFile(event, url)}
+      >
+        <img
+          data-dsh-scard="attach-thumb"
+          src={url}
+          alt={attachment.name}
+          loading="lazy"
+          decoding="async"
+          draggable={false}
+          onError={() => setBroken(true)}
+        />
+        <span data-dsh-scard="attach-name">{attachment.name}</span>
+      </button>
+    )
+  }
+
+  return (
+    <button
+      type="button"
+      data-dsh-scard="attach-file"
+      data-dsh-scard-attach-ext={badge}
+      title={`打开附件：${attachment.name}`}
+      aria-label={`打开附件：${attachment.name}`}
+      onClick={(event: any) => openAttachFile(event, url)}
+    >
+      <span data-dsh-scard="attach-badge" aria-hidden="true">{badge}</span>
+      <span data-dsh-scard="attach-name">{attachment.name}</span>
+      {size !== '' && <span data-dsh-scard="attach-size">{size}</span>}
+    </button>
+  )
+}
+
 export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: string; turn?: any; api?: OrbApi }): any {
   const id = String(sessionId ?? '')
   const isSecretary = id !== '' && id === peekSecretarySessionId()
@@ -444,10 +543,12 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
   const quoteState = useSecretaryQuoteState(id)
   // 分页窗口：这张秘书回复卡是完整渲染还是压成一行折叠行（hooks 全部在此之前，条件 return 之后不能再有 hook）
   const windowState = useSecretaryCardWindow(key)
-  const display = stripSessionRefs(body).trim()
+  // 附件标记也剔除：卡片正文、复制文本、朗读文本里都不许出现绝对路径
+  const display = stripAttachRefs(stripSessionRefs(body)).trim()
   const speechText = normalizeForSpeech(body)
   const { title, paragraphs } = parseAnswerBody(display)
   const refs = parseSessionRefs(body)
+  const attaches = parseAttachRefs(body)
   const unread = turnNo !== '' && !readState.isRead(key)
 
   // 自动朗读：只读最末一轮，每轮一次；读过（含被中断）就算这条已读
@@ -475,7 +576,8 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
 
   if (!isSecretary) return null
   // 根节点必须无条件渲染（ref 要靠它定位轮次）；空壳由 CSS 整体隐藏（不输出占位条）
-  if (display === '') return <article ref={wrapRef as any} data-dsh-scard="card" data-dsh-scard-kind={CARD_KIND_ASSISTANT} data-empty="1" />
+  // 2026-11-26：只有附件标记、正文全是标记时**不是空壳**——附件区照样要出图，否则交付物整块消失
+  if (display === '' && attaches.length === 0) return <article ref={wrapRef as any} data-dsh-scard="card" data-dsh-scard-kind={CARD_KIND_ASSISTANT} data-empty="1" />
 
   // 分页窗口外（比最近 30 张更旧）：压成一行折叠行，绝不把整张老卡拉回渲染
   if (windowState.collapsed) {
@@ -523,7 +625,7 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
       </div>
       <div {...foldProps}>
         <div data-dsh-scard="content" ref={mainRef} style={bodyStyle}>
-          <h1 data-dsh-scard="title">{inlineAnswerText(title)}</h1>
+          {title !== '' && <h1 data-dsh-scard="title">{inlineAnswerText(title)}</h1>}
           {paragraphs.map((line, index) => (<p key={`para:${index}`} data-dsh-scard="para">{inlineAnswerText(line)}</p>))}
           {refs.map((ref) => (
             <button
@@ -545,6 +647,14 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
           {overflow && !open && <span data-dsh-scard="ellipsis" aria-hidden="true">…</span>}
         </div>
       </div>
+      {/* 附件区：折叠区之外，始终可见，也不进折叠高度测量（mainRef 只包住折叠区里的 content） */}
+      {attaches.length > 0 && (
+        <div data-dsh-scard="attachments" aria-label="附件">
+          {attaches.map((attachment) => (
+            <ReplyAttachmentPiece key={attachment.path} attachment={attachment} />
+          ))}
+        </div>
+      )}
       <div data-dsh-scard="foot">
         {/* 三种卡同一颗引用按钮：都放在时间左边，规格与时间右边那棵复制按钮完全一样 */}
         <QuoteCardButton

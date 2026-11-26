@@ -6,6 +6,7 @@ import { dirname, resolve as pathResolve, sep } from 'node:path'
 import { createRequire } from 'node:module'
 import { manageWebRoutes } from './web-routes'
 import { createPathGuard, minimalTermEnv, type PathGuard } from './path-guard'
+import { contentDispositionHeaderFor } from './file-disposition'
 import { homedir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -442,7 +443,14 @@ export function apply(ctx: Context) {
     },
   })
 
-  // 本地文件读取（资源管理器点击 .html 后浏览器标签内打开）
+  // 本地文件读取（资源管理器点击 .html 后浏览器标签内打开；秘书回复卡的图片/附件也从这里取）
+  //
+  // 2026-11-26 需求（手机上点开附件要能弹「打开方式」）：补 content-disposition。
+  //   - 图片 / pdf / svg / 文本 → inline，标签页里直接看；
+  //   - docx / xlsx / pptx / zip 等其余 → attachment + 文件名（RFC 5987 带中文名），
+  //     手机浏览器这才下载文件、下载完弹系统的「用哪个应用打开」；
+  //   - 顺带给 content-length 并支持 HEAD：卡片上的文件条只问大小，不必把 20MB 文件整份读回来。
+  // 边界（denyOutside 目录 allowlist、20MB 上限）一个字没动。
   webServer.register({
     kind: 'exact',
     path: '/api/worktable/file',
@@ -455,15 +463,21 @@ export function apply(ctx: Context) {
         const abs = pathResolve(p)
         const stat = await import('node:fs/promises').then((m) => m.stat(abs))
         if (stat.size > 20 * 1024 * 1024) { json(res, 413, { error: 'file too large' }); return }
-        const data = await readFile(abs)
         const ext = (abs.split('.').pop() || '').toLowerCase()
-        const types: Record<string, string> = {
-          html: 'text/html; charset=utf-8', htm: 'text/html; charset=utf-8',
-          css: 'text/css; charset=utf-8', js: 'text/javascript; charset=utf-8', mjs: 'text/javascript; charset=utf-8',
-          json: 'application/json; charset=utf-8', md: 'text/markdown; charset=utf-8', markdown: 'text/markdown; charset=utf-8', txt: 'text/plain; charset=utf-8', log: 'text/plain; charset=utf-8',
-          pdf: 'application/pdf', svg: 'image/svg+xml', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', ico: 'image/x-icon',
+        const headers = {
+          'content-type': FILE_TYPES[ext] ?? 'application/octet-stream',
+          'content-length': String(stat.size),
+          'content-disposition': contentDispositionHeaderFor(abs),
+          'cache-control': 'no-store',
         }
-        res.writeHead(200, { 'content-type': FILE_TYPES[ext] ?? 'application/octet-stream', 'cache-control': 'no-store' })
+        // 只要响应头（卡片上的附件条问大小）：不读文件正文
+        if (String(req.method ?? 'GET').toUpperCase() === 'HEAD') {
+          res.writeHead(200, headers)
+          res.end()
+          return
+        }
+        const data = await readFile(abs)
+        res.writeHead(200, headers)
         res.end(data)
       } catch (err) {
         json(res, 404, { error: String(err) })

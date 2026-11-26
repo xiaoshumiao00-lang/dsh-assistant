@@ -82,6 +82,8 @@ export { assistantTtsTestSurface } from './assistant-tts'
 export { secretaryCardsTestSurface } from './client/pocket/orb/secretary-cards.ts'
 /** 秘书朗读分块流水线（纯逻辑：预取/排队/abort/重试/缓存，node 可单测） */
 export { secretarySpeechPipelineTestSurface } from './client/pocket/orb/secretary-speech-pipeline.ts'
+/** 本地文件路由的 content-disposition 口径（inline/attachment + RFC 5987 中文名，node 可单测） */
+export { fileDispositionTestSurface } from './file-disposition'
 /** 目录 allowlist 与终端环境变量（供 scripts/test-path-guard.mjs 直接验） */
 export { expandHome, defaultAllowedRoots, createPathGuard, minimalTermEnv, isDirectory } from './path-guard'
 /** turn-guard 的判定与状态函数（供 scripts/test-turn-guard.mjs 直接验） */

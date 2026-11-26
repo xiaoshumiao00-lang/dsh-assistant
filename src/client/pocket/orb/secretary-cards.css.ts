@@ -466,6 +466,93 @@ body[data-dsh-secretary="1"] [data-dsh-scard="attachment-icon"] {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* ── 秘书回复卡的附件区（2026-11-26 需求：回复卡里附带图片与文件，点开用手机默认程序打开） ──
+ * 位置在折叠区之外（卡体与脚部之间）：始终可见、不参与折叠高度测量。
+ * 图片出内联缩略图（lazy、圆角、最大高 180px、object-fit: cover 超出裁剪）；
+ * 其余类型出行式文件条（类型角标 + 显示名 + 大小），触控高度 ≥44px，手机上点得中。 */
+[data-dsh-scard="attachments"] {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 20px 16px;
+}
+[data-dsh-scard="attach-image"] {
+  display: block;
+  width: 100%;
+  max-width: 320px;
+  padding: 0;
+  overflow: hidden;
+  text-align: left;
+  background: var(--dsh-card-surface);
+  border: 0.5px solid var(--dsh-card-border);
+  border-radius: 10px;
+  cursor: pointer;
+}
+[data-dsh-scard="attach-file"] {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  max-width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  background: var(--dsh-card-accent-wash);
+  border: 0.5px solid var(--dsh-card-accent-line);
+  border-radius: 10px;
+  cursor: pointer;
+}
+[data-dsh-scard="attach-image"]:focus-visible,
+[data-dsh-scard="attach-file"]:focus-visible {
+  outline: 2px solid var(--dsh-card-focus-ring);
+  outline-offset: 2px;
+}
+[data-dsh-scard="attach-thumb"] {
+  display: block;
+  width: 100%;
+  max-height: 180px;
+  object-fit: cover;
+  background: var(--dsh-card-foot-surface);
+}
+[data-dsh-scard="attach-badge"] {
+  flex: none;
+  padding: 2px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  letter-spacing: 0.04em;
+  color: var(--dsh-card-accent-deep);
+  background: var(--dsh-card-surface);
+  border-radius: 6px;
+}
+[data-dsh-scard="attach-name"] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsh-card-accent-deep);
+  text-decoration: none;
+}
+[data-dsh-scard="attach-image"] [data-dsh-scard="attach-name"] {
+  display: block;
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 18px;
+}
+[data-dsh-scard="attach-file"] [data-dsh-scard="attach-name"] { flex: 1 1 auto; }
+[data-dsh-scard="attach-size"] {
+  flex: none;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsh-card-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+@media (max-width: 520px) {
+  [data-dsh-scard="attachments"] { padding: 0 14px 14px; }
+  [data-dsh-scard="attach-image"] { max-width: 100%; }
+  [data-dsh-scard="attach-thumb"] { max-height: 180px; }
+}
 
 /* ── 底部操作栏：时间挪到最右、紧贴复制按钮左侧（DOM 顺序：时间 + 复制 → 分隔线 → 展开全文） ── */
 [data-dsh-scard="foot"] {
