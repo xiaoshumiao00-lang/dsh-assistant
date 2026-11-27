@@ -1,0 +1,25 @@
+{
+  "$schema说明": "本文件不是插件真正读的字段集，真正读的字段名见同目录 模板说明.md。所有值都是占位符，必须替换成你自己电脑上的值。",
+
+  "newProjectParent": "D:\\<你自己的目录>\\项目",
+  "skillRoot": "C:\\Users\\<你的用户名>\\.dsh\\skills",
+  "asrTerms": [
+    { "pattern": "<你的专有名词A|别名A写错的样子>", "replace": "<规范名A>", "flags": "gi" },
+    { "pattern": "<店名B|别名B>", "replace": "<规范名B>" }
+  ],
+  "persona": {
+    "title": "本机人设",
+    "lines": [
+      "我是<谁>，在<哪台电脑>做什么。"
+    ]
+  },
+  "allowedRoots": [
+    "D:\\<你自己的项目盘>"
+  ],
+  "allowAllLocalPaths": false,
+  "termEnvAllow": [
+    "<额外环境变量名，一般不用填>"
+  ],
+  "updateSource": "<你自己的 owner/repo，留空就不检查更新>",
+  "updateCheckEnabled": false
+}

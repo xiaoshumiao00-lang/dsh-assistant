@@ -1,0 +1,23 @@
+{
+  "lanEnabled": false,
+  "lanAuthEnabled": true,
+  "lanIpOverride": "<你自己的电脑局域网IP，一般留空自动识别>",
+  "proxyPort": 3081,
+  "publicPinCustom": false,
+  "lanPinCustom": false,
+  "tunnelMode": "quick",
+  "tunnelHostname": "<你自己的域名，例如 pocket.example.com>",
+  "tunnelToken": "<必填·你自己 Cloudflare Zero Trust 后台生成的完整 Token，别外发>",
+  "cloudflaredPath": "<已自己下载过 cloudflared 时才填，例如 C:\\<你的目录>\\cloudflared.exe>",
+  "sshTunnel": {
+    "enabled": false,
+    "host": "<你自己的VPS地址：IPv4 或域名>",
+    "port": 22,
+    "user": "<你自己的SSH用户名，不默认 root>",
+    "remotePort": 7080,
+    "keyPath": "C:\\Users\\<你的用户名>\\.ssh\\id_ed25519",
+    "localPort": 0,
+    "hostKeyChecking": "accept-new",
+    "knownHostsPath": ""
+  }
+}

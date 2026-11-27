@@ -1,0 +1,34 @@
+个人助手（dsh-assistant）环境变量模板
+=========================================
+全部可选。不设置就用插件内置默认。值一律是占位符，替换成你自己电脑上的值。
+设置方式：在 DSH 宿主的环境里设置（或 PowerShell 里 $env:NAME='...' 后再启动宿主）。
+
+【路径】
+DSH_HOME=<你的 DSH 数据根，默认 ~/.dsh；多 profile 或换盘时才需要>
+DSH_ASSISTANT_HOME=<助手家目录，默认 <DSH_HOME>/assistant>
+DSH_ASSISTANT_CONFIG=<本机配置文件绝对路径，一般不用填；只有想把配置放在别处才填>
+DSH_ASSISTANT_ELECTRON=<Electron 运行时路径；找不到就用页面内悬浮球>
+
+【朗读 / TTS】
+ASSISTANT_TTS_EDGE_PY=<装了 edge-tts 的 python 绝对路径；留空按系统 python / py>
+ASSISTANT_TTS_EDGE_PYTHON=<同上，两个名字都认，优先第一个>
+ASSISTANT_TTS_EDGE_VOICE=zh-CN-XiaoxiaoNeural      <音色，默认晓晓；换别的填微软音色名>
+ASSISTANT_TTS_EDGE_RATE=+45%                        <语速，默认 +45%>
+ASSISTANT_TTS_EDGE_PROXY=http://127.0.0.1:<你自己的本地代理端口>   <默认不使用代理；只有需要才填>
+注：edge-tts 必须 >= 7.3.1（7.2.x 的 Sec-MS-GEC 已过期，Bing WSS 会 403）。装法：
+    python -m pip install -U edge-tts -i <你自己的 PyPI 镜像地址>
+
+【手机访问（pocket 侧）】
+DSH_POCKET_CLOUDFLARED=<已自己下载过 cloudflared 时才填，跳过下载>
+DSH_POCKET_DESKTOP=<手机「电脑文件」的默认目录覆盖>
+DSH_POCKET_WS_DEFLATE=0            <0 = 关 WebSocket 压缩；默认开>
+DSH_POCKET_SSH_HOST_KEY_CHECKING=accept-new   <accept-new | yes | no>
+DSH_POCKET_SSH_KNOWN_HOSTS=<known_hosts 路径；留空 = <DSH_HOME>/dsh-pocket/known_hosts>
+
+【安卓构建侧（只有要重新构建 APK 的人需要）】
+DSH_ANDROID_KEYSTORE_PASS=<必填·你自己生成的强口令；只从环境变量读，绝不出现在任何文件或命令里>
+
+【宿主调试用（普通用户不需要）】
+DSH_HOST_PARSER=<会话日志解析器覆盖>
+DSH_HOST_SESSION_MODULE=<会话模块覆盖>
+DSH_ASSISTANT_TSC=<typecheck 用的 tsc 位置覆盖>
