@@ -285,3 +285,71 @@ installCuObservationWrapper(ctx, { readSwitch: () => resolveChannelSwitch({ env:
 | 是否重启宿主 | **否**（按你的口径：写完代码给证据后停下等确认） |
 | 是否 push | **否** |
 | vendor/computer-use | **零改动**（三处出口 998 / 1177 / 1639 都只是引用，没有一处被改） |
+
+## 11. 接线完成：观察帧编号框挂到 tools/execute（等重启，未跑 A/B）
+
+批准后只做一件事：把观察帧包装挂进插件入口。**vendor/computer-use 三处出口（998 / 1177 / 1639）仍然一行未改。**
+
+### 11.1 改了几行（`src/assistant.ts`：+3 / -0）
+
+```diff
+@@ -60,6 +60,7 @@
+ export { assistantCuWatchTestSurface } from './assistant-cu-watch'
++import { installCuObservationWrapper } from './cu-uia-observe.ts'
+ /** v4 会话日志事务化改写：宿主真实解析器 dry-run + 写入后回读 + 失败回滚 */
+@@ -277,6 +278,9 @@
+   registerPiece('assistant cu watch', () => registerAssistantCuWatch(ctx))
++  // Computer Use 观察帧编号框（插件侧 around-dispatch，走 tools/execute；默认关，见 docs/…§11）
++  registerPiece('computer use observation', () => installCuObservationWrapper(ctx))
+```
+
+其余逻辑全在**新增文件** `src/cu-uia-observe.ts` 里补齐（不占现有文件）：
+`readCuUiaSwitch(ctx)`（`DSH_CU_UIA` 优先 → profile 文件 `dsh-assistant-cu-uia.json` 的 `enabled` → 缺省关）、
+`createObservationProbe()`（懒起 sidecar，42–49ms/页 + 页面缓存 30s，任何异常回「通道不启动」）。
+`registerPiece` 自带 try/catch：包装装不上也只是记一条日志，不影响其它半部。
+
+### 11.2 重建与证据
+
+| 项 | 值 |
+| --- | --- |
+| 重建 | `node build.mjs` → EXIT 0；`lib/index.js` 重新生成（**+984 行**产物），bundle 里 grep 到 `installCuObservationWrapper` / `tools/execute` |
+| `npm run check` | EXIT 0 |
+| 单元测试 | `test-cu-uia-core` 9/9、`test-cu-uia-overlay` 7/7、`test-cu-uia-observe` 5/5 |
+| 回退演练 | **PASS**：14 个新增文件 + 白名单 2 个（`src/assistant.ts` **+3 行**、`lib/index.js` +984 构建产物） |
+| 关通道后 CU 测试 | **8/8 PASS**（`DSH_CU_UIA=0`：capture-scale / observation-surface / bridge / code-agent-notice / title-bold / core / overlay / observe） |
+| 全量脚本 | **97 个：94 通过 / 3 条既有红**（`mobile-proxy`、`pagination-dom`、`session-log-write`）——无新增红 |
+| 是否重启宿主 | **否**（按口径停下等用户点） |
+| 是否跑 A/B | **否**（重启后才可能；本轮按要求不自己跑） |
+| 是否 push | **否** |
+
+演练脚本这轮加了白名单口径（`ALLOWED_TOUCHED`）：只允许 `src/assistant.ts` +3 行与构建产物，
+白名单外的现有文件改动仍然直接判 FAIL——「只新增文件」这条纪律没有被放宽，只是把这次批准的 3 行登记在案。
+
+### 11.3 提交与回退
+
+| 项 | 值 |
+| --- | --- |
+| 本段提交 | **`eba493a`**（接线：assistant.ts +3 行 + observe 默认开关/探针 + 重建 lib/index.js + 演练白名单） |
+| 本段之前的基线 | `ff877ae` |
+| 全轮提交序列 | `aef60f0` → `2326629` → `c063bfe` → `ff877ae` → `b557cde` → `537c6e8` → `d6e5e97` → **`eba493a`** |
+
+回退（任选一条）：
+
+```bash
+# 1) 只回退这次接线（保留前面 sidecar/合成器，回到「装好了但没挂」）
+git revert --no-edit eba493a
+# 2) 整轮回退到第一段基线（等于通道从未存在过）
+git checkout ebf16ae -- . && git rm -q --cached $(git diff --name-only --diff-filter=A ebf16ae HEAD) 2>/dev/null
+rm -f $(git diff --name-only --diff-filter=A ebf16ae HEAD)     # 删掉 14 个新增文件
+# 3) 只关通道（最小动作，不改任何代码）
+export DSH_CU_UIA=0        # 或：echo '{"enabled": false}' > <profile>/dsh-assistant-cu-uia.json
+```
+
+### 11.4 重启后怎么测（等用户点，我不自己跑）
+
+1. 重启宿主（让 `lib/index.js` 生效）→ 2. `DSH_CU_UIA=0` 跑一遍只读演练任务，记 6 项：
+工具调用数 / 点击数 / 同坐标重复点击数 / 墙钟 / 失败重试数 / 总步数 →
+3. `DSH_CU_UIA=1` 再跑同一任务一遍，记同样 6 项 → 4. 任一指标变差（步数不降 / 耗时 +10% / 重复点击增多）→ 默认关。
+
+基线仍参照 2026-11-20 hpg 门店录入：60.5 分钟 / 116 工具调用 / 35 点击 / 11 重复点击 / 44 步（39%）耗在辨认悬浮球窗口。
+**重启后的两遍真实数字，会把它们填进本文 §12。**
