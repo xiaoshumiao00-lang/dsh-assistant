@@ -315,6 +315,30 @@ function isProtectedHost(host, isProtected) {
   return isProtected ? isProtected(host) : classifyHost(host) === 'public';
 }
 
+/**
+ * 转发给上游时用的「来源类别」请求头（2026-11-28 手机访问安全整改）。
+ *
+ * 为什么要这个头：插件的 webServer 只看得见本机 HTTP 层——手机流量必经本机代理，
+ * 代理又把 Host/Origin 改写成本机权威（127.0.0.1:3080），所以到 /dsh-pocket 与
+ * /api/assistant/* 之后「本机浏览器」和「手机」看起来一模一样。PIN 回显、危险字段
+ * 写入这类收紧必须分得清两者，只能由代理亲口写一个不可伪造的标记。
+ * 值取 classifyHost 的口径：loopback / lan / public。代理**总是覆盖**这个头
+ * （入站自带的先删掉），手机侧伪造它无效：它到不了上游，只有代理写的那份作数。
+ */
+export const POCKET_SOURCE_MARKER = 'x-dsh-pocket-source';
+
+/** 这条流量的真实来源类别（Host 声明 + 不可伪造的 TCP 源地址 + Cloudflare 边缘 IP）。 */
+export function pocketSourceClass(req, host = null) {
+  const declared = String(host ?? policyHost(req, req?.headers?.host ?? '') ?? '').trim();
+  const claimed = classifyHost(declared);
+  const cf = String(req?.headers?.['cf-connecting-ip'] ?? '').trim();
+  // 隧道进来的 Host 常常是 127.0.0.1（cloudflared 回连本机），cf-connecting-ip 才是真实客户端
+  if (cf && claimed === 'loopback') return 'public';
+  const actual = classifySource(req?.socket?.remoteAddress);
+  if (actual && HOST_CLASS_RANK[actual] > HOST_CLASS_RANK[claimed]) return actual;
+  return claimed;
+}
+
 /** 保护强度序：本机最弱（可免密）→ 局域网（按开关）→ 公网（永远要密码）。 */
 const HOST_CLASS_RANK = { loopback: 0, lan: 1, public: 2 };
 
@@ -527,16 +551,18 @@ function maybeSeedAuthCookie(req, res, rawToken, sessionKey) {
  * 若不改写，设置/凭据平面会在宿主侧被 403（issue #58 的另一半）。
  * 统一小写化键名，避免 Node 原样转发时大小写键并存导致重复头。
  */
-function loopbackAuthority(headers, upstream) {
+function loopbackAuthority(headers, upstream, sourceClass = null) {
   const authority = `${upstream.host}:${upstream.port}`;
   const out = {};
   for (const [k, v] of Object.entries(headers)) {
     const lk = k.toLowerCase();
-    if (lk === 'host' || lk === 'origin' || lk === 'referer' || lk === 'sec-fetch-site') continue;
+    // host/origin/referer/sec-fetch-site 要改写；来源标记要**重写**（入站自带的先扔掉）
+    if (lk === 'host' || lk === 'origin' || lk === 'referer' || lk === 'sec-fetch-site' || lk === POCKET_SOURCE_MARKER) continue;
     out[lk] = v;
   }
   out.host = authority;
   out.origin = `http://${authority}`;
+  if (sourceClass) out[POCKET_SOURCE_MARKER] = String(sourceClass);
   const referer = headers.referer ?? headers.Referer;
   if (referer) {
     try {
@@ -1097,7 +1123,8 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
         }
       }
     }
-    const headers = loopbackAuthority({ ...req.headers }, upstream);
+    // 转发前把「这条流量从哪来」写给上游插件看（见 POCKET_SOURCE_MARKER）
+    const headers = loopbackAuthority({ ...req.headers }, upstream, pocketSourceClass(req, host));
     // HTML 必须取未压缩版本：注入与移动首屏精简都只能安全改写纯文本。
     // 上游 HTML 仅几十 KB，identity 的额外字节远小于误下放数 MB 旧插件 batch。
     if (isHtmlRequest(req)) headers['accept-encoding'] = 'identity';
@@ -1362,7 +1389,8 @@ export function createPocketProxy({ port = 3081, host = '0.0.0.0', upstream = DE
       });
     };
 
-    const headers = loopbackAuthority({ ...req.headers }, upstream);
+    // 转发前把「这条流量从哪来」写给上游插件看（见 POCKET_SOURCE_MARKER）
+    const headers = loopbackAuthority({ ...req.headers }, upstream, pocketSourceClass(req, host));
     // 0.2.2 起上游 dsh web 默认协商 permessage-deflate（101 回 Sec-WebSocket-Extensions）。
     // 手机这条腿的压缩由本代理自己协商（下方 wsDeflateValue），上游这条腿必须保持明文：
     // 否则 101 里会出现两个 Sec-WebSocket-Extensions，手机 WebView 判定协议错误立即断连。

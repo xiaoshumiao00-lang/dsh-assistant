@@ -10,6 +10,9 @@ export const POCKET_ENDPOINTS = Object.freeze({
   update: 'pocket.update',
   restart: 'pocket.restart',
   lanTokenRefresh: 'token.lanRefresh',
+  // 查看当前访问密码（2026-11-28 安全整改）：**只允许本机回环调用**；
+  // status 不再回显 PIN，页面要看密码必须显式走这条受限端点。
+  pinView: 'pin.view',
   lanAuthSetEnabled: 'lanAuth.setEnabled',
   lanSetOverride: 'lan.setOverride',
   lanSetEnabled: 'lan.setEnabled',
@@ -62,6 +65,20 @@ export function compareVersions(a, b) {
     return ax < bx ? -1 : 1; // 字典序
   }
   return 0;
+}
+
+/**
+ * PIN/Token 的「可安全回显」形态（2026-11-28 手机访问安全整改）：
+ * 绝不出现密码本体，只出现「有没有设 + 位数」。
+ * @param {string} field 字段名前缀（'accessToken' / 'lanToken' / 'pin'）
+ * @param {unknown} value 密码值（null/undefined = 未设置）
+ */
+export function pinMeta(field, value) {
+  const text = typeof value === 'string' ? value : '';
+  return {
+    [`${field}Set`]: text.length > 0,
+    [`${field}Length`]: text.length,
+  };
 }
 
 /** 浏览器可见的状态字段（无敏感信息；含二维码 data URL）。 */

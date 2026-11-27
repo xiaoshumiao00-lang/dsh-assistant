@@ -9,7 +9,8 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { POCKET_RPC_CHANNEL, POCKET_ENDPOINTS, redactStatus } from '../client/pocket/api.js';
+import { POCKET_RPC_CHANNEL, POCKET_ENDPOINTS, redactStatus, pinMeta } from '../client/pocket/api.js';
+import { POCKET_SOURCE_MARKER } from './proxy.mjs';
 import { listFs, saveUpload, uploadsDir } from './fs-rpc.mjs';
 
 /** 单次读取上限：4 MB，避免把大文件塞进剪贴板 / 内存。 */
@@ -29,6 +30,53 @@ const ENDPOINT_SEGMENT_PATTERN = /^[A-Za-z0-9_$.-]+$/;
 const INVALID_REQUEST_RPC_ID = 'invalid-request';
 
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
+
+/** Host 头里的 hostname（去端口、认 [::1]）——与 proxy.mjs 的 classifyHost 同一个口径。 */
+function hostNameFrom(value) {
+  let name = String(value ?? '').trim().toLowerCase();
+  if (name.startsWith('[')) {
+    const end = name.indexOf(']');
+    if (end >= 0) name = name.slice(1, end);
+  } else {
+    name = name.replace(/:\d+$/, '');
+  }
+  return name;
+}
+
+/** Host 是否本机回环权威（127.x / localhost / ::1）。认不出的形态一律**不算**本机。 */
+function isLoopbackAuthority(value) {
+  const name = hostNameFrom(value);
+  if (!name) return false;
+  return LOOPBACK_HOSTNAMES.has(name) || name === '0.0.0.0' || /^127\./.test(name);
+}
+
+/**
+ * 这条请求从哪来（2026-11-28 手机访问安全整改第 2/3/4 项的共同判定入口）。
+ *
+ * 关键点：插件的 webServer 只能看见本机 HTTP 层——手机流量必经本机 pocket 代理，
+ * 代理又把 Host/Origin 改写成本机权威（issue #58/#90 的老改法），于是「桌面浏览器」
+ * 和「手机」在上游长得一模一样。所以来源只能信代理亲口写的标记头
+ * （POCKET_SOURCE_MARKER，见 proxy.mjs），入站自带的版本在代理里已被删掉。
+ * 判不到来源时按**非本机**处理（fail closed），别拿「看不见」当「本机」。
+ *
+ * @param {{headers?:Record<string,string>}|undefined} requestInfo RPC 桥给的解释（旧版 rpc.handle 路径没有）
+ * @returns {{loopback:boolean, source:string, reason:string}}
+ */
+export function pocketRequestSource(requestInfo) {
+  // 旧版 dsh 的回退路径：ctx.connection.rpc.handle(…, { authority:'loopback' })，
+  // 那条通道本来就是本机专用（文件底部注册处），当本机处理，否则老宿主上设置页会全灭。
+  if (!requestInfo || !requestInfo.headers) return { loopback: true, source: 'loopback', reason: 'legacy-loopback-rpc-channel' };
+  const headers = requestInfo.headers;
+  const marker = String(headers[POCKET_SOURCE_MARKER] ?? '').trim().toLowerCase();
+  if (marker === 'lan' || marker === 'public') return { loopback: false, source: marker, reason: `pocket-proxy:${marker}` };
+  const cf = String(headers['cf-connecting-ip'] ?? '').trim();
+  if (cf) return { loopback: false, source: 'public', reason: 'cf-connecting-ip' };
+  if (marker === 'loopback') return { loopback: true, source: 'loopback', reason: 'pocket-proxy:loopback' };
+  const host = headers.host ?? '';
+  if (!host) return { loopback: false, source: 'unknown', reason: 'no-host-header' };
+  if (isLoopbackAuthority(host)) return { loopback: true, source: 'loopback', reason: 'host-loopback' };
+  return { loopback: false, source: 'lan-or-public', reason: `host:${hostNameFrom(host)}` };
+}
 
 /**
  * 从 `${channel}/<endpoint>` 路径里取出 endpoint，段非法时返回 undefined。
@@ -114,7 +162,10 @@ function pocketFetchHandler(channel, handler, log) {
         );
       }
       try {
-        const result = await handler(endpoint, body.payload, request.signal);
+        // 把 HTTP 头交给业务层：来源判定（pocketRequestSource）要在业务层看来源头，
+        // 桥这里只认 fetch 形状，所以 headers 一次性交出去（只读，不含正文）。
+        const requestInfo = { headers: Object.fromEntries(request.headers.entries()), url: request.url };
+        const result = await handler(endpoint, body.payload, request.signal, requestInfo);
         return new Response(serverResponseJson(rpcId, result), {
           status: 200,
           headers: { 'content-type': 'application/json' },
@@ -276,10 +327,14 @@ export function killHint(port) {
  * 不可用时回退 ctx.connection.rpc.handle（旧版 dsh 兼容路径）。
  * wire 协议两条路径完全一致：client-request → handler → server-response。 */
 export function installPocketRpc(ctx, { service, log = console, desktop = false, runUpdate = null, restart = null, restartNotice = null, getToken = null, getLanToken = null, refreshLanToken = null, getLanAuthEnabled = null, setLanAuthEnabled = null, getLanEnabled = null, setLanEnabled = null, getLanIpOverride = null, setLanIpOverride = null, getPinCustom = null, setCustomPin = null, getTunnelConfig = null, setTunnelConfig = null, resetPocket = null, setSshTunnelEnabled = null, setSshTunnelConfig = null, reconnectSshTunnel = null }) {
-  const pocketRpcHandler = async (endpoint, payload = {}, signal) => {
+  const pocketRpcHandler = async (endpoint, payload = {}, signal, requestInfo) => {
     if (signal?.aborted) return fail('cancelled', 'The request was cancelled.');
+    const source = pocketRequestSource(requestInfo);
 
-    // status 响应：服务状态 + 重启提示 + 停止命令 + 桌面端标志 + 公网/局域网访问密码 + 局域网密码开关
+    // status 响应：服务状态 + 重启提示 + 停止命令 + 桌面端标志 + 局域网密码开关 + 隧道配置
+    // 2026-11-28 安全整改（第 2 项）：公网/局域网访问密码**不再回显**——以前这两行直接把
+    // 8 位 PIN 明文塞进 status，而 status 手机随时能拿（等于把整条入口的钥匙发给拿着
+    // cookie 的那台设备）。现在只报「是否已设置 + 位数」，要看密码得走 pin.view（只认本机回环）。
     const statusPayload = async () => {
       let notice = null;
       try { notice = (await restartNotice?.()) ?? null; } catch { notice = null; }
@@ -289,8 +344,10 @@ export function installPocketRpc(ctx, { service, log = console, desktop = false,
         desktop,
         restartNotice: notice,
         killHint: killHint(s.dshPort ?? 3080),
-        accessToken: getToken?.() ?? null,
-        lanToken: getLanToken?.() ?? null,
+        ...pinMeta('accessToken', getToken?.()),
+        ...pinMeta('lanToken', getLanToken?.()),
+        // 明文 PIN 只在本机页面出现（同一个 boolean 也告诉页面「本机能不能拿到密码」）
+        pinViewAvailable: source.loopback === true,
         lanAuthEnabled: getLanAuthEnabled?.() ?? true,
         lanEnabled: getLanEnabled?.() ?? true,
         publicPinCustom: getPinCustom?.('public') ?? false,
@@ -303,10 +360,25 @@ export function installPocketRpc(ctx, { service, log = console, desktop = false,
       if (endpoint === POCKET_ENDPOINTS.status) {
         return await statusPayload();
       }
+      if (endpoint === POCKET_ENDPOINTS.pinView) {
+        // 访问密码的「查看」端点：只有本机回环能用。手机/公网来源哪怕已经登录，
+        // 也不给看密码本体——它本来就知道自己输过什么，看不出的是别的设备的密码。
+        const which = payload?.which === 'lan' ? 'lan' : 'public';
+        if (!source.loopback) {
+          return fail('bad-request', `loopback-only: 访问密码只在本机设置页显示 | pin view is loopback-only (${source.reason})`);
+        }
+        const value = which === 'lan' ? (getLanToken?.() ?? null) : (getToken?.() ?? null);
+        if (!value) return fail('bad-request', 'PIN 不可用 | PIN unavailable');
+        return ok({ which, pin: value, loopback: true, ...pinMeta(which === 'lan' ? 'lanToken' : 'accessToken', value) });
+      }
       if (endpoint === POCKET_ENDPOINTS.lanTokenRefresh) {
         const fresh = refreshLanToken?.() ?? null;
         if (!fresh) return fail('bad-request', '局域网密码刷新不可用 | LAN PIN refresh unavailable');
-        return ok({ lanToken: fresh });
+        // 轮换照做，但新密码本体只给本机来源（非本机来源此前能从 status 读到明文，现在读不到）
+        if (!source.loopback) {
+          return ok({ lanTokenRotated: true, ...pinMeta('lanToken', fresh), loopback: false });
+        }
+        return ok({ lanToken: fresh, loopback: true });
       }
       if (endpoint === POCKET_ENDPOINTS.lanAuthSetEnabled) {
         const enabled = setLanAuthEnabled?.(payload?.on === true);
@@ -320,7 +392,7 @@ export function installPocketRpc(ctx, { service, log = console, desktop = false,
       }
       if (endpoint === POCKET_ENDPOINTS.lanSetOverride) {
         // 返回完整 status：前端 setStatus(await call(...)) 直接替换 status 对象，
-        // 若只返回 { lanIpOverride } 会丢掉 accessToken/lanToken/tunnelUrl 等字段，
+        // 若只返回 { lanIpOverride } 会丢掉 accessTokenSet/lanTokenSet/tunnelUrl 等字段，
         // 且 lanUrl/二维码不会随新 IP 刷新（PR #47 的客户端写法依赖完整 status）。
         try {
           const ip = setLanIpOverride?.(payload?.ip ?? '');
@@ -336,7 +408,10 @@ export function installPocketRpc(ctx, { service, log = console, desktop = false,
         try {
           const pin = setCustomPin?.(which, payload?.value);
           if (pin === undefined) return fail('bad-request', '自定义密码不可用 | custom PIN unavailable');
-          return ok({ which, pin, custom: true });
+          // 设密码这件事本身照做（用户在自己的手机上改自己的密码是合法意图），
+          // 但**不回显**密码本体：非本机来源只拿到「已设置 + 位数」（2026-11-28 第 2 项）。
+          if (!source.loopback) return ok({ which, custom: true, loopback: false, ...pinMeta(which === 'lan' ? 'lanToken' : 'accessToken', pin) });
+          return ok({ which, pin, custom: true, loopback: true });
         } catch (err) {
           return fail('bad-request', err?.message ?? String(err));
         }

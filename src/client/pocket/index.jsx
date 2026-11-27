@@ -70,6 +70,11 @@ export function PocketSettingsTab({ rpcCall, t }) {
   const [updateInfo, setUpdateInfo] = useState(null); // { current, latest, updating, result, startedAt } | null
   const [isDesktop, setIsDesktop] = useState(false); // DSH Desktop（Electron）环境：更新/重启由桌面版管理
   const [now, setNow] = useState(Date.now()); // 每秒 tick，驱动倒计时
+  // 访问密码本体（2026-11-28 手机访问安全整改第 2 项）：status 不再回显明文 PIN，
+  // 只有本机回环能显式读（pin.view，见 pocket-host/web-rpc.js）；
+  // 手机/公网打开这个页面时读不到本体，只渲染「已设置 N 位」掩码。
+  const [pinView, setPinView] = useState(null); // null = 未读；{ public, lan, blocked }
+  const pinsRequested = useRef(false);
 
   // 只有正在显示的倒计时才需要 1Hz tick；空闲设置页不再每秒重渲染整张卡。
   const ticking = updateInfo?.updating === true
@@ -90,12 +95,32 @@ export function PocketSettingsTab({ rpcCall, t }) {
     return res.value;
   };
 
+  /** 读密码本体（本机专用路径）：status.pinViewAvailable 假时不请求（省一次必拒的调用）。 */
+  const loadPins = async () => {
+    try {
+      const pub = await call(POCKET_ENDPOINTS.pinView, { which: 'public' }).catch(() => null);
+      const lan = await call(POCKET_ENDPOINTS.pinView, { which: 'lan' }).catch(() => null);
+      setPinView({ public: pub?.pin ?? null, lan: lan?.pin ?? null, blocked: !pub && !lan });
+      if (!pub && !lan) pinsRequested.current = false; // 没读到本体：让下一次 status 轮询重试
+      return Boolean(pub || lan);
+    } catch {
+      setPinView({ public: null, lan: null, blocked: true });
+      pinsRequested.current = false;
+      return false;
+    }
+  };
+
   const load = async () => {
     try {
       const s = await call(POCKET_ENDPOINTS.status, {});
       setStatus(s);
       setTunnelState(s.tunnelState ?? null);
       if (s.desktop) setIsDesktop(true);
+      if (s.pinViewAvailable && !pinsRequested.current) {
+        // status 每 3 秒轮询一次；密码本体只在第一次成功加载时读（改过后由 saveCustomPin/refreshLanPin 重新读）
+        pinsRequested.current = true;
+        void loadPins();
+      }
       if (s.restartNotice) {
         // 新进程确认起来了：显示一次「已重启」，清掉旧的更新横幅（单状态，不并存），
         // 然后自动刷新页面加载新代码——不用用户手动刷新
@@ -270,6 +295,9 @@ export function PocketSettingsTab({ rpcCall, t }) {
       setTunnelCfg(null);
       setCustomPin(null);
       setAdvOpen(false);
+      // 出厂设置把密码都换新了：本机的密码本体作废重读
+      setPinView(null);
+      pinsRequested.current = false;
       showToast(t('resetDone'));
     } catch (err) {
       setError(err.message);
@@ -283,8 +311,29 @@ export function PocketSettingsTab({ rpcCall, t }) {
   const refreshLanPin = async () => {
     try {
       const r = await call(POCKET_ENDPOINTS.lanTokenRefresh, {});
-      setStatus((s) => ({ ...s, lanToken: r.lanToken }));
+      // 非本机来源只拿到 lanTokenSet/lanTokenLength（掩码）；本机来源拿到 lanToken 本体
+      setStatus((s) => ({
+        ...s,
+        lanTokenSet: r.lanTokenSet ?? Boolean(r.lanToken),
+        lanTokenLength: r.lanTokenLength ?? String(r.lanToken ?? '').length,
+      }));
+      if (r.lanToken) setPinView((p) => ({ ...(p ?? {}), lan: r.lanToken, blocked: false }));
+      else { pinsRequested.current = false; await loadPins(); }
     } catch { /* 忽略 */ }
+  };
+
+  /** 密码掩码文本（这台设备读不到本体时显示）：只说「已设置 N 位」，绝不出现密码。 */
+  const maskedPinText = (which) => {
+    const base = which === 'lan' ? 'lanToken' : 'accessToken';
+    const set = status?.[`${base}Set`];
+    const len = status?.[`${base}Length`];
+    if (!set) return t('pinUnset');
+    return fmt(t, 'pinMasked', { len: Number.isFinite(Number(len)) ? Number(len) : '?' });
+  };
+  /** 密码显示文本：本机有本体就用本体，否则掩码（2026-11-28 第 2 项）。 */
+  const pinText = (which) => {
+    const raw = which === 'lan' ? pinView?.lan : pinView?.public;
+    return raw || maskedPinText(which);
   };
 
   // 局域网访问密码开关（issue #24）：默认开启；关闭后局域网扫码直连（公网不受影响）
@@ -326,14 +375,18 @@ export function PocketSettingsTab({ rpcCall, t }) {
   const saveCustomPin = async (which) => {
     try {
       const r = await call(POCKET_ENDPOINTS.pinSetCustom, { which, value: customPin?.value ?? '' });
+      const base = which === 'lan' ? 'lanToken' : 'accessToken';
       setStatus((s) => ({
         ...s,
-        accessToken: which === 'public' ? r.pin : s.accessToken,
-        lanToken: which === 'lan' ? r.pin : s.lanToken,
+        // status 不再有明文密码字段：合并掩码元数据（r.pin 只在本机来源出现）
+        [`${base}Set`]: r[`${base}Set`] ?? Boolean(r.pin),
+        [`${base}Length`]: r[`${base}Length`] ?? String(r.pin ?? '').length,
         publicPinCustom: which === 'public' ? true : s.publicPinCustom,
         lanPinCustom: which === 'lan' ? true : s.lanPinCustom,
       }));
       setCustomPin(null);
+      if (r.pin) setPinView((p) => ({ ...(p ?? {}), [which]: r.pin, blocked: false }));
+      else { pinsRequested.current = false; await loadPins(); }
     } catch (err) {
       setCustomPin((c) => ({ ...c, err: err.message }));
     }
@@ -635,7 +688,7 @@ export function PocketSettingsTab({ rpcCall, t }) {
                 : (customPin?.which === 'lan'
                   ? customPinRow('lan')
                   : h('div', { style: { marginTop: 6, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
-                    h('span', { style: { fontFamily: 'ui-monospace,Menlo,monospace', fontSize: 13, letterSpacing: 1 } }, status.lanToken),
+                    h('span', { style: { fontFamily: 'ui-monospace,Menlo,monospace', fontSize: 13, letterSpacing: 1 } }, pinText('lan')),
                     h('button', { style: { ...styles.btn, height: 26, padding: '0 10px', fontSize: 12 }, onClick: refreshLanPin }, t('refresh')),
                     customBtn('lan'),
                     status?.lanPinCustom ? h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-state-warn-primary,#b45309)' } }, t('pinCustomHint')) : null,
@@ -733,12 +786,12 @@ export function PocketSettingsTab({ rpcCall, t }) {
             ),
           ),
           // 访问密码行：值 + 自定义（自定义输入态整体替换）
-          status.accessToken
+          status?.accessTokenSet
             ? row(t('pinLabel'),
               customPin?.which === 'public'
                 ? null
                 : h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 8 } },
-                  h('span', { style: { fontFamily: 'ui-monospace,Menlo,monospace', fontSize: 13, letterSpacing: 1 } }, status.accessToken),
+                  h('span', { style: { fontFamily: 'ui-monospace,Menlo,monospace', fontSize: 13, letterSpacing: 1 } }, pinText('public')),
                   customBtn('public')),
               h('div', { style: { marginTop: 6 } },
                 customPin?.which === 'public' ? customPinRow('public') : null,
