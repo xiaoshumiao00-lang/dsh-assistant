@@ -18,8 +18,7 @@
 import type { ChannelDecision, ChannelSwitch, UiaControl, UiaRect } from './cu-uia-core.ts'
 import { planMarks } from './cu-uia-core.ts'
 import { OverlayUnsupportedError, overlayPng } from './cu-uia-overlay.ts'
-import { buildSlimControlHint, onscreenMarks } from './cu-uia-core.ts'
-import { recordMetrics } from './cu-uia-metrics.ts'
+import { buildControlHintBlock } from './cu-uia-core.ts'
 
 /** 本机逐步工具名（关通道时不进任何分支，零开销；只有开通道才按这套名字匹配）。 */
 export const CU_OBSERVATION_TOOLS = [
@@ -55,7 +54,6 @@ export type ContentRewrite = {
   replaced: number
   drawn: number
   hintChars: number
-  hintLines: number
 }
 
 /**
@@ -79,11 +77,9 @@ export async function rewriteContentBlocks(
   const decision = input.decision
   if (decision !== undefined && decision !== null && decision.enabled !== true) return null
   if (!Array.isArray(content) || content.length === 0) return null
-  // ① 清单瘦身：只列本屏可视区里、名字非空的前 8 条（框仍然按全部编号画在图上）
   const marks = planMarks(input.controls ?? [], input.windowRect ?? null)
   if (marks.length === 0) return null
-  const slim = buildSlimControlHint(onscreenMarks(marks, input.windowRect ?? null), { maxItems: 8, maxChars: 300 })
-  const hint = slim.text
+  const hint = buildControlHintBlock(marks, { maxChars: input.maxChars })
   let replaced = 0
   let drawn = 0
   const next: ContentBlock[] = []
@@ -114,7 +110,7 @@ export async function rewriteContentBlocks(
   }
   if (replaced === 0) return null
   if (hint !== '') next.push({ type: 'text', text: hint })
-  return { content: next, replaced, drawn, hintChars: hint.length, hintLines: slim.lines }
+  return { content: next, replaced, drawn, hintChars: hint.length }
 }
 
 export type PostExecuteDecision = { kind: 'accept'; content?: ContentBlock[]; [key: string]: any }
@@ -145,7 +141,6 @@ export function installContentWrapper(ctx: any, opts: {
       if (sample.decision.enabled !== true) return decision
       const content = Array.isArray(decision.content) ? decision.content : Array.isArray(result?.content) ? result.content : []
       if (content.length === 0) return decision
-      const overlayStarted = Date.now()
       const rewritten = await rewriteContentBlocks(content, {
         switch: sw,
         decision: sample.decision,
@@ -154,23 +149,6 @@ export function installContentWrapper(ctx: any, opts: {
         io,
         namePrefix: name,
       })
-      const overlayMs = Date.now() - overlayStarted
-      // 通道开才埋点（关时上面已经 return，一次 IO 都不会发生）
-      try {
-        recordMetrics({
-          at: new Date().toISOString(),
-          tool: name,
-          page: String((sample as any).cacheKey ?? ''),
-          probed: (sample as any).probed === true,
-          probeMs: Number((sample as any).probeMs ?? 0),
-          hintChars: rewritten === null ? 0 : rewritten.hintChars,
-          hintLines: rewritten === null ? 0 : rewritten.hintLines,
-          replaced: rewritten === null ? 0 : rewritten.replaced,
-          drawn: rewritten === null ? 0 : rewritten.drawn,
-          overlayMs,
-          decision: String(sample.decision?.reason ?? ''),
-        })
-      } catch {}
       if (rewritten === null) return decision
       return { ...decision, content: rewritten.content }
     } catch {
