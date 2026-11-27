@@ -30,6 +30,8 @@ const CU_TESTS = [
   'test-cu-code-agent-notice.mjs',
   'test-cu-title-bold.mjs',
   'test-cu-uia-core.mjs',
+  'test-cu-uia-overlay.mjs',
+  'test-cu-uia-observe.mjs',
 ]
 
 function git(args) {
