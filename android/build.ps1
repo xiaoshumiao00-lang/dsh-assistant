@@ -5,23 +5,29 @@
 #   powershell -ExecutionPolicy Bypass -File D:\dsh-assistant\android\build.ps1 -Flavor generic -VersionName 1.1.0 -VersionCode 5
 #   powershell -ExecutionPolicy Bypass -File ... -Sdk D:\android-sdk -Jdk "C:\Program Files\Eclipse Adoptium\jdk-17.0.17.10-hotspot"
 #
-# 路径全部由 $PSScriptRoot 推导，不写死任何绝对目录；SDK/JDK 找不到时报中文错误并提示用 -Sdk/-Jdk 覆盖。
+# 工程内路径全部由 $PSScriptRoot 推导；签名密钥不在仓库里：默认取仓库外 D:\dsh-assistant-signing\assistant.keystore
+# （可用 -Keystore 或环境变量 DSH_ANDROID_KEYSTORE 覆盖）；口令只从环境变量 DSH_ANDROID_KEYSTORE_PASS 读，
+# 没有这个变量就直接报错退出（fail closed，无内置默认值，也不把口令写进命令行与日志）。
+# SDK/JDK 找不到时报中文错误并提示用 -Sdk/-Jdk 覆盖。
 param(
     [ValidateSet('personal', 'generic')][string]$Flavor = 'generic',
     [string]$VersionName = '1.1.0',
     [int]$VersionCode = 5,
     [string]$Sdk = '',
-    [string]$Jdk = ''
+    [string]$Jdk = '',
+    [string]$Keystore = '',
+    [switch]$GenerateKeystore
 )
 
 $ErrorActionPreference = 'Stop'
 
-# 两个变体：本机版预置入口、打开即用；通用版入口留空、首次打开进设置页（之后可随时长按返回键再改）。
+# 两个变体：本机版预置入口（来自环境变量，脚本里不再写死任何真实地址）、打开即用；通用版入口留空、首次打开进设置页（之后可随时长按返回键再改）。
+$PRESET_URL = if ($env:DSH_ANDROID_DEFAULT_URL) { $env:DSH_ANDROID_DEFAULT_URL } else { '' }
 $FLAVORS = @{
     personal = @{
         AppId           = 'com.chenpan.assistant'
         Label           = '个人助手'
-        DefaultUrl      = 'http://***REMOVED***'
+        DefaultUrl      = $PRESET_URL
         Out             = '个人助手'
     }
     generic  = @{
@@ -41,8 +47,16 @@ $GEN       = Join-Path $OUT "gen-$Flavor"
 $CLS       = Join-Path $OUT "classes-$Flavor"
 $DEX       = Join-Path $OUT "dex-$Flavor"
 $DIST      = Join-Path $ROOT 'dist'
-$KS        = Join-Path $ROOT 'assistant.keystore'
-$KS_PASS   = '***REMOVED***'
+# 签名密钥不在仓库里（第 2 步整改 A）：默认取仓库外 D:\dsh-assistant-signing\assistant.keystore，
+# 可被 -Keystore 参数或 $env:DSH_ANDROID_KEYSTORE 覆盖（换机 / CI 用）。
+$KS_DEFAULT = 'D:\dsh-assistant-signing\assistant.keystore'
+$KS = if ($Keystore) { $Keystore } elseif ($env:DSH_ANDROID_KEYSTORE) { $env:DSH_ANDROID_KEYSTORE } else { $KS_DEFAULT }
+# 口令只从环境变量 DSH_ANDROID_KEYSTORE_PASS 读：没有这个变量就直接报错退出（fail closed），
+# 不再回退到任何内置默认值，也不把口令写进日志或命令行（apksigner/keytool 走 env: 形式）。
+$KS_PASS = $env:DSH_ANDROID_KEYSTORE_PASS
+if (-not $KS_PASS) {
+    throw '缺少签名口令：请先设 $env:DSH_ANDROID_KEYSTORE_PASS（一次性口令存在仓库外 D:\dsh-assistant-signing\keystore.pass，不在本仓库里）。'
+}
 $MIN_SDK   = 24
 $TARGET    = 34
 
@@ -178,16 +192,21 @@ if ($LASTEXITCODE -ne 0) { throw 'zipalign 失败' }
 
 Write-Host '== 9/9 签名 ==' -ForegroundColor Cyan
 if (-not (Test-Path $KS)) {
-    Write-Host '   首次构建：生成签名密钥' -ForegroundColor Yellow
+    if (-not $GenerateKeystore) {
+        throw "找不到签名 keystore：$KS（本机那把在仓库外 D:\dsh-assistant-signing\assistant.keystore；换机用 -Keystore 或 DSH_ANDROID_KEYSTORE 指到你自己的密钥；要现场生成新密钥就加 -GenerateKeystore，注意新密钥生成的 APK 无法覆盖安装旧版本）"
+    }
+    Write-Host '   -GenerateKeystore：现场生成新的签名密钥（与既有 1.4.x 不是同一把，不能覆盖安装）' -ForegroundColor Yellow
+    New-Item -ItemType Directory -Force -Path (Split-Path $KS -Parent) | Out-Null
     & "$JAVA_HOME\bin\keytool.exe" -genkeypair -keystore $KS -alias assistant `
         -keyalg RSA -keysize 2048 -validity 10950 -storetype PKCS12 `
-        -storepass $KS_PASS -keypass $KS_PASS `
+        -storepass:env DSH_ANDROID_KEYSTORE_PASS -keypass:env DSH_ANDROID_KEYSTORE_PASS `
         -dname 'CN=ChenPan, OU=Personal, O=dsh-assistant, L=Xiaogan, ST=Hubei, C=CN'
     if ($LASTEXITCODE -ne 0) { throw 'keytool 失败' }
 }
+# 口令走 env: 形式：不再把口令写进命令行，也不再有任何内置默认值
 & "$BT\apksigner.bat" sign `
     --ks $KS --ks-key-alias assistant `
-    --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" `
+    --ks-pass env:DSH_ANDROID_KEYSTORE_PASS --key-pass env:DSH_ANDROID_KEYSTORE_PASS `
     --min-sdk-version $MIN_SDK `
     --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true `
     --out $final $aligned

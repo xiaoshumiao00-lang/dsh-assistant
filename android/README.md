@@ -8,7 +8,7 @@
 | 版本 | **1.4.8**（实测 versionCode `35` / versionName `1.4.8`，可覆盖升级 1.4.x） |
 | 包名 | `com.chenpan.assistant.generic`（通用版） |
 | 交付件 | `android/dist/个人助手-通用版-1.4.8.apk`（86,899 字节，2026-11-27 10:48 构建；构建产物同时在 `android/out/`，同目录另有 `个人助手-通用版-1.4.8.apk.idsig` 5,660 字节） |
-| 签名 | `android/assistant.keystore`，alias `assistant`，口令 `***REMOVED***`（**升级必须用同一把**） |
+| 签名 | 口令**从环境变量 `DSH_ANDROID_KEYSTORE_PASS` 读取**（脚本里没有默认值，缺了就报错退出）；keystore 已挪到仓库外 `D:\dsh-assistant-signing\assistant.keystore`（2750 字节），可用 `-Keystore` 或 `DSH_ANDROID_KEYSTORE` 指到别处。**升级必须用同一把**，证书指纹 SHA-256 `b081dc7ba8a54c2fa36ab4f8bffcabedcd9558d922dcea8dcac21cfe04b7a333`（1.4.4–1.4.8 同一把） |
 | 最低 / 目标 | Android 7.0（API 24）/ API 34 |
 
 ## 1.4.3 的变化：鹈鹕设备功能整条撤掉
@@ -60,7 +60,7 @@ APK 签名块 5,356→6,212（+856）、本地头 +3、中央目录 +3。逐项�
 
 | 输入框 | 填什么 | 常用值 |
 | --- | --- | --- |
-| 助手地址（DSH） | 电脑上 DSH → 设置 → 个人助手 → 手机访问 给的入口 | `http://***REMOVED***` |
+| 助手地址（DSH） | 电脑上 DSH → 设置 → 个人助手 → 手机访问 给的入口 | 填**你自己电脑**的入口地址（本机看 DSH → 设置 → 个人助手 → 手机访问；局域网内就是 `http://<电脑IP>:3081`） |
 
 - 空着点保存会明确提示，不会进一片白屏；懒得复制就点 **「一键填入常用地址」**（只填还空着的那格，不覆盖已填好的）。
 - 改地址：**长按返回键约 1 秒**（或长按桌面图标的「设置地址」快捷方式）。宽屏/平板上设置页限宽 560dp。
@@ -70,14 +70,18 @@ APK 签名块 5,356→6,212（+856）、本地头 +3、中央目录 +3。逐项�
 ## 重新构建
 
 ```powershell
+# 口令先读进环境变量（一次性口令文件在仓库外，脚本与仓库里都没有它）：
+$env:DSH_ANDROID_KEYSTORE_PASS = Get-Content 'D:\dsh-assistant-signing\keystore.pass'
 powershell -ExecutionPolicy Bypass -File D:\dsh-assistant\android\build.ps1 -Flavor generic -VersionName 1.4.8 -VersionCode 35
 # 可选：-Sdk D:\android-sdk  -Jdk "C:\Program Files\Eclipse Adoptium\jdk-17.0.17.10-hotspot"
+# 可选：-Keystore <路径>（或 $env:DSH_ANDROID_KEYSTORE）指到别处的密钥；加 -GenerateKeystore 才会现场生成新密钥
 ```
 
-- 路径全部由脚本自身位置推导（本目录就是工程根）；SDK/JDK 找不到会报中文错误并提示用 `-Sdk` / `-Jdk` 覆盖。
+- 没有 `DSH_ANDROID_KEYSTORE_PASS` 时脚本直接报错退出（不生成、不签名、无内置默认口令）；keystore 默认取仓库外 `D:\dsh-assistant-signing\assistant.keystore`。
+- 工程内路径全部由脚本自身位置推导（本目录就是工程根）；SDK/JDK 找不到会报中文错误并提示用 `-Sdk` / `-Jdk` 覆盖。
 - 依赖：`D:\android-sdk`（platform 34 + build-tools 34.0.0）、JDK 17。**不再需要 Porcupine / TFLite AAR。**
 - 产物：`out\个人助手-通用版-1.4.8.apk`，并自动复制到 `dist\`。
-- `-Flavor personal` 仍保留在脚本里（预置助手地址、包名 `com.chenpan.assistant`），日常交付只用 `generic`。
+- `-Flavor personal` 仍保留在脚本里（包名 `com.chenpan.assistant`；它的预置助手地址现在只从环境变量 `DSH_ANDROID_DEFAULT_URL` 取，脚本里不再写死任何真实地址），日常交付只用 `generic`。
 
 ## 核查这台设备里没有鹈鹕残留（1.4.4 的判据）
 
@@ -108,7 +112,7 @@ android/
   app/src/main/java/com/chenpan/assistant/
     MainActivity.java                           助手屏外壳（WebView / 设置页 / 返回菜单 / 生命周期）—— 无任何悬浮控件
   app/src/main/res/…                            图标、颜色、样式、快捷方式
-  build.ps1                                     无 Gradle 构建（相对路径 + -Sdk/-Jdk）
-  assistant.keystore                            签名密钥（必须沿用）
+  build.ps1                                     无 Gradle 构建（相对路径 + -Sdk/-Jdk/-Keystore）
   dist/ out/                                    交付件 / 构建中间产物
+  （签名密钥不在这里：仓库外 D:\dsh-assistant-signing\assistant.keystore + keystore.pass）
 ```

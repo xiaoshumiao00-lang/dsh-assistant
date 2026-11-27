@@ -338,7 +338,7 @@ npm run lint       # scripts/lint-standards.mjs（不靠 eslint：查个人化�
 
 装插件 + 装 APK 就能用：APK 是一块 Android WebView 外壳，里面只有「助手」屏——电脑上 DSH 那套页面（同一份前端、同一个会话、同一套插件）。
 
-- 源码 / 构建脚本 / 签名密钥 / 交付件都在 [`android/`](android/README.md)；当前版本 **1.4.8**（实测 versionCode `35`，包名 `com.chenpan.assistant.generic`，最低 API 24 / 目标 API 34）。
+- 源码 / 构建脚本 / 交付件都在 [`android/`](android/README.md)；签名密钥不在仓库里（本机那把在仓库外 `D:\dsh-assistant-signing\assistant.keystore`，口令只从环境变量 `DSH_ANDROID_KEYSTORE_PASS` 读）；当前版本 **1.4.8**（实测 versionCode `35`，包名 `com.chenpan.assistant.generic`，最低 API 24 / 目标 API 34）。
 - 交付件：`android/dist/个人助手-通用版-1.4.8.apk`（86,899 字节，2026-11-27 10:48）；构建命令见 `android/README.md`。
 - 首次打开进设置页：助手地址留空时可手填或点「一键填入常用地址」。
 - 语音输入走页面内既有的麦克风入口（宿主语音转写 / 系统输入法），插件侧不再有设备转写接口（2026-11-22 设备线已整体移除）。
