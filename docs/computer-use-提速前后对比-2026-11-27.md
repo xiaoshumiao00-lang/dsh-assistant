@@ -425,3 +425,65 @@ export DSH_CU_UIA=0        # 或：echo '{"enabled": false}' > <profile>/dsh-ass
 
 开关状态已恢复为 `{"enabled": false}`（通道默认关）；本轮**没有**改任何现有文件（只追加本报告），
 `src/assistant.ts` 仍是上一轮批准的 +3 行。
+
+## 13. §12.5 两个真 bug 的修复（代码已就绪；**A/B 待重启后补数字**）
+
+> 状态：代码 / 测试 / 演练已全部跑绿（见 13.3），**宿主尚未重启**，所以本节**没有**新的 A/B 数字，
+> 也**不声称**拿到了真数字。重启后按 13.5 的同一任务跑两遍，把 6 项指标填进本节 13.6。
+
+### 13.1 bug ②：喂帧层换到「能改模型可见内容块」的层
+
+| 项 | 内容 |
+| --- | --- |
+| 旧做法（无效） | `tools/execute` around 位改 value 的 `paths` → 只改了落盘文件与剪贴板（§12.3 实测：编号图 23973 洋红像素，模型可见帧仍 0） |
+| 新做法 | `tools/post-execute` 的 `accept` 决策里**替换 content**（宿主 `dsh-tools` `postExecute` 注释原文：「`accept` keeps the call successful (replacing `content` when given)」） |
+| 换什么 | image 块的 `attachment`：`attachments.readImage(ref)` → `overlayPng()` 画编号 → `attachments.saveImage({data, mediaType:'image/png', name})` → 用新 ref 替换；末尾再追加候选清单 `text` 块（这就是"每帧注入词数"的来源） |
+| 不动什么 | value 里的坐标字段一个不碰（模型坐标原样执行）；vendor/computer-use 零改动；文本块顺序不变，只在末尾追加 |
+| 拦截集 | 从 `computer_use`/`screenshot` 扩到 `click / open_app / type / key / hotkey / scroll / drag / move / open / long_press / wait` 等本机逐步工具 |
+| 关通道开销 | 只做一次 `switch.enabled` 判断就返回原 decision —— 单测断言 **readImage/saveImage 0 次调用** |
+| 兜底 | 探针不启动 / 没控件 / 没有 image 块 / 读不出附件 / 存不进附件 / 不是 PNG → **原 decision 同一引用返回**（不中断 CU） |
+
+文件：**新增** `src/cu-uia-content.ts`（`rewriteContentBlocks()` 纯逻辑 + `installContentWrapper()` + `attachmentIo()` 适配宿主 attachments 服务），
+并由 `src/cu-uia-observe.ts` 的 `installCuObservationWrapper()` 同时挂上 `tools/execute` 与 `tools/post-execute` 两处包装
+（卸载函数两处都拆，单测有断言）。`src/assistant.ts` **仍是已批准的 +3 行，没有再动**。
+
+### 13.2 bug ①：开关文件 BOM
+
+`readCuUiaFileEnabled()` 先 `.replace(/^\uFEFF/, '')` 再 `JSON.parse`；回归测试写了一个**真的带 UTF-8 BOM** 的开关文件
+（首字节 0xEF 断言过），验证 `{"enabled": true}` 读成 `true`、`false` 读成 `false`、非布尔值仍回 `undefined`（交给缺省关）。
+
+### 13.3 本轮测试与演练证据（重启前）
+
+| 项 | 结果 |
+| --- | --- |
+| `test-cu-uia-content.mjs`（新增） | **6/6 通过**：关通道零 IO、开着换 attachment 且存下的图有洋红像素、五种失败原样返回、拦截集含 click/open_app/type、BOM 回归、两处包装都装都拆 |
+| `test-cu-uia-observe.mjs` | **5/5 通过**（原 5 条按事件名取 handler，适配"装两处"） |
+| `test-cu-uia-core.mjs` / `test-cu-uia-overlay.mjs` | 9/9 / 7/7 |
+| `npm run check` | EXIT 0（`lib/index.js` 含 `tools/post-execute` / `installContentWrapper` / BOM 剥离） |
+| 回退演练 | **PASS**：新增文件 16 个 + 白名单 2 个（`src/assistant.ts` +3 行、`lib/index.js` +1153 行构建产物） |
+| 关通道 CU 测试 | **9/9 PASS**（`DSH_CU_UIA=0`，capture-scale / observation-surface / bridge / code-agent-notice / title-bold / core / overlay / observe / content） |
+| 全量脚本 | **98 个：95 通过 / 3 条既有红**（`mobile-proxy`、`pagination-dom`、`session-log-write`）——无新增红 |
+| 提交 | `1389272` fix(cu): 编号框改走 post-execute 内容块层 + 开关文件剥 BOM |
+
+### 13.4 为修演练脚本加的两处口径（不是放宽）（原文如此，见脚本内注释）
+
+- 白名单里 `lib/index.js` 是**构建产物**，行数不设限；`src/assistant.ts` 仍是 **+3 行**上限，超出即 FAIL。
+- 同一路径只登记一次（工作区与 HEAD 都有改动时不重复计数），避免"3 个文件"的误报。
+
+### 13.5 重启后要跑的 A/B（与 §12 完全同一任务）
+
+同一任务同一目标 UI（PDF 第 18/24 页）：
+`open_app chrome` → `click [87,421]` → `click [86,620]` → `click [972,134]` → `screenshot`。
+
+两遍：① 开关关（profile `{"enabled": false}`，无 BOM）② 开关开（`{"enabled": true}`）。
+要取的指标（比 §12 多了"每帧注入词数"和"洋红像素/sha"两列）：
+步数、点击数、同坐标重复、点击失败重找、每帧读取次数、每帧注入词数、探针毫秒、编号框命中/未命中步数、端到端墙钟、
+**模型可见帧洋红像素数与 sha**。
+
+### 13.6 结果（待重启后填）
+
+| 指标 | 基线（关） | 改动后（开） |
+| --- | --- | --- |
+| 待补 | 待补 | 待补 |
+
+判据不变：任一指标劣于基线 → 通道判关（默认 `{"enabled": false}`）并照实写进本节。
