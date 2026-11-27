@@ -532,3 +532,53 @@ export DSH_CU_UIA=0        # 或：echo '{"enabled": false}' > <profile>/dsh-ass
 **下一步的收益点（不改口径也能做）**：把清单压到只列「本屏可视区 + 可点角色 + 名字非空」的前 8–12 条（预计 < 300 字符），
 并把探针结果按页面缓存（已有 `createPageCache`）接进 post-execute 路径——那两条做完再跑同一 A/B，才可能把「注入词数/探针」这两项拉到不劣于基线。
 （旧的「待补」空表已移除；本轮结果见 §14。）
+
+## 14. §13.7 两条收益点落地（代码 + 证据；**A/B 待重启**）
+
+> 状态：代码 / 测试 / 演练已跑绿（14.1–14.3），**宿主未重启**，所以本节**没有**新的 A/B 数字。
+> 重启后按 14.4 跑新旧各一遍，把 10 项指标填进 14.5。**不提前声称拿到真数字。**
+
+### 14.1 ① 候选清单瘦身（774 字符 / 17 行 → 297 字符 / 8 行）
+
+| 项 | 实现 |
+| --- | --- |
+| 只列本屏可视区 | `onscreenMarks(marks, windowRect)`：rect 与观察面求交集，交集为空就丢掉 |
+| 只列可点角色 + 名字非空 | 复用 `UIA_ACTIONABLE_ROLES` 与 `planMarks()`；名字为空的直接跳过 |
+| 前 8 条 + 双上限 | `buildSlimControlHint()`：`maxItems=8`、`maxChars=300`、名字截 18 字符，超限即停 |
+| 图不瘦身 | 编号框仍按**全部**可点控件画（`planMarks` 不变），只有文本清单变短 |
+| 实测（同一样本） | **17 行 / 774 字符 → 8 行 / 297 字符**（`test-cu-uia-slim` 打印的真实数字） |
+
+### 14.2 ② 探针接进 post-execute + 实跑埋点
+
+| 项 | 实现 |
+| --- | --- |
+| 页面缓存 | `createObservationProbe()` 内的 `createPageCache`（TTL 30s、≤8 页）；同页命中不重探 |
+| 同页每秒 ≤1 次 | 新增 `minIntervalMs=1000` 节流：1 秒内直接吃上次结果，**probeMs 记 0** |
+| 冷启动不算预算 | 首帧前先 `await sidecar.probe(1)` 预热并丢弃（实测冷启动 ~380ms），之后才开始计时（实测首探 **45ms**） |
+| 埋点 | 新增 `src/cu-uia-metrics.ts`：通道**开**时每次拦截追加一行 JSONL 到 `%TEMP%\dsh-cu-marks\metrics-<日期>.jsonl`；字段含 `at/tool/page/probed/probeMs/hintChars/hintLines/replaced/drawn/overlayMs/decision`；**关通道时一次 IO 都不发生** |
+
+### 14.3 本轮测试与演练（重启前）
+
+| 项 | 结果 |
+| --- | --- |
+| `test-cu-uia-slim.mjs`（新增） | **4/4**：瘦身 ≤8 行 <300 字符且名字非空、可视区过滤（框不受影响）、双上限、节流（首次 probed=true 45ms / 第二次 probed=false 0ms） |
+| 其余 CU 单测 | content 6/6、observe 5/5、core 9/9、overlay 7/7 |
+| `npm run check` | EXIT 0 |
+| 回退演练 | **PASS**（新增文件 + 白名单仅 `src/assistant.ts` +3、`lib/index.js` 构建产物） |
+| 关通道 CU 测试 | **10/10 PASS** |
+| 全量脚本 | **99 个：96 通过 / 3 条既有红**（`mobile-proxy`、`pagination-dom`、`session-log-write`）——无新增红 |
+| 提交 | `1613e5b`（瘦身 + 缓存/节流 + 埋点） |
+| 另 | 已清掉 §13.6 末尾那段残留的「待补」空表 |
+
+### 14.4 重启后要跑的 A/B（与 §13.5 完全同一任务同一 UI）
+
+`open_app chrome` → `click [87,421]` → `click [86,620]` → `click [972,134]` → `screenshot`；
+两遍：① `{"enabled": false}` ② `{"enabled": true}`（均无 BOM 写入）。
+
+取 10 项：步数、点击数、同坐标重复、失败重找、每帧读取次数、**每帧注入词数（字符数+行数）**、
+**探针毫秒（取埋点 JSONL 的 probeMs 实跑值）**、编号命中/未命中步数、端到端墙钟（起止时间戳）、
+**模型可见帧洋红像素数与 sha**。
+
+### 14.5 结果
+
+（待宿主重启后填入；本轮不写推测数字。）
