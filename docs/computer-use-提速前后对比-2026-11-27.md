@@ -7,7 +7,7 @@
 
 | 项 | 值 | 证据/出处 |
 | --- | --- | --- |
-| **改动前基线 commit** | `ebf16ae` | `git rev-parse aef60f0^`（清单 commit 的父提交） |
+| **改动前基线 commit** | 第一段 `ebf16ae`（清单 `aef60f0` 的父提交）；**本段（sidecar）另立新基线 `ff877ae`** | `git rev-parse aef60f0^` / `git log --oneline -1 ff877ae` |
 | 本轮改动 commit | `aef60f0`（清单）→ `2326629`（核心逻辑+单测/微基准/真机探针）→ `c063bfe`（恢复点+一键回退+演练脚本，package.json 回基线）→ 本报告更新 | `git log --oneline -5` |
 | **与基线的差异** | **8 个新增文件 / 现有文件 0 改动** | `node scripts/cu-uia-rollback-drill.mjs` ① 段 |
 | **通道默认状态** | **关**（`default-off`） | `resolveChannelSwitch({})` |
@@ -166,3 +166,61 @@ npm run check                                # EXIT 0（lib 产物未变，本�
 
 `test-mobile-proxy`、`test-secretary-pagination-dom`、`test-secretary-session-log-write`：改动前就是红的；
 本轮新增的 `test-cu-uia-core` 是绿的，全量仍是 92/95。
+
+## 9. 本段续做：常驻 sidecar 把探针压进 120ms（基线 `ff877ae`）
+
+上一段的结论是「探针 296–611ms > 120ms → 永远不启动」。本段按批准范围第 1 步把它压下来，**没有放宽预算线**。
+
+### 9.1 怎么压的
+
+| 手段 | 效果（本机实测，Chrome 前台窗口） |
+| --- | --- |
+| 常驻进程（程序集只加载一次） | 消掉每次都付的 150–190ms 冷启动 |
+| `CacheRequest` + 可点类型 `OrCondition` 批量取缓存（节点 453 → 183，保留 88 个可点控件） | 把「每个控件一次跨进程取属性」换成「一次 FindAll 批量取」 |
+
+### 9.2 实测（`node scripts/cu-uia-sidecar-bench.mjs --runs 12`，2026-11-27T06:33Z）
+
+| 项 | 值 |
+| --- | --- |
+| sidecar ready | **332 ms**（一次性，程序集加载） |
+| 每次往返 | **42 / 43 / 43 / 43 / 44 / 44 / 45 / 46 / 46 / 47 / 48 / 49 ms** |
+| p50 / p95 / max | **43 / 49 / 49 ms**（预算 120 ms） |
+| 可点控件 | **88 个**（旧一次性进程 123 个原始节点、筛后可点 40 个） |
+| 判定 | `可用`（`decideControlChannel` 通过） |
+| 结论 | **PASS：p95 49ms < 120ms**，sidecar 站得住；预算线一个字没动 |
+
+开关打开时的完整链路（`DSH_CU_UIA=1 node scripts/cu-uia-live-probe.mjs --sidecar`）：
+探针 46ms → 判定可用 → **编号 40 个**、候选清单 **774 字符**、`copyFrame=true`；默认关时同一页面
+⇒ 编号 0 个、清单 0 字符、`copyFrame=false`（帧原样，改动前行为）。
+
+### 9.3 接线状态：**仍未接线**（这是本轮没跑 A/B 的直接原因）
+
+- 插件侧**没有**观察帧出口的钩子：每帧喂模型的图 + 文由 `vendor/computer-use/index.js`
+  `writeDesktopScreenshots()`(:998) / `recapture()`(:1177) / `screenshot`(:1639) 产出。
+- 两条可行路线（都需要额外能力，不是本轮已做的）：
+  1. **插件侧 around-dispatch 包装**：宿主 `dsh-tools` 有 around-wrapper 机制，可在工具结果层
+     把编号图 + 候选清单附上去；但仍需一个**图像合成器**（在 PNG 上画编号：编码器 + 位图字体），
+     这段还没写、也没验证过。
+  2. **改 vendor 观察帧出口**：需要在上面 3 个函数里各插一个「可选的帧后处理钩子」；
+     按你的口径，动之前必须先逐行报告（本轮没有动，vendor 零改动）。
+- 也就是说：**sidecar 达标 ≠ 通道已能影响一次 CU 任务**。通道现在只会「算」，没有「喂」。
+
+### 9.4 A/B 为什么本轮仍然没跑（不编数字）
+
+1. 没接线（9.3）：开着 `DSH_CU_UIA=1` 跑同一任务，模型看到的东西与关着**完全一样**，跑出的数字无意义。
+2. A/B 要跑两遍真实 CU 任务（每次 30–60 分钟级），且要在**重启后的宿主**上跑；重启会**杀掉当前这条工作会话**，
+   测量必须由外部常驻脚本驱动，不能在本会话里串着做。
+3. 我不会把只读演练计时或估算当端到端数字。
+
+**要拿到数字的最小步骤**（按顺序，需你点头）：
+① 写图像合成器（编号框画到 PNG 副本）→ ② 插件侧 around-dispatch 包装（或按 9.3 改 vendor 三处，先报行号）→
+③ 重启宿主 → ④ 用同一只读演练任务跑 `DSH_CU_UIA=0` 与 `=1` 各一遍，采集 6 项：工具调用数、点击数、
+同坐标重复点击数、墙钟耗时、失败重试数、总步数 → ⑤ 任一指标变差（步数不降 / 耗时 +10% / 重复点击增多）→ 默认关。
+
+### 9.5 本段回退与差异
+
+- 本段新基线：**`ff877ae`**；本段新增提交：`b557cde`（sidecar）。
+- 与第一段基线 `ebf16ae` 比：仍是 **10 个新增文件 / 现有文件 0 改动**（`node scripts/cu-uia-rollback-drill.mjs` → PASS）。
+- 回退照旧：`git revert --no-edit b557cde`，或删新增文件 + 开关关（`DSH_CU_UIA=0` / profile `{"enabled": false}`）。
+- 本轮**没有重启宿主**：新产物都是独立模块与脚本（`lib/*` 未变），重启没有可加载的新东西，
+  却会中断这条会话，所以在报告落盘前不做。
