@@ -824,7 +824,7 @@ URL `https://www.bing.com`，窗口 `Chrome_WidgetWin_1`，1920×1032；5 步同
 ### 16.4 开关文件已删除 + 全仓库 grep
 
 - profile 开关文件 `C::\Users\<ACCOUNT>\.dsh\profiles\desktop\dsh-assistant-cu-uia.json`（撤前实测 17 字节、无 BOM、内容 `{"enabled":false}`）已删除；删前逐字节备份到 `outputs/2026-11-28/rollback/switch-off-2026-11-28.json`（17 字节，hex `7b22656e61626c6564223a66616c73657d`，与原件逐字节一致；`outputs/` 不提交）。删后核对同目录（78 个条目）里 `cu-uia` 文件 **0 个**，`dsh-assistant-cu-uia.json` 不存在。
-- 全仓库 grep（`DSH_CU_UIA` / `dsh-assistant-cu-uia` / `cu-uia-`，本报告写到 §16 之后重跑，含本节自身引用）：**代码区 0 命中**（`src/`、`lib/`、`scripts/`、`vendor/`、`package.json` 三个关键词全为 0 行，`git grep` 退出码 1 = 无匹配）。整棵已提交树的命中行只落在本报告的 2 个 docs 档案里：`DSH_CU_UIA` **25 行**、`dsh-assistant-cu-uia` **9 行**、`cu-uia-` **63 行**——这些是决策档案里的历史引用，按「决策档案保留不删」照旧留着。未提交的证据与本机 scratch：`outputs/` 命中 **1 行**（`dsh-assistant-cu-uia`），`.tmp/` 命中 **59 个文件 / 144 行**（本机一次性探针与脚本，不入库）。
+- 全仓库 grep（`DSH_CU_UIA` / `dsh-assistant-cu-uia` / `cu-uia-`，本报告写到 §16 之后重跑，含本节自身引用）：**代码区 0 命中**（`src/`、`lib/`、`scripts/`、`vendor/`、`package.json` 三个关键词全为 0 行，`git grep` 退出码 1 = 无匹配）。整棵已提交树的命中行只落在本报告的 2 个 docs 档案里：`DSH_CU_UIA` **25 行**、`dsh-assistant-cu-uia` **9 行**、`cu-uia-` **63 行**——这些是决策档案里的历史引用，按「决策档案保留不删」照旧留着。未提交的证据与本机 scratch：`outputs/` 命中 **1 行**（`dsh-assistant-cu-uia`），`.tmp/` 命中 **60 个文件 / 146 行**（本机一次性探针与助手脚本，包括本轮回退用的 `.tmp/report-stats.mjs` / `.tmp/verify-doc.mjs` / `.tmp/append-sec16.mjs` / `.tmp/grep-counts.mjs`，一律不入库）。
 - 运行时残留（不参与 git 状态，按档案留证）：`%TEMP%\dsh-cu-marks\` 内仍有本轮通道跑的 12 张 `*.marks.png` 与 `metrics-2026-11-27.jsonl`；快照副本已落在 `outputs/2026-11-28/r3`（`metrics-live-2026-11-27.jsonl` 46 行、`metrics-slice-before-c1on.jsonl` 16 行、`case1-on/metrics-after-c1on.jsonl`）与 `r2`（`metrics-live-5steps.jsonl`、`hint-block-received.txt` + `baseline`/`treatment` 帧）。档案一律保留，未删。
 
 ### 16.5 真机复核位
