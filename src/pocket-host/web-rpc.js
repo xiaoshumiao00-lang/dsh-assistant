@@ -7,11 +7,9 @@
 //   2. 旧版 dsh / 无 webServer 服务（headless）→ 回退 ctx.connection.rpc.handle(...)。
 
 import { promises as fs } from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
 import { POCKET_RPC_CHANNEL, POCKET_ENDPOINTS, redactStatus, pinMeta } from '../client/pocket/api.js';
 import { POCKET_SOURCE_MARKER } from './proxy.mjs';
-import { listFs, saveUpload, uploadsDir } from './fs-rpc.mjs';
+import { listFs, saveUpload, uploadsDir, requireAllowedPath } from './fs-rpc.mjs';
 
 /** 单次读取上限：4 MB，避免把大文件塞进剪贴板 / 内存。 */
 const FILE_READ_MAX = 4 * 1024 * 1024;
@@ -498,24 +496,16 @@ export function installPocketRpc(ctx, { service, log = console, desktop = false,
         //   - ~/ 开头：展开为用户 HOME；
         //   - 相对路径：相对「客户端传入的 cwd」或「DSH 主机进程 cwd = 工作目录」
         //     （用户从自己项目里 `dsh web` 时，二者一致，与 dsh-web 的
-        //     resolveWorkspacePath(cwd, path) 行为对齐）。安全边界同既有 RPC：
-        //     仅本机/隧道经 PIN 可达，等同于你自己操作这台机器。
+        //     resolveWorkspacePath(cwd, path) 行为对齐）。
+        // 安全边界（2026-11-28 手机访问安全整改第 3 项）：不再只是「经 PIN 可达」——
+        // 每个路径都要过与工作台同一份目录 allowlist（src/path-guard.ts），
+        // 越界 / 盘符根 / `..` 遍历一律拒绝并带明确错误码。
         const raw = String(payload?.path ?? '').trim();
         if (!raw) return fail('bad-request', '缺少文件路径 | missing path');
-        let abs;
-        try {
-          if (/^~[/\\]?/.test(raw)) {
-            // 去掉 ~ 及其后的可选斜杠，再相对 HOME 解析
-            abs = path.resolve(os.homedir(), raw.replace(/^~[/\\]?/, ''));
-          } else if (path.isAbsolute(raw)) {
-            abs = path.resolve(raw);
-          } else {
-            const base = typeof payload?.cwd === 'string' && payload.cwd ? payload.cwd : process.cwd();
-            abs = path.resolve(base, raw);
-          }
-        } catch {
-          return fail('bad-request', '路径非法 | invalid path');
-        }
+        const checkedPath = requireAllowedPath(raw, {
+          cwd: typeof payload?.cwd === 'string' && payload.cwd ? payload.cwd : process.cwd(),
+        });
+        const abs = checkedPath;
         let stat;
         try {
           stat = await fs.stat(abs);

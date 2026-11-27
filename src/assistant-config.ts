@@ -97,6 +97,62 @@ export const WRITABLE_CONFIG_FIELDS = [
 
 export type WritableConfigField = (typeof WRITABLE_CONFIG_FIELDS)[number]
 
+/**
+ * 只有本机回环能写的字段（2026-11-28 手机访问安全整改第 3 项）：
+ * `allowAllLocalPaths` 把整条目录边界关掉，`allowedRoots` 把边界拉宽——
+ * 这两项等于「把这台电脑的钥匙换个说法交出去」，所以手机/公网来源（经 pocket 代理进来的）
+ * 一律拒写，即使它已经带着 PIN 登录过。要改这些字段请在电脑上改。
+ */
+export const LOOPBACK_ONLY_CONFIG_FIELDS = ['allowAllLocalPaths', 'allowedRoots'] as const
+
+/** 本机回环 Host 名单（与 pocket-host/web-rpc.js 的 LOOPBACK_HOSTNAMES 同一份口径）。 */
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1'])
+/**
+ * pocket 代理写给插件的来源标记（与 src/pocket-host/proxy.mjs 的 POCKET_SOURCE_MARKER 同名同值；
+ * lib/index.js 与 lib/pocket.js 是两个独立 bundle，不能互相 import，所以这里只能重复一份。
+ * 改名字/改值必须两处一起改，scripts/test-fs-rpc-allowlist.mjs 会断言两边一致）。
+ */
+const POCKET_SOURCE_MARKER = 'x-dsh-pocket-source'
+
+/** Host 头里的 hostname（去端口、认 [::1]）。 */
+function hostNameOf(value: unknown): string {
+  let name = String(value ?? '').trim().toLowerCase()
+  if (name.startsWith('[')) {
+    const end = name.indexOf(']')
+    if (end >= 0) name = name.slice(1, end)
+  } else {
+    name = name.replace(/:\d+$/, '')
+  }
+  return name
+}
+
+/** 取单值头（数组头取第一个）。 */
+function headerOf(req: any, name: string): string {
+  const raw = req?.headers?.[name]
+  if (Array.isArray(raw)) return String(raw[0] ?? '')
+  return String(raw ?? '')
+}
+
+/**
+ * 这条 HTTP 请求是不是本机回环（危险字段写入门槛）。
+ * 判据与 pocket-host/web-rpc.js 的 pocketRequestSource 一致：代理写的来源标记说了算，
+ * `cf-connecting-ip`（Cloudflare 边缘的真实客户端 IP）也算外部来源；判不到就按非本机（fail closed）。
+ */
+export function requestLoopback(req: any): { loopback: boolean; reason: string } {
+  const marker = headerOf(req, POCKET_SOURCE_MARKER).trim().toLowerCase()
+  if (marker === 'lan' || marker === 'public') return { loopback: false, reason: `pocket-proxy:${marker}` }
+  if (headerOf(req, 'cf-connecting-ip').trim()) return { loopback: false, reason: 'cf-connecting-ip' }
+  if (marker === 'loopback') return { loopback: true, reason: 'pocket-proxy:loopback' }
+  const host = hostNameOf(headerOf(req, 'host'))
+  if (!host) {
+    const addr = String(req?.socket?.remoteAddress ?? '').trim().toLowerCase()
+    if (addr && (LOOPBACK_HOSTNAMES.has(addr) || addr === '0.0.0.0' || /^127\./.test(addr))) return { loopback: true, reason: 'socket-loopback' }
+    return { loopback: false, reason: 'no-host-header' }
+  }
+  if (LOOPBACK_HOSTNAMES.has(host) || host === '0.0.0.0' || /^127\./.test(host)) return { loopback: true, reason: 'host-loopback' }
+  return { loopback: false, reason: `host:${host}` }
+}
+
 /** 一次写入的可写子集（只带用户真的改过的那几个键）。 */
 export type AssistantConfigPatch = Partial<Pick<AssistantLocalConfig, WritableConfigField>>
 
@@ -592,6 +648,20 @@ export function registerAssistantConfigRoutes(ctx: any): () => void {
             sendJson(res, 400, { ok: false, error: validated.error, ...(validated.field ? { field: validated.field } : {}) })
             return
           }
+          // 危险字段（拆边界 / 拉宽边界）只允许本机回环写：手机来源即使带 PIN 登录过也拒
+          const dangerous = LOOPBACK_ONLY_CONFIG_FIELDS.filter((field) => field in validated.patch)
+          if (dangerous.length > 0) {
+            const source = requestLoopback(req)
+            if (!source.loopback) {
+              sendJson(res, 403, {
+                ok: false,
+                error: 'loopback-only',
+                field: dangerous.join(','),
+                hint: `${dangerous.join(' / ')} 只在这台电脑上改（来源判定：${source.reason}）`,
+              })
+              return
+            }
+          }
           // 逃生开关要求显式确认（与 memory-clear 的 DELETE-ALL 同一种做法）
           const body = read.body as Record<string, unknown>
           if (validated.patch.allowAllLocalPaths === true && body?.confirm !== 'ALLOW-ALL') {
@@ -631,5 +701,7 @@ export const assistantConfigTestSurface = {
   validateAssistantConfigPatch,
   writeAssistantConfig,
   registerAssistantConfigRoutes,
+  requestLoopback,
+  LOOPBACK_ONLY_CONFIG_FIELDS,
   WRITABLE_CONFIG_FIELDS,
 }

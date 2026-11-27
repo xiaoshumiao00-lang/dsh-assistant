@@ -39,10 +39,14 @@ function fakeWebServer() {
   }
 }
 
-function fakeReq(method, body) {
+function fakeReq(method, body, extraHeaders = {}) {
   const stream = Readable.from(body === undefined ? [] : [Buffer.from(body, 'utf8')])
   stream.method = method
   stream.url = '/api/assistant/config'
+  // 这份 fixture 代表「桌面浏览器在本机打开设置页」：dsh web 只认本机 HTTP 层，
+  // 所以必须带 loopback Host——危险字段（allowAllLocalPaths / allowedRoots）只在回环写才放行
+  // （2026-11-28 手机访问安全整改第 3 项）。不带 Host 的旧写法等于「来源不明」，会被 fail closed 拒。
+  stream.headers = { host: '127.0.0.1:53691', 'content-type': 'application/json', ...extraHeaders }
   return stream
 }
 
@@ -62,9 +66,9 @@ const dispose = surface.registerAssistantConfigRoutes({
 const route = server.exact.get('/api/assistant/config')
 assert.ok(route, '没有注册 /api/assistant/config')
 
-const call = async (method, payload) => {
+const call = async (method, payload, extraHeaders = {}) => {
   const res = fakeRes()
-  await route.handler(fakeReq(method, payload === undefined ? undefined : JSON.stringify(payload)), res)
+  await route.handler(fakeReq(method, payload === undefined ? undefined : JSON.stringify(payload), extraHeaders), res)
   let json = null
   try { json = JSON.parse(res.body) } catch { json = null }
   return { status: res.status, headers: res.headers, json, raw: res.body }
@@ -151,6 +155,27 @@ cases.push(['逃生开关要显式确认（allowAllLocalPaths 需 confirm:"ALLOW
   const off = await call('POST', { allowAllLocalPaths: false })
   assert.equal(off.status, 200)
   assert.equal(off.json.allowAllLocalPaths, false)
+}])
+
+cases.push(['危险字段只允许本机回环写（手机来源即使带确认词也 403，且不落盘）', async () => {
+  const marker = 'x-dsh-pocket-source'
+  for (const headers of [{ [marker]: 'lan' }, { [marker]: 'public' }, { 'cf-connecting-ip': '203.0.113.7' }, { host: 'pocket.example.com' }]) {
+    const deniedRoots = await call('POST', { allowedRoots: [join(tempHome, 'from-phone')] }, headers)
+    assert.equal(deniedRoots.status, 403, `来源 ${JSON.stringify(headers)} 该被拒：${deniedRoots.raw}`)
+    assert.equal(deniedRoots.json.error, 'loopback-only')
+    const deniedEscape = await call('POST', { allowAllLocalPaths: true, confirm: 'ALLOW-ALL' }, headers)
+    assert.equal(deniedEscape.status, 403, '回环判定该走在确认之前：' + deniedEscape.raw)
+    assert.equal(deniedEscape.json.field, 'allowAllLocalPaths')
+  }
+  assert.ok(!readFileSync(configFile, 'utf8').includes('from-phone'), '非本机来源把目录边界改宽了')
+  assert.ok(!/"allowAllLocalPaths"\s*:\s*true/.test(readFileSync(configFile, 'utf8')), '非本机来源把逃生开关打开了')
+  // 不需要边界特权的字段照旧可写（手机改自己的设置是正常用法）
+  const normal = await call('POST', { termEnvAllow: ['FROM_PHONE_OK'] }, { [marker]: 'lan' })
+  assert.equal(normal.status, 200, `普通字段不该被来源判定挡住：${normal.raw}`)
+  // 本机回环照旧能写危险字段（上面 403 用例的对照面）
+  const local = await call('POST', { allowedRoots: [join(tempHome, 'from-desktop')] })
+  assert.equal(local.status, 200, `本机回环该能改边界：${local.raw}`)
+  assert.ok(readFileSync(configFile, 'utf8').includes('from-desktop'))
 }])
 
 cases.push(['词表与目录边界：整表替换、空数组合法', async () => {

@@ -161,9 +161,11 @@ export function LocalConfigPanel({ tl }: { tl?: (key: any) => string }) {
     if (!result.ok) {
       setNote({
         ok: false,
-        text: result.field
+        text: (result.field
           ? t('localConfig.saveFailedField', { field: result.field }) + ' — ' + String(result.error)
-          : t('localConfig.saveFailed') + ' — ' + String(result.error),
+          : t('localConfig.saveFailed') + ' — ' + String(result.error))
+          // 危险字段（allowAllLocalPaths / allowedRoots）被本机以外来源拒了：宿主的 hint 要说得照着给
+          + (result.hint ? '\n' + String(result.hint) : ''),
       })
       return
     }

@@ -163,6 +163,8 @@ export interface SaveConfigResult {
   ok: boolean
   error?: string
   field?: string
+  /** 宿主给出的下一步建议（危险字段被拒时会带「只在这台电脑上改」这类说明） */
+  hint?: string
   /** 保存后台实际写到的文件（宿主回报） */
   file?: string
   config?: AssistantClientConfig | null
@@ -185,7 +187,12 @@ export async function saveAssistantConfig(
     })
     const body: any = await response.json().catch(() => null)
     if (!response.ok || !body || body.ok === false) {
-      return { ok: false, error: asString(body?.error) || `HTTP ${response.status}`, field: asString(body?.field) || undefined }
+      return {
+        ok: false,
+        error: asString(body?.error) || `HTTP ${response.status}`,
+        field: asString(body?.field) || undefined,
+        hint: asString(body?.hint) || undefined,
+      }
     }
     const config = normalize(body)
     if (config) {

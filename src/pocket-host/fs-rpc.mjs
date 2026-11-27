@@ -4,13 +4,89 @@
 //   listFs(path, { includeFiles }) — 列出电脑上的目录（可选含文件），带面包屑；
 //   saveUpload({ name, data })    — 把手机上传的文件落到电脑磁盘，返回绝对路径。
 //
-// 安全边界与既有 pocket RPC 一致：仅本机 / 隧道经 PIN 可达（web-rpc 层已把关），
+// 安全边界：仅本机 / 隧道经 PIN 可达（web-rpc 层已把关），**并且**每个路径都过目录 allowlist
+// （2026-11-28 手机访问安全整改第 3 项：一个 8 位 PIN 不等于「能翻整台电脑的磁盘」）。
 // 路径解析规则与 pocket.fileRead 完全对齐（绝对 / ~/ / 相对 cwd）。
 
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createPathGuard } from '../path-guard.ts';
+
+/**
+ * 目录边界执行体：与工作台（lib/index.js 的 assistantPathGuard）用的是同一份 allowlist、
+ * 同一份本机配置（~/.dsh/assistant/config.json 的 allowedRoots / allowAllLocalPaths），
+ * 所以「手机文件通道能看哪些目录」和「内容窗文件通道能看哪些目录」是同一个答案。
+ */
+const pocketPathGuard = createPathGuard();
+
+/** 拒绝原因的稳定错误码（消息前缀 = 机器可读，客户端原样显示给用户）。 */
+export const FS_DENY_CODES = {
+  outside: 'outside-allowlist',
+  driveRoot: 'drive-root-denied',
+  traversal: 'path-traversal-denied',
+  empty: 'empty-path',
+};
+
+/** 带错误码的拒绝（web-rpc 把它转成 bad-request 的 message，前缀即代码）。 */
+function deny(code, detail) {
+  const err = new Error(`${code}: ${detail}`);
+  err.dshFsCode = code;
+  return err;
+}
+
+/** 是不是盘符根（C:\ / D:\）或 POSIX 的 /——「整盘根」单独一类拒绝，文案要说得清。 */
+function isVolumeRoot(target) {
+  const p = String(target ?? '');
+  if (!p) return false;
+  if (process.platform === 'win32') return /^[A-Za-z]:[\\/]*$/.test(p);
+  return p === '/';
+}
+
+/** 入参里是否出现 `..` 段（遍历的线索，用来给出更贴切的错误码）。 */
+function hasTraversalSegment(raw) {
+  return /(^|[/\\])\.\.([/\\]|$)/.test(String(raw ?? '').trim());
+}
+
+/** 当前 allowlist 的根列表（每次请求重读本机配置，见 path-guard.ts 的 P0-5 说明）。 */
+export function allowedRoots() {
+  return pocketPathGuard.roots;
+}
+
+/** 全局放行开关（本机配置 allowAllLocalPaths）——只用于日志/诊断，不用于绕过检查。 */
+export function allowlistOpen() {
+  return pocketPathGuard.open === true;
+}
+
+/**
+ * 解析入参路径并做目录边界检查（2026-11-28 第 3 项）。
+ * @param {string} raw 原始路径（空 = 用户主目录，与 listFs 的默认一致）
+ * @param {{cwd?:string, defaultRoot?:string}} [opts] 相对路径的基准（缺省：用户主目录）
+ * @returns {string} 归一化后的绝对路径
+ * @throws Error（message 前缀是错误码：outside-allowlist / drive-root-denied / path-traversal-denied）
+ */
+export function requireAllowedPath(raw, opts = {}) {
+  const home = os.homedir();
+  const base = typeof opts.cwd === 'string' && opts.cwd ? opts.cwd : (opts.defaultRoot ?? home);
+  const target = resolvePath(raw, base);
+  if (target === null) throw deny(FS_DENY_CODES.empty, `路径非法：${raw} | invalid path`);
+  const check = pocketPathGuard.check(target);
+  if (check.ok) return check.target;
+  const code = isVolumeRoot(check.target)
+    ? FS_DENY_CODES.driveRoot
+    : (hasTraversalSegment(raw) ? FS_DENY_CODES.traversal : FS_DENY_CODES.outside);
+  throw deny(code, `${raw ?? ''} → ${check.target}（目录边界之外；要放行请在电脑上加 allowedRoots，来源：${check.reason}）`);
+}
+
+/** 与工作台 index.ts 的 denyOutside 同一个口径：越界时给 403 形状的错误码。 */
+export function checkPath(raw, opts = {}) {
+  try {
+    return { ok: true, target: requireAllowedPath(raw, opts) };
+  } catch (err) {
+    return { ok: false, code: err?.dshFsCode ?? FS_DENY_CODES.outside, target: '', message: err?.message ?? String(err) };
+  }
+}
 
 /** 与 lib/tunnel.mjs、lib/settings.mjs 一致的 $DSH_HOME 解析。 */
 export function dshHome() {
@@ -127,9 +203,10 @@ export async function listFs(rawPath, opts = {}) {
   const { includeFiles = false, cwd, maxEntries = MAX_LIST_ENTRIES } = opts;
   const home = os.homedir();
   if (rawPath !== undefined && rawPath !== null && String(rawPath).trim() !== '' && resolvePath(rawPath, cwd) === null) {
-    throw new Error(`路径非法：${rawPath} | invalid path`);
+    throw deny(FS_DENY_CODES.empty, `路径非法：${rawPath} | invalid path`);
   }
-  const target = resolvePath(rawPath, home) ?? home;
+  // 目录边界（2026-11-28 第 3 项）：越界 / 盘符根 / `..` 遍历一律拒绝，带明确错误码
+  const target = requireAllowedPath(rawPath, { cwd, defaultRoot: home });
   let dirents;
   try {
     dirents = await fs.readdir(target, { withFileTypes: true });
@@ -204,11 +281,28 @@ export async function saveUpload(input) {
     throw new Error(`附件过大（${(buf.length / 1024 / 1024).toFixed(1)} MB），上限 25 MB | attachment too large`);
   }
   const dir = uploadsDir();
+  // 落盘目录本身也要过边界（allowAllLocalPaths 撤掉时这里同样拒绝，见第 4 项）
+  requireAllowedPath(dir);
   await fs.mkdir(dir, { recursive: true });
   // 时间戳 + 随机后缀防并发撞名；保留原文件名便于用户识别。
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const suffix = Math.random().toString(36).slice(2, 8);
   const target = path.join(dir, `${stamp}-${suffix}-${leaf}`);
+  // 最后一道闸：拼出来的路径必须仍在 uploads 目录内（leafName 已挡穿越，双保险）
+  const inDir = comparablePrefix(path.resolve(target), dir);
+  if (!inDir) throw deny(FS_DENY_CODES.traversal, `${target} 不在上传目录内 | outside uploads dir`);
   await fs.writeFile(target, buf);
   return { path: target, size: buf.length };
+}
+
+/** `p` 是否在 `dir` 之内（含 dir 本身）——比较用归一化与 path-guard 一致。 */
+function comparablePrefix(p, dir) {
+  const norm = (v) => {
+    let s = String(v).replace(/[\\/]+/g, '/');
+    if (s.length > 1 && s.endsWith('/')) s = s.slice(0, -1);
+    return process.platform === 'win32' ? s.toLowerCase() : s;
+  };
+  const a = norm(p);
+  const b = norm(dir);
+  return a === b || a.startsWith(b + '/');
 }
