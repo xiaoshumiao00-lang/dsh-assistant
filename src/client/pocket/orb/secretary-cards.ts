@@ -1644,6 +1644,115 @@ export function planHistoryScrollRestore(
   return { scrollTop: null, reason: 'keep', delta: 0 }
 }
 
+/** 守护循环：补偿之后仍可能有异步高度增长（折叠卡 0→35px、图片晚到、折叠展开）把锚点顶走，
+ * 而手机触摸/惯性滑动期间浏览器原生 scroll anchoring 被抑制，没人兜底——视图就会落到新加载批次顶部。
+ * 所以补偿后一小段时间内逐帧核对锚点行的视口偏移，偏了就再补 scrollTop，直到安静 quietFrames 帧或到 maxMs 上限。 */
+export const HISTORY_GUARD_MAX_MS = 600
+export const HISTORY_GUARD_QUIET_FRAMES = 8
+/** 最早收工时间：异步高度变化通常在前 300ms 内到达，早于它不许判「安静」。 */
+export const HISTORY_GUARD_MIN_MS = 300
+/** 锚点行短暂消失（翻卡/重画）容忍帧数。 */
+export const HISTORY_GUARD_MISSING_GRACE_FRAMES = 45
+
+export interface HistoryScrollGuardOptions {
+  scroller: any
+  /** 锚点行的 data-dsh-scard-key；空串一律不守护。 */
+  anchorKey: string
+  /** 期望的锚点行视口偏移（相对滚动口顶部，px）。 */
+  expectOffset: number
+  maxMs?: number
+  quietFrames?: number
+  missingGraceFrames?: number
+  /** 是否挂 MutationObserver 同步纠偏（默认 true；离线数值模型可关掉）。 */
+  observeMutations?: boolean
+  now?: () => number
+  raf?: (cb: () => void) => number
+  caf?: (id: number) => void
+}
+
+/** 启动守护循环，返回停止函数（幂等）。 */
+export function startHistoryScrollGuard(options: HistoryScrollGuardOptions): () => void {
+  const scroller = options?.scroller
+  const key = String(options?.anchorKey ?? '')
+  if (scroller === null || scroller === undefined || key === '') return () => {}
+  const view = typeof window === 'undefined' ? null : window
+  const raf = options.raf ?? ((cb: () => void): number => (view === null ? 0 : view.requestAnimationFrame(cb)))
+  const caf = options.caf ?? ((id: number): void => { try { view?.cancelAnimationFrame(id) } catch { /* 忽略 */ } })
+  const now = options.now ?? ((): number => (typeof performance === 'undefined' ? Date.now() : performance.now()))
+  const maxMs = Math.max(1, Number(options.maxMs ?? HISTORY_GUARD_MAX_MS) || HISTORY_GUARD_MAX_MS)
+  const quietFrames = Math.max(1, Number(options.quietFrames ?? HISTORY_GUARD_QUIET_FRAMES) || HISTORY_GUARD_QUIET_FRAMES)
+  const graceFrames = Math.max(1, Number(options.missingGraceFrames ?? HISTORY_GUARD_MISSING_GRACE_FRAMES) || HISTORY_GUARD_MISSING_GRACE_FRAMES)
+  const expectOffset = Number(options.expectOffset) || 0
+  const startedAt = now()
+  let quiet = 0
+  let missing = 0
+  let observer: any = null
+  let frame = 0
+  let stopped = false
+  const stop = (): void => {
+    if (stopped) return
+    stopped = true
+    if (frame !== 0) { caf(frame); frame = 0 }
+    if (observer !== null) { try { observer.disconnect() } catch { /* 忽略 */ } observer = null }
+  }
+  const findRow = (): any => {
+    const rows = scroller?.querySelectorAll?.(HISTORY_CARD_ROW_SELECTOR) ?? []
+    for (const item of Array.from(rows as ArrayLike<any>)) {
+      if (String(item?.getAttribute?.('data-dsh-scard-key') ?? '') === key) return item
+    }
+    return null
+  }
+  /** 就地纠偏（同步）：返回是否还活着。MutationObserver 与 rAF 两条路都走它。 */
+  const correct = (): boolean => {
+    if (stopped) return false
+    if (scroller?.isConnected === false) { stop(); return false }
+    const row = findRow()
+    const scrollerTop = Number(scroller?.getBoundingClientRect?.().top) || 0
+    const rowTop = row === null ? null : Number(row?.getBoundingClientRect?.().top) || 0
+    const rowHeight = row === null ? 0 : (Number(row?.getBoundingClientRect?.().height) || 0)
+    // 翻卡/重画期间锚点行会短暂不在（或 0 高）：容忍若干帧，不许因此提前退出——
+    // 提前退出等于放弃守护，异步增长一到就又跳了。
+    if (rowTop === null || rowHeight <= 0) {
+      missing += 1
+      quiet = 0
+      if (missing > graceFrames) { stop(); return false }
+      return true
+    }
+    missing = 0
+    const drift = rowTop - scrollerTop - expectOffset
+    if (Math.abs(drift) >= 1) {
+      quiet = 0
+      // 同步写 scrollTop：MO 回调就跑在当前任务尾部，能在**同一帧**内把位置纠回来，不会画出跳帧
+      scroller.scrollTop = (Number(scroller.scrollTop) || 0) + drift
+    } else {
+      quiet += 1
+    }
+    if (now() - startedAt >= maxMs) { stop(); return false }
+    if (quiet >= quietFrames && now() - startedAt >= HISTORY_GUARD_MIN_MS) { stop(); return false }
+    return true
+  }
+  const step = (): void => {
+    frame = 0
+    if (stopped) return
+    if (!correct()) return
+    frame = raf(step)
+  }
+  // 关键：MutationObserver 在 DOM 变化**同一任务尾部**触发（早于下一帧 rAF），宿主 prepend / 插件插卡
+  // 这类同步生长当场就能纠偏，用户看到的不是「先跳一帧再回来」。
+  if (options.observeMutations !== false && typeof MutationObserver !== 'undefined') {
+    try {
+      observer = new MutationObserver(() => { try { correct() } catch { /* 忽略 */ } })
+      observer.observe(scroller, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'src', 'height', 'data-open'] })
+    } catch { observer = null }
+  }
+  const stopAll = (): void => {
+    stop()
+    if (observer !== null) { try { observer.disconnect() } catch { /* 忽略 */ } observer = null }
+  }
+  frame = raf(step)
+  return stopAll
+}
+
 /** 卡行矩形（pickHistoryAnchorKey 的输入；DOM 侧由 captureHistoryScrollSnapshot 量好喂进来）。 */
 export interface HistoryScrollRowRect {
   key: string

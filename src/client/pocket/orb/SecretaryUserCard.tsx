@@ -38,7 +38,7 @@ import {
   latestRealUserCardRef, noticeArrivalStore, noticeCardExpired, noticeCardSpeechKey, nearestNoticeExpiryMs, NOTICE_CARD_TTL_MS,
   parseNoticeCardBody, parseSessionRefs, parseUserCardBody, secretaryPager,
   secretaryQuoteStore, stripSessionRefs, tagSecretaryCompactHintRows, clearLatestTurnProcessTags, tagLatestTurnProcessRows, userCardSpeechKey, EARLIER_HINT_TEXT, SCROLL_TOP_THRESHOLD_PX,
-  captureHistoryScrollSnapshot, planHistoryScrollRestore, shouldExpandOnScroll,
+  captureHistoryScrollSnapshot, planHistoryScrollRestore, shouldExpandOnScroll, startHistoryScrollGuard,
   type PagerDomCard, type SecretaryCardRow, type UserCardAttachment, type UserCardBodyBlock,
 } from './secretary-cards.ts'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
@@ -396,6 +396,8 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
   const pager = secretaryPager()
   const pagerVersion = useSecretaryPagerVersion()
   const expandingRef = useRef(false)
+  /** 历史滚动守护循环的停止函数（null = 没在守）。 */
+  const guardStopRef = useRef<null | (() => void)>(null)
 
   useEffect(() => {
     let alive = true
@@ -505,6 +507,27 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
       const clearGestureWatch = (): void => {
         for (const type of gestureEvents) el.removeEventListener(type, noteGesture, gestureOptions)
       }
+      // 守护循环：必须从加载**开始前**就起——补偿是一次性的，之后折叠卡长出来、图片晚到、折叠展开
+      // 还会把锚点顶走；手机触摸/惯性滑动期间浏览器原生 scroll anchoring 又被抑制，这里是唯一防线。
+      // 翻卡/重画期间锚点行会短暂消失，guard 容忍若干帧；上限 1.2s，安静 8 帧且过 300ms 自行收工。
+      guardStopRef.current?.()
+      guardStopRef.current = null
+      if (before.anchorKey !== null && before.anchorOffset !== null) {
+        const stopGuard = startHistoryScrollGuard({
+          scroller: el,
+          anchorKey: before.anchorKey,
+          expectOffset: before.anchorOffset,
+          maxMs: 1200,
+        })
+        const stopGuardNow = (): void => { guardStopRef.current?.(); guardStopRef.current = null }
+        for (const type of gestureEvents) el.addEventListener(type, stopGuardNow, { passive: true, capture: true })
+        document.addEventListener('visibilitychange', stopGuardNow)
+        guardStopRef.current = (): void => {
+          for (const type of gestureEvents) el.removeEventListener(type, stopGuardNow, { capture: true })
+          document.removeEventListener('visibilitychange', stopGuardNow)
+          stopGuard()
+        }
+      }
       void Promise.resolve(pager.expandOlder()).then(async () => {
         await settleScrollHeight(el)
         const after = captureHistoryScrollSnapshot(el, before.anchorKey)
@@ -531,6 +554,8 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
       observer.disconnect()
       if (frame !== 0) window.cancelAnimationFrame(frame)
       if (attached !== null) attached.removeEventListener('scroll', onScroll)
+      guardStopRef.current?.()
+      guardStopRef.current = null
     }
   }, [pager])
 
