@@ -17,4 +17,11 @@ dsh-assistant 包含以下第三方代码，按原许可证使用：
    https://github.com/xiaoshumiao00-lang/dsh-tuoguan
    代码位置：src/tuoguan-host.ts、src/client/tuoguan.tsx
 
+5. dsh-orb（Computer Use 悬浮球宿主，vendored）— MIT License
+   https://github.com/mini-yifan/dsh-orb-cordis
+   Copyright (c) 2026 mini-yifan
+   许可证全文：vendor/computer-use/LICENSE.dsh-orb
+   版本与包信息：vendor/computer-use/package-info.dsh-orb.json（dsh-orb 0.1.8）
+   代码位置：vendor/computer-use/**（随本包分发，由 src/cu-bridge*.mjs 与 src/cu-shims/** 接入）
+
 本插件整体按 GPL-2.0 发布（见 LICENSE）。
