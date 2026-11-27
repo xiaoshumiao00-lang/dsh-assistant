@@ -291,6 +291,9 @@ export function setCloudflaredPath(value) {
 //     "remotePort": 7080,
 //     "keyPath": "<你的私钥路径，例如 ~/.ssh/id_ed25519>",
 //     "localPort": 0          // 0 = 跟随插件代理实际端口（推荐）
+//     // 可选（2026-11-28 安全整改）：主机键校验与 known_hosts 位置，缺省即安全默认
+//     // "hostKeyChecking": "accept-new",   // accept-new | yes | no（no 只在确实想降级的人那里出现）
+//     // "knownHostsPath": "",              // 空 = <DSH_HOME>/dsh-pocket/known_hosts
 //   }
 // 2026-11-05（P0-4）：六项都能在设置页里改（RPC `sshTunnel.setConfig`），
 // 不再需要手写这个文件；user 也不再默认 root（必须自己填）。

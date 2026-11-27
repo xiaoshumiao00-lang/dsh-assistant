@@ -8,6 +8,8 @@
 //     DSH 退出 → 一起停掉。断线/半死由探活发现后自动重连，不需要任何人工操作。
 //
 // 安全边界：公网入口仍然要 8 位 PIN（由 proxy.mjs 校验），这里只负责把端口接出去。
+// 主机键边界（2026-11-28）：`StrictHostKeyChecking=accept-new` + 真 known_hosts 文件
+// （见 hostKeyArgs()）。旧写法是「校验取 no」+「known_hosts 指向空设备」——等于允许中间人。
 //
 // 设计要点：
 //   - 先探活再 spawn：如果已有隧道（手动开的、上次没退干净的）健康，就直接「收养」，
@@ -28,7 +30,9 @@
 //   4) 收养外部健康隧道时把它的本机 pid 也记进状态，避免「插件说没连上、机器上却有进程」。
 
 import { spawn, execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import http from 'node:http';
 
 const POWERSHELL = process.platform === 'win32'
@@ -115,7 +119,18 @@ export const SSH_TUNNEL_DEFAULTS = Object.freeze({
   keyPath: '',
   /** 0 = 跟随插件代理实际端口（推荐）；>0 用于手工指到别的本地端口 */
   localPort: 0,
+  // 主机键校验（2026-11-28 安全整改）：这两项都是**可选**字段，缺省即安全默认——
+  //   hostKeyChecking 缺省 'accept-new'，knownHostsPath 缺省 <DSH_HOME>/dsh-pocket/known_hosts。
+  // 也可用环境变量 DSH_POCKET_SSH_HOST_KEY_CHECKING / DSH_POCKET_SSH_KNOWN_HOSTS 覆盖
+  // （env 优先级高于 settings.json 里的字段，和 DSH_POCKET_CLOUDFLARED 的既有写法一致）。
 });
+
+/** 可写进 settings.json 的主机键校验取值；坏值一律当「未配置」（回默认 accept-new）。 */
+function normalizeHostKeyCheckingField(v) {
+  const raw = String(v ?? '').trim().toLowerCase();
+  if (raw === 'acceptnew') return 'accept-new';
+  return SSH_HOST_KEY_CHECKING_VALUES.includes(raw) ? raw : '';
+}
 
 function toPort(v, fallback) {
   const n = Number(v);
@@ -133,6 +148,9 @@ export function normalizeSshTunnelConfig(raw) {
     remotePort: toPort(v.remotePort, SSH_TUNNEL_DEFAULTS.remotePort),
     keyPath: String(v.keyPath ?? '').trim(),
     localPort: Number.isInteger(Number(v.localPort)) && Number(v.localPort) > 0 ? Number(v.localPort) : 0,
+    // 空字符串 = 未配置（真正的取值由 hostKeyChecking()/knownHostsPath() 在调用时定）
+    hostKeyChecking: normalizeHostKeyCheckingField(v.hostKeyChecking),
+    knownHostsPath: String(v.knownHostsPath ?? '').trim(),
   };
 }
 
@@ -150,8 +168,67 @@ function sshBinary() {
   return 'ssh';
 }
 
-function knownHostsNull() {
-  return process.platform === 'win32' ? 'NUL' : '/dev/null';
+/** 本机 dsh 数据根（与 lib/settings.mjs、lib/tunnel.mjs 同一套解析：DSH_HOME 优先，否则 ~/.dsh）。 */
+function dshHome() {
+  const env = String(process.env.DSH_HOME ?? '').trim();
+  return env || join(homedir(), '.dsh');
+}
+
+/**
+ * 主机键校验默认值（2026-11-28 安全整改）：`accept-new`。
+ *   - `no`（旧行为）＝ 无人值守但**零信任**：中间人能顶走整条 http 会话（含 PIN）；
+ *     审计报告 P1-4（校验取 no + 空 known_hosts）判的就是这条；
+ *   - `accept-new`＝ 首次连接自动收下主机键、之后键变了就拒（`hostkey` 分类在
+ *     FAILURE_PATTERNS 里已经认得「REMOTE HOST IDENTIFICATION HAS CHANGED」）；
+ *   - `yes`＝ 严格：首次连接需要人工收键（BatchMode 下会直接失败，留给确实想这么配的人）。
+ */
+export const SSH_HOST_KEY_CHECKING_DEFAULT = 'accept-new';
+/** 允许写进 `-o StrictHostKeyChecking=` 的值（'no' 只作为显式降级，见 normalize 的注释）。 */
+export const SSH_HOST_KEY_CHECKING_VALUES = Object.freeze(['accept-new', 'yes', 'no', 'none']);
+
+/**
+ * known_hosts 的落盘位置（2026-11-28）：以前写的是 `NUL`（Windows）或 `/dev/null`（POSIX），
+ * 也就是「现问现扔」——收下来的键没有任何地方留存，下次连接自然无从比对，形同没有校验。
+ * 现在放进 pocket 的 profile 目录，与 settings.json / token 同目录（已有备份约定：
+ * 同名文件加 `.bak-<时间戳>`，known_hosts 只在本机读写，不需要备份）。
+ * 优先级：env DSH_POCKET_SSH_KNOWN_HOSTS > cfg.knownHostsPath > 默认路径
+ * （env 先，跟 DSH_POCKET_CLOUDFLARED 的既有写法一个味道：外部注入说了算）。
+ */
+export function knownHostsPath(cfg = null) {
+  const fromEnv = String(process.env.DSH_POCKET_SSH_KNOWN_HOSTS ?? '').trim();
+  const fromCfg = String(cfg?.knownHostsPath ?? '').trim();
+  const explicit = fromEnv || fromCfg;
+  if (explicit) return explicit;
+  return join(dshHome(), 'dsh-pocket', 'known_hosts');
+}
+
+/** 主机键校验的取值（env DSH_POCKET_SSH_HOST_KEY_CHECKING > cfg.hostKeyChecking > 默认）。 */
+function hostKeyChecking(cfg) {
+  const raw = String(
+    process.env.DSH_POCKET_SSH_HOST_KEY_CHECKING ?? cfg?.hostKeyChecking ?? '',
+  ).trim().toLowerCase();
+  if (!raw) return SSH_HOST_KEY_CHECKING_DEFAULT;
+  if (raw === 'accept-new' || raw === 'acceptnew') return 'accept-new';
+  return SSH_HOST_KEY_CHECKING_VALUES.includes(raw) ? raw : SSH_HOST_KEY_CHECKING_DEFAULT;
+}
+
+/** known_hosts 的父目录必须存在（ssh 不会自己造目录）；只造目录，不碰已有文件。 */
+function ensureKnownHostsDir(cfg) {
+  const file = knownHostsPath(cfg);
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** `-o` 主机键参数组（两处 ssh 调用共用，改一处等于两处都改）。 */
+function hostKeyArgs(cfg) {
+  return [
+    '-o', `StrictHostKeyChecking=${hostKeyChecking(cfg)}`,
+    '-o', `UserKnownHostsFile=${knownHostsPath(cfg)}`,
+  ];
 }
 
 /** 子进程环境：禁掉任何交互式口令提示（BatchMode 之外的双保险）。 */
@@ -165,8 +242,7 @@ export function buildSshArgs(cfg, localPort) {
     '-N',
     '-R', `0.0.0.0:${cfg.remotePort}:127.0.0.1:${localPort}`,
     '-i', cfg.keyPath,
-    '-o', 'StrictHostKeyChecking=no',
-    '-o', `UserKnownHostsFile=${knownHostsNull()}`,
+    ...hostKeyArgs(cfg),
     '-o', 'ServerAliveInterval=15',
     '-o', 'ServerAliveCountMax=3',
     '-o', 'TCPKeepAlive=yes',
@@ -187,8 +263,7 @@ export function buildRemoteCmdArgs(cfg) {
   const args = [
     '-T',
     '-i', cfg.keyPath,
-    '-o', 'StrictHostKeyChecking=no',
-    '-o', `UserKnownHostsFile=${knownHostsNull()}`,
+    ...hostKeyArgs(cfg),
     '-o', 'ConnectTimeout=10',
     '-o', 'ServerAliveInterval=15',
     '-o', 'ServerAliveCountMax=2',
@@ -408,6 +483,8 @@ export function planRemoteKills(parsed, cfg) {
 export function runRemoteSsh(cfg, command, timeoutMs = 20_000, { execFn = execFile } = {}) {
   if (!sshTunnelConfigured(cfg)) return Promise.resolve({ ok: false, error: 'SSH 隧道未配置 | not configured', stdout: '', stderr: '' });
   return new Promise((resolve) => {
+    // known_hosts 目录不在（新装、或 DSH_HOME 换过）就别在这里把主机键写丢：先造目录再连。
+    ensureKnownHostsDir(cfg);
     let args;
     try { args = [...buildRemoteCmdArgs(cfg), command]; } catch (err) {
       resolve({ ok: false, error: oneLine(err?.message ?? err), stdout: '', stderr: '' });
@@ -669,6 +746,9 @@ export function createSshTunnel({
 
   function spawnTunnel(cfg, localPort) {
     const args = buildSshArgs(cfg, localPort);
+    // accept-new 要往 UserKnownHostsFile 里**写**首连收下的键：目录不存在就先造，
+    // 否则 ssh 报 "Could not stat /realpath: No such file or directory" 并把整条隧道拖进重试。
+    ensureKnownHostsDir(cfg);
     info(`dsh-pocket: starting ssh reverse tunnel ${cfg.host}:${cfg.remotePort} -> 127.0.0.1:${localPort} | 启动固定公网隧道`);
     let c;
     try {
@@ -918,6 +998,9 @@ export function createSshTunnel({
       // 只暴露私钥文件名（不含目录）与是否存在——足够诊断 key_missing，不把本机路径全发给手机
       keyName: String(cfg.keyPath ?? '').split(/[\\/]/).filter(Boolean).pop() ?? '',
       keyExists: Boolean(cfg.keyPath) && existsSync(cfg.keyPath),
+      // 主机键校验状态（设置页看得到「accept-new」有没有真的生效；路径不外发，只报有没有）
+      hostKeyChecking: hostKeyChecking(cfg),
+      knownHostsExists: existsSync(knownHostsPath(cfg)),
       localPort: currentLocalPort(cfg),
       url: state.url || urlOf(cfg),
       phase: state.phase,
