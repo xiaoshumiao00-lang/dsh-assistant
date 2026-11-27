@@ -768,12 +768,71 @@ export function addReadCardKey(state: Record<string, string[]>, sessionId: strin
 const SESSION_SOURCE_NONE = 'none'
 
 /**
- * 取宿主两路会话表（持久化清单优先、活会话表补上 `live`）。
+ * 从宿主投影块里取标题：**{ asOfSeq, values: { title } }**（宿主自己的会话列表 API 也是这么取的）。
+ * 形状不对 / 没有 title 行 / 不是字符串 → 空串（调用方据此保留 id 兜底，绝不因为没标题就丢这行）。
+ */
+export function titleFromProjectionBlock(block: unknown): string {
+  const values = (block as any)?.values
+  if (values === null || typeof values !== 'object') return ''
+  const raw = (values as Record<string, unknown>).title
+  if (typeof raw !== 'string') return ''
+  return raw.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX_CHARS)
+}
+
+/**
+ * 一条宿主会话的真实标题（2026-11-27 用户实测：控制室「更换会话」面板里全是 session-83bca3e3-… 原始 id）。
+ *
+ * 根因：宿主会话表的 header **只有身份**（id / cwd / createdAt / updatedAt），没有标题。
+ * 标题是会话日志 fold 出来的投影行 `title`，宿主自己的会话列表也是从投影里取的：
+ *   活会话 → `ctx.sessionProjections.cachedSnapshot(session)`（内存里现成，零 IO）；
+ *   冷会话 → `ctx.sessionProjectionCache.cachedSnapshot(header)`（磁盘侧投影缓存，同样零日志读）；
+ *            跨格式世代的老记录再退一步走 `cachedPredecessorTitle(header)`（只借前代 title 行）；
+ *   最后兜底才问 `ctx.sessionTitle.get(session)`（只对活会话成立）。
+ * 全都问不出来就回空串——外面拿 id 兜底，不许因为标题缺席把这条会话从候选里丢掉。
+ */
+function resolveHostSessionTitle(ctx: any, header: any, live: boolean): string {
+  const sessionId = String(header?.id ?? '').trim()
+  let liveSession: any
+  try {
+    if (live === true && sessionId !== '' && typeof ctx?.sessions?.get === 'function') liveSession = ctx.sessions.get(sessionId)
+  } catch { /* 取不到活会话就只走缓存那一路 */ }
+  try {
+    const projections = ctx?.sessionProjections
+    if (liveSession !== undefined && liveSession !== null && projections && typeof projections.cachedSnapshot === 'function') {
+      const title = titleFromProjectionBlock(projections.cachedSnapshot(liveSession))
+      if (title !== '') return title
+    }
+  } catch { /* 活会话那一路问不出：继续走投影缓存 */ }
+  try {
+    const cache = typeof ctx?.get === 'function' ? ctx.get('sessionProjectionCache') : undefined
+    if (cache && typeof cache.cachedSnapshot === 'function') {
+      let title = titleFromProjectionBlock(cache.cachedSnapshot(header))
+      if (title === '' && typeof cache.cachedPredecessorTitle === 'function') {
+        title = titleFromProjectionBlock(cache.cachedPredecessorTitle(header))
+      }
+      if (title !== '') return title
+    }
+  } catch { /* 投影缓存也没有：再问一次标题服务 */ }
+  try {
+    const titles = typeof ctx?.get === 'function' ? ctx.get('sessionTitle') : undefined
+    if (liveSession !== undefined && liveSession !== null && titles && typeof titles.get === 'function') {
+      const snapshot = titles.get(liveSession)
+      const raw = typeof snapshot === 'string' ? snapshot : (snapshot as any)?.title
+      const title = typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX_CHARS) : ''
+      if (title !== '') return title
+    }
+  } catch { /* 标题服务不可用就算了：id 兜底 */ }
+  return ''
+}
+
+/**
+ * 取宿主两路会话表（持久化清单优先、活会话表补上 `live`），**并补上真实标题**。
  * 两路都试、都失败才回空——返回 empty 而不是 null 是因为「会话表空」本身是合法答案
  * （新 profile 一条会话都没有），客户端据此知道「真没有可选会话」，不用猜宿主答没答话。
+ * 标题这一步见 {@link resolveHostSessionTitle}：宿主 header 里没有标题，得自己去投影缓存取。
  */
 async function collectHostSessionRows(ctx: any): Promise<{ rows: BindableSecretarySession[]; source: string }> {
-  const rows: BindableSecretarySession[] = []
+  const entries: { header: any; live: boolean }[] = []
   let source = SESSION_SOURCE_NONE
   try {
     const query = ctx?.get?.('sessionQuery')
@@ -782,8 +841,9 @@ async function collectHostSessionRows(ctx: any): Promise<{ rows: BindableSecreta
       if (Array.isArray(list)) {
         source = 'session-query'
         for (const record of list) {
-          const row = normalizeBindableSessionRow(record)
-          if (row !== null) rows.push(row)
+          const header = (record as any)?.header ?? record
+          if (header === null || typeof header !== 'object') continue
+          entries.push({ header, live: (record as any)?.live === true })
         }
       }
     }
@@ -793,11 +853,24 @@ async function collectHostSessionRows(ctx: any): Promise<{ rows: BindableSecreta
     if (live !== null) {
       if (source === SESSION_SOURCE_NONE) source = 'sessions-list'
       for (const session of live) {
-        const row = normalizeBindableSessionRow(session)
-        if (row !== null) { row.live = true; rows.push(row) }
+        const header = (session as any)?.header ?? session
+        if (header === null || typeof header !== 'object') continue
+        entries.push({ header, live: true })
       }
     }
   } catch { /* 宿主没有 sessions.list：只剩持久化清单的结果 */ }
+  const rows: BindableSecretarySession[] = []
+  for (const entry of entries) {
+    const row = normalizeBindableSessionRow(entry.header)
+    if (row === null) continue
+    if (entry.live) row.live = true
+    // 宿主 header 里没有标题：标题自己去投影缓存取（取不到就留着 id 兜底）
+    if (row.title === row.sessionId) {
+      const title = resolveHostSessionTitle(ctx, entry.header, entry.live)
+      if (title !== '') row.title = title
+    }
+    rows.push(row)
+  }
   return { rows, source }
 }
 
@@ -1695,6 +1768,8 @@ export const assistantSecretaryTestSurface = {
   SECRETARY_SESSIONS_DEFAULT_LIMIT,
   SECRETARY_SESSIONS_MAX_LIMIT,
   normalizeBindableSessionRow,
+  titleFromProjectionBlock,
+  collectHostSessionRows,
   parseSecretarySessionsQuery,
   pickBindableSessions,
   markBoundSessions,

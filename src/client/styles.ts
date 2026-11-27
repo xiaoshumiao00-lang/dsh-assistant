@@ -741,10 +741,12 @@ export const css = xtermCss + '\n' + [
   // 当前绑定的那条：留着、标出来、但不许再选（重选同一条等于没换，别白写一次盘）
   '.dsh-wt_sswItemBound{background:rgba(79,142,247,.14);color:var(--wt-text);cursor:default;opacity:.86}',
   '.dsh-wt_sswItem:disabled{cursor:default}',
-  '.dsh-wt_sswName{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.35}',
+  '.dsh-wt_sswName{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.35;font-weight:600;color:var(--wt-text)}',
   '.dsh-wt_sswMeta{display:flex;align-items:center;gap:6px;min-width:0;font-size:10px;line-height:1.3;color:var(--wt-text3)}',
   '.dsh-wt_sswTag{flex:none;padding:0 6px;border-radius:999px;background:rgba(79,142,247,.18);color:var(--dsw-alias-state-accent-primary,#4f8ef7);font-size:9px;line-height:15px}',
   '.dsh-wt_sswTime{flex:none;color:var(--wt-text3)}',
+  // 会话 id 短名：只在次要行露前 8 位（认人用），别让它再顶到主行位置
+  '.dsh-wt_sswId{flex:none;margin-left:auto;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:9px;letter-spacing:.04em;color:var(--wt-text3);opacity:.72}',
   '.dsh-wt_sswEmpty{padding:16px 6px;text-align:center;font-size:11px;color:var(--wt-text3)}',
   '.dsh-wt_sswError{padding:6px 8px;border-radius:8px;background:rgba(248,81,73,.14);color:#f85149;font-size:11px;line-height:1.5}',
   '.dsh-wt_sswWarn{padding:4px 8px;border-radius:8px;background:rgba(210,153,34,.14);color:var(--dsw-alias-state-warning,#d29922);font-size:10px;line-height:1.5}',

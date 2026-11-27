@@ -4,7 +4,7 @@ import { cachedJsonRead, cachedJsonWrite } from './localStore'
 import { filterWorkingCards } from './consoleFilter'
 import { CONSOLE_FIRST_MOUNT, sameConsoleCard } from './consoleCardPolicy'
 import { sortSessionsByActivity } from './sessionRank'
-import { filterSwitchRows, switchTimeText, type SecretarySwitchRow } from './secretary-session-switch'
+import { filterSwitchRows, shortSessionId, switchRowName, switchTimeText, type SecretarySwitchRow } from './secretary-session-switch'
 import { archivableBlankRows, sessionRowsVisible } from './sessionFolder'
 import { domGate, createGatedThrottle } from './compositionGate'
 import { createCardRefreshCoalescer } from './cardRefreshPolicy'
@@ -3274,13 +3274,14 @@ export function ConsolePane() {
                     type="button"
                     className={'dsh-wt_sswItem' + (row.bound ? ' dsh-wt_sswItemBound' : '')}
                     disabled={row.bound || switchPop.busy}
-                    title={row.cwd || row.id}
+                    title={[switchRowName(row, T('console.switchUntitled')), row.id, row.cwd].filter((part) => part !== '').join(' · ')}
                     onClick={() => { void pickSwitchRow(row) }}
                   >
-                    <span className="dsh-wt_sswName">{row.title}</span>
+                    <span className="dsh-wt_sswName">{switchRowName(row, T('console.switchUntitled'))}</span>
                     <span className="dsh-wt_sswMeta">
                       {row.bound && <span className="dsh-wt_sswTag">{T('console.switchBoundTag')}</span>}
                       <span className="dsh-wt_sswTime">{switchTimeText(row.updatedAt)}</span>
+                      <span className="dsh-wt_sswId">{shortSessionId(row.id)}</span>
                     </span>
                   </button>
                 ))}

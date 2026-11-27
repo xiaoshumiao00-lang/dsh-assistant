@@ -103,6 +103,29 @@ export function filterSwitchRows(rows: readonly SecretarySwitchRow[], keyword: s
     || row.cwd.toLowerCase().includes(needle))
 }
 
+/**
+ * 行的**主标题**（2026-11-27 用户要求：以会话标题为主显示，id 只作次要信息）。
+ * 宿主还没给出标题时 normalizeSwitchRow 会把 title 落成 id——这里把这种「标题就是 id」的行
+ * 换成「未命名会话」占位，免得原始 id 又跑到主行位置上来。
+ */
+export function switchRowName(row: SecretarySwitchRow | null | undefined, untitled = '未命名会话'): string {
+  const title = String(row?.title ?? '').replace(/\s+/g, ' ').trim()
+  if (title === '' || title === String(row?.id ?? '')) return untitled
+  return title
+}
+
+/**
+ * 次要行里显示的会话 id 短名：`session-83bca3e3-bcd1-49f0-…` → `83bca3e3`。
+ * 只用来「认人」（汇报、报错时对得上号），不占主行位置。
+ */
+export function shortSessionId(id: unknown): string {
+  const raw = String(id ?? '').trim()
+  if (raw === '') return ''
+  const body = raw.startsWith('session-') ? raw.slice('session-'.length) : raw
+  const head = body.split('-')[0] ?? ''
+  return head !== '' ? head.slice(0, 8) : body.slice(0, 8)
+}
+
 /** 面板时间口径：刚刚 / N 分钟前 / N 小时前 / N 天前；没有时间戳就明说「时间未知」。 */
 export function switchTimeText(updatedAt: unknown, now = Date.now()): string {
   const stamp = Number(updatedAt ?? 0)
@@ -112,6 +135,47 @@ export function switchTimeText(updatedAt: unknown, now = Date.now()): string {
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`
   return `${Math.floor(diff / 86_400_000)} 天前`
+}
+
+/**
+ * 页面侧会话列表快照里的一条标题（宿主投影行 title）。
+ * 快照形状与本插件 cu-title-bold.ts 用的是同一套（实测）：byId[id].projectionValues.title /
+ * byId[id].projections.values.title / displayTitle / title，值可能被 { val } / { value } 包一层。
+ * 取不到、或取出来就是 id 本身 → 空串（调用方保留原样）。
+ */
+export function snapshotSessionTitle(byId: unknown, id: unknown): string {
+  const sessionId = String(id ?? '').trim()
+  if (sessionId === '' || byId === null || typeof byId !== 'object') return ''
+  const entry = (byId as Record<string, any>)[sessionId]
+  if (entry === null || entry === undefined || typeof entry !== 'object') return ''
+  const candidates = [
+    entry.projectionValues?.title,
+    entry.projections?.values?.title,
+    entry.projectionValues?.displayTitle,
+    entry.displayTitle,
+    entry.title,
+    entry.header?.title,
+  ]
+  for (const candidate of candidates) {
+    const raw = typeof candidate === 'string'
+      ? candidate
+      : (candidate !== null && typeof candidate === 'object' ? (candidate.val ?? candidate.value) : '')
+    const title = typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim() : ''
+    if (title !== '' && title !== sessionId) return title.slice(0, 160)
+  }
+  return ''
+}
+
+/**
+ * 把页面快照里的标题补到「标题还是 id」的候选行上（宿主答复没带标题时的页面侧兜底：
+ * 老宿主不重启也能显示标题，但能覆盖的范围只到本页快照里有的会话）。
+ */
+export function fillSwitchRowTitles(rows: readonly SecretarySwitchRow[], byId: unknown): SecretarySwitchRow[] {
+  return Array.from(rows ?? []).map((row) => {
+    if (row.title !== row.id) return row
+    const title = snapshotSessionTitle(byId, row.id)
+    return title === '' ? row : { ...row, title }
+  })
 }
 
 /**

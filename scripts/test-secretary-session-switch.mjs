@@ -70,6 +70,8 @@ function makeHost(opts = {}) {
     webServer: server,
     get(name) {
       if (name === 'profileContext') return { dir }
+      // 允许用例注入额外宿主服务（投影缓存 / 标题服务……），缺省一律 undefined
+      if (opts.services !== undefined && Object.prototype.hasOwnProperty.call(opts.services, name)) return opts.services[name]
       if (name === 'sessionQuery') {
         if (opts.persisted === false) return undefined
         return { listSessions: async () => (Array.isArray(opts.persistedRows) ? opts.persistedRows : PERSISTED) }
@@ -81,9 +83,11 @@ function makeHost(opts = {}) {
       return () => { if (hooks.get(name) === fn) hooks.delete(name) }
     },
   }
-  if (opts.live !== false) {
+  if (opts.live !== false || opts.liveGet !== undefined) {
     ctx.sessions = { list: () => (Array.isArray(opts.liveRows) ? opts.liveRows : LIVE) }
+    if (opts.liveGet !== undefined) ctx.sessions.get = opts.liveGet
   }
+  if (opts.projections !== undefined) ctx.sessionProjections = opts.projections
   const dispose = surface.registerAssistantSecretary(ctx)
   return { dir, server, ctx, dispose, stateFile: join(dir, STATE_FILE) }
 }
@@ -403,6 +407,102 @@ cases.push(['客户端纯函数：宿主答复 → 面板行、本地筛选、�
     [ID_ARCHIVED]: { title: 'C', updatedAt: 10 },
   }, { limit: 2 })
   assert.deepEqual(cappedSnap.map((r) => r.id), [ID_A, ID_B], '快照兜底也要按 limit 截断（别一次把两千行塞进面板）')
+}])
+
+// ── E. 标题解析（2026-11-27 用户实测：面板每行只显示 session-83bca3e3-… 原始 id）──────────
+// 宿主会话表的 header 只有身份（id/cwd/时间），标题在会话日志投影行 title 里；
+// 宿主自己的会话列表也是从投影缓存（stored row）取的，这里按同一条路验。
+const ID_C = 'session-4444dddd-5555-6666-7777-88889999aaaa'
+const HEADER_ONLY_ROWS = [
+  { header: { id: ID_A, cwd: 'C:\\work\\alpha', updatedAt: T_A } },
+  { header: { id: ID_B, cwd: 'C:\\work\\beta', updatedAt: T_B } },
+  { header: { id: ID_C, cwd: 'C:\\work\\delta', updatedAt: T_B - 1_000 } },
+]
+const CACHE_TITLES = { [ID_A]: 'Alpha 温度场复核', [ID_B]: 'Beta 报告初稿' }
+const titleHost = makeHost({
+  persistedRows: HEADER_ONLY_ROWS,
+  live: false,
+  services: {
+    sessionProjectionCache: {
+      cachedSnapshot: (header) => (CACHE_TITLES[header?.id] === undefined ? undefined : { asOfSeq: 12, values: { title: CACHE_TITLES[header.id] } }),
+      cachedPredecessorTitle: () => undefined,
+    },
+  },
+})
+
+cases.push(['标题解析：header 里没有标题时从投影缓存取真实标题，取不到才回落到 id', async () => {
+  const r = await call(titleHost, 'GET', `${SESSIONS}?limit=200`)
+  assert.equal(r.status, 200)
+  const byId = new Map(r.json.items.map((row) => [row.sessionId, row]))
+  assert.equal(r.json.items.length, 3, '标题缺席不等于会话缺席（三行都要在）')
+  assert.equal(byId.get(ID_A).title, 'Alpha 温度场复核', 'A 的标题必须来自投影缓存，不是 session id')
+  assert.equal(byId.get(ID_B).title, 'Beta 报告初稿')
+  assert.equal(byId.get(ID_C).title, ID_C, '缓存里真没有的行才回落到 id')
+}])
+cases.push(['标题解析：搜索能按标题命中（搜索框提示的就是标题）', async () => {
+  const byTitle = await call(titleHost, 'GET', `${SESSIONS}?q=${encodeURIComponent('温度场')}`)
+  assert.deepEqual(byTitle.json.items.map((row) => row.sessionId), [ID_A], '标题搜不到')
+  const byLower = await call(titleHost, 'GET', `${SESSIONS}?q=${encodeURIComponent('beta')}`)
+  assert.deepEqual(byLower.json.items.map((row) => row.sessionId), [ID_B], '标题搜索要大小写不敏感')
+}])
+cases.push(['标题解析：活会话优先用 sessionProjections 的当前标题；投影服务抛异常也只回落 id', async () => {
+  const collected = await surface.collectHostSessionRows({
+    sessions: { list: () => [{ header: { id: ID_A, cwd: 'C:\\work\\alpha', updatedAt: T_A } }], get: () => ({ id: ID_A }) },
+    sessionProjections: { cachedSnapshot: () => ({ asOfSeq: 30, values: { title: '活会话的新标题' } }) },
+    get: () => undefined,
+  })
+  assert.equal(collected.rows.length, 1)
+  assert.equal(collected.rows[0].title, '活会话的新标题', '活会话用内存投影的当前标题')
+  assert.equal(collected.rows[0].live, true)
+  assert.equal(surface.titleFromProjectionBlock(undefined), '')
+  assert.equal(surface.titleFromProjectionBlock({ values: {} }), '')
+  assert.equal(surface.titleFromProjectionBlock({ values: { title: 5 } }), '')
+  assert.equal(surface.titleFromProjectionBlock({ values: { title: '  多   空格  ' } }), '多 空格')
+  const bad = await surface.collectHostSessionRows({
+    sessions: { list: () => [{ header: { id: ID_B } }], get: () => { throw new Error('boom') } },
+    sessionProjections: { cachedSnapshot: () => { throw new Error('boom') } },
+    get: () => undefined,
+  })
+  assert.equal(bad.rows.length, 1, '投影服务抛异常不许把整张会话表打空')
+  assert.equal(bad.rows[0].title, ID_B, '问不到标题就回落 id')
+}])
+cases.push(['面板显示口径：主行是标题、id 只作次要信息（露前 8 位）', async () => {
+  const named = switchMod.switchRowsFromResponse({ ok: true, sessionId: ID_A, items: [{ sessionId: ID_A, title: 'Alpha 温度场复核', updatedAt: T_A }] }, ID_A)[0]
+  assert.equal(switchMod.switchRowName(named), 'Alpha 温度场复核', '有标题就显示标题')
+  assert.equal(switchMod.shortSessionId(ID_A), '1111aaaa', 'id 短名取 session- 之后的前 8 位')
+  const bare = switchMod.switchRowsFromResponse({ ok: true, items: [{ sessionId: ID_B, updatedAt: T_B }] }, '')[0]
+  assert.equal(bare.title, ID_B, '归一不丢信息：行内 title 仍是 id')
+  assert.equal(switchMod.switchRowName(bare), '未命名会话', '但主行显示「未命名会话」，原始 id 不许顶到主行')
+  assert.equal(switchMod.switchRowName(null), '未命名会话')
+  assert.equal(switchMod.switchRowName({ id: ID_B, title: '  ' }), '未命名会话')
+  assert.equal(switchMod.shortSessionId(''), '')
+  assert.equal(switchMod.shortSessionId('abc'), 'abc')
+}])
+
+cases.push(['页面侧兜底：快照投影行里的标题能补到「标题还是 id」的行上', async () => {
+  const rows = switchMod.switchRowsFromResponse({
+    ok: true,
+    sessionId: ID_A,
+    items: [
+      { sessionId: ID_A, updatedAt: T_A },
+      { sessionId: ID_B, updatedAt: T_B },
+      { sessionId: ID_C, updatedAt: T_B - 1_000 },
+    ],
+  }, ID_A)
+  const byId = {
+    [ID_A]: { projectionValues: { title: 'Alpha 温度场复核' } },
+    [ID_B]: { projectionValues: { title: { val: 'Beta 报告初稿' } } },
+    [ID_C]: { displayTitle: ID_C },
+  }
+  const filled = switchMod.fillSwitchRowTitles(rows, byId)
+  assert.equal(filled.find((r) => r.id === ID_A).title, 'Alpha 温度场复核', 'projectionValues.title 要认')
+  assert.equal(filled.find((r) => r.id === ID_B).title, 'Beta 报告初稿', '{ val } 包装要拆')
+  assert.equal(filled.find((r) => r.id === ID_C).title, ID_C, '快照标题就是 id 时不采信，保持原样')
+  assert.equal(switchMod.snapshotSessionTitle(byId, ID_A), 'Alpha 温度场复核')
+  assert.equal(switchMod.snapshotSessionTitle(byId, 'session-nope'), '')
+  assert.equal(switchMod.snapshotSessionTitle(null, ID_A), '')
+  const kept = switchMod.fillSwitchRowTitles(switchMod.switchRowsFromResponse({ ok: true, items: [{ sessionId: ID_A, title: '已有标题', updatedAt: T_A }] }, ''), byId)
+  assert.equal(kept[0].title, '已有标题', '已有标题的行不许被快照覆盖')
 }])
 
 let failed = 0

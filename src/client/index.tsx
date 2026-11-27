@@ -18,7 +18,7 @@ import { ICON_CHOICES, resolveProjectIcon, pickUnusedIcon } from './projectIcons
 import { focusSessionInHost, sessionFaceState, healBlankSessionIfStuck, type FocusResult } from './sessionFocus'
 import { archivableBlankRows, looksBlankWithoutFlag, normalizeFolderPath, projectClaims, transientVisibility, unownedSessionIds } from './sessionFolder'
 import { assistantHomeDir, bindSecretarySession, fetchSecretarySwitchCandidates, openAssistant, peekSecretarySessionId } from './assistant-entry'
-import { SWITCH_PANEL_LIMIT, rowsFromSessionSnapshot } from './secretary-session-switch'
+import { SWITCH_PANEL_LIMIT, fillSwitchRowTitles, rowsFromSessionSnapshot } from './secretary-session-switch'
 import { ASSISTANT_PROJECT_ID, ASSISTANT_CARD_NAME, ASSISTANT_CARD_ICON, SECRETARY_CARD_ID, SECRETARY_CARD_NAME, SECRETARY_CARD_ICON, shouldAddAssistantCard, withAssistantCard } from './assistant-card'
 import { hasPendingInteraction, sessionStatusSourceOf, pendingInteractionSignature } from './sessionStatus'
 import { sessionSnapshotIndexOf, invalidateSessionSnapshotIndex, sessionIdsUnderFolderOf } from './sessionIndex'
@@ -4063,7 +4063,13 @@ function WorktableSection(props: any) {
         // 并在面板上标「降级」，让用户知道这份列表可能不全。
         getSecretarySessions: async (query) => {
           const host = await fetchSecretarySwitchCandidates(query)
-          if (host !== null) return { rows: host.rows, degraded: false }
+          if (host !== null) {
+            // 宿主会话表只回身份时（老宿主 / 未重启），标题从本页会话快照的投影行补一遍，
+            // 免得面板上还是 session-xxxx 原始 id（能补的只限本页快照里有的会话）。
+            let rows = host.rows
+            try { rows = fillSwitchRowTitles(host.rows, sessionBridge?.list?.getSnapshot?.()?.byId) } catch {}
+            return { rows, degraded: false }
+          }
           const snap = sessionBridge?.list?.getSnapshot?.()
           let archived: string[] = []
           try {
