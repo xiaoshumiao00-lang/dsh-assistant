@@ -32,6 +32,7 @@ export function sameConsoleCard(a, b) {
     && a.temp === b.temp
     && a.self === b.self
     && a.canNewSession === b.canNewSession
+    && a.canSwitchSession === b.canSwitchSession
     && a.runtimeMs === b.runtimeMs
 }
 

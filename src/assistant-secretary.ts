@@ -18,6 +18,17 @@
  *   POST   /api/assistant/secretary  body { sessionId } → 覆盖；同一个 id 不再写盘（去抖，防多客户端互相覆盖）
  *   DELETE /api/assistant/secretary  → 清空（测试/重置用）
  *
+ *   GET    /api/assistant/secretary/sessions?q=<关键词>&limit=<n>
+ *                                            → 列「可绑定会话」（宿主持久化清单 + 活会话表合并去重，
+ *                                              按 updatedAt 倒序、丢归档、标记当前绑定的那条）
+ *   POST   /api/assistant/secretary/sessions  body { sessionId }
+ *                                            → 控制室「更换会话」专用：先在宿主会话表里认这条 id
+ *                                              （认不到直接 400，坏 id 绝不写进 state），
+ *                                              写盘后必须回读校验；回读不成立就把之前那条恢复回去
+ *
+ *   控制室卡片的换绑定走上面那条严格路由；既有 POST /api/assistant/secretary 留给
+ *   「固定 id 已失效 → 新建一条并把 state 指过去」的重建链路，两条各自独立。
+ *
  * 已读卡集合（未读红点，2026-11-21 第三批需求）另落 dsh-assistant-secretary-read.json：
  *   GET    /api/assistant/secretary-read?sessionId=<id>            → { ok, sessionId, cards, count }
  *   POST   /api/assistant/secretary-read  { sessionId, cardKey, mark:'read' } → { ok, cardKey, read, count }
@@ -34,6 +45,27 @@ export const SECRETARY_DISPATCH_POLICY = 'default-computer-use-v2'
 const STATE_FILENAME = 'dsh-assistant-secretary.json'
 const MAX_BODY_BYTES = 4096
 const SESSION_ID_RE = /^[A-Za-z0-9._:-]{1,256}$/
+
+/* ── 更换会话（2026-11-27 需求，控制室「个人秘书」卡片上的按钮）────────────────
+ *  为什么列表要在宿主这一侧算：固定秘书 id 的硬约束是「必须指向宿主能读回来的会话」
+ *  （判据在宿主的持久化清单 / 活会话表里，只有宿主知道某条会话是不是坏 id）。
+ *  所以在宿主把坏 id 写进 state 之前先拿住它自己的会话清单——客户端那份 localStorage 缓存
+ *  说了不算，客户端快照也不说了算。
+ *  路由：
+ *    GET /api/assistant/secretary/sessions?q=<关键词>&limit=<n>
+ *      → { ok, sessionId(当前绑定), updatedAt, items[{sessionId,title,updatedAt,cwd}], total, returned, limit, source }
+ *    POST /api/assistant/secretary { sessionId }（既有路由， tightened 语义）
+ *      → 先在宿主会话表里认这条 id：明确认不到就 400 session-not-in-host-list，不写盘；
+ *        写完之后必须回读文件校验（回读不成立就恢复成之前那条，绝不留坏 state）。 */
+export const ASSISTANT_SECRETARY_SESSIONS_ROUTE = '/api/assistant/secretary/sessions'
+/** 会话表两千多行（实测），一次别给手机发太多：默认 200 条，上限 600 条。 */
+export const SECRETARY_SESSIONS_DEFAULT_LIMIT = 200
+export const SECRETARY_SESSIONS_MAX_LIMIT = 600
+/** 搜索关键词的上限：超过就只吃前 80 个字符（防把整段日志当关键词）。 */
+const SECRETARY_SESSIONS_QUERY_MAX = 80
+/** 列表行里标题/目录的截断长度（面板一行显示得下，也别把整条路径塞进 JSON）。 */
+const TITLE_MAX_CHARS = 160
+const CWD_MAX_CHARS = 300
 
 /** `?verify=1`：客户端问「这条固定会话还在不在宿主的会话表里」；会话表两千多行，答案缓存 30s。 */
 const EXISTENCE_TTL_MS = 30_000
@@ -91,6 +123,117 @@ async function secretarySessionExistsOnHost(ctx: any, sessionId: string): Promis
   if (!asked) return null
   existenceCache = { id, value: false, at: Date.now() }
   return false
+}
+
+/**
+ * 一条会话行（宿主会话表里的最小可辨形状）。
+ * `live` = 来自活会话表（这条会话此刻就挂在宿主内存里）；
+ * `archived` 只有宿主明确说了才算数（没说过就当没归档，别凭空猜）。
+ */
+export interface BindableSecretarySession {
+  sessionId: string
+  title: string
+  updatedAt: number
+  cwd: string
+  live?: boolean
+  archived?: boolean
+  /** 这条就是当前秘书绑定的那条（面板要标记它、也不许再选它一次） */
+  bound?: boolean
+}
+
+/** 归一一条会话行：id 形状不对就整条丢（宁可不列，也不列一条选不了的）。 */
+export function normalizeBindableSessionRow(raw: unknown): BindableSecretarySession | null {
+  const record = raw as Record<string, unknown> | null
+  if (record === null || typeof record !== 'object' || Array.isArray(record)) return null
+  const header = (typeof record.header === 'object' && record.header !== null) ? record.header as Record<string, unknown> : record
+  const id = String(header?.id ?? record?.sessionId ?? '').trim()
+  if (!SESSION_ID_RE.test(id)) return null
+  const titleRaw = typeof header.title === 'string' ? header.title : ''
+  const displayTitle = typeof header.displayTitle === 'string' ? header.displayTitle : ''
+  const title = (displayTitle || titleRaw || id).replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX_CHARS)
+  const cwdRaw = typeof header.cwd === 'string' ? header.cwd : ''
+  const stamp = Number(header.updatedAt ?? header.createdAt ?? 0)
+  const updatedAt = Number.isFinite(stamp) && stamp > 0 ? stamp : 0
+  const row: BindableSecretarySession = { sessionId: id, title, updatedAt, cwd: cwdRaw.slice(0, CWD_MAX_CHARS) }
+  if (header.archived === true) row.archived = true
+  // 已经是归一过的行（两路会话表合并时又过了一遍）就把它带的标记带上，别在这一步丢掉
+  if (header.live === true) row.live = true
+  if (header.bound === true) row.bound = true
+  return row
+}
+
+/** 读 `?q=` 与 `?limit=`：只认这两个参数；limit 越界钳到上限，非法就当默认。 */
+export function parseSecretarySessionsQuery(rawUrl: string): { query: string; limit: number } {
+  const url = String(rawUrl ?? '')
+  const index = url.indexOf('?')
+  const query = index === -1 ? '' : url.slice(index + 1)
+  const qMatch = query.match(/(?:^|&)q=([^&]*)/)
+  const lMatch = query.match(/(?:^|&)limit=(\d{1,4})/)
+  const keyword = qMatch === null ? '' : decodeURIComponent(qMatch[1]).replace(/\s+/g, ' ').trim().slice(0, SECRETARY_SESSIONS_QUERY_MAX)
+  const parsed = lMatch === null ? 0 : Number(lMatch[1])
+  const limit = Number.isFinite(parsed) && parsed > 0
+  ? Math.min(parsed, SECRETARY_SESSIONS_MAX_LIMIT)
+  : SECRETARY_SESSIONS_DEFAULT_LIMIT
+  return { query: keyword, limit }
+}
+
+/** 搜索判据：标题 / id / 目录，任一大写小写都行（用户只会打字，不会记大小写）。 */
+function sessionRowMatchesKeyword(row: BindableSecretarySession, keyword: string): boolean {
+  if (keyword === '') return true
+  const needle = keyword.toLowerCase()
+  return row.title.toLowerCase().includes(needle)
+    || row.sessionId.toLowerCase().includes(needle)
+    || row.cwd.toLowerCase().includes(needle)
+}
+
+/**
+ * 把宿主两路会话表（持久化清单 + 活会话表）合并成可绑定列表：
+ * ① 按 id 去重（同一条两处都有时取更近的 updatedAt，并把 `live` 合上去）；
+ * ② 丢掉归档会话（宿主明确说了归档的）；
+ * ③ 关键词过滤；
+ * ④ 按 updatedAt 倒序（时间未知的排最后，它们通常是被选错的那条）；
+ * ⑤ 截断到 limit，但 `bound` 那条永远留着（不然翻页时用户看不到「当前绑定的到底是谁」）。
+ */
+export function pickBindableSessions(
+  rows: readonly BindableSecretarySession[],
+  opts: { currentId?: string; query?: string; limit?: number } = {},
+): BindableSecretarySession[] {
+  const currentId = String(opts.currentId ?? '').trim()
+  const keyword = String(opts.query ?? '').trim()
+  const limit = Number(opts.limit) > 0 ? Number(opts.limit) : SECRETARY_SESSIONS_DEFAULT_LIMIT
+  const merged = new Map<string, BindableSecretarySession>()
+  for (const row of Array.from(rows ?? [])) {
+    const normalized = normalizeBindableSessionRow(row)
+    if (normalized === null) continue
+    if (normalized.archived === true) continue
+    const previous = merged.get(normalized.sessionId)
+    if (previous === undefined) { merged.set(normalized.sessionId, normalized); continue }
+    if (normalized.updatedAt > previous.updatedAt) {
+      previous.updatedAt = normalized.updatedAt
+      if (normalized.title !== normalized.sessionId) previous.title = normalized.title
+      if (normalized.cwd !== '') previous.cwd = normalized.cwd
+    }
+    if (normalized.live === true) previous.live = true
+  }
+  const current = currentId !== '' ? merged.get(currentId) : undefined
+  if (current !== undefined) current.bound = true
+  const filtered = Array.from(merged.values()).filter((row) => sessionRowMatchesKeyword(row, keyword))
+  filtered.sort((a, b) => b.updatedAt - a.updatedAt)
+  if (filtered.length <= limit) return filtered
+  const trimmed = filtered.slice(0, limit)
+  if (current !== undefined && !trimmed.includes(current)) trimmed.unshift(current)
+  return trimmed
+}
+
+/** 给列表打上「当前绑定」标记（客户端降级路径也要用同一套判据）。 */
+export function markBoundSessions(rows: readonly BindableSecretarySession[], currentId: string): BindableSecretarySession[] {
+  const id = String(currentId ?? '').trim()
+  return Array.from(rows ?? []).map((row) => (row.sessionId === id ? { ...row, bound: true } : row))
+}
+
+/** 回读判据：文件里的 state 必须 exactly 等于刚写的那条 id（写坏了就不算成功）。 */
+export function secretaryStateMatchesWrite(expected: string, readBack: SecretaryState | null): boolean {
+  return readBack !== null && readBack.sessionId === expected
 }
 
 export interface SecretaryState {
@@ -621,6 +764,43 @@ export function addReadCardKey(state: Record<string, string[]>, sessionId: strin
   return list.length
 }
 
+/** 问不出结果（老宿主既没给 sessions.list 也没给 sessionQuery）时，客户端按「不许凭空写」处理。 */
+const SESSION_SOURCE_NONE = 'none'
+
+/**
+ * 取宿主两路会话表（持久化清单优先、活会话表补上 `live`）。
+ * 两路都试、都失败才回空——返回 empty 而不是 null 是因为「会话表空」本身是合法答案
+ * （新 profile 一条会话都没有），客户端据此知道「真没有可选会话」，不用猜宿主答没答话。
+ */
+async function collectHostSessionRows(ctx: any): Promise<{ rows: BindableSecretarySession[]; source: string }> {
+  const rows: BindableSecretarySession[] = []
+  let source = SESSION_SOURCE_NONE
+  try {
+    const query = ctx?.get?.('sessionQuery')
+    if (query && typeof query.listSessions === 'function') {
+      const list = await query.listSessions(undefined)
+      if (Array.isArray(list)) {
+        source = 'session-query'
+        for (const record of list) {
+          const row = normalizeBindableSessionRow(record)
+          if (row !== null) rows.push(row)
+        }
+      }
+    }
+  } catch { /* 没有 sessionQuery：只剩活会话表那一趟 */ }
+  try {
+    const live = Array.isArray(ctx?.sessions?.list?.()) ? ctx.sessions.list() : null
+    if (live !== null) {
+      if (source === SESSION_SOURCE_NONE) source = 'sessions-list'
+      for (const session of live) {
+        const row = normalizeBindableSessionRow(session)
+        if (row !== null) { row.live = true; rows.push(row) }
+      }
+    }
+  } catch { /* 宿主没有 sessions.list：只剩持久化清单的结果 */ }
+  return { rows, source }
+}
+
 export function registerAssistantSecretary(ctx: any): () => void {
   const server = ctx?.webServer
   if (!server || typeof server.register !== 'function') return () => void 0
@@ -659,6 +839,20 @@ export function registerAssistantSecretary(ctx: any): () => void {
     const run = chain.then(task, task)
     chain = run.then(() => void 0, () => void 0)
     return run
+  }
+
+  /** 写坏了的收场：把之前那条 state 恢复回去（恢复不了就明确回失败，绝不留着坏 id）。 */
+  const restoreSecretaryState = async (previous: SecretaryState | null): Promise<SecretaryState | null> => {
+    try {
+      if (previous === null) {
+        await clearState()
+        return null
+      }
+      const back = await writeState(previous.sessionId)
+      return secretaryStateMatchesWrite(previous.sessionId, readFileState(file)) ? back : null
+    } catch {
+      return null
+    }
   }
 
   webServer.register({
@@ -723,6 +917,120 @@ export function registerAssistantSecretary(ctx: any): () => void {
       }
     },
   })
+
+  // ── 更换会话（控制室卡片上的「更换会话」按钮）────────────────────────
+  // 同一条路由两种方法：GET 列候选、POST 定绑定。写 state 的严格边界都在这条路由上，
+  // 既有 POST /api/assistant/secretary（重建链路在用）一个字没改。
+  webServer.register({
+    kind: 'exact',
+    path: ASSISTANT_SECRETARY_SESSIONS_ROUTE,
+    handler: async (req: any, res: any) => {
+      const method = String(req.method ?? 'GET').toUpperCase()
+      const current = state?.sessionId ?? ''
+      try {
+        if (method === 'GET' || method === 'HEAD') {
+          const parsed = parseSecretarySessionsQuery(String(req.url ?? ''))
+          const collected = await collectHostSessionRows(ctx)
+          // 先算一份「不截断」的候选：total/truncated 都以它为准——
+          // 归档/搜索过滤掉的条数不算「截断」，不然面板会一直提示列表不全。
+          const all = pickBindableSessions(collected.rows, {
+            currentId: current,
+            query: parsed.query,
+            limit: Number.MAX_SAFE_INTEGER,
+          })
+          const items = pickBindableSessions(collected.rows, {
+            currentId: current,
+            query: parsed.query,
+            limit: parsed.limit,
+          })
+          sendJson(res, 200, {
+            ok: true,
+            sessionId: current || null,
+            updatedAt: state?.updatedAt ?? '',
+            query: parsed.query,
+            limit: parsed.limit,
+            total: all.length,
+            returned: items.length,
+            truncated: all.length > items.length,
+            source: collected.source,
+            items,
+          })
+          return
+        }
+        if (method === 'POST' || method === 'PUT') {
+          const body = await readJsonBody(req)
+          if (body?.__tooLarge === true) { sendJson(res, 413, { ok: false, error: 'too-large' }); return }
+          const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : ''
+          if (!SESSION_ID_RE.test(sessionId)) {
+            sendJson(res, 400, { ok: false, error: 'invalid-session-id' })
+            return
+          }
+          const previous = state
+          const currentId = previous?.sessionId ?? ''
+          if (sessionId === currentId && previous !== null) {
+            appendOpenDiag({ step: 'host-switch-skip-unchanged', sessionId })
+            sendJson(res, 200, { ok: true, sessionId, updatedAt: previous.updatedAt, unchanged: true })
+            return
+          }
+          const collected = await collectHostSessionRows(ctx)
+          const known = collected.rows.some((row) => row.sessionId === sessionId)
+          if (!known) {
+            // 硬约束：秘书 id 必须指向宿主读得回来的会话。认不到就不写，别把坏的写进去。
+            appendOpenDiag({ step: 'host-switch-refused', sessionId, reason: collected.source === SESSION_SOURCE_NONE ? 'no-session-source' : 'session-not-in-host-list' })
+            sendJson(res, 400, {
+              ok: false,
+              error: collected.source === SESSION_SOURCE_NONE ? 'no-session-source' : 'session-not-in-host-list',
+              sessionId: currentId || null,
+            })
+            return
+          }
+          let next: SecretaryState | null = null
+          let writeError = ''
+          try {
+            next = await writeState(sessionId)
+          } catch (err: any) {
+            writeError = String(err?.message ?? err)
+          }
+          if (next === null) {
+            appendOpenDiag({ step: 'host-switch-write-failed', sessionId, error: writeError })
+            sendJson(res, 500, { ok: false, error: 'state-write-failed', message: writeError, sessionId: currentId || null })
+            return
+          }
+          if (!secretaryStateMatchesWrite(sessionId, readFileState(file))) {
+            const restored = await restoreSecretaryState(previous)
+            appendOpenDiag({ step: 'host-switch-read-back-mismatch', sessionId, restored: restored?.sessionId ?? '' })
+            sendJson(res, 500, {
+              ok: false,
+              error: 'state-read-back-mismatch',
+              sessionId: restored?.sessionId ?? null,
+              restored: restored !== null,
+            })
+            return
+          }
+          appendOpenDiag({ step: 'host-switch-bind', sessionId, previous: currentId })
+          sendJson(res, 200, {
+            ok: true,
+            sessionId: next.sessionId,
+            updatedAt: next.updatedAt,
+            previous: currentId || null,
+            verified: true,
+            readBack: true,
+            dispatchPolicy: SECRETARY_DISPATCH_POLICY,
+          })
+          return
+        }
+        if (method === 'DELETE') {
+          sendJson(res, 405, { ok: false, error: 'not-allowed', message: '秘书绑定只能用 POST 改；要重置请走 DELETE /api/assistant/secretary' })
+          return
+        }
+        res.writeHead(405, { allow: 'GET, HEAD, POST, PUT' })
+        res.end()
+      } catch (err: any) {
+        sendJson(res, 500, { ok: false, error: 'internal', message: String(err?.message ?? err) })
+      }
+    },
+  })
+
 
   // ── 已读卡集合（未读红点的宿主真值）───────────────────────────────
   // 落 dsh-assistant-secretary-read.json（按 sessionId 存已读 cardKey 集合）：
@@ -1382,6 +1690,15 @@ export const assistantSecretaryTestSurface = {
   compressSessionLogText,
   decompressSessionLogBytes,
   parseSecretaryRequestQuery,
+  // 更换会话（控制室卡片按钮）这一块的离线测试入口
+  ASSISTANT_SECRETARY_SESSIONS_ROUTE,
+  SECRETARY_SESSIONS_DEFAULT_LIMIT,
+  SECRETARY_SESSIONS_MAX_LIMIT,
+  normalizeBindableSessionRow,
+  parseSecretarySessionsQuery,
+  pickBindableSessions,
+  markBoundSessions,
+  secretaryStateMatchesWrite,
   ASSISTANT_SECRETARY_QUOTE_ROUTE,
   SECRETARY_QUOTE_SECTION_ORDER,
   SECRETARY_QUOTE_ANCHOR_SECTION_ORDER,

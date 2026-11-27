@@ -4,6 +4,7 @@ import { cachedJsonRead, cachedJsonWrite } from './localStore'
 import { filterWorkingCards } from './consoleFilter'
 import { CONSOLE_FIRST_MOUNT, sameConsoleCard } from './consoleCardPolicy'
 import { sortSessionsByActivity } from './sessionRank'
+import { filterSwitchRows, switchTimeText, type SecretarySwitchRow } from './secretary-session-switch'
 import { archivableBlankRows, sessionRowsVisible } from './sessionFolder'
 import { domGate, createGatedThrottle } from './compositionGate'
 import { createCardRefreshCoalescer } from './cardRefreshPolicy'
@@ -261,6 +262,8 @@ export type ConsoleCardData = {
   bound: boolean
   /** 项目已配置文件夹：卡片可「新建会话」（在该文件夹下新开对话并绑定） */
   canNewSession: boolean
+  /** 仅「个人秘书」卡：卡片可「更换会话」（把固定秘书 sessionId 换成另一条会话） */
+  canSwitchSession?: boolean
   /** 是否为「工作台」自己（卡片点击无操作） */
   self: boolean
   /** 完成/待决且未被确认：卡片发对应色光（点击确认后熄灭） */
@@ -372,6 +375,11 @@ type SplitEnv = {
     onNewSession?: (id: string) => void | Promise<boolean | void>
     /** 卡片「会话列表」：该项目目录下的全部会话（含模板各步骤子目录），按最近更新倒序 */
     getProjectSessions?: (id: string) => ProjectSessionItem[]
+    /** 卡片「更换会话」（仅个人秘书卡）：向宿主要可绑定会话候选。
+     *  `degraded=true` = 宿主答不上、面板用的是本地会话快照（要在面板上如实标出来）。 */
+    getSecretarySessions?: (query: string) => Promise<{ rows: SecretarySwitchRow[]; degraded: boolean }>
+    /** 面板里选定一条：把秘书绑定写过去（宿主写盘 + 回读校验），成功后面板关闭、秘书页切到这条 */
+    onBindSecretarySession?: (sessionId: string) => Promise<{ ok: boolean; reason?: string }>
     /** 从列表进入某个会话（历史保留，可继续对话） */
     onOpenSession?: (sessionId: string) => void
     /** 删除某条会话（宿主归档：从各列表移除，磁盘日志保留；运行中的会话不入列删除） */
@@ -1913,6 +1921,7 @@ const ConsoleCard = memo(function ConsoleCard({ c, canCreate, handlers }: {
     open: (c: ConsoleCardData) => void
     create: (c: ConsoleCardData, mode: 'standard' | 'computer-use') => void
     list: (el: HTMLElement, c: ConsoleCardData) => void
+    switch: (el: HTMLElement, c: ConsoleCardData) => void
   }
 }) {
   const statusLabel: Record<string, string> = { idle: T('console.idle'), busy: T('console.busy'), need: T('console.need'), done: T('console.done'), error: T('console.error') }
@@ -2001,6 +2010,22 @@ const ConsoleCard = memo(function ConsoleCard({ c, canCreate, handlers }: {
           </svg>
           <span>{T('console.sessions')}</span>
         </button>
+        {/* 个人秘书卡专用「更换会话」：换的是秘书固定会话的绑定 id（2026-11-27 需求） */}
+        {c.canSwitchSession && (
+          <button
+            type="button"
+            className="dsh-wt_consoleOpBtn dsh-wt_consoleOpBtnFull dsh-wt_consoleOpBtnSwitch"
+            title={T('console.switchSessionTip')}
+            aria-label={T('console.switchSession')}
+            onClick={(e) => { e.stopPropagation(); handlers.switch(e.currentTarget as HTMLElement, c) }}
+          >
+            <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden>
+              <path d="M3 5.4h8.2M8.6 2.6l2.8 2.8-2.8 2.8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M13 10.6H4.8M7.4 13.4l-2.8-2.8 2.8-2.8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            <span>{T('console.switchSession')}</span>
+          </button>
+        )}
       </div>
     </div>
   )
@@ -2036,6 +2061,22 @@ export function ConsolePane() {
   /** 「归档空白会话」的两步确认 + 在途闸门（手机上连点容易，第一次点只亮确认文案） */
   const [sessArchiveConfirm, setSessArchiveConfirm] = useState(false)
   const [sessArchiveBusy, setSessArchiveBusy] = useState(false)
+  /** 个人秘书「更换会话」面板（2026-11-27）：锚点坐标 + 候选行 + 搜索词 + 在途闸门 + 失败原因。
+   *  数据一律来自宿主会话表（宿主答不上才降级用本地快照，`degraded` 会写在面板上）。 */
+  const [switchPop, setSwitchPop] = useState<{
+    x: number
+    y: number
+    rows: SecretarySwitchRow[]
+    query: string
+    loading: boolean
+    busy: boolean
+    error: string
+    degraded: boolean
+  } | null>(null)
+  /** 候选请求的序号：搜索连打时只认最后一次答复（前面的晚到不能把列表刷回去） */
+  const switchRequestRef = useRef(0)
+  /** 搜索防抖定时器（250ms；关面板/卸载都要清） */
+  const switchQueryTimerRef = useRef<number | null>(null)
   /** 新建会话面板：项目 id/名称 + 模式 + 前台/后台模型 */
   const [newSessFor, setNewSessFor] = useState<{ id: string; name: string } | null>(null)
   const [manageOpen, setManageOpen] = useState(false)
@@ -2762,6 +2803,70 @@ export function ConsolePane() {
     setSessArchiveBusy(false)
     setEditingId(null)
   }
+  /** 打开「更换会话」面板：按按钮位置定位，随后去宿主取候选（手机宽度由 CSS 改成底部抽屉）。 */
+  const openSwitchPanel = (anchor: HTMLElement) => {
+    const r = anchor.getBoundingClientRect()
+    const w = 380
+    const x = Math.max(8, Math.min(Math.round(r.left), Math.max(8, window.innerWidth - w - 8)))
+    const y = Math.min(Math.round(r.bottom + 6), Math.max(8, window.innerHeight - 220))
+    setSwitchPop({ x, y, rows: [], query: '', loading: true, busy: false, error: '', degraded: false })
+    void loadSwitchRows('')
+  }
+  /** 取候选：宿主真值优先；宿主答不上（旧宿主没这条路由 / 网络失败）才降级用本地会话快照。 */
+  const loadSwitchRows = async (query: string): Promise<void> => {
+    const requestId = switchRequestRef.current + 1
+    switchRequestRef.current = requestId
+    const loader = splitEnv?.console?.getSecretarySessions
+    let next: { rows: SecretarySwitchRow[]; degraded: boolean } = { rows: [], degraded: false }
+    if (loader) {
+      try {
+        const loaded = await loader(query)
+        if (loaded) next = loaded
+      } catch { /* 宿主取不到：保留已加载的行，面板照常可搜 */ }
+    }
+    if (switchRequestRef.current !== requestId) return
+    setSwitchPop((prev) => (prev === null ? prev : { ...prev, rows: next.rows, degraded: next.degraded, loading: false }))
+  }
+  /** 搜索：先本地过一遍（打字即见），250ms 后再向宿主问一次（宿主那份能搜到 200 条窗口外的会话）。 */
+  const onSwitchQueryChange = (value: string): void => {
+    setSwitchPop((prev) => (prev === null ? prev : { ...prev, query: value }))
+    if (switchQueryTimerRef.current !== null) window.clearTimeout(switchQueryTimerRef.current)
+    switchQueryTimerRef.current = window.setTimeout(() => {
+      switchQueryTimerRef.current = null
+      void loadSwitchRows(value)
+    }, 250)
+  }
+  /** 选定一条：交给工作台写宿主并回读；成功即关面板（工作台把秘书页切到新会话），失败把原因留在面板里。 */
+  const pickSwitchRow = async (row: SecretarySwitchRow): Promise<void> => {
+    if (row.bound) return
+    const bind = splitEnv?.console?.onBindSecretarySession
+    if (!bind) return
+    setSwitchPop((prev) => (prev === null ? prev : { ...prev, busy: true, error: '' }))
+    let ok = false
+    let reason = ''
+    try {
+      const result = await bind(row.id)
+      ok = result !== null && typeof result === 'object' && result.ok === true
+      if (result !== null && typeof result === 'object' && typeof result.reason === 'string') reason = result.reason
+    } catch (error: any) {
+      reason = String(error?.message ?? error)
+    }
+    if (ok) { setSwitchPop(null); return }
+    setSwitchPop((prev) => (prev === null ? prev : { ...prev, busy: false, error: reason || '宿主没确认这次更换' }))
+  }
+  /** 面板开着时 Esc 关闭；关掉面板要把搜索防抖与在途请求一起作废（晚到的答复不能再改状态）。 */
+  const switchPopOpen = switchPop !== null
+  useEffect(() => {
+    if (!switchPopOpen) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setSwitchPop(null) }
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      if (switchQueryTimerRef.current !== null) { window.clearTimeout(switchQueryTimerRef.current); switchQueryTimerRef.current = null }
+    }
+  }, [switchPopOpen])
+  /** 面板可见行：本地即时筛选（时间倒序由宿主/快照那边排好） */
+  const switchRows = switchPop === null ? [] : filterSwitchRows(switchPop.rows, switchPop.query)
   /** 临时卡片「收工」：只移除已结束的会话（运行中的继续留着），会话本身不删除 */
   const dismissTransientFinished = () => {
     if (!sessPop?.transient) return
@@ -2880,6 +2985,7 @@ export function ConsolePane() {
     open: (c: ConsoleCardData): void => { void c },
     create: (c: ConsoleCardData, mode: 'standard' | 'computer-use'): void => { void c; void mode },
     list: (el: HTMLElement, c: ConsoleCardData): void => { void el; void c },
+    switch: (el: HTMLElement, c: ConsoleCardData): void => { void el; void c },
   })
   cardActionRef.current = {
     open: (c) => {
@@ -2892,11 +2998,13 @@ export function ConsolePane() {
       else env?.onNewSession?.(c.id)
     },
     list: (el, c) => openSessionList(el, c),
+    switch: (el, c) => { void c; openSwitchPanel(el) },
   }
   const cardHandlers = useMemo(() => ({
     open: (c: ConsoleCardData) => cardActionRef.current.open(c),
     create: (c: ConsoleCardData, mode: 'standard' | 'computer-use') => cardActionRef.current.create(c, mode),
     list: (el: HTMLElement, c: ConsoleCardData) => cardActionRef.current.list(el, c),
+    switch: (el: HTMLElement, c: ConsoleCardData) => cardActionRef.current.switch(el, c),
   }), [])
   const canCreateCard = !!splitEnv?.console?.onCreateSession
   /** 会话列表浮层的可见行（空白会话与已归档默认藏掉，开关在浮层底部） */
@@ -3134,6 +3242,51 @@ export function ConsolePane() {
             {sessPop.transient && (
               <div className="dsh-wt_sessHint">{T('console.transientHint')}</div>
             )}
+          </div>
+        </>
+      )}
+      {/* 个人秘书「更换会话」面板：候选来自宿主会话表，选定 → 宿主写 state 并回读 → 秘书页切过去 */}
+      {switchPop && (
+        <>
+          <div className="dsh-wt_sswMask" onClick={() => setSwitchPop(null)} />
+          <div className="dsh-wt_sswPop" style={{ left: switchPop.x, top: switchPop.y }} role="dialog" aria-label={T('console.switchTitle')}>
+            <div className="dsh-wt_sswHead">
+              <span className="dsh-wt_sswTitle">{T('console.switchTitle')}</span>
+              <span className="dsh-wt_sswCount">{switchPop.busy ? T('console.switchBusy') : switchRows.length}</span>
+            </div>
+            <input
+              className="dsh-wt_sswSearch"
+              value={switchPop.query}
+              placeholder={T('console.switchSearchPh')}
+              aria-label={T('console.switchSearchPh')}
+              onChange={(e) => onSwitchQueryChange(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); setSwitchPop(null) } }}
+            />
+            {switchPop.error !== '' && <div className="dsh-wt_sswError">{T('console.switchFail', { msg: switchPop.error })}</div>}
+            {switchPop.degraded && <div className="dsh-wt_sswWarn">{T('console.switchDegraded')}</div>}
+            {switchRows.length === 0 ? (
+              <div className="dsh-wt_sswEmpty">{switchPop.loading ? T('console.switchLoading') : T('console.switchEmpty')}</div>
+            ) : (
+              <div className="dsh-wt_sswList">
+                {switchRows.map((row) => (
+                  <button
+                    key={row.id}
+                    type="button"
+                    className={'dsh-wt_sswItem' + (row.bound ? ' dsh-wt_sswItemBound' : '')}
+                    disabled={row.bound || switchPop.busy}
+                    title={row.cwd || row.id}
+                    onClick={() => { void pickSwitchRow(row) }}
+                  >
+                    <span className="dsh-wt_sswName">{row.title}</span>
+                    <span className="dsh-wt_sswMeta">
+                      {row.bound && <span className="dsh-wt_sswTag">{T('console.switchBoundTag')}</span>}
+                      <span className="dsh-wt_sswTime">{switchTimeText(row.updatedAt)}</span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="dsh-wt_sswHint">{T('console.switchHint')}</div>
           </div>
         </>
       )}

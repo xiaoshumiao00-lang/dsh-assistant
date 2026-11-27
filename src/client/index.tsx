@@ -17,7 +17,8 @@ import { POCKET_ENDPOINTS, POCKET_RPC_CHANNEL } from './pocket/api.js'
 import { ICON_CHOICES, resolveProjectIcon, pickUnusedIcon } from './projectIcons'
 import { focusSessionInHost, sessionFaceState, healBlankSessionIfStuck, type FocusResult } from './sessionFocus'
 import { archivableBlankRows, looksBlankWithoutFlag, normalizeFolderPath, projectClaims, transientVisibility, unownedSessionIds } from './sessionFolder'
-import { assistantHomeDir, openAssistant, peekSecretarySessionId } from './assistant-entry'
+import { assistantHomeDir, bindSecretarySession, fetchSecretarySwitchCandidates, openAssistant, peekSecretarySessionId } from './assistant-entry'
+import { SWITCH_PANEL_LIMIT, rowsFromSessionSnapshot } from './secretary-session-switch'
 import { ASSISTANT_PROJECT_ID, ASSISTANT_CARD_NAME, ASSISTANT_CARD_ICON, SECRETARY_CARD_ID, SECRETARY_CARD_NAME, SECRETARY_CARD_ICON, shouldAddAssistantCard, withAssistantCard } from './assistant-card'
 import { hasPendingInteraction, sessionStatusSourceOf, pendingInteractionSignature } from './sessionStatus'
 import { sessionSnapshotIndexOf, invalidateSessionSnapshotIndex, sessionIdsUnderFolderOf } from './sessionIndex'
@@ -3829,6 +3830,8 @@ function WorktableSection(props: any) {
       live: secretaryRunning,
       bound: Boolean(secretaryId),
       canNewSession: false,
+      // 2026-11-27：这张卡多一个「更换会话」按钮（把固定秘书 sessionId 换成别的会话）
+      canSwitchSession: true,
       self: false,
       glow: false,
     })
@@ -4055,6 +4058,37 @@ function WorktableSection(props: any) {
         onReorderProject: (dragId, targetId, before) => reorderProject(dragId, targetId, before),
         onDeleteProject: (id) => deleteProject(id),
         getProjectSessions: (id) => projectSessionsOf(id),
+        // ── 个人秘书「更换会话」（2026-11-27）──────────────────────────────
+        // 候选一律问宿主（宿主会话表 = 能不能读回来的唯一判据）；宿主答不上才用本页会话快照兜底，
+        // 并在面板上标「降级」，让用户知道这份列表可能不全。
+        getSecretarySessions: async (query) => {
+          const host = await fetchSecretarySwitchCandidates(query)
+          if (host !== null) return { rows: host.rows, degraded: false }
+          const snap = sessionBridge?.list?.getSnapshot?.()
+          let archived: string[] = []
+          try {
+            const wsnap = sessionBridge?.workspaces?.list?.getSnapshot?.()
+            if (Array.isArray(wsnap?.archivedSessionIds)) archived = wsnap.archivedSessionIds.map(String)
+          } catch {}
+          return {
+            rows: rowsFromSessionSnapshot(snap?.byId ?? null, {
+              currentId: peekSecretarySessionId(),
+              archivedIds: archived,
+              limit: SWITCH_PANEL_LIMIT,
+            }),
+            degraded: true,
+          }
+        },
+        onBindSecretarySession: async (sid) => {
+          const result = await bindSecretarySession(sid)
+          if (!result.ok) return { ok: false, reason: result.reason }
+          // 绑定成功：关控制室 → 走一遍既有「进秘书」链路（只读/托管/置顶/改名/开页全在里面，
+          // 打开目标以宿主 state 为准），所以秘书页直接落在新会话上，不需要刷新页面。
+          controlRoomStore.setOpen(false)
+          notifyConsole()
+          try { await openAssistant() } catch { /* openAssistant 自己会兜底到控制室并提示原因 */ }
+          return { ok: true }
+        },
         onOpenSession: (sid) => openProjectSession(sid),
         onDeleteSession: (sid) => deleteProjectSession(sid),
         onDismissTransient: (ids) => dismissTransient(ids),

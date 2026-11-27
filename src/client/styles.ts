@@ -725,6 +725,32 @@ export const css = xtermCss + '\n' + [
   // 手机上会话列表改用底部抽屉（贴底、左右各留 8px，避免锚点浮层超出屏宽）
   '@media (max-width:640px){.dsh-wt_sessPop{left:8px !important;right:8px;top:auto !important;bottom:calc(8px + env(safe-area-inset-bottom));width:auto;max-height:70vh}}',
   '@media (hover:none),(max-width:640px){.dsh-wt_sessOps{position:static;transform:none;opacity:1;pointer-events:auto;background:transparent;padding:0;margin-left:auto}.dsh-wt_sessItem:hover .dsh-wt_sessRel{opacity:1}.dsh-wt_sessRel{display:none}.dsh-wt_sessOp{width:26px;height:26px}}',
+  // 个人秘书「更换会话」面板（2026-11-27）：卡片按钮 → 会话选择浮层
+  // 与「会话列表」同一套定位思路（贴按钮下方、手机上改底部抽屉），但宽一点、行是两行（标题 + 时间/标记）
+  '.dsh-wt_sswMask{position:fixed;inset:0;z-index:60}',
+  '.dsh-wt_sswPop{position:fixed;z-index:61;width:380px;max-width:calc(100vw - 16px);display:flex;flex-direction:column;gap:8px;padding:10px;border:1px solid var(--wt-borderHover);border-radius:12px;background:var(--wt-card);box-shadow:0 18px 44px rgba(0,0,0,.42);animation:dsh-wt_sessIn .14s ease}',
+  '.dsh-wt_sswHead{display:flex;align-items:center;gap:8px;min-width:0;font-size:11px;color:var(--wt-text2);padding:0 2px}',
+  '.dsh-wt_sswTitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;color:var(--wt-text)}',
+  '.dsh-wt_sswCount{flex:none;padding:1px 6px;border-radius:999px;background:var(--wt-chip);font-size:10px;color:var(--wt-text2)}',
+  '.dsh-wt_sswSearch{width:100%;box-sizing:border-box;padding:7px 9px;border:1px solid var(--wt-border);border-radius:8px;background:rgba(255,255,255,.04);color:var(--wt-text);font:inherit;font-size:12px;line-height:1.4;outline:none}',
+  '.dsh-wt_sswSearch:focus{border-color:var(--dsw-alias-state-accent-primary,#4f8ef7);background:rgba(79,142,247,.10)}',
+  '.dsh-wt_sswSearch::placeholder{color:var(--wt-text3)}',
+  '.dsh-wt_sswList{display:flex;flex-direction:column;gap:2px;max-height:min(46vh,340px);overflow:auto;overflow-x:hidden}',
+  '.dsh-wt_sswItem{display:flex;flex-direction:column;gap:2px;width:100%;padding:7px 9px;border:0;border-radius:8px;background:transparent;color:var(--wt-text2);font:inherit;text-align:left;cursor:pointer;user-select:none}',
+  '.dsh-wt_sswItem:hover:not(:disabled),.dsh-wt_sswItem:focus-visible{background:var(--wt-chip);color:var(--wt-text);outline:none}',
+  // 当前绑定的那条：留着、标出来、但不许再选（重选同一条等于没换，别白写一次盘）
+  '.dsh-wt_sswItemBound{background:rgba(79,142,247,.14);color:var(--wt-text);cursor:default;opacity:.86}',
+  '.dsh-wt_sswItem:disabled{cursor:default}',
+  '.dsh-wt_sswName{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.35}',
+  '.dsh-wt_sswMeta{display:flex;align-items:center;gap:6px;min-width:0;font-size:10px;line-height:1.3;color:var(--wt-text3)}',
+  '.dsh-wt_sswTag{flex:none;padding:0 6px;border-radius:999px;background:rgba(79,142,247,.18);color:var(--dsw-alias-state-accent-primary,#4f8ef7);font-size:9px;line-height:15px}',
+  '.dsh-wt_sswTime{flex:none;color:var(--wt-text3)}',
+  '.dsh-wt_sswEmpty{padding:16px 6px;text-align:center;font-size:11px;color:var(--wt-text3)}',
+  '.dsh-wt_sswError{padding:6px 8px;border-radius:8px;background:rgba(248,81,73,.14);color:#f85149;font-size:11px;line-height:1.5}',
+  '.dsh-wt_sswWarn{padding:4px 8px;border-radius:8px;background:rgba(210,153,34,.14);color:var(--dsw-alias-state-warning,#d29922);font-size:10px;line-height:1.5}',
+  '.dsh-wt_sswHint{padding:2px 4px 0;font-size:10px;line-height:1.5;color:var(--wt-text3)}',
+  // 手机上同样改底部抽屉（375–430 宽也不超屏宽，按钮 26px 高、行 40px 高起，手指点得准）
+  '@media (max-width:640px){.dsh-wt_sswPop{left:8px !important;right:8px;top:auto !important;bottom:calc(8px + env(safe-area-inset-bottom));width:auto;max-height:78vh}.dsh-wt_sswList{max-height:min(52vh,380px)}.dsh-wt_sswItem{padding:9px}.dsh-wt_sswName{font-size:13px}}',
   // 新建会话面板（标准 / computer-use + 前后台模型）
   '.dsh-wt_newSessMask{position:fixed;inset:0;z-index:70;display:flex;align-items:center;justify-content:center;padding:18px;background:rgba(4,7,12,.55);backdrop-filter:blur(2px)}',
   '.dsh-wt_newSess{width:min(480px,100%);max-height:calc(100vh - 40px);overflow:auto;display:flex;flex-direction:column;gap:11px;padding:18px;border:1px solid var(--wt-borderHover);border-radius:16px;background:var(--wt-card);box-shadow:0 24px 64px rgba(0,0,0,.5);color:var(--wt-text)}',

@@ -45,6 +45,14 @@ import { controlRoomStore, exitWorkspace, getAssistantApi, readModelPref } from 
 import { orbStore } from './pocket/orb/state.ts'
 import { createPanelOpenGuard, type PanelOpenGuard } from './secretary-open-guard.ts'
 import {
+  SECRETARY_SESSIONS_ROUTE,
+  SWITCH_PANEL_LIMIT,
+  SWITCH_QUERY_MAX,
+  switchRowsFromResponse,
+  type SecretarySwitchBindResult,
+  type SecretarySwitchCandidates,
+} from './secretary-session-switch.ts'
+import {
   isDeadSessionError,
   OPEN_RETRY_EXTRA_LIMIT,
   OPEN_RETRY_LIMIT,
@@ -204,6 +212,74 @@ async function persistSecretaryId(sessionId: string): Promise<boolean> {
     return response.ok
   } catch {
     return false
+  }
+}
+
+/** 向宿主要「可绑定会话」候选（宿主答不上就回 null，调用方自己降级用本地快照）。 */
+export async function fetchSecretarySwitchCandidates(query = ''): Promise<SecretarySwitchCandidates | null> {
+  const keyword = String(query ?? '').replace(/\s+/g, ' ').trim().slice(0, SWITCH_QUERY_MAX)
+  const url = `${SECRETARY_SESSIONS_ROUTE}?limit=${String(SWITCH_PANEL_LIMIT)}${keyword !== '' ? `&q=${encodeURIComponent(keyword)}` : ''}&_=${String(Date.now())}`
+  try {
+    const response = await fetch(url, { cache: 'no-store', headers: { accept: 'application/json' } })
+    if (!response.ok) return null
+    const body = await response.json().catch(() => null)
+    if (body === null || typeof body !== 'object' || body.ok !== true) return null
+    const current = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+    return {
+      current,
+      rows: switchRowsFromResponse(body, current),
+      source: typeof body.source === 'string' ? body.source : '',
+      truncated: body.truncated === true,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 把个人秘书绑定换成另一条会话（控制室卡片「更换会话」按钮）。
+ * 顺序是硬规矩：① 只问严格路由（后端认 id + 写盘 + 回读）；② 宿主真值回读必须是这条才更新本地缓存；
+ * ③ 任何一环失败都不动本地缓存，免得下次进秘书直接点进一条坏会话（MEMORY 实测事故就是这个形状）。
+ */
+export async function bindSecretarySession(sessionIdRaw: string): Promise<SecretarySwitchBindResult> {
+  const sessionId = String(sessionIdRaw ?? '').trim()
+  if (sessionId === '') return { ok: false, sessionId: peekSecretarySessionId(), reason: '没选会话' }
+  if (!/^[A-Za-z0-9._:-]{1,256}$/.test(sessionId)) {
+    noteOpenDiag({ step: 'switch-bind-reject', sessionId, reason: 'invalid-session-id' })
+    return { ok: false, sessionId: peekSecretarySessionId(), reason: '会话 id 不合法' }
+  }
+  try {
+    const response = await fetch(SECRETARY_SESSIONS_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ sessionId }),
+    })
+    const body = await response.json().catch(() => null)
+    if (!response.ok || body === null || typeof body !== 'object' || body.ok !== true) {
+      const errorText = typeof body?.error === 'string' ? body.error : `HTTP ${String(response.status)}`
+      const message = typeof body?.message === 'string' && body.message !== '' ? `${errorText}（${body.message}）` : errorText
+      const keep = typeof body?.sessionId === 'string' ? body.sessionId.trim() : peekSecretarySessionId()
+      noteOpenDiag({ step: 'switch-bind-fail', sessionId, reason: errorText })
+      return { ok: false, sessionId: keep, reason: message }
+    }
+    const hostId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+    if (hostId === '') return { ok: false, sessionId: peekSecretarySessionId(), reason: '宿主没回会话 id' }
+    // 回读校验：拿宿主 GET 的真值再认一次（写盘与内存 ref 都变了但文件读回来不是，等于没换成）
+    const truth = await readHostSecretaryId()
+    if (truth.id !== hostId) {
+      noteOpenDiag({ step: 'switch-read-back-mismatch', mine: hostId, host: truth.id })
+      return {
+        ok: false,
+        sessionId: truth.id !== '' ? truth.id : peekSecretarySessionId(),
+        reason: truth.id !== '' ? `宿主回读成了另一条（${truth.id}）` : '宿主回读不出这条会话',
+      }
+    }
+    writeKey(CACHE_KEY, hostId)
+    noteOpenDiag({ step: 'switch-bind-ok', sessionId: hostId, unchanged: body.unchanged === true })
+    return { ok: true, sessionId: hostId, reason: '', unchanged: body.unchanged === true }
+  } catch (error: any) {
+    noteOpenDiag({ step: 'switch-bind-throw', sessionId, reason: String(error?.message ?? error) })
+    return { ok: false, sessionId: peekSecretarySessionId(), reason: String(error?.message ?? error) }
   }
 }
 
