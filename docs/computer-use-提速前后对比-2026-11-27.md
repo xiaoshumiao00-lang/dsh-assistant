@@ -781,3 +781,52 @@ URL `https://www.bing.com`，窗口 `Chrome_WidgetWin_1`，1920×1032；5 步同
 - `outputs\2026-11-28\r3\metrics-slice-before-c1on.jsonl`：16 行起点快照。
 - `outputs\2026-11-28\r3\case1-on\metrics-after-c1on.jsonl`。
 - `outputs\` 不提交（仓库约定）。
+## 16. 回退记录（编号通道全撤，回到 ebf16ae 基线代码）
+
+### 16.1 判定理由
+
+§15 的 4 案例两态实测把编号通道判为**无收益**，三条证据都在：
+
+1. 墙钟：4 例里 **3 例开通道更长** —— ① **+0.905 s**、② **+1.547 s**、④ **+0.034 s**；只有 ③ 短 **−0.765 s**，但该差值落在单步抖动内（同一 `off` 跑末步报错、`on` 跑末步正常），**不许算作通道的功劳**。
+2. 新增成本（①②③ 开通道侧，4 例按注入/探针/叠框口径）：注入 **1430 / 1430 / 1196 / 0** 字符、探针 **271 / 415 / 97 / 0** ms、叠框 **566 / 1011 / 207 / 0** ms —— 全通道开着时每一帧都要多付这笔钱，而步数 / 点击数 / 同坐标重复 / 点击未命中 4 例两态**全平**，没有一项指标换来改善。
+3. 编号本身没命中目标：①② 的 **40 个编号只覆盖 Chrome 窗口外壳**（标签 / 工具栏 / 书签栏 / 窗口按钮），PDF 渲染文本与必应页面本体不在 UIA 树里 ⇒ 编号命中了外壳、**没命中任务真正要点的元素**；只有 ③ 这类原生控件树可读的窗口才命中真目标。
+
+按硬约束一（只增不减）与硬约束二（必须可回退）：**判定整条撤掉，不是只关开关**。开关文件与 `DSH_CU_UIA` 环境变量留到最后也不等于撤销代码，所以本轮把 §2 登记的恢复点 `ebf16ae` 走 `git revert` 链整条撤干净。
+
+### 16.2 逐个 revert 提交号与被撤的文件清单
+
+改动前基线 `ebf16ae`，本轮代码提交按倒序逐个 `git revert --no-edit`（不改写历史、不 reset、不 rebase、不 amend、不 push）：
+
+| 撤销提交 | 撤掉的原提交 | 该提交动的文件 |
+| --- | --- | --- |
+| `c788aa6` | `2326629` 控件树通道核心逻辑 | `src/cu-uia-core.ts`（删）、`src/cu-uia-win.ts`（删）、`scripts/cu-uia-core`/`bench-cu-uia-core.mjs`/`cu-uia-live-probe.mjs`/`test-cu-uia-core.mjs`（删）、`package.json`（回到基线） |
+| `ede2d68` | `c063bfe` 回退点与一键回退 | `scripts/cu-uia-rollback-drill.mjs`（删）、`src/cu-uia-core.ts`、`scripts/test-cu-uia-core.mjs`、`scripts/cu-uia-live-probe.mjs`、`package.json`（回到基线） |
+| `f07e0d8` | `b557cde` UIA 常驻 sidecar | `src/cu-uia-sidecar.ts`（删）、`scripts/cu-uia-sidecar-bench.mjs`（删）、`scripts/cu-uia-live-probe.mjs` |
+| `0692279` | `537c6e8` 编号框图像合成器 + 观察帧包装 | `src/cu-uia-overlay.ts`（删）、`src/cu-uia-observe.ts`（删）、`scripts/test-cu-uia-overlay.mjs`（删）、`scripts/test-cu-uia-observe.mjs`（删）、`scripts/cu-uia-rollback-drill.mjs` |
+| `1859f30` | `eba493a` 接到 tools/execute（assistant.ts +3 行） | `src/assistant.ts`（接线撤销）、`lib/index.js`（构建产物回退）、`src/cu-uia-observe.ts`、`scripts/cu-uia-rollback-drill.mjs` |
+| `1c4f595` | `1389272` 编号框走 post-execute 内容块层 | `src/cu-uia-content.ts`（删）、`scripts/test-cu-uia-content.mjs`（删）、`src/cu-uia-observe.ts`、`scripts/test-cu-uia-observe.mjs`、`lib/index.js`、`scripts/cu-uia-rollback-drill.mjs` |
+| `aabf642` | `1613e5b` 候选清单瘦身 + 探针缓存 + 埋点 | `src/cu-uia-metrics.ts`（删）、`scripts/test-cu-uia-slim.mjs`（删）、`src/cu-uia-core.ts`、`src/cu-uia-content.ts`、`src/cu-uia-observe.ts`、`lib/index.js`、`scripts/cu-uia-rollback-drill.mjs` |
+
+- **`e16e4d7` 与 `a2ea586` 是纯报告提交，按指示未撤**（§14.5–14.7 与 §15 的实测数字必须留在档案里）。
+- 撤完后 `git ls-tree -r HEAD` 与工作树里 cu-uia 文件 **0 个**：`src/cu-uia-*.ts`（7 个）、`scripts/cu-uia-*.mjs`、`scripts/test-cu-uia-*.mjs`、`scripts/bench-cu-uia-core.mjs`（共 9 个）全部消失；被撤的脚本清单见本节。
+- **报告文件与代码提交的冲突处理**：`1613e5b` 当年同时改过本报告，撤它时报告出现 merge conflict。恢复口径按「撤之前的内容」执行 —— 即恢复成本轮撤改之前 HEAD 的报告版本（blob `5fd7446d3c79e26801fd5968515c0e63fe022e4a`），而不是 `1613e5b^` 那份（那份还没有 `aed1824` 的 §14、`e16e4d7` 的 §14.5–14.7 与 `a2ea586` 的 §15）。这样 §14.5/14.6/14.7 与 §15 正文**一字未丢**，冲突在 `aabf642` 这一次 revert 提交里就地解决（该提交只动代码文件，报告在该提交内 0 改动），因此**没有额外多出一个「恢复报告」提交**，也没有需要单独补 commit 的残差。
+- 报告自证（撤完后实测，与 §15.4 之前版本逐字节一致）：**783 行 / 61392 字节 / BOM `EF BB BF` / CRLF 783 / bareLF 0**。
+
+### 16.3 测试证据
+
+1. 既有 CU 测试（`DSH_CU_UIA=0` 环境，脚本按 `ebf16ae` 的 `scripts` 清单为准）：**8 个脚本全绿（8 PASS / 0 FAIL）** —— `test-cu-bridge` / `test-cu-capture-scale` / `test-cu-code-agent-notice` / `test-cu-observation-surface` / `test-cu-title-bold`（基线里本就存在的 5 个 `test-cu-*`）＋ `test-assistant-cu-watch` / `test-coordinate-mode` / `verify-cu-observation-live`。
+2. 全量套件按既有跑法逐脚本跑（不经 `&&` 链，`DSH_CU_UIA=0`）：**脚本总数 94 / ok 91 / FAIL 3**，红只有既有的三条：`test-mobile-proxy.mjs`、`test-secretary-pagination-dom.mjs`、`test-secretary-session-log-write.mjs`；`PASS` 行合计 638、`FAIL` 行合计 2。无新增红。脚本总数回到基线口径：`git ls-tree -r HEAD -- scripts` 与 `ebf16ae` 的 `test-*.mjs` 计数同为 **94**（本轮新增的 5 个 `test-cu-uia-*.mjs` 已全部撤掉）。
+3. 被撤掉的脚本清单（本轮新增，现已不存在）：`scripts/test-cu-uia-core.mjs`、`scripts/test-cu-uia-overlay.mjs`、`scripts/test-cu-uia-observe.mjs`、`scripts/test-cu-uia-content.mjs`、`scripts/test-cu-uia-slim.mjs`，另加非测试脚本 `scripts/bench-cu-uia-core.mjs`、`scripts/cu-uia-live-probe.mjs`、`scripts/cu-uia-sidecar-bench.mjs`、`scripts/cu-uia-rollback-drill.mjs`。
+4. 相对基线的 0 改动自证（`git diff --numstat ebf16ae HEAD`）：`src/assistant.ts` **空**（接线 3 行已撤）、`lib/index.js` **空**（撤完重建 `node build.mjs` 后逐字节回到基线 blob `2d1f044b`，553500 字节 / CRLF 0）、`vendor/computer-use` **空**（本来没改过，自证一次）、`package.json` 不在改动清单里。
+5. `git status --porcelain -uno` **输出为空**（干净）。
+6. `git diff --name-status ebf16ae HEAD` **只剩决策档案 2 个文件**：`docs/computer-use-提速前后对比-2026-11-27.md`（783 行）与 `docs/ComputerUse-优化-只增不减-改动清单-20261127.md`（116 行）。为凑数字没有删任何档案。
+
+### 16.4 开关文件已删除 + 全仓库 grep
+
+- profile 开关文件 `C::\Users\<ACCOUNT>\.dsh\profiles\desktop\dsh-assistant-cu-uia.json`（撤前实测 17 字节、无 BOM、内容 `{"enabled":false}`）已删除；删前逐字节备份到 `outputs/2026-11-28/rollback/switch-off-2026-11-28.json`（17 字节，hex `7b22656e61626c6564223a66616c73657d`，与原件逐字节一致；`outputs/` 不提交）。删后核对同目录（78 个条目）里 `cu-uia` 文件 **0 个**，`dsh-assistant-cu-uia.json` 不存在。
+- 全仓库 grep（`DSH_CU_UIA` / `dsh-assistant-cu-uia` / `cu-uia-`，本报告写到 §16 之后重跑，含本节自身引用）：**代码区 0 命中**（`src/`、`lib/`、`scripts/`、`vendor/`、`package.json` 三个关键词全为 0 行，`git grep` 退出码 1 = 无匹配）。整棵已提交树的命中行只落在本报告的 2 个 docs 档案里：`DSH_CU_UIA` **25 行**、`dsh-assistant-cu-uia` **9 行**、`cu-uia-` **63 行**——这些是决策档案里的历史引用，按「决策档案保留不删」照旧留着。未提交的证据与本机 scratch：`outputs/` 命中 **1 行**（`dsh-assistant-cu-uia`），`.tmp/` 命中 **59 个文件 / 144 行**（本机一次性探针与脚本，不入库）。
+- 运行时残留（不参与 git 状态，按档案留证）：`%TEMP%\dsh-cu-marks\` 内仍有本轮通道跑的 12 张 `*.marks.png` 与 `metrics-2026-11-27.jsonl`；快照副本已落在 `outputs/2026-11-28/r3`（`metrics-live-2026-11-27.jsonl` 46 行、`metrics-slice-before-c1on.jsonl` 16 行、`case1-on/metrics-after-c1on.jsonl`）与 `r2`（`metrics-live-5steps.jsonl`、`hint-block-received.txt` + `baseline`/`treatment` 帧）。档案一律保留，未删。
+
+### 16.5 真机复核位
+
+- 待宿主重启后复核：可见帧洋红 0、工具结果无编号清单注入；重启前进程仍加载旧构建产物
