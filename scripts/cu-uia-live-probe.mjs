@@ -7,7 +7,7 @@
  * 只读演练：不点击、不输入、不改任何页面状态；拿不到树就如实打印「读不出」并给出退回原因。
  */
 import { probeForeground, UIA_PS1_SCRIPT } from '../src/cu-uia-win.ts'
-import { decideControlChannel, pageCacheKey, planChannelFrame, planMarks, resolveChannelSwitch } from '../src/cu-uia-core.ts'
+import { buildControlHintBlock, decideControlChannel, pageCacheKey, planMarks } from '../src/cu-uia-core.ts'
 import { execFile } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -41,21 +41,18 @@ const records = []
 for (let i = 0; i < repeat; i += 1) {
   const outcome = await probeForeground({ run: runOnce })
   const decision = decideControlChannel(outcome)
-  const sw = resolveChannelSwitch({ env: process.env.DSH_CU_UIA })
   const marks = decision.enabled ? planMarks(outcome.controls, outcome.window?.rect ?? null) : []
-  const plan = planChannelFrame({ switch: sw, decision, marks })
-  records.push({ i: i + 1, ms: outcome.ms, ok: outcome.ok, error: outcome.error ?? '', controls: outcome.controls.length, enabled: decision.enabled, reason: decision.reason, switch: sw.reason, useMarks: plan.useMarks, copyFrame: plan.copyFrame, marks: plan.marks.length, hintChars: plan.hint.length })
-  console.log(`  第 ${i + 1} 次：${outcome.ms} ms，控件 ${outcome.controls.length} 个，ok=${outcome.ok}${outcome.error === undefined ? '' : '，error=' + outcome.error}，探针判定=${decision.enabled ? '可用' : '不启动(' + decision.reason + ')'}，开关=${sw.enabled ? '开(' + sw.reason + ')' : '关(' + sw.reason + ')'}，编号 ${plan.marks.length} 个，清单 ${plan.hint.length} 字符，复制帧=${plan.copyFrame}`)
+  const hint = decision.enabled ? buildControlHintBlock(marks) : ''
+  records.push({ i: i + 1, ms: outcome.ms, ok: outcome.ok, error: outcome.error ?? '', controls: outcome.controls.length, enabled: decision.enabled, reason: decision.reason, marks: marks.length, hintChars: hint.length })
+  console.log(`  第 ${i + 1} 次：${outcome.ms} ms，控件 ${outcome.controls.length} 个，ok=${outcome.ok}${outcome.error === undefined ? '' : '，error=' + outcome.error}，通道=${decision.enabled ? '启动' : '不启动(' + decision.reason + ')'}，编号 ${marks.length} 个，清单 ${hint.length} 字符`)
   if (i === 0) {
     const win = outcome.window
     console.log(`  窗口：class=${win?.className ?? ''} rect=${win === null ? '' : `${win.rect.w}x${win.rect.h}@(${win.rect.x},${win.rect.y})`}`)
     console.log(`  标题：${String(win?.title ?? '').slice(0, 80)}`)
     console.log(`  页面缓存键：${pageCacheKey(win)}`)
-    if (plan.useMarks) {
+    if (decision.enabled) {
       console.log('  前 8 个候选：')
-      for (const line of plan.hint.split('\n').slice(0, 8)) console.log('    ' + line)
-    } else {
-      console.log('  这一帧不画编号、不返清单：帧原样交给模型（改动前行为）')
+      for (const line of hint.split('\n').slice(0, 8)) console.log('    ' + line)
     }
     if (find !== '') {
       const hit = outcome.controls.filter((control) => String(control.name ?? '').includes(find))
@@ -70,6 +67,6 @@ for (let i = 0; i < repeat; i += 1) {
 }
 const typical = records.slice(1).length > 0 ? records.slice(1) : records
 const avg = typical.reduce((sum, r) => sum + r.ms, 0) / typical.length
-console.log(`\n结论：探针 ${avg.toFixed(0)} ms/次（${typical.length} 次平均，${records[0].ms} ms 那次含程序集冷启动）；探针判定 = ${typical[0].enabled ? '可用' : '不启动(' + typical[0].reason + ')'}；开关 = ${typical[0].switch}`)
-if (typical[0].useMarks === false) console.log('按第 ① / ③ 条硬约束：这一帧整段跳过候选清单与编号框，退回纯视觉（零开销，点击参数与改动前逐字节相同）。')
+console.log(`\n结论：探针 ${avg.toFixed(0)} ms/次（${typical.length} 次平均，${records[0].ms} ms 那次含程序集冷启动）；判定 = ${typical[0].enabled ? '启动' : '不启动(' + typical[0].reason + ')'}`)
+if (typical[0].enabled === false) console.log('按第 ① 条硬约束：这一帧整段跳过候选清单与编号框，退回纯视觉（零开销）。')
 try { rmSync(dir, { recursive: true, force: true }) } catch {}

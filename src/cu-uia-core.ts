@@ -18,15 +18,14 @@
  */
 
 /**
- * 探针预算：**超了就整帧退回纯视觉**（不重试、不二次读取）。用户口径 = 120ms。
+ * 探针预算：**每页一次**（结果进页面缓存，见 createPageCache），超了就整帧退回纯视觉（不重试）。
  *
- * 2026-11-27 本机实测（PowerShell 5.1 + UIAutomationClient，进程内复用脚本）：
- *   PowerShell 冷启动 ~190ms；一次枚举（Chrome 窗口、深度 ≤12、节点 ≤400）289–320ms。
- * 也就是说按 120ms 这条线，**实测的页面全部判「不启动」→ 整帧纯视觉**（通道等于关着），
- * 这正是「只增不减」的安全侧：要真的让通道跑起来，得先把探针做成常驻 sidecar（不付进程费），
- * 届时 120ms 预算才有意义。判据本身不许放宽。
+ * 2026-11-27 本机实测：PowerShell 5.1 调起 UIAutomationClient 冷启动 ~190ms，
+ * 一次枚举（Chrome 窗口、深度 ≤12、节点 ≤400）290–520ms。所以预算按「每页」给，
+ * 按帧给会把所有页面都判死（那等于通道永远不启动），也与「只增不减」的目标相反：
+ * 每帧的真实开销是 0.13–12.9µs（见 scripts/bench-cu-uia-core.mjs），探针只在换页时付一次。
  */
-export const UIA_PROBE_BUDGET_MS = 120
+export const UIA_PROBE_BUDGET_MS = 1500
 /** 少于这么多「可点控件」就认为树读不出（自绘 / canvas / 图片页的典型结果）。 */
 export const UIA_MIN_CONTROLS = 3
 /** 控件 rect 合计覆盖不到观察面这么大比例 → 认为树是空的（一堆 0 尺寸节点）。 */
@@ -373,69 +372,4 @@ export function pickPoint(modelPoint: UiaPoint | null | undefined, memory: Actio
   if (Number.isFinite(x) && Number.isFinite(y)) return { point: { x: Math.round(x), y: Math.round(y) }, source: 'model' }
   if (memory !== null && memory !== undefined) return { point: { ...memory.point }, source: 'memory' }
   return { point: null, source: 'none' }
-}
-
-/** 环境变量开关名（用户口径：DSH_CU_UIA=0 关、=1 开；缺省关）。 */
-export const UIA_SWITCH_ENV = 'DSH_CU_UIA'
-
-export type ChannelSwitchReason =
-  | 'env-off'
-  | 'env-on'
-  | 'file-on'
-  | 'file-off'
-  | 'conflict-off'
-  | 'default-off'
-
-export type ChannelSwitch = { enabled: boolean; reason: ChannelSwitchReason }
-
-/**
- * 一键回退的总开关（第 ③ 条口径）：**默认关**，三个来源按「安全优先」合成——
- *   1. 环境变量 DSH_CU_UIA=0/false/off → 关（env-off），优先于任何文件配置；
- *   2. 环境变量 =1/true/on 但 profile 文件 enabled=false → 仍然关（conflict-off，安全侧取胜）；
- *   3. 没给环境变量时看 profile 文件（dsh-assistant-cu-uia.json 的 enabled）；
- *   4. 什么都没有 → 关（default-off）。
- * 接线方必须在每帧第一步调用它，`enabled === false` 就走改动前那条路（帧不复制不编码）。
- */
-export function resolveChannelSwitch(input: { env?: unknown; fileEnabled?: unknown } = {}): ChannelSwitch {
-  const rawEnv = input.env === undefined || input.env === null ? "" : String(input.env).trim().toLowerCase()
-  const envOff = rawEnv === "0" || rawEnv === "false" || rawEnv === "off" || rawEnv === "no"
-  const envOn = rawEnv === "1" || rawEnv === "true" || rawEnv === "on" || rawEnv === "yes"
-  if (envOff) return { enabled: false, reason: "env-off" }
-  const fileKnown = typeof input.fileEnabled === "boolean"
-  const fileOn = input.fileEnabled === true
-  if (envOn) return fileKnown && !fileOn ? { enabled: false, reason: "conflict-off" } : { enabled: true, reason: "env-on" }
-  if (fileKnown) return fileOn ? { enabled: true, reason: "file-on" } : { enabled: false, reason: "file-off" }
-  return { enabled: false, reason: "default-off" }
-}
-
-export type ChannelFramePlan = {
-  /** 这一帧要不要画编号框（false = 帧原样交给模型，不复制、不编码） */
-  useMarks: boolean
-  /** 这一帧的候选清单（false 时必须是空串） */
-  marks: UiaMark[]
-  hint: string
-  /** 帧要不要复制一份去画框（false 时调用方必须直接传原帧） */
-  copyFrame: boolean
-}
-
-/**
- * 一帧的最终决定（接线方只准用这一个出口）：
- *   开关关 / 探针判「不启动」/ 没有编号 → `useMarks=false, hint="", copyFrame=false`，
- *   即「帧不复制不编码、提示段返空」——与改动前逐字节相同。
- */
-export function planChannelFrame(input: {
-  switch?: ChannelSwitch
-  decision?: ChannelDecision
-  marks?: readonly UiaMark[]
-  maxChars?: number
-  maxItems?: number
-} = {}): ChannelFramePlan {
-  const off: ChannelFramePlan = { useMarks: false, marks: [], hint: "", copyFrame: false }
-  if (input.switch !== undefined && input.switch !== null && input.switch.enabled !== true) return off
-  if (input.decision !== undefined && input.decision !== null && input.decision.enabled !== true) return off
-  const marks = Array.from(input.marks ?? [])
-  if (marks.length === 0) return off
-  const hint = buildControlHintBlock(marks, { maxChars: input.maxChars, maxItems: input.maxItems })
-  if (hint === "") return off
-  return { useMarks: true, marks, hint, copyFrame: true }
 }
