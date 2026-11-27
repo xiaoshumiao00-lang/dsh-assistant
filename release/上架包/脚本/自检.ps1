@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 自检.ps1 · 个人助手（dsh-assistant）上架包自检
 打印 4 项：插件版本 / 悬浮球快捷键 / 个人秘书会话是否就绪 / 手机访问入口状态。
