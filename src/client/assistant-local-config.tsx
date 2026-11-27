@@ -17,6 +17,7 @@ import {
   loadAssistantConfig,
   reloadAssistantConfig,
   saveAssistantConfig,
+  fetchEscapeHatchToken,
   type AsrTermRule,
   type AssistantClientConfig,
 } from './assistant-config.ts'
@@ -124,7 +125,10 @@ export function LocalConfigPanel({ tl }: { tl?: (key: any) => string }) {
   const [busy, setBusy] = useState('')
   const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null)
   const [picker, setPicker] = useState<{ target: PickerTarget; start: string } | null>(null)
-  const [allowAllText, setAllowAllText] = useState('')
+  // 逃生开关（allowAllLocalPaths）的确认词不在页面上手输：
+  // 一次性口令从本机回环的宿主路由取（2026-11-28 手机访问安全整改第 4 项）
+  const [allowAllToken, setAllowAllToken] = useState('')
+  const [allowAllTokenBusy, setAllowAllTokenBusy] = useState(false)
   const [caps, setCaps] = useState<any>(null)
   const importRef = useRef<HTMLInputElement | null>(null)
 
@@ -185,17 +189,36 @@ export function LocalConfigPanel({ tl }: { tl?: (key: any) => string }) {
 
   const saveAsr = (terms: AsrTermRule[]): Promise<void> => save({ asrTerms: terms }, 'asr')
 
+  /** 取本机一次性口令（宿主只在本机回环答这条路由；手机端取不到，也就改不动危险字段） */
+  const takeEscapeToken = async (): Promise<void> => {
+    setAllowAllTokenBusy(true)
+    setNote(null)
+    const result = await fetchEscapeHatchToken()
+    setAllowAllTokenBusy(false)
+    if (!result.ok) {
+      setAllowAllToken('')
+      setNote({ ok: false, text: t('localConfig.allowAllTokenFailed') + ' — ' + result.error })
+      return
+    }
+    setAllowAllToken(result.token)
+    setNote({ ok: true, text: t('localConfig.allowAllTokenTaken') })
+  }
+
   const saveRoots = (): Promise<void> => {
-    if (draft.allowAll) {
-      if (allowAllText.trim() !== 'ALLOW-ALL') {
-        setNote({ ok: false, text: t('localConfig.allowAllBadConfirm') })
-        return Promise.resolve()
-      }
+    if (draft.allowAll && !allowAllToken.trim()) {
+      setNote({ ok: false, text: t('localConfig.allowAllNeedToken') })
+      return Promise.resolve()
     }
     const patch: Record<string, unknown> = { allowedRoots: draft.allowedRoots.map((item) => item.trim()).filter(Boolean) }
     patch.allowAllLocalPaths = draft.allowAll
-    if (draft.allowAll) patch.confirm = 'ALLOW-ALL'
-    return save(patch, 'roots')
+    // 口令是一次性的：宿主写成功后立刻换新，本地这份即刻作废（下一次保存得重新取）
+    if (draft.allowAll) patch.confirm = allowAllToken.trim()
+    return save(patch, 'roots').then(async () => {
+      if (!draft.allowAll) return
+      setAllowAllToken('')
+      const next = await fetchEscapeHatchToken()
+      if (next.ok) setAllowAllToken(next.token)
+    })
   }
 
   const saveUpdate = (): Promise<void> => save({
@@ -406,8 +429,14 @@ export function LocalConfigPanel({ tl }: { tl?: (key: any) => string }) {
           {draft.allowAll ? (
             <div style={{ marginTop: 6 }}>
               <p style={{ ...errText, margin: '0 0 6px' }}>{t('localConfig.allowAllWarn')}</p>
-              <input style={input} value={allowAllText} placeholder={t('localConfig.allowAllConfirm')}
-                onChange={(e) => setAllowAllText(e.target.value)} />
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                <input style={{ ...input, flex: '1 1 220px' }} value={allowAllToken} readOnly
+                  placeholder={t('localConfig.allowAllConfirm')} />
+                <button type="button" style={btn} disabled={allowAllTokenBusy} onClick={() => void takeEscapeToken()}>
+                  {allowAllTokenBusy ? t('localConfig.allowAllTokenFetching') : t('localConfig.allowAllTokenBtn')}
+                </button>
+              </div>
+              <p style={{ ...desc, margin: '6px 0 0' }}>{t('localConfig.allowAllTokenDesc')}</p>
             </div>
           ) : null}
         </div>

@@ -262,7 +262,7 @@ $DSH_ASSISTANT_CONFIG                 ← 显式覆盖（换机 / 测试用）
 | `skillRoot` | `templates.ts` / `verifyLoop.ts` 里技能文件路径的前缀 | `<DSH_HOME>/skills`（**唯一**回落，客户端不再自己拼 `~`） |
 | `asrTerms` | 语音转写的个人化词表（人名 / 校院名 / 店名）；`flags` 缺省 `g`，坏正则只跳过该条 | 空数组 = 只纠通用词 |
 | `allowedRoots` | 目录边界（allowlist）追加根 | 默认根已含助手目录、DSH 数据根、桌面、项目父目录、技能根、临时目录与用户主目录 |
-| `allowAllLocalPaths` | 逃生开关：true = 关掉目录边界检查（**危险**，界面要输 `ALLOW-ALL` 确认） | `false` |
+| `allowAllLocalPaths` | 逃生开关：true = 关掉目录边界检查（**危险**。只允许本机回环写；还要带一次性随机口令，见下面「逃生口令」） | `false` |
 | `persona` | 写进 `AGENTS.md` 的托管段落（`<!-- dsh-assistant:persona -->` 之间；用户手写的 AGENTS.md 不动） | 不注入；改动会**替换**已有托管段（v0.2.16 起，不再"只写一次"） |
 | `termEnvAllow` | 终端最小环境变量名追加项 | 只有内置白名单 |
 | `updateSource` | 更新源仓库 `owner/repo`；空 = 不检查更新 | 空（**默认不联网检查**） |
@@ -270,13 +270,28 @@ $DSH_ASSISTANT_CONFIG                 ← 显式覆盖（换机 / 测试用）
 
 改了 `allowedRoots` / `allowAllLocalPaths` 之后**不用重启**：目录 allowlist 每次请求都会重读本机配置（`path-guard.ts` 的 `check()` 自带同步）。
 
+### 逃生口令（2026-11-28 手机访问安全整改第 4 项）
+
+`allowAllLocalPaths: true` 那道「显式确认」的确认词**不再是一个公开字面量**（过去它直接写在源码与文案里，
+读过仓库、README、构建产物的人都能照着把边界关掉，门槛只剩形式）。现在它是一个**运行时生成的一次性随机口令**：
+
+- **生成与存放**：`~/.dsh/assistant/escape-hatch.json`——`crypto.randomBytes(18)` 转 base64url（24 位），文件权限 0o600，
+  原子 tmp → rename（同 `config.json` 的写法）。源码里、仓库里、构建产物里都不出现它。
+- **取用**：设置页「本机配置 → 目录边界」按「🔑 取一次性口令」，走 `GET /api/assistant/escape-hatch`。
+  这条路由**只在本机回环**答话：手机/隧道来源（pocket 代理标记 `lan` / `public`、带 `cf-connecting-ip`、或 Host 不是回环）
+  一律 403，而且拒的时候也不回吐口令本体。
+- **一次性**：用它保存成功一次，宿主立刻换新口令，旧那串即刻作废（所以页面上那串会跟着换）。
+- **比对方式**：`timingSafeEqual` 定长比较，不按字符长度分流。
+- **配套的边界**：危险字段本身（`allowAllLocalPaths` / `allowedRoots`）也只有本机回环能写（第 3 项）；
+  手机文件通道每个路径都过同一份目录 allowlist（`src/path-guard.ts`），越界 / 盘符根 / `..` 遍历都拒。
+
 
 ## 开发
 
 ```powershell
 npm run build      # lib/index.js（宿主）+ lib/pocket.js（手机访问）+ lib/client.js（客户端）+ computer-use 三个包
 npm run check      # node --check 三个产物（语法级）
-npm test           # 30 个 scripts/test-*.mjs 串接（无测试框架，失败即退出码 1）
+npm test           # 93 条 scripts/test-*.mjs 串接成一条 && 链（无测试框架，失败即退出码 1）
 npm run typecheck  # tsc --noEmit（见下：目前【过不了】，见「质量门」）
 npm run lint       # scripts/lint-standards.mjs（不靠 eslint：查个人化残留 / 退役仓库名 / 版本源一致性）
 ```

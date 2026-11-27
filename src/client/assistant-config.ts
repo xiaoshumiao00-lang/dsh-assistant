@@ -207,11 +207,50 @@ export async function saveAssistantConfig(
   }
 }
 
+/**
+ * 取本机一次性口令（2026-11-28 手机访问安全整改第 4 项）：关掉目录边界那道确认词的凭据。
+ * 宿主只在本机回环答这条路由（`/api/assistant/escape-hatch`）；手机/公网来源会拿到 403，
+ * 所以口令本体不会从这台电脑以外的地方出去——这正是它「不在源码里、不在仓库里」的意义。
+ */
+export async function fetchEscapeHatchToken(
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ ok: boolean; token: string; error: string }> {
+  try {
+    const response = await fetchImpl('/api/assistant/escape-hatch', { cache: 'no-store' })
+    const body: any = await response.json().catch(() => null)
+    if (!response.ok || !body || body.ok === false) {
+      return { ok: false, token: '', error: asString(body?.error) || asString(body?.hint) || `HTTP ${response.status}` }
+    }
+    const token = asString(body.token)
+    if (!token) return { ok: false, token: '', error: 'no-token' }
+    return { ok: true, token, error: '' }
+  } catch (err) {
+    return { ok: false, token: '', error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/** 换新的一次性口令（旧那串即刻作废）。同样只在本机回环可用。 */
+export async function rotateEscapeHatchToken(
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ ok: boolean; token: string; error: string }> {
+  try {
+    const response = await fetchImpl('/api/assistant/escape-hatch', { method: 'POST', cache: 'no-store' })
+    const body: any = await response.json().catch(() => null)
+    if (!response.ok || !body || body.ok === false) {
+      return { ok: false, token: '', error: asString(body?.error) || asString(body?.hint) || `HTTP ${response.status}` }
+    }
+    const token = asString(body.token)
+    if (!token) return { ok: false, token: '', error: 'no-token' }
+    return { ok: true, token, error: '' }
+  } catch (err) {
+    return { ok: false, token: '', error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 /** 新建项目默认父目录（未解析到就是空串，调用方按空处理）。 */
 export function newProjectParentSync(): string {
   return readCached()?.newProjectParent ?? ''
 }
-
 /** 技能根目录：宿主下发什么就是什么；没答过时为空串（不再自己拼 `~`）。 */
 export function skillRootSync(): string {
   return readCached()?.skillRoot ?? ''

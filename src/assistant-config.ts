@@ -22,6 +22,12 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { assistantHomeDir, syncPersonaSection } from './assistant-home.ts'
 import { manageWebRoutes } from './web-routes.ts'
+import {
+  ensureEscapeHatch,
+  escapeHatchStatus,
+  rotateEscapeHatchAfterUse,
+  verifyEscapeHatchConfirm,
+} from './assistant-escape-hatch.ts'
 
 /** 一条语音转写术语规则（JSON 里没有 RegExp，只有源串）。 */
 export interface AsrTermRuleJson {
@@ -625,6 +631,11 @@ function applyConfigSideEffects(ctx: any): void {
  *   POST → 白名单字段 + 类型校验 + 原子写 + 写后清缓存 + 即时应用副作用。
  * 注意：早期版本这个 handler 不看 `req.method`，POST 也会 200 下发查询结果（静默丢改动），
  * 现在 GET/POST/405 三路分明。
+ * 2026-11-28 手机访问安全整改：
+ *   - 危险字段（allowAllLocalPaths / allowedRoots）只有本机回环能写（`requestLoopback`）；
+ *   - `allowAllLocalPaths: true` 的确认词换成一次性随机口令（src/assistant-escape-hatch.ts），
+ *     口令走 `GET /api/assistant/escape-hatch`（同样只在本机回环显示），用完即刻换新；
+ *   - `GET /api/assistant/config` 的下发内容里永远不含口令本体。
  */
 export function registerAssistantConfigRoutes(ctx: any): () => void {
   const server = ctx?.webServer
@@ -662,10 +673,17 @@ export function registerAssistantConfigRoutes(ctx: any): () => void {
               return
             }
           }
-          // 逃生开关要求显式确认（与 memory-clear 的 DELETE-ALL 同一种做法）
+          // 逃生开关的确认词**不是**源码里的公开常量（2026-11-28 第 4 项）：
+          // 它是一次性随机口令，见 src/assistant-escape-hatch.ts（口令文件 0o600、不在仓库里）。
           const body = read.body as Record<string, unknown>
-          if (validated.patch.allowAllLocalPaths === true && body?.confirm !== 'ALLOW-ALL') {
-            sendJson(res, 400, { ok: false, error: 'confirm-required', field: 'allowAllLocalPaths', hint: 'allowAllLocalPaths 需要 confirm:"ALLOW-ALL"' })
+          if (validated.patch.allowAllLocalPaths === true && !verifyEscapeHatchConfirm(body?.confirm)) {
+            const hatch = escapeHatchStatus()
+            sendJson(res, 400, {
+              ok: false,
+              error: 'confirm-required',
+              field: 'allowAllLocalPaths',
+              hint: `allowAllLocalPaths 需要本机一次性口令（口令长 ${hatch.tokenLength} 位，只在这台电脑的设置页显示，不在源码/仓库/构建产物里）`,
+            })
             return
           }
           const result = writeAssistantConfig(validated.patch)
@@ -674,6 +692,10 @@ export function registerAssistantConfigRoutes(ctx: any): () => void {
             return
           }
           applyConfigSideEffects(ctx)
+          // 一次性口令用完就换新的：旧那串即刻作废（下一次要关掉边界得重新取）
+          if (validated.patch.allowAllLocalPaths === true) {
+            try { rotateEscapeHatchAfterUse() } catch { /* 换新的失败不阻塞保存；下次取口令会重生成 */ }
+          }
           sendJson(res, 200, { ...assistantConfigClientView(), saved: Object.keys(validated.patch), file: result.file })
           return
         }
@@ -684,6 +706,51 @@ export function registerAssistantConfigRoutes(ctx: any): () => void {
       }
     },
   })
+
+  // 一次性口令的取用路由（第 4 项）：只在本机回环可用，非回环一律 403 且不回吐口令本体。
+  // GET  → 打印当前口令（没有就当场生成）
+  // POST → 换一份新的（旧的那串即刻作废）并打印
+  routes.webServer.register({
+    kind: 'exact',
+    path: '/api/assistant/escape-hatch',
+    handler: async (req: any, res: any) => {
+      const method = String(req?.method ?? 'GET').toUpperCase()
+      try {
+        const source = requestLoopback(req)
+        if (!source.loopback) {
+          sendJson(res, 403, {
+            ok: false,
+            error: 'loopback-only',
+            hint: `逃生口令只在这台电脑的设置页显示（来源判定：${source.reason}）`,
+          })
+          return
+        }
+        if (method !== 'GET' && method !== 'HEAD' && method !== 'POST') {
+          res.writeHead(405, { allow: 'GET, HEAD, POST' })
+          res.end()
+          return
+        }
+        const hatch = method === 'GET' || method === 'HEAD' ? ensureEscapeHatch() : rotateEscapeHatchAfterUse()
+        if (!hatch.ok) {
+          sendJson(res, 500, { ok: false, error: hatch.error })
+          return
+        }
+        // 口令本体只走这一条回环路由，别的地方（含 GET /api/assistant/config）都不带它
+        sendJson(res, 200, {
+          ok: true,
+          token: hatch.record.token,
+          createdAt: hatch.record.createdAt,
+          rotatedAt: hatch.record.rotatedAt,
+          file: escapeHatchStatus().file,
+          loopback: true,
+        })
+        return
+      } catch (err) {
+        sendJson(res, 500, { ok: false, error: String((err as Error)?.message ?? err) })
+      }
+    },
+  })
+
   return routes.dispose
 }
 

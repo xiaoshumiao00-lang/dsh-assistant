@@ -39,10 +39,10 @@ function fakeWebServer() {
   }
 }
 
-function fakeReq(method, body, extraHeaders = {}) {
+function fakeReq(method, body, extraHeaders = {}, url = '/api/assistant/config') {
   const stream = Readable.from(body === undefined ? [] : [Buffer.from(body, 'utf8')])
   stream.method = method
-  stream.url = '/api/assistant/config'
+  stream.url = url
   // 这份 fixture 代表「桌面浏览器在本机打开设置页」：dsh web 只认本机 HTTP 层，
   // 所以必须带 loopback Host——危险字段（allowAllLocalPaths / allowedRoots）只在回环写才放行
   // （2026-11-28 手机访问安全整改第 3 项）。不带 Host 的旧写法等于「来源不明」，会被 fail closed 拒。
@@ -75,6 +75,17 @@ const call = async (method, payload, extraHeaders = {}) => {
 }
 
 const readFileJson = () => JSON.parse(readFileSync(configFile, 'utf8'))
+// 一次性口令路由（第 4 项）：同一批 registerAssistantConfigRoutes 注册的另一个 exact 路径
+const hatchRoute = server.exact.get('/api/assistant/escape-hatch')
+assert.ok(hatchRoute, '没有注册 /api/assistant/escape-hatch')
+const hatchFile = join(assistantDir, 'escape-hatch.json')
+const callHatch = async (method, extraHeaders = {}) => {
+  const res = fakeRes()
+  await hatchRoute.handler(fakeReq(method, undefined, extraHeaders, '/api/assistant/escape-hatch'), res)
+  let json = null
+  try { json = JSON.parse(res.body) } catch { json = null }
+  return { status: res.status, json, raw: res.body }
+}
 const cases = []
 
 cases.push(['GET 在没有配置文件时下发通用默认（不报错、不建文件）', async () => {
@@ -142,19 +153,76 @@ cases.push(['类型校验：路径必须绝对、开关必须是布尔、词表�
   assert.equal(empty.json.error, 'nothing-to-change')
 }])
 
-cases.push(['逃生开关要显式确认（allowAllLocalPaths 需 confirm:"ALLOW-ALL"）', async () => {
-  const denied = await call('POST', { allowAllLocalPaths: true })
-  assert.equal(denied.status, 400)
-  assert.equal(denied.json.error, 'confirm-required')
-  const allowed = await call('POST', { allowAllLocalPaths: true, confirm: 'ALLOW-ALL' })
-  assert.equal(allowed.status, 200)
+cases.push(['逃生开关要一次性口令（口令不在源码里、只在本机回环显示、用完即作废）', async () => {
+  // 源码与构建产物里都不该再有那个公开常量
+  const sourceText = readFileSync(new URL('../src/assistant-config.ts', import.meta.url), 'utf8')
+  const bundleText = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const pocketBundleText = readFileSync(new URL('../lib/pocket.js', import.meta.url), 'utf8')
+  assert.ok(!sourceText.includes('ALLOW-ALL'), 'assistant-config.ts 里还留着公开确认词')
+  assert.ok(!bundleText.includes('ALLOW-ALL'), '构建产物 lib/index.js 里还留着公开确认词')
+  assert.ok(!pocketBundleText.includes('ALLOW-ALL'), '构建产物 lib/pocket.js 里还留着公开确认词')
+
+  const missing = await call('POST', { allowAllLocalPaths: true })
+  assert.equal(missing.status, 400)
+  assert.equal(missing.json.error, 'confirm-required')
+  const guessed = await call('POST', { allowAllLocalPaths: true, confirm: 'guess-me-0123456789' })
+  assert.equal(guessed.status, 400, '乱猜的口令不该过：' + guessed.raw)
+  assert.ok(!/ALLOW-ALL/.test(guessed.json.hint ?? ''), '错误提示里也不该再出现公开词：' + guessed.json.hint)
+
+  const fetched = await callHatch('GET')
+  assert.equal(fetched.status, 200, `本机该取到口令：${fetched.raw}`)
+  const token = fetched.json?.token
+  assert.ok(typeof token === 'string' && token.length >= 24, '口令该是 24 位随机值：' + token)
+  assert.ok(!/ALLOW/i.test(token), '口令里不该带任何公开常量字样')
+  assert.ok(!/[+/=]/.test(token), 'base64url：口令本身不带需要转义的字符')
+  assert.equal(existsSync(hatchFile), true, '口令没落在助手目录里')
+  assert.ok(!readFileSync(configFile, 'utf8').includes(token), '口令不该出现在本机配置文件里')
+
+  // 非本机来源取不到口令（403，而且不回吐）
+  for (const headers of [{ 'x-dsh-pocket-source': 'lan' }, { 'x-dsh-pocket-source': 'public' }, { host: 'pocket.example.com' }, { 'cf-connecting-ip': '203.0.113.7' }]) {
+      const phone = await callHatch('GET', headers)
+      assert.equal(phone.status, 403, `手机来源该被拒（${JSON.stringify(headers)}）：${phone.raw}`)
+      assert.ok(!phone.raw.includes(token), '拒的时候也不该回吐口令本体')
+  }
+
+  const allowed = await call('POST', { allowAllLocalPaths: true, confirm: token })
+  assert.equal(allowed.status, 200, allowed.raw)
   assert.equal(allowed.json.allowAllLocalPaths, true)
-  const g = await call('GET')
-  assert.equal(g.json.allowAllLocalPaths, true)
-  // 关回去不需要确认
+  // 一次性：同一串再用必须作废，而且文件里那份已经换新
+  const reused = await call('POST', { allowAllLocalPaths: true, confirm: token })
+  assert.equal(reused.status, 400, '同一个口令该即刻作废：' + reused.raw)
+  const rotated = readFileSync(hatchFile, 'utf8')
+  assert.ok(!rotated.includes(token), '旧口令还在文件里，等于「即刻作废」没生效')
+
+  // 关掉开关不需要口令
   const off = await call('POST', { allowAllLocalPaths: false })
   assert.equal(off.status, 200)
   assert.equal(off.json.allowAllLocalPaths, false)
+  // GET 下发的那份客户端视图永远不含口令本体
+  const g = await call('GET')
+  assert.equal(g.json.allowAllLocalPaths, false)
+  assert.ok(!g.raw.includes(token), 'GET /api/assistant/config 回吐了口令本体')
+}])
+
+cases.push(['一次性口令相关的中英文文案都补齐（两份，且源码里不再有公开确认词）', async () => {
+  const loc = readFileSync(new URL('../src/client/locales.ts', import.meta.url), 'utf8')
+  for (const key of [
+    'localConfig.allowAllConfirm',
+    'localConfig.allowAllBadConfirm',
+    'localConfig.allowAllNeedToken',
+    'localConfig.allowAllTokenBtn',
+    'localConfig.allowAllTokenFetching',
+    'localConfig.allowAllTokenTaken',
+    'localConfig.allowAllTokenFailed',
+    'localConfig.allowAllTokenDesc',
+  ]) {
+    assert.equal((loc.match(new RegExp("'" + key + "'", 'g')) ?? []).length, 2, key + ' 缺中英两份')
+  }
+  const panel = readFileSync(new URL('../src/client/assistant-local-config.tsx', import.meta.url), 'utf8')
+  const literal = ['ALLOW', '-', 'ALL'].join('')
+  assert.ok(!panel.includes(literal), '设置页源码里还留着公开确认词')
+  assert.ok(!loc.includes(literal), '文案里还留着公开确认词')
+  assert.ok(!assistant.escapeHatchTestSurface.escapeHatchStatus().file.includes(literal), '口令文件名带公开词')
 }])
 
 cases.push(['危险字段只允许本机回环写（手机来源即使带确认词也 403，且不落盘）', async () => {
@@ -163,7 +231,7 @@ cases.push(['危险字段只允许本机回环写（手机来源即使带确认�
     const deniedRoots = await call('POST', { allowedRoots: [join(tempHome, 'from-phone')] }, headers)
     assert.equal(deniedRoots.status, 403, `来源 ${JSON.stringify(headers)} 该被拒：${deniedRoots.raw}`)
     assert.equal(deniedRoots.json.error, 'loopback-only')
-    const deniedEscape = await call('POST', { allowAllLocalPaths: true, confirm: 'ALLOW-ALL' }, headers)
+    const deniedEscape = await call('POST', { allowAllLocalPaths: true, confirm: 'not-a-valid-passphrase' }, headers)
     assert.equal(deniedEscape.status, 403, '回环判定该走在确认之前：' + deniedEscape.raw)
     assert.equal(deniedEscape.json.field, 'allowAllLocalPaths')
   }
