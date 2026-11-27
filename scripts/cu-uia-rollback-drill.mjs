@@ -43,6 +43,7 @@ const CU_TESTS = [
   'test-cu-uia-overlay.mjs',
   'test-cu-uia-observe.mjs',
   'test-cu-uia-content.mjs',
+  'test-cu-uia-slim.mjs',
 ]
 
 function git(args) {

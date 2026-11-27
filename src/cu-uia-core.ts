@@ -439,3 +439,66 @@ export function planChannelFrame(input: {
   if (hint === "") return off
   return { useMarks: true, marks, hint, copyFrame: true }
 }
+
+/* ── 清单瘦身（§13.7 下一步 ①）────────────────────────────────────────────
+ * 目标：只列**本屏可视区**、可点角色、名字非空的前 8–12 条，总长 < 300 字符。
+ * 2026-11-27 §13.6 实测瘦身前：17 行 774 字符（连书签栏整条都列了进去）。
+ */
+export const UIA_HINT_SLIM_ITEMS = 8
+export const UIA_HINT_SLIM_CHARS = 300
+export const UIA_HINT_SLIM_NAME_CHARS = 18
+
+/** 只留落在观察面 rect 里的编号（本屏可视区；框仍在图上——图不瘦身，只有清单瘦身）。 */
+export function onscreenMarks(marks: readonly UiaMark[], windowRect: UiaRect | null | undefined): UiaMark[] {
+  const list = Array.from(marks ?? [])
+  const win = windowRect
+  if (win === null || win === undefined) return list
+  const wx = Number(win.x) || 0
+  const wy = Number(win.y) || 0
+  const ww = Number(win.w) || 0
+  const wh = Number(win.h) || 0
+  if (ww <= 0 || wh <= 0) return list
+  return list.filter((mark) => {
+    const r = mark.rect
+    const x = Number(r.x) || 0
+    const y = Number(r.y) || 0
+    const w = Number(r.w) || 0
+    const h = Number(r.h) || 0
+    const overlapW = Math.min(x + w, wx + ww) - Math.max(x, wx)
+    const overlapH = Math.min(y + h, wy + wh) - Math.max(y, wy)
+    return overlapW > 0 && overlapH > 0
+  })
+}
+
+export type SlimHint = { text: string; lines: number; chars: number; keptIds: number[] }
+
+/**
+ * 紧凑候选清单：允许叠用 `maxItems`/`maxChars` 双上限，名字截到 18 字符。
+ * 返回真实字符数，供埋点与门禁（§14 的"每帧注入词数"）直接取用。
+ */
+export function buildSlimControlHint(marks: readonly UiaMark[], opts: {
+  maxItems?: number
+  maxChars?: number
+  maxNameChars?: number
+} = {}): SlimHint {
+  const maxItems = Math.max(1, Number(opts.maxItems ?? UIA_HINT_SLIM_ITEMS))
+  const maxChars = Math.max(40, Number(opts.maxChars ?? UIA_HINT_SLIM_CHARS))
+  const maxName = Math.max(4, Number(opts.maxNameChars ?? UIA_HINT_SLIM_NAME_CHARS))
+  const kept: string[] = []
+  const keptIds: number[] = []
+  let chars = 0
+  for (const mark of Array.from(marks ?? [])) {
+    if (kept.length >= maxItems) break
+    const name = String(mark.control?.name ?? '').replace(/\s+/g, ' ').trim()
+    if (name === '') continue
+    const role = String(mark.control?.role ?? '').trim()
+    const label = name.length > maxName ? name.slice(0, maxName) + '…' : name
+    const r = mark.rect
+    const line = '#' + mark.no + ' ' + role + ' "' + label + '" (' + r.x + ',' + r.y + ',' + r.w + ',' + r.h + ')'
+    if (chars + line.length + (kept.length === 0 ? 0 : 1) > maxChars) break
+    kept.push(line)
+    keptIds.push(mark.no)
+    chars += line.length + (kept.length === 1 ? 0 : 1)
+  }
+  return { text: kept.join('\n'), lines: kept.length, chars: chars, keptIds }
+}

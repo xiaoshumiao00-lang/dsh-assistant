@@ -236,35 +236,75 @@ export function readCuUiaSwitch(ctx: any): ChannelSwitch {
   return resolveChannelSwitch({ env: process.env.DSH_CU_UIA, fileEnabled: readCuUiaFileEnabled(ctx) })
 }
 
-export type ObservationSample = { decision: ChannelDecision; controls: UiaControl[]; windowRect: UiaRect | null; cacheKey: string }
+export type ObservationSample = {
+  decision: ChannelDecision
+  controls: UiaControl[]
+  windowRect: UiaRect | null
+  cacheKey: string
+  /** 这次有没有真发探针（false = 页面缓存命中，0 ms） */
+  probed: boolean
+  /** 探针往返毫秒（缓存命中 = 0）——§14 的实跑数字就取这个字段 */
+  probeMs: number
+}
 
 /**
  * 默认探针：懒起 sidecar（42–49ms/页）+ 页面缓存（同页 TTL 内不重探）。
  * 任何异常都回「通道不启动」，绝不把异常抛给 CU 调用链。
  */
-export function createObservationProbe(opts: { ttlMs?: number } = {}) {
+export function createObservationProbe(opts: { ttlMs?: number; minIntervalMs?: number } = {}) {
   let sidecar: ReturnType<typeof createUiaSidecar> | null = null
   const cache = createPageCache({ ttlMs: Number(opts.ttlMs ?? 30_000), maxPages: 8 })
+  // 第 ② 条硬约束：同一页每秒至多 1 次真探针；1 秒内重复出现直接吃缓存
+  const minIntervalMs = Math.max(0, Number(opts.minIntervalMs ?? 1000))
+  let lastKey = ''
+  let lastProbeAt = 0
+  let lastDecision: ChannelDecision = { enabled: false, reason: 'default-off' }
+  let lastWindowRect: UiaRect | null = null
+  let lastControls: UiaControl[] = []
   return {
     async sample(): Promise<ObservationSample> {
       try {
-        if (sidecar === null) sidecar = createUiaSidecar()
+        // 节流：同页 1 秒内 —— 一个字节的探针都不发
+        if (lastKey !== '' && Date.now() - lastProbeAt < minIntervalMs) {
+          return { decision: lastDecision, controls: lastControls, windowRect: lastWindowRect, cacheKey: lastKey, probed: false, probeMs: 0 }
+        }
+        if (sidecar === null) {
+          sidecar = createUiaSidecar()
+          // 预热：首帧要付 sidecar 冷启动（PowerShell 程序集 + ready 握手，实测 ~330-380ms）。
+          // 这笔账不能算进 120ms 预算里，所以先空跑一次丢掉结果，再开始计时。
+          await sidecar.probe(1).catch(() => undefined)
+        }
+        const started = Date.now()
         const outcome = await sidecar.probe(200)
+        const probeMs = Date.now() - started
+        lastProbeAt = Date.now()
         const decision = decideControlChannel(outcome)
         const windowRect = outcome.window === null ? null : outcome.window.rect
-        if (!decision.enabled) return { decision, controls: [], windowRect, cacheKey: '' }
         const key = pageCacheKey(outcome.window)
+        lastKey = key
+        lastDecision = decision
+        lastWindowRect = windowRect
+        if (!decision.enabled) {
+          lastControls = []
+          return { decision, controls: [], windowRect, cacheKey: key, probed: true, probeMs }
+        }
         const cached = cache.get(key)
-        if (cached !== null) return { decision, controls: cached, windowRect, cacheKey: key }
+        if (cached !== null) {
+          lastControls = cached
+          return { decision, controls: cached, windowRect, cacheKey: key, probed: true, probeMs }
+        }
         cache.set(key, outcome.controls)
-        return { decision, controls: outcome.controls, windowRect, cacheKey: key }
+        lastControls = outcome.controls
+        return { decision, controls: outcome.controls, windowRect, cacheKey: key, probed: true, probeMs }
       } catch {
-        return { decision: { enabled: false, reason: 'error' }, controls: [], windowRect: null, cacheKey: '' }
+        return { decision: { enabled: false, reason: 'error' }, controls: [], windowRect: null, cacheKey: '', probed: false, probeMs: 0 }
       }
     },
     close(): void {
       try { sidecar?.close() } catch {}
       sidecar = null
+      lastKey = ''
+      lastProbeAt = 0
     },
   }
 }
