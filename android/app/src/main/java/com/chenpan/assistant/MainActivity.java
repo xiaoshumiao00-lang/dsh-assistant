@@ -99,6 +99,7 @@ public class MainActivity extends Activity {
 
     private static final int REQ_FILE = 1001;
     private static final int REQ_PERM = 1002;
+    private static final int REQ_NOTIF = 1003;
 
     private static final int BG = 0xFF0F1115;
     private static final int CARD = 0xFF161A21;
@@ -127,6 +128,10 @@ public class MainActivity extends Activity {
     /** DSH 重启后旧会话 cookie 失效的自愈计数（见 recoverAuth）。 */
     private int authRecoveries;
     private boolean authRecovering;
+
+    /** 设置页「后台保活」区块的两个按钮（onResume 刷新状态文案）。 */
+    private Button keepAliveToggle;
+    private Button batteryWhitelist;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private Runnable backLongPress;
@@ -180,6 +185,11 @@ public class MainActivity extends Activity {
             intent.removeExtra(EXTRA_SETTINGS);
             showSetup(true);
         }
+
+        // 2026-11-27 后台保活：Android 13+ 通知是运行时权限（常驻通知/任务完成通知都要它）；
+        // 前台服务把进程钉在高优先级，切后台 WebView 里的 WebSocket 才不会被省电策略冻结。
+        ensureNotificationPermission();
+        KeepAliveService.start(this);
     }
 
     @Override
@@ -233,6 +243,11 @@ public class MainActivity extends Activity {
 
         w.setWebViewClient(new AppClient());
         w.setWebChromeClient(new AppChrome());
+
+        // JS 桥（2026-11-27 后台播报）：页面在后台收到任务完成时，经它发系统通知、
+        // 用原生 TextToSpeech 播报（后台 WebAudio 被挂起，页面那套微软 TTS 不可靠）。
+        // 挂在 buildWebView 里：渲染进程被杀重建（recoverWebView）后桥自动还在。
+        w.addJavascriptInterface(new NativeBridge(this), "DshAssistantNative");
 
         w.setDownloadListener(new android.webkit.DownloadListener() {
             @Override
@@ -930,6 +945,58 @@ public class MainActivity extends Activity {
             }
         });
 
+        // ---- 后台保活（2026-11-27）：前台服务开关 + 电池优化白名单入口。
+        //      只给开关与入口，绝不自动弹系统授权页（用户点按钮才跳）。 ----
+        TextView kaTitle = new TextView(this);
+        kaTitle.setText("后台保活（切后台不重连、任务完成播报）");
+        kaTitle.setTextColor(TEXT);
+        kaTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        kaTitle.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        LinearLayout.LayoutParams kaTitleLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        kaTitleLp.topMargin = dp(24);
+        form.addView(kaTitle, kaTitleLp);
+
+        keepAliveToggle = new Button(this);
+        keepAliveToggle.setAllCaps(false);
+        keepAliveToggle.setTextColor(TEXT);
+        keepAliveToggle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        keepAliveToggle.setBackgroundColor(CARD);
+        LinearLayout.LayoutParams kaLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+        kaLp.topMargin = dp(8);
+        form.addView(keepAliveToggle, kaLp);
+        keepAliveToggle.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                boolean next = !KeepAliveService.isEnabled(MainActivity.this);
+                KeepAliveService.setEnabled(MainActivity.this, next);
+                refreshKeepAliveRows();
+                toast(next ? "已开启后台常驻保活" : "已关闭后台常驻保活");
+            }
+        });
+
+        batteryWhitelist = new Button(this);
+        batteryWhitelist.setAllCaps(false);
+        batteryWhitelist.setTextColor(TEXT);
+        batteryWhitelist.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        batteryWhitelist.setBackgroundColor(CARD);
+        LinearLayout.LayoutParams bwLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+        bwLp.topMargin = dp(8);
+        form.addView(batteryWhitelist, bwLp);
+        batteryWhitelist.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                try {
+                    startActivity(KeepAliveService.batteryWhitelistIntent(MainActivity.this));
+                } catch (ActivityNotFoundException e) {
+                    toast("这台设备没有电池优化设置页");
+                }
+            }
+        });
+        refreshKeepAliveRows();
+
         TextView tip = new TextView(this);
         tip.setText("· 家里同一个 WiFi 可用局域网地址，出门用固定公网地址\n"
                 + "· 需要访问密码就在页面里输入一次，之后长期记住\n"
@@ -949,6 +1016,18 @@ public class MainActivity extends Activity {
 
     private void hideSetup() {
         if (setupView != null) setupView.setVisibility(View.GONE);
+    }
+
+    /** 设置页「后台保活」两行的状态文案（按钮还没建/设置页没开时空调用也无害）。 */
+    private void refreshKeepAliveRows() {
+        if (keepAliveToggle != null) {
+            keepAliveToggle.setText("后台常驻保活（前台服务）："
+                    + (KeepAliveService.isEnabled(this) ? "已开启" : "已关闭"));
+        }
+        if (batteryWhitelist != null) {
+            batteryWhitelist.setText("电池优化白名单："
+                    + (KeepAliveService.isIgnoringBatteryOptimizations(this) ? "已加入" : "去加入（防厂商杀后台）"));
+        }
     }
 
     private String normalizeUrl(String raw) {
@@ -1235,9 +1314,10 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
-        if (web != null) {
-            web.onPause();
-        }
+        // 2026-11-27 后台保活：不再暂停 WebView（WebView.onPause 会停掉媒体与部分处理），
+        // 后台恰恰要靠 JS 定时器/WebSocket/音频继续跑（任务完成才能收到并播报）。
+        // 渲染省电交给系统（不可见时本来就不绘制），进程保活交给 KeepAliveService。
+        NativeBridge.setAppInBackground(true);
         CookieManager.getInstance().flush();
         WindowManager.LayoutParams lp = getWindow().getAttributes();
         lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_STATE_UNCHANGED;
@@ -1247,8 +1327,54 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        NativeBridge.setAppInBackground(false);
         if (web != null) web.onResume();
         applySystemBars(false);
+        // 保活服务若曾在后台被回收，回到前台立刻补拉（start 内部幂等，已在跑则空转）
+        KeepAliveService.start(this);
+        refreshKeepAliveRows();
+        // 连接断开由页面侧 foreground-nudge 负责（可见即 reconnect + 阶梯补刀）；
+        // 这里只探「渲染进程是不是还活着」，绝不无条件 reload——那就是用户骂的重连白等。
+        probePageAlive();
+    }
+
+    /**
+     * 页面探活：给 WebView 递一句 JS，读页面侧暴露的连接状态。
+     * 回调来了 = 渲染进程健康，连接状态交给页面侧自愈（foreground-nudge.ts）；
+     * 5 秒都没回调 = 渲染进程卡死/被冻结（evaluateJavascript 永远不会回来），
+     * 重建一块 WebView 等同于浏览器刷新一次，比让用户对着死页面强。
+     */
+    private void probePageAlive() {
+        if (web == null || web.getUrl() == null) return;
+        if (setupView != null && setupView.getVisibility() == View.VISIBLE) return;
+        if (errorView != null && errorView.getVisibility() == View.VISIBLE) return;
+        final WebView probe = web;
+        final boolean[] answered = new boolean[1];
+        web.evaluateJavascript(
+                "(function(){try{var f=window.__dshAssistantConnState;"
+                        + "return typeof f==='function'?String(f()):'unknown'}catch(e){return 'unknown'}})()",
+                new android.webkit.ValueCallback<String>() {
+                    @Override
+                    public void onReceiveValue(String value) {
+                        answered[0] = true;
+                    }
+                });
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!answered[0] && web == probe) {
+                    recoverWebView();
+                }
+            }
+        }, 5000);
+    }
+
+    /** Android 13+ 通知是运行时权限：常驻通知与任务完成通知都要它；启动时申请一次，不纠缠。 */
+    private void ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIF);
+        }
     }
 
     @Override

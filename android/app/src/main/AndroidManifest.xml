@@ -11,6 +11,15 @@
     <!-- 2026-11-27「所有附件都走下载」：apk 下载完成后用 ACTION_VIEW 弹系统安装界面，
          Android 8+ 必须声明这条权限，否则安装意图根本递不到 PackageInstaller。 -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 2026-11-27 后台保活四件套：前台服务常驻连接 + 任务完成系统通知 + 原生播报。
+         targetSdk 34：dataSync 类型的前台服务必须单独声明 FOREGROUND_SERVICE_DATA_SYNC；
+         Android 13+ 通知是运行时权限（MainActivity 启动时申请一次）。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 设置页「电池优化白名单」按钮跳系统授权页用（只给入口，不自动弹）。 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
@@ -43,5 +52,13 @@
                 android:name="android.app.shortcuts"
                 android:resource="@xml/shortcuts" />
         </activity>
+
+        <!-- 常驻连接前台服务：切后台/锁屏时把进程优先级钉在前台，WebView 里的 WebSocket
+             才不会被厂商省电策略冻结；带一条最低优先级的常驻通知（可点回页面）。
+             不导出、无 intent-filter，只能被本应用显式拉起。 -->
+        <service
+            android:name=".KeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>

@@ -14,6 +14,7 @@ import { PathBrowser } from './orb/PathBrowser.tsx';
 import { zh as ORB_ZH, en as ORB_EN } from './orb/locales.ts';
 import { mobileApply } from './mobile/mobile-apply.tsx';
 import { installDiag } from './orb/diag.ts';
+import { installForegroundNudge } from './orb/foreground-nudge.ts';
 import { orbApply } from './orb/orb-apply.tsx';
 import { NS as POCKET_NS, zh as POCKET_ZH, en as POCKET_EN } from './pocket-locales.js';
 import { PHONE_STUCK_VIEWPORT, readAppliedLayout, readStoredLayout, needsNarrowDesktopConfirm, stripLayoutParamFromHref, writeLayout } from './mobile/layout-mode.mjs';
@@ -893,6 +894,11 @@ export function apply(ctx) {
       try { ctx.connection.isLoopback = true; } catch { /* 忽略 */ }
     }
   }
+
+  // 前台即重连（2026-11-27「切后台秒恢复」）：页面重新可见时若连接不在 connected 态，
+  // 立刻 connection.reconnect() 把退避睡着的连接层拍醒，并按 2s→4s→8s→15s→30s 阶梯补刀；
+  // 连接没断时什么都不做（秒恢复主要靠原生前台服务保活，这里只是断线后的加速器）。
+  installForegroundNudge(ctx);
 
   // 设置页签接入 DSH 本地化：注册 pocket 词典（zh/en），并绑定一个随当前 locale 切换的 t()。
   // 必须排在 mobileApply 之前：手机上的常驻布局徽章与 auto-heal 提示用的也是 pocket

@@ -13,6 +13,7 @@
  */
 import { createSpeechController, type SpeechPlayer } from './secretary-cards.ts'
 import { createChunkPipeline, createSpeechClipCache, type SpeechSynthClip, type SpeechPlayback } from './secretary-speech-pipeline.ts'
+import { nativeBackgroundSpeak } from './native-assistant-bridge.ts'
 
 const TTS_ROUTE = '/api/assistant/tts'
 
@@ -156,6 +157,11 @@ export function requestAutoReadOnce(scope: string, key: string, text: string): b
   if (seen.size > AUTO_READ_CAP) {
     for (const oldest of seen) { if (seen.size <= AUTO_READ_CAP) break; seen.delete(oldest) }
   }
+  // 2026-11-27 后台播报：页面不可见/原生标记后台且安卓桥在时，改走原生 TextToSpeech
+  // + 系统通知（后台 WebAudio 被挂起，下面这条微软 TTS 链路播不出声）；原生接住后
+  // 直接 return true——同一条不再进 WebAudio 队列，回到前台也不会两路叠声。
+  // 前台（或没有桥的桌面/浏览器）行为完全不变。
+  if (nativeBackgroundSpeak(globalThis, key, text)) return true
   secretarySpeech.request(key, text)
   return true
 }
