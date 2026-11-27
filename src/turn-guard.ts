@@ -19,8 +19,11 @@
  * 跨 turn、跨自然日自动重置。旧口径是「按整条会话累计」——被定时任务每天复用的会话
  * 一旦补满 3 次就永久静音（2026-11-06 定时任务 turn 41 就是这么没被续跑的）。
  * 每次 `turn-stopping` 决策都写一行 verdict 日志（带 ISO 时间戳）：
- *   `verdict turn=N steer=true|false branch=判据名 injected=已补/上限 dayInjected=当日已补`
+ *   `verdict turn=N session=<会话标识> steer=true|false branch=判据名 injected=已补/上限 dayInjected=当日已补`
  * 所以「被上限拦下」「被预设跳过」这类不动作的判定也能在日志里看见。
+ * 日志只落标识（turn 号、判据分支名、会话标识、预设名、阈值数字、正文字符数），
+ * 不落回复正文片段、也不落本机绝对路径；文件超过 MAX_LOG_BYTES 会自动轮转到 `.1`
+ * （只留 1 份历史）。
  *
  * 开关：真值落在 `<profile 目录>/dsh-assistant-turn-guard.json`，客户端通过同源
  * `GET/POST /.dsh-assistant/turn-guard` 读写（与托管状态同一种跨端同步方式）。
@@ -55,6 +58,26 @@ const MAX_BODY_BYTES = 64 * 1024
 /** 预设名 / 列表长度上限，防止把垃圾写进状态文件。 */
 const MAX_PRESET_LENGTH = 64
 const MAX_PRESETS = 16
+
+/**
+ * 日志落盘上限（字节）：这个 log 每个 turn 决策写一行，本机实测已经攒到 1 MB 以上。
+ * 超过就轮转，别让它无限长。
+ */
+export const MAX_LOG_BYTES = 200 * 1024
+/** 轮转归档后缀：只留 1 份历史（每次轮转覆写同一个 `.1`，不堆 `.2`/`.3`）。 */
+const LOG_ARCHIVE_SUFFIX = '.1'
+/** 日志行最长这么多字符：超了直接截，顺手把多行压成单行——正文不整段落盘。 */
+export const MAX_LOG_LINE_CHARS = 240
+/**
+ * 本机绝对路径形态：盘符开头（`C:\` / `D:/`）、UNC（`\\share\`）、或裸 root（`\Users\`）。
+ * 日志只落标识，不落路径；这几个正则用来兜底把路径从错误消息/堆栈里剔出去。
+ * 尾巴的排除表里带全角标点（（）：。，、），这样「路径紧跟中文说明」不会被顺手吃光。
+ */
+const LOCAL_PATH_PATTERNS = [
+  /\b[A-Za-z]:[\\/][^\s,;)'"`（）：。，、]*/g,
+  /[\\/]{2}[A-Za-z0-9._$-]+[\\/][^\s,;)'"`（）：。，、]*/g,
+  /[\\/](?:Users|Documents and Settings|Profiles|home)[\\/][^\s,;)'"`（）：。，、]*/gi,
+]
 
 /** 模型把工具调用写成正文时常见的残留标记。 */
 const LEAK = /<tool_call>|<\/tool_call>|<parameter|<function|<\/function>|<input_text>/i
@@ -321,6 +344,15 @@ export function lastToolError(session: any): string {
   return ''
 }
 
+/**
+ * 会话标识（日志里只落 id 这种短标识；拿不到就写 `?`，绝不落标题或正文）。
+ */
+export function sessionIdOf(session: any, payload: any): string {
+  const raw = session?.id ?? session?.header?.id ?? payload?.sessionId ?? payload?.address?.sessionId
+  const text = typeof raw === 'string' ? raw : typeof raw === 'number' ? String(raw) : ''
+  return text === '' ? '?' : text.slice(0, 64)
+}
+
 /** 会话当前的 agent 预设（优先投影，退回 header）。 */
 export function presetOf(ctx: any, session: any): string | undefined {
   try {
@@ -525,7 +557,7 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
     : {}
 }
 
-async function handleRequest(store: TurnGuardStore, logFile: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleRequest(store: TurnGuardStore, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1')
   if (url.pathname !== PREFIX) {
     sendJson(res, 404, { error: 'not-found' })
@@ -539,7 +571,7 @@ async function handleRequest(store: TurnGuardStore, logFile: string, req: Incomi
       return
     }
     if (method === 'GET') {
-      sendJson(res, 200, { ok: true, ...(await store.read()), logFile, version: VERSION })
+      sendJson(res, 200, { ok: true, ...(await store.read()), logFile: LOG_FILENAME, version: VERSION })
       return
     }
     if (method === 'POST') {
@@ -554,7 +586,7 @@ async function handleRequest(store: TurnGuardStore, logFile: string, req: Incomi
         return
       }
       const next = await store.patch(change)
-      sendJson(res, 200, { ok: true, ...next, logFile, version: VERSION })
+      sendJson(res, 200, { ok: true, ...next, logFile: LOG_FILENAME, version: VERSION })
       return
     }
     res.writeHead(405, { allow: 'GET, POST, OPTIONS' })
@@ -567,6 +599,53 @@ async function handleRequest(store: TurnGuardStore, logFile: string, req: Incomi
   }
 }
 
+/* ---------- 日志落盘（轮转 + 只落标识） ---------- */
+
+/**
+ * 把一行日志收成单行、剔掉本机绝对路径、截到 MAX_LOG_LINE_CHARS。
+ * 调用方已经只送标识了，这层是兜底：防「错误消息里带路径」、「堆栈整段」和
+ * 「某个地方漏了正文片段」这几种情况。
+ */
+export function sanitizeTurnGuardLine(line: unknown): string {
+  let text = String(line ?? '').replace(/\s+/g, ' ').trim()
+  for (const pattern of LOCAL_PATH_PATTERNS) text = text.replace(pattern, '<path>')
+  if (text.length > MAX_LOG_LINE_CHARS) text = `${text.slice(0, MAX_LOG_LINE_CHARS)}...`
+  return text
+}
+
+/**
+ * 现存日志超过 MAX_LOG_BYTES 就轮转到 `.1`（只留 1 份历史：每次覆写同一个归档件）。
+ * 写前先 statSync；任何失败都不抛，返回「轮转成了没有」。
+ */
+export function rotateTurnGuardLog(logFile: string): boolean {
+  try {
+    const size = statSync(logFile).size
+    if (size <= MAX_LOG_BYTES) return false
+    renameSync(logFile, `${logFile}${LOG_ARCHIVE_SUFFIX}`)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 一行日志的落盘形状：ISO 时间戳 + pid + 内容（不带任何本机路径）。 */
+function formatTurnGuardLine(line: string): string {
+  return `${new Date().toISOString()} [pid ${process.pid}] ${line}\n`
+}
+
+/**
+ * 写日志：先按大小轮转（超阈值才动），再追加。全程不抛，返回写没写成。
+ */
+export function appendTurnGuardLog(logFile: string, line: unknown): boolean {
+  try {
+    rotateTurnGuardLog(logFile)
+    appendFileSync(logFile, formatTurnGuardLine(sanitizeTurnGuardLine(line)), 'utf8')
+    return true
+  } catch {
+    return false
+  }
+}
+
 /* ---------- 插件体 ---------- */
 
 /**
@@ -574,7 +653,9 @@ async function handleRequest(store: TurnGuardStore, logFile: string, req: Incomi
  * 所以设置页一点开关，下一轮就按新状态跑（无需重载插件）。
  *
  * 每次决策（含「开关关闭 / 预设不在名单 / 配额已满」这些不动作的判定）都写一行
- * verdict 日志：`verdict turn=N steer=… branch=… injected=已补/上限 dayInjected=… maxPerTurn=…`。
+ * verdict 日志：`verdict turn=N session=<会话标识> steer=… branch=… injected=已补/上限`
+ * `dayInjected=… maxPerTurn=… textChars=…`。日志只落标识与数字，不落回复正文片段，
+ * 也不落本机绝对路径（超阈值会轮转到 `.1`，见「日志落盘」一节）。
  */
 export function installTurnGuard(ctx: any, options: { readState: () => TurnGuardState; log: (line: string) => void }): () => void {
   const disposers: Array<() => void> = []
@@ -592,22 +673,23 @@ export function installTurnGuard(ctx: any, options: { readState: () => TurnGuard
       try {
         const state = options.readState()
         const turnLabel = typeof payload?.turn === 'number' ? String(payload.turn) : '?'
+        const sessionTag = `session=${sessionIdOf(payload?.agent?.session, payload)}`
         const quota = `maxPerTurn=${state.maxPerTurn}`
         if (state.enabled !== true) {
-          options.log(`verdict turn=${turnLabel} steer=false branch=disabled injected=0/${state.maxPerTurn} ${quota}`)
+          options.log(`verdict turn=${turnLabel} ${sessionTag} steer=false branch=disabled injected=0/${state.maxPerTurn} ${quota}`)
           return
         }
         const agent = payload?.agent
         const session = agent?.session
         if (agent === undefined || session === undefined) {
-          options.log(`verdict turn=${turnLabel} steer=false branch=no-agent ${quota}`)
+          options.log(`verdict turn=${turnLabel} ${sessionTag} steer=false branch=no-agent ${quota}`)
           return
         }
         const anyPreset = state.presets.includes('*')
         if (!anyPreset) {
           const preset = presetOf(ctx, session)
           if (preset === undefined || !state.presets.includes(preset)) {
-            options.log(`verdict turn=${turnLabel} steer=false branch=preset-skip preset=${String(preset ?? '?')} allowed=[${state.presets.join(',')}] ${quota}`)
+            options.log(`verdict turn=${turnLabel} ${sessionTag} steer=false branch=preset-skip preset=${String(preset ?? '?')} allowed=[${state.presets.join(',')}] ${quota}`)
             return
           }
         }
@@ -615,9 +697,11 @@ export function installTurnGuard(ctx: any, options: { readState: () => TurnGuard
         const verdict = judge(session, state, turn)
         const injected = verdict.injected ?? 0
         const injectedMax = verdict.injectedMax ?? state.maxPerTurn
-        options.log(`verdict turn=${turnLabel} steer=${verdict.steer ? 'true' : 'false'} branch=${verdict.branch} `
-          + `injected=${injected}/${injectedMax} dayInjected=${verdict.dayInjected ?? 0} scoped=${turn === undefined ? 'session' : 'turn'} ${quota}`
-          + ` text=${JSON.stringify(String(verdict.text ?? '').slice(0, 40))}`)
+        // 只落计数与标识：正文本体（哪怕前 40 字）不落盘 —— 会话日志里已经有它了。
+        const textChars = String(verdict.text ?? '').length
+        options.log(`verdict turn=${turnLabel} ${sessionTag} steer=${verdict.steer ? 'true' : 'false'} branch=${verdict.branch} `
+          + `injected=${injected}/${injectedMax} dayInjected=${verdict.dayInjected ?? 0} scoped=${turn === undefined ? 'session' : 'turn'} ${quota} `
+          + `textChars=${textChars} toolCall=${verdict.hasToolCall ? 'yes' : 'no'}`)
         if (!verdict.steer) return
         const message = buildUserMessage(correctiveText(verdict.reason as 'leak' | 'empty', lastToolError(session)), {
           kind: 'user',
@@ -626,9 +710,10 @@ export function installTurnGuard(ctx: any, options: { readState: () => TurnGuard
         // 走唯一的构造入口：id 一定有，形状一定校验过（不合格直接抛，绝不写坏日志）。
         assertIdentifiedMessage(message, 'turn-guard corrective message')
         agent.send(message, 'next-step', false)
-        options.log(`steer turn=${turnLabel} reason=${verdict.reason} branch=${verdict.branch} injected=${injected + 1}/${injectedMax} text=${JSON.stringify(String(verdict.text ?? '').slice(0, 40))}`)
+        options.log(`steer turn=${turnLabel} ${sessionTag} reason=${verdict.reason} branch=${verdict.branch} injected=${injected + 1}/${injectedMax} textChars=${textChars}`)
       } catch (error) {
-        options.log(`steer failed: ${(error as Error)?.stack ?? String(error)}`)
+        // 堆栈里全是本机绝对路径（还有可能带正文）：只落错误种类与清洗过的消息。
+        options.log(`steer failed kind=${String((error as Error)?.name ?? 'unknown')} message=${String((error as Error)?.message ?? '')}`)
       }
     })
     if (typeof off === 'function') disposers.push(off)
@@ -652,12 +737,19 @@ export function apply(ctx: any): () => void {
   const directory = profileDirectory(ctx)
   const store = new TurnGuardStore(join(directory, STATE_FILENAME))
   const logFile = join(dshHome(), LOG_FILENAME)
+  // 加载时就先把现存的过大日志轮转出表：本机实测那份已经攒到 1 MB 以上，
+  // 不先归档的话「超阈值才轮转」的检查永远轮不到旧账（写前 statSync 也轮转会做，
+  // 这里只是让它必然发生在第一行新日志之前）。
+  const rotatedExisting = rotateTurnGuardLog(logFile)
   const log = (line: string): void => {
-    try {
-      const bullet = `dsh-assistant: ${line}`
-      console.warn(bullet)
-      appendFileSync(logFile, `${new Date().toISOString()} [pid ${process.pid}] ${line}\n`, 'utf8')
-    } catch { /* 诊断写不出去也不该让插件启动失败 */ }
+    const text = sanitizeTurnGuardLine(line)
+    try { console.warn(`dsh-assistant: ${text}`) } catch { /* 控制台写不进也无所谓 */ }
+    appendTurnGuardLog(logFile, text)
+  }
+  if (rotatedExisting) {
+    let archivedBytes = 0
+    try { archivedBytes = statSync(`${logFile}${LOG_ARCHIVE_SUFFIX}`).size } catch { /* 归档件读不到就算了 */ }
+    log(`log rotate: 现存量 ${archivedBytes} 字节已归档到 ${LOG_FILENAME}${LOG_ARCHIVE_SUFFIX}`)
   }
   const initial = store.readSync()
   log(`load: v${VERSION} enabled=${initial.enabled} presets=[${initial.presets.join(', ')}] maxPerTurn=${initial.maxPerTurn} steerEmptyText=${initial.steerEmptyText}`)
@@ -669,11 +761,11 @@ export function apply(ctx: any): () => void {
       kind: 'exact',
       path: PREFIX,
       handler: (req: IncomingMessage, res: ServerResponse) => {
-        void handleRequest(store, logFile, req, res)
+        void handleRequest(store, req, res)
       },
     })
     disposers.push(routes.dispose)
-    log(`已挂载 turn-guard 路由 GET/POST ${PREFIX}（状态文件 ${store.file}）`)
+    log(`已挂载 turn-guard 路由 GET/POST ${PREFIX}（状态文件 ${STATE_FILENAME}）`)
   } catch (error) {
     log(`turn-guard 路由挂载失败（开关仍按状态文件生效）：${String((error as Error)?.message ?? error)}`)
   }
@@ -686,7 +778,7 @@ export function apply(ctx: any): () => void {
   }
 }
 
-/** 测试面：scripts/test-turn-guard.mjs 直接拿判定与状态函数。 */
+/** 测试面：scripts/test-turn-guard.mjs 与 test-turn-guard-log-rotation.mjs 直接拿判定、状态与日志函数。 */
 export const turnGuardTestSurface = {
   looksLikeCall,
   judge,
@@ -697,8 +789,15 @@ export const turnGuardTestSurface = {
   guardMessagesForHistory,
   normalizeState,
   defaultState,
+  sessionIdOf,
+  sanitizeTurnGuardLine,
+  rotateTurnGuardLog,
+  appendTurnGuardLog,
   Mark: MARK,
   Version: VERSION,
+  MaxLogBytes: MAX_LOG_BYTES,
+  LogFilename: LOG_FILENAME,
+  LogArchiveSuffix: LOG_ARCHIVE_SUFFIX,
 }
 
 export default apply
