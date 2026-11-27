@@ -26,8 +26,10 @@ import {
   filterMarkableControls,
   pageCacheKey,
   pickPoint,
+  planChannelFrame,
   planMarks,
   rectArea,
+  resolveChannelSwitch,
   verifyClick,
 } from '../src/cu-uia-core.ts'
 import { parseUiaProbeJson } from '../src/cu-uia-win.ts'
@@ -48,7 +50,7 @@ const RICH = [
 const RICH_OUTCOME = { ok: true, window: WINDOW, controls: RICH, ms: 40 }
 
 const cases = []
-cases.push(['第 ①/② 条：读得出来才启动通道（每页预算 1.5s、≥3 个可点控件、覆盖 ≥1%）', async () => {
+cases.push(['第 ①/② 条：读得出来才启动通道（预算 120ms、≥3 个可点控件、覆盖 ≥1%）', async () => {
   assert.equal(decideControlChannel(RICH_OUTCOME).enabled, true)
   assert.equal(decideControlChannel(RICH_OUTCOME).reason, 'ok', '正常页面必须启动通道')
   const few = { ok: true, window: WINDOW, controls: [control('画布', 'Pane', 0, 0, 1600, 900)], ms: 30 }
@@ -170,14 +172,44 @@ cases.push(['坐标换算与探针解析：窗口相对 → 屏幕绝对；坏�
   assert.deepEqual(parsed.controls[0], { name: '更多', role: 'Button', rect: { x: 1597, y: 110, w: 40, h: 28 }, enabled: true, automationId: 'more' })
   assert.deepEqual(parsed.window.rect, { x: -8, y: -8, w: 1936, h: 1048 })
   assert.equal(parsed.ms, 487)
-  assert.equal(decideControlChannel(parsed).reason, 'few-controls', '这条真实样本只有 2 个控件（截图页），按第 ① 条就是不启动')
-  assert.equal(decideControlChannel({ ok: true, window: WINDOW, controls: RICH, ms: 2000 }).reason, 'too-slow', '超过每页预算（1.5s）才判不启动')
+  assert.equal(decideControlChannel(parsed).reason, 'too-slow', '真机实测 487ms 已超过 120ms 预算 → 整帧退回纯视觉')
+  assert.equal(decideControlChannel({ ok: true, window: WINDOW, controls: RICH, ms: UIA_PROBE_BUDGET_MS }).enabled, true, '恰好 120ms 仍算通过（边界不许含糊）')
+  assert.equal(decideControlChannel({ ok: true, window: WINDOW, controls: RICH, ms: UIA_PROBE_BUDGET_MS + 1 }).reason, 'too-slow', '超过 120ms 一律不启动')
   assert.equal(parseUiaProbeJson('').error, 'empty-output')
   assert.equal(parseUiaProbeJson('not json').error, 'bad-json')
   assert.equal(parseUiaProbeJson('[]').error, 'bad-shape')
   assert.equal(parseUiaProbeJson(JSON.stringify({ ok: false, reason: 'boom', controls: [], frame: [0, 0, 10, 10] })).error, 'boom')
   assert.equal(parseUiaProbeJson(JSON.stringify({ ok: true, frame: [0, 0, 10, 10], controls: [] })).error, 'no-controls')
   assert.ok(UIA_MIN_CONTROLS >= 3)
+}])
+
+cases.push(['一键回退开关：默认关；env=0 关；env=1 才开；文件 false 压过 env=1（安全侧取胜）', async () => {
+  assert.deepEqual(resolveChannelSwitch({}), { enabled: false, reason: 'default-off' }, '什么都不配 = 关（默认关）')
+  assert.deepEqual(resolveChannelSwitch({ env: '0' }), { enabled: false, reason: 'env-off' })
+  assert.deepEqual(resolveChannelSwitch({ env: 'off' }), { enabled: false, reason: 'env-off' })
+  assert.deepEqual(resolveChannelSwitch({ env: '0', fileEnabled: true }), { enabled: false, reason: 'env-off' }, 'env=0 优先于文件 on')
+  assert.deepEqual(resolveChannelSwitch({ env: '1', fileEnabled: false }), { enabled: false, reason: 'conflict-off' }, 'env=1 与文件 false 冲突时取安全侧')
+  assert.deepEqual(resolveChannelSwitch({ env: '1' }), { enabled: true, reason: 'env-on' })
+  assert.deepEqual(resolveChannelSwitch({ fileEnabled: false }), { enabled: false, reason: 'file-off' })
+  assert.deepEqual(resolveChannelSwitch({ fileEnabled: true }), { enabled: true, reason: 'file-on' })
+}])
+cases.push(['关通道 = 改动前行为：帧不复制不编码、提示段返空、点击参数逐字节相同', async () => {
+  const marks = planMarks(RICH, WINDOW.rect)
+  const decision = decideControlChannel(RICH_OUTCOME)
+  const closed = planChannelFrame({ switch: resolveChannelSwitch({ env: '0' }), decision, marks })
+  assert.deepEqual(closed, { useMarks: false, marks: [], hint: '', copyFrame: false }, '关掉时一帧都不许动')
+  const blind = planChannelFrame({ switch: { enabled: true, reason: 'env-on' }, decision: decideControlChannel({ ok: true, window: WINDOW, controls: [], ms: 10 }), marks: [] })
+  assert.deepEqual(blind, { useMarks: false, marks: [], hint: '', copyFrame: false }, '读不出时同样不许动帧')
+  const open = planChannelFrame({ switch: { enabled: true, reason: 'env-on' }, decision, marks })
+  assert.equal(open.useMarks, true)
+  assert.equal(open.copyFrame, true, '只有真要画编号时才复制帧')
+  assert.ok(open.hint.length > 0)
+  const modelPoint = { x: 1476, y: 231 }
+  const snapshot = JSON.stringify(modelPoint)
+  const picked = pickPoint(modelPoint, createActionMemory().recall('p', RICH[1]))
+  assert.deepEqual(picked, { point: { x: 1476, y: 231 }, source: 'model' })
+  verifyClick(marks[0].rect, modelPoint)
+  assert.equal(JSON.stringify(modelPoint), snapshot, '模型坐标不许被任何通道函数改写')
 }])
 
 let failed = 0
