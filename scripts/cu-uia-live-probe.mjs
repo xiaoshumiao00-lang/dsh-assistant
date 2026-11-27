@@ -1,0 +1,72 @@
+﻿/**
+ * 真机探针演练：读一次**当前前台窗口**的控件树，打印真实耗时 / 控件数 / 通道判定 / 候选清单体积。
+ *   node scripts/cu-uia-live-probe.mjs                 # 单次（含进程启动）
+ *   node scripts/cu-uia-live-probe.mjs --repeat 3      # 同进程跑 3 次（看程序集加载后的稳定耗时）
+ *   node scripts/cu-uia-live-probe.mjs --find 更多      # 看某个按钮是否在候选里（读得到 rect 就算命中）
+ *
+ * 只读演练：不点击、不输入、不改任何页面状态；拿不到树就如实打印「读不出」并给出退回原因。
+ */
+import { probeForeground, UIA_PS1_SCRIPT } from '../src/cu-uia-win.ts'
+import { buildControlHintBlock, decideControlChannel, pageCacheKey, planMarks } from '../src/cu-uia-core.ts'
+import { execFile } from 'node:child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+const argv = process.argv.slice(2)
+function argOf(name, fallback) {
+  const index = argv.indexOf(name)
+  if (index === -1) return fallback
+  const next = argv[index + 1]
+  return next === undefined ? fallback : next
+}
+const repeat = Math.max(1, Math.min(10, Number(argOf('--repeat', '1')) || 1))
+const find = String(argOf('--find', '') ?? '').trim()
+
+const stamp = new Date().toISOString()
+
+// 同进程重复：把脚本落盘一次，连跑 N 次（第二次起不再付程序集冷启动）
+const dir = mkdtempSync(join(tmpdir(), 'dsh-cu-uia-live-'))
+const file = join(dir, 'probe.ps1')
+writeFileSync(file, UIA_PS1_SCRIPT, 'utf8')
+const runOnce = (script, args) => new Promise((resolve) => {
+  const started = Date.now()
+  execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, ...args], { timeout: 8000, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (error, out) => {
+    resolve({ stdout: String(out ?? ''), ms: Date.now() - started, error: error === null ? undefined : String(error?.message ?? error) })
+  })
+})
+
+console.log(`时间戳 ${stamp}`)
+const records = []
+for (let i = 0; i < repeat; i += 1) {
+  const outcome = await probeForeground({ run: runOnce })
+  const decision = decideControlChannel(outcome)
+  const marks = decision.enabled ? planMarks(outcome.controls, outcome.window?.rect ?? null) : []
+  const hint = decision.enabled ? buildControlHintBlock(marks) : ''
+  records.push({ i: i + 1, ms: outcome.ms, ok: outcome.ok, error: outcome.error ?? '', controls: outcome.controls.length, enabled: decision.enabled, reason: decision.reason, marks: marks.length, hintChars: hint.length })
+  console.log(`  第 ${i + 1} 次：${outcome.ms} ms，控件 ${outcome.controls.length} 个，ok=${outcome.ok}${outcome.error === undefined ? '' : '，error=' + outcome.error}，通道=${decision.enabled ? '启动' : '不启动(' + decision.reason + ')'}，编号 ${marks.length} 个，清单 ${hint.length} 字符`)
+  if (i === 0) {
+    const win = outcome.window
+    console.log(`  窗口：class=${win?.className ?? ''} rect=${win === null ? '' : `${win.rect.w}x${win.rect.h}@(${win.rect.x},${win.rect.y})`}`)
+    console.log(`  标题：${String(win?.title ?? '').slice(0, 80)}`)
+    console.log(`  页面缓存键：${pageCacheKey(win)}`)
+    if (decision.enabled) {
+      console.log('  前 8 个候选：')
+      for (const line of hint.split('\n').slice(0, 8)) console.log('    ' + line)
+    }
+    if (find !== '') {
+      const hit = outcome.controls.filter((control) => String(control.name ?? '').includes(find))
+      if (hit.length === 0) console.log(`  --find ${find}：控件树里没有（= 只能靠视觉）`)
+      for (const control of hit.slice(0, 5)) {
+        const cx = control.rect.x + Math.round(control.rect.w / 2)
+        const cy = control.rect.y + Math.round(control.rect.h / 2)
+        console.log(`  --find ${find}：命中 ${control.role} "${control.name}" rect=(${control.rect.x},${control.rect.y},${control.rect.w},${control.rect.h}) 中心=(${cx},${cy})`)
+      }
+    }
+  }
+}
+const typical = records.slice(1).length > 0 ? records.slice(1) : records
+const avg = typical.reduce((sum, r) => sum + r.ms, 0) / typical.length
+console.log(`\n结论：探针 ${avg.toFixed(0)} ms/次（${typical.length} 次平均，${records[0].ms} ms 那次含程序集冷启动）；判定 = ${typical[0].enabled ? '启动' : '不启动(' + typical[0].reason + ')'}`)
+if (typical[0].enabled === false) console.log('按第 ① 条硬约束：这一帧整段跳过候选清单与编号框，退回纯视觉（零开销）。')
+try { rmSync(dir, { recursive: true, force: true }) } catch {}
