@@ -593,13 +593,21 @@ export function createSpeechController(factory: SpeechPlayerFactory) {
   const api = {
     getSnapshot(): SpeechState { return state },
     subscribe(listener: () => void): () => void { listeners.add(listener); return () => { listeners.delete(listener) } },
-    /** 请求朗读一条内容（key 换 = 停上一条从头读；同 key 的 toggle 语义见状态机）。 */
+    /**
+     * 请求朗读一条内容（key 换 = 停上一条从头读；同 key 的 toggle 语义见状态机）。
+     *
+     * **同 key 且已在 loading 时必须什么都不做**：状态机对「同 key + loading/playing/paused」
+     * 会原样返回同一个 state 对象，所以「next !== before」就是「这次 request 真的换了一条 /
+     * 从 error 重来」。早先用 `next.status === 'loading'` 判，会把「同 key 仍在 loading」也当成
+     * 要起播，于是同一段文本被第二次 start()（丢掉已排好的首块、整条从头重排）——
+     * 一次朗读被反复起播，正是「有时候」几路声音一起来的一半来源。
+     */
     request(key: string, text: string): void {
       pendingText = text
       const before = state
       const next = reduceSpeech(state, { type: 'play', key })
       setState(next)
-      if (next.key !== before.key || next.status === 'loading') start(key)
+      if (next !== before) start(key)
     },
     /**
      * 单击：暂停/继续；空闲/报错/换 key 时用**调用方传入的文本**起播。

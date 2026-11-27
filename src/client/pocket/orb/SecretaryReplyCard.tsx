@@ -29,12 +29,16 @@ import {
   CARD_KIND_ASSISTANT, CARD_KIND_NOTICE, CARD_KIND_USER, FOLD_BODY_LINE_BUDGET, FOLD_BLOCK_GAP, FOLD_TITLE_LINE_BUDGET, FOLD_FALLBACK_LINE_HEIGHT_PX, cardFoldStyle,
   type AttachRef, type FoldBlockBox, type FoldGeometryOut, type SecretaryQuoteAttachment,
 } from './secretary-cards.ts'
-import { secretarySpeech } from './secretary-speech.ts'
+import { requestAutoReadOnce } from './secretary-speech.ts'
 import { SecretarySpeakButton } from './SecretarySpeakButton.tsx'
 import { CollapsedSecretaryCard, useSecretaryCardWindow } from './SecretaryCollapsedCard.tsx'
 import type { OrbApi } from './orb-api.ts'
 
-/** 已经自动朗读过的轮次 key（防止重挂载后反复自动读）。 */
+/**
+ * 已经自动朗读过的轮次 key（防止重挂载后反复自动读）。
+ * 只是本模块的快路径；**唯一权威在 secretary-speech.ts 的全局去重表**（跨模块实例/跨重挂载），
+ * 这里留着是为了同一实例内的重渲染不发无谓的状态广播。
+ */
 const autoReadKeys = new Set<string>()
 
 /** 从宿主 turn 对象里尽量拿轮次结束时间（epoch ms 或 ISO；拿不到回空串，底行就不显示时间）。 */
@@ -571,13 +575,15 @@ export function SecretaryReplyCard({ sessionId, turn, api }: { sessionId?: strin
   const attaches = parseAttachRefs(body)
   const unread = turnNo !== '' && !readState.isRead(key)
 
-  // 自动朗读：只读最末一轮，每轮一次；读过（含被中断）就算这条已读
+  // 自动朗读：只读最末一轮，每轮一次；读过（含被中断）就算这条已读。
+  // 去重是**全局**的（secretary-speech.ts 的 requestAutoReadOnce）：同一份代码被再次求值、
+  // 卡片整棵重挂载，都不会把同一轮再请求一遍 —— 否则第二个控制器会从头再读一遍，两路叠声。
   useEffect(() => {
     if (!isSecretary || turnNo === '' || speechText === '') return
     if (turnNo !== latestReplyTurnNo(document)) return
     if (autoReadKeys.has(key)) return
     autoReadKeys.add(key)
-    secretarySpeech.request(key, speechText)
+    requestAutoReadOnce(id, key, speechText)
     readState.markRead(key)
   }, [isSecretary, turnNo, speechText, key, readState])
 

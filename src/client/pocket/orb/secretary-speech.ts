@@ -122,3 +122,40 @@ function playerFactory(_key: string, text: string): SpeechPlayer {
 
 /** 全局唯一朗读控制器（切卡片停上一条由控制器内部保证）。 */
 export const secretarySpeech = createSpeechController(playerFactory)
+
+/**
+ * 自动朗读去重表也必须跨模块实例：`autoReadKeys` 原来是回复卡模块里的一个 Set，
+ * 页面里模块被再次求值 / 组件整棵重挂载后它就空了，同一轮会被再请求一次（第二个控制器、
+ * 第二个 AudioContext 各读一遍 = 用户听到「同时朗读多个回答」的另一半来源）。
+ * 表挂在 globalThis 上，同一 realm 内谁求值都看到同一份，且带上会话 id：
+ * 换一条秘书会话时轮次号会重号，不能把新会话的第 3 轮当成「已读过的第 3 轮」跳过。
+ */
+const AUTO_READ_KEY = '__dshSecretaryAutoReadKeys'
+const AUTO_READ_CAP = 400
+
+function autoReadSeen(): Set<string> {
+  const root = globalThis as unknown as Record<string, unknown>
+  let seen = root[AUTO_READ_KEY] as Set<string> | undefined
+  if (!(seen instanceof Set)) {
+    seen = new Set<string>()
+    try { root[AUTO_READ_KEY] = seen } catch { /* 只读全局就退回本实例（退化到旧行为，不是硬约束） */ }
+  }
+  return seen
+}
+
+/**
+ * 自动朗读同一条内容全页只请求一次；返回是否真的发起了请求。
+ * `scope` 传会话 id（没有就传空串），`key` 是卡片朗读 key（assistant:turn:N 等）。
+ */
+export function requestAutoReadOnce(scope: string, key: string, text: string): boolean {
+  const id = `${String(scope ?? '')}|${String(key ?? '')}`
+  if (String(key ?? '') === '' || String(text ?? '') === '') return false
+  const seen = autoReadSeen()
+  if (seen.has(id)) return false
+  seen.add(id)
+  if (seen.size > AUTO_READ_CAP) {
+    for (const oldest of seen) { if (seen.size <= AUTO_READ_CAP) break; seen.delete(oldest) }
+  }
+  secretarySpeech.request(key, text)
+  return true
+}

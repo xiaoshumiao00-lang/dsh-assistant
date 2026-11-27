@@ -141,6 +141,7 @@ function ModelSelect(props: {
 
 /**
  * 宿主模型目录（Computer Use 分区用）。
+ */
 function useModelCatalog(): {
   models: { provider: string; model: string; name: string; groupName: string }[]
   fallback?: { provider: string; model: string }

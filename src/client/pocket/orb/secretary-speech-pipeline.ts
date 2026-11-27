@@ -10,11 +10,17 @@
  *     按钮显示「朗读失败（原因）」，不换引擎、不整段重来）；
  *   - 换文本 / 停止 / 重读 = 代数 +1：in-flight 合成请求全部 abort（AbortController），
  *     已排播的音频全部 stop，旧代回调一律作废（不会和新文本叠声）；
+ *   - **跨实例硬约束（secretary-speech-flight.ts）**：真正决定「有没有声音」的是共享
+ *     AudioContext 时间轴上已经 start(when) 的源，而代数只在**本条流水线**内有效。
+ *     所以起播时还要在全局 flight 令牌表上 `begin()`（同步掐掉所有旧代登记的源，含已排播
+ *     未响的块），排播每一块之前再校验令牌是否仍是当下最新 —— 过期即丢。于是哪怕页面上
+ *     存在第二条流水线 / 第二份模块实例（各持一个 AudioContext），任何时刻最多只有一条在响；
  *   - 块音频按「文本指纹」缓存（speechClipCacheKey），同一句第二次朗读零合成秒播。
  *
  * 浏览器适配（fetch + AudioContext）在 secretary-speech.ts；本文件不 import 它。
  */
 import { splitSpeechChunks, type SpeechChunkOptions } from './secretary-cards.ts'
+import { speechFlightBus, type SpeechFlightBus } from './secretary-speech-flight.ts'
 
 /** 一块合成好的音频。payload 对引擎不透明（浏览器里是 AudioBuffer，单测里是假对象）。 */
 export interface SpeechSynthClip {
@@ -99,6 +105,11 @@ export interface ChunkPipelineOptions extends SpeechChunkOptions {
   retryDelayMs?: number
   /** 块音频缓存（跨实例共享）。 */
   cache?: SpeechClipCache
+  /**
+   * 全局 flight 令牌表（跨流水线/跨模块实例共享，默认取 globalThis 上那一份）。
+   * 单测要隔离世界时注入自己的。
+   */
+  flight?: SpeechFlightBus
   /** 合成追不上播放时回调（index=受影响块；lateSec=比理想时间轴晚多少秒）。 */
   onUnderrun?: (info: { index: number; lateSec: number }) => void
 }
@@ -134,6 +145,8 @@ export function createChunkPipeline(io: SpeechPipelineIo, options: ChunkPipeline
   const leadInSec = options.leadInSec ?? 0.03
   const retryDelayMs = options.retryDelayMs ?? 250
   const cache = options.cache ?? undefined
+  /** 全局唯一 flight 令牌表：默认就是 globalThis 上那一份（跨模块实例共享）。 */
+  const flight: SpeechFlightBus = options.flight ?? speechFlightBus()
 
   let generation = 0
   let endedCb: (() => void) | null = null
@@ -143,8 +156,12 @@ export function createChunkPipeline(io: SpeechPipelineIo, options: ChunkPipeline
 
   interface RunState {
     gen: number
+    /** 本次播放的全局 flight 令牌（跨实例）；过期即丢。 */
+    token: number
     aborts: AbortController[]
     playbacks: SpeechPlayback[]
+    /** 已登记到令牌表的「掐掉这一块」函数；注销用。 */
+    unregisters: Array<() => void>
     results: Array<Promise<SpeechSynthClip> | undefined>
     requestIndex: number
   }
@@ -176,10 +193,18 @@ export function createChunkPipeline(io: SpeechPipelineIo, options: ChunkPipeline
   }
 
   function swallow(state: RunState): void {
+    for (const off of state.unregisters) { try { off() } catch { /* 注销失败不许阻断停机 */ } }
+    state.unregisters.length = 0
     for (const ac of state.aborts) { try { ac.abort() } catch { /* 重复 abort 无害 */ } }
     for (const pb of state.playbacks) { try { pb.stop() } catch { /* stop 已播完的源会抛，忽略 */ } }
     for (const p of state.results) { p?.catch(() => { /* in-flight 拒绝全部吞掉 */ }) }
   }
+
+  /**
+   * 这一代还能不能往时间轴上排东西：本流水线的代数仍是最新（stop/restart 没发生）
+   * **且**全局 flight 令牌仍是最新（没有别处起播）。两条缺一条就可能把旧朗读的块排上去。
+   */
+  const alive = (state: RunState): boolean => state.gen === generation && flight.isCurrent(state.token)
 
   async function run(state: RunState, chunks: string[], firstResolve: () => void, firstReject: (error: Error) => void): Promise<void> {
     let scheduleEnd = 0
@@ -198,13 +223,18 @@ export function createChunkPipeline(io: SpeechPipelineIo, options: ChunkPipeline
         // 预取窗口：保持 requestIndex 领先播放位 index 最多 prefetch 块
         while (state.requestIndex < chunks.length && state.requestIndex - index < prefetch) requestOne(state.requestIndex)
         const clip = await state.results[index]!
-        if (state.gen !== generation) return
+        if (!alive(state)) return
         const startAt = Math.max(io.now() + leadInSec, scheduleEnd)
         if (firstScheduled && startAt > scheduleEnd + 0.005) {
           stats.underruns += 1
           try { options.onUnderrun?.({ index, lateSec: startAt - scheduleEnd }) } catch { /* 统计回调不许炸 */ }
         }
+        // 合成回来再判一次令牌：等合成这段时间里别处可能已经起播（旧代现在排上去就是叠声）
+        if (!alive(state)) return
         const playback = io.schedule(clip, startAt)
+        // 立刻把「怎么掐掉这一块」登记进全局令牌表：任何新一代 begin() 都能掐掉它；
+        // 令牌已过期时 register 会当场把它掐掉并拒绝登记，所以过期即丢、不留漏网的声音
+        state.unregisters.push(flight.register(() => { try { playback.stop() } catch { /* 已停过 */ } }, state.token))
         playback.finished.catch(() => { /* stop() 后 finished 不兑现；兜底防未处理拒绝 */ })
         state.playbacks.push(playback)
         scheduleEnd = startAt + Math.max(0, clip.durationSec)
@@ -218,7 +248,7 @@ export function createChunkPipeline(io: SpeechPipelineIo, options: ChunkPipeline
       }
       if (lastPlayback !== null) {
         void lastPlayback.finished.then(() => {
-          if (state.gen === generation) { try { endedCb?.() } catch { /* ignore */ } }
+          if (alive(state)) { try { endedCb?.() } catch { /* ignore */ } }
         })
       } else {
         try { endedCb?.() } catch { /* ignore */ }
@@ -236,7 +266,10 @@ export function createChunkPipeline(io: SpeechPipelineIo, options: ChunkPipeline
     generation += 1
     const gen = generation
     if (current !== null) swallow(current)
-    const state: RunState = { gen, aborts: [], playbacks: [], results: [], requestIndex: 0 }
+    // 起播的同一瞬间吊销上一代全局令牌：旧朗读的源（含已排播未响的块、别的流水线/别的
+    // 模块实例排上去的块）在这一行里全部同步 stop —— 先掐后播，任何时刻最多一条在出声
+    const token = flight.begin()
+    const state: RunState = { gen, token, aborts: [], playbacks: [], unregisters: [], results: [], requestIndex: 0 }
     current = state
     try { io.resume?.() } catch { /* 解锁音频失败不阻断（自动朗读场景无手势） */ }
     const chunks = splitSpeechChunks(text, options)
@@ -252,7 +285,15 @@ export function createChunkPipeline(io: SpeechPipelineIo, options: ChunkPipeline
     restart(): void { void play() },
     stop(): void {
       generation += 1
-      if (current !== null) { swallow(current); current = null }
+      if (current !== null) {
+        const state = current
+        swallow(state)
+        current = null
+        // 双重保底：令牌表上这一代还挂着的取消器（含别处替它登记的）也一并吊销
+        flight.cancel(state.token)
+      }
+      // current === null = 这条流水线从没起播（play() 才会 begin）或已经停过：
+      // 它名下没有排在时间轴上的源，这里**不做**全局吊销，免得误停别的流水线正在播的朗读。
     },
     onEnded(cb: () => void): void { endedCb = cb },
     onPlaying(cb: () => void): void { playingCb = cb },
