@@ -22,8 +22,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import type { ChannelDecision, ChannelSwitch, UiaControl, UiaMark, UiaRect } from './cu-uia-core.ts'
-import { createPageCache, decideControlChannel, pageCacheKey, planChannelFrame, planMarks, resolveChannelSwitch } from './cu-uia-core.ts'
-import { createUiaSidecar } from './cu-uia-sidecar.ts'
+import { pageCacheKey, planChannelFrame, planMarks } from './cu-uia-core.ts'
 import { OverlayUnsupportedError, overlayPng } from './cu-uia-overlay.ts'
 
 /** 编号图落盘目录（系统临时目录下，可随时清）。 */
@@ -149,9 +148,7 @@ export function installCuObservationWrapper(ctx: any, opts: {
   tools?: readonly string[]
 } = {}): () => void {
   const tools = new Set(Array.from(opts.tools ?? ['computer_use', 'screenshot']))
-  const readSwitch = typeof opts.readSwitch === 'function' ? opts.readSwitch : () => readCuUiaSwitch(ctx)
-  const fallbackProbe = createObservationProbe()
-  const probeFn = typeof opts.probe === 'function' ? opts.probe : () => fallbackProbe.sample()
+  const readSwitch = typeof opts.readSwitch === 'function' ? opts.readSwitch : () => ({ enabled: false, reason: 'default-off' } as ChannelSwitch)
   if (typeof ctx?.on !== 'function') return () => void 0
   const handler = async (exec: any, next: () => Promise<any>): Promise<any> => {
     const result = await next()
@@ -160,7 +157,8 @@ export function installCuObservationWrapper(ctx: any, opts: {
     try {
       const sw = readSwitch()
       if (sw.enabled !== true) return result
-      const sample = await probeFn()
+      if (typeof opts.probe !== 'function') return result
+      const sample = await opts.probe()
       const value = result?.value !== undefined ? result.value : result
       if (value === null || typeof value !== 'object') return result
       const swapped = overlayObservationValue(value, { switch: sw, decision: sample.decision, controls: sample.controls, windowRect: sample.windowRect })
@@ -191,72 +189,4 @@ export function sampleObservation(input: {
       cacheKey: pageCacheKey(outcome.window as any),
     }
   })
-}
-
-/** profile 目录（与 src/coordinate-mode.ts 同款取法，拿不到就退 DSH_HOME / cwd）。 */
-export function profileDirOf(ctx: any): string {
-  try {
-    const p = ctx?.get?.('profileContext')
-    if (p && typeof p.dir === 'string' && p.dir) return p.dir
-  } catch {}
-  try {
-    const h = ctx?.get?.('homePaths')
-    if (h && typeof h.home === 'string' && h.home) return h.home
-  } catch {}
-  return process.env.DSH_HOME || process.cwd()
-}
-
-/** 开关文件名（profile 目录下；`{"enabled": false}` 或缺省都算关）。 */
-export const UIA_SWITCH_FILE = 'dsh-assistant-cu-uia.json'
-
-/** 读 profile 文件里的 enabled；文件不存在 / 读不了 / 不是布尔 → undefined（交给缺省关）。 */
-export function readCuUiaFileEnabled(ctx: any): boolean | undefined {
-  try {
-    const raw = readFileSync(join(profileDirOf(ctx), UIA_SWITCH_FILE), 'utf8')
-    const parsed = JSON.parse(raw)
-    return typeof parsed?.enabled === 'boolean' ? parsed.enabled : undefined
-  } catch {
-    return undefined
-  }
-}
-
-/**
- * 一键回退的总开关读取口（接线方唯一入口）：
- * `DSH_CU_UIA=0` 优先 → profile 文件 enabled=false 优先于 =true → 什么都没有就关。
- */
-export function readCuUiaSwitch(ctx: any): ChannelSwitch {
-  return resolveChannelSwitch({ env: process.env.DSH_CU_UIA, fileEnabled: readCuUiaFileEnabled(ctx) })
-}
-
-export type ObservationSample = { decision: ChannelDecision; controls: UiaControl[]; windowRect: UiaRect | null; cacheKey: string }
-
-/**
- * 默认探针：懒起 sidecar（42–49ms/页）+ 页面缓存（同页 TTL 内不重探）。
- * 任何异常都回「通道不启动」，绝不把异常抛给 CU 调用链。
- */
-export function createObservationProbe(opts: { ttlMs?: number } = {}) {
-  let sidecar: ReturnType<typeof createUiaSidecar> | null = null
-  const cache = createPageCache({ ttlMs: Number(opts.ttlMs ?? 30_000), maxPages: 8 })
-  return {
-    async sample(): Promise<ObservationSample> {
-      try {
-        if (sidecar === null) sidecar = createUiaSidecar()
-        const outcome = await sidecar.probe(200)
-        const decision = decideControlChannel(outcome)
-        const windowRect = outcome.window === null ? null : outcome.window.rect
-        if (!decision.enabled) return { decision, controls: [], windowRect, cacheKey: '' }
-        const key = pageCacheKey(outcome.window)
-        const cached = cache.get(key)
-        if (cached !== null) return { decision, controls: cached, windowRect, cacheKey: key }
-        cache.set(key, outcome.controls)
-        return { decision, controls: outcome.controls, windowRect, cacheKey: key }
-      } catch {
-        return { decision: { enabled: false, reason: 'error' }, controls: [], windowRect: null, cacheKey: '' }
-      }
-    },
-    close(): void {
-      try { sidecar?.close() } catch {}
-      sidecar = null
-    },
-  }
 }

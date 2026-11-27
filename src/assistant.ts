@@ -60,7 +60,6 @@ import { secretCardSharedTestSurface as cardSharedSurface } from './secretary-ca
 export { cardSharedSurface as secretCardSharedTestSurface }
 export { assistantDispatchTestSurface } from './assistant-dispatch'
 export { assistantCuWatchTestSurface } from './assistant-cu-watch'
-import { installCuObservationWrapper } from './cu-uia-observe.ts'
 /** v4 会话日志事务化改写：宿主真实解析器 dry-run + 写入后回读 + 失败回滚 */
 export {
   loadHostLogParser,
@@ -278,8 +277,6 @@ export function apply(ctx: any, config: any = {}): () => void {
   registerPiece('assistant dispatch', () => registerAssistantDispatch(ctx))
   // CU 会话完成 → 秘书会话收可点跳的卡片消息
   registerPiece('assistant cu watch', () => registerAssistantCuWatch(ctx))
-  // Computer Use 观察帧编号框（插件侧 around-dispatch，走 tools/execute；默认关，见 docs/computer-use-提速前后对比-2026-11-27.md §11）
-  registerPiece('computer use observation', () => installCuObservationWrapper(ctx))
   // 主动服务卡片：卡组存储 + 路由 + proactive_card 工具
   registerPiece('assistant proactive', () => registerAssistantProactive(ctx))
   // 秘书卡片朗读：POST /api/assistant/tts
