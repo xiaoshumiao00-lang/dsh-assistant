@@ -1553,10 +1553,146 @@ export function collapsedCardTitle(domText: string, hostTitle = ''): string {
   return truncateCardTitle(domText)
 }
 
-/** 上滚后保持原滚动位置不跳：新渲染把更旧的内容插到顶部，就要把 scrollTop 补回增量。 */
+/**
+ * 旧的「按 scrollHeight 差值整体补偿」公式（2026-11-27 起被 planHistoryScrollRestore 取代，留作旧测试口径）：
+ * 它假设加载期间所有高度增长都发生在阅读位置**上方**；实际上 expandOlder 把折叠行翻成完整卡的位置
+ * （窗口边界）在用户阅读位置**下方**，整体补偿会把视图往下拽几千 px——这就是「加载完跳回最新」的根因。
+ */
 export function scrollAnchorTopPatch(beforeScrollHeight: number, afterScrollHeight: number): number {
   const delta = Math.round(Number(afterScrollHeight) - Number(beforeScrollHeight))
   return delta > 0 ? delta : 0
+}
+
+/* ───────── 加载更早消息时的阅读位置锚点（2026-11-27 「跳回最新」根因修复） ─────────
+ *
+ * 几何事实（手机实测 bug 的机理）：
+ *   - 列表从上到下 = 折叠行（更旧的卡，一行一条）→ 完整卡窗口（最近 windowSize 张）→ 最新；
+ *   - 用户上滚到顶部阈值（240px）时，眼睛落在**折叠行区**；expandOlder 把窗口边界处的
+ *     pageSize 张折叠行翻成完整卡——增长发生在阅读位置**下方**，阅读位置本身一像素都没动；
+ *   - 旧公式 scrollTop += (新 scrollHeight − 旧 scrollHeight) 把这份下方增长全加到滚动位置上，
+ *     视图被拽向最新；落点若距底 < 25px，宿主 follow 采样（use-scroll-follow 的 nearBottom）
+ *     还会把 followingTail 重新置真，之后每次内容增长都钉回底部——用户看到「跳回最新消息」。
+ *
+ * 修法（锚点口径，三条）：
+ *   ① 加载前记下「第一个可见卡行」为锚点行（key + 它相对滚动口顶部的屏幕偏移）；
+ *   ② 加载后重测同一 key 的行：锚点内容坐标位移 = (after.anchorOffset + after.scrollTop)
+ *      − (before.anchorOffset + before.scrollTop)，只补偿这个位移——增长在锚点下方时位移为 0，
+ *      一个像素都不写；增长在上方（宿主 prepend、「正在加载」提示插删、提示行插删）时精确补偿；
+ *      等待期间用户自己上滚也不会被拽回（用户滚动同时改变 scrollTop 与锚点偏移，位移公式天然抵消）；
+ *   ③ 只有加载前本来就距底 < HISTORY_FOLLOW_BOTTOM_PX 时才跟随最新（钉到底部）。
+ */
+
+/** 距底多少 px 以内算「本来就在底部附近」：只有这种情况加载更早后才跟随最新。 */
+export const HISTORY_FOLLOW_BOTTOM_PX = 80
+
+/** 滚动位置快照：scrollTop/scrollHeight/clientHeight + 锚点行（key 与屏幕偏移）。 */
+export interface HistoryScrollSnapshot {
+  scrollTop: number
+  scrollHeight: number
+  clientHeight: number
+  /** 锚点行的 data-dsh-scard-key；没有可用锚点行时为 null。 */
+  anchorKey: string | null
+  /** 锚点行顶部相对滚动口顶部的偏移（px，可负）；没有锚点时为 null。 */
+  anchorOffset: number | null
+}
+
+export interface HistoryScrollPlan {
+  /** 要写入的 scrollTop；null = 一个像素都不许动（保持现状）。 */
+  scrollTop: number | null
+  reason: 'follow-tail' | 'anchor' | 'keep'
+  /** 本次采用的补偿量（无手势 = 锚点屏幕偏移变化；有手势 = 锚点内容坐标位移）。 */
+  delta: number
+}
+
+/**
+ * 加载更早消息后的滚动恢复计划（纯函数，离线单测直接喂数值模型）。决策树：
+ *   ① 跟随最新：加载前贴底（距底 < 80px）且加载后仍贴底（允许地板被 prepend 等推高带来的等量
+ *      下移；用户向上滚走了就不钉）→ 钉到 after 的底；
+ *   ② 有锚点行（before/after 同 key 且偏移可测）：
+ *      - 等待期间**没有**用户手势 → 「屏幕偏移复原」：只补锚点屏幕偏移的变化量。
+ *        宿主自己的 prepend 补偿（finishHistoryPrepend / overflow-anchor）已经把锚点屏幕位置
+ *        保持住了（偏移变化 = 0）→ keep，绝不重复补偿；没人补偿过的上方增长（翻卡跨锚点、
+ *        「正在加载」控件变高、提示行插删）→ 偏移变了多少就补多少；
+ *      - 等待期间**有**用户手势 → 「内容坐标位移」：只补锚点内容坐标的位移（= 锚点上方净增长），
+ *        用户自己的滚动分量天然抵消，绝不把用户拽回加载前的位置；
+ *   ③ 锚点丢了（宿主整棵重画）→ keep，一个像素都不写（瞎补比不补更糟）。
+ */
+export function planHistoryScrollRestore(
+  before: HistoryScrollSnapshot,
+  after: HistoryScrollSnapshot,
+  options: { userGestured?: boolean } = {},
+): HistoryScrollPlan {
+  const userGestured = options.userGestured === true
+  const beforeFloor = Math.max(0, Number(before.scrollHeight) - Number(before.clientHeight))
+  const afterFloor = Math.max(0, Number(after.scrollHeight) - Number(after.clientHeight))
+  const beforeBottomGap = beforeFloor - Number(before.scrollTop)
+  const afterBottomGap = afterFloor - Number(after.scrollTop)
+  const floorGrowth = Math.max(0, afterFloor - beforeFloor)
+  // floorGrowth > 0.5：内容真的长了才谈「跟随」；零增长（加载失败/空页）不把贴底用户再往地板上拽
+  if (floorGrowth > 0.5 && beforeBottomGap < HISTORY_FOLLOW_BOTTOM_PX && afterBottomGap <= beforeBottomGap + floorGrowth + 1) {
+    return { scrollTop: Math.round(afterFloor), reason: 'follow-tail', delta: 0 }
+  }
+  if (before.anchorKey !== null && before.anchorOffset !== null
+    && after.anchorKey === before.anchorKey && after.anchorOffset !== null) {
+    const delta = userGestured
+      ? (Number(after.anchorOffset) + Number(after.scrollTop)) - (Number(before.anchorOffset) + Number(before.scrollTop))
+      : Number(after.anchorOffset) - Number(before.anchorOffset)
+    const target = Math.max(0, Math.round(Number(after.scrollTop) + delta))
+    if (Math.abs(target - Number(after.scrollTop)) <= 0.5) return { scrollTop: null, reason: 'keep', delta }
+    return { scrollTop: target, reason: 'anchor', delta }
+  }
+  return { scrollTop: null, reason: 'keep', delta: 0 }
+}
+
+/** 卡行矩形（pickHistoryAnchorKey 的输入；DOM 侧由 captureHistoryScrollSnapshot 量好喂进来）。 */
+export interface HistoryScrollRowRect {
+  key: string
+  top: number
+  bottom: number
+  height: number
+}
+
+/**
+ * 锚点行 = 文档顺序里第一个「底部越过滚动口顶部」的卡行（用户正在看的那一行）；
+ * 零高度行（还没长出来的）跳过；一行都没有 → null。
+ */
+export function pickHistoryAnchorKey(rows: readonly HistoryScrollRowRect[], scrollerTop: number): string | null {
+  const top = Number(scrollerTop) || 0
+  for (const row of rows) {
+    if (Number(row?.height) > 0 && Number(row?.bottom) > top + 1) return String(row?.key ?? '') || null
+  }
+  return null
+}
+
+/** 卡行选择器：完整卡与折叠行都算（锚点行翻卡后 key 不变，还能找到）。 */
+export const HISTORY_CARD_ROW_SELECTOR = '[data-dsh-scard="card"], [data-dsh-scard="collapsed-row"]'
+
+/**
+ * DOM 侧快照（组件与离线假 DOM 共用）：量滚动口与所有卡行矩形，定锚点行。
+ * anchorKey 给了就按 key 找回同一行（找不到 → anchorOffset=null → 计划层 keep）。
+ */
+export function captureHistoryScrollSnapshot(scroller: any, anchorKey: string | null = null): HistoryScrollSnapshot {
+  const scrollerTop = Number(scroller?.getBoundingClientRect?.().top) || 0
+  const rows: HistoryScrollRowRect[] = []
+  const list = scroller?.querySelectorAll?.(HISTORY_CARD_ROW_SELECTOR) ?? []
+  for (const row of Array.from(list as ArrayLike<any>)) {
+    const rect = row?.getBoundingClientRect?.() ?? { top: 0, bottom: 0, height: 0 }
+    rows.push({
+      key: String(row?.getAttribute?.('data-dsh-scard-key') ?? ''),
+      top: Number(rect.top) || 0,
+      bottom: Number(rect.bottom) || 0,
+      height: Number(rect.height) || 0,
+    })
+  }
+  const key = anchorKey ?? pickHistoryAnchorKey(rows, scrollerTop)
+  const anchor = key === null ? null : rows.find((row) => row.key === key) ?? null
+  return {
+    scrollTop: Number(scroller?.scrollTop) || 0,
+    scrollHeight: Number(scroller?.scrollHeight) || 0,
+    clientHeight: Number(scroller?.clientHeight) || 0,
+    anchorKey: key,
+    anchorOffset: anchor === null ? null : anchor.top - scrollerTop,
+  }
 }
 
 export function createSecretaryPager(deps: SecretaryPagerDeps = {}): SecretaryPagerStore {
@@ -2832,6 +2968,11 @@ export const secretaryCardsTestSurface = {
   secretaryPager,
   collapsedCardTitle,
   scrollAnchorTopPatch,
+  HISTORY_FOLLOW_BOTTOM_PX,
+  planHistoryScrollRestore,
+  pickHistoryAnchorKey,
+  captureHistoryScrollSnapshot,
+  HISTORY_CARD_ROW_SELECTOR,
   CARD_WINDOW_DEFAULT,
   CARD_PAGE_SIZE,
   CARD_RENDER_CAP,

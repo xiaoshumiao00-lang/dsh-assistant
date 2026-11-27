@@ -38,7 +38,7 @@ import {
   latestRealUserCardRef, noticeArrivalStore, noticeCardExpired, noticeCardSpeechKey, nearestNoticeExpiryMs, NOTICE_CARD_TTL_MS,
   parseNoticeCardBody, parseSessionRefs, parseUserCardBody, secretaryPager,
   secretaryQuoteStore, stripSessionRefs, tagSecretaryCompactHintRows, clearLatestTurnProcessTags, tagLatestTurnProcessRows, userCardSpeechKey, EARLIER_HINT_TEXT, SCROLL_TOP_THRESHOLD_PX,
-  scrollAnchorTopPatch, shouldExpandOnScroll,
+  captureHistoryScrollSnapshot, planHistoryScrollRestore, shouldExpandOnScroll,
   type PagerDomCard, type SecretaryCardRow, type UserCardAttachment, type UserCardBodyBlock,
 } from './secretary-cards.ts'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
@@ -386,7 +386,8 @@ export function syncEarlierHint(doc: Document, visible: boolean): void {
  * 分页（第四批需求 A）：这一层是唯一持有分页 store 的地方——
  *   - 每次扫描把页面上已有的卡（完整卡 + 折叠行）按 document 顺序送进 pager；
  *   - 进页面/刷新/恢复选择只取最近一段（ensureWindow），绝不自动回填老卡；
- *   - 只有滚动到达顶部阈值才 expandOlder 取下一段，取回后用 scroll-anchoring 补回 scrollTop，位置不跳；
+ *   - 只有滚动到达顶部阈值才 expandOlder 取下一段，取回后按「第一个可见卡行」锚点补偿 scrollTop，
+ *     增长在阅读位置下方时一像素都不动（2026-11-27 根因修复，口径在 planHistoryScrollRestore）；
  *   - 到 CARD_RENDER_CAP 就停，并把「更早的内容请到轨迹/搜索里看」插在渲染区前面。
  */
 export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
@@ -491,14 +492,27 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
         alreadyExpanding: expandingRef.current,
       })) return
       expandingRef.current = true
-      const beforeTop = el.scrollTop
-      const beforeHeight = el.scrollHeight
+      // 2026-11-27「加载完跳回最新」根因修复：不再按 scrollHeight 差值整体补偿（旧公式假设增长全在
+      // 阅读位置上方；实际折叠行→完整卡的翻转发生在窗口边界、阅读位置下方，整体补偿会把视图拽向最新）。
+      // 改成锚点口径（planHistoryScrollRestore）：无手势时只复原锚点屏幕偏移（宿主已补偿的 prepend 不重复补），
+      // 有手势时只补偿锚点内容坐标位移（用户自己的滚动不拽回）；只有加载前后都贴底（< 80px）才跟随最新。
+      const before = captureHistoryScrollSnapshot(el)
+      let userGestured = false
+      const noteGesture = (): void => { userGestured = true }
+      const gestureEvents = ['touchstart', 'touchmove', 'wheel', 'pointerdown', 'keydown'] as const
+      const gestureOptions = { passive: true, capture: true } as const
+      for (const type of gestureEvents) el.addEventListener(type, noteGesture, gestureOptions)
+      const clearGestureWatch = (): void => {
+        for (const type of gestureEvents) el.removeEventListener(type, noteGesture, gestureOptions)
+      }
       void Promise.resolve(pager.expandOlder()).then(async () => {
         await settleScrollHeight(el)
-        const delta = scrollAnchorTopPatch(beforeHeight, el.scrollHeight)
-        if (delta > 0) el.scrollTop = beforeTop + delta
+        const after = captureHistoryScrollSnapshot(el, before.anchorKey)
+        const plan = planHistoryScrollRestore(before, after, { userGestured })
+        if (plan.scrollTop !== null && Math.abs(plan.scrollTop - el.scrollTop) > 0.5) el.scrollTop = plan.scrollTop
+        clearGestureWatch()
         expandingRef.current = false
-      }, () => { expandingRef.current = false })
+      }, () => { clearGestureWatch(); expandingRef.current = false })
     }
     const attach = (): void => {
       const el = findConversationScrollHost(document)
