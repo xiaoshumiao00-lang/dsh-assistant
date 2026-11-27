@@ -432,6 +432,25 @@ export function attachFileUrl(path: string): string {
   return `/api/worktable/file?path=${encodeURIComponent(String(path ?? ''))}`
 }
 
+/**
+ * 安卓端图片点击专用的「下载意图」地址（2026-11-27 需求）：同一条只读路由追加 download=1，
+ * 宿主据此把 content-disposition 强制成 attachment，WebView 的 DownloadListener 就会把它交给
+ * 系统下载器（带 cookie 的那条原生链路，与文件附件完全同一条），页面原地不动。
+ * 不加这个参数时宿主对图片回 inline，WebView 会同页导航去渲染图片，把卡片页整个刷掉。
+ */
+export function attachDownloadUrl(path: string): string {
+  return `${attachFileUrl(path)}&download=1`
+}
+
+/**
+ * 图片点击要不要改走系统下载器：只看 UA 里有没有 Android。
+ * APK 的 WebView（`…; wv) …`）与安卓上的手机浏览器都命中——与文件附件「一律下载」的口径一致；
+ * 桌面/其余浏览器一律 false，保持原来的新标签页内联看图，别把桌面改坏。
+ */
+export function attachOpenViaDownload(userAgent: string): boolean {
+  return /\bAndroid\b/i.test(String(userAgent ?? ''))
+}
+
 /** 字节数 → 文件条上那行大小（拿不到大小就不显示，绝不写 0 B）。 */
 export function formatFileSize(bytes: number): string {
   const value = Number(bytes)
@@ -2690,6 +2709,8 @@ export const secretaryCardsTestSurface = {
   isAttachImage,
   attachTypeBadge,
   attachFileUrl,
+  attachDownloadUrl,
+  attachOpenViaDownload,
   formatFileSize,
   splitSpeechChunks,
   SPEECH_CHUNK_MIN_CHARS,

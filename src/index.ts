@@ -436,10 +436,13 @@ export function createLocalFileHandler(deps: {
         return
       }
       const ext = (abs.split('.').pop() || '').toLowerCase()
+      // download=1（2026-11-27）：客户端显式标明「这次要下载」——安卓 APK 点图片走的就是这条路：
+      // 强制 attachment，WebView 的 DownloadListener 才会把它交给系统下载器，而不是同页导航刷掉卡片页。
+      const forceAttachment = u.searchParams.get('download') === '1'
       const headers = {
         'content-type': FILE_TYPES[ext] ?? 'application/octet-stream',
         'content-length': String(stat.size),
-        'content-disposition': contentDispositionHeaderFor(abs),
+        'content-disposition': contentDispositionHeaderFor(abs, { forceAttachment }),
         'cache-control': 'no-store',
       }
       // 只要响应头（卡片上的附件条问大小）：不读文件正文
@@ -524,6 +527,8 @@ export function apply(ctx: Context) {
   //   - docx / xlsx / pptx / zip 等其余 → attachment + 文件名（RFC 5987 带中文名），
   //     手机浏览器这才下载文件、下载完弹系统的「用哪个应用打开」；
   //   - 顺带给 content-length 并支持 HEAD：卡片上的文件条只问大小，不必把整份文件读回来。
+  // 2026-11-27 需求（点图片别再刷新页面）：路由认 download=1 参数，显式下载意图一律 attachment，
+  //   安卓端图片点击由此进入与文件相同的系统下载链路（下载完成由 MainActivity 拉起看图应用）。
   // 2026-11-26 需求（上限 20MB → 100MB）：常量化 + 改流式发送，处理器见 createLocalFileHandler。
   // 边界（denyOutside 目录 allowlist）一个字没动。
   webServer.register({

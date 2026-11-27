@@ -24,7 +24,7 @@ import { peekSecretarySessionId } from '../../assistant-entry.ts'
 import {
   answerInlineTokens, assistantCardSpeechKey, collectTurnText, foldClipFromBlocks, foldCollapsedCapPx, formatClock, latestReplyTurnNo, parseAnswerBody,
   parseSessionRefs, stripSessionRefs, normalizeForSpeech, secretaryReadStore, secretaryQuoteStore, QUOTE_PREVIEW_MAX_CHARS,
-  parseAttachRefs, stripAttachRefs, isAttachImage, attachFileUrl, attachTypeBadge, formatFileSize,
+  parseAttachRefs, stripAttachRefs, isAttachImage, attachFileUrl, attachDownloadUrl, attachOpenViaDownload, attachTypeBadge, formatFileSize,
   CARD_KIND_ASSISTANT, CARD_KIND_NOTICE, CARD_KIND_USER, FOLD_BODY_LINE_BUDGET, FOLD_BLOCK_GAP, FOLD_TITLE_LINE_BUDGET, FOLD_FALLBACK_LINE_HEIGHT_PX, cardFoldStyle,
   type AttachRef, type FoldBlockBox, type FoldGeometryOut, type SecretaryQuoteAttachment,
 } from './secretary-cards.ts'
@@ -445,6 +445,26 @@ function openAttachFile(event: any, url: string): void {
 }
 
 /**
+ * 点开图片附件（2026-11-27 需求「点图片别再刷新页面，像下载文件一样落盘再用图库看」）。
+ *
+ * 真机 bug 的根因：图片与文件原来都走 openAttachFile → window.open(url, '_blank')，而 APK 的
+ * WebView setSupportMultipleWindows(false)，于是变成**同页导航**到 /api/worktable/file；
+ * 服务端对图片回 inline（file-disposition.ts 的 INLINE_FILE_EXTENSIONS），WebView 直接在当前页
+ * 渲染图片，卡片页被整个刷掉（用户看到的就是「APK 重新刷新、重新进」）。文件不踩这个坑是因为
+ * 服务端对 docx 等回 attachment，WebView 渲染不了，才回调 DownloadListener 走原生下载。
+ *
+ * 修法（与文件同一条原生下载链路，不新造桥）：安卓端（UA 带 Android，含 APK 的 WebView）
+ * 图片点击改用 attachDownloadUrl——同一条只读路由加 download=1，宿主强制回 attachment，
+ * WebView 的 DownloadListener 把它交给系统 DownloadManager（带 cookie，MainActivity.startDownload），
+ * 下载完成由 MainActivity 用系统看图应用 ACTION_VIEW 打开；页面全程不动。
+ * 桌面/其余浏览器 attachOpenViaDownload 为 false，保持原来的 window.open 内联看图。
+ */
+function openAttachImage(event: any, path: string, url: string): void {
+  const ua = String((globalThis as any).navigator?.userAgent ?? '')
+  openAttachFile(event, attachOpenViaDownload(ua) ? attachDownloadUrl(path) : url)
+}
+
+/**
  * 附件区里的一件附件（2026-11-26 需求）：
  *   - 图片扩展名（png/jpg/jpeg/gif/webp/bmp/svg）→ 内联缩略图（lazy、圆角、最大高 180px、超出裁剪）；
  *   - 其余（docx/xlsx/pptx/zip/pdf…）→ 行式文件条：类型角标 + 显示名 + 拿得到的大小。
@@ -466,7 +486,7 @@ export function ReplyAttachmentPiece({ attachment }: { attachment: AttachRef }):
         data-dsh-scard="attach-image"
         title={`打开图片：${attachment.name}`}
         aria-label={`打开图片：${attachment.name}`}
-        onClick={(event: any) => openAttachFile(event, url)}
+        onClick={(event: any) => openAttachImage(event, attachment.path, url)}
       >
         <img
           data-dsh-scard="attach-thumb"

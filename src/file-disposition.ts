@@ -30,8 +30,13 @@ export function fileExtensionOf(nameOrPath: string): string {
   return ext.startsWith('.') ? ext.slice(1).toLowerCase() : ext.toLowerCase()
 }
 
-/** 该扩展名用 inline 还是 attachment（纯函数，单测直接验）。 */
-export function fileDispositionType(ext: string): 'inline' | 'attachment' {
+/**
+ * 该扩展名用 inline 还是 attachment（纯函数，单测直接验）。
+ * forceAttachment（2026-11-27）：调用方显式要求下载（路由的 download=1 参数）时一律 attachment——
+ * 安卓 APK 点图片要走系统下载器，inline 会让 WebView 同页导航把卡片页刷掉。
+ */
+export function fileDispositionType(ext: string, forceAttachment?: boolean): 'inline' | 'attachment' {
+  if (forceAttachment === true) return 'attachment'
   return INLINE_FILE_EXTENSION_SET.has(String(ext ?? '').trim().toLowerCase()) ? 'inline' : 'attachment'
 }
 
@@ -45,17 +50,17 @@ function encodeRfc5987(value: string): string {
  *   `attachment; filename="report_2026.docx"; filename*=UTF-8''report_2026.docx`
  * type 缺省时按扩展名判；filename 取 basename（不带目录，避免任何注入面）。
  */
-export function contentDispositionValue(nameOrPath: string, ext?: string): string {
+export function contentDispositionValue(nameOrPath: string, ext?: string, opts?: { forceAttachment?: boolean }): string {
   const full = String(nameOrPath ?? '').trim()
   const name = basename(full) === '' ? 'file' : basename(full)
-  const type = fileDispositionType(ext ?? fileExtensionOf(name))
+  const type = fileDispositionType(ext ?? fileExtensionOf(name), opts?.forceAttachment)
   const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_') || 'file'
   return `${type}; filename="${ascii}"; filename*=UTF-8''${encodeRfc5987(name)}`
 }
 
-/** 路由里直接用的响应头值（按绝对路径判类型）。 */
-export function contentDispositionHeaderFor(absPath: string): string {
-  return contentDispositionValue(absPath, fileExtensionOf(absPath))
+/** 路由里直接用的响应头值（按绝对路径判类型；forceAttachment 来自 download=1 的显式下载意图）。 */
+export function contentDispositionHeaderFor(absPath: string, opts?: { forceAttachment?: boolean }): string {
+  return contentDispositionValue(absPath, fileExtensionOf(absPath), opts)
 }
 
 /** 供 scripts/test-*.mjs 离线验的纯函数出口（不碰文件系统、不碰 http）。 */

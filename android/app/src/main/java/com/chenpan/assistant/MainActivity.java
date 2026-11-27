@@ -641,9 +641,77 @@ public class MainActivity extends Activity {
             if (c != null) { try { c.close(); } catch (Throwable ignored) { } }
         }
         if (status == DownloadManager.STATUS_SUCCESSFUL) {
-            toast("已下载到「下载」：" + name + "\n点通知栏那条可以直接打开");
+            // 2026-11-27 需求「点图片 = 下载好再用自带看图应用打开，和下载文件的效果一样」：
+            // 图片下载完成后直接拉起系统看图应用；拉不起来（没装看图应用等）退回原提示。
+            if (isImageDownload(id, name)) {
+                if (openDownloadedImage(id, name)) {
+                    toast("已下载到「下载」并用看图应用打开：" + name);
+                } else {
+                    toast("已下载到「下载」：" + name + "\n没找到能看图的应用，点通知栏那条打开");
+                }
+            } else {
+                toast("已下载到「下载」：" + name + "\n点通知栏那条可以直接打开");
+            }
         } else {
             toast("下载失败（" + downloadFailureText(status, reason) + "）\n" + name);
+        }
+    }
+
+    /** 这次下载是不是图片：先看系统下载器记的 MIME，再看落盘名扩展名（服务端 content-type 与文件名总有一个对得上）。 */
+    private boolean isImageDownload(long id, String name) {
+        DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+        if (dm != null) {
+            try {
+                String mime = dm.getMimeTypeForDownloadedFile(id);
+                if (mime != null && mime.toLowerCase().startsWith("image/")) return true;
+            } catch (Throwable ignored) {
+                // 查询失败就靠扩展名兜底
+            }
+        }
+        String lower = name == null ? "" : name.toLowerCase();
+        return lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg")
+                || lower.endsWith(".gif") || lower.endsWith(".webp") || lower.endsWith(".bmp")
+                || lower.endsWith(".svg");
+    }
+
+    /**
+     * 用系统看图应用打开刚下好的图片；返回 false 表示没拉起来（调用方退回 toast 提示）。
+     *
+     * 必须拿 DownloadManager 的 content:// Uri（getUriForDownloadedFile）发 ACTION_VIEW：
+     * 直接发 file:// 在 Android 7+ 会抛 FileUriExposedException；content Uri 加
+     * FLAG_GRANT_READ_URI_PERMISSION 把这一条记录的读权限临时授给看图应用，不需要 FileProvider。
+     */
+    private boolean openDownloadedImage(long id, String name) {
+        DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+        if (dm == null) return false;
+        Uri uri = null;
+        try {
+            uri = dm.getUriForDownloadedFile(id);
+        } catch (Throwable ignored) {
+        }
+        if (uri == null) return false;
+        String mime = null;
+        try {
+            mime = dm.getMimeTypeForDownloadedFile(id);
+        } catch (Throwable ignored) {
+        }
+        if (TextUtils.isEmpty(mime) || "application/octet-stream".equalsIgnoreCase(mime)) {
+            String ext = "";
+            int dot = name == null ? -1 : name.lastIndexOf('.');
+            if (dot >= 0 && dot < name.length() - 1) ext = name.substring(dot + 1).toLowerCase();
+            String guessed = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
+            mime = TextUtils.isEmpty(guessed) ? "image/*" : guessed;
+        }
+        try {
+            Intent view = new Intent(Intent.ACTION_VIEW);
+            view.setDataAndType(uri, mime);
+            view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(view);
+            return true;
+        } catch (ActivityNotFoundException e) {
+            return false;
+        } catch (Throwable t) {
+            return false;
         }
     }
 

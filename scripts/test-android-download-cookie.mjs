@@ -113,7 +113,38 @@ case_('成功与失败都有 toast（旧版失败时一声不响，通知栏永�
   }
 })
 
-/* ---------- 5. 生命周期与清单不变式 ---------- */
+/* ---------- 5. 图片下载完成 → 系统看图应用（2026-11-27 需求） ---------- */
+
+case_('reportDownload 成功分支：图片走 openDownloadedImage，其余保持原 toast', () => {
+  const body = methodBody('reportDownload')
+  assert.match(body, /STATUS_SUCCESSFUL/, '成功分支还在')
+  assert.match(body, /isImageDownload\(id, name\)/, '成功时必须先判是不是图片')
+  assert.match(body, /openDownloadedImage\(id, name\)/, '图片必须尝试拉起看图应用')
+  assert.match(body, /toast\("已下载到「下载」：" \+ name \+ "\\n点通知栏那条可以直接打开"\)/,
+    '非图片的成功提示一字不许动（文件仍保持通知 + toast）')
+})
+
+case_('openDownloadedImage：ACTION_VIEW + content Uri + 读权限授权，不许 file://', () => {
+  const body = methodBody('openDownloadedImage')
+  assert.match(body, /Intent\.ACTION_VIEW/, '必须用 ACTION_VIEW 拉起系统看图应用')
+  assert.match(body, /setDataAndType\(uri, mime\)/, '必须 setDataAndType（图片 MIME）')
+  assert.match(body, /getUriForDownloadedFile\(id\)/, '必须用 DownloadManager 的 content:// Uri')
+  assert.match(body, /FLAG_GRANT_READ_URI_PERMISSION/, 'content Uri 必须临时授权给看图应用')
+  assert.match(body, /FLAG_ACTIVITY_NEW_TASK/, '广播回调里起 Activity 必须 NEW_TASK')
+  assert.equal(body.includes('"file://'), false, 'Android 7+ 直接 file:// 会 FileUriExposedException')
+  assert.match(body, /ActivityNotFoundException/, '没装看图应用要接得住（退回 toast）')
+})
+
+case_('isImageDownload：MIME image/ 优先，扩展名兜底', () => {
+  const body = methodBody('isImageDownload')
+  assert.match(body, /getMimeTypeForDownloadedFile\(id\)/, '先查系统下载器记的 MIME')
+  assert.match(body, /startsWith\("image\/"\)/, 'image/* 即算图片')
+  for (const ext of ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg']) {
+    assert.equal(body.includes(`"${ext}"`), true, `扩展名兜底要认 ${ext}`)
+  }
+})
+
+/* ---------- 6. 生命周期与清单不变式 ---------- */
 
 case_('onDestroy 注销下载广播（不泄漏 receiver）', () => {
   const body = methodBody('onDestroy')
