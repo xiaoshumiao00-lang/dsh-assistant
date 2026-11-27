@@ -42,6 +42,7 @@ const CU_TESTS = [
   'test-cu-uia-core.mjs',
   'test-cu-uia-overlay.mjs',
   'test-cu-uia-observe.mjs',
+  'test-cu-uia-content.mjs',
 ]
 
 function git(args) {
@@ -54,7 +55,16 @@ const baseline = baselineArg === '' ? DEFAULT_BASELINE : baselineArg
 console.log('== ① 与基线比对（只许新增文件）==')
 console.log(`  基线 commit：${baseline}（${git(['log', '-1', '--pretty=%s', baseline])}）`)
 // 白名单文件按「基线..工作区」口径一起看：未提交的接线改动也要算进来
-const status = git(['diff', '--name-status', baseline, 'HEAD']).split('\n').filter(Boolean)
+const statusLines = git(['diff', '--name-status', baseline, 'HEAD']).split('\n').filter(Boolean)
+// 同一路径只登记一次（工作区又改了同一文件时不重复计数）
+const seenPaths = new Set()
+const status = []
+for (const line of statusLines) {
+  const path = line.split(String.fromCharCode(9)).slice(1).join(String.fromCharCode(9))
+  if (seenPaths.has(path)) continue
+  seenPaths.add(path)
+  status.push(line)
+}
 for (const line of git(['diff', '--name-status', 'HEAD']).split('\n').filter(Boolean)) {
   const path = line.split('\t').slice(1).join('\t')
   if (!status.some((existing) => existing.split(	).slice(1).join(	) === path)) status.push(line)
