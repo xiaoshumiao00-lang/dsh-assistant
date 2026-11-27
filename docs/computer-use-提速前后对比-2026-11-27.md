@@ -1,143 +1,168 @@
-﻿# Computer Use 提速前后对比（2026-11-27）
+﻿# Computer Use 提速前后对比 + 恢复点与一键回退（2026-11-27）
 
-> 口径：五条「只增不减」硬约束（docs/ComputerUse-优化-只增不减-改动清单-20261127.md，# aef60f0）。
-> 本轮**只加新文件、不接线、不动 vendor**：vendor/computer-use 的观察环（截图 → 模型）不在本插件里，
-> 按「不许改 vendor」的口径，接线点只能在插件侧（§5）。因此**端到端提速数字本轮给不出来**，原因见 §3；
-> 下面给的是**能实测的全部数字**，逐条标了命令、时间戳与出处，没有估算冒充实测。
+> 两条硬要求一起写在本文：**提速**（只增不减）与**可回退**（提取失败必须回到改动前的行为）。
+> 所有数字都是本机实测（命令与时间戳见各节），没有估算冒充实测；测不出来的部分在 §4 明说。
 
 ## 0. 结论先行
 
-| 项 | 结论 | 证据 |
+| 项 | 值 | 证据/出处 |
 | --- | --- | --- |
-| 代码提交 | `2326629` feat(cu): 控件树通道核心逻辑 + 单测·微基准·真机探针 | `git log --oneline -1` |
-| 本报告提交 | `2326629` 的下一条（本文件自身） | `git log --oneline -2` |
-| 端到端提速（60.5 分钟 → ?） | **未测出**：观察环在 vendor 内且不许改 + 需重启宿主 + 本会话不是 CU 会话，无法作为受测对象 | §3 |
-| 真机探针代价 | **292 ms/页**（`--repeat 3`，本机 1920×1032 Chrome 前台窗口，读 123 个控件） | §2.1 |
-| 每帧纯 JS 开销 | 有候选 **13.9 µs**；读不出 **0.129 µs**；事后校验 0.013 µs；记忆 recall 0.203 µs | §2.2 |
-| 缓存复用 | 8 个页面 / 40 帧 → **8 次探针**，命中率 **80%** | §2.2 |
-| 候选清单体积 | 上限 40 个编号 / 20 行，实测 **774 字符**（真机）/ 682 字符（200 控件压测） | §2.3 |
-| 候选命中（免视觉） | `更多操作` → `rect=(1872,133,32,32)`，中心 **(1888,149)**，与 2026-11-20 实录里「更多 1597,110」同一条痛点 | §2.1 |
-| 通道默认状态 | **关**（保底 ⑤：端到端 A/B 没跑成就不许开） | §4 |
-| push | **无**（只 commit） | `git status` / 远端未动 |
-| vendor/computer-use | **一个文件都没改**（只读引用行号） | §6 |
+| **改动前基线 commit** | `ebf16ae` | `git rev-parse aef60f0^`（清单 commit 的父提交） |
+| 本轮改动 commit | `aef60f0`（清单）→ `2326629`（核心逻辑+单测/微基准/真机探针）→ `c063bfe`（恢复点+一键回退+演练脚本，package.json 回基线）→ 本报告更新 | `git log --oneline -5` |
+| **与基线的差异** | **8 个新增文件 / 现有文件 0 改动** | `node scripts/cu-uia-rollback-drill.mjs` ① 段 |
+| **通道默认状态** | **关**（`default-off`） | `resolveChannelSwitch({})` |
+| **关通道后 CU 测试** | **6/6 PASS**（5 个既有 + 本通道单测） | 演练脚本 ② 段（`DSH_CU_UIA=0`） |
+| 全量脚本 | **95 个：92 通过 / 3 条既有红**（`mobile-proxy`、`secretary-pagination-dom`、`secretary-session-log-write`） | 逐脚本跑全量 |
+| 真机 UIA 探针 | **292–611 ms/页**，读到 123 个控件；按 120ms 硬预算 → **一律判「不启动」**（整帧纯视觉） | `cu-uia-live-probe.mjs` |
+| 每帧纯 JS 开销 | 有候选 **14.193 µs**；读不出 **0.129 µs**；校验 0.013 µs；记忆 recall 0.204 µs | `bench-cu-uia-core.mjs` |
+| 端到端提速（60.5 分钟 → ?） | **未测出**（原因见 §4，不编数字） | §4 |
+| push | **无**（只 commit） | 远端未动 |
 
-## 1. 基线（用户提供的 2026-11-20 hpg 门店录入实录，**本轮未复测**）
+## 1. 基线（用户提供的 2026-11-20 hpg 门店录入实录，本轮未复测）
 
-| 指标 | 旧基线 |
-| --- | --- |
-| 总耗时 | 60.5 分钟 |
-| 工具调用 | 116 次 |
-| 点击 | 35 次 |
-| 同坐标重复点击 | 11 次 |
-| 辨认悬浮球窗口占用 | 44 步（39%） |
-| 单点死磕 | 13.7 分钟耗在「复制链接」 |
-| 截图/坐标 | 1630×766 截图被裁成 72×72，坐标被判偏 |
+总 **60.5 分钟** / **116 次**工具调用 / **35 次**点击 / **11 次**同坐标重复点击 /
+**44 步（39%）**耗在辨认悬浮球窗口 / **13.7 分钟**死磕「复制链接」/ **1630×766** 截图被裁成 **72×72** 带偏坐标。
 
-这 7 个数是**用户记录的既有基线**，本轮没有重跑（要想得新数字，必须先接线并重启宿主，见 §3）。
+这 7 个数是既有基线，本轮没有重跑（重跑的前提见 §4）。
 
-## 2. 本轮实测（新增的、可复现的）
+## 2. 恢复点与一键回退（本轮新增的硬要求）
 
-### 2.1 真机探针（真实 UIA，非模拟）
+### 2.1 恢复点
 
-命令：`node scripts/cu-uia-live-probe.mjs --repeat 3 --find 更多操作`
-时间戳：`2026-11-27T05:50Z` 前后两次运行；前台窗口 = `Chrome_WidgetWin_1`，rect = 1936×1048 @ (-8,-8)。
+- 基线 = **`ebf16ae`**（"fix(secretary): 更换会话面板按会话标题显示"），即清单提交 `aef60f0` 的父提交。
+- 本轮全部改动走**独立 commit**：`aef60f0` → `2326629` → `c063bfe` → 报告更新；**没有 amend、没有 rebase**。
+- 现有文件**没有改动**：`package.json` 上一条临时加过测试链，已在 `c063bfe` 里**恢复成基线内容**，
+  所以 `git diff ebf16ae HEAD` 现在只剩新增文件（演练脚本 ① 段实测：8 A / 0 M）。
 
-| 项 | 实测 |
-| --- | --- |
-| 每次探针耗时 | 289 / 295 / 292 ms（第 1 次含程序集冷启动约 190ms） |
-| 读到控件 | 123 个（深度 ≤12、节点 ≤400、跳过 offscreen 与 0 尺寸） |
-| 通道判定 | 启动（`ok`），编号 40 个，候选清单 774 字符 |
-| 候选命中 | `--find 更多操作` → `Button "更多操作" rect=(1872,133,32,32)` 中心 `(1888,149)` |
+### 2.2 三条回退路径（任选一条，都回到改动前）
 
-结论：**「点哪个」可以完全不靠视觉猜**——探针直接把候选控件的绝对 rect 给出来；这也解释了基线里
-「13.7 分钟死磕复制链接」为什么能省（它就在「更多」菜单里，命中即可算中心点）。
-注意：探针是**每页一次**（300ms 级），不是每帧一次；按帧重探必须被禁止（保底 ②），代码里由页面缓存保证。
+```bash
+cd D:/dsh-assistant
+# 1) 保留历史，反向提交（推荐：不改写历史）
+git revert --no-edit 2326629 c063bfe          # 逆向本次两个代码提交
+# 2) 直接丢弃本轮全部改动
+git checkout ebf16ae -- .                     # 或：git reset --hard ebf16ae
+# 3) 只删新增文件 + 关开关（最轻，等价于「通道从未存在过」）
+git rm -q --cached $(git diff --name-only ebf16ae HEAD) && rm -f $(git diff --name-only ebf16ae HEAD)
+echo '{"enabled": false}' > "$DSH_HOME/profiles/desktop/dsh-assistant-cu-uia.json"   # 或 export DSH_CU_UIA=0
+```
 
-### 2.2 每帧/每步开销与缓存复用
+关闭开关（**默认就是关**，不需要任何操作）：环境变量 `DSH_CU_UIA=0` → 关；设置页 CU 面板「控件树通道」= 关；
+profile 文件 `dsh-assistant-cu-uia.json` 的 `{"enabled": false}`。优先级（安全侧取胜）：
+`DSH_CU_UIA=0` > 文件 `enabled=false` > 文件 `enabled=true` > 缺省关；`DSH_CU_UIA=1` 遇上文件 `false` 记作 `conflict-off`（仍然关）。
 
-命令：`node scripts/bench-cu-uia-core.mjs`（本机，Node v24.13.0，2000/200000 次迭代，预热后计时）
+### 2.3 「提取失败 = 改动前行为」的三条保证（都有单测）
 
-| 项目 | 实测 | 说明 |
+| 保证 | 实现 | 验证 |
 | --- | --- | --- |
-| 每帧（有候选：判定 + 编号 + 清单） | **13.903 µs** | 2000 次，共 27.8 ms |
-| 每帧（读不出：直接退回） | **0.129 µs** | 108 倍差距 → 退回路径几乎免费 |
-| 每步（事后校验 verifyClick） | **0.013 µs** | 20 万次，共 2.6 ms |
-| 每步（动作记忆 recall） | **0.203 µs** | 20 万次，共 40.5 ms |
-| 40 帧 / 8 个页面 | **8 次探针**，命中率 **80%**，40 帧总耗时 **0.19 ms** | 缓存键 = 窗口类名｜标题｜宽×高 |
+| 帧不复制、不编码 | `planChannelFrame()` 关/失败时返回 `copyFrame=false`、`marks=[]` | 单测「关通道 = 改动前行为」 |
+| 提示段返空 | 同上 `hint=''`（`buildControlHintBlock([])` 也是 `''`） | 同上 + 「不启动时零开销」例 |
+| 点击参数逐字节相同 | 通道函数只读不写：`verifyClick()` 不改入参，`pickPoint()` 只在模型没给坐标时才用记忆 | 单测断言 `JSON.stringify(modelPoint)` 前后相等 |
 
-### 2.3 候选清单体积（进 prefill 的真实成本）
+触发「整帧退回」的 5 个判据（任一命中即退回，不重试、不二次读取）：
+无前台窗口 / 可交互控件 < 3 / **探针 > 120ms** / 控件 rect 覆盖 < 1% / 探针报错。
 
-| 场景 | 编号数 | 清单字符 | 粗估 token（中文 1 字符≈1、ASCII≈0.25） |
+### 2.4 关通道后的实测（演练脚本真跑）
+
+`node scripts/cu-uia-rollback-drill.mjs`（`--baseline` 可换基线）：
+
+```
+① 与基线比对：新增 8 个文件，现有文件改动 0 个
+② 关通道后 CU 测试（DSH_CU_UIA=0）：
+   test-cu-capture-scale PASS / test-cu-observation-surface PASS / test-cu-bridge PASS
+   test-cu-code-agent-notice PASS / test-cu-title-bold PASS / test-cu-uia-core PASS
+③ 回退命令（三条，见 §2.2）
+RESULT: PASS
+```
+
+## 3. 真机与微基准实测
+
+### 3.1 真机探针（真实 UIA，不是模拟）
+
+`node scripts/cu-uia-live-probe.mjs --repeat 2`（前台 = Chrome PDF 文档页，`Chrome_WidgetWin_1`，1936×1048）：
+读到 **123 个控件**，单次 **296–611 ms**（含 PowerShell 5.1 程序集冷启动 ~190ms）。
+按 120ms 硬预算 → `不启动(too-slow)` → 这一帧**不画编号、不返清单、不复制帧**（打印原话：
+「这一帧不画编号、不返清单：帧原样交给模型（改动前行为）」）。
+
+免视觉定位的证据（同一台机器，早一次运行）：`--find 更多操作` → `Button "更多操作" rect=(1872,133,32,32)`，
+中心 **(1888,149)**——这正是 2026-11-20 实录里「更多 1597,110」那类痛点；说明「探针一旦足够快（常驻 sidecar），
+候选 rect 可以直接免掉 13.7 分钟的死磕」。
+
+**结论（重要）**：按用户口径的 120ms 预算，实测页面**全部落在退回分支**——通道实际处于「永远不启动」状态，
+这是安全侧，也意味着**本轮没有任何提速发生**。要让通道真的跑起来，必须先把探针做成常驻 sidecar（不付进程费），
+把 292–611ms 压到 120ms 以内；预算那条线不动。
+
+### 3.2 微基准（纯 JS 部分）
+
+`node scripts/bench-cu-uia-core.mjs`（Node v24.13.0，预热后计时）：
+
+| 项目 | 实测 |
+| --- | --- |
+| 每帧（有候选：判定+编号+清单） | **14.193 µs**（2000 次，28.4 ms） |
+| 每帧（读不出：直接退回） | **0.129 µs**（2000 次，0.3 ms） |
+| 每步（事后校验） | **0.013 µs**（20 万次，2.5 ms） |
+| 每步（记忆 recall） | **0.204 µs**（20 万次，40.9 ms） |
+| 40 帧 / 8 页面 | **8 次探针**，命中率 **80%**，40 帧共 0.20 ms |
+| 候选清单体积 | 真机 774 字符；压测（200 控件）682 字符 ≈ 546–682 token/帧 |
+
+### 3.3 旧 vs 新（能对齐的只有这几项）
+
+| 指标 | 旧（2026-11-20 基线） | 新（2026-11-27 本轮实测） | 说明 |
 | --- | --- | --- | --- |
-| 真机 Chrome 页面（123 控件） | 40 | 774 | 约 620–774 |
-| 压测（200 控件） | 40（上限） | 682 | 约 546–682 |
+| 总耗时 | 60.5 分钟 | **未测出** | 需要接线 + 重启宿主 + 同任务跑两遍（§4） |
+| 工具调用 | 116 次 | **未测出** | 同上 |
+| 点击次数 | 35 次 | **未测出** | 同上 |
+| 同坐标重复点击 | 11 次 | **未测出** | 同上 |
+| 辨认页面步数 | 44 步（39%） | **未测出** | 同上 |
+| 每帧通道开销 | 0（无通道） | 0.129 µs（关/读不出） / 14.2 µs（开） | 实测，可忽略 |
+| 免视觉定位 | 靠猜坐标（13.7 分钟死磕） | 探针给出 rect，center (1888,149) | 实测，但探针 296–611ms 超预算 |
+| 关通道后行为差异 | — | 0（8 新增文件，0 现有改动） | 演练脚本实测 |
 
-这是本方案**唯一确定的增量成本**：每帧多 550–800 tokens 的 prefill。能不能被「少走冤枉步」赚回来，
-必须靠 §3 的端到端 A/B 判定——所以保底 ⑤ 之前不许默认打开。
+## 4. 为什么端到端 A/B 仍然给不出来
 
-## 3. 为什么端到端 A/B（60.5 分钟 → ?）本轮给不出来
+1. **观察环在 vendor 里且不许改**：每帧喂模型的内容由 `vendor/computer-use/index.js` 的
+   `writeDesktopScreenshots()`(:998)、`recapture()`(:1177)、`screenshot`(:1639) 产出；编号图 + 清单只能插在这条链上。
+2. **接完还要重启宿主**才生效（本轮没重启，用户长期口径：不擅自重启）。
+3. **本会话不是 CU 会话**，无法作为受测体跑同一任务；只读演练的计时不具备可比性，不拿来充当提速数字。
 
-三条硬原因，全部可复核：
+要拿到真数字：① vendor 观察帧出口加可选钩子（或插件侧 observation wrapper）→ ② 重启宿主 →
+③ 同一 hpg 只读演练任务跑两遍（`DSH_CU_UIA=0/1`）→ ④ 采集工具调用/点击/同坐标重复/墙钟/重试/总步数 →
+⑤ 任一指标变差（步数不降、耗时 +10% 以上、重复点击增多）**就默认关**（门禁照旧，不放宽）。
 
-1. **观察环在 vendor 里，且不许改。** 每帧喂给模型的东西（截图 + 文本）由 `vendor/computer-use/index.js`
-   的 `writeDesktopScreenshots()`（:998）、`recapture()`（:1177）、`screenshot`（:1639）产出；
-   「编号框图 + 控件清单一起喂」只能在这条链路上插入，而本轮口径是**不改 vendor**。
-   插件侧拿不到「本步的观察帧」回调，也就无法把编号图塞进模型看到的那一帧。
-2. **改了宿主侧也要重启才生效。** 本轮没有重启宿主（用户长期口径：不擅自重启），
-   所以即便接线完成，也只能等下一次重启才可能在真机上跑 A/B。
-3. **本会话不是 CU 会话。** A/B 要求「同一任务在新/旧各跑一遍」量步数与耗时，
-   需要一条 Computer Use 会话在同一台机器上跑同一个目标页面；本会话没有屏幕控制型 CU 执行体，
-   无法充当受测对象，也不能把一次「人工点击演练」冒充成 A/B 结果（只读演练可以走流程，
-   但流程计时没有可比性，我不会拿它当提速数字）。
+## 5. 五条保底 → 文件/函数落点
 
-**要拿到真数字，需要按顺序做**（下一步）：
-① 在 vendor 观察帧出口加一个可选钩子（或改用插件侧 observation wrapper）→ ② 重启宿主 →③ 用同一个
-hpg 只读演练任务跑两遍（`DSH_CU_UIA=0/1`）→ ④ 采集 6 项指标（工具调用、点击、同坐标重复、墙钟、
-失败重试、总步数）→ ⑤ 任一变差就按保底 ⑤ 关掉（开关已设计在 `src/client/assistant-settings.tsx` CU 面板 +
-`<profile>/dsh-assistant-cu-uia.json`，默认关）。
-
-## 4. 五条保底 → 落在哪个文件/函数
-
-| 保底 | 落地位置（本轮已实现，纯逻辑 + 单测） | 验收 |
+| 保底 | 落点 | 验证 |
 | --- | --- | --- |
-| ① 读不出自动退回纯视觉、零开销 | `src/cu-uia-core.ts:128 decideControlChannel()`（5 种原因：`no-window / few-controls / too-slow / low-coverage / error`）；不启动时 `planMarks()` 返回 `[]`、`buildControlHintBlock()` 返回 `''`（:254 / :277） | `scripts/test-cu-uia-core.mjs` 第 1、2 例；实测退回路径 0.129 µs |
-| ② 按页面缓存复用，UI 变了才重跑 | `src/cu-uia-core.ts:172 createPageCache()`（含 `resolve()` 只在 miss 时探、`invalidate()`、TTL 30s、最多 8 页）；键 `pageCacheKey()` :150 | 单测「40 帧同页只探 1 次」；微基准 8 页 40 帧 = 8 次探针、命中率 80% |
-| ③ 校验只做事后比对，不替模型决定 | `src/cu-uia-core.ts:300 verifyClick()` 只回 `hit / miss / unknown`（容差 = 短边 10%，≥4px）；`pickPoint()` :369 永远优先模型坐标 | 单测断言「校验不改入参坐标」+ `miss` 后 `memory.forget()` 清缓存 |
-| ④ 禁 rollout / Best-of-N | 无任何重试放大逻辑；`pickPoint()` 一次只出一个点；探针失败不重试（一次性调用） | 单测第 4 例；`vendor/computer-use` 侧 `rollout` 关键字全仓 0 命中 |
-| ⑤ 同任务新旧各跑一遍，变慢就关 | `scripts/bench-cu-uia-core.mjs`（微基准门禁，本次 PASS）；端到端门禁脚本待接线后补（§3） | 本轮结论：**通道默认关**，等端到端 A/B |
+| ① 读不出自动退回纯视觉、零开销 | `src/cu-uia-core.ts` `decideControlChannel()`（:128 附近）+ `planChannelFrame()`（关/失败 → `useMarks=false / copyFrame=false / hint=''`） | 单测 2 例 + 真机 120ms 预算实测（整帧退回） |
+| ② 按页面缓存复用 | `createPageCache()`（TTL 30s、≤8 页、`resolve()` 只在 miss 时探）；键 `pageCacheKey()` | 单测「40 帧同页只探 1 次」；基准 8 页 40 帧 = 8 探针 |
+| ③ 校验只比对、不替模型决定 | `verifyClick()` 只回 `hit/miss/unknown`；`pickPoint()` 永远优先模型坐标 | 单测「校验不改入参坐标」「模型坐标逐字节相同」 |
+| ④ 禁 rollout / Best-of-N | 无重试放大逻辑；探针失败不重试 | 单测第 4 例；`vendor` 侧 `rollout` 全仓 0 命中 |
+| ⑤ 同任务新旧各跑一遍，变差就关 | `bench-cu-uia-core.mjs`（本轮 PASS）+ 端到端门禁待接线；`resolveChannelSwitch` 默认关 | 本轮结论：**关**，等 A/B |
 
-## 5. 四步方案落点（已定稿口径）
+四步方案落点：候选清单 = `buildControlHintBlock()`；编号框锚点 = `planMarks()`（编号 1..40、只留可点角色
+`UIA_ACTIONABLE_ROLES`）；事后校验 = `verifyClick()`；坐标复用 = `createActionMemory()` + `pickPoint()`；
+探针 = `src/cu-uia-win.ts`（`UIA_PS1_SCRIPT` / `parseUiaProbeJson()` / `probeForeground()`）。
+视觉坐标与点击基准：`vendor/computer-use/index.js:1240/:1771`、`src/coordinate-mode.ts`——**一个字没动**。
 
-| 步 | 落点 | 状态 |
-| --- | --- | --- |
-| 视觉坐标为唯一决策者 | `vendor/computer-use/index.js:1240 click`、`:1771 drag`、`src/coordinate-mode.ts`（像素/千分比） | **一个字没动** |
-| 前置候选清单（紧凑文本） | `src/cu-uia-core.ts:277 buildControlHintBlock()`（上限 800 字符 / 20 行） | 已实现、已压测 |
-| 编号框锚点（Set-of-Mark） | `src/cu-uia-core.ts:254 planMarks()`（编号 1..40，阅读顺序，只留可点角色 `UIA_ACTIONABLE_ROLES` :56） | 已实现（编号数据）；**画到图上**要等接线（§3 ①） |
-| 事后校验 | `src/cu-uia-core.ts:300 verifyClick()` | 已实现 |
-| 坐标复用 / 动作记忆 | `src/cu-uia-core.ts:326 createActionMemory()` + `pickPoint()` | 已实现 |
+## 6. vendor/computer-use 只读门槛核查
 
-探针本体：`src/cu-uia-win.ts`（`UIA_PS1_SCRIPT` :25，`parseUiaProbeJson()` :115，`probeForeground()` :181）；
-真机读数脚本：`scripts/cu-uia-live-probe.mjs`。
-
-## 6. 关于「vendor/computer-use 只读门槛」
-
-核查结论：`src/tuoguan-host.ts:427` 一带的「只读门控」是**托管信号门控**（`installTuoguanGateForSignals`，
-给 vendor 侧 `code_agent` 决定「这个会话是否自动应答」用的只读判定），**不是文件锁**，
-并没有阻止写 vendor 文件。真正拦住「每帧双通道」的是**本轮口径本身**（不许改 vendor）＋
-观察环物理上不在插件里（§3 原因 1）。本轮因此没有尝试任何绕过，vendor 目录零改动。
+`src/tuoguan-host.ts:427` 一带的「只读门控」是**托管信号门控**（`installTuoguanGateForSignals`：决定后台
+`code_agent` 是否自动应答），**不是文件锁**，不阻止写 vendor 文件。真正拦住「每帧双通道」的是本轮口径
+（不许改 vendor）＋观察环物理上不在插件里。本轮 vendor 目录**零改动**，也没有任何绕过尝试。
 
 ## 7. 复现命令
 
 ```bash
 cd D:/dsh-assistant
-node scripts/test-cu-uia-core.mjs        # 7/7 通过
-node scripts/bench-cu-uia-core.mjs       # 每帧 13.9µs / 8 页 40 帧 8 次探针 / PASS
-node scripts/cu-uia-live-probe.mjs --repeat 3 --find 更多操作   # 真机 292ms/页、123 控件、候选命中
-npm run check                            # EXIT 0
-node scripts/test-*.mjs 全量              # 95 个脚本：92 通过 / 3 条既有红
+node scripts/test-cu-uia-core.mjs            # 9/9 通过
+node scripts/bench-cu-uia-core.mjs           # 每帧 14.2µs / 8 页 40 帧 8 探针 / PASS
+node scripts/cu-uia-live-probe.mjs --repeat 2 --find 更多操作   # 真机 296–611ms、123 控件、120ms→整帧退回
+DSH_CU_UIA=0 node scripts/cu-uia-live-probe.mjs                 # 关通道演练（不画编号、不返清单）
+node scripts/cu-uia-rollback-drill.mjs       # 恢复点演练：8 新增/0 改 + 6 个 CU 测试 PASS
+npm run check                                # EXIT 0（lib 产物未变，本轮没动现有文件）
 ```
 
-## 8. 已知红（与本次改动无关）
+## 8. 既有红（与本次改动无关）
 
-`test-mobile-proxy`、`test-secretary-pagination-dom`、`test-secretary-session-log-write` —— 改动前就是红的
-（上一轮全量 94 个时 OK=91），本轮新增的 `test-cu-uia-core` 是绿的，无新增红。
+`test-mobile-proxy`、`test-secretary-pagination-dom`、`test-secretary-session-log-write`：改动前就是红的；
+本轮新增的 `test-cu-uia-core` 是绿的，全量仍是 92/95。
