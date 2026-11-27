@@ -5,9 +5,9 @@
 
 | 项 | 值 |
 | --- | --- |
-| 版本 | **1.4.4**（versionCode `31`，可覆盖升级 1.4.x） |
+| 版本 | **1.4.8**（实测 versionCode `35` / versionName `1.4.8`，可覆盖升级 1.4.x） |
 | 包名 | `com.chenpan.assistant.generic`（通用版） |
-| 交付件 | `android/dist/个人助手-通用版-1.4.4.apk`（构建产物同时在 `android/out/`） |
+| 交付件 | `android/dist/个人助手-通用版-1.4.8.apk`（86,899 字节，2026-11-27 10:48 构建；构建产物同时在 `android/out/`，同目录另有 `个人助手-通用版-1.4.8.apk.idsig` 5,660 字节） |
 | 签名 | `android/assistant.keystore`，alias `assistant`，口令 `***REMOVED***`（**升级必须用同一把**） |
 | 最低 / 目标 | Android 7.0（API 24）/ API 34 |
 
@@ -23,9 +23,36 @@
 - 改地址的入口：长按返回键约 1 秒，或长按桌面图标选「设置地址」；返回键退到底也会弹同一个菜单（设置地址 / 重新加载页面 / 退出应用）。
 - 体积：1.4.2 的 3.1 MB → 1.4.3 的 78,707 字节 → 1.4.4 的 **74,608 字节**（APK 里已无 `.so`、无 `assets/`）。
 
+## 当前最新版本与 1.4.5–1.4.8 各版变化
+
+最新交付件 = **1.4.8（versionCode 35）**，没有 1.4.9 或更高：`android/dist/` 与 `android/out/` 里最高就是 1.4.8（32 个 APK，1.1.0 起），`android/app/src/main/AndroidManifest.xml` 也没有更新版本号（版本号由 `build.ps1 -VersionName/-VersionCode` 在 `aapt2 link` 时注入）。
+
+实测判据（`aapt2 dump badging` + `apksigner verify`，原始输出在 `outputs/2026-11-28/apk-audit/`）：
+
+```
+1.4.8 : package com.chenpan.assistant.generic versionCode=35 versionName=1.4.8  minSdk=24 targetSdk=34
+1.4.7 : versionCode=34 versionName=1.4.7  minSdk=24 targetSdk=34
+apksigner verify --print-certs: Verifies / v2=true v3=true (v1、v3.1、v4 = false), 1 signer,
+  cert SHA-256 b081dc7ba8a54c2fa36ab4f8bffcabedcd9558d922dcea8dcac21cfe04b7a333（1.4.4–1.4.8 全部同一把 assistant.keystore，可覆盖装）
+```
+
+| 版本（code） | 一句话结论 | 证据 | APK 字节 |
+| --- | --- | --- | --- |
+| 1.4.5（32） | 附件下载带上 WebView cookie（Cookie / Referer / User-Agent）＋下载完成/失败广播（`watchDownload`/`reportDownload`、RFC5987 `filename*` 中文名、toast）：修掉 pocket 401 导致通知栏「正在下载」永不结束 | `f86751b`（2026-11-26 18:13，MainActivity +154/-5）、`docs/安卓附件下载-401-根因-20261126.md:185,198` | 74,608 → 78,707 |
+| 1.4.6（33） | 图片类附件点击改走原生只读下载链路（同一路径加 `download=1`、服务端强制 `attachment`）＋下载完成拉起系统看图（`isImageDownload` / `openDownloadedImage` / `MimeTypeMap` / `image/*`） | `85d4a13`（2026-11-27 09:10，MainActivity +69/-1）、`docs/秘书回复卡图片-原生下载与看图-20261127.md:21,129-130` | 78,707（与 1.4.5 同字节数） |
+| 1.4.7（34） | 所有附件点击统一走系统下载 + 安卓端按 MIME 分流打开（看图 / apk 弹安装 / pdf·office·txt·音频 `ACTION_VIEW` / 其余留通知），`openDownloadedFile` 泛化（`content:` Uri + `FLAG_GRANT_READ_URI_PERMISSION`），清单新增 `REQUEST_INSTALL_PACKAGES` | `f27fe4b`（2026-11-27 09:21，MainActivity +92/-18、Manifest +3）、`docs/秘书回复卡附件-全类型下载-20261127.md:92-95` | 78,704（-3） |
+| 1.4.8（35） | 后台保活 ＋ 切回秒恢复 ＋ 后台任务完成播报：新增 `KeepAliveService.java`（前台服务 `dataSync`、常驻通知、`START_STICKY`、`onTaskRemoved` 拉回、9 分钟 Doze 节拍续唤醒锁）、新增 `NativeBridge.java`（`@JavascriptInterface` 桥 `DshAssistantNative`，页面探活 `probePageAlive`）、`MainActivity` 加 onResume 不 reload/自动朗读走原生 `TextToSpeech`、设置页加保活开关与电池优化白名单入口 | `353c99d`（2026-11-27 10:49，Manifest +17、KeepAliveService 288 行、NativeBridge 239 行、MainActivity +132）、`docs/安卓后台保活-秒恢复-20261127.md:8,181-185` | 78,704 → 86,899（+8,195） |
+
+1.4.8 比 1.4.7 多的 8,195 字节，看 APK 条目清单比不出名堂——两版条目**完全同一套**（12 项、无 `lib/*.so`、无 `assets/`）：
+AndroidManifest.xml 压缩后 1,447→1,712（未压缩 4,532→5,620：多了 `POST_NOTIFICATIONS`/`FOREGROUND_SERVICE`/`FOREGROUND_SERVICE_DATA_SYNC`/`WAKE_LOCK`/`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` 五条权限和 `.KeepAliveService` 那条 `service`，`foregroundServiceType=0x1`＝dataSync），
+`classes.dex` 压缩后 17,935→25,005（未压缩 36,296→50,980，即上面那三个 Java 文件的新增代码），META-INF 三项合计 -2；
+APK 签名块 5,356→6,212（+856）、本地头 +3、中央目录 +3。逐项相加正好等于 8,195。
+
+1.4.5 / 1.4.6 都是 78,707 字节、1.4.4 是 74,608 字节，1.4.7 是 78,704 字节（1.4.6→1.4.7 dex 长了 1,668 字节但 manifest 也长了 172 字节，压缩率抵消后只差 3 字节）。
+
 ## 装到手机
 
-1. 把 `个人助手-通用版-1.4.4.apk` 传到手机（数据线 / U 盘都行）。
+1. 把 `个人助手-通用版-1.4.8.apk` 传到手机（数据线 / U 盘都行）。
 2. 点开安装，系统提示「未知来源」时允许一次（自己签名的应用，正常）。同包名可直接覆盖 1.4.x 旧版。
 3. 通用版首次打开进「地址设置页」——输入框是空的。
 
@@ -43,13 +70,13 @@
 ## 重新构建
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File D:\dsh-assistant\android\build.ps1 -Flavor generic -VersionName 1.4.4 -VersionCode 31
+powershell -ExecutionPolicy Bypass -File D:\dsh-assistant\android\build.ps1 -Flavor generic -VersionName 1.4.8 -VersionCode 35
 # 可选：-Sdk D:\android-sdk  -Jdk "C:\Program Files\Eclipse Adoptium\jdk-17.0.17.10-hotspot"
 ```
 
 - 路径全部由脚本自身位置推导（本目录就是工程根）；SDK/JDK 找不到会报中文错误并提示用 `-Sdk` / `-Jdk` 覆盖。
 - 依赖：`D:\android-sdk`（platform 34 + build-tools 34.0.0）、JDK 17。**不再需要 Porcupine / TFLite AAR。**
-- 产物：`out\个人助手-通用版-1.4.4.apk`，并自动复制到 `dist\`。
+- 产物：`out\个人助手-通用版-1.4.8.apk`，并自动复制到 `dist\`。
 - `-Flavor personal` 仍保留在脚本里（预置助手地址、包名 `com.chenpan.assistant`），日常交付只用 `generic`。
 
 ## 核查这台设备里没有鹈鹕残留（1.4.4 的判据）

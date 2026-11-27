@@ -323,10 +323,17 @@ npm run lint       # scripts/lint-standards.mjs（不靠 eslint：查个人化�
 
 装插件 + 装 APK 就能用：APK 是一块 Android WebView 外壳，里面只有「助手」屏——电脑上 DSH 那套页面（同一份前端、同一个会话、同一套插件）。
 
-- 源码 / 构建脚本 / 签名密钥 / 交付件都在 [`android/`](android/README.md)；当前版本 **1.4.3**（包名 `com.chenpan.assistant.generic`）。
-- 交付件：`android/dist/个人助手-通用版-1.4.3.apk`；构建命令见 `android/README.md`。
+- 源码 / 构建脚本 / 签名密钥 / 交付件都在 [`android/`](android/README.md)；当前版本 **1.4.8**（实测 versionCode `35`，包名 `com.chenpan.assistant.generic`，最低 API 24 / 目标 API 34）。
+- 交付件：`android/dist/个人助手-通用版-1.4.8.apk`（86,899 字节，2026-11-27 10:48）；构建命令见 `android/README.md`。
 - 首次打开进设置页：助手地址留空时可手填或点「一键填入常用地址」。
 - 语音输入走页面内既有的麦克风入口（宿主语音转写 / 系统输入法），插件侧不再有设备转写接口（2026-11-22 设备线已整体移除）。
+
+### 1.4.5–1.4.8 各版变化（安卓壳，最新交付件就是 1.4.8 / versionCode 35，没有更高版本）
+
+- **1.4.5（32）**：附件下载带上 WebView cookie（`Cookie`/`Referer`/`User-Agent`）＋下载完成/失败广播，修掉「通知栏永远正在下载」的 pocket 401（`f86751b`；`docs/安卓附件下载-401-根因-20261126.md`）。APK 74,608 → 78,707 字节。
+- **1.4.6（33）**：图片类附件点击走原生只读下载链路（加 `download=1`、服务端强制 `attachment`）＋下载完成拉起系统看图（`85d4a13`；`docs/秘书回复卡图片-原生下载与看图-20261127.md`）。APK 78,707 字节。
+- **1.4.7（34）**：所有附件点击统一走系统下载，安卓端按 MIME 分流打开（看图 / apk 装 / pdf·office·txt·音频 / 其余通知），清单加 `REQUEST_INSTALL_PACKAGES`（`f27fe4b`；`docs/秘书回复卡附件-全类型下载-20261127.md`）。APK 78,704 字节。
+- **1.4.8（35）**：后台保活＋切回秒恢复＋后台任务完成播报——新增 `KeepAliveService.java`（前台服务 dataSync、常驻通知、`START_STICKY`、9 分钟 Doze 节拍）与 `NativeBridge.java`（`@JavascriptInterface` 桥 + 原生 `TextToSpeech` 朗读），Manifest 加 `POST_NOTIFICATIONS`/`FOREGROUND_SERVICE`/`FOREGROUND_SERVICE_DATA_SYNC`/`WAKE_LOCK`/`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`（`353c99d`；`docs/安卓后台保活-秒恢复-20261127.md`）。APK 86,899 字节（比 1.4.7 多 8,195：dex 多 14,684 未压缩字节＋Manifest 多 1,088）。
 
 ## 朗读（秘书卡片）TTS 运行时
 
