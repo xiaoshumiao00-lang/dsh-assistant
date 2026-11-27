@@ -100,22 +100,21 @@ cases.push(['around-dispatch 包装：关着不碰结果、开着换图、探针
   assert.equal(registered[0].name, 'tools/execute', '必须挂在 around-dispatch 位')
   const nextValue = { paths: [samplePath] }
   const exec = { tool: { name: 'computer_use' } }
-  const executeHandlerAt = (list) => list.filter((item) => item.name === 'tools/execute').pop().handler
-  const closed = await executeHandlerAt(registered)(exec, async () => nextValue)
+  const closed = await registered[0].handler(exec, async () => nextValue)
   assert.equal(closed, nextValue, '关着必须原样透传（连新对象都不许造）')
 
   const onCtx = { on: (name, handler) => { registered.push({ name, handler }); return () => void 0 } }
   installCuObservationWrapper(onCtx, { readSwitch: () => ON, probe: async () => ({ decision: CH_OK, controls: CONTROLS, windowRect: WINDOW }) })
-  const opened = await executeHandlerAt(registered)(exec, async () => ({ paths: [samplePath] }))
+  const opened = await registered[1].handler(exec, async () => ({ paths: [samplePath] }))
   assert.match(opened.paths[0], /\.marks\.png$/, '开着要把路径换成编号图')
 
   const throwCtx = { on: (name, handler) => { registered.push({ name, handler }); return () => void 0 } }
   installCuObservationWrapper(throwCtx, { readSwitch: () => ON, probe: async () => { throw new Error('probe boom') } })
   const original = { paths: [samplePath] }
-  const survived = await executeHandlerAt(registered)(exec, async () => original)
+  const survived = await registered[2].handler(exec, async () => original)
   assert.equal(survived, original, '探针炸了也必须原样返回')
 
-  const otherTool = await executeHandlerAt(registered)({ tool: { name: 'bash' } }, async () => original)
+  const otherTool = await registered[1].handler({ tool: { name: 'bash' } }, async () => original)
   assert.equal(otherTool, original, '不是 CU 工具就直接透传')
   assert.match(overlayPathFor('/x/y/frame.png', 2), /2-frame\.marks\.png$/)
 }])

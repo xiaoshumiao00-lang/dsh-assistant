@@ -24,7 +24,6 @@ import { basename, join } from 'node:path'
 import type { ChannelDecision, ChannelSwitch, UiaControl, UiaMark, UiaRect } from './cu-uia-core.ts'
 import { createPageCache, decideControlChannel, pageCacheKey, planChannelFrame, planMarks, resolveChannelSwitch } from './cu-uia-core.ts'
 import { createUiaSidecar } from './cu-uia-sidecar.ts'
-import { installContentWrapper } from './cu-uia-content.ts'
 import { OverlayUnsupportedError, overlayPng } from './cu-uia-overlay.ts'
 
 /** 编号图落盘目录（系统临时目录下，可随时清）。 */
@@ -171,16 +170,11 @@ export function installCuObservationWrapper(ctx: any, opts: {
       return result // 任何意外都保持原样（通道坏了不许影响 CU 本身）
     }
   }
-  let disposeExecute: any = () => void 0
   try {
-    disposeExecute = ctx.on('tools/execute', handler) ?? (() => void 0)
-  } catch { disposeExecute = () => void 0 }
-  // 2026-11-27 §12 实测：改 value.paths 到不了模型眼前，真正生效的是 post-execute 改 content 块。
-  let disposeContent: any = () => void 0
-  try {
-    disposeContent = installContentWrapper(ctx, { readSwitch, probe: probeFn, tools: opts.tools })
-  } catch { disposeContent = () => void 0 }
-  return () => { try { disposeExecute() } catch {}; try { disposeContent() } catch {} }
+    return ctx.on('tools/execute', handler) ?? (() => void 0)
+  } catch {
+    return () => void 0
+  }
 }
 
 /** 探针 + 缓存的一体化取数（接线方用；纯函数化便于单测替换）。 */
@@ -218,9 +212,7 @@ export const UIA_SWITCH_FILE = 'dsh-assistant-cu-uia.json'
 /** 读 profile 文件里的 enabled；文件不存在 / 读不了 / 不是布尔 → undefined（交给缺省关）。 */
 export function readCuUiaFileEnabled(ctx: any): boolean | undefined {
   try {
-    // PowerShell 5.1 的 `Set-Content -Encoding utf8` 会写 UTF-8 BOM；不剥掉 JSON.parse 直接抛，
-    // 开关就被判成「读不到 → 默认关」（2026-11-27 §12.5 实测踩过：14:56:07 那次 A/B 因此白跑）。
-    const raw = readFileSync(join(profileDirOf(ctx), UIA_SWITCH_FILE), 'utf8').replace(/^\uFEFF/, '')
+    const raw = readFileSync(join(profileDirOf(ctx), UIA_SWITCH_FILE), 'utf8')
     const parsed = JSON.parse(raw)
     return typeof parsed?.enabled === 'boolean' ? parsed.enabled : undefined
   } catch {
