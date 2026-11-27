@@ -652,3 +652,14 @@ archive 自己超过 32MB 时只在面板与日志里提示，插件不再自动
 - 0.2.1：项目管理菜单、按设备列数、独立 Electron 悬浮球、模板步骤进度。
 - 0.2.0：合并托管、跨端同步、桌面原生球、设置整合、控制室交互修复；首次同步取项目并集再回写宿主。
 - 0.1.x：悬浮球控制室 + 手机访问一体化插件首发；去掉侧栏工作台区块（控制室只从悬浮球进入）。
+
+## [android 壳 1.4.5 → 1.4.8] - 2026-11-26 至 2026-11-27
+
+只补安卓壳那四条（CHANGELOG 此前只到 1.4.3 / 1.4.4，1.4.5–1.4.8 一直没有独立条目）；内容按已实测事实写，判据见 `android/README.md` 与 `outputs/2026-11-28/apk-audit/`。
+
+- **1.4.5（versionCode 32）**：附件下载带上 WebView cookie（`Cookie` / `Referer` / `User-Agent`）＋ 下载完成 / 失败广播（`watchDownload` / `reportDownload`、RFC5987 `filename*` 中文名、toast），修掉 pocket 401 造成通知栏「正在下载」永不结束。commit `f86751b`（MainActivity +154/-5）。APK 74,608 → **78,707** 字节。根因见 `docs/安卓附件下载-401-根因-20261126.md`。
+- **1.4.6（versionCode 33）**：图片类附件点击改走原生只读下载链路（同一路径加 `download=1`、服务端强制 `attachment`）＋ 下载完成拉起系统看图（`isImageDownload` / `openDownloadedImage` / `MimeTypeMap` / `image/*`）。commit `85d4a13`（MainActivity +69/-1）。APK **78,707** 字节（与 1.4.5 同字节数）。
+- **1.4.7（versionCode 34）**：所有类型附件统一走系统下载并按 MIME 分流打开（看图 / apk 弹安装 / pdf·office·txt·音频 `ACTION_VIEW` / 其余留通知），`openDownloadedFile` 泛化（`content:` Uri + `FLAG_GRANT_READ_URI_PERMISSION`）；清单加 `REQUEST_INSTALL_PACKAGES`（Manifest +3）。commit `f27fe4b`（MainActivity +92/-18）。APK **78,704** 字节（-3）。
+- **1.4.8（versionCode 35）**：后台保活 + 切回秒恢复 + 后台任务完成播报——新增 `KeepAliveService.java`（前台服务 `dataSync`、常驻通知、`START_STICKY`、`onTaskRemoved` 拉回、9 分钟 Doze 节拍）、新增 `NativeBridge.java`（`@JavascriptInterface` 桥 + 原生 `TextToSpeech` 朗读），Manifest **+5 权限**（`POST_NOTIFICATIONS` / `FOREGROUND_SERVICE` / `FOREGROUND_SERVICE_DATA_SYNC` / `WAKE_LOCK` / `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`）。commit `353c99d`（KeepAliveService 288 行、NativeBridge 239 行、MainActivity +132、Manifest +17）。APK 78,704 → **86,899** 字节（+8,195）。
+- 当前交付件就是 **1.4.8 / versionCode 35**（`android/dist/个人助手-通用版-1.4.8.apk`，86,899 字节）；没有 1.4.9 或更高。`aapt2 dump badging` 实测 1.4.7 = versionCode 34 / 1.4.8 = versionCode 35，`apksigner verify` 两版都是同一把签名密钥（证书 SHA-256 `b081dc7ba8a54c2fa36ab4f8bffcabedcd9558d922dcea8dcac21cfe04b7a333`）。
+- 顺带修一处版本不一致（第 0 步自查发现）：`android/build.ps1` 的默认参数 `-VersionName 1.1.0 -VersionCode 5` 滞后于实际交付的 1.4.8 / 35，这一版把默认值改成 **1.4.8 / 35**（构建时仍可显式给 `-VersionName` / `-VersionCode`）。

@@ -2,7 +2,8 @@
 #
 # 位置：D:\dsh-assistant\android\build.ps1（本目录就是整个 Android 工程的根）
 # 用法：
-#   powershell -ExecutionPolicy Bypass -File D:\dsh-assistant\android\build.ps1 -Flavor generic -VersionName 1.1.0 -VersionCode 5
+#   powershell -ExecutionPolicy Bypass -File D:\dsh-assistant\android\build.ps1 -Flavor generic -VersionName 1.4.8 -VersionCode 35
+#   （默认就是这两项：不传 -VersionName / -VersionCode 时用的就是当前交付的 1.4.8 / 35）
 #   powershell -ExecutionPolicy Bypass -File ... -Sdk D:\android-sdk -Jdk "C:\Program Files\Eclipse Adoptium\jdk-17.0.17.10-hotspot"
 #
 # 工程内路径全部由 $PSScriptRoot 推导；签名密钥不在仓库里：默认取仓库外 D:\dsh-assistant-signing\assistant.keystore
@@ -11,8 +12,8 @@
 # SDK/JDK 找不到时报中文错误并提示用 -Sdk/-Jdk 覆盖。
 param(
     [ValidateSet('personal', 'generic')][string]$Flavor = 'generic',
-    [string]$VersionName = '1.1.0',
-    [int]$VersionCode = 5,
+    [string]$VersionName = '1.4.8',
+    [int]$VersionCode = 35,
     [string]$Sdk = '',
     [string]$Jdk = '',
     [string]$Keystore = '',
