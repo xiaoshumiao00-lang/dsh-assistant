@@ -7,6 +7,7 @@
  * 只读演练：不点击、不输入、不改任何页面状态；拿不到树就如实打印「读不出」并给出退回原因。
  */
 import { probeForeground, UIA_PS1_SCRIPT } from '../src/cu-uia-win.ts'
+import { createUiaSidecar } from '../src/cu-uia-sidecar.ts'
 import { decideControlChannel, pageCacheKey, planChannelFrame, planMarks, resolveChannelSwitch } from '../src/cu-uia-core.ts'
 import { execFile } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -21,6 +22,8 @@ function argOf(name, fallback) {
   return next === undefined ? fallback : next
 }
 const repeat = Math.max(1, Math.min(10, Number(argOf('--repeat', '1')) || 1))
+// --sidecar：走常驻 sidecar（42–48ms/次）；不加则走一次性进程（296–611ms/次，超 120ms 预算）
+const useSidecar = argv.includes('--sidecar')
 const find = String(argOf('--find', '') ?? '').trim()
 
 const stamp = new Date().toISOString()
@@ -29,6 +32,7 @@ const stamp = new Date().toISOString()
 const dir = mkdtempSync(join(tmpdir(), 'dsh-cu-uia-live-'))
 const file = join(dir, 'probe.ps1')
 writeFileSync(file, UIA_PS1_SCRIPT, 'utf8')
+const sidecar = useSidecar ? createUiaSidecar() : null
 const runOnce = (script, args) => new Promise((resolve) => {
   const started = Date.now()
   execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, ...args], { timeout: 8000, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (error, out) => {
@@ -39,7 +43,7 @@ const runOnce = (script, args) => new Promise((resolve) => {
 console.log(`时间戳 ${stamp}`)
 const records = []
 for (let i = 0; i < repeat; i += 1) {
-  const outcome = await probeForeground({ run: runOnce })
+  const outcome = sidecar !== null ? await sidecar.probe(200) : await probeForeground({ run: runOnce })
   const decision = decideControlChannel(outcome)
   const sw = resolveChannelSwitch({ env: process.env.DSH_CU_UIA })
   const marks = decision.enabled ? planMarks(outcome.controls, outcome.window?.rect ?? null) : []
@@ -72,4 +76,5 @@ const typical = records.slice(1).length > 0 ? records.slice(1) : records
 const avg = typical.reduce((sum, r) => sum + r.ms, 0) / typical.length
 console.log(`\n结论：探针 ${avg.toFixed(0)} ms/次（${typical.length} 次平均，${records[0].ms} ms 那次含程序集冷启动）；探针判定 = ${typical[0].enabled ? '可用' : '不启动(' + typical[0].reason + ')'}；开关 = ${typical[0].switch}`)
 if (typical[0].useMarks === false) console.log('按第 ① / ③ 条硬约束：这一帧整段跳过候选清单与编号框，退回纯视觉（零开销，点击参数与改动前逐字节相同）。')
+try { sidecar?.close() } catch {}
 try { rmSync(dir, { recursive: true, force: true }) } catch {}
