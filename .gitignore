@@ -42,6 +42,11 @@ asr-sensevoice/.venv*/
 android/tools/
 android/dist/
 android/assistant.keystore
+# 第 2 步整改 A：签名密钥与一次性口令不再放仓库内。
+# 真身现在在仓库外 D:\dsh-assistant-signing\（assistant.keystore / keystore.pass），
+# 下面这两条挡住任何机器把密钥或口令误塞进仓库目录。
+*.keystore
+keystore.pass
 whisper/
 .artifacts/
 .tihu-preview/
