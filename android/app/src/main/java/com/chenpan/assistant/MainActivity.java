@@ -641,20 +641,85 @@ public class MainActivity extends Activity {
             if (c != null) { try { c.close(); } catch (Throwable ignored) { } }
         }
         if (status == DownloadManager.STATUS_SUCCESSFUL) {
-            // 2026-11-27 需求「点图片 = 下载好再用自带看图应用打开，和下载文件的效果一样」：
-            // 图片下载完成后直接拉起系统看图应用；拉不起来（没装看图应用等）退回原提示。
+            // 2026-11-27 需求「不只是图片，所有附件（apk/docx/pdf/zip/音频/图片…）都通过下载实现」：
+            // 下载完成后按 MIME 分流拉起系统应用——
+            //   图片 → 系统看图；apk → 系统安装界面；pdf/office/txt/音频 → ACTION_VIEW 交给对应应用；
+            //   zip 等没有默认应用的类型 → 保持通知 + toast，绝不把异常抛给广播回调。
+            String mime = downloadMime(id, name);
             if (isImageDownload(id, name)) {
-                if (openDownloadedImage(id, name)) {
+                if (openDownloadedFile(id, name, mime.startsWith("image/") ? mime : "image/*")) {
                     toast("已下载到「下载」并用看图应用打开：" + name);
                 } else {
                     toast("已下载到「下载」：" + name + "\n没找到能看图的应用，点通知栏那条打开");
                 }
+            } else if (APK_MIME.equalsIgnoreCase(mime)) {
+                // apk：MIME 必须钉死 application/vnd.android.package-archive，系统包安装器才接得住
+                if (openDownloadedFile(id, name, APK_MIME)) {
+                    toast("已下载到「下载」，正在打开安装界面：" + name);
+                } else {
+                    toast("已下载到「下载」：" + name + "\n安装界面拉不起来，请在文件管理器里点它安装");
+                }
+            } else if (isDirectOpenableMime(mime)) {
+                // pdf / office / txt / 音频：交给系统里对应的应用（WPS、阅读器、播放器等）
+                if (openDownloadedFile(id, name, mime)) {
+                    toast("已下载到「下载」并尝试打开：" + name);
+                } else {
+                    toast("已下载到「下载」：" + name + "\n没找到能打开它的应用，请在文件管理器中打开");
+                }
             } else {
+                // zip 等没有默认应用的类型：保持通知 + toast，不抛异常
                 toast("已下载到「下载」：" + name + "\n点通知栏那条可以直接打开");
             }
         } else {
             toast("下载失败（" + downloadFailureText(status, reason) + "）\n" + name);
         }
+    }
+
+    /** apk 的 MIME：服务端 content-type、系统下载器记录、安装意图三处都必须用它。 */
+    private static final String APK_MIME = "application/vnd.android.package-archive";
+
+    /**
+     * 这次下载的 MIME：先查系统下载器记的服务端 content-type；是空或 octet-stream 时按落盘名
+     * 扩展名推断（MimeTypeMap 在部分机型上缺 apk/OOXML 的项，所以这几类先查小表兜底）。
+     */
+    private String downloadMime(long id, String name) {
+        DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+        if (dm != null) {
+            try {
+                String mime = dm.getMimeTypeForDownloadedFile(id);
+                if (!TextUtils.isEmpty(mime) && !"application/octet-stream".equalsIgnoreCase(mime)) return mime;
+            } catch (Throwable ignored) {
+                // 查询失败就靠扩展名兜底
+            }
+        }
+        String ext = "";
+        int dot = name == null ? -1 : name.lastIndexOf('.');
+        if (dot >= 0 && dot < name.length() - 1) ext = name.substring(dot + 1).toLowerCase();
+        // 分流的关键类型先查小表：机型上的 MimeTypeMap 缺项时不能落成 octet-stream
+        if ("apk".equals(ext)) return APK_MIME;
+        if ("pdf".equals(ext)) return "application/pdf";
+        if ("doc".equals(ext)) return "application/msword";
+        if ("docx".equals(ext)) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        if ("xls".equals(ext)) return "application/vnd.ms-excel";
+        if ("xlsx".equals(ext)) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+        if ("ppt".equals(ext)) return "application/vnd.ms-powerpoint";
+        if ("pptx".equals(ext)) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+        String guessed = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
+        return TextUtils.isEmpty(guessed) ? "application/octet-stream" : guessed;
+    }
+
+    /**
+     * 这几类 MIME 大概率有系统应用能直接打开（图片已在上面分流）：pdf / office / 文本 / 音频。
+     * zip、未知二进制不在这里——它们没有默认应用，保持通知 + toast。
+     */
+    private boolean isDirectOpenableMime(String mime) {
+        if (TextUtils.isEmpty(mime)) return false;
+        String m = mime.toLowerCase();
+        if (m.startsWith("audio/") || m.startsWith("text/")) return true;
+        if ("application/pdf".equals(m)) return true;
+        if ("application/msword".equals(m) || "application/vnd.ms-excel".equals(m)
+                || "application/vnd.ms-powerpoint".equals(m)) return true;
+        return m.startsWith("application/vnd.openxmlformats-officedocument.");
     }
 
     /** 这次下载是不是图片：先看系统下载器记的 MIME，再看落盘名扩展名（服务端 content-type 与文件名总有一个对得上）。 */
@@ -675,13 +740,15 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 用系统看图应用打开刚下好的图片；返回 false 表示没拉起来（调用方退回 toast 提示）。
+     * 用系统应用打开刚下好的附件（图片看图 / pdf·office·txt·音频 / apk 弹安装界面）；
+     * 返回 false 表示没拉起来（调用方退回 toast 提示，绝不把异常抛给广播回调）。
      *
      * 必须拿 DownloadManager 的 content:// Uri（getUriForDownloadedFile）发 ACTION_VIEW：
      * 直接发 file:// 在 Android 7+ 会抛 FileUriExposedException；content Uri 加
-     * FLAG_GRANT_READ_URI_PERMISSION 把这一条记录的读权限临时授给看图应用，不需要 FileProvider。
+     * FLAG_GRANT_READ_URI_PERMISSION 把这一条记录的读权限临时授给目标应用，不需要 FileProvider。
+     * apk 走同一条路：content Uri + application/vnd.android.package-archive → 系统包安装器。
      */
-    private boolean openDownloadedImage(long id, String name) {
+    private boolean openDownloadedFile(long id, String name, String mime) {
         DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
         if (dm == null) return false;
         Uri uri = null;
@@ -690,18 +757,7 @@ public class MainActivity extends Activity {
         } catch (Throwable ignored) {
         }
         if (uri == null) return false;
-        String mime = null;
-        try {
-            mime = dm.getMimeTypeForDownloadedFile(id);
-        } catch (Throwable ignored) {
-        }
-        if (TextUtils.isEmpty(mime) || "application/octet-stream".equalsIgnoreCase(mime)) {
-            String ext = "";
-            int dot = name == null ? -1 : name.lastIndexOf('.');
-            if (dot >= 0 && dot < name.length() - 1) ext = name.substring(dot + 1).toLowerCase();
-            String guessed = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
-            mime = TextUtils.isEmpty(guessed) ? "image/*" : guessed;
-        }
+        if (TextUtils.isEmpty(mime)) mime = "application/octet-stream";
         try {
             Intent view = new Intent(Intent.ACTION_VIEW);
             view.setDataAndType(uri, mime);

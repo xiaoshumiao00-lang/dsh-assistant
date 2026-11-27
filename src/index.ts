@@ -81,6 +81,9 @@ const FILE_TYPES: Record<string, string> = {
   gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', ico: 'image/x-icon', avif: 'image/avif',
   woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf',
   wasm: 'application/wasm', mp3: 'audio/mpeg', mp4: 'video/mp4', webm: 'video/webm',
+  // 2026-11-27「所有附件都走下载」：apk 必须回对 MIME——DownloadManager 与安卓端下载完成后的
+  // 安装分流都靠它认安装包（缺了会落成 application/octet-stream，安装界面拉不起来）。
+  apk: 'application/vnd.android.package-archive',
 }
 
 const SITE_PREFIX = '/api/worktable/site'

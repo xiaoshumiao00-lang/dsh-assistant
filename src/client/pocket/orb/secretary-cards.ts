@@ -35,8 +35,9 @@
  *      以及 `quoteChipParts` 那三段文案（轮次 + 卡片种类 + 正文开头一小段）。渲染落在
  *      src/client/pocket/orb/SecretaryQuoteChip.tsx（宿主 `conversation.input.right` 槽位）。
  *  13. 附件标记（2026-11-26）：`[[attach:<绝对路径>|<显示名>]]` → parseAttachRefs / stripAttachRefs，
- *      秘书回复卡把它渲染成缩略图或文件条（图片点开走 /api/worktable/file 的 inline，docx 等走
- *      attachment 下载后由手机选「打开方式」），展示与朗读都剔除这串标记（见 §2.6）。
+ *      秘书回复卡把它渲染成缩略图或文件条，展示与朗读都剔除这串标记（见 §2.6）。
+ *      点开（2026-11-27「所有附件都通过下载实现」）：安卓端图片与文件一律走 download=1 系统下载
+ *      （下载完成由 MainActivity 按 MIME 分流拉起系统应用），桌面保持 window.open 新标签页。
  */
 
 import {
@@ -433,19 +434,22 @@ export function attachFileUrl(path: string): string {
 }
 
 /**
- * 安卓端图片点击专用的「下载意图」地址（2026-11-27 需求）：同一条只读路由追加 download=1，
- * 宿主据此把 content-disposition 强制成 attachment，WebView 的 DownloadListener 就会把它交给
- * 系统下载器（带 cookie 的那条原生链路，与文件附件完全同一条），页面原地不动。
- * 不加这个参数时宿主对图片回 inline，WebView 会同页导航去渲染图片，把卡片页整个刷掉。
+ * 安卓端**所有附件**点击统一的「下载意图」地址（2026-11-27 需求「不只是图片，所有附件都通过
+ * 下载实现」）：同一条只读路由追加 download=1，宿主据此把 content-disposition 对**任何类型**
+ * 强制成 attachment，WebView 的 DownloadListener 就会把它交给系统下载器（带 cookie 的那条
+ * 原生链路），页面原地不动；下载完成由 MainActivity 按 MIME 分流拉起系统应用（看图/文档/
+ * apk 安装/…）。
+ * 不加这个参数时宿主对图片/pdf/文档回 inline，WebView 会同页导航去渲染，把卡片页整个刷掉。
  */
 export function attachDownloadUrl(path: string): string {
   return `${attachFileUrl(path)}&download=1`
 }
 
 /**
- * 图片点击要不要改走系统下载器：只看 UA 里有没有 Android。
- * APK 的 WebView（`…; wv) …`）与安卓上的手机浏览器都命中——与文件附件「一律下载」的口径一致；
- * 桌面/其余浏览器一律 false，保持原来的新标签页内联看图，别把桌面改坏。
+ * 附件点击要不要改走系统下载器：只看 UA 里有没有 Android。
+ * APK 的 WebView（`…; wv) …`）与安卓上的手机浏览器都命中——图片与文件同一条判定；
+ * 桌面/其余浏览器一律 false，保持原来的新标签页（图片/pdf 内联看，office 浏览器自己下载），
+ * 别把桌面改坏。
  */
 export function attachOpenViaDownload(userAgent: string): boolean {
   return /\bAndroid\b/i.test(String(userAgent ?? ''))

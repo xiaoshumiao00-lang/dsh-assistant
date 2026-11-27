@@ -14,7 +14,8 @@
  *   6. 朗读按钮只出现在头部，不出在底部；
  *   7. 附件区（2026-11-26 需求）：正文里的 `[[attach:<绝对路径>|<显示名>]]` 渲染成图片缩略图或行式文件条，
  *      放在**折叠区之外**（卡体与脚部之间）——始终可见、不参与折叠高度测量；点开走宿主只读路由
- *      `/api/worktable/file?path=`，手机端由浏览器决定「下载后用哪个应用打开」。
+ *      `/api/worktable/file?path=`。2026-11-27 需求「所有附件都通过下载实现」：安卓端图片与文件
+ *      收敛成同一条判定（openAttach）——一律加 download=1 走系统下载，桌面保持 window.open 新标签页。
  *
  * TTS 状态机不变：换卡停上一条、单击暂停/继续、长按 600ms 从头重读。
  * 已读判据：这条卡被朗读过（含自动朗读，成功或被中断都算）或用户点过卡体/展开全文/复制 → 立刻写进已读集合。
@@ -434,9 +435,27 @@ function useAttachFileSize(url: string): string {
   return text
 }
 
-/** 打开附件：同源只读路由（手机端经 pocket 代理透传，cookie 照旧带过去）。 */
-function openAttachFile(event: any, url: string): void {
+/**
+ * 打开附件（2026-11-27 需求「不只是图片，所有附件——apk、docx、pdf、zip、音频、图片——都通过
+ * 下载实现」）：图片缩略图与文件条收敛成**同一条判定**，不再两套 handler。
+ *
+ * 真机 bug 的根因：APK 的 WebView setSupportMultipleWindows(false)，window.open 变成**同页导航**
+ * 到 /api/worktable/file；服务端对图片/文档回 inline（file-disposition.ts 的
+ * INLINE_FILE_EXTENSIONS）时 WebView 在当前页直接渲染，卡片页被整个刷掉（用户看到的就是
+ * 「APK 重新刷新、重新进」）。
+ *
+ * 修法（不新造 JS 桥，事实上的桥是 WebView 的 DownloadListener）：安卓端（UA 带 Android，含
+ * APK 的 WebView）**任何附件**点击都走 attachDownloadUrl——同一条只读路由加 download=1，
+ * 宿主对所有类型强制回 attachment，WebView 的 DownloadListener 把它交给系统下载器（带 cookie，
+ * MainActivity.startDownload），下载完成由 MainActivity 按 MIME 分流拉起系统应用（看图/文档/
+ * apk 安装/…），页面全程不动。
+ * 桌面/其余浏览器 attachOpenViaDownload 为 false，保持 window.open 新标签页（图片/pdf 内联看，
+ * office 文件浏览器自己下载）。
+ */
+function openAttach(event: any, path: string): void {
   event.stopPropagation()
+  const ua = String((globalThis as any).navigator?.userAgent ?? '')
+  const url = attachOpenViaDownload(ua) ? attachDownloadUrl(path) : attachFileUrl(path)
   try {
     window.open(url, '_blank')
   } catch {
@@ -445,30 +464,11 @@ function openAttachFile(event: any, url: string): void {
 }
 
 /**
- * 点开图片附件（2026-11-27 需求「点图片别再刷新页面，像下载文件一样落盘再用图库看」）。
- *
- * 真机 bug 的根因：图片与文件原来都走 openAttachFile → window.open(url, '_blank')，而 APK 的
- * WebView setSupportMultipleWindows(false)，于是变成**同页导航**到 /api/worktable/file；
- * 服务端对图片回 inline（file-disposition.ts 的 INLINE_FILE_EXTENSIONS），WebView 直接在当前页
- * 渲染图片，卡片页被整个刷掉（用户看到的就是「APK 重新刷新、重新进」）。文件不踩这个坑是因为
- * 服务端对 docx 等回 attachment，WebView 渲染不了，才回调 DownloadListener 走原生下载。
- *
- * 修法（与文件同一条原生下载链路，不新造桥）：安卓端（UA 带 Android，含 APK 的 WebView）
- * 图片点击改用 attachDownloadUrl——同一条只读路由加 download=1，宿主强制回 attachment，
- * WebView 的 DownloadListener 把它交给系统 DownloadManager（带 cookie，MainActivity.startDownload），
- * 下载完成由 MainActivity 用系统看图应用 ACTION_VIEW 打开；页面全程不动。
- * 桌面/其余浏览器 attachOpenViaDownload 为 false，保持原来的 window.open 内联看图。
- */
-function openAttachImage(event: any, path: string, url: string): void {
-  const ua = String((globalThis as any).navigator?.userAgent ?? '')
-  openAttachFile(event, attachOpenViaDownload(ua) ? attachDownloadUrl(path) : url)
-}
-
-/**
  * 附件区里的一件附件（2026-11-26 需求）：
  *   - 图片扩展名（png/jpg/jpeg/gif/webp/bmp/svg）→ 内联缩略图（lazy、圆角、最大高 180px、超出裁剪）；
  *   - 其余（docx/xlsx/pptx/zip/pdf…）→ 行式文件条：类型角标 + 显示名 + 拿得到的大小。
- * 两种都是 44px 以上触控目标，手机上点得中；点开一律走 /api/worktable/file。
+ * 两种都是 44px 以上触控目标，手机上点得中；点开一律走同一个 openAttach（安卓 → 系统下载，
+ * 桌面 → window.open 新标签页），不再图片一套、文件一套。
  */
 export function ReplyAttachmentPiece({ attachment }: { attachment: AttachRef }): any {
   const url = attachFileUrl(attachment.path)
@@ -486,7 +486,7 @@ export function ReplyAttachmentPiece({ attachment }: { attachment: AttachRef }):
         data-dsh-scard="attach-image"
         title={`打开图片：${attachment.name}`}
         aria-label={`打开图片：${attachment.name}`}
-        onClick={(event: any) => openAttachImage(event, attachment.path, url)}
+        onClick={(event: any) => openAttach(event, attachment.path)}
       >
         <img
           data-dsh-scard="attach-thumb"
@@ -509,7 +509,7 @@ export function ReplyAttachmentPiece({ attachment }: { attachment: AttachRef }):
       data-dsh-scard-attach-ext={badge}
       title={`打开附件：${attachment.name}`}
       aria-label={`打开附件：${attachment.name}`}
-      onClick={(event: any) => openAttachFile(event, url)}
+      onClick={(event: any) => openAttach(event, attachment.path)}
     >
       <span data-dsh-scard="attach-badge" aria-hidden="true">{badge}</span>
       <span data-dsh-scard="attach-name">{attachment.name}</span>

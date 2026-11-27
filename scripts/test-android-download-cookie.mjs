@@ -9,6 +9,9 @@
  * 这条链路的修复只能落在 Java（android/app/src/main/java/com/chenpan/assistant/MainActivity.java），
  * 本机没有 Android 运行时，所以这里做**源码守卫**：把「必须存在的那几行」钉住，
  * 防止以后重构 MainActivity 时又把 Cookie 头 / 文件名解析 / 失败提示静默删掉。
+ * 2026-11-27 起守卫范围扩到「所有附件下载完成后按 MIME 分流拉起系统应用」：
+ * 图片 → 看图；apk → 安装界面（application/vnd.android.package-archive + REQUEST_INSTALL_PACKAGES）；
+ * pdf/office/txt/音频 → ACTION_VIEW；zip 等无默认应用的类型保持通知 + toast。
  * 它不替代真机验证，真机步骤见 docs/安卓附件下载-401-根因-20261126.md。
  *
  *   node scripts/test-android-download-cookie.mjs
@@ -113,26 +116,59 @@ case_('成功与失败都有 toast（旧版失败时一声不响，通知栏永�
   }
 })
 
-/* ---------- 5. 图片下载完成 → 系统看图应用（2026-11-27 需求） ---------- */
+/* ---------- 5. 下载完成 → 按 MIME 分流拉起系统应用（2026-11-27「所有附件都走下载」） ---------- */
 
-case_('reportDownload 成功分支：图片走 openDownloadedImage，其余保持原 toast', () => {
+case_('reportDownload 成功分支：图片 / apk / 文档·音频 / 其他 四路分流，其他保持原 toast', () => {
   const body = methodBody('reportDownload')
   assert.match(body, /STATUS_SUCCESSFUL/, '成功分支还在')
-  assert.match(body, /isImageDownload\(id, name\)/, '成功时必须先判是不是图片')
-  assert.match(body, /openDownloadedImage\(id, name\)/, '图片必须尝试拉起看图应用')
+  assert.match(body, /downloadMime\(id, name\)/, '成功时必须先定 MIME')
+  assert.match(body, /isImageDownload\(id, name\)/, '图片分流还在')
+  assert.match(body, /APK_MIME\.equalsIgnoreCase\(mime\)/, '必须有 apk 分流')
+  assert.match(body, /openDownloadedFile\(id, name, APK_MIME\)/, 'apk 必须用钉死的安装 MIME 拉起（弹安装界面）')
+  assert.match(body, /isDirectOpenableMime\(mime\)/, '必须有 pdf/office/txt/音频分流')
+  assert.match(body, /openDownloadedFile\(id, name, mime\)/, '文档/音频用推断出的 MIME 拉起')
   assert.match(body, /toast\("已下载到「下载」：" \+ name \+ "\\n点通知栏那条可以直接打开"\)/,
-    '非图片的成功提示一字不许动（文件仍保持通知 + toast）')
+    'zip 等无默认应用类型的成功提示一字不许动（仍保持通知 + toast）')
 })
 
-case_('openDownloadedImage：ACTION_VIEW + content Uri + 读权限授权，不许 file://', () => {
-  const body = methodBody('openDownloadedImage')
-  assert.match(body, /Intent\.ACTION_VIEW/, '必须用 ACTION_VIEW 拉起系统看图应用')
-  assert.match(body, /setDataAndType\(uri, mime\)/, '必须 setDataAndType（图片 MIME）')
+case_('downloadMime：服务端 MIME 优先，octet-stream 按扩展名小表 + MimeTypeMap 兜底', () => {
+  const body = methodBody('downloadMime')
+  assert.match(body, /getMimeTypeForDownloadedFile\(id\)/, '先查系统下载器记的 MIME')
+  assert.match(body, /application\/octet-stream/, 'octet-stream 必须当「没认出来」处理')
+  assert.match(body, /"apk"\.equals\(ext\)\) return APK_MIME/, 'apk 扩展名必须映射到安装 MIME')
+  for (const pair of [
+    ['pdf', 'application/pdf'],
+    ['doc', 'application/msword'],
+    ['docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+    ['xls', 'application/vnd.ms-excel'],
+    ['xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+    ['ppt', 'application/vnd.ms-powerpoint'],
+    ['pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation'],
+  ]) {
+    assert.equal(body.includes(`"${pair[0]}".equals(ext)) return "${pair[1]}"`), true, `扩展名小表要认 ${pair[0]}`)
+  }
+  assert.match(body, /MimeTypeMap\.getSingleton\(\)\.getMimeTypeFromExtension/, '小表之外交给 MimeTypeMap（txt/mp3/图片靠它）')
+})
+
+case_('isDirectOpenableMime：pdf / office / text / audio 直接打开，zip 不在列', () => {
+  const body = methodBody('isDirectOpenableMime')
+  assert.match(body, /audio\//, '音频必须可直接打开')
+  assert.match(body, /text\//, 'txt 等文本必须可直接打开')
+  assert.match(body, /application\/pdf/, 'pdf 必须可直接打开')
+  assert.match(body, /application\/msword/, 'doc 必须可直接打开')
+  assert.match(body, /openxmlformats-officedocument/, 'docx/xlsx/pptx 必须可直接打开')
+  assert.equal(body.includes('"application/zip"'), false, 'zip 没有默认应用，不许进直接打开名单')
+})
+
+case_('openDownloadedFile：ACTION_VIEW + content Uri + 读权限授权，不许 file://', () => {
+  const body = methodBody('openDownloadedFile')
+  assert.match(body, /Intent\.ACTION_VIEW/, '必须用 ACTION_VIEW 拉起系统应用')
+  assert.match(body, /setDataAndType\(uri, mime\)/, '必须 setDataAndType（按分流 MIME）')
   assert.match(body, /getUriForDownloadedFile\(id\)/, '必须用 DownloadManager 的 content:// Uri')
-  assert.match(body, /FLAG_GRANT_READ_URI_PERMISSION/, 'content Uri 必须临时授权给看图应用')
+  assert.match(body, /FLAG_GRANT_READ_URI_PERMISSION/, 'content Uri 必须临时授权给目标应用')
   assert.match(body, /FLAG_ACTIVITY_NEW_TASK/, '广播回调里起 Activity 必须 NEW_TASK')
   assert.equal(body.includes('"file://'), false, 'Android 7+ 直接 file:// 会 FileUriExposedException')
-  assert.match(body, /ActivityNotFoundException/, '没装看图应用要接得住（退回 toast）')
+  assert.match(body, /ActivityNotFoundException/, '没装对应应用要接得住（退回 toast，不许抛异常）')
 })
 
 case_('isImageDownload：MIME image/ 优先，扩展名兜底', () => {
@@ -156,6 +192,11 @@ case_('清单仍然允许明文 http（手机入口是 http://IP:7080，没有�
   assert.match(manifest, /android\.permission\.INTERNET/)
   // WRITE_EXTERNAL_STORAGE 只对 API<=28 需要；写死 maxSdkVersion=28 是有意为之
   assert.match(manifest, /WRITE_EXTERNAL_STORAGE[^>]*android:maxSdkVersion="28"/)
+})
+
+case_('清单声明 REQUEST_INSTALL_PACKAGES（apk 安装界面的门票，Android 8+ 必需）', () => {
+  assert.match(manifest, /android\.permission\.REQUEST_INSTALL_PACKAGES/,
+    '没有它 ACTION_VIEW 递不到 PackageInstaller，apk 安装界面弹不出来')
 })
 
 process.exit(failures === 0 ? 0 : 1)
