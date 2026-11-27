@@ -1646,7 +1646,9 @@ export function planHistoryScrollRestore(
 
 /** 守护循环：补偿之后仍可能有异步高度增长（折叠卡 0→35px、图片晚到、折叠展开）把锚点顶走，
  * 而手机触摸/惯性滑动期间浏览器原生 scroll anchoring 被抑制，没人兜底——视图就会落到新加载批次顶部。
- * 所以补偿后一小段时间内逐帧核对锚点行的视口偏移，偏了就再补 scrollTop，直到安静 quietFrames 帧或到 maxMs 上限。 */
+ * 所以加载**开始前**就起守护，逐帧核对锚点行的视口偏移：锚点上方长了就补 scrollTop 钉回去；
+ * 但 scrollTop 被外部改过（用户自己滑 / 原生锚定已补）时只重设期望、不重复补——绝不拽回用户。
+ * 直到安静 quietFrames 帧（且已过 MIN_MS）或到 maxMs 上限收工。 */
 export const HISTORY_GUARD_MAX_MS = 600
 export const HISTORY_GUARD_QUIET_FRAMES = 8
 /** 最早收工时间：异步高度变化通常在前 300ms 内到达，早于它不许判「安静」。 */
@@ -1660,6 +1662,9 @@ export interface HistoryScrollGuardOptions {
   anchorKey: string
   /** 期望的锚点行视口偏移（相对滚动口顶部，px）。 */
   expectOffset: number
+  /** 拿 expectOffset 那一刻的 scrollTop（缺省读当前值）。守护用「和上一帧比 scrollTop 有没有被
+   *  外部改过」来判断用户自己滚动 / 原生锚定已补偿，所以起点要跟 expectOffset 同一次快照。*/
+  startScrollTop?: number
   maxMs?: number
   quietFrames?: number
   missingGraceFrames?: number
@@ -1682,7 +1687,16 @@ export function startHistoryScrollGuard(options: HistoryScrollGuardOptions): () 
   const maxMs = Math.max(1, Number(options.maxMs ?? HISTORY_GUARD_MAX_MS) || HISTORY_GUARD_MAX_MS)
   const quietFrames = Math.max(1, Number(options.quietFrames ?? HISTORY_GUARD_QUIET_FRAMES) || HISTORY_GUARD_QUIET_FRAMES)
   const graceFrames = Math.max(1, Number(options.missingGraceFrames ?? HISTORY_GUARD_MISSING_GRACE_FRAMES) || HISTORY_GUARD_MISSING_GRACE_FRAMES)
-  const expectOffset = Number(options.expectOffset) || 0
+  let expectOffset = Number(options.expectOffset) || 0
+  const startTop = options.startScrollTop === undefined
+    ? (Number(scroller?.scrollTop) || 0)
+    : (Number(options.startScrollTop) || 0)
+  // 期望屏幕偏移 + 「上一次看到的 scrollTop」。逐帧核对锚点屏幕偏移；但只要 scrollTop 被外部改过
+  // （用户自己滑 / 浏览器原生锚定已经补过），就说明这份位移已经被处理过了——把期望偏移重设成当前值，
+  // 一个像素都不重复补：用户自己的滑动（含 touchend 后的惯性滑动，没有手势事件）绝不会被拽回，
+  // 原生 scroll anchoring 已补偿的 prepend 也不会被再补一次。
+  let lastTop = startTop
+  let lastHeight = Number(scroller?.scrollHeight) || 0
   const startedAt = now()
   let quiet = 0
   let missing = 0
@@ -1719,14 +1733,32 @@ export function startHistoryScrollGuard(options: HistoryScrollGuardOptions): () 
       return true
     }
     missing = 0
-    const drift = rowTop - scrollerTop - expectOffset
-    if (Math.abs(drift) >= 1) {
+    const scrollTop = Number(scroller?.scrollTop) || 0
+    const scrollHeight = Number(scroller?.scrollHeight) || 0
+    const anchorOffset = rowTop - scrollerTop
+    const heightChanged = Math.abs(scrollHeight - lastHeight) > 0.5
+    const scrollChanged = Math.abs(scrollTop - lastTop) > 0.5
+    if (scrollChanged && !heightChanged) {
+      // 内容高度没变、scrollTop 变了 = 用户自己滑（含 touchend 后的惯性滑动，没有手势事件）：
+      // 位移就是用户要的，重设期望，一个像素都不拽回。用户还在滑就不算「安静」——晚到的图片
+      // 仍要被守住，所以 quiet 归零、继续守到 maxMs。
+      expectOffset = anchorOffset
       quiet = 0
-      // 同步写 scrollTop：MO 回调就跑在当前任务尾部，能在**同一帧**内把位置纠回来，不会画出跳帧
-      scroller.scrollTop = (Number(scroller.scrollTop) || 0) + drift
     } else {
-      quiet += 1
+      // 增长帧（含浏览器原生 scroll anchoring 已补过一部分的）：补它没补干净的残余，把锚点钉回期望位置。
+      // 原生锚定跑在布局里（这里读 rect 会先触发布局），所以它已经补的那份不会再被重复补。
+      const drift = anchorOffset - expectOffset
+      if (Math.abs(drift) >= 1) {
+        quiet = 0
+        const floor = Math.max(0, scrollHeight - (Number(scroller?.clientHeight) || 0))
+        // 同步写 scrollTop：MO 回调就跑在当前任务尾部，能在**同一帧**内把增长补回来，不会画出跳帧
+        scroller.scrollTop = Math.max(0, Math.min(floor, scrollTop + drift))
+      } else {
+        quiet += 1
+      }
     }
+    lastTop = Number(scroller?.scrollTop) || 0
+    lastHeight = scrollHeight
     if (now() - startedAt >= maxMs) { stop(); return false }
     if (quiet >= quietFrames && now() - startedAt >= HISTORY_GUARD_MIN_MS) { stop(); return false }
     return true
@@ -3082,6 +3114,11 @@ export const secretaryCardsTestSurface = {
   pickHistoryAnchorKey,
   captureHistoryScrollSnapshot,
   HISTORY_CARD_ROW_SELECTOR,
+  startHistoryScrollGuard,
+  HISTORY_GUARD_MAX_MS,
+  HISTORY_GUARD_QUIET_FRAMES,
+  HISTORY_GUARD_MIN_MS,
+  HISTORY_GUARD_MISSING_GRACE_FRAMES,
   CARD_WINDOW_DEFAULT,
   CARD_PAGE_SIZE,
   CARD_RENDER_CAP,

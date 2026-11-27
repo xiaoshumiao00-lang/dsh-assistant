@@ -38,7 +38,7 @@ import {
   latestRealUserCardRef, noticeArrivalStore, noticeCardExpired, noticeCardSpeechKey, nearestNoticeExpiryMs, NOTICE_CARD_TTL_MS,
   parseNoticeCardBody, parseSessionRefs, parseUserCardBody, secretaryPager,
   secretaryQuoteStore, stripSessionRefs, tagSecretaryCompactHintRows, clearLatestTurnProcessTags, tagLatestTurnProcessRows, userCardSpeechKey, EARLIER_HINT_TEXT, SCROLL_TOP_THRESHOLD_PX,
-  captureHistoryScrollSnapshot, planHistoryScrollRestore, shouldExpandOnScroll, startHistoryScrollGuard,
+  captureHistoryScrollSnapshot, planHistoryScrollRestore, shouldExpandOnScroll, startHistoryScrollGuard, HISTORY_FOLLOW_BOTTOM_PX,
   type PagerDomCard, type SecretaryCardRow, type UserCardAttachment, type UserCardBodyBlock,
 } from './secretary-cards.ts'
 import { peekSecretarySessionId } from '../../assistant-entry.ts'
@@ -499,6 +499,11 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
       // 改成锚点口径（planHistoryScrollRestore）：无手势时只复原锚点屏幕偏移（宿主已补偿的 prepend 不重复补），
       // 有手势时只补偿锚点内容坐标位移（用户自己的滚动不拽回）；只有加载前后都贴底（< 80px）才跟随最新。
       const before = captureHistoryScrollSnapshot(el)
+      // 加载前贴底（距底 < HISTORY_FOLLOW_BOTTOM_PX）=「跟随最新」那种情形：交给一次性 plan 钉地板；
+      // 其余（在读历史）= 锚点情形：交给守护循环连续守，plan 一个像素都不写（它分不清
+      // 「用户惯性滑动」和「内容增长」，写了就会把用户拽回加载前的位置）。
+      const wasAtBottom = Math.max(0, before.scrollHeight - before.clientHeight) - before.scrollTop < HISTORY_FOLLOW_BOTTOM_PX
+      const guardActive = !wasAtBottom && before.anchorKey !== null && before.anchorOffset !== null
       let userGestured = false
       const noteGesture = (): void => { userGestured = true }
       const gestureEvents = ['touchstart', 'touchmove', 'wheel', 'pointerdown', 'keydown'] as const
@@ -509,21 +514,23 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
       }
       // 守护循环：必须从加载**开始前**就起——补偿是一次性的，之后折叠卡长出来、图片晚到、折叠展开
       // 还会把锚点顶走；手机触摸/惯性滑动期间浏览器原生 scroll anchoring 又被抑制，这里是唯一防线。
+      // 口径（见 startHistoryScrollGuard）：逐帧把锚点屏幕偏移钉回加载前的位置；一旦检测到 scrollTop
+      // 被外部改过（用户自己滑 / 原生锚定已补偿），就把期望重设成当前值、一个像素都不重复补——
+      // 所以用户惯性滑动（touchend 后没有手势事件）绝不会被拽回，原生锚定补过的也不会再补一次。
       // 翻卡/重画期间锚点行会短暂消失，guard 容忍若干帧；上限 1.2s，安静 8 帧且过 300ms 自行收工。
       guardStopRef.current?.()
       guardStopRef.current = null
-      if (before.anchorKey !== null && before.anchorOffset !== null) {
+      if (guardActive) {
         const stopGuard = startHistoryScrollGuard({
           scroller: el,
-          anchorKey: before.anchorKey,
-          expectOffset: before.anchorOffset,
+          anchorKey: before.anchorKey as string,
+          expectOffset: before.anchorOffset as number,
+          startScrollTop: before.scrollTop,
           maxMs: 1200,
         })
         const stopGuardNow = (): void => { guardStopRef.current?.(); guardStopRef.current = null }
-        for (const type of gestureEvents) el.addEventListener(type, stopGuardNow, { passive: true, capture: true })
         document.addEventListener('visibilitychange', stopGuardNow)
         guardStopRef.current = (): void => {
-          for (const type of gestureEvents) el.removeEventListener(type, stopGuardNow, { capture: true })
           document.removeEventListener('visibilitychange', stopGuardNow)
           stopGuard()
         }
@@ -531,8 +538,11 @@ export function SecretaryUserCards({ api }: { api?: OrbApi }): any {
       void Promise.resolve(pager.expandOlder()).then(async () => {
         await settleScrollHeight(el)
         const after = captureHistoryScrollSnapshot(el, before.anchorKey)
-        const plan = planHistoryScrollRestore(before, after, { userGestured })
-        if (plan.scrollTop !== null && Math.abs(plan.scrollTop - el.scrollTop) > 0.5) el.scrollTop = plan.scrollTop
+        // 锚点情形由守护循环连续接管（它逐帧补），这里不再写——避免与守护叠加/把用户拽回。
+        if (!guardActive) {
+          const plan = planHistoryScrollRestore(before, after, { userGestured })
+          if (plan.scrollTop !== null && Math.abs(plan.scrollTop - el.scrollTop) > 0.5) el.scrollTop = plan.scrollTop
+        }
         clearGestureWatch()
         expandingRef.current = false
       }, () => { clearGestureWatch(); expandingRef.current = false })

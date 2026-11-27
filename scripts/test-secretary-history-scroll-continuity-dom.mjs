@@ -149,35 +149,43 @@ async function installHelpers() {
       })
     }
 
-    // 照抄 SecretaryUserCard.tsx:494-515 expandOlder 的滚动处理（doExpand = pager.expandOlder 的 DOM 效果）
+    // 照抄 SecretaryUserCard.tsx expandOlder 的滚动处理（doExpand = pager.expandOlder 的 DOM 效果）
     let activeGuardStop = null
     async function expandOlderWithAnchor(doExpand) {
       const el = scroller()
       const before = st.captureHistoryScrollSnapshot(el)
+      // 与组件同一判据：加载前贴底 → 一次性 plan 钉地板；在读历史 → 守护循环连续守，plan 不写
+      const wasAtBottom = Math.max(0, before.scrollHeight - before.clientHeight) - before.scrollTop < st.HISTORY_FOLLOW_BOTTOM_PX
+      const guardActive = !wasAtBottom && before.anchorKey !== null && before.anchorOffset !== null
       let userGestured = false
       const noteGesture = () => { userGestured = true }
       const gestureEvents = ['touchstart', 'touchmove', 'wheel', 'pointerdown', 'keydown']
       const gestureOptions = { passive: true, capture: true }
       for (const type of gestureEvents) el.addEventListener(type, noteGesture, gestureOptions)
       const clearGestureWatch = () => { for (const type of gestureEvents) el.removeEventListener(type, noteGesture, gestureOptions) }
-      // 守护循环（照抄组件实现）：从加载前就起，容忍锚点行短暂消失，逐帧钉住锚点屏幕位置
+      // 守护循环（照抄组件实现）：从加载前就起，容忍锚点行短暂消失，守锚点行的内容坐标（只补增长）
       if (activeGuardStop !== null) { activeGuardStop(); activeGuardStop = null }
-      if (before.anchorKey !== null && before.anchorOffset !== null) {
-        const stopGuard = st.startHistoryScrollGuard({ scroller: el, anchorKey: before.anchorKey, expectOffset: before.anchorOffset, maxMs: 1200 })
-        const stopGuardNow = () => { if (activeGuardStop !== null) { activeGuardStop(); activeGuardStop = null } }
-        for (const type of gestureEvents) el.addEventListener(type, stopGuardNow, { passive: true, capture: true })
-        activeGuardStop = () => {
-          for (const type of gestureEvents) el.removeEventListener(type, stopGuardNow, { capture: true })
-          stopGuard()
-        }
+      if (guardActive) {
+        const stopGuard = st.startHistoryScrollGuard({
+          scroller: el,
+          anchorKey: before.anchorKey,
+          expectOffset: before.anchorOffset,
+          startScrollTop: before.scrollTop,
+          maxMs: 1200,
+        })
+        activeGuardStop = () => { stopGuard() }
       }
       await Promise.resolve(doExpand())
       await settleScrollHeight(el)
       const after = st.captureHistoryScrollSnapshot(el, before.anchorKey)
       const plan = st.planHistoryScrollRestore(before, after, { userGestured })
-      if (plan.scrollTop !== null && Math.abs(plan.scrollTop - el.scrollTop) > 0.5) el.scrollTop = plan.scrollTop
+      let applied = null
+      if (!guardActive && plan.scrollTop !== null && Math.abs(plan.scrollTop - el.scrollTop) > 0.5) {
+        el.scrollTop = plan.scrollTop
+        applied = plan.scrollTop
+      }
       clearGestureWatch()
-      return { before, after, plan }
+      return { before, after, plan, applied, guardActive }
     }
 
     // 翻卡：把 rank 最高的 count 张折叠行**替换成**完整卡（模拟 React unmount 折叠行 + mount 完整卡）
@@ -341,7 +349,7 @@ for (const nativeAnchor of [true, false]) {
   const { anchor, before, after, offsetDrift, result, drift } = await scenario('flip-below', 90, 30, 200, async () => {
     return page.evaluate(async () => {
       const out = await window.__mk.expandOlderWithAnchor(async () => { window.__mk.flipNewestCollapsed(30) })
-      return { reason: out.plan.reason, delta: out.plan.delta, wrote: out.plan.scrollTop }
+      return { reason: out.plan.reason, delta: out.plan.delta, wrote: out.applied, guard: out.guardActive }
     })
   }, { nativeAnchor })
   check(`场景①${nativeAnchor ? '（原生锚定开）' : '（原生锚定关=手机滑动态）'} 翻卡在锚点下方：锚点偏移逐像素不变`, offsetDrift !== null && offsetDrift <= 1 && (drift.drift === null || drift.drift <= 1),
@@ -353,7 +361,7 @@ for (const nativeAnchor of [true, false]) {
   const { anchor, before, after, offsetDrift, result, drift } = await scenario('flip-crossing', 40, 30, 200, async () => {
     return page.evaluate(async () => {
       const out = await window.__mk.expandOlderWithAnchor(async () => { window.__mk.flipNewestCollapsed(40) })
-      return { reason: out.plan.reason, delta: out.plan.delta, wrote: out.plan.scrollTop }
+      return { reason: out.plan.reason, delta: out.plan.delta, wrote: out.applied, guard: out.guardActive }
     })
   }, { nativeAnchor })
   check(`场景②${nativeAnchor ? '（原生锚定开）' : '（原生锚定关）'} 翻卡跨过锚点（锚点行被翻、上方增长）：锚点偏移逐像素不变`, offsetDrift !== null && offsetDrift <= 1 && (drift.drift === null || drift.drift <= 1),
@@ -368,7 +376,7 @@ for (const nativeAnchor of [true, false]) {
       const out = await window.__mk.expandOlderWithAnchor(async () => { window.__mk.flipNewestCollapsed(30) })
       await new Promise((r) => setTimeout(r, 130)) // 插件扫描去抖后给 prepend 壳渲染折叠卡 → 锚点上方生长
       window.__mk.renderCollapsedIntoPrepended()
-      return { reason: out.plan.reason, delta: out.plan.delta, wrote: out.plan.scrollTop }
+      return { reason: out.plan.reason, delta: out.plan.delta, wrote: out.applied, guard: out.guardActive }
     })
   }, { nativeAnchor })
   check(`场景③${nativeAnchor ? '（原生锚定开）' : '（原生锚定关）'} 宿主 prepend + 插件异步渲染新卡（锚点上方生长）：锚点偏移逐像素不变`, offsetDrift !== null && offsetDrift <= 1 && (drift.drift === null || drift.drift <= 1),
@@ -386,7 +394,7 @@ for (const nativeAnchor of [true, false]) {
       const above = anchorEl === null ? [] : cards.filter((c) => c.compareDocumentPosition(anchorEl) & Node.DOCUMENT_POSITION_PRECEDING)
       const target = above[above.length - 1]
       if (target) window.__mk.growCardByKey(target.getAttribute('data-dsh-scard-key'), 300)
-      return { reason: out.plan.reason, delta: out.plan.delta, wrote: out.plan.scrollTop, grewAbove: target?.getAttribute('data-dsh-scard-key') ?? null }
+      return { reason: out.plan.reason, delta: out.plan.delta, wrote: out.applied, guard: out.guardActive, grewAbove: target?.getAttribute('data-dsh-scard-key') ?? null }
     }, anchorKey)
   }, { nativeAnchor })
   check(`场景④${nativeAnchor ? '（原生锚定开）' : '（原生锚定关）'} 加载后锚点上方图片晚到撑高 300px：锚点偏移逐像素不变（守住）`, offsetDrift !== null && offsetDrift <= 1 && (drift.drift === null || drift.drift <= 1),
@@ -404,13 +412,13 @@ for (const nativeAnchor of [true, false]) {
   const before = await anchorOffset(anchor)
   const r1 = await page.evaluate(async () => {
     const out = await window.__mk.expandOlderWithAnchor(async () => { window.__mk.flipNewestCollapsed(30) })
-    return { reason: out.plan.reason, wrote: out.plan.scrollTop }
+    return { reason: out.plan.reason, wrote: out.applied, guard: out.guardActive }
   })
   await page.waitForTimeout(200)
   const mid = await anchorOffset(anchor)
   const r2 = await page.evaluate(async () => {
     const out = await window.__mk.expandOlderWithAnchor(async () => { window.__mk.flipNewestCollapsed(30) })
-    return { reason: out.plan.reason, wrote: out.plan.scrollTop }
+    return { reason: out.plan.reason, wrote: out.applied, guard: out.guardActive }
   })
   await page.waitForTimeout(600)
   const after = await anchorOffset(anchor)
@@ -440,7 +448,7 @@ for (const nativeAnchor of [true, false]) {
       const anchorEl = document.querySelector(`[data-dsh-scard-key="${beforeSnap.anchorKey}"]`)
       if (anchorEl) anchorEl.closest('.flowItem')?.remove() // 宿主整棵重画：锚点行被抹掉
     })
-    return { reason: out.plan.reason, wrote: out.plan.scrollTop, beforeAnchor: beforeSnap.anchorKey }
+    return { reason: out.plan.reason, wrote: out.applied, guard: out.guardActive, beforeAnchor: beforeSnap.anchorKey }
   })
   const after = await page.evaluate(() => {
     const el = document.querySelector('[data-conversation-scroll]')
@@ -449,6 +457,45 @@ for (const nativeAnchor of [true, false]) {
   // 锚点丢失 → keep：插件一个像素都不写；scrollTop 留在原地（不跳到批次顶部 ≈0，也不跳到任何一行）
   check('场景⑥（原生锚定关）锚点行被抹掉 → keep 不写滚动（不跳到任何一行）', res.reason === 'keep' && res.wrote === null && Math.abs(after.scrollTop - before.scrollTop) <= 40,
     `scrollTop ${before.scrollTop}→${after.scrollTop} reason=${res.reason} wrote=${res.wrote}`)
+}
+
+/* 场景⑦：加载在飞期间用户自己的惯性滑动（touchend 后没有手势事件）→ 守护循环绝不能把用户
+ * 自己的滑动也钉死（那会变成「加载时滑动卡住」）。用户滑动分量必须原样保留，只补内容增长。*/
+{
+  await page.setContent(pageHtml(90, 30))
+  await installHelpers()
+  await page.addStyleTag({ content: '[data-conversation-scroll] { overflow-anchor: none !important; }' })
+  await page.evaluate(() => { document.querySelector('[data-conversation-scroll]').scrollTop = 400 })
+  await page.waitForTimeout(50)
+  const anchor = await pickAnchor()
+  const before = await anchorOffset(anchor)
+  const res = await page.evaluate(async () => {
+    const el = document.querySelector('[data-conversation-scroll]')
+    const startTop = el.scrollTop
+    const out = await window.__mk.expandOlderWithAnchor(async () => {
+      // 惯性滑动：8 帧、每帧上滚 20px（160px），不派发任何手势事件
+      for (let i = 0; i < 8; i += 1) {
+        el.scrollTop -= 20
+        await new Promise((r) => requestAnimationFrame(r))
+      }
+      window.__mk.flipNewestCollapsed(30) // 翻卡增长在锚点下方（与用户滑动叠加）
+      // 用户滑完之后又来一批锚点上方的异步增长（宿主 prepend 壳 + 插件补卡）
+      window.__mk.hostPrepend(20, false)
+      await new Promise((r) => setTimeout(r, 130))
+      window.__mk.renderCollapsedIntoPrepended()
+    })
+    const grown = el.scrollHeight
+    return { startTop, endTop: el.scrollTop, grown, reason: out.plan.reason, applied: out.applied, guardActive: out.guardActive }
+  })
+  await page.waitForTimeout(600)
+  const after = await anchorOffset(anchor)
+  // 唯一判据 = 锚点行的屏幕位置。用户自己上滚 160px 必须保留（锚点随之下移 160px），
+  // 锚点上方的异步增长必须被补掉（不额外下移）→ 最终偏移应恰为 before+160。
+  // 若守护钉死用户：偏移停在 −10；若增长没补：偏移约 850。两者都会让这条失败。
+  const expected = before.anchorOffset === null ? null : before.anchorOffset + 160
+  const anchorOk = after.anchorOffset !== null && expected !== null && Math.abs(after.anchorOffset - expected) <= 8
+  check('场景⑦ 加载期间惯性滑动 + 锚点上方异步增长：用户滑动原样保留、增长被补（不钉死也不跳）', anchorOk,
+    `锚点偏移 ${before.anchorOffset}→${after.anchorOffset}（期望 ${expected}）scrollTop ${res.startTop}→${res.endTop}（scrollHeight ${res.grown}）plan=${JSON.stringify(res)}`)
 }
 
 await browser.close()
