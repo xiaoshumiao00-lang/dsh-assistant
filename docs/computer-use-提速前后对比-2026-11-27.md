@@ -224,3 +224,64 @@ npm run check                                # EXIT 0（lib 产物未变，本�
 - 回退照旧：`git revert --no-edit b557cde`，或删新增文件 + 开关关（`DSH_CU_UIA=0` / profile `{"enabled": false}`）。
 - 本轮**没有重启宿主**：新产物都是独立模块与脚本（`lib/*` 未变），重启没有可加载的新东西，
   却会中断这条会话，所以在报告落盘前不做。
+
+## 10. 本段续做：编号框合成器 + 插件侧观察帧包装（仍未接线，等确认）
+
+按批准范围，本段只做「让编号图能出现在模型看到的那一帧」的两块代码，**vendor 三处出口一行未动**。
+
+### 10.1 编号框图像合成器（`src/cu-uia-overlay.ts`，新增）
+
+| 项 | 值 |
+| --- | --- |
+| 依赖 | 只用 `node:zlib`，不引任何原生包（宿主没给 sharp） |
+| PNG 支持 | 8 位、非隔行、颜色类型 0/2/3/4/6（含 tRNS 调色板透明）；别的形状抛 `OverlayUnsupportedError` |
+| 画法 | 2px 洋红框 + 深色数字底片 + 3×5 点阵数字放大 2 倍（编号 1..40） |
+| 实测 | 真实 900×900 截图画 **40 个编号 = 16.6 ms**，产出 34 KB、尺寸不变 |
+| 零开销路径 | `drawn=0`（没有可画编号 / 框太小）→ **返回原 buffer 本体**，不复制不编码 |
+| 单测 | `scripts/test-cu-uia-overlay.mjs` **7/7 通过**（编解码闭环、框与编号落点、越界裁剪、原帧原样、非法形状、缩放换算、真图 40 编号） |
+
+### 10.2 插件侧观察帧包装（`src/cu-uia-observe.ts`，新增）
+
+依据（宿主源码只读核对）：`@deepseek-ai/dsh-tools` 的执行链是
+`tools/pre-execute` → **`tools/execute`（around-dispatch）** → `tools/post-execute` → `tools/result`；
+而 `vendor/computer-use` 的 screenshot/click 结果只回 **文件路径**（`paths` / `screens`），
+图像在渲染时才从磁盘读。**所以插件侧只要在 around 位把路径换成编号版 PNG，模型看到的就是编号帧，vendor 不用改。**
+
+| 项 | 值 |
+| --- | --- |
+| 改什么 | 只换 `paths` 与 `screens[].path` → 临时目录 `dsh-cu-marks/` 下的 `.marks.png` 副本 |
+| 不改什么 | 不新增字段（宿主 `output.schema` 是 `additionalProperties:false`，加字段会被拒）、**坐标字段一个都不碰**、原帧文件零字节改动（单测用 sha256 比对过） |
+| 兜底 | 开关关 / 探针不启动 / 不是 PNG / 画不出编号 / 探针抛异常 / 事件炸了 → **原 result 原样透传**（连新对象都不造） |
+| 单测 | `scripts/test-cu-uia-observe.mjs` **5/5 通过**（四种不画、关着同引用、开着换图且原帧不变、非 PNG 透传、around 位注册与异常兜底） |
+
+### 10.3 还差哪一步才真的接上（需要你点头，我没有擅自做）
+
+在插件入口 `src/assistant.ts`（现有文件）加**两行**，然后 `node build.mjs` + 重启宿主：
+
+```ts
+import { installCuObservationWrapper } from './cu-uia-observe.ts'
+// apply() 里，与其它 install 并列：
+installCuObservationWrapper(ctx, { readSwitch: () => resolveChannelSwitch({ env: process.env.DSH_CU_UIA, fileEnabled: readCuUiaFileEnabled(ctx) }) })
+```
+
+代价与影响：`src/assistant.ts` 会从「0 改动」变成「+2 行」（回退演练会显示 1 个 M），
+所以本段**故意没接**，保持「与基线只差新增文件」的可回退状态。你说接，我再加这两行并重跑演练。
+
+另外两点如实说明：
+- 提示段（候选清单文本）**只能换图**这条路还到不了模型上下文：vendored `render()` 从 value 生成文本，
+  value 不许加字段；要给文本得走 `tools/post-execute`/`tools/result`，那是下一步。
+- 编号图坐标换算用「窗口 rect → 图像尺寸」的 `scale`，接线时要用 vendor 同一份观察面 rect 算（`windowSurfaceRect`），
+  这一条在接线那一轮再对一遍，避免缩放对不上。
+
+### 10.4 本段状态与证据
+
+| 项 | 值 |
+| --- | --- |
+| 本段提交 | `b557cde`（sidecar）、**`537c6e8`（合成器 + 包装）** |
+| 本段基线 | `ff877ae` |
+| 与第一段基线 `ebf16ae` 差异 | **14 个新增文件 / 现有文件 0 改动**（演练 ① 段实测） |
+| 关通道后 CU 测试 | **8/8 PASS**（5 个既有 + core + overlay + observe）——演练 ② 段 |
+| 全量脚本 | **97 个：94 通过 / 3 条既有红**（`mobile-proxy`、`pagination-dom`、`session-log-write`） |
+| 是否重启宿主 | **否**（按你的口径：写完代码给证据后停下等确认） |
+| 是否 push | **否** |
+| vendor/computer-use | **零改动**（三处出口 998 / 1177 / 1639 都只是引用，没有一处被改） |
