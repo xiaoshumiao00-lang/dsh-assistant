@@ -65,6 +65,9 @@ const BASE = 1700000000000
 const sessionId = 'session-gate-test'
 const realBbox = { x1: 346, y1: 888, x2: 471, y2: 917 }
 const realScreenshot = { width: 1920, height: 1032 }
+// 显式观察面矩形（与截图 1:1、原点 0,0）：2026-11-28 起记录必须标 explicit/auto，
+// 这里沿用 1:1 口径，好让既有算式断言（落点/偏差/建议分数）保持原值。
+const realBounds = { x: 0, y: 0, width: 1920, height: 1032 }
 
 function sessionOf(mode = 'millifraction') {
   return {
@@ -87,6 +90,8 @@ function recordFor(over = {}) {
   const record = resolveCoordinates({
     screenshot: realScreenshot,
     bbox: realBbox,
+    bounds: realBounds,
+    boundsSource: 'explicit',
     mode: 'millifraction',
     sessionId,
     target: 'Publish release',

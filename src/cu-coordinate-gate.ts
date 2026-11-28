@@ -1,14 +1,23 @@
 /**
- * Computer Use 坐标硬门：pre-execute 拒绝「没有解析记录 / 分数落在 bbox 外」的点击，
- * post-execute 把工具回执的 `Pointer landed at [x, y]` 与记录 bbox 比对，命中/未命中
- * 写进 turn-guard 日志（沿用 sanitizeTurnGuardLine 掩码与 MAX_LOG_BYTES 轮转）。
+ * Computer Use 坐标硬门：pre-execute 拒绝「没有解析记录 / 记录原点不可信 / 分数落在 bbox 外」的点击，
+ * post-execute 把工具回执的 `Pointer landed at [x, y]`（**屏幕绝对坐标**）减掉观察面原点、
+ * 换回**截图坐标**再比 bbox，命中/未命中/坐标空间不一致写进 turn-guard 日志
+ * （沿用 sanitizeTurnGuardLine 掩码与 MAX_LOG_BYTES 轮转）。
+ *
+ * 坐标空间（2026-11-28 运行期实测）：截图是窗口内坐标，landed 是屏幕绝对坐标。
+ * 直接拿 landed 比 bbox 等于假定原点 0,0：窗口不在屏幕左上角时就是永久 miss（实测假警报 210 px），
+ * 连续 2 次还会把目标硬停。所以这里做三件事：
+ *   1) pre-execute 拒绝原点推断来的记录（`coordinate-bounds-unknown`）；
+ *   2) post-execute 优先用本条回执里的观察面矩形当原点，拿不到才退回记录里的 bounds；
+ *   3) 原点不可用或换算后明显在截图外时报 `coordinate-space-mismatch`——
+ *      **不计 miss streak、不触发 coordinate-target-blocked**，因为这不是「点歪了」。
  *
  * vendor/computer-use 一行未改：工具 schema 本来就没有 coordinate_record 字段，但宿主
  * 的 `defineTool` 参数对象默认允许附加属性，所以模型可以多带一个 `coordinate_record`。
  * 记录由 scripts/cu-coordinate-resolver.mjs 产出（同一份纯逻辑在 src/cu-coordinate.ts）。
  *
- * 日志只落标识与数字：tool / code / session / screen / bbox / landed / deviationPx /
- * streak / textChars，不落目标文本（没有 excerpt），也不落本机绝对路径。
+ * 日志只落标识与数字：tool / code / session / screen / bbox / landed / origin / boundsSource /
+ * deviationPx / streak / textChars，不落目标文本（没有 excerpt），也不落本机绝对路径。
  */
 
 // @ts-ignore -- 仓库没有 @types/node（见 scripts/typecheck.mjs 的已知缺口）
@@ -20,16 +29,20 @@ import { appendTurnGuardLog, sanitizeTurnGuardLine } from './turn-guard.ts'
 import {
   CLICK_TOOLS,
   COORDINATE_RECORD_TTL_MS,
-  checkLandedPhysical,
+  checkLandedAgainstRecord,
   defaultCoordinateRecordDir,
   isCoordinateRecordId,
+  observationRectFromValue,
+  observationSizeFromValue,
   readCoordinateRecord,
+  validateCoordinateBounds,
   validateCoordinateRecord,
   validatePositionForRecord,
 } from './cu-coordinate.ts'
 import type {
   CuCoordinateMode,
   CuCoordinateRecord,
+  CuLandedCheck,
   CuPositionCheck,
 } from './cu-coordinate.ts'
 
@@ -43,6 +56,10 @@ export const DENY_RECORD_STALE = 'coordinate-record-stale'
 export const DENY_RECORD_INVALID = 'coordinate-record-invalid'
 /** deny 码：同一目标已连续 2 次 miss，坐标点击停用。 */
 export const DENY_TARGET_BLOCKED = 'coordinate-target-blocked'
+/** deny 码：记录里的观察面原点是推断的（没标 explicit/auto），不能用来换算屏幕绝对坐标。 */
+export const DENY_BOUNDS_UNKNOWN = 'coordinate-bounds-unknown'
+/** 结果侧错误码：落点与记录不在同一个坐标空间（不是真 miss，不计 streak）。 */
+export const DENY_SPACE_MISMATCH = 'coordinate-space-mismatch'
 
 const CLICK_TOOL_SET = new Set<string>(CLICK_TOOLS)
 
@@ -136,10 +153,24 @@ function suggestedText(record: CuCoordinateRecord): string {
   return `${String(fractions.x)},${String(fractions.y)}`
 }
 
+/** 日志里的原点来源三件套：boundsSource / origin / bounds 尺寸。 */
+function boundsTrace(record: CuCoordinateRecord): string {
+  const { bounds } = record
+  return `boundsSource=${String(record.boundsSource ?? 'none')} origin=${String(bounds.x)},${String(bounds.y)} surface=${String(bounds.width)}x${String(bounds.height)}`
+}
+
+function boundsUnknownReason(tool: string, record: CuCoordinateRecord, resolverPath: string): string {
+  const { bounds } = record
+  return `坐标硬门拒绝了 ${tool}：${DENY_BOUNDS_UNKNOWN}（记录里的观察面矩形 ${String(bounds.x)},${String(bounds.y)},${String(bounds.width)},${String(bounds.height)} 是推断的，没标 explicit/auto）。`
+    + `截图是窗口内坐标、落点是屏幕绝对坐标，原点必须现场量：重跑解析器加 --bounds auto（现场取前台窗口矩形），`
+    + `或 --bounds x,y,w,h 显式给窗口在屏幕上的矩形；命令形如 node "${resolverPath}" --shot <宽>x<高> --bbox <x1,y1,x2,y2> --bounds auto --target "<目标>" --tool ${tool}。`
+}
+
 function missingReason(tool: string, mode: CuCoordinateMode, resolverPath: string): string {
   const modeHint = mode === 'pixel' ? 'pixel' : 'millifraction'
   return `坐标硬门拒绝了 ${tool}：这次调用没有带 coordinate_record，按规则不许点击。`
-    + `先跑解析器：node "${resolverPath}" --shot <截图宽>x<截图高> --bbox <x1,y1,x2,y2> --target "<目标>" --tool ${tool} --mode ${modeHint}；`
+    + `先跑解析器：node "${resolverPath}" --shot <截图宽>x<截图高> --bbox <x1,y1,x2,y2> --bounds auto --target "<目标>" --tool ${tool} --mode ${modeHint}；`
+    + `--bounds 是必填（截图是窗口内坐标、落点是屏幕绝对坐标）：auto 现场量前台窗口，或自己给 x,y,w,h。`
     + `再把输出里的 record.id 作为 coordinate_record 传入，position 用 suggestedFractions（0–1000）或 suggestedPixels（像素，按回执里的坐标口径选）。`
     + `截图尺寸与 bbox 从最新截图读，不许目测分数。`
 }
@@ -156,15 +187,28 @@ function invalidReason(code: string, message: string, tool: string, resolverPath
   return `坐标硬门拒绝了 ${tool}：${code}（${message}）。重跑解析器 node "${resolverPath}" ... 生成新记录后再点；不许凭目测分数重试。`
 }
 
-function missFeedback(check: CuPositionCheck, record: CuCoordinateRecord): string {
+function missFeedback(check: CuLandedCheck, record: CuCoordinateRecord): string {
   return `未命中：工具回执落点 (${String(check.landed.x)},${String(check.landed.y)}) 不在目标 bbox (${bboxText(record)}) 内，偏差 ${String(check.deviationPx)} px。`
     + `修正建议：分数 [${String(record.suggestedFractions.x)}, ${String(record.suggestedFractions.y)}]，预计落点 [${String(record.predictedRounded.x)},${String(record.predictedRounded.y)}]。`
     + `先按最新截图重算 bbox，再点一次。`
 }
 
-function secondMissFeedback(check: CuPositionCheck, record: CuCoordinateRecord, streak: number): string {
+function secondMissFeedback(check: CuLandedCheck, record: CuCoordinateRecord, streak: number): string {
   return `同一目标已连续 ${String(streak)} 次未命中（本次落点 (${String(check.landed.x)},${String(check.landed.y)})，偏差 ${String(check.deviationPx)} px）。`
     + `停止坐标点击，不许继续蒙点：改用地址栏直接导航 URL、键盘 Tab-Enter、或读页面文本链接来操作。`
+}
+
+/** 坐标空间不一致的提示：明确说「不是点歪了、不计 streak」，并给出可执行的修法。 */
+function spaceMismatchFeedback(check: CuLandedCheck, record: CuCoordinateRecord, resolverPath: string): string {
+  const why = check.reason === 'origin-unknown'
+    ? '记录里的观察面原点是推断的（按 0,0 算），没法把屏幕绝对落点换回截图坐标'
+    : check.reason === 'surface-resized'
+      ? `截图对应的观察面 ${String(check.originRect.width)}x${String(check.originRect.height)} 与记录里的 ${String(record.bounds.width)}x${String(record.bounds.height)} 差太多（窗口可能被搬动或缩放过）`
+      : `落点 (${String(check.landed.x)},${String(check.landed.y)}) 减掉原点 (${String(check.originRect.x)},${String(check.originRect.y)}) 后是 (${String(Math.round(check.shot.x))},${String(Math.round(check.shot.y))})，落在截图 ${String(record.screenshot.width)}x${String(record.screenshot.height)} 之外`
+  return `坐标空间不一致（${DENY_SPACE_MISMATCH}）：${why}。`
+    + `这不是「点歪了」：本次不计入连续未命中、也不会停用这个目标的坐标点击。`
+    + `修法：用 --bounds auto 重算记录，再点一次 —— node "${resolverPath}" --shot ${String(record.screenshot.width)}x${String(record.screenshot.height)} --bbox ${bboxText(record)} --bounds auto --target "<目标>" --tool click；`
+    + `截图是窗口内坐标、落点是屏幕绝对坐标，两者必须先对齐同一个窗口矩形。`
 }
 
 function blockedReason(tool: string, record: CuCoordinateRecord): string {
@@ -244,6 +288,15 @@ export function createCuCoordinateGate(options: CuCoordinateGateOptions = {}): C
         return deny(tool, valid.code, invalidReason(valid.code, valid.message, tool, resolverPath), `session=${sessionId} screen=${String(screenIndex)} record=${recordArg}`)
       }
       const checked = record as CuCoordinateRecord
+      const boundsCheck = validateCoordinateBounds(checked)
+      if (!boundsCheck.ok) {
+        return deny(
+          tool,
+          DENY_BOUNDS_UNKNOWN,
+          boundsUnknownReason(tool, checked, resolverPath),
+          `session=${sessionId} screen=${String(screenIndex)} record=${recordArg} ${boundsTrace(checked)}`,
+        )
+      }
       const streakKey = `${sessionId}|${bboxText(checked)}`
       if ((streaks.get(streakKey) ?? 0) >= 2) {
         return deny(
@@ -279,7 +332,7 @@ export function createCuCoordinateGate(options: CuCoordinateGateOptions = {}): C
         }
       }
       pending.set(exec as object, { record: checked, tool, screenIndex, sessionId })
-      log(`cu-coord allow tool=${tool} session=${sessionId} screen=${String(screenIndex)} record=${recordArg} bbox=${bboxText(checked)} position=${positionText(primary.position)} deviationPx=0 textChars=0`)
+      log(`cu-coord allow tool=${tool} session=${sessionId} screen=${String(screenIndex)} record=${recordArg} bbox=${bboxText(checked)} position=${positionText(primary.position)} deviationPx=0 ${boundsTrace(checked)} textChars=0`)
       return next()
     } catch (error) {
       return deny(
@@ -306,19 +359,27 @@ export function createCuCoordinateGate(options: CuCoordinateGateOptions = {}): C
         return next()
       }
       const record = pendingRecord.record
-      const check = checkLandedPhysical(record, landed)
+      const observationRect = observationRectFromValue(result?.value, pendingRecord.screenIndex)
+      const observationSize = observationSizeFromValue(result?.value, pendingRecord.screenIndex)
+      const check = checkLandedAgainstRecord(record, landed, { rect: observationRect, size: observationSize })
       const streakKey = `${pendingRecord.sessionId}|${bboxText(record)}`
       const landedText = `${String(landed.x)},${String(landed.y)}`
+      const trace = `${boundsTrace(record)} originSource=${check.originSource}`
+      if (check.spaceMismatch) {
+        // 坐标空间对不上不是「点歪了」：不累计 streak、不触发硬停，只报码并给 --bounds auto 的修法。
+        log(`cu-coord mismatch tool=click session=${pendingRecord.sessionId} screen=${String(pendingRecord.screenIndex)} landed=${landedText} shot=${String(Math.round(check.shot.x))},${String(Math.round(check.shot.y))} bbox=${bboxText(record)} reason=${check.reason} streak=${String(streaks.get(streakKey) ?? 0)} record=${record.id} code=${DENY_SPACE_MISMATCH} ${trace} textChars=0`)
+        return { kind: 'block', feedback: [{ type: 'text', text: spaceMismatchFeedback(check, record, resolverPath) }] }
+      }
       if (check.hit) {
         streaks.delete(streakKey)
-        log(`cu-coord hit tool=click session=${pendingRecord.sessionId} screen=${String(pendingRecord.screenIndex)} landed=${landedText} bbox=${bboxText(record)} center=${String(record.center.x)},${String(record.center.y)} deviationPx=0 streak=0 record=${record.id} textChars=0`)
+        log(`cu-coord hit tool=click session=${pendingRecord.sessionId} screen=${String(pendingRecord.screenIndex)} landed=${landedText} bbox=${bboxText(record)} center=${String(record.center.x)},${String(record.center.y)} deviationPx=0 streak=0 record=${record.id} ${trace} textChars=0`)
         return next()
       }
       const streak = (streaks.get(streakKey) ?? 0) + 1
       streaks.set(streakKey, streak)
       if (streaks.size > 500) streaks.clear()
       const advice = streak >= 2 ? ' advice=non-coordinate' : ''
-      log(`cu-coord miss tool=click session=${pendingRecord.sessionId} screen=${String(pendingRecord.screenIndex)} landed=${landedText} bbox=${bboxText(record)} deviationPx=${String(check.deviationPx)} streak=${String(streak)} record=${record.id}${advice} textChars=0`)
+      log(`cu-coord miss tool=click session=${pendingRecord.sessionId} screen=${String(pendingRecord.screenIndex)} landed=${landedText} bbox=${bboxText(record)} deviationPx=${String(check.deviationPx)} streak=${String(streak)} record=${record.id}${advice} ${trace} textChars=0`)
       const text = streak >= 2 ? secondMissFeedback(check, record, streak) : missFeedback(check, record)
       return { kind: 'block', feedback: [{ type: 'text', text }] }
     } catch (error) {
@@ -349,9 +410,11 @@ export function defaultResolverPath(): string {
 export function coordinateGatePrompt(resolverPath: string): string {
   return `【点击前坐标硬门（必须执行）】本会话的 click / drag / input_text / long_press 没有坐标记录会被直接拒绝。每次点击前：`
     + `1) 从最新截图读出目标元素的起止像素 x1,y1,x2,y2 和截图尺寸 WxH，不许目测分数；`
-    + `2) 运行 node "${resolverPath}" --shot WxH --bbox x1,y1,x2,y2 --target "<目标>" --tool click --mode <会话坐标口径>（截图被缩放时加 --bounds x,y,w,h：观察面窗口矩形）；`
+    + `2) 运行 node "${resolverPath}" --shot WxH --bbox x1,y1,x2,y2 --bounds auto --target "<目标>" --tool click --mode <会话坐标口径>；`
+    + `--bounds 必填：截图是窗口内坐标、回执落点是屏幕绝对坐标，auto 会现场量前台窗口矩形（也可以自己给 x,y,w,h）；`
     + `3) 把输出 record.id 作为 coordinate_record 传入，position 用 suggestedFractions（0–1000）或 suggestedPixels（像素，按回执里的坐标口径选）；`
-    + `4) 回执 Pointer landed at [x,y] 必须落在 bbox 内；同一目标连续 2 次未命中就停手，改用地址栏导航 URL / 键盘 Tab-Enter / 读页面文本链接，不许继续蒙点。`
+    + `4) 回执 Pointer landed at [x,y] 必须落在 bbox 内；同一目标连续 2 次未命中就停手，改用地址栏导航 URL / 键盘 Tab-Enter / 读页面文本链接，不许继续蒙点；`
+    + `5) 如果反馈是 coordinate-space-mismatch（坐标空间不一致，不是点歪了），用 --bounds auto 重算记录再点，别当成 miss。`
 }
 
 const COORDINATE_RECORD_DESCRIPTION = 'Required before this click: the record.id printed by scripts/cu-coordinate-resolver.mjs. The call is rejected without a valid record.'
