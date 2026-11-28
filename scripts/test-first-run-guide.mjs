@@ -1,3 +1,4 @@
+import { personalMarkers } from './personal-context-lib.mjs'
 /** 首启引导的状态与文案回归（P0-6 / P0-8）：node scripts/test-first-run-guide.mjs */
 import assert from 'node:assert/strict'
 
@@ -66,7 +67,7 @@ cases.push(['引导内容讲清三件事：悬浮球用途 / 单击 vs 长按 / 
 
 cases.push(['引导文案里没有本机个人化内容', () => {
   const text = JSON.stringify(guideScreens('zh')) + JSON.stringify(guideScreens('en'))
-  for (const banned of ['<NAME-CJK>', '<ABBREV>', '<ACCOUNT>', '<CONTACT-TRACE>', '<ARCHIVE-TOKEN>']) {
+  for (const banned of personalMarkers()) {
     assert.ok(!text.includes(banned), `引导文案里出现了本机个人化内容：${banned}`)
   }
 }])

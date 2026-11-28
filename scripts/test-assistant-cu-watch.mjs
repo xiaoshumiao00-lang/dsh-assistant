@@ -1,3 +1,4 @@
+import { archiveRoot as ARCHIVE_ROOT } from './personal-context-lib.mjs'
 /**
  * 秘书「管理 CU 会话 + 派活分层」单测（不启动 DSH、不碰真实目录）：
  *   node scripts/test-assistant-cu-watch.mjs
@@ -258,7 +259,7 @@ cases.push(['控制器：长报告整段落进通知（收集端不再按 900 �
 }])
 
 cases.push(['长通知保留头 + 保留尾：结论段与末尾路径都不被吃掉，并写明省略多少字、省略在哪', () => {
-  const tailPath = 'D:\\<PRIVATE-ARCHIVE-ROOT>\\03T-基金申报\\联合基金\\联合基金申请-终稿.docx'
+  const tailPath = ARCHIVE_ROOT() + '\\03T-基金申报\\联合基金\\联合基金申请-终稿.docx'
   const rows = []
   let i = 0
   while (rows.join('\n').length < 26000) {
@@ -305,7 +306,7 @@ cases.push(['超上限时落盘完整原文：文件真存在、内容完整、�
       n += 1
       rows.push(`明细 ${n}：链接 https://example.org/item/${n} 复核通过`)
     }
-    const finalLine = '末行：完整清单已写到 D:\\<PRIVATE-ARCHIVE-ROOT>\\03T-基金申报\\联合基金\\清单.md'
+    const finalLine = '末行：完整清单已写到 ' + ARCHIVE_ROOT() + '\\03T-基金申报\\联合基金\\清单.md'
     const fullText = `${rows.join('\n')}\n${finalLine}`
     const cu = { id: 'cu-dump', preset: 'computer-use', header: { title: '联合基金报告', cwd: root } }
     ctl.handleSessionEvent(cu, { type: 'assistant/message', data: { turn: 12, message: { content: [{ type: 'text', text: fullText }] } } })

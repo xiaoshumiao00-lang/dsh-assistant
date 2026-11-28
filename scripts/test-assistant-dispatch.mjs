@@ -1,3 +1,4 @@
+import { assistantHome, archiveRoot as ARCHIVE_ROOT } from './personal-context-lib.mjs'
 /**
  * 个人秘书「派活目录由模型决定 + 规则兜底」单测（不启动 DSH、不碰真实目录）：
  *   node scripts/test-assistant-dispatch.mjs
@@ -18,14 +19,14 @@ import assert from 'node:assert/strict'
 const lib = await import('../lib/index.js')
 const surface = lib.assistantDispatchTestSurface
 
-const ASSISTANT = 'C:\\Users\\<ACCOUNT>\\.dsh\\assistant'
+const ASSISTANT = assistantHome()
 const PARENT = 'D:\\Projects'
 const NOW = new Date(2026, 10, 20, 23, 30)
 const QQ_SCREEN_QUESTION = '你看我打开的 QQ 页面，他们说的 38 fn 指什么模型？'
 
 const projects = [
   { dir: 'D:\\hpg', name: 'hpg 小程序', titles: ['修店铺详情页白屏'], lastUsedAt: 3 },
-  { dir: 'D:\\<PRIVATE-ARCHIVE-ROOT>\\15 高珂中文论文', name: '高珂中文论文', titles: ['第5章算法改用SCI完整算法'], lastUsedAt: 2 },
+  { dir: ARCHIVE_ROOT() + '\\15 高珂中文论文', name: '高珂中文论文', titles: ['第5章算法改用SCI完整算法'], lastUsedAt: 2 },
 ]
 
 const cases = []
@@ -61,7 +62,7 @@ cases.push(['模型没给目录 → 规则兜底：旧项目', () => {
   })
   assert.equal(r.decidedBy, 'rules')
   assert.equal(r.kind, 'existing')
-  assert.equal(r.cwd, 'D:\\<PRIVATE-ARCHIVE-ROOT>\\15 高珂中文论文')
+  assert.equal(r.cwd, ARCHIVE_ROOT() + '\\15 高珂中文论文')
 }])
 
 cases.push(['模型没给目录 → 规则兜底：简单动手活也新建专项文件夹', () => {

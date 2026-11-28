@@ -1,3 +1,4 @@
+import { androidPackageSegment as PACKAGE_SEGMENT } from './personal-context-lib.mjs'
 /**
  * 安卓「后台保活 + 切回秒恢复 + 后台任务完成播报」源码守卫（2026-11-27 需求）。
  *
@@ -30,7 +31,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
-const JAVA_DIR = join(ROOT, 'android', 'app', 'src', 'main', 'java', 'com', '<NAME-PINYIN>', 'assistant')
+const JAVA_DIR = join(ROOT, 'android', 'app', 'src', 'main', 'java', 'com', PACKAGE_SEGMENT(), 'assistant')
 
 function readOrEmpty(path) {
   try { return readFileSync(path, 'utf8') } catch { return '' }

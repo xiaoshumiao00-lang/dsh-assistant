@@ -1,3 +1,4 @@
+import { sanitizedSessionDir } from './personal-context-lib.mjs'
 /**
  * 第四批（A 分页 + B 滚动摘要）的 node 侧验收：口径、分页 store、宿主分页接口（真会话数据）、
  * 上下文摘要文件与注入段。浏览器侧的 DOM 断言在 scripts/test-secretary-pagination-dom.mjs。
@@ -26,7 +27,7 @@ const log = (text) => process.stdout.write(`${text}\n`)
 /* ---------- 真会话数据（只读取证：按 zstd 帧边界逐帧解，绝不改写、绝不重拼） ---------- */
 
 const SESSION_FILE = process.env.DSH_TEST_SESSION_FILE
-  || join(os.homedir(), '.dsh', 'sessions', '--C-Users-<ACCOUNT>-.dsh-assistant--', 'session-83bca3e3-bcd1-49f0-8b3c-2ec9edae14e3', 'session.v4.jsonl.zstd')
+  || join(os.homedir(), '.dsh', 'sessions', sanitizedSessionDir(), 'session-83bca3e3-bcd1-49f0-8b3c-2ec9edae14e3', 'session.v4.jsonl.zstd')
 
 function readSessionEvents(file) {
   const buffer = readFileSync(file)

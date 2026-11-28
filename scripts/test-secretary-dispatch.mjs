@@ -1,3 +1,4 @@
+import { assistantHome, archiveRoot as ARCHIVE_ROOT, accountPath as ACCOUNT_PATH } from './personal-context-lib.mjs'
 /**
  * 个人秘书「派活目录」规则单测（纯函数，不启动 DSH、不碰真实目录）：
  *   node scripts/test-secretary-dispatch.mjs
@@ -16,14 +17,14 @@ import {
 } from '../src/client/secretary-dispatch.ts'
 import { basenameOf } from '../src/client/pathutil.ts'
 
-const ASSISTANT = 'C:\\Users\\<ACCOUNT>\\.dsh\\assistant'
+const ASSISTANT = assistantHome()
 const PARENT = 'D:\\Projects'
 const NOW = new Date(2026, 10, 20, 23, 30)
 const QQ_SCREEN_QUESTION = '你看我打开的 QQ 页面，他们说的 38 fn 指什么模型？'
 
 const projects = [
   { dir: 'D:\\hpg', name: 'hpg 小程序', titles: ['修店铺详情页白屏'], lastUsedAt: 3 },
-  { dir: 'D:\\<PRIVATE-ARCHIVE-ROOT>\\15 高珂中文论文', name: '高珂中文论文', titles: ['第5章算法改用SCI完整算法'], lastUsedAt: 2 },
+  { dir: ARCHIVE_ROOT() + '\\15 高珂中文论文', name: '高珂中文论文', titles: ['第5章算法改用SCI完整算法'], lastUsedAt: 2 },
   { dir: 'D:\\dsh-assistant', name: 'dsh-assistant', titles: ['修手机端长按悬浮球'], lastUsedAt: 1 },
 ]
 
@@ -58,7 +59,7 @@ cases.push(['与既有项目相关 → 派到旧项目目录', () => {
   assert.match(r.reason, /相关/)
   const t = decide('继续改高珂中文论文第5章的表')
   assert.equal(t.kind, 'existing')
-  assert.equal(t.cwd, 'D:\\<PRIVATE-ARCHIVE-ROOT>\\15 高珂中文论文')
+  assert.equal(t.cwd, ARCHIVE_ROOT() + '\\15 高珂中文论文')
 }])
 
 cases.push(['旧任务延续（会话标题命中）→ 旧项目目录', () => {
@@ -107,7 +108,7 @@ cases.push(['上网查证不是秘书页直接回答', () => {
 cases.push(['没给新项目父目录 → 用助手目录的父目录', () => {
   const r = decide('新建一个工程，先建目录再写脚本最后部署，所有文件都要有说明', { newFolderParent: '' })
   assert.equal(r.kind, 'new-folder')
-  assert.equal(r.cwd, 'C:\\Users\\<ACCOUNT>\\.dsh\\' + r.folderName)
+  assert.equal(r.cwd, ACCOUNT_PATH() + '\\.dsh\\' + r.folderName)
 }])
 
 cases.push(['纯知识问题不依赖派活目录', () => {

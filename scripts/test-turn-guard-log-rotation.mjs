@@ -1,3 +1,4 @@
+import { assistantHome, dshRoot } from './personal-context-lib.mjs'
 /**
  * turn-guard 日志落盘的轮转与「只落标识」回归：node scripts/test-turn-guard-log-rotation.mjs
  *
@@ -142,7 +143,7 @@ cases.push(['写入不抛错：目录不存在 / 路径不可写时只返回 fal
 
 cases.push(['日志行只有标识：不落回复正文片段、不落本机绝对路径', () => {
   const secretBody = '这一段是助手回复正文，日志里不许出现它'
-  const localPath = 'C:\\Users\\<ACCOUNT>\\.dsh\\dsh-assistant-turn-guard.json'
+  const localPath = dshRoot() + '\\dsh-assistant-turn-guard.json'
   assert.equal(sanitizeTurnGuardLine(secretBody), secretBody, '纯标识（无路径）原样保留')
   const masked = sanitizeTurnGuardLine(`状态文件 ${localPath}（档位 desktop）`)
   assert.ok(!/[A-Za-z]:[\\/]/.test(masked), '盘符绝对路径必须被掩掉')
@@ -203,7 +204,7 @@ cases.push(['错误行也不再带堆栈：steer 失败只落错误种类与清�
   // 用 sendHook 造一次失败：agent.send 抛错（消息里塞本机绝对路径，路径尾巴里带着正文字样）
   const broken = stateOf()
   broken.sendHook = () => {
-    throw new Error('宿主拒绝写入 C:\\Users\\<ACCOUNT>\\.dsh\\assistant\\正文片段XYZ.json')
+    throw new Error('宿主拒绝写入 ' + assistantHome() + '\\正文片段XYZ.json')
   }
   guard.setState(broken)
   guard.turnStopping(sessionOf([assistantEvent([textBlock('<tool_call>')])], { id: 'session-fail1' }), 6)

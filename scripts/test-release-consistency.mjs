@@ -1,3 +1,4 @@
+import { retiredMarkers } from './personal-context-lib.mjs'
 /** 发版一致性回归（P0-4）：版本源只有一处、公告由 CHANGELOG.md 生成、更新源不再有多个仓库名。
  *  node scripts/test-release-consistency.mjs */
 import assert from 'node:assert/strict'
@@ -49,8 +50,9 @@ cases.push(['更新源只有一个仓库：旧的两个退役仓库名不再出�
   const files = ['src/client/updateCheck.ts', 'src/client/split.tsx', 'src/client/index.tsx', 'src/client/changelog.ts', 'README.md']
   for (const file of files) {
     const text = read(file)
-    assert.ok(!text.includes('<RETIRED-REPO>'), `${file} 里还有 <RETIRED-REPO>/dsh-worktable 更新源`)
-    assert.ok(!text.includes('<RETIRED-REPO>'), `${file} 里还有 <RETIRED-REPO> 更新源`)
+    for (const retired of retiredMarkers()) {
+      assert.ok(!text.includes(retired), `${file} 更新源里还有退役仓库名（长度 ${retired.length}）`)
+    }
   }
   // P0-3（2026-11-05）：更新源不再写死作者仓库——真值来自本机配置 updateSource，
   // 默认关闭（别人的机器不该被作者的 release 牵着升级）。

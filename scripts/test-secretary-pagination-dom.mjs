@@ -1,3 +1,4 @@
+import { sanitizedSessionDir } from './personal-context-lib.mjs'
 /**
  * 卡片分页（第四批需求 A）的浏览器 DOM 验收：
  *   node scripts/test-secretary-pagination-dom.mjs
@@ -22,7 +23,7 @@ const lib = await import('../lib/index.js')
 const shared = lib.secretCardSharedTestSurface
 const cards = lib.secretaryCardsTestSurface
 const realEventsSource = process.env.DSH_TEST_SESSION_FILE
-  || join(os.homedir(), '.dsh', 'sessions', '--C-Users-<ACCOUNT>-.dsh-assistant--', 'session-83bca3e3-bcd1-49f0-8b3c-2ec9edae14e3', 'session.v4.jsonl.zstd')
+  || join(os.homedir(), '.dsh', 'sessions', sanitizedSessionDir(), 'session-83bca3e3-bcd1-49f0-8b3c-2ec9edae14e3', 'session.v4.jsonl.zstd')
 
 function readSessionEvents(file) {
   const buffer = readFileSync(file)

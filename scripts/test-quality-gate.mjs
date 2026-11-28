@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { nameCjkMarkers, contactMarkers, abbrevMarkers, retiredMarkers, accountPathMarkers, archiveTokenMarkers, nameForms } from './personal-context-lib.mjs'
 
 const repo = (path) => new URL('../' + path, import.meta.url)
 const ciPath = join(process.cwd(), '.github', 'workflows', 'ci.yml')
@@ -68,9 +69,16 @@ cases.push(['typecheck 不许「假装通过」：跑不起来 / 编译器没跑
 
 cases.push(['lint 查的是查得动的东西，且个人化残留与旧仓库名不许复现（宿主侧）', () => {
   const text = readFileSync(repo('scripts/lint-standards.mjs'), 'utf8')
-  for (const marker of ['<NAME-CJK>', '<CONTACT-TRACE>', '<ABBREV>', '<RETIRED-REPO>', '<RETIRED-REPO>']) {
-    assert.ok(text.includes(marker), `lint 的黑名单里没有 ${marker}`)
-  }
+  assert.ok(text.includes('personal-context-lib.mjs'), 'lint 的黑名单取派生标识库')
+  assert.ok(text.includes('PERSONAL_MARKERS'), 'lint 个人标识常量不见了')
+  assert.ok(text.includes('RETIRED_REPOS'), 'lint 退役仓库名单不见了')
+  assert.ok(nameCjkMarkers().length >= 1, '派生类别缺中文姓名')
+  assert.ok(contactMarkers().length >= 1, '派生类别缺联系人名标签')
+  assert.ok(abbrevMarkers().length >= 1, '派生类别缺机构缩写')
+  assert.ok(retiredMarkers().length >= 2, '派生类别缺已退役仓库名')
+  assert.ok(accountPathMarkers().length >= 1, '派生类别缺本机账户路径')
+  assert.ok(archiveTokenMarkers().length >= 1, '派生类别缺档案子目录标记')
+  assert.ok(nameForms().length >= 1, '派生类别缺姓名拼音形态')
   assert.ok(text.includes('dsh-worktable'), 'lint 没查宿主日志自名')
   const index = readFileSync(repo('src/index.ts'), 'utf8')
   assert.ok(!/\[dsh-worktable\]/.test(index), '宿主日志还自称 [dsh-worktable]')

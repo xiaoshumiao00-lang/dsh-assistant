@@ -1,3 +1,4 @@
+import { archiveRoot as ARCHIVE_ROOT } from './personal-context-lib.mjs'
 /**
  * 单测：后台 Code agent → Computer Use 会话的 GUI 回传桥（src/cu-bridge-core.mjs）。
  *   node scripts/test-cu-bridge.mjs
@@ -163,7 +164,7 @@ cases.push(['capText 新口径：保留头 + 保留尾（不再只裁尾），�
   assert.equal(long.length, 12000, '12000 字的结果不许被截断')
   const headPart = '甲'.repeat(10000)
   const middlePart = '乙'.repeat(10000)
-  const tailPath = 'D:\\<PRIVATE-ARCHIVE-ROOT>\\结论.txt'
+  const tailPath = ARCHIVE_ROOT() + '\\结论.txt'
   const tailPart = `${'丙'.repeat(5000)}${tailPath}`
   const cut = capText(`${headPart}${middlePart}${tailPart}`)
   assert.ok(cut.startsWith(headPart), '头部 15000 字必须原样保留')
@@ -196,7 +197,7 @@ cases.push(['回传结果超上限时落盘完整原文：文件真存在、内�
       n += 1
       rows.push(`第 ${n} 步：窗口标题「文件传输助手」，数量 ${n}`)
     }
-    const finalLine = '末尾：清单已写到 D:\\<PRIVATE-ARCHIVE-ROOT>\\微信\\清单.md'
+    const finalLine = '末尾：清单已写到 ' + ARCHIVE_ROOT() + '\\微信\\清单.md'
     const answer = `${rows.join('\n')}\n${finalLine}`
     const parent = makeAgent({ answer: () => answer })
     const background = makeAgent({ id: 'bg-1' })

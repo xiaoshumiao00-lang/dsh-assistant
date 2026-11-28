@@ -12,14 +12,18 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { lintMarkerClasses, neutralizeProtectedForms } from './personal-context-lib.mjs'
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)))
 
 /** 黑名单本身必须写出来，所以这些文件豁免「标识不得复现」这条 */
 const SELF_EXEMPT = new Set(['scripts/lint-standards.mjs', 'scripts/test-release-consistency.mjs'])
 
-const PERSONAL_MARKERS = ['<NAME-CJK>', '<NAME-PINYIN>', '<ABBREV>', '<CONTACT-TRACE>', 'C:\\Users\\<ACCOUNT>', '<ARCHIVE-TOKEN>']
-const RETIRED_REPOS = ['<RETIRED-REPO>', '<RETIRED-REPO>']
+/** 标识一律派生：账户形态来自本机环境变量，档案根/中文姓名/机构缩写来自盘面目录，
+ *  姓名拼音来自 android/ 的包标识与签名主体；这三类都不在仓库里写死字面量。
+ *  档案子目录标记、联系人名标签、已退役仓库名无法从本机派生，取自仓库外的本机 override 文件
+ *  （scripts/personal-context-lib.mjs 的 overridePath；缺失时这两类不参与扫描）。 */
+const { personal: PERSONAL_MARKERS, retired: RETIRED_REPOS } = lintMarkerClasses()
 
 const problems = []
 
@@ -54,7 +58,7 @@ const scanned = files.filter((rel) => {
 
 for (const rel of scanned) {
   let text = ''
-  try { text = readFileSync(join(repoRoot, rel), 'utf8') } catch { continue }
+  try { text = neutralizeProtectedForms(readFileSync(join(repoRoot, rel), 'utf8')) } catch { continue }
   for (const marker of PERSONAL_MARKERS) {
     if (text.includes(marker)) problems.push(`${rel}: 出现本机个人化标识「${marker}」`)
   }

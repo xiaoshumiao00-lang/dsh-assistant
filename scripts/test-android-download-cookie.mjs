@@ -1,3 +1,4 @@
+import { androidPackageSegment as PACKAGE_SEGMENT } from './personal-context-lib.mjs'
 /**
  * 安卓下载链路「带上登录态 + 失败可见」的源码守卫（2026-11-26 真机 bug）。
  *
@@ -22,7 +23,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
-const javaPath = join(ROOT, 'android', 'app', 'src', 'main', 'java', 'com', '<NAME-PINYIN>', 'assistant', 'MainActivity.java')
+const javaPath = join(ROOT, 'android', 'app', 'src', 'main', 'java', 'com', PACKAGE_SEGMENT(), 'assistant', 'MainActivity.java')
 const java = readFileSync(javaPath, 'utf8')
 const manifest = readFileSync(join(ROOT, 'android', 'app', 'src', 'main', 'AndroidManifest.xml'), 'utf8')
 

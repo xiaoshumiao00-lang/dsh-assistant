@@ -1,3 +1,4 @@
+import { personalMarkers } from './personal-context-lib.mjs'
 // 私人助手「家」目录与路由的组装测试：
 //   - apply 前就有 AGENTS.md / journal / notes / outputs / archive（会话一建就有人设，产物有地方放）；
 //   - GET /api/assistant/home 返回真实目录、体积、文件清单、容量上限；
@@ -44,7 +45,7 @@ assert.ok(agents.includes('收工'), '收工蒸馏规则写进人设')
 assert.ok(agents.includes('家目录规矩'), '家目录规矩写进人设')
 assert.ok(agents.includes('归档规矩'), '归档规矩写进人设')
 // 仓库模板不写死本机人名：模板里出现的「主人」称谓不能变成具体姓名
-assert.ok(!/陈|潘某|<ACCOUNT>/.test(agents), 'AGENTS.md 模板里没有本机个人化内容')
+assert.ok(!personalMarkers().some((marker) => agents.includes(marker)), 'AGENTS.md 模板里没有本机个人化内容')
 
 const call = async (path, method = 'GET', body) => {
   const route = routes.find((r) => r.path === path)

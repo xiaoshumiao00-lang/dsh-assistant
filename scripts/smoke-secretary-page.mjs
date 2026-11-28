@@ -1,3 +1,4 @@
+import { assistantHome } from './personal-context-lib.mjs'
 /**
  * 个人秘书真页面冒烟（Playwright + 本机 Chrome，手机视口）：
  *   node scripts/smoke-secretary-page.mjs
@@ -67,7 +68,7 @@ if (REAL_CARD) {
   const plan = dispatch.resolveDispatchTarget({
     task: QQ_SCREEN_QUESTION,
     projects: [],
-    assistantHome: 'C:\\Users\\<ACCOUNT>\\.dsh\\assistant',
+    assistantHome: assistantHome(),
     newFolderParent: 'D:\\SmokeProjects',
     now: new Date(2026, 10, 21, 14, 30),
   })

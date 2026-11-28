@@ -1,3 +1,4 @@
+import { assistantHome } from './personal-context-lib.mjs'
 /**
  * 秘书 v4 会话日志「写入后能重新打开」回归 —— **用宿主真实解析器断言**。
  *
@@ -34,7 +35,7 @@ const HEADER = {
   version: 4,
   id: 'session-00000000-0000-4000-8000-000000000000',
   createdAt: 1795000000000,
-  cwd: 'C:\\Users\\<ACCOUNT>\\.dsh\\assistant',
+  cwd: assistantHome(),
   isSeeded: false,
   delegationDepth: 0,
   agentPreset: 'standard',
