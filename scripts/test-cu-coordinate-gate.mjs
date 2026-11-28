@@ -16,22 +16,31 @@
  * 隔离：记录与日志全部写 mkdtempSync 临时目录，绝不碰真实 ~/.dsh。
  */
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
+  boundsFromWindowProbe,
+  boundsOriginKnown,
+  checkLandedAgainstRecord,
   isCoordinateRecordId,
+  observationRectFromValue,
   readCoordinateRecord,
   resolveCoordinates,
+  validateCoordinateBounds,
   validateCoordinateRecord,
   validatePositionForRecord,
   writeCoordinateRecord,
 } from '../src/cu-coordinate.ts'
 import {
+  DENY_BOUNDS_UNKNOWN,
   DENY_MISSING_RECORD,
   DENY_OUT_OF_BOUNDS,
   DENY_RECORD_INVALID,
   DENY_RECORD_STALE,
+  DENY_SPACE_MISMATCH,
   DENY_TARGET_BLOCKED,
   coordinateGatePrompt,
   createCuCoordinateGate,
@@ -61,6 +70,7 @@ function deepEqual(actual, expected, message) {
 const root = mkdtempSync(join(tmpdir(), 'cu-coordinate-gate-'))
 const stateDir = join(root, 'records')
 const gateLines = []
+const resolverFile = fileURLToPath(new URL('../scripts/cu-coordinate-resolver.mjs', import.meta.url))
 const BASE = 1700000000000
 const sessionId = 'session-gate-test'
 const realBbox = { x1: 346, y1: 888, x2: 471, y2: 917 }
@@ -156,6 +166,67 @@ cases.push(['像素模式：[408,902] 命中、[280,901] miss；分数仍按截�
   eq(miss.hit, false, '像素 [280,901] 在 bbox 左边缘外')
   eq(miss.deviationPx, 66, '像素模式偏差同为 66 px')
   ok(Math.abs(record.fractions.x - 212.76041666666669) < 1e-9, '像素模式下分数仍是截图比例')
+}])
+
+cases.push(['解析器 CLI：缺 --bounds 报 missing-bounds 退出 1；给了矩形才把原点写进输出', () => {
+  const missing = spawnSync(process.execPath, [
+    resolverFile, '--shot', '1282x821', '--bbox', '12,180,272,198',
+    '--target', 'Skill/MCP nav row', '--tool', 'click', '--no-write',
+  ], { encoding: 'utf8' })
+  eq(missing.status, 1, '缺 --bounds 退出码 1')
+  ok(String(missing.stderr).includes('missing-bounds'), 'stderr 带错误码 missing-bounds')
+  ok(String(missing.stderr).includes('屏幕绝对坐标'), '提示里写清截图是窗口内坐标、落点是屏幕绝对坐标')
+  ok(String(missing.stderr).includes('--bounds auto'), '提示里给出 --bounds auto 这个出口')
+  eq(String(missing.stdout).trim(), '', '缺 --bounds 不打印记录 JSON')
+
+  const explicit = spawnSync(process.execPath, [
+    resolverFile, '--shot', '1282x821', '--bbox', '12,180,272,198', '--bounds', '319,106,1282,821',
+    '--position', '110.76,230.21', '--target', 'Skill/MCP nav row', '--tool', 'click', '--no-write',
+  ], { encoding: 'utf8' })
+  eq(explicit.status, 0, '带 --bounds 解析成功')
+  const parsed = JSON.parse(String(explicit.stdout))
+  eq(parsed.boundsSource, 'explicit', 'boundsSource = explicit')
+  deepEqual(parsed.origin, { x: 319, y: 106 }, 'origin 写进输出')
+  deepEqual(parsed.bounds, { x: 319, y: 106, width: 1282, height: 821 }, 'bounds 原样保留')
+  eq(parsed.check.hit, true, '屏幕绝对落点落在 bbox 内 → hit')
+  eq(parsed.check.deviationPx, 0, '换算对时偏差 0（不是 210 px 的假警报）')
+  deepEqual(parsed.check.landed, { x: 461, y: 295 }, '预测落点 = 原点 + 分数×边宽')
+}])
+
+cases.push(['--bounds auto：桩注入窗口矩形走 exact / inset / DPI 缩放 / 截图缩放四条分支，取不到与对不上都明确报错', () => {
+  const shot1282 = { width: 1282, height: 821 }
+  const exact = boundsFromWindowProbe(shot1282, { rect: { x: 319, y: 106, width: 1282, height: 821 }, dpi: 96, frameSource: 'dwm-extended-frame' })
+  eq(exact.boundsSource, 'auto', 'auto 模式标 auto')
+  deepEqual(exact.bounds, { x: 319, y: 106, width: 1282, height: 821 }, '同尺寸时原点直接取窗口左上角')
+  deepEqual(exact.origin, { x: 319, y: 106 }, 'origin 单列一份')
+  eq(exact.captureScale, 1, '同尺寸时截图比例 1')
+  eq(exact.frameSource, 'dwm-extended-frame', '记下矩形来源')
+  ok(String(exact.boundsNotes[0]).includes('同尺寸'), 'output 里有推算说明')
+
+  const inset = boundsFromWindowProbe(shot1282, { rect: { x: 312, y: 106, width: 1296, height: 828 }, frameSource: 'window-rect' })
+  deepEqual(inset.bounds, { x: 319, y: 106, width: 1282, height: 821 }, '窗口矩形含 7 px 不可见边框 → 原点推算回 319,106')
+  ok(String(inset.boundsNotes[0]).includes('不可见边框'), '说明里点名按不可见边框推算')
+
+  const dpi = boundsFromWindowProbe(shot1282, { rect: { x: 213, y: 71, width: 855, height: 547 }, dpi: 144, coordScale: 1.5 })
+  eq(dpi.bounds.width, 1283, 'DPI 虚拟化矩形 ×1.5 后与截图同量级')
+  eq(dpi.origin.x, 320, '原点也按 1.5 放大（213×1.5=319.5）')
+  ok(String(dpi.boundsNotes[0]).includes('DPI 缩放 1.5'), '说明里打印 DPI 比例')
+
+  const scaled = boundsFromWindowProbe({ width: 1920, height: 1080 }, { rect: { x: 100, y: 50, width: 2560, height: 1440 } })
+  eq(scaled.bounds.width, 2560, '截图被缩放时 bounds 仍是物理矩形')
+  eq(scaled.captureScale, 1.3333, '截图缩放比例 2560÷1920')
+
+  let mismatched = ''
+  try {
+    boundsFromWindowProbe(shot1282, { rect: { x: 10, y: 10, width: 1920, height: 1080 } })
+  } catch (error) { mismatched = String(error?.message ?? error) }
+  ok(mismatched.includes('auto-bounds-mismatch'), '对不上时抛 auto-bounds-mismatch（不静默退回 0,0）')
+
+  let unavailable = ''
+  try {
+    boundsFromWindowProbe(shot1282, { rect: { x: 0, y: 0, width: 0, height: 0 } })
+  } catch (error) { unavailable = String(error?.message ?? error) }
+  ok(unavailable.includes('auto-bounds-unavailable'), '矩形成立不了时抛 auto-bounds-unavailable')
 }])
 
 cases.push(['记录读写：id 校验、TTL 过期、跨会话与坐标口径不一致', () => {
@@ -286,6 +357,111 @@ cases.push(['post-execute：连续 2 次 miss，第 2 次必须引导改用非�
   eq(third.kind, 'deny', '同一 bbox 第 3 次点击被硬停')
   eq(third.info?.code, DENY_TARGET_BLOCKED, '硬停码 coordinate-target-blocked')
   ok(String(third.reason).includes('Tab-Enter'), '硬停提示带非坐标手段')
+}])
+
+cases.push(['pre-execute：记录原点是推断的（没标 explicit/auto）→ coordinate-bounds-unknown', async () => {
+  const inferred = resolveCoordinates({
+    screenshot: realScreenshot, bbox: realBbox, mode: 'millifraction', sessionId, target: 'Publish release', now: BASE, id: 'ffff6666',
+  })
+  writeCoordinateRecord(inferred, stateDir)
+  eq(inferred.boundsSource, 'inferred', '没给 bounds 时记录标 inferred')
+  eq(boundsOriginKnown(inferred), false, 'inferred 原点不可信')
+  eq(validateCoordinateBounds(inferred).code, DENY_BOUNDS_UNKNOWN, '校验码 coordinate-bounds-unknown')
+  eq(boundsOriginKnown(recordFor()), true, 'explicit 原点可信')
+
+  const gate = createCuCoordinateGate({ stateDir, now: () => BASE, resolverPath: 'scripts/cu-coordinate-resolver.mjs', log: () => {} })
+  const exec = execOf(sessionOf('millifraction'), { screen_index: 0, position: [213, 875], coordinate_record: 'ffff6666' })
+  const next = nextSpy()
+  const decision = await gate.preExecute(exec, next.fn)
+  eq(decision.kind, 'deny', '原点推断的记录必须拒绝')
+  eq(decision.info?.code, DENY_BOUNDS_UNKNOWN, '拒绝码 coordinate-bounds-unknown')
+  eq(next.calls, 0, '拒绝时不许执行工具')
+  ok(String(decision.reason).includes('--bounds auto'), '提示给出 --bounds auto 的可执行修法')
+  ok(String(decision.reason).includes('屏幕绝对坐标'), '提示讲清两个坐标空间')
+}])
+
+cases.push(['post-execute：屏幕绝对落点减观察面原点后命中 bbox（真机口径 461,295）', async () => {
+  const record = resolveCoordinates({
+    screenshot: { width: 1282, height: 821 },
+    bbox: { x1: 12, y1: 180, x2: 272, y2: 198 },
+    bounds: { x: 319, y: 106, width: 1282, height: 821 },
+    boundsSource: 'auto',
+    sessionId,
+    target: 'Skill/MCP nav row',
+    now: BASE,
+    id: 'dddd4444',
+  })
+  writeCoordinateRecord(record, stateDir)
+  const logs = []
+  const gate = createCuCoordinateGate({ stateDir, now: () => BASE, resolverPath: 'scripts/cu-coordinate-resolver.mjs', log: (line) => logs.push(line) })
+  const session = sessionOf('millifraction')
+  const exec = execOf(session, { screen_index: 0, position: [110.76, 230.21], coordinate_record: 'dddd4444' })
+  const allowed = await gate.preExecute(exec, nextSpy().fn)
+  deepEqual(allowed, { kind: 'accept' }, '原点可信的记录放行')
+  const postNext = nextSpy()
+  const result = {
+    isError: false,
+    value: { landed: [461, 295], screens: [{ screenIndex: 0, logicalWidth: 1282, logicalHeight: 821 }] },
+    content: [{ type: 'text', text: 'Pointer landed at [461, 295] physical pixels.' }],
+  }
+  const decision = await gate.postExecute(exec, result, postNext.fn)
+  deepEqual(decision, { kind: 'accept' }, '绝对落点对齐后命中')
+  eq(postNext.calls, 1, '命中时继续下游')
+  const hitLine = logs.find((line) => line.includes('cu-coord hit'))
+  ok(hitLine !== undefined, '日志里有 cu-coord hit 行')
+  ok(String(hitLine).includes('origin=319,106'), '日志行带 origin 字段')
+  ok(String(hitLine).includes('boundsSource=auto'), '日志行带 boundsSource 字段')
+  ok(String(hitLine).includes('deviationPx=0'), '命中偏差 0')
+  ok(String(hitLine).includes('textChars=0'), 'textChars= 计数口径不变')
+  ok(!String(hitLine).includes('text="'), '不落 excerpt（没有 text="）')
+  ok(!String(hitLine).includes('Skill/MCP'), '日志不落目标文本')
+
+  const check = checkLandedAgainstRecord(record, { x: 461, y: 295 }, { rect: { x: 319, y: 106, width: 1282, height: 821 } })
+  eq(check.hit, true, '同一落点用观察面原点换算也命中')
+  eq(check.originSource, 'observation', '优先用回执里的观察面')
+  eq(check.deviationPx, 0, '观察面口径偏差 0')
+  ok(Math.abs(check.shot.x - 142) < 1e-6 && Math.abs(check.shot.y - 189) < 1e-6, '换回截图坐标 = 142,189')
+  deepEqual(
+    observationRectFromValue({ observation: { windowRect: { x: 1, y: 2, width: 3, height: 4 } } }),
+    { x: 1, y: 2, width: 3, height: 4 },
+    '从回执的 observation.windowRect 取观察面',
+  )
+  eq(observationRectFromValue(null), null, '没有回执就是 null')
+}])
+
+cases.push(['post-execute：换算后落在窗口外 → coordinate-space-mismatch，streak 不增、不触发 blocked', async () => {
+  const record = resolveCoordinates({
+    screenshot: { width: 1282, height: 821 },
+    bbox: { x1: 12, y1: 180, x2: 272, y2: 198 },
+    bounds: { x: 319, y: 106, width: 1282, height: 821 },
+    boundsSource: 'auto',
+    sessionId,
+    now: BASE,
+    id: 'eeee5555',
+  })
+  writeCoordinateRecord(record, stateDir)
+  const logs = []
+  const gate = createCuCoordinateGate({ stateDir, now: () => BASE, resolverPath: 'scripts/cu-coordinate-resolver.mjs', log: (line) => logs.push(line) })
+  const session = sessionOf('millifraction')
+
+  for (const landed of [[120, 500], [1900, 1200]]) {
+    const exec = execOf(session, { screen_index: 0, position: [110.76, 230.21], coordinate_record: 'eeee5555' })
+    deepEqual(await gate.preExecute(exec, nextSpy().fn), { kind: 'accept' }, 'pre-execute 只管记录，放行')
+    const decision = await gate.postExecute(exec, { isError: false, value: { landed } }, nextSpy().fn)
+    eq(decision.kind, 'block', '坐标空间不一致要 feedback')
+    const text = String(decision.feedback?.[0]?.text)
+    ok(text.includes(DENY_SPACE_MISMATCH), '反馈里点名 coordinate-space-mismatch')
+    ok(text.includes('--bounds auto'), '反馈给出 --bounds auto 的可执行修法')
+    ok(text.includes('不计入连续未命中'), '反馈说明不计 streak')
+  }
+  const mismatchLines = logs.filter((line) => line.includes('cu-coord mismatch'))
+  eq(mismatchLines.length, 2, '两次都写 mismatch 行')
+  ok(mismatchLines.every((line) => line.includes('streak=0')), 'mismatch 不动 streak')
+  ok(mismatchLines.every((line) => line.includes(`code=${DENY_SPACE_MISMATCH}`)), '行里带 code')
+  eq(logs.filter((line) => line.includes('cu-coord miss')).length, 0, '没有写成真 miss')
+
+  const third = await gate.preExecute(execOf(session, { screen_index: 0, position: [110.76, 230.21], coordinate_record: 'eeee5555' }), nextSpy().fn)
+  deepEqual(third, { kind: 'accept' }, '两次不一致之后仍没被 coordinate-target-blocked 硬停')
 }])
 
 cases.push(['日志掩码与轮转：sanitizeTurnGuardLine 生效、textChars= 保留、超阈值轮转', () => {
