@@ -34,7 +34,7 @@
 | 2 | 下行 12MB「硬上限」其实照单全收 | ❌ 未修 | `src/pocket-host/downlink-lanes.mjs:32 DEFAULT_MAX_QUEUED_BYTES = 12_000_000`；`:286-292` 注释写「硬上限」但只是 `stats.overflowEvents += 1` + `onOverflow?.()`，紧接着仍 `pending.push(item); queuedBytes += meta.bytes;` |
 | 3 | Deflate/Inflate 队列无上限、且没接 overflow 通知 | ❌ 未修 | `src/pocket-host/ws-deflate.mjs:129-133` 与 `:183-187` 无界 push；`:264-288` 调 `createDownlinkScheduler` 只给 `encode`/`write`，**不给 `limits`、不给 `onOverflow`** → 上层的 overflow 记账无处可看 |
 | 4 | mobile-batch 同一定义存 identity+gzip+br 三份、缓存 8 代 | ❌ 未修 | `src/pocket-host/mobile-batch.mjs:23-31`（`definitions` Map、裁到 8 代）、`:66-68`（`{identity, gzip, br}` 三份 Buffer 永久留在 promise 里）、`:10 MAX_RESPONSE_BYTES = 24MB` 只是单条上游响应上限 |
-| 5 | `StrictHostKeyChecking=no` + 空 known_hosts | ❌ 未修 | `src/pocket-host/ssh-tunnel.mjs:168-169` 与 `:190-191`；实况 `settings.json:4-12`：`enabled: true`、`host ***REMOVED***`、`user root`、`remotePort 7080`、`keyPath D:/dsh-frp/id_ed25519` |
+| 5 | `StrictHostKeyChecking=no` + 空 known_hosts | ❌ 未修 | `src/pocket-host/ssh-tunnel.mjs:168-169` 与 `:190-191`；实况 `settings.json:4-12`：`enabled: true`、`host [已作废·旧入口地址已于 2026-11-28 停用·此处不再写值]`、`user root`、`remotePort 7080`、`keyPath D:/dsh-frp/id_ed25519` |
 | 6 | 首屏批次权重表覆盖不全（75 模块只有 17 条权重） | ❌ 未修 | `src/pocket-host/mobile-boot.mjs:16-34`（17 条）+ `:35`（默认 10000）→ 未列模块按同一估值装箱 |
 | 7 | 上游 401（宿主登录轮转）时代理不丢旧 cookie 重试 | ❌ 未修 | `src/pocket-host/proxy.mjs` 全文无「401 → 清 cookie → 重放」路径；壳侧只有 Android 自愈（`MainActivity.java:296-326`） |
 
@@ -89,7 +89,7 @@
 - 验证：实况断言 `diagnostic.jsonl` 的 `maxFrameBytes` 从 4,416,076 降到 <2MB；`scripts/test-downlink-lanes.mjs` 增用例。
 
 **P0-8 诊断写入去同步化 + 未认证 `page` 写入限流**
-- 做什么：`appendFileSync` 改成批量异步（或至少对 `page` 事件也走 `diagRateLimited`）；现 `page` 分支在鉴权之前、且没有 rate limit 调用，公网扫地址（实测 `diagnostic.jsonl` 里已出现 `host ***REMOVED***` / `***REMOVED***` 的 `page` 记录，UA 是 X11 Chrome/Firefox 扫描器）每次 GET 都落盘一次。
+- 做什么：`appendFileSync` 改成批量异步（或至少对 `page` 事件也走 `diagRateLimited`）；现 `page` 分支在鉴权之前、且没有 rate limit 调用，公网扫地址（实测 `diagnostic.jsonl` 里已出现 `host [已作废·旧入口地址已于 2026-11-28 停用·此处不再写值]` / `[已作废·旧入口地址已于 2026-11-28 停用·此处不再写值]` 的 `page` 记录，UA 是 X11 Chrome/Firefox 扫描器）每次 GET 都落盘一次。
 - 在哪：[src/pocket-host/proxy.mjs](../src/pocket-host/proxy.mjs)：911-959（诊断端点，先于鉴权）、963-974（`page` 写入，无限流）；`src/pocket-host/diagnostics.mjs`:44。
 - 成本：低。风险：低。
 - 验证：从公网 `curl` 连打 200 次 `/`，看日志增长与 429 计数。
@@ -193,7 +193,7 @@
 18. `ssh-tunnel.mjs:168-169,190-191` `StrictHostKeyChecking=no` + `UserKnownHostsFile=NUL`，且 `sshTunnel.user = root`（实况 `settings.json:8`）：中间人可拿整条 http 会话（含 PIN、cookie）。→ P1-4。
 19. `turn-guard.ts:629` 把助手回复前 40 字（含本机绝对路径）明文写盘；`proxy.mjs:933-939,963-974` 把 UA/IP 明文写盘且 `page` 未经鉴权与限流。→ P0-3/P0-8。
 20. `D:\dsh-pocket\.git\config` 的 origin URL **内嵌明文 GitHub PAT**（`ghp_…`）。建议：立即轮换该 token、改 `credential.helper` 或环境变量。成本低，风险高（若仓库外发即泄露）。
-21. 壳侧：`MF:24 usesCleartextTraffic=true` 无 `networkSecurityConfig`、`MainActivity.java:171 MIXED_CONTENT_ALWAYS_ALLOW`、`:184-186 setSafeBrowsingEnabled(false)`、`:188-190` 第三方 cookie 全接受、`:356-367 route()` 把任意 scheme 直接 `ACTION_VIEW`（远端页可诱发 `intent://`/`file://`/`content://`）、`:422-423` 权限已给即整包 `grant()` 无二次确认、`:65 DEFAULT_URL http://***REMOVED***` 写死进 APK、`MF:18 allowBackup=true` 无 backup 例外（`home_url` + WebView cookie/DB 可被系统备份导出）。建议：`networkSecurityConfig` 只放本机/VPS 域、scheme 白名单只留 http/https、401 自愈保留 cookie origin 精确清除（现 `:255-271` 已只按新 origin 逐名清，旧端口残留）。成本中，风险中。
+21. 壳侧：`MF:24 usesCleartextTraffic=true` 无 `networkSecurityConfig`、`MainActivity.java:171 MIXED_CONTENT_ALWAYS_ALLOW`、`:184-186 setSafeBrowsingEnabled(false)`、`:188-190` 第三方 cookie 全接受、`:356-367 route()` 把任意 scheme 直接 `ACTION_VIEW`（远端页可诱发 `intent://`/`file://`/`content://`）、`:422-423` 权限已给即整包 `grant()` 无二次确认、`:65 DEFAULT_URL [已作废·旧入口地址已于 2026-11-28 停用·此处不再写值]` 写死进 APK、`MF:18 allowBackup=true` 无 backup 例外（`home_url` + WebView cookie/DB 可被系统备份导出）。建议：`networkSecurityConfig` 只放本机/VPS 域、scheme 白名单只留 http/https、401 自愈保留 cookie origin 精确清除（现 `:255-271` 已只按新 origin 逐名清，旧端口残留）。成本中，风险中。
 
 ### D. 可维护性
 22. 测试覆盖偏斜：`scripts/` 只有 6 处引用 `src/pocket-host/`（`downlink-lanes / proxy / mobile-boot / runtime / settings / index`），**ssh-tunnel.mjs(951 行)、ws-deflate.mjs(377)、tunnel.mjs(632)、web-rpc.js(533)、fs-rpc.mjs(214)、mobile-batch.mjs(111) 零直接测试**。成本低，风险低。
@@ -213,7 +213,7 @@
 ### F. APK 壳 / 发布链
 33. `build.ps1:8-9` `VersionName` 默认 1.0.0 与 `VersionCode=1` 默认，两者与产物名解耦（`:59`）→ 可产出「版本名不同、versionCode 相同」的包，装机不升级。
 34. `build.ps1:155` `apksigner verify` 后无 `$LASTEXITCODE` 检查 → 验签失败仍打印「完成」；无 `aapt2 badging`、无 `Get-FileHash`（grep 0）。
-35. `build.ps1:43` keystore 口令明文 `***REMOVED***`、`:149 --ks-pass "pass:…"` 进命令行、`:141-144 -dname CN=…L=Xiaogan,ST=Hubei` 身份外泄、`assistant.keystore` 落仓库根且无 `.gitignore`；README 也把口令写进文档。
+35. `build.ps1:43` keystore 口令明文 `[已作废·签名口令已于 2026-11-28 轮换·此处不再写值]`、`:149 --ks-pass "pass:…"` 进命令行、`:141-144 -dname CN=…L=Xiaogan,ST=Hubei` 身份外泄、`assistant.keystore` 落仓库根且无 `.gitignore`；README 也把口令写进文档。
 36. dist 是手工改名复制（脚本不写 `dist\`，实测 `dist\个人助手-通用版-1.0.2.apk` 与 `out\assistant-generic-1.0.2.apk` SHA256 一致）；personal 1.0.2 只存在于 `out\`，dist 没有 → 发版清单不可靠。
 
 ---
