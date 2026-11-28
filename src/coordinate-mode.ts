@@ -80,6 +80,166 @@ async function readBody(req: any, limit = 8 * 1024): Promise<any> {
   }
 }
 
+/** Computer Use 会话的 agent 预设 id（与 src/assistant-cu-watch.ts / src/assistant-dispatch.ts 同一口径）。 */
+const CU_AGENT_PRESET = 'computer-use'
+
+/**
+ * 注入段的宿主内唯一名字。宿主 SystemPrompt.section 要求全局唯一（重名会抛），
+ * 瀑布兜底靠这个名字认「这段已经在载荷里了」，避免两处重复注入。
+ */
+const CU_POLICY_SECTION_NAME = 'assistant:computer-use-coordinate-policy'
+
+/**
+ * 段位次序：紧跟内嵌 computer-use 自己的策略段（order 1750，
+ * vendor/computer-use/index.js:1043 → :1219-1223），所以这段规则在模型读到的文本里
+ * 排在「Coordinates: …」那句之后；1770/1775/1780/1785/1790 是秘书会话自己的段，不占用 1760。
+ */
+export const CU_POLICY_SECTION_ORDER = 1760
+
+/** 内嵌 computer-use 在会话日志里盖坐标模式戳的事件名（canonical 与迁移别名都认）。 */
+const COORDINATE_MODE_EVENT_TYPES = ['computer-use/coordinate-mode', 'plugin:computer-use/coordinate-mode']
+
+/**
+ * DSH 数据根（`<DSH_HOME>`）：本机 profile 目录就是 `<DSH_HOME>/profiles/<名字>`，
+ * 所以先认目录里的 `.dsh` 段、再认 `profiles` 段往回退一级；都认不出时按 `<DSH_HOME>/cu-click`
+ * 的默认位置把 `.dsh` 补上。刻意不新引 `process` / `node:os`：本文件已有 profileDir()
+ * 的同一条回落链（profile 目录 → homePaths → DSH_HOME → cwd），够用了。
+ */
+function dshRootOf(dir: string): string {
+  const parts = String(dir).split(/[\\/]+/).filter((part) => part !== '')
+  const dshAt = parts.lastIndexOf('.dsh')
+  if (dshAt > 0) return join(...parts.slice(0, dshAt + 1))
+  const profilesAt = parts.lastIndexOf('profiles')
+  if (profilesAt > 0) return join(...parts.slice(0, profilesAt))
+  return join(dir, '.dsh')
+}
+
+/** 本机量坐标脚本的绝对路径（仓库里不许写死账户名，按宿主给的 profile 目录派生）。 */
+export function cuMeasureScriptPath(ctx?: any): string {
+  return join(dshRootOf(profileDir(ctx)), 'cu-click', 'measure.ps1')
+}
+
+/**
+ * 「先量后点」硬规则正文（发给 CU 模型的原文）。
+ * @param measurePath - 本机量坐标脚本绝对路径（默认按 DSH_HOME 派生）。
+ * @returns 规则文本；非空串，长度上限由回归断言看着。
+ */
+export function computerUseCoordinatePolicyText(measurePath = cuMeasureScriptPath()): string {
+  return [
+    'CU 坐标硬规则（动手前必照做）：',
+    '1. 先量后点。click / drag / input_text / long_press 之前先在当前截图量出目标像素包围盒 x1,y1,x2,y2，中心=((x1+x2)/2,(y1+y2)/2)；不许目测估点。',
+    '2. 写出算式：正文必须打出算式。千分比会话分数 = 中心像素 ÷ 截图宽或高 × 1000（x÷宽、y÷高）；像素会话直接传中心像素。',
+    '3. 尺寸只认这次：宽高读当前观察面 attached_size 的实际像素，不许沿用上一轮或屏幕尺寸。',
+    '4. 核对落点：click 回执 Pointer landed at [x, y] physical pixels 要落进第 1 步包围盒，没中就地重算再打，不许重复同一组坐标（drag / long_press / input_text 没这句就按这次截图重新量包围盒）。',
+    '5. 同一目标连续 2 次未命中即停用坐标：改地址栏导航 URL、键盘 Tab/Enter/Space 或读页面文本链接，不许第 3 次盲点。',
+    `6. 量坐标优先脚本：跑 ${measurePath} -Shot <截图> -X0 -X1 -Y0 -Y1 -Mode dark|blue|yellow|gray -Split -MinPixels，读它打印的 TOTAL bbox 与 center=(x,y) fraction=[x,y]；脚本跑不动才目测扫描，算式照写。`,
+  ].join('\n')
+}
+
+/** 会话日志里有没有内嵌 computer-use 盖过的坐标模式戳（有 ⇒ 这条会话是 CU）。 */
+function hasCoordinateModeStamp(session: any): boolean {
+  try {
+    const events = session?.snapshotEvents?.()
+    if (!Array.isArray(events)) return false
+    return events.some((event: any) => COORDINATE_MODE_EVENT_TYPES.includes(String(event?.type ?? '')))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 当前是不是一条 Computer Use 会话。
+ *
+ * 判据 = 会话 agent 预设 === 'computer-use'，读法与 src/assistant-cu-watch.ts:616-634 的
+ * sessionPresetOf 同一套（宿主投影优先，header 兜底），所以新建会话（预设刚被宿主写下）
+ * 和续接会话（预设早已在 header / 投影里）都认得；再加一条兜底：内嵌 computer-use 只给
+ * CU 会话盖坐标模式戳（vendor/computer-use/index.js:379-405），日志里有戳也算 CU。
+ * 标准会话（standard / standard-slim-local / 空预设）在这里一律判假，一段字都不多。
+ * @param ctx - dsh-assistant 宿主上下文。
+ * @param session - 这次装配所属的会话（context.agent.session）。
+ * @returns 是否 CU 会话。
+ */
+export function isComputerUseSessionOf(ctx: any, session: any): boolean {
+  for (const value of [
+    (() => { try { return ctx?.get?.('sessionProjections')?.cachedSnapshot?.(session)?.values?.agentPreset } catch { return undefined } })(),
+    (() => { try { return ctx?.get?.('sessionProjections')?.stateOf?.(session, 'agentPreset') } catch { return undefined } })(),
+    (() => { try { return ctx?.get?.('sessionProjectionCache')?.cachedSnapshot?.(session?.header ?? session)?.values?.agentPreset } catch { return undefined } })(),
+    session?.header?.agentPreset,
+  ]) {
+    if (typeof value === 'string' && value !== '') return value === CU_AGENT_PRESET
+  }
+  return hasCoordinateModeStamp(session)
+}
+
+/**
+ * 把「先量后点」硬规则挂到 CU 会话的系统提示上（插件侧唯一的合法通道：
+ * 宿主 SystemPrompt.section，见 @deepseek-ai/dsh-system-prompt 的 PromptSection 定义——
+ * `text` 可以是每次装配现算的函数，装配前宿主就把它解析成 AssembledSection）。
+ *
+ * 覆盖新建与续接两条路：段位文本是**每次装配**现算的（不是会话创建时一次性拼死的），
+ * 判据用会话预设，所以下面这两类会话都会带上这段规则。
+ *
+ * 兜底一层：宿主全局段注册拿不到 systemPrompt 服务时（插件 entry 的 inject 没声明它），
+ * 靠瀑布监听器就地往装配载荷的 sections 里补同一条段——同一个名字，认到已经在就不重复加。
+ * @param ctx - dsh-assistant 宿主上下文。
+ * @param disposers - 插件卸载时要一起摘掉的清理函数。
+ */
+function installComputerUseCoordinatePolicy(ctx: any, disposers: Array<() => void>): void {
+  // 量坐标脚本路径按宿主真实 profile 目录派生一次（每次装配重算没必要，路径是机器静态事实）。
+  let measurePath = ''
+  try {
+    measurePath = cuMeasureScriptPath(ctx)
+  } catch {
+    measurePath = ''
+  }
+  if (typeof ctx?.on === 'function') {
+    const hook = async (assembly: any, context: any, next: () => Promise<any>): Promise<any> => {
+      const inner = await next()
+      try {
+        if (!isComputerUseSessionOf(ctx, context?.agent?.session)) return inner
+        const sections = Array.isArray(inner?.sections) ? inner.sections : []
+        if (sections.some((section: any) => section?.name === CU_POLICY_SECTION_NAME)) return inner
+        const appended = {
+          name: CU_POLICY_SECTION_NAME,
+          text: computerUseCoordinatePolicyText(measurePath || undefined),
+          interpolate: false,
+        }
+        return { ...inner, sections: [...sections, appended] }
+      } catch {
+        return inner
+      }
+    }
+    try {
+      const off = ctx.on('system-prompt/assemble', hook)
+      if (typeof off === 'function') disposers.push(off)
+    } catch (err) {
+      try { ctx.logger?.('dsh-assistant')?.error?.('cu coordinate policy waterfall failed: %s', String(err)) } catch {}
+    }
+  }
+
+  let systemPrompt: any
+  try {
+    systemPrompt = (typeof ctx?.get === 'function' ? ctx.get('systemPrompt') : undefined) ?? ctx?.systemPrompt
+  } catch {
+    systemPrompt = undefined
+  }
+  if (systemPrompt === undefined || typeof systemPrompt.section !== 'function') return
+  try {
+    const off = systemPrompt.section({
+      name: CU_POLICY_SECTION_NAME,
+      order: CU_POLICY_SECTION_ORDER,
+      text: (context: any) => (
+        isComputerUseSessionOf(ctx, context?.agent?.session)
+          ? computerUseCoordinatePolicyText(measurePath || undefined)
+          : ''
+      ),
+    })
+    if (typeof off === 'function') disposers.push(off)
+  } catch (err) {
+    try { ctx.logger?.('dsh-assistant')?.error?.('cu coordinate policy section failed: %s', String(err)) } catch {}
+  }
+}
+
 /**
  * 给宿主 `system-prompt/assemble` 的载荷补上 `tools`。
  *
@@ -159,6 +319,8 @@ export function registerCoordinateMode(ctx: any): () => void {
   const disposers: Array<() => void> = []
   // 先补宿主 assemble 载荷缺的 `tools`（内嵌 computer-use 的像素模式钩子要求它存在）。
   installAssembleToolsPayload(ctx, disposers)
+  // 「先量后点」硬规则：只往 Computer Use 会话的系统提示注入（新建与续接都覆盖）。
+  installComputerUseCoordinatePolicy(ctx, disposers)
   const routes = manageWebRoutes(ctx.webServer)
   disposers.push(routes.dispose)
   // 服务名专用，避免和 dsh-orb 的 orbCoordinateMode 撞名；内嵌 computer-use 优先读它。
