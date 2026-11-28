@@ -61,3 +61,9 @@ dist/*.apk
 /*.apk
 /ESP32-S3-BOX-3-AIoT-*.pdf
 /ESP32-S3-BOX-3-AIoT-*.pdf
+
+# 上架阻断第 2 件（2026-11-28）：本机临时工作目录与构建产物一律不入库，
+# 免得 git add -A 这类操作会把 .tmp/ 与 outputs/ 的证据件送进提交里。
+.tmp/
+outputs/
+/tmp-*.png
