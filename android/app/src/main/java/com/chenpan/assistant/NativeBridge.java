@@ -109,6 +109,10 @@ public class NativeBridge {
         });
     }
 
+    // 与 KeepAliveService.buildNotification 同一句注释：消掉 javac 的「已过时 API」提示是硬要求——
+    // Windows PowerShell 5.1 把本机命令写到 stderr 的一行变成终止错误（build.ps1 里 EAP=Stop），
+    // 一句提示就能打断整条构建（本轮实测）。这两处（Builder(Context) / setPriority）只在 Android 8 以下走。
+    @SuppressWarnings("deprecation")
     private void postTaskDoneNotification(String title, String text) {
         Activity activity = activityRef.get();
         if (activity == null) return;

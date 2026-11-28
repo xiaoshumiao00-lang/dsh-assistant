@@ -184,6 +184,10 @@ public class KeepAliveService extends Service {
     }
 
     /** 常驻低优先级通知：「个人助手常驻连接中」，点一下回页面。 */
+    // 消掉 javac 的「已过时 API」提示（Notification.Builder(Context) / setPriority 只在 Android 8 以下走）：
+    // Windows PowerShell 5.1 会把本机命令写到 stderr 的一行变成终止错误（build.ps1 里 EAP=Stop），
+    // 一句提示就能把整条构建打断——本轮实测；javac 静默后 build.ps1 才能按原样跑通。
+    @SuppressWarnings("deprecation")
     private Notification buildNotification() {
         Intent open = new Intent(this, MainActivity.class);
         open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);

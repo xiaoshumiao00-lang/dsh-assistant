@@ -136,6 +136,17 @@ public class MainActivity extends Activity {
     private Button keepAliveToggle;
     private Button batteryWhitelist;
 
+    /** 设置页「检查更新」区块（1.4.10）：版本行 + 开关 + 源输入 + 状态行 + 忽略这版的恢复按钮。 */
+    private TextView versionRow;
+    private Button updateCheckToggle;
+    private EditText updateSourceInput;
+    private Button updateSourceSave;
+    private Button updateCheckRun;
+    private TextView updateStatusRow;
+    private Button updateSkipClear;
+    /** 后台查询进行中标志（一次只允许在飞一条请求，重复点不叠加）。 */
+    private boolean updateChecking;
+
     private final Handler handler = new Handler(Looper.getMainLooper());
     private Runnable backLongPress;
     private boolean backLongFired;
@@ -548,6 +559,7 @@ public class MainActivity extends Activity {
      * 401 既没有内容长度、又是 chunked + keep-alive，下载器拿不到大小也没处可写，通知栏就停在 0% 不动。
      * 所以这里必须把 CookieManager 里该 URL 的 cookie 原样塞进下载请求。
      */
+    @SuppressWarnings("deprecation")
     private void startDownload(String url, String contentDisposition, String mimeType) {
         String name = "";
         try {
@@ -815,6 +827,225 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---------------------------------------------------- 1.4.10 检查更新入口
+
+    /**
+     * 用户主动按「检查更新」（后菜单第 4 项 / 设置页按钮）才走到这里。
+     * 关闭态、源空态都在 UpdateCheck 里当场返回，不发请求；这里也只在这一次点按里发 1 次。
+     * 请求跑在后台线程：主线程只负责提示与弹窗，UI 不会被网络卡住。
+     */
+    private void startUpdateCheck() {
+        if (updateChecking) {
+            toast("上一次检查还在跑，先等它结束（不会叠加第二次请求）");
+            return;
+        }
+        if (!UpdateCheck.isEnabled(this)) {
+            toast("更新检查是关闭的（默认就关）：先在这个应用的设置页开开关并填你自己的 owner/repo，再点检查更新");
+            return;
+        }
+        if (TextUtils.isEmpty(UpdateCheck.trimSource(UpdateCheck.source(this)))) {
+            toast("更新源还空着：填「你的GitHub账号名/仓库名」才会去查，空着就是不联网");
+            return;
+        }
+        updateChecking = true;
+        toast("正在检查更新：只连 " + UpdateCheck.ALLOWED_API_HOST + "，一次只发 1 个请求，查完就停，不会后台自动查");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                UpdateCheck.Result result = null;
+                String fatal = "";
+                try {
+                    result = UpdateCheck.check(MainActivity.this, System.currentTimeMillis());
+                } catch (Throwable t) {
+                    fatal = t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
+                }
+                final UpdateCheck.Result delivered = result;
+                final String deliveredFatal = fatal;
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        updateChecking = false;
+                        showUpdateResult(delivered, deliveredFatal);
+                    }
+                });
+            }
+        }, "dsh-update-check").start();
+    }
+
+    /** 结果照实说：失败就是失败，绝不说成「已经是最新版」；有新版本才给「下载并安装」。 */
+    private void showUpdateResult(UpdateCheck.Result r, String fatal) {
+        if (r == null) {
+            toast("检查更新没跑起来：" + (TextUtils.isEmpty(fatal) ? "未知原因" : fatal)
+                    + "\n（这次没当成「没有新版本」，可以过一忽再点一次）");
+            refreshUpdateRows();
+            return;
+        }
+        boolean installable = !TextUtils.isEmpty(r.latest) && !TextUtils.isEmpty(r.apkUrl);
+        if (UpdateCheck.RESULT_NEW.equals(r.status)
+                || (UpdateCheck.RESULT_THROTTLED.equals(r.status) && installable)) {
+            promptInstallUpdate(r);
+        } else {
+            toast(r.message);
+        }
+        refreshUpdateRows();
+    }
+
+    /** 有新版本才弹这个窗：主按钮「下载并安装」，副按钮「这版不装」（skipVersion 持久化）。 */
+    private void promptInstallUpdate(final UpdateCheck.Result r) {
+        String head = UpdateCheck.RESULT_THROTTLED.equals(r.status)
+                ? "发现新版本 " + r.latest + "（这一次没联网，用的是 24 小时内查到的结果）"
+                : "发现新版本 " + r.latest;
+        String note = TextUtils.isEmpty(r.notes) ? "" : ("\n\n更新说明：\n" + r.notes);
+        new AlertDialog.Builder(this)
+                .setTitle("检查更新")
+                .setMessage(head + "\n本机版本：" + (TextUtils.isEmpty(r.localVersion) ? "读不到" : r.localVersion)
+                        + "\n装新版要在系统弹出的安装界面里点「安装」确认（本应用没法自己静默装）。" + note)
+                .setPositiveButton("下载并安装", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        tryInstallUpdate(r.latest, r.apkUrl, r.apkName);
+                    }
+                })
+                .setNegativeButton("这版不装", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        UpdateCheck.setSkipVersion(MainActivity.this, r.latest);
+                        toast("已记下「这版不装」：v " + r.latest + " 不再提示（要恢复就去设置页清掉这条忽略）");
+                        refreshUpdateRows();
+                    }
+                })
+                .setNeutralButton("先不弄", null)
+                .show();
+    }
+
+    /** Android 8+ 装应用要先允许「安装未知应用」；没允许就先说清、只给跳系统设置页的入口（绝不自动授权）。 */
+    private boolean installAlreadyPermitted() {
+        if (Build.VERSION.SDK_INT < 26) return true;
+        try {
+            return getPackageManager().canRequestPackageInstalls();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private void tryInstallUpdate(final String tag, final String apkUrl, final String assetName) {
+        if (!installAlreadyPermitted()) {
+            new AlertDialog.Builder(this)
+                    .setTitle("要装新版，先允许这个应用装应用")
+                    .setMessage("这台手机还没允许「个人助手」安装应用。\n"
+                            + "点「去设置」打开系统里的「安装未知应用」，把它允许；回到这里再点一次「下载并安装」。\n"
+                            + "点「只下载」也行：新版会落到系统「下载」里，你在下载通知或文件管理器里点它一样能装。")
+                    .setPositiveButton("去设置", new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            try {
+                                Intent intent = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES);
+                                intent.setData(Uri.parse("package:" + getPackageName()));
+                                startActivity(intent);
+                            } catch (Throwable t) {
+                                toast("这台设备没有这个系统设置页：去系统设置里搜「安装未知应用」");
+                            }
+                        }
+                    })
+                    .setNegativeButton("只下载", new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            startUpdateDownload(tag, apkUrl, assetName);
+                        }
+                    })
+                    .setNeutralButton("取消", null)
+                    .show();
+            return;
+        }
+        startUpdateDownload(tag, apkUrl, assetName);
+    }
+
+    /**
+     * 下载这条复用 1.4.4 起的系统原生下载链路（DownloadManager.enqueue + 可见下载队列 + 完成通知），
+     * 完成以后走既有 reportDownload 的 apk 分流：content:// + ACTION_VIEW + 读权限临时授权 → 系统安装界面。
+     * 这里不往下载请求里塞 WebView 的 cookie：GitHub 的公开 release 不需要登录态，
+     * 把助手入口的访问密码 cookie 顺手发给 GitHub 纯属泄漏。
+     */
+    @SuppressWarnings("deprecation")
+    private void startUpdateDownload(String tag, String url, String assetName) {
+        if (!UpdateCheck.isDownloadUrlAllowed(url, UpdateCheck.source(this))) {
+            toast("这个下载地址不合格：只许 https、只许同一个更新源（你自己的 owner/repo）下面的 .apk。已拒绝下载");
+            return;
+        }
+        String name = updateDownloadName(url, assetName, tag);
+        try {
+            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
+            req.setMimeType(APK_MIME);
+            req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            req.setVisibleInDownloadsUi(true);
+            req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
+            DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+            if (dm == null) throw new IllegalStateException("没有 DownloadManager");
+            watchDownload(dm.enqueue(req), name);
+            toast("正在下载 v" + tag + "（系统「下载」通知里有进度）；下载完会自动弹系统安装界面");
+        } catch (Throwable t) {
+            String why = t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
+            toast("下载没起来：" + why + "\n文件：" + name);
+        }
+    }
+
+    /** 落盘名：优先 GitHub 资产名，其次按 tag 拼一个；一律去掉路径分隔符（防止下载直接起不来）。 */
+    private String updateDownloadName(String url, String assetName, String tag) {
+        String raw = TextUtils.isEmpty(assetName) ? "" : assetName;
+        if (TextUtils.isEmpty(raw) && !TextUtils.isEmpty(url)) {
+            String path = Uri.parse(url).getPath();
+            if (!TextUtils.isEmpty(path)) {
+                int slash = path.lastIndexOf('/');
+                raw = slash >= 0 ? path.substring(slash + 1) : path;
+            }
+        }
+        if (TextUtils.isEmpty(raw)) {
+            raw = "assistant-" + (TextUtils.isEmpty(tag) ? "update" : tag) + ".apk";
+        }
+        if (!raw.toLowerCase().endsWith(".apk")) raw = raw + ".apk";
+        return raw.replace('\\', '_').replace('/', '_').replace(':', '_').trim();
+    }
+
+    /** 设置页「检查更新」那一块的状态文案（按钮没建/设置页没开时调用也无害）。 */
+    private void refreshUpdateRows() {
+        if (versionRow != null) {
+            String name = UpdateCheck.versionName(this);
+            int code = UpdateCheck.versionCode(this);
+            versionRow.setText("当前版本：" + (TextUtils.isEmpty(name) ? "读不到" : name)
+                    + "　versionCode " + (code < 0 ? "?" : String.valueOf(code)));
+        }
+        if (updateCheckToggle != null) {
+            updateCheckToggle.setText("检查更新：" + (UpdateCheck.isEnabled(this)
+                    ? "已开启"
+                    : "已关闭（默认关闭；关闭期间这个应用不会联网查版本）"));
+        }
+        if (updateStatusRow != null) {
+            String src = UpdateCheck.source(this);
+            String skip = UpdateCheck.getSkipVersion(this);
+            long last = UpdateCheck.lastCheckAt(this);
+            long now = System.currentTimeMillis();
+            StringBuilder sb = new StringBuilder();
+            if (TextUtils.isEmpty(src)) {
+                sb.append("更新源：空　状态：关闭（不联网）");
+            } else if (!UpdateCheck.isOwnerRepoForm(src)) {
+                sb.append("更新源：「").append(src).append("」不合格　状态：这个源被拒，不会联网");
+            } else {
+                sb.append("更新源：").append(src)
+                        .append(UpdateCheck.isEnabled(this) ? "　状态：可查" : "　状态：关闭（开关没开，不会联网）");
+            }
+            sb.append("\n节流：24 小时只查一次");
+            if (last <= 0L) sb.append("　还没查过");
+            else if (UpdateCheck.checkAllowedNow(last, now)) sb.append("　现在可以再查");
+            else sb.append("　下次可以再查还差 ").append(UpdateCheck.throttleLeftText(last, now));
+            if (!TextUtils.isEmpty(skip)) sb.append("\n「这版不装」：v ").append(skip);
+            updateStatusRow.setText(sb.toString());
+        }
+        if (updateSkipClear != null) {
+            updateSkipClear.setVisibility(TextUtils.isEmpty(UpdateCheck.getSkipVersion(this))
+                    ? View.GONE : View.VISIBLE);
+        }
+    }
+
     // ------------------------------------------------------------- 地址设置页
 
     private void showSetup(boolean overlay) {
@@ -1011,6 +1242,150 @@ public class MainActivity extends Activity {
             }
         });
         refreshKeepAliveRows();
+
+        // ---- 1.4.10 检查更新：默认关闭、更新源要自己填（owner/repo），24 小时只查一次。
+        //      这一整块只是开关 + 输入 + 手动按钮；没有定时器、没有后台自动查。 ----
+        TextView updateTitle = new TextView(this);
+        updateTitle.setText("检查更新（默认关闭）");
+        updateTitle.setTextColor(TEXT);
+        updateTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        updateTitle.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        LinearLayout.LayoutParams updateTitleLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        updateTitleLp.topMargin = dp(24);
+        form.addView(updateTitle, updateTitleLp);
+
+        versionRow = new TextView(this);
+        versionRow.setTextColor(DIM);
+        versionRow.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        LinearLayout.LayoutParams versionLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        versionLp.topMargin = dp(8);
+        form.addView(versionRow, versionLp);
+
+        TextView updateDesc = new TextView(this);
+        updateDesc.setText("更新检查默认是关闭的，要自己填更新源：填你自己的仓库 owner/repo（GitHub 账号名/仓库名），"
+                + "留空就是关闭、完全不联网。\n查到的新版只认 https 的 GitHub 发布页，24 小时内只查一次，"
+                + "只有你点「检查更新」才发一次请求，本应用不会后台自动联网。");
+        updateDesc.setTextColor(DIM);
+        updateDesc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        updateDesc.setLineSpacing(dp(3), 1f);
+        LinearLayout.LayoutParams updateDescLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        updateDescLp.topMargin = dp(8);
+        form.addView(updateDesc, updateDescLp);
+
+        updateCheckToggle = new Button(this);
+        updateCheckToggle.setAllCaps(false);
+        updateCheckToggle.setTextColor(TEXT);
+        updateCheckToggle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        updateCheckToggle.setBackgroundColor(CARD);
+        LinearLayout.LayoutParams updateToggleLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+        updateToggleLp.topMargin = dp(8);
+        form.addView(updateCheckToggle, updateToggleLp);
+        updateCheckToggle.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                boolean next = !UpdateCheck.isEnabled(MainActivity.this);
+                UpdateCheck.setEnabled(MainActivity.this, next);
+                refreshUpdateRows();
+                toast(next
+                        ? "已开启更新检查（还要填更新源才会联网）"
+                        : "已关闭更新检查：关闭期间不会联网查版本");
+            }
+        });
+
+        TextView updateSourceLabel = new TextView(this);
+        updateSourceLabel.setText("更新源（owner/repo）");
+        updateSourceLabel.setTextColor(TEXT);
+        updateSourceLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        updateSourceLabel.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        LinearLayout.LayoutParams updateSourceLabelLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        updateSourceLabelLp.topMargin = dp(10);
+        form.addView(updateSourceLabel, updateSourceLabelLp);
+
+        updateSourceInput = new EditText(this);
+        updateSourceInput.setText(UpdateCheck.source(this));
+        updateSourceInput.setSingleLine(true);
+        updateSourceInput.setInputType(InputType.TYPE_CLASS_TEXT);
+        updateSourceInput.setTextColor(TEXT);
+        updateSourceInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        updateSourceInput.setHintTextColor(DIM);
+        updateSourceInput.setHint("你的GitHub账号名/仓库名（留空就是不联网）");
+        updateSourceInput.setSelectAllOnFocus(true);
+        LinearLayout.LayoutParams updateSourceInputLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        updateSourceInputLp.topMargin = dp(6);
+        form.addView(updateSourceInput, updateSourceInputLp);
+
+        updateSourceSave = new Button(this);
+        updateSourceSave.setText("保存更新源");
+        updateSourceSave.setAllCaps(false);
+        updateSourceSave.setTextColor(TEXT);
+        updateSourceSave.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        updateSourceSave.setBackgroundColor(CARD);
+        LinearLayout.LayoutParams updateSourceSaveLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+        updateSourceSaveLp.topMargin = dp(8);
+        form.addView(updateSourceSave, updateSourceSaveLp);
+        updateSourceSave.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                String reason = UpdateCheck.saveSource(MainActivity.this,
+                        updateSourceInput.getText().toString());
+                refreshUpdateRows();
+                toast(reason);
+            }
+        });
+
+        updateCheckRun = new Button(this);
+        updateCheckRun.setText("检查更新（手动查一次）");
+        updateCheckRun.setAllCaps(false);
+        updateCheckRun.setTextColor(Color.WHITE);
+        updateCheckRun.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        updateCheckRun.setBackgroundColor(ACCENT);
+        LinearLayout.LayoutParams updateRunLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+        updateRunLp.topMargin = dp(8);
+        form.addView(updateCheckRun, updateRunLp);
+        updateCheckRun.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startUpdateCheck();
+            }
+        });
+
+        updateSkipClear = new Button(this);
+        updateSkipClear.setText("取消「这版不装」，恢复提示");
+        updateSkipClear.setAllCaps(false);
+        updateSkipClear.setTextColor(TEXT);
+        updateSkipClear.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        updateSkipClear.setBackgroundColor(CARD);
+        LinearLayout.LayoutParams skipLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+        skipLp.topMargin = dp(8);
+        form.addView(updateSkipClear, skipLp);
+        updateSkipClear.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                UpdateCheck.clearSkipVersion(MainActivity.this);
+                refreshUpdateRows();
+                toast("已取消「这版不装」：以后查到同一个版本还会提示");
+            }
+        });
+
+        updateStatusRow = new TextView(this);
+        updateStatusRow.setTextColor(DIM);
+        updateStatusRow.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        updateStatusRow.setLineSpacing(dp(3), 1f);
+        LinearLayout.LayoutParams updateStatusLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        updateStatusLp.topMargin = dp(8);
+        form.addView(updateStatusRow, updateStatusLp);
+
+        refreshUpdateRows();
 
         TextView tip = new TextView(this);
         tip.setText("· 家里同一个 WiFi 可用局域网地址，出门用固定公网地址\n"
@@ -1224,6 +1599,7 @@ public class MainActivity extends Activity {
     }
 
     /** 白底 → 状态栏/导航栏图标改深色；深色 → 恢复浅色图标。 */
+    @SuppressWarnings("deprecation")
     private void applySystemBars(boolean light) {
         try {
             View decor = getWindow().getDecorView();
@@ -1293,13 +1669,14 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 返回键菜单（1.4.2 起）：只留「设置地址 / 重新加载页面 / 退出应用」三项。
+     * 返回键菜单（1.4.2 起三项；1.4.10 起加第 4 项「检查更新」）：
+     * 「设置地址 / 重新加载页面 / 退出应用 / 检查更新」。
      *
      * 没有「取消」按钮：AlertDialog 默认 cancelable，点弹窗外面或按返回键就关掉
      * （弹窗有自己的 Window 抢焦点，不会落进 Activity 的 dispatchKeyEvent 里）。
      */
     private void showBackMenu() {
-        final String[] items = new String[]{"设置地址", "重新加载页面", "退出应用"};
+        final String[] items = new String[]{"设置地址", "重新加载页面", "退出应用", "检查更新"};
         AlertDialog dlg = new AlertDialog.Builder(this)
                 .setTitle("个人助手")
                 .setCancelable(true)
@@ -1315,6 +1692,9 @@ public class MainActivity extends Activity {
                                 hideError();
                                 web.loadUrl(saved);
                             }
+                        } else if (which == 3) {
+                            // 1.4.10：只有用户主动按这一项才发一次请求（关闭态只提示、不联网）
+                            startUpdateCheck();
                         } else {
                             finish();
                         }
@@ -1348,6 +1728,7 @@ public class MainActivity extends Activity {
         // 保活服务若曾在后台被回收，回到前台立刻补拉（start 内部幂等，已在跑则空转）
         KeepAliveService.start(this);
         refreshKeepAliveRows();
+        refreshUpdateRows();
         // 连接断开由页面侧 foreground-nudge 负责（可见即 reconnect + 阶梯补刀）；
         // 这里只探「渲染进程是不是还活着」，绝不无条件 reload——那就是用户骂的重连白等。
         probePageAlive();
