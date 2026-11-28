@@ -2,19 +2,25 @@
 /**
  * Computer Use 坐标解析器（命令行）。
  *
- * 输入：截图实际像素尺寸 + 目标元素在截图上的起止像素（bbox；UIA 元素边界换算成截图坐标后同样适用）。
+ * 输入：截图实际像素尺寸 + 目标元素在截图上的起止像素（bbox；UIA 元素边界换算成截图坐标后同样适用）
+ *      + **观察面在屏幕上的矩形**（`--bounds x,y,w,h` 或 `--bounds auto`）。
  * 输出：目标中心物理像素、bbox、0–1000 归一化分数（x/y 各带算式）、按 harness 映射规则预测的
  *       物理落点，以及可选的校验（分数换算回来落在 bbox 外时直接报 miss、偏差像素、建议分数）。
  * 同时把一份记录写到系统临时目录 dsh-cu-coordinate-records/<id>.json，供插件侧 pre-execute 校验。
  *
+ * 为什么 `--bounds` 是必填（2026-11-28 运行期实测）：
+ *   截图是**窗口内坐标**（原点 0,0），工具回执的 `Pointer landed at [x, y]` 是**屏幕绝对坐标**。
+ *   不给窗口矩形就只能假定原点 0,0，任何不在屏幕左上角的窗口都会得到永久 miss（实测假警报 210 px）。
+ *   所以缺 `--bounds` 直接报 `missing-bounds` 退出，绝不静默按 0,0 算。
+ *
  * 用法（不带参数会打印帮助）：
  *   node scripts/cu-coordinate-resolver.mjs --shot 1920x1032 --bbox 346,888,471,917 \
- *     --target "Publish release" --tool click --mode millifraction [--position 146,873]
+ *     --bounds auto --target "Publish release" --tool click --mode millifraction [--position 146,873]
  *
  * 参数：
  *   --shot WxH            截图实际像素尺寸（必填）
  *   --bbox x1,y1,x2,y2    目标元素在截图上的起止像素（必填）
- *   --bounds x,y,w,h      观察面物理矩形（可选；缺省 0,0,截图宽,截图高）
+ *   --bounds x,y,w,h|auto 观察面在屏幕上的矩形（必填）；auto = 现场量前台窗口（koffi → user32）
  *   --mode millifraction|pixel  会话坐标口径（缺省 millifraction）
  *   --position x,y        要校验的坐标（可选；按 mode 解释）
  *   --target <文本>       目标标签（只进记录文件，不进日志）
@@ -26,9 +32,16 @@
  *   --json                只打印 JSON（缺省也打印 JSON，保留这个开关便于脚本拼命令）
  *   --help                打印本帮助
  *
- * 退出码：0 = 解析成功（check 可能是 miss，miss 也是成功解析）；1 = 参数/输入错误。
+ * 退出码：0 = 解析成功（check 可能是 miss，miss 也是成功解析）；1 = 参数/输入错误
+ *        （错误码写在 stderr：missing-bounds / auto-bounds-unavailable / auto-bounds-mismatch / ...）。
  */
-import { resolveCoordinates, writeCoordinateRecord, defaultCoordinateRecordDir } from '../src/cu-coordinate.ts'
+import { createRequire } from 'node:module'
+import {
+  boundsFromWindowProbe,
+  defaultCoordinateRecordDir,
+  resolveCoordinates,
+  writeCoordinateRecord,
+} from '../src/cu-coordinate.ts'
 
 function fail(message) {
   process.stderr.write(`cu-coordinate-resolver: ${message}\n`)
@@ -57,10 +70,107 @@ function parseQuad(text, name) {
   return parts
 }
 
+/* ---------- --bounds auto：koffi → user32 / dwmapi 现场量前台窗口 ---------- */
+
+function loadKoffi() {
+  try {
+    return createRequire(import.meta.url)('koffi')
+  } catch {
+    return null
+  }
+}
+
+const RECT_BUFFER_BYTES = 16
+const DWMWA_EXTENDED_FRAME_BOUNDS = 9
+
+function readRectInt32(buffer) {
+  return {
+    x: buffer.readInt32LE(0),
+    y: buffer.readInt32LE(4),
+    width: buffer.readInt32LE(8) - buffer.readInt32LE(0),
+    height: buffer.readInt32LE(12) - buffer.readInt32LE(4),
+  }
+}
+
+/**
+ * 量前台窗口在屏幕上的矩形。
+ * 优先 DWM 的 extended frame bounds（与抓屏用的可见区逐像素一致，不含不可见边框）；
+ * 退回 GetWindowRect（含不可见边框，交给 boundsFromWindowProbe 的 inset 分支推算原点）。
+ * 进程 DPI 感知级别决定坐标是否需要按 DPI 缩放：unaware 时 Win32 返回虚拟化坐标。
+ * 取不到就抛 auto-bounds-unavailable，**绝不**静默退回 0,0。
+ */
+function foregroundWindowProbe() {
+  if (process.platform !== 'win32') {
+    throw new TypeError('auto-bounds-unavailable: 只有 Windows 能现场量前台窗口，请用 --bounds x,y,w,h')
+  }
+  const koffi = loadKoffi()
+  if (!koffi) throw new TypeError('auto-bounds-unavailable: 加载不到 koffi 原生模块，请用 --bounds x,y,w,h')
+  let user32
+  try {
+    user32 = koffi.load('user32.dll')
+  } catch {
+    throw new TypeError('auto-bounds-unavailable: user32.dll 加载失败，请用 --bounds x,y,w,h')
+  }
+  const getForeground = user32.func('void * __stdcall GetForegroundWindow()')
+  const hwnd = getForeground()
+  if (!hwnd) throw new TypeError('auto-bounds-unavailable: 取不到前台窗口（锁屏或无焦点窗口），请用 --bounds x,y,w,h')
+
+  let rect = null
+  let frameSource = 'window-rect'
+  try {
+    const dwmapi = koffi.load('dwmapi.dll')
+    const dwmRect = dwmapi.func('int __stdcall DwmGetWindowAttribute(void *hwnd, uint32 attribute, _Out_ uint8_t *value, uint32 size)')
+    const extended = Buffer.alloc(RECT_BUFFER_BYTES)
+    if (dwmRect(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, extended, RECT_BUFFER_BYTES) === 0) {
+      const frame = readRectInt32(extended)
+      if (frame.width > 0 && frame.height > 0) {
+        rect = frame
+        frameSource = 'dwm-extended-frame'
+      }
+    }
+  } catch {
+    rect = null
+  }
+  if (!rect) {
+    const getWindowRect = user32.func('int __stdcall GetWindowRect(void *hwnd, _Out_ uint8_t *rect)')
+    const raw = Buffer.alloc(RECT_BUFFER_BYTES)
+    if (getWindowRect(hwnd, raw) === 0) {
+      throw new TypeError('auto-bounds-unavailable: GetWindowRect 失败（窗口已关闭？），请用 --bounds x,y,w,h')
+    }
+    rect = readRectInt32(raw)
+    frameSource = 'window-rect'
+  }
+
+  // DPI：unaware 进程拿到的是虚拟化坐标，要按系统 DPI 放大才是物理像素。
+  let dpi = 96
+  let coordScale = 1
+  let awareness = 1
+  try {
+    const getDpiForWindow = user32.func('uint32 __stdcall GetDpiForWindow(void *hwnd)')
+    const value = Number(getDpiForWindow(hwnd))
+    if (Number.isFinite(value) && value > 0) dpi = value
+  } catch { /* 老系统没有 GetDpiForWindow：按 96 处理 */ }
+  try {
+    const threadContext = user32.func('void * __stdcall GetThreadDpiAwarenessContext()')
+    const awarenessOf = user32.func('int __stdcall GetAwarenessFromDpiAwarenessContext(void *context)')
+    awareness = Number(awarenessOf(threadContext()))
+  } catch { /* 老系统没有 DPI 感知查询：按已感知处理（不做缩放） */ }
+  if (awareness === 0) {
+    let systemDpi = dpi
+    try {
+      const getDpiForSystem = user32.func('uint32 __stdcall GetDpiForSystem()')
+      const value = Number(getDpiForSystem())
+      if (Number.isFinite(value) && value > 0) systemDpi = value
+    } catch { /* 用窗口 DPI 兜底 */ }
+    coordScale = systemDpi / 96
+  }
+  return { rect, dpi, coordScale, frameSource }
+}
+
 function usage() {
   return [
-    'usage: node scripts/cu-coordinate-resolver.mjs --shot WxH --bbox x1,y1,x2,y2 [options]',
-    '  --bounds x,y,w,h     observation surface rect (default 0,0,W,H)',
+    'usage: node scripts/cu-coordinate-resolver.mjs --shot WxH --bbox x1,y1,x2,y2 --bounds x,y,w,h|auto [options]',
+    '  --bounds x,y,w,h|auto  REQUIRED observation rect on screen; auto = measure the foreground window now',
     '  --mode millifraction|pixel   session coordinate contract (default millifraction)',
     '  --position x,y       position to validate (interpreted by --mode)',
     '  --target <text>      target label (record only; never logged)',
@@ -70,6 +180,9 @@ function usage() {
     '  --state-dir <dir>    record directory (default system temp)',
     '  --no-write           resolve only, do not write a record',
     '  --help               print this help',
+    '',
+    'exit codes: 0 = resolved (check may be miss); 1 = input error, code on stderr',
+    '(missing-bounds / auto-bounds-unavailable / auto-bounds-mismatch)',
   ].join('\n')
 }
 
@@ -82,6 +195,7 @@ if (argv.length === 0 || argv.includes('--help') || argv.includes('-h')) {
 let shot
 let bbox
 let bounds
+let boundsArgSeen = false
 let mode = 'millifraction'
 let position
 let target = ''
@@ -107,8 +221,14 @@ for (let index = 0; index < argv.length; index += 1) {
       break
     }
     case '--bounds': {
-      const [x, y, width, height] = parseQuad(readValue(argv, index, arg), arg)
-      bounds = { x, y, width, height }
+      const value = readValue(argv, index, arg)
+      boundsArgSeen = true
+      if (value === 'auto') {
+        bounds = 'auto'
+      } else {
+        const [x, y, width, height] = parseQuad(value, arg)
+        bounds = { x, y, width, height }
+      }
       index += 1
       break
     }
@@ -166,10 +286,54 @@ for (let index = 0; index < argv.length; index += 1) {
 
 if (!shot) fail('缺 --shot WxH')
 if (!bbox) fail('缺 --bbox x1,y1,x2,y2')
+if (!boundsArgSeen) {
+  fail('missing-bounds: 截图是窗口内坐标（原点 0,0）、落点是屏幕绝对坐标，必须给窗口在屏幕上的矩形：'
+    + '--bounds x,y,w,h 或 --bounds auto（现场量前台窗口）')
+}
+
+let boundsSource = 'explicit'
+let boundsNotes = []
+let windowProbe = null
+if (bounds === 'auto') {
+  let probe
+  try {
+    probe = foregroundWindowProbe()
+  } catch (error) {
+    fail(String(error?.message ?? error))
+  }
+  let autoBounds
+  try {
+    autoBounds = boundsFromWindowProbe(shot, probe)
+  } catch (error) {
+    fail(String(error?.message ?? error))
+  }
+  bounds = autoBounds.bounds
+  boundsSource = 'auto'
+  boundsNotes = autoBounds.boundsNotes
+  windowProbe = {
+    frameSource: probe.frameSource,
+    dpi: probe.dpi,
+    coordScale: probe.coordScale,
+    rect: probe.rect,
+    captureScale: autoBounds.captureScale,
+  }
+}
 
 let record
 try {
-  record = resolveCoordinates({ screenshot: shot, bbox, bounds, mode, position, target, tool, sessionId, screenIndex })
+  record = resolveCoordinates({
+    screenshot: shot,
+    bbox,
+    bounds,
+    boundsSource,
+    boundsNotes,
+    mode,
+    position,
+    target,
+    tool,
+    sessionId,
+    screenIndex,
+  })
 } catch (error) {
   fail(String(error?.message ?? error))
 }
@@ -190,6 +354,10 @@ const output = {
   mode: record.mode,
   screenshot: record.screenshot,
   bounds: record.bounds,
+  boundsSource: record.boundsSource,
+  origin: record.origin,
+  boundsNotes: record.boundsNotes,
+  ...(windowProbe === null ? {} : { windowProbe }),
   bbox: record.bbox,
   center: record.center,
   fractions: record.fractions,

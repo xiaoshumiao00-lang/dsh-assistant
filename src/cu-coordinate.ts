@@ -9,6 +9,12 @@
  *   物理 x = bounds.x + (分数 x / 1000) × bounds.width，落点取 Math.round
  *   像素模式：分数 x = 截图像素 x / 截图宽 × 1000，再走同一公式
  *
+ * 坐标空间（2026-11-28 运行期实测的第二处缺陷）：
+ *   截图是**窗口内坐标**（原点 0,0），工具回执的 `Pointer landed at [x, y]` 是**屏幕绝对坐标**。
+ *   所以 `bounds`（观察面在屏幕上的矩形）不是可选项：缺了它，预测落点会少加窗口原点，
+ *   任何不在屏幕左上角的窗口都会得到永久 miss。`bounds` 的原点来源记在记录里
+ *   （`boundsSource: explicit | auto | inferred`），`inferred` 表示按 0,0 推断、门必须拒绝。
+ *
  * 这个文件里没有本机账户、私有档案根、个人姓名等任何字面量；记录目录默认在系统临时目录。
  */
 
@@ -49,6 +55,14 @@ export interface CuRect {
   height: number
 }
 
+/**
+ * 观察面原点的来源：
+ *   explicit = 命令行给了 `--bounds x,y,w,h`；
+ *   auto     = 现场量前台窗口（`--bounds auto`）；
+ *   inferred = 没给，按 0,0 推断 —— 这种记录不能用，pre-execute 必须拒绝。
+ */
+export type CuBoundsSource = 'explicit' | 'auto' | 'inferred'
+
 /** 目标元素在截图上的起止像素（含边界）。 */
 export interface CuBbox {
   x1: number
@@ -85,8 +99,12 @@ export interface CuResolveOptions {
   screenshot: CuImageSize
   /** 目标元素在图上的起止像素。 */
   bbox: CuBbox
-  /** 观察面物理矩形；省略时按 0,0,截图宽,截图高（1:1）。 */
+  /** 观察面物理矩形；省略时按 0,0,截图宽,截图高 推断（记录会标 inferred，门拒绝）。 */
   bounds?: CuRect
+  /** bounds 原点来源；给了 bounds 时缺省 explicit，没给 bounds 一律记 inferred。 */
+  boundsSource?: CuBoundsSource
+  /** auto 模式的推算说明（可选；只进记录与输出）。 */
+  boundsNotes?: string[]
   /** 会话坐标口径；省略 = millifraction（harness 缺省）。 */
   mode?: CuCoordinateMode
   /** 可选：要校验的坐标（按 mode 解释）。 */
@@ -116,6 +134,12 @@ export interface CuCoordinateRecord {
   target: string
   screenshot: CuImageSize
   bounds: CuRect
+  /** bounds 原点怎么来的；inferred 表示按 0,0 推断，门不许用。 */
+  boundsSource: CuBoundsSource
+  /** 本次用的观察面原点（= bounds 左上角；单独落一份，日志与排障都读它）。 */
+  origin: CuPoint
+  /** auto 模式的推算说明（人读；explicit/inferred 为空数组）。 */
+  boundsNotes: string[]
   mode: CuCoordinateMode
   bbox: CuBbox
   center: CuPoint
@@ -289,6 +313,12 @@ export function checkPosition(
 export function resolveCoordinates(options: CuResolveOptions): CuCoordinateRecord {
   const screenshot = requireImageSize(options?.screenshot)
   const bounds = requireRect(options?.bounds, screenshot)
+  const boundsSource: CuBoundsSource = options?.bounds === undefined
+    ? 'inferred'
+    : options?.boundsSource === 'auto' ? 'auto' : 'explicit'
+  const boundsNotes = Array.isArray(options?.boundsNotes)
+    ? options.boundsNotes.map((note) => String(note))
+    : []
   const bbox = requireBbox(options?.bbox, screenshot)
   const mode: CuCoordinateMode = options?.mode === 'pixel' ? 'pixel' : 'millifraction'
   const center = bboxCenter(bbox)
@@ -315,6 +345,9 @@ export function resolveCoordinates(options: CuResolveOptions): CuCoordinateRecor
     target: String(options?.target ?? ''),
     screenshot,
     bounds,
+    boundsSource,
+    origin: { x: bounds.x, y: bounds.y },
+    boundsNotes,
     mode,
     bbox,
     center,
@@ -409,7 +442,248 @@ export function validatePositionForRecord(
   return checkPosition(position, record.mode, record.screenshot, record.bounds, record.bbox)
 }
 
-/** 用工具回执的**物理落点**校验命中（post-execute 用；与记录里的 mode 无关）。 */
+/* ---------------- 观察面原点：可信判定、auto 模式、回执侧对齐 ---------------- */
+
+/** 记录里的 bounds 原点是否可信：显式给过（explicit）或现场量过（auto）才算。 */
+export function boundsOriginKnown(record: CuCoordinateRecord | null | undefined): boolean {
+  if (!record) return false
+  return record.boundsSource === 'explicit' || record.boundsSource === 'auto'
+}
+
+/** pre-execute 用：原点不可信的记录直接拒绝（码固定 coordinate-bounds-unknown）。 */
+export function validateCoordinateBounds(record: CuCoordinateRecord | null | undefined): CuRecordValidation {
+  if (!record) {
+    return { ok: false, code: 'coordinate-bounds-unknown', message: '没有记录，拿不到观察面原点' }
+  }
+  if (boundsOriginKnown(record)) return { ok: true, code: 'ok', message: '' }
+  const { bounds } = record
+  const rect = `${formatNumber(bounds.x)},${formatNumber(bounds.y)},${formatNumber(bounds.width)},${formatNumber(bounds.height)}`
+  return {
+    ok: false,
+    code: 'coordinate-bounds-unknown',
+    message: `记录里的观察面矩形 ${rect} 是按 0,0 推断的（没标 explicit/auto）；截图是窗口内坐标、落点是屏幕绝对坐标`,
+  }
+}
+
+/** koffi 侧量到的窗口事实（命令行填；测试注入桩）。 */
+export interface CuWindowProbe {
+  /** 窗口矩形；可能是 DPI 虚拟化坐标。 */
+  rect: CuRect
+  /** 窗口 DPI（96 = 100%）。 */
+  dpi?: number
+  /** 物理像素 / 矩形像素；缺省 1。 */
+  coordScale?: number
+  /** 矩形来源：dwm-extended-frame | window-rect。 */
+  frameSource?: string
+}
+
+/** auto 模式的产出：观察面矩形 + 推算说明。 */
+export interface CuAutoBounds {
+  bounds: CuRect
+  origin: CuPoint
+  boundsSource: 'auto'
+  /** 物理像素 / 截图像素；截图被缩放时 > 1。 */
+  captureScale: number
+  /** 推算说明（人读，进输出与记录）。 */
+  boundsNotes: string[]
+  frameSource: string
+}
+
+/** 窗口矩形最多能比截图大多少（不可见边框预算，物理像素；Win10/11 单边 7 起）。 */
+const AUTO_BORDER_BUDGET_PX = 32
+/** 宽高比容差：截图与窗口矩形的比例差超过这个值就不当成同一个面。 */
+const AUTO_ASPECT_TOLERANCE = 0.03
+
+function rectText(rect: CuRect): string {
+  return `${formatNumber(rect.x)},${formatNumber(rect.y)},${formatNumber(rect.width)},${formatNumber(rect.height)}`
+}
+
+function roundRect(rect: CuRect): CuRect {
+  return {
+    x: Math.round(rect.x),
+    y: Math.round(rect.y),
+    width: Math.round(rect.width),
+    height: Math.round(rect.height),
+  }
+}
+
+/**
+ * 把现场量到的窗口矩形换算成「截图对应的观察面矩形」。
+ *
+ * 能对上的三种情形（tol 像素容差，默认 2）：
+ *   1. exact：窗口矩形与截图同尺寸（DPI 100% 且未被缩放）；
+ *   2. inset：窗口矩形比截图大一点点（不超过 32 px 的边框预算，例如 GetWindowRect 含不可见边框）——
+ *      按截图宽高比推算可见区原点：左右各让一半余量，竖直余量全放底部
+ *      （标题栏在窗口矩形顶部，可见区从 top 开始）；
+ *   3. scaled：窗口矩形是截图的等比放大（抓屏长边上限把截图缩小了），比例 ≈ 物理/截图。
+ * 先判 inset 再判 scaled：边框预算只有 32 px，而真实抓屏缩放不会只缩 0.5%（判反了最多差几像素）。
+ * 三种都不是 → 抛 `auto-bounds-mismatch`，让调用方用 --bounds x,y,w,h 显式给矩形；
+ * 绝不静默退回 0,0。
+ */
+export function boundsFromWindowProbe(
+  screenshot: CuImageSize,
+  probe: CuWindowProbe | null | undefined,
+  tolerancePx = 2,
+): CuAutoBounds {
+  const shot = requireImageSize(screenshot)
+  const raw = probe?.rect
+  if (!raw || !isFiniteNumber(raw.x) || !isFiniteNumber(raw.y)
+    || !isFiniteNumber(raw.width) || !isFiniteNumber(raw.height)
+    || raw.width <= 0 || raw.height <= 0) {
+    throw new TypeError('auto-bounds-unavailable: 前台窗口矩形无效（取不到窗口或窗口已最小化），请用 --bounds x,y,w,h 显式给')
+  }
+  const coordScale = isFiniteNumber(probe?.coordScale) && probe.coordScale > 0 ? probe.coordScale : 1
+  const frameSource = String(probe?.frameSource ?? 'window-rect')
+  const notes: string[] = []
+  if (coordScale !== 1) {
+    notes.push(`DPI 缩放 ${formatNumber(coordScale)}：窗口矩形 ${rectText(raw)} 按比例换成物理像素`)
+  }
+  const physical = roundRect({
+    x: raw.x * coordScale,
+    y: raw.y * coordScale,
+    width: raw.width * coordScale,
+    height: raw.height * coordScale,
+  })
+  const tol = Number.isFinite(tolerancePx) && tolerancePx > 0 ? tolerancePx : 2
+  const deltaWidth = physical.width - shot.width
+  const deltaHeight = physical.height - shot.height
+
+  if (Math.abs(deltaWidth) <= tol && Math.abs(deltaHeight) <= tol) {
+    notes.push(`窗口矩形 ${physical.width}x${physical.height} 与截图 ${shot.width}x${shot.height} 同尺寸，原点直接取窗口左上角`)
+    return { bounds: physical, origin: { x: physical.x, y: physical.y }, boundsSource: 'auto', captureScale: 1, boundsNotes: notes, frameSource }
+  }
+
+  if (deltaWidth >= 0 && deltaHeight >= 0
+    && deltaWidth <= AUTO_BORDER_BUDGET_PX && deltaHeight <= AUTO_BORDER_BUDGET_PX) {
+    const left = Math.round(deltaWidth / 2)
+    const origin = { x: physical.x + left, y: physical.y }
+    const bounds: CuRect = { x: origin.x, y: origin.y, width: shot.width, height: shot.height }
+    notes.push(`窗口矩形比截图大 ${deltaWidth}x${deltaHeight}（不可见边框）：可见区原点按"左右各半、竖直余量全在底部"推算为 ${origin.x},${origin.y}；截图按 1:1 对待`)
+    return { bounds, origin, boundsSource: 'auto', captureScale: 1, boundsNotes: notes, frameSource }
+  }
+
+  const scaleX = physical.width / shot.width
+  const scaleY = physical.height / shot.height
+  const uniform = Math.abs(scaleX - scaleY) <= Math.max(AUTO_ASPECT_TOLERANCE, AUTO_ASPECT_TOLERANCE * Math.max(scaleX, scaleY))
+  if (scaleX >= 1 - 1e-6 && scaleY >= 1 - 1e-6 && uniform) {
+    const captureScale = round4((scaleX + scaleY) / 2)
+    notes.push(`截图被缩放 ${formatNumber(captureScale)} 倍：物理 ${physical.width}x${physical.height} ÷ 截图 ${shot.width}x${shot.height}`)
+    return { bounds: physical, origin: { x: physical.x, y: physical.y }, boundsSource: 'auto', captureScale, boundsNotes: notes, frameSource }
+  }
+
+  throw new TypeError(
+    `auto-bounds-mismatch: 窗口矩形 ${physical.width}x${physical.height} 与截图 ${shot.width}x${shot.height} 对不上`
+    + `（差 ${deltaWidth}x${deltaHeight}，既超出 ${String(AUTO_BORDER_BUDGET_PX)} px 边框预算、也不是等比缩放）；请用 --bounds x,y,w,h 显式给观察面在屏幕上的矩形`,
+  )
+}
+
+/** 从工具回执的 value 里读观察面矩形：observation.bounds/windowRect 优先，其次顶层与 screens[]。 */
+export function observationRectFromValue(value: any, screenIndex = 0): CuRect | null {
+  if (!value || typeof value !== 'object') return null
+  const pick = (holder: any): CuRect | null => {
+    const fromBounds = requireRectOrNull(holder?.bounds)
+    if (fromBounds) return fromBounds
+    return requireRectOrNull(holder?.windowRect)
+  }
+  const screens = Array.isArray(value.screens) ? value.screens : []
+  const screen = screens.find((item: any) => Number(item?.screenIndex) === screenIndex) ?? screens[0]
+  return pick(value.observation) ?? pick(value) ?? pick(screen)
+}
+
+/** 从工具回执的 value 里读观察面尺寸（logicalWidth/logicalHeight）：没有完整矩形时用它核对窗口有没有变。 */
+export function observationSizeFromValue(value: any, screenIndex = 0): CuImageSize | null {
+  if (!value || typeof value !== 'object') return null
+  const screens = Array.isArray(value.screens) ? value.screens : []
+  const screen = screens.find((item: any) => Number(item?.screenIndex) === screenIndex) ?? screens[0]
+  const width = screen?.logicalWidth
+  const height = screen?.logicalHeight
+  if (!isFiniteNumber(width) || !isFiniteNumber(height) || width <= 0 || height <= 0) return null
+  return { width, height }
+}
+
+function requireRectOrNull(value: any): CuRect | null {
+  if (!value || typeof value !== 'object') return null
+  const { x, y, width, height } = value
+  if (!isFiniteNumber(x) || !isFiniteNumber(y) || !isFiniteNumber(width) || !isFiniteNumber(height)) return null
+  if (width <= 0 || height <= 0) return null
+  return { x, y, width, height }
+}
+
+/** 回执侧的观察面：完整矩形可缺省，尺寸可缺省。 */
+export interface CuObservationSurface {
+  rect?: CuRect | null
+  size?: CuImageSize | null
+}
+
+/** 回执落点的判定结果：真 miss 与「坐标空间对不上」必须分开。 */
+export interface CuLandedCheck {
+  hit: boolean
+  /** 坐标空间不一致（不是「点歪了」）：不计 miss streak、不触发硬停。 */
+  spaceMismatch: boolean
+  /** 换回截图坐标后的落点。 */
+  shot: CuPoint
+  /** 回执原样落点（取整）。 */
+  landed: CuPoint
+  /** 物理像素偏差（截图被缩放时按比例折算）。 */
+  deviationPx: number
+  /** 本次用的原点矩形。 */
+  originRect: CuRect
+  /** 原点来源：observation = 本条回执里的观察面；record = 记录里的 bounds。 */
+  originSource: 'observation' | 'record'
+  /** 判定说明：inside-bbox / outside-bbox / outside-surface / surface-resized / origin-unknown。 */
+  reason: string
+}
+
+/**
+ * post-execute 用：把**屏幕绝对**落点换回**截图坐标**，再比 bbox。
+ *
+ * 原点优先取本条回执里的观察面（截图对应的窗口在屏幕上的位置），拿不到才退回记录里的 bounds；
+ * 记录原点又是推断的（inferred）→ 直接判 `origin-unknown`；
+ * 换算后落在截图外（超宽/为负）→ `outside-surface`；观察面尺寸与记录差超过 2% → `surface-resized`。
+ * 这三种都算「坐标空间不一致」，不是真 miss。
+ */
+export function checkLandedAgainstRecord(
+  record: CuCoordinateRecord,
+  landed: CuPoint,
+  observation: CuObservationSurface = {},
+): CuLandedCheck {
+  const shot = record.screenshot
+  const observationRect = requireRectOrNull(observation?.rect)
+  const originSource: 'observation' | 'record' = observationRect ? 'observation' : 'record'
+  const originRect: CuRect = observationRect ?? record.bounds
+  const landedRounded = { x: Math.round(landed.x), y: Math.round(landed.y) }
+  const shotPoint = {
+    x: ((landed.x - originRect.x) / originRect.width) * shot.width,
+    y: ((landed.y - originRect.y) / originRect.height) * shot.height,
+  }
+  const note: Omit<CuLandedCheck, 'hit' | 'spaceMismatch' | 'deviationPx' | 'reason'> = {
+    shot: shotPoint,
+    landed: landedRounded,
+    originRect,
+    originSource,
+  }
+  if (originSource === 'record' && !boundsOriginKnown(record)) {
+    return { ...note, hit: false, spaceMismatch: true, deviationPx: 0, reason: 'origin-unknown' }
+  }
+  const size = observation?.size
+  if (originSource === 'observation' && size
+    && (Math.abs(size.width - record.bounds.width) / record.bounds.width > 0.02
+      || Math.abs(size.height - record.bounds.height) / record.bounds.height > 0.02)) {
+    return { ...note, hit: false, spaceMismatch: true, deviationPx: 0, reason: 'surface-resized' }
+  }
+  const outside = !Number.isFinite(shotPoint.x) || !Number.isFinite(shotPoint.y)
+    || shotPoint.x < 0 || shotPoint.x > shot.width
+    || shotPoint.y < 0 || shotPoint.y > shot.height
+  if (outside) {
+    return { ...note, hit: false, spaceMismatch: true, deviationPx: 0, reason: 'outside-surface' }
+  }
+  const hit = bboxContains(record.bbox, shotPoint.x, shotPoint.y)
+  const physicalPerShot = originRect.width / shot.width
+  const deviationPx = hit ? 0 : round2(distanceToBbox(record.bbox, shotPoint.x, shotPoint.y) * physicalPerShot)
+  return { ...note, hit, spaceMismatch: false, deviationPx, reason: hit ? 'inside-bbox' : 'outside-bbox' }
+}
+
+/** 用工具回执的**物理落点**校验命中（旧口径：直接比记录 bounds 下的物理 bbox；门已改用 {@link checkLandedAgainstRecord}）。 */
 export function checkLandedPhysical(
   record: CuCoordinateRecord,
   landed: CuPoint,
