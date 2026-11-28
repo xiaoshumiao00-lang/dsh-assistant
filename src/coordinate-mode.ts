@@ -120,19 +120,186 @@ export function cuMeasureScriptPath(ctx?: any): string {
 }
 
 /**
- * 「先量后点」硬规则正文（发给 CU 模型的原文）。
+ * 一条坐标门：条件（可机械求值的谓词）+ 命中后必须做的动作。
+ *
+ * 门表就是策略正文的唯一来源（正文由本表渲染，回归按表断言），这样「门」是数据而不是
+ * 散文：加门必须补一条谓词，删门会直接掉出正文，正文与门表不会悄悄漂移。谓词只用
+ * ∈ / ∉ / ≠ / ≥ / = 与显式集合，模型与回归都能按字面判定。
+ */
+export type CuCoordinateGate = {
+  /** 门号，正文与回归都按它认门（G1…G12、G14…G20；G13 是空号，见下表注释）。 */
+  id: string
+  /** 门名（正文方括号里的第二段）。 */
+  axis: string
+  /** 判定条件：成立即命中，不准写成「尽量/建议」。 */
+  when: string
+  /** 命中后的动作：祈使句，做完才算合规。 */
+  then: string
+}
+
+/**
+ * 坐标门表（2026-11-28 机制化 / 2026-11-29 追加 G16…G20）。顺序即正文顺序：帧 / 重排 / 阶梯 /
+ * 锚点 / 合并 / 预算 / 黑名单 / 偏移 / 语义 / 参数 / 等待 / 存储 / 测量独立性 / 出口优先 /
+ * 弹层枚举 / 落盘核验 / 剪贴板优先 / 变灰必解状态 / 输入落点确认。
+ *
+ * G13 是空号：新增的门按用户给定编号写成 G14/G15 与 G16…G20，不回填 G13，避免正文里的门号
+ * 与会话记录、报告里的门号指的不是同一道门。
+ *
+ * 全部判据都只用「值 ∈ 集合 / 相等 / 不等 / 次数」这种机械关系，没有一条依赖主观判断；
+ * 其中 G1 的 frame=、G5 的 MERGE-SPAN、G10 的参数拒收、G14 的 REGION-ECHO、G16 的按行簇、
+ * G20 的 caret 都由 measure.ps1 / 工具回执在同一次输出里给出现成读数（不额外加测、不加轮次）。
+ * G14 的数值门槛固定 60 px：region 任一边 ≥ 60 px 才判 REGION-ECHO（拒中心），两边都 < 60 px 的同形
+ * 回显豁免（脚本打 SPAN-EQUAL tight-region (<60px): center=ACCEPT，中心与分数照旧用）。这道门槛与
+ * measure_core.py / measure.ps1 / measure_legacy.ps1 里的 ECHO_MIN_SPAN_PX=60 同源，脚本不许把它做成
+ * 命令行参数，门文本与脚本两边也不许各算一套；豁免只免同形这一判据，MERGE-SPAN 与簇中心照旧独立生效。
+ * 门只留机械判据与出口，「脚本会打印什么补救文字」这类说明门表与脚本 usage 各说一遍即可，正文不重复。
+ * G1…G12 逐字冻结在回归 scripts/test-coordinate-mode.mjs 的 FROZEN_GATE_LINES 里：
+ * 加门只准往后追加，改旧门必须同时改冻结表并在提交说明里写清。
+ */
+export const CU_COORDINATE_GATES: readonly CuCoordinateGate[] = Object.freeze([
+  {
+    id: 'G1',
+    axis: '帧',
+    when: '坐标动作（click/drag/input_text/long_press）不带 frame=，或 frame≠当前 frontmost 帧，或同一 frame 内该坐标未命中≥1',
+    then: '该坐标作废，同帧重测一次后再点，禁止复用旧帧坐标',
+  },
+  {
+    id: 'G2',
+    axis: '重排',
+    when: '上一动作∈{改筛选,排序,滚动,开窗,换标签,展开,折叠,窗口移动,resize}',
+    then: '旧坐标全部作废并重测；纯输入/纯热键/纯读不算重排，本帧坐标继续用',
+  },
+  {
+    id: 'G3',
+    axis: '阶梯',
+    when: '目标∈{有加速键/Tab/Enter 路径, 有原生输入框/地址栏/名称字段/type-to-select/原生搜索, 有大 hit 原生控件}',
+    then: '按该级优先做；坐标是小目标最后一级，坐标不禁用',
+  },
+  {
+    id: 'G4',
+    axis: '锚点',
+    when: '目标∈容器（行/列/面板带）',
+    then: '先按 y 带定位，再在带内定 x 跨度，禁止直接量整块容器',
+  },
+  {
+    id: 'G5',
+    axis: '合并',
+    when: '量测输出=MERGE-SPAN REJECT，或 TOTAL bbox 覆盖候选簇≥2',
+    then: '拒绝取 center 值，改用同次输出的簇中心，或 -Split <int> 取指定簇、收窄 -X0/-X1/-Y0/-Y1 拆区',
+  },
+  {
+    id: 'G6',
+    axis: '预算',
+    when: '同一目标跨帧未命中=2',
+    then: '换定位方式（G3 上一级或键盘路径），禁止第 3 次同坐标',
+  },
+  {
+    id: 'G7',
+    axis: '黑名单',
+    when: '候选∈{harness caret 读数, hover 预览卡片, 浮层气泡, 放大镜/图标浮层}',
+    then: '不进入坐标候选',
+  },
+  {
+    id: 'G8',
+    axis: '偏移',
+    when: '回执=物理像素，要换算回截图坐标',
+    then: '按 <frontmost_app> 查窗口偏移表；无表项一律不减（全局减是反效果）',
+  },
+  {
+    id: 'G9',
+    axis: '语义',
+    when: '导航型动作后，观察包 <frontmost_app>/<frontmost_window>/<frontmost_folder> ≠ 期望实体名',
+    then: '换帧重算，禁止继续在本帧下结论',
+  },
+  {
+    id: 'G10',
+    axis: '参数',
+    when: 'count∉{1,2}，或 scroll_level∉1..10，或缺 screen_index/position，或正文含工具标签片段',
+    then: '拒收并立即报出字段名',
+  },
+  {
+    id: 'G11',
+    axis: '等待',
+    when: '默认不等待；仅当最新帧∈{loader/spinner/进度条/尚未出现的控件} 且目标=本次要继续操作对象',
+    then: '仅 wait 1s，最多连开 3 次（上限 3s）；long_wait∈{10,30,60,120} 全禁；bash sleep/pwsh 等待全禁；回执截图=最新帧，换帧重取，不加 screenshot',
+  },
+  {
+    id: 'G12',
+    axis: '存储',
+    when: '动作=判断界面状态',
+    then: '只读界面；app 私有存储（书签 JSON/设置文件/注册表）不作 UI 真值',
+  },
+  {
+    id: 'G14',
+    axis: '测量独立性',
+    when: '本次测量输出的 TOTAL bbox 的 x 跨度 = region 的 x 跨度 且 y 跨度 = region 的 y 跨度（同形回显），且 region 宽或高任一边 ≥ 60 px',
+    then: '禁止取该中心：收窄 -X0/-X1/-Y0/-Y1 或加 -Split <int> 重测一次，只用元素/簇 bbox 定中心，比对 region 不算命中；静态 chrome∈{标题栏,菜单文字,地址栏,标签} 不测；只在该行出现时重测一次，不逐目标预检；region 两边都 < 60 px（手工窄区）时 span 相等不判 REGION-ECHO，打 SPAN-EQUAL tight-region (<60px): center=ACCEPT 就照常用该中心与分数；只豁免同形回显这一判据，MERGE-SPAN（簇间隙 ≥ -MergeGap）与簇中心照旧独立生效',
+  },
+  {
+    id: 'G15',
+    axis: '出口优先',
+    when: '任务∈{读内容：网页/回答/文档/表格/日志/终端输出, 发送类动作：发送/确认/地址栏/重命名} 且该应用存在原生出口∈{复制钮,导出,下载,剪贴板,已有文件,命令读取}',
+    then: '先用原生出口取内容，取不到才逐屏滚动 OCR；发送类动作先走键盘等效∈{Enter,Ctrl+Enter,Tab,加速键,原生输入框}，再退到点控件；出口不存在时照旧走坐标，GUI 不禁用',
+  },
+  {
+    id: 'G16',
+    axis: '弹层枚举',
+    when: '帧∈{右键菜单,下拉,对话框,tooltip 浮层}',
+    then: '同一次 -Split 按行列出簇、按该簇中心点击；禁止用上一行 y 推算下一行坐标；命中失败按 G6 换路',
+  },
+  {
+    id: 'G17',
+    axis: '落盘核验',
+    when: '刚做过∈{下载,导出,另存,打印成文件}',
+    then: '立刻 1 条 Get-ChildItem 查目标目录最新文件 mtime 与字节数；无新文件=该 UI 出口失效，改走剪贴板；禁止再点同一图标',
+  },
+  {
+    id: 'G18',
+    axis: '剪贴板优先',
+    when: '任务∈{交付位图,取出位图}',
+    then: '先走应用内「复制为图像/复制为PNG」＋剪贴板落盘＋自动去边框；截图裁剪只作最后兜底（剪贴板给确定尺寸，不受截图分辨率上限约束）',
+  },
+  {
+    id: 'G19',
+    axis: '变灰必解状态',
+    when: '原生命令/菜单项∈{变灰,不可用}',
+    then: '先解 gating∈{锁定,未选中,分组,图层隐藏,只读,模态窗未关}，再回同菜单同行重试；禁止判定该功能不存在',
+  },
+  {
+    id: 'G20',
+    axis: '输入落点确认',
+    when: 'input_text 焦点点击∈{画布,文本编辑器,表格,文档区}',
+    then: '先量该字段 bbox 且回执帧见 caret；无 caret=撤销一次（Ctrl+Z）并复验对象状态；禁止把 URL/正文打进编辑区',
+  },
+])
+
+/**
+ * 门表渲染成的一行正文；回归按这个格式逐条解析（条件/动作两段都必须在）。
+ * @param gate - 门表里的一项。
+ * @returns `[G1 帧] 条件：… → 动作：…`。
+ */
+export function cuCoordinateGateLine(gate: CuCoordinateGate): string {
+  return `[${gate.id} ${gate.axis}] 条件：${gate.when} → 动作：${gate.then}`
+}
+
+/**
+ * 「先量后点 + 坐标门」规则正文（发给 CU 模型的原文）。
+ *
+ * 正文顺序：门表 → 量测协议（每帧最多一次脚本调用）→ 算式 → 落点核对。门表是数据，
+ * 协议只保留脚本参数与算式这类必须逐字给模型的东西。
  * @param measurePath - 本机量坐标脚本绝对路径（默认按 DSH_HOME 派生）。
  * @returns 规则文本；非空串，长度上限由回归断言看着。
  */
 export function computerUseCoordinatePolicyText(measurePath = cuMeasureScriptPath()): string {
   return [
-    'CU 坐标硬规则（动手前必照做）：',
-    '1. 先量后点。click / drag / input_text / long_press 之前先在当前截图量出目标像素包围盒 x1,y1,x2,y2，中心=((x1+x2)/2,(y1+y2)/2)；不许目测估点。',
-    '2. 写出算式：正文必须打出算式。千分比会话分数 = 中心像素 ÷ 截图宽或高 × 1000（x÷宽、y÷高）；像素会话直接传中心像素。',
-    '3. 尺寸只认这次：宽高读当前观察面 attached_size 的实际像素，不许沿用上一轮或屏幕尺寸。',
-    '4. 核对落点：click 回执 Pointer landed at [x, y] physical pixels 要落进第 1 步包围盒，没中就地重算再打，不许重复同一组坐标（drag / long_press / input_text 没这句就按这次截图重新量包围盒）。',
-    '5. 同一目标连续 2 次未命中即停用坐标：改地址栏导航 URL、键盘 Tab/Enter/Space 或读页面文本链接，不许第 3 次盲点。',
-    `6. 量坐标优先脚本：跑 ${measurePath} -Shot <截图> -X0 -X1 -Y0 -Y1 -Mode dark|blue|yellow|gray -Split -MinPixels，读它打印的 TOTAL bbox 与 center=(x,y) fraction=[x,y]；脚本跑不动才目测扫描，算式照写。`,
+    'CU 坐标门（条件成立即照 → 做，不是建议）：',
+    ...CU_COORDINATE_GATES.map(cuCoordinateGateLine),
+    '',
+    '先量后点（每帧最多 1 次量测，不加轮次）：',
+    `1. 量：跑 ${measurePath} -Shot <path>（省略=自动取最新观察帧） -X0 <int> -X1 <int> -Y0 <int> -Y1 <int> -Mode dark|blue|yellow|gray -Split <int> -MinPixels <int>；一次量多区用 -Regions "<x0,x1,y0,y1>;…"（同帧同一次调用，共用同一 -Mode 与阈值）；读 frame= / TOTAL bbox / center=(x,y) fraction=[x,y]；打印的 image: WxH 必须等于本帧 attached_size；不要再复制截图。`,
+    '2. 算：包围盒 → center=((x1+x2)/2,(y1+y2)/2)；分数 = 中心像素 ÷ 截图宽或高 × 1000（像素会话直接传中心像素）。',
+    '3. 点：正文先写 frame=<量测打印值>，再发坐标动作。',
+    '4. 核：click 回执 Pointer landed at [x, y] physical pixels 必须落进包围盒；drag / long_press / input_text 没这句就按回执截图重新量包围盒；chrome 帧不减（1920×1032 同帧），harness 窗口帧减 x319 / y106。',
   ].join('\n')
 }
 
