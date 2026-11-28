@@ -78,7 +78,7 @@ foreach ($c in $candidates) {
 }
 if ($version) {
   Write-Host ('  插件版本：' + $version + '（package.json 来源：' + (Hide-Home $pkgFile) + '）')
-  if ($version -ne '0.2.41') { Write-Host '  注意：与上架包口径 0.2.41 不一致，请以《交付清单》为准核对。' }
+  if ($version -ne '0.2.42') { Write-Host '  注意：与上架包口径 0.2.42 不一致，请以《交付清单》为准核对。' }
 } else {
   Write-Host '  插件版本：未找到 package.json（请用 -PluginDir 指到插件目录）'
 }

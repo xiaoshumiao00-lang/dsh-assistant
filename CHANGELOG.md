@@ -4,6 +4,16 @@
 控制室里的「更新公告」正文由 `npm run build` 从本文件里当前版本那一节抽出来（见 `build.mjs`），
 不再手写常量——改了代码就必须改这一节，公告与实现不会各说各话。
 
+## [0.2.42] - 2026-11-28
+
+📦【上架收口 · 1.4.10 交付可用性实测 + 版本口径递增 + GitHub Release 依赖点】本轮由用户明确授权「上架」：只 push `main`（fast-forward，不重写历史、不强推）与两枚新 tag（附注 `v0.2.42`、轻量 `android-shell-1.4.10`，均指本轮最终 HEAD）；两枚旧 tag（`v0.2.41` 与 `android-shell-1.4.9`）按原样留在远端，它们是上一轮已上架过的历史锚点，不删不重指。
+
+- **版本口径**：`package.json` 与 `dsh.plugin.json` 从 0.2.41 递增到 **0.2.42**；`package.json` 的 test 链已在 1.4.10 那笔 commit 里接入 `scripts/test-android-update-check.mjs`（96 → **97** 条）。上架包侧版本口径同步：`交付清单.md`、`产品文案.md`、`发布说明.md`、`手册\安装与部署手册.md`、`脚本\自检.ps1`（脚本保持 UTF-8 BOM + LF / 199 行，版本串本身等长替换、文件字节不变）、`素材\图标横幅规格.md` 第 3 节示例值。`package-lock.json` 本轮未动（没有依赖变动，npm 不需要重算 lock）。
+- **交付可用性现场实测**：`脚本\自检.ps1` 原样跑出 4 项（插件版本 / 快捷键 / 个人秘书已就绪 / 3081 监听 + HTTP 200）；上架包 `安装包` 里 1.4.10 的 APK 与 `android\dist` 那份 sha256 与字节完全一致（99,187 字节 / sha256 前 8 `3473E642`）；整包复扫现场取实 31 件、逐件四类形态（旧口令 / 旧入口地址形态 / 私有网段 / 个人标识 / session id / token·PIN）命中 0；15 张 PNG 按真 chunk 链核对元数据块 0；APK 二进制标识残留 4 处、全部落在 APK Signing Block 的 v2/v3 id pair 区（block 94208–98304、id pairs 94216–98288），12 个 zip 条目数据区各 0 命中。
+- **检查更新的依赖点（现场实测，不猜）**：壳里的 `UpdateCheck.validatedApiUrl()` 只拼 `https://api.github.com/repos/<owner>/<repo>/releases/latest`，`fetchApi()` 对 404 直接给出「这个仓库没有 release」，代码里没有读 tag 的分支。实测：只带 tag 不带 release 的仓库，`/releases/latest` 回 **404**（`Not Found`），而 `/tags` 回 200 列出两枚 tag、`/releases` 回 200 且是空数组 —— 三者同时成立就是「壳必须靠 Release、tag 救不了它」的证据；对照另一侧：已带 Release 的公开仓库同一个 URL 回 200 且带 `tag_name` 与 `assets`。所以买家/用户要用「检查更新」，**必须先在自己的仓库建 1 个 Release 并把 APK 作为资产挂上**，这条已写进 `手册\安装与部署手册.md` 第 5.1 节与《发布说明》（不含「待确认」）。本轮没有、也不允许在 GitHub 网页上创建任何 Release，那一步要用户单独点头。
+- **仍未做的两件待决 + 一件账**：① 远端悬挂旧对象与 374 个 LFS 正文（要 GitHub 支持工单，本轮按纪律不发起）；② 换签名证书 DN（会逼老用户卸载重装，需你决定）；③ 真机安装/覆盖升级实测仍未做（本机没有安卓运行时）。
+- 质量门本轮重跑：`node build.mjs`、`npm run check`、`node scripts/lint-standards.mjs`、`npm run typecheck`、97 条链逐条单跑、新回归单独跑，数字登记在《发布说明》第 3 节与回报正文（本节是公告正文本体，不写自指产物字节数）。
+
 ## [0.2.41] - 2026-11-28
 
 🔧 【依赖升级 · npm audit 两条 high 收口】`package.json`：prod 侧 `zod` 从 4.6.5 升到 **4.6.7**（下限要求 ≥ 4.6.6；GHSA-mrhx-c7xc-m3w5 = 超大受约束集合可耗尽内存），dev 侧 `markdown-it` 从 15.0.0 升到 **15.0.3**（4 条 15.0.0–15.0.2 的 quadratic-time DoS：smartquotes 未闭合引号、`html` 打开时的 inline HTML、默认选项下单条多行 link reference definition、`linkify: true` 的两条 quadratic 路径）。`package-lock.json` 由 `npm install --save` / `--save-dev` 自动同步，同时带出 `argparse` 3.0.0→3.0.4、`entities` 8.0.0→8.1.0、`linkify-it` 6.0.0→6.1.0（都是 markdown-it 15.0.3 的依赖边界，不是自己挑的顺带升级）。**`koffi` / `playwright` / `qrcode` 一律未动**（仍 3.3.1 / 1.65.0 / 1.5.4，audit 没要求）。升级前现场：全量 `npm audit` = 2 条 high（`markdown-it 15.0.0 - 15.0.2` + `zod <4.6.6`）、`npm audit --omit=dev` = 1 条 high（只剩 `zod`）；升级后现场：两种口径都 `found 0 vulnerabilities`、exit 0。
