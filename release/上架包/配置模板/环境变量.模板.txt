@@ -28,6 +28,12 @@ DSH_POCKET_SSH_KNOWN_HOSTS=<known_hosts 路径；留空 = <DSH_HOME>/dsh-pocket/
 【安卓构建侧（只有要重新构建 APK 的人需要）】
 DSH_ANDROID_KEYSTORE_PASS=<必填·你自己生成的强口令；只从环境变量读，绝不出现在任何文件或命令里>
 
+【Computer Use（GUI 自动化，一般不用改）】
+DSH_CU_SNAP=0                     <0 = 整段关掉点击吸附；默认开。关了就是按原坐标点，不再补扫同一帧>
+DSH_CU_SNAP_BUDGET_MS=1000        <点击吸附的补帧预算（毫秒），默认 1000；调小更快、调大更稳>
+DSH_CU_TARGET_TABLE=0             <0 = 关掉目标表坐标缓存，退回逐目标量测；默认开>
+DSH_CU_PYTHON=<装了 Pillow 的 python 绝对路径；留空按系统 python / py>
+
 【宿主调试用（普通用户不需要）】
 DSH_HOST_PARSER=<会话日志解析器覆盖>
 DSH_HOST_SESSION_MODULE=<会话模块覆盖>
