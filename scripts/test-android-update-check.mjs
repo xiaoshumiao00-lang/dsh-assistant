@@ -364,14 +364,14 @@ case_('【B 静态·钉构建脚本】出包口径：1.4.10 / 37，minSdk 24 / t
 })
 
 /* =====================================================================
- * 【B 静态·钉 package.json】测试链接入：96 -> 97
+ * 【B 静态·钉 package.json】测试链接入：97 -> 98
  * ===================================================================== */
 
-case_('【B 静态·钉 package.json】本脚本已接入 test 链且总数为 97', () => {
+case_('【B 静态·钉 package.json】本脚本已接入 test 链且总数为 98', () => {
   const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
   const chain = pkg.scripts.test.split('node scripts/').slice(1).map((x) => x.split(' ')[0].trim())
   assert.ok(chain.includes('test-android-update-check.mjs'), '本脚本没进 test 链')
-  assert.equal(chain.length, 97, `test 链应为 97 条（实测 ${chain.length}）`)
+  assert.equal(chain.length, 98, `test 链应为 98 条（实测 ${chain.length}）`)
   assert.equal(new Set(chain).size, chain.length, 'test 链里有重复条目')
 })
 
