@@ -84,8 +84,11 @@ public class MainActivity extends Activity {
      */
     private static final String DEFAULT_URL = "";
 
-    /** 设置页「一键填入常用地址」用的常用值（也是占位提示里写的那条）。 */
-    private static final String COMMON_ASSISTANT_URL = "http://***REMOVED***";
+    /**
+     * 设置页「一键填入常用地址」用的常用值。
+     * 1.4.9 起这里不预置任何真实地址（上架壳不许带作者本机入口），留空 = 必须自己填。
+     */
+    private static final String COMMON_ASSISTANT_URL = "";
 
     private static final String PREFS = "dsh_assistant";
     private static final String KEY_URL = "home_url";
@@ -539,7 +542,7 @@ public class MainActivity extends Activity {
      * 2026-11-26 真机 bug「点了 Word 之后通知栏一直正在下载、既打不开也看不到」的根因：
      * DownloadManager 是**系统下载器**，它不会继承 WebView 的 cookie 罐；而本机 pocket 代理
      * （转发到 DSH 3081）对没有凭证的请求一律回 401。离线实测（同一份 1,605,373 字节的 docx、
-     * 同一个公网入口 http://***REMOVED***/api/worktable/file）：
+     * 同一个入口＝作者自己电脑上的助手入口地址 + /api/worktable/file，源码里不再写死这条地址）：
      *   不带 cookie → HTTP/1.1 401、body `{"error":"unauthorized"}`（24 字节、chunked、**无 content-length**）；
      *   带上 pocket 凭证（`?token=` 与 `dsh_pocket_token` cookie 同一道闸）→ 200 + content-length: 1605373 + 完整 1,605,373 字节。
      * 401 既没有内容长度、又是 chunked + keep-alive，下载器拿不到大小也没处可写，通知栏就停在 0% 不动。
@@ -849,7 +852,7 @@ public class MainActivity extends Activity {
         TextView desc = new TextView(this);
         desc.setText("填一个地址就能用：\n"
                 + "· 助手地址：电脑上 DSH → 设置 → 个人助手 → 手机访问 给的那个入口。\n"
-                + "通用版首次打开是空的——可以手填，也可以点下面的「一键填入常用地址」。\n"
+                + "通用版首次打开是空的，必须自己填（这版壳里没有预置任何人的地址）。\n"
                 + "填一次就记住，之后打开直接进这个地址。");
         desc.setTextColor(DIM);
         desc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
@@ -877,17 +880,22 @@ public class MainActivity extends Activity {
         input.setTextColor(TEXT);
         input.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
         input.setHintTextColor(DIM);
-        input.setHint("http://***REMOVED***");
+        input.setHint("http://<你自己的电脑IP>:3081");
         input.setSelectAllOnFocus(true);
         LinearLayout.LayoutParams inputLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         inputLp.topMargin = dp(6);
         form.addView(input, inputLp);
 
-        // 通用版默认空：给出常用值，一键填进空着的那格（不覆盖用户已经填好的）
+        // 1.4.9：通用版不预置任何人的地址，常用值那格改成占位说明；填过一次以后照常记住。
         TextView common = new TextView(this);
-        common.setText("常用地址：\n"
-                + "助手  " + COMMON_ASSISTANT_URL);
+        if (TextUtils.isEmpty(COMMON_ASSISTANT_URL)) {
+            common.setText("常用地址：无\n"
+                    + "助手  照这格式填：http://<你自己的电脑IP>:3081");
+        } else {
+            common.setText("常用地址：\n"
+                    + "助手  " + COMMON_ASSISTANT_URL);
+        }
         common.setTextColor(DIM);
         common.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         common.setLineSpacing(dp(3), 1f);
@@ -897,7 +905,9 @@ public class MainActivity extends Activity {
         form.addView(common, commonLp);
 
         Button quick = new Button(this);
-        quick.setText("一键填入常用地址");
+        quick.setText(TextUtils.isEmpty(COMMON_ASSISTANT_URL)
+                ? "常用地址没预置，请自己填"
+                : "一键填入常用地址");
         quick.setAllCaps(false);
         quick.setTextColor(TEXT);
         quick.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
@@ -909,6 +919,11 @@ public class MainActivity extends Activity {
         quick.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
+                if (TextUtils.isEmpty(COMMON_ASSISTANT_URL)) {
+                    // 没有预置常用地址：只提示，绝不往输入框里塞占位文字（塞进去照样连不上）
+                    toast("这版没有预置常用地址，请自己填电脑上的助手入口地址");
+                    return;
+                }
                 if (TextUtils.isEmpty(input.getText().toString().trim())) {
                     input.setText(COMMON_ASSISTANT_URL);
                 }
@@ -932,7 +947,7 @@ public class MainActivity extends Activity {
                 String url = normalizeUrl(assistantRaw);
                 // 通用版默认空：不许点完保存还是一片空白
                 if (url == null) {
-                    toast("地址不能空着，例如 http://***REMOVED***");
+                    toast("地址不能空着，照 http://<你自己的电脑IP>:3081 这个格式填");
                     return;
                 }
                 String oldUrl = prefs.getString(KEY_URL, "");
