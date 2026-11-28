@@ -26,6 +26,7 @@ import { registerAssistantSecretaryHistory, ASSISTANT_SECRETARY_HISTORY_ROUTE } 
 import { registerAssistantSecretaryContext, ASSISTANT_SECRETARY_CONTEXT_ROUTE } from './assistant-secretary-context'
 import { registerAssistantDispatch } from './assistant-dispatch'
 import { registerAssistantCuWatch } from './assistant-cu-watch'
+import { installCuCoordinateGate } from './cu-coordinate-gate'
 import { registerAssistantProactive } from './assistant-proactive'
 import { registerAssistantTts } from './assistant-tts'
 import { assistantConfigTestSurface } from './assistant-config'
@@ -278,6 +279,8 @@ export function apply(ctx: any, config: any = {}): () => void {
   registerPiece('assistant dispatch', () => registerAssistantDispatch(ctx))
   // CU 会话完成 → 秘书会话收可点跳的卡片消息
   registerPiece('assistant cu watch', () => registerAssistantCuWatch(ctx))
+  // Computer Use 坐标硬门：点击前必须有解析记录，点击后核对落点是否在 bbox 内
+  registerPiece('computer use coordinate gate', () => installCuCoordinateGate(ctx))
   // 主动服务卡片：卡组存储 + 路由 + proactive_card 工具
   registerPiece('assistant proactive', () => registerAssistantProactive(ctx))
   // 秘书卡片朗读：POST /api/assistant/tts
