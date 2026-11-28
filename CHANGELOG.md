@@ -4,6 +4,24 @@
 控制室里的「更新公告」正文由 `npm run build` 从本文件里当前版本那一节抽出来（见 `build.mjs`），
 不再手写常量——改了代码就必须改这一节，公告与实现不会各说各话。
 
+## [0.2.43] - 2026-11-29
+
+🎯 【Computer Use「先量后点」落到机制层 · 一处生效、所有 CU 会话自动遵守】用户的要求是「不要只针对单次任务，所有 Computer Use 的 GUI 都要满足」——所以这次不是改某一轮的操作习惯，而是把规则写进 Computer Use 的系统提示：`src/coordinate-mode.ts` 新增策略节 `assistant:computer-use-coordinate-policy`（order 1760），只在 Computer Use 会话注入（`isComputerUseSessionOf()` 认 `header.agentPreset === 'computer-use'`，投影缓存 2s），普通会话一个字都读不到。正文 6 条：① 点击坐标必须来自**当前这一帧的像素读数**，一帧扫一次、同帧复用，禁止目测估值或凭记忆点；② 点之前把包围盒与算式写出来（`physical = bounds.x + fraction/1000 × bounds.width`）；③ 截图尺寸只认这一次回执里的 `image: WxH` 与 `attached_size`，不许拿上一次的尺寸套这一帧；④ 点完核对回执里的 `Pointer landed at [x, y] physical pixels` 是否落在包围盒内；⑤ 同一目标连续 2 次没命中**别再点第三次**，换键盘 / 地址栏 / 原生控件这条非坐标路；⑥ 量测优先跑 `%USERPROFILE%\.dsh\cu-click\measure.ps1`（`-Shot` 必须显式传当前帧，省略会静默取错帧）。因为系统提示每轮重新装配，凡新建或续接的 CU 会话都会读到；宿主侧改动，重启 DSH 后生效。
+
+🔧 【修掉「新建 CU 会话首轮必崩」：assemble 载荷缺 tools】内嵌 Computer Use 的像素模式在 `system-prompt/assemble` 钩子里读 `nextAssembly.tools` 再做映射，而宿主是**在 waterfall 返回之后**才把 tools 挂上去的（`PromptPresentation` 只有 sections / contexts / variables，`PromptAssembly` = presentation + tools）——于是凡是在 `agent/created` 就打了像素标记的新会话，首轮必抛 `TypeError: Cannot read properties of undefined (reading 'map')`；带 `end-seed` 的老会话退回毫单位制反而没事，所以症状看起来像「只有新会话坏」。修法：在同一个 payload 对象上补 `ctx.tools.schemas(scope, toolSet)`，让钩子拿到的那份数据与返回后的装配一致。离线复现：只装 vendor 原件时抛同一个错，补上载荷即通过。
+
+🧪 【坐标硬门试点 → 当场撤销（用户判定太慢）】0.2.42 之后曾按「点击前必须有解析记录、点击后核对落点」落过一版硬门（`src/cu-coordinate.ts` 710 行 / `src/cu-coordinate-gate.ts` 493 行 / `scripts/cu-coordinate-resolver.mjs` 371 行 / `scripts/test-cu-coordinate-gate.mjs` 600 行，另加一条解析器 bounds 契约回归，测试链一度 97 → 98）。实测每次点击多两跳、用户判定「太慢了，多了太多步骤」，于是整段删除、测试链退回 **97** 条原口径，保留的是提示词里的软约束（上面第 1 条）与目标表缓存。为什么留软不留硬、以及硬门那几条踩坑（`GetForegroundWindow` 取到的是前台聊天窗口而不是被捕获窗口、`landed` 是屏幕绝对坐标而截图是窗口局部坐标导致 210 px 幻影误判）都写进了 `reports\cu-版本考古-20261128.md`。
+
+📐 【CU 目标表坐标缓存 + 通用门 G16–G24】提示词里补上「一帧扫一次、同帧复用」的目标表协议：扫一帧拿到带名字的元素行与表文件 → 结构没变就**零测量**按元素名取 center 直接点 → 结构一变（滚动 / 弹窗开关 / 跳页 / 换标签 / 窗口移动缩放 / DPI 变化）整份旧表立刻作废并重扫一次 → 表不存在或按名未命中就地补扫一次（0.2s 封顶、不循环、同一目标最多重试 1 次）→ 预览图与帧尺寸不等时按 1920/1792≈1.0714、1032/963≈1.0717 乘回帧坐标再点。同批还加了 G16 弹层按行列出簇、禁止用上一行 y 推算下一行；G17 落盘核验（下载 / 导出 / 另存之后必须查目标目录最新文件的 mtime 与字节，无新文件说明这个出口失效）；G18 位图优先走「复制为图像 + 剪贴板落盘」，截图裁剪只作兜底；G19 菜单项变灰先解 gating（锁定 / 未选中 / 只读 / 模态窗未关）再回同一行重试，不许判定功能不存在；G20 往画布 / 编辑器 / 表格打字前必须先看到 caret，看不到就撤销一次再复验。
+
+🖱️ 【点击吸附（`vendor\computer-use\index.js` 补丁，+419 行）】点击真正落下之前，在预算内对同一帧再补扫一次，把落点吸附到候选控件的中心，避免「量是量对了、落点踩在边线上」。默认预算 `SNAP_DEFAULT_BUDGET_MS = 1000`；`DSH_CU_SNAP=0` 整段关闭，`DSH_CU_SNAP_BUDGET_MS` 可覆盖预算。两个必须知道的生效条件：① 宿主加载的是打包产物 `lib\computer-use.js`，不是 `vendor\computer-use\index.js` 原件——改了 vendor 必须 `node build.mjs` 才进产物；② 产物只在宿主启动时 import 一次，`cordis` 的 `watchConfig` 不监听 bundle，所以**还要重启 DSH**。离线实测补扫一帧约 470–494 ms。回归 `scripts/test-cu-click-snap.mjs`（502 行，本轮新增）；它**没有**接进 `npm test` 链，链仍是 97 条，单独跑。
+
+🫥 【个人秘书「10 秒系统提示卡」不再闪现：首帧即空壳】那张卡此前是「先渲染、10 秒后消失」（`NOTICE_CARD_TTL_MS = 10 * 1000`），用户要求「这个卡片不要出现」，但又不能直接从渲染里摘掉——它身上挂着 `:has(> [data-dsh-scard="card"][data-dsh-scard-kind="notice"])`，宿主原生的系统气泡正是被这条选择器压住的，摘了卡气泡就会冒出来。做法：`secretary-cards.ts` 新增 `noticeCardShelled()`（`NOTICE_CARD_SHELL_ON_FIRST_FRAME = true`），只对 `kind === 'notice'` 的行返回 true；`SecretaryUserCard.tsx` 从**第一帧**就走已有的空壳早退分支，输出的仍是带 `data-dsh-scard="card"` + `data-dsh-scard-kind="notice"` + 空壳标记的 `<article>`，所以 `:has()` 照旧命中、气泡照旧被压住，而屏幕上什么都不出现。全尺寸卡与折叠行两条分支都覆盖；`earlier-hint` 那条分页提示不带 kind、走的是另一条分支，**没有被顺带吞掉**；用户卡与秘书回复卡一字未动。通知数据、读取与 10 秒 TTL 逻辑全部保留（只是不再渲染成可见卡）。
+
+🗂️ 【档案】`reports\cu-版本考古-20261128.md`（298 行）、`reports\cu-snap预算600-20261129-0010.md`（150 行）、`docs\computer-use-提速前后对比-2026-11-27.md` §16.7–§16.9、`reports\上架前整改-2026-11-28.md` §13–§14 跟着这次改动一起追加（append-only，旧结论不删不改）。
+
+📦 【版本口径】`package.json` 与 `dsh.plugin.json` 0.2.42 → **0.2.43**；`CHANGELOG.md` 新增本节；上架包 6 处口径同步（`交付清单.md`、`产品文案.md`、`发布说明.md`、`手册\安装与部署手册.md`、`脚本\自检.ps1`（保持 UTF-8 BOM + LF / 199 行，版本串等长替换、文件字节不变）、`素材\图标横幅规格.md` 第 3 节示例值）。**安卓壳本轮零改动**：仍是 1.4.10 / versionCode 37，`安装包\个人助手-通用版-1.4.10.apk` 与 `android\dist\` 那份现场 sha256 与字节逐位一致（99,187 字节 / sha256 前 8 位 `3473E642`），所以**不重打 APK**。`node build.mjs` 重跑，控制室「更新公告」的正文换成这一节，公告与实现不再各说各话。宿主侧改动需重启 DSH 生效；客户端那半边整页刷新即可。
+
 ## [0.2.42] - 2026-11-28
 
 📦【上架收口 · 1.4.10 交付可用性实测 + 版本口径递增 + GitHub Release 依赖点】本轮由用户明确授权「上架」：只 push `main`（fast-forward，不重写历史、不强推）与两枚新 tag（附注 `v0.2.42`、轻量 `android-shell-1.4.10`，均指本轮最终 HEAD）；两枚旧 tag（`v0.2.41` 与 `android-shell-1.4.9`）按原样留在远端，它们是上一轮已上架过的历史锚点，不删不重指。
