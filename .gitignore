@@ -67,3 +67,8 @@ dist/*.apk
 .tmp/
 outputs/
 /tmp-*.png
+
+# pocket 构建的临时 staging 目录（build.mjs 会在仓库根写 .pocket-build-XXXXXX\），
+# 用后即焚，不入库。
+.pocket-build-*/
+.pocket-build-*
