@@ -1,7 +1,7 @@
 {
   "name": "dsh-assistant",
   "description": "DeepSeek Harness 一体化助手：悬浮球 → 控制室（项目/会话/模板）+ 手机扫码远程访问（局域网/公网）。合并 dsh-worktable 与 dsh-pocket 的能力。",
-  "version": "0.2.40",
+  "version": "0.2.41",
   "engines": {
     "node": ">=22"
   },
@@ -60,7 +60,7 @@
     "koffi": "^3.3.1",
     "playwright": "^1.65.0",
     "qrcode": "^1.5.4",
-    "zod": "^4.4.3"
+    "zod": "^4.6.7"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",
@@ -82,7 +82,7 @@
     "@types/node": "^26.6.11",
     "esbuild": "^0.25.0",
     "highlight.js": "^11.12.0",
-    "markdown-it": "^15.0.0",
+    "markdown-it": "^15.0.3",
     "typescript": "^7.0.2",
     "xterm": "^5.3.0"
   }
