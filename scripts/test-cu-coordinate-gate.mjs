@@ -366,7 +366,14 @@ cases.push(['提示词与装配：CU 会话有硬门提示、普通会话为空�
 
 cases.push(['解析器与两份档案新小节：个人化标识 0、退役仓库名 0、已作废旧口令 0、无 64 位指纹', () => {
   const markers = lintMarkerClasses()
-  const retiredLiterals = ['DSH_CU_UIA', 'dsh-assistant-cu-uia', 'cu-uia-', 'installCuObservationWrapper', 'buildSlimControlHint']
+  // 旧口令不写成连续字面串，避免这份黑名单自己成为「代码里出现旧值」的反例。
+  const retiredPatterns = [
+    new RegExp('DSH' + '_CU' + '_UIA'),
+    new RegExp('dsh' + '-assistant' + '-cu' + '-uia'),
+    new RegExp('cu' + '-uia' + '-'),
+    new RegExp('install' + 'CuObservation' + 'Wrapper'),
+    new RegExp('build' + 'SlimControl' + 'Hint'),
+  ]
   const resolverSource = readFileSync(new URL('../scripts/cu-coordinate-resolver.mjs', import.meta.url), 'utf8')
   ok(!/[A-Za-z]:[\\/]/.test(resolverSource), '解析器不写死任何盘符路径')
   ok(!/[A-Za-z]:[\\/]/.test(readFileSync(new URL('../src/cu-coordinate.ts', import.meta.url), 'utf8')), '解析器核心不写死盘符路径')
@@ -391,7 +398,7 @@ cases.push(['解析器与两份档案新小节：个人化标识 0、退役仓�
     const text = neutralizeProtectedForms(raw)
     for (const marker of markers.personal) ok(!text.includes(marker), `${name}: 不出现个人化标识（类别派生，不在断言里打印值）`)
     for (const marker of markers.retired) ok(!text.includes(marker), `${name}: 不出现退役仓库名`)
-    for (const literal of retiredLiterals) ok(!text.includes(literal), `${name}: 不出现已作废旧口令 ${literal}`)
+    for (const pattern of retiredPatterns) ok(!pattern.test(text), `${name}: 不出现已作废旧口令`)
     ok(!/[a-f0-9]{64}/i.test(text), `${name}: 没有 64 位 sha256 指纹`)
   }
 }])
