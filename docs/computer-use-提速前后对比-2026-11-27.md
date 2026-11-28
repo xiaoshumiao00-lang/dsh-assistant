@@ -914,6 +914,7 @@ URL `https://www.bing.com`，窗口 `Chrome_WidgetWin_1`，1920×1032；5 步同
 输入：截图实际像素尺寸 WxH、目标 bbox（x1,y1,x2,y2）、可选观察面物理矩形 bounds、会话坐标口径 mode、可选待校验 position。
 输出：bbox 起止、中心物理像素、0–1000 分数（x/y 各带算式）、建议分数/像素、按 harness 映射规则预测的物理落点（未取整与 round），以及 check（命中/偏差/修正建议）。
 记录：写到系统临时目录 `dsh-cu-coordinate-records/<id>.json`；id 为 8 位十六进制，记录 10 分钟过期。
+截图被缩放（抓屏长边上限 1920）时，`bounds` 必须填观察面窗口矩形；缺省按 1:1 算预测落点。
 
 真实算例（仓库相对路径）：
 

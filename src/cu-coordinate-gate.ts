@@ -349,7 +349,7 @@ export function defaultResolverPath(): string {
 export function coordinateGatePrompt(resolverPath: string): string {
   return `【点击前坐标硬门（必须执行）】本会话的 click / drag / input_text / long_press 没有坐标记录会被直接拒绝。每次点击前：`
     + `1) 从最新截图读出目标元素的起止像素 x1,y1,x2,y2 和截图尺寸 WxH，不许目测分数；`
-    + `2) 运行 node "${resolverPath}" --shot WxH --bbox x1,y1,x2,y2 --target "<目标>" --tool click --mode <会话坐标口径>；`
+    + `2) 运行 node "${resolverPath}" --shot WxH --bbox x1,y1,x2,y2 --target "<目标>" --tool click --mode <会话坐标口径>（截图被缩放时加 --bounds x,y,w,h：观察面窗口矩形）；`
     + `3) 把输出 record.id 作为 coordinate_record 传入，position 用 suggestedFractions（0–1000）或 suggestedPixels（像素，按回执里的坐标口径选）；`
     + `4) 回执 Pointer landed at [x,y] 必须落在 bbox 内；同一目标连续 2 次未命中就停手，改用地址栏导航 URL / 键盘 Tab-Enter / 读页面文本链接，不许继续蒙点。`
 }
