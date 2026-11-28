@@ -894,3 +894,47 @@ URL `https://www.bing.com`，窗口 `Chrome_WidgetWin_1`，1920×1032；5 步同
 6. **测试现场重跑**（与新宿主同一构建）：`npm run check` **exit 0**；CU 基线 8 个脚本逐条单跑全 **exit 0**（带计数的 4 个：capture-scale 14/14、code-agent-notice 12/12、observation-surface 15/15、assistant-cu-watch 16/16）；全量链 96 条逐条单跑 **94 绿 / 2 红**，红的两条仍是既有位置（链第 12 位 `test-secretary-session-log-write`、链第 42 位 `test-mobile-proxy`）⇒ **无新增红**。
 7. **本节还证明不了的东西（照实登记）**：① 没有对宿主进程内存做扫描，「重启后进程彻底不含该通道」仍是间接证据（依据 = 产物标记 0 命中 + 帧洋红 0 + 埋点 0 新增行）；② 本例窗口 1080×694 与 §15 案例的 1920×1032 尺寸不同，逐像素计数不可跨案例直接比较；③ 洋红计数只覆盖这 3 帧，不是该 CU 会话的全部中间帧；④ §16.5 那一段（11-27 21:43 旧构建）与 §16.4 的旧埋点件按「档案保留不删」照旧留着，未清理。
 
+## 16.7 Computer Use 点击前坐标硬门（2026-11-28，实测失误驱动）
+
+### 16.7.1 本轮实测的 3 次未命中
+
+2026-11-28 下午，同一 CU 会话，窗口 1920×1032，目标「Publish release」按钮在图上的 bbox 实测为 (346,888)-(471,917)，中心 (408.5,902.5)。前三次点击都落在按钮左边缘之外：
+
+| 次序 | 发送分数 [x,y] | 实际落点（物理像素） | 与 bbox 的偏差 | 判定 |
+| --- | --- | --- | --- | --- |
+| 1 | [146,873] | (280,901) | 66 px | miss |
+| 2 | [171,873] | (328,901) | 18 px | miss |
+| 3 | [145,874] | (278,902) | 68 px | miss |
+| 4 | [213,875] | (409,903) | 0 px | hit |
+
+根因：分数是按截图目测估的，没有从 bbox 起止像素算。目标中心换算应是 x = 408.5 ÷ 1920 × 1000 = 212.7604、y = 902.5 ÷ 1032 × 1000 = 874.5155；前三次的 x 分数只有 145–171，换算后的物理落点自然在 bbox 左边缘外。
+
+### 16.7.2 解析器（`scripts\cu-coordinate-resolver.mjs`）
+
+输入：截图实际像素尺寸 WxH、目标 bbox（x1,y1,x2,y2）、可选观察面物理矩形 bounds、会话坐标口径 mode、可选待校验 position。
+输出：bbox 起止、中心物理像素、0–1000 分数（x/y 各带算式）、建议分数/像素、按 harness 映射规则预测的物理落点（未取整与 round），以及 check（命中/偏差/修正建议）。
+记录：写到系统临时目录 `dsh-cu-coordinate-records/<id>.json`；id 为 8 位十六进制，记录 10 分钟过期。
+
+真实算例（仓库相对路径）：
+
+```
+node scripts\cu-coordinate-resolver.mjs --shot 1920x1032 --bbox 346,888,471,917 --target "Publish release" --tool click --mode millifraction --position 146,873
+```
+
+输出要点：center=(408.5,902.5)，fractions=(212.7604,874.5155)，predictedRounded=(409,903)，check={hit:false, landed:(280,901), deviationPx:66, suggestion.fractions:(212.7604,874.5155)}。
+
+### 16.7.3 管线硬门
+
+- pre-execute：CU 会话的 click / drag / input_text / long_press 必须带 `coordinate_record`。缺记录 → deny `missing-coordinate-record`；记录过期 → `coordinate-record-stale`；记录坏/跨会话/坐标口径不一致 → `coordinate-record-invalid`；position 按记录换算后落在 bbox 外 → `coordinate-out-of-bounds`，并把偏差像素与建议分数写进拒绝原因。
+- post-execute：从工具回执的 `Pointer landed at [x, y]`（结构化 landed，文本兜底）与记录 bbox 比对；命中/未命中写进 turn-guard 日志。同一目标连续 2 次 miss 时，结果侧 block 并提示改用地址栏导航 URL / 键盘 Tab-Enter / 读页面文本链接。
+- 日志字段：tool / code / session / screen / bbox / landed / deviationPx / streak / record / advice / textChars；不落目标文本（没有 excerpt），不落本机绝对路径；沿用 `sanitizeTurnGuardLine` 掩码与 `MAX_LOG_BYTES = 200 × 1024` 轮转。
+- 提示词：CU 会话每步可见一段硬门说明；普通会话为空串。
+
+### 16.7.4 与已撤销覆盖层通道的关系
+
+本轮不恢复 §16 已撤销的覆盖层/编号通道，也不把编号框加回来；要的是「先脚本算坐标、再点击、按回执核对命中」。覆盖层时代的旧开关、旧文件名、旧入口一个都没有重新引入。
+
+### 16.7.5 生效前提
+
+插件改动要等宿主下次重启才进运行进程；本轮只 commit 不 push、不重启宿主，所以运行中的 CU 会话仍走旧逻辑。重启后新建的 CU 会话与后续步骤才会被这道门拦住。
+
