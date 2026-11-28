@@ -940,3 +940,73 @@ node scripts\cu-coordinate-resolver.mjs --shot 1920x1032 --bbox 346,888,471,917 
 
 插件改动要等宿主下次重启才进运行进程；本轮只 commit 不 push、不重启宿主，所以运行中的 CU 会话仍走旧逻辑。重启后新建的 CU 会话与后续步骤才会被这道门拦住。
 
+## 16.8 坐标空间缺陷与修复（2026-11-28 运行期实测）
+
+> 摘一句：截图是**窗口内坐标**（原点 0,0），工具回执的 `Pointer landed at [x, y]` 是**屏幕绝对坐标**。
+> 缺窗口矩形时解析器假定原点 (0,0)，门也直接拿绝对坐标比 bbox，于是不在屏幕左上角的窗口永久 miss，
+> 假 miss 还累计 streak 把目标硬停。本轮把 `--bounds` 改成必填（可 `--bounds auto` 现场量），
+> 门侧按观察面原点对齐，并把「坐标空间不一致」从真 miss 里拆出来。
+
+### 16.8.1 运行期日志原文（宿主重启后真机 GUI 测试）
+
+```
+cu-coord deny  tool=click code=missing-coordinate-record textChars=0
+cu-coord allow tool=click record=5f579e9c bbox=12,145,272,172 position=111,193 deviationPx=0
+cu-coord miss  tool=click landed=461,264 bbox=12,145,272,172 deviationPx=210.2 streak=1 record=5f579e9c
+cu-coord allow tool=click record=645a3743 bbox=12,180,272,198 position=110.76,230.21 deviationPx=0
+cu-coord hit   tool=click landed=461,295 bbox=12,180,272,198 center=142,189 deviationPx=0 streak=0
+```
+
+同窗口现场口径：`GetWindowRect` = (312,106,1608,934)（1296×828）；截图可见区 1282×821、原点≈ (319,106)；
+把 `--bounds 319,106,1282,821` 传进解析器后，第一组 bbox 的 predicted (461,264.5) 与 landed (461,264) 偏差 0 → hit，
+第二组 bbox 的 predicted (461,295) 与 landed (461,295) 偏差 0 → hit。会话字段按 `session-…` 截断。
+
+### 16.8.2 根因
+
+1. 解析器缺 `--bounds` 就按 `{0,0,截图宽,截图高}` 算预测落点（等于假定截图原点 = 屏幕原点）；
+2. post-execute 直接拿 landed 比 bbox，同样假定原点 (0,0)；
+3. 于是 (461,264) 被判成 210.2 px 的假警报 —— 减掉原点 (319,106) 后是 (142,158)，本来就在 bbox 内；
+4. 假 miss 按真 miss 累计 streak，第 2 次就 `coordinate-target-blocked` 硬停；模型漏传 `--bounds` 的成本过高，而漏传极常见。
+
+### 16.8.3 修复设计（提交 6193af5 / b0d86a6）
+
+- **bounds 必填**：缺 `--bounds` 直接 `missing-bounds` 退出 1，提示写清两个坐标空间并给出 `--bounds auto`；不再默认 0,0。
+- **`--bounds auto`**：`koffi` 调 user32 `GetForegroundWindow` + `GetWindowRect`，优先 dwmapi 的 `DWMWA_EXTENDED_FRAME_BOUNDS`（与抓屏可见区逐像素一致；本轮实测 DWM 帧 = (319,106,1601,927) = 1282×821，DPI 96）；unaware 进程按系统 DPI 放大到物理像素；与截图对不上时按「同尺寸 / 边框预算 ≤ 32 px 推算 / 等比缩放」三条路径推算可见区原点并打印，都对不上报 `auto-bounds-mismatch`，取不到报 `auto-bounds-unavailable`，**绝不静默退回 0,0**。
+- **观察面原点对齐**：post-execute 原点优先取本条回执里的观察面矩形（`observation.bounds` / `windowRect`，其次 `screens[]`），拿不到才退回记录 `bounds`；`shotX = (landedX − originX) ÷ originW × 截图宽`，再拿截图坐标比 bbox。宿主当前回执只带 `screens[].logicalWidth/Height`，所以运行侧实际走「记录 bounds + 尺寸核对」，观察面分支是前向兼容（已在测试里按注入方式验过）。
+- **space-mismatch 与真 miss 分离**：
+
+| 判定 | 触发条件 | streak | 结果 |
+| --- | --- | --- | --- |
+| hit | 换算后落在 bbox 内 | 清零 | 放行 |
+| miss（真 miss） | 换算后不在 bbox 内、仍在截图范围内 | +1，第 2 次 block + `advice=non-coordinate`，之后 pre 拒绝 `coordinate-target-blocked` | 修正提示 |
+| space-mismatch | 原点不可用（记录 inferred）/ 观察面尺寸与记录差 > 2% / 换算后落在截图外 | 不变 | block + 建议 `--bounds auto` 重算，不触发硬停 |
+
+- **pre-execute 新拒绝**：记录原点按 0,0 推断（没标 explicit/auto）→ `coordinate-bounds-unknown`。
+- **日志字段**：allow / hit / miss / mismatch 都带 `boundsSource` / `origin` / `surface` / `originSource`；`textChars=0`、没有 `text="`、不落目标文本的口径不变。
+
+### 16.8.4 错误码清单
+
+| 码 | 阶段 | 本次 |
+| --- | --- | --- |
+| `missing-coordinate-record` | pre-execute | 旧 |
+| `coordinate-out-of-bounds` | pre-execute | 旧 |
+| `coordinate-record-stale` | pre-execute | 旧 |
+| `coordinate-record-invalid` | pre-execute | 旧 |
+| `coordinate-target-blocked` | pre-execute | 旧 |
+| `coordinate-bounds-unknown` | pre-execute | **新** |
+| `coordinate-space-mismatch` | post-execute（block） | **新** |
+| `missing-bounds` | 解析器 CLI | **新** |
+| `auto-bounds-unavailable` | 解析器 CLI | **新** |
+| `auto-bounds-mismatch` | 解析器 CLI | **新** |
+
+回归：`scripts\test-cu-coordinate-gate.mjs` 17/17 通过 · assertions=302（上一轮 12 例 / 235 条）；
+全量链 98 条 96 通过 / 2 失败（基线 `test-secretary-session-log-write`、`test-mobile-proxy`，无新增红）；
+typecheck 494（与基线同）；lint 抱怨 0；`lib\index.js` 598,176 B。
+
+### 16.8.5 生效前提与未做到
+
+- 插件侧要**宿主重启**才进运行进程；本轮只 commit，不 push、不打 tag、不重启宿主，重启前运行中的 CU 会话仍走旧逻辑。
+- 本轮没做真机点击复验（没动鼠标），只做了真实解析器自证（`--bounds auto` 实测 = 319,106,1282,821；显式 bounds 下 hit、偏差 0）。
+- `--bounds auto` 在部分 DPI 组合下可能取不准（边框预算 32 px、unaware 进程按系统 DPI 放大；截图只缩 < 0.5% 时会判成边框，原点最多差几像素）。
+- 显式 `--bounds 0,0,W,H`（等于假定窗口贴屏幕左上角）仍放行；多屏/非左上角窗口请用 `--bounds auto`。
+- `vendor/computer-use` 一行未改，§16 已撤销的覆盖层/编号通道没有加回来。
