@@ -119,6 +119,57 @@ export function cuMeasureScriptPath(ctx?: any): string {
   return join(dshRootOf(profileDir(ctx)), 'cu-click', 'measure.ps1')
 }
 
+/** 全帧扫描器（scan_frame.ps1）的绝对路径：与 measure.ps1 同目录，同属本机 CU 资产。 */
+export function cuScanFrameScriptPath(ctx?: any): string {
+  return join(dshRootOf(profileDir(ctx)), 'cu-click', 'scan_frame.ps1')
+}
+
+/**
+ * 目标表（坐标缓存）包装器的绝对路径：target_table.py，套在 scan_frame.ps1 外面。
+ *
+ * 它补 scan_frame.ps1 缺的两样能力——给 cluster 附稳定名字标签、算粗粒度结构指纹——并把
+ * 名字 → 中心物理像素落盘。和 measure.ps1 一样是本机 CU 资产（不进仓库、不进 npm 包），
+ * 所以路径按宿主给的 profile 目录派生，命令行写死账户名是禁止的。
+ */
+export function cuTargetTableScriptPath(ctx?: any): string {
+  return join(dshRootOf(profileDir(ctx)), 'cu-click', 'target_table.py')
+}
+
+/** 目标表落盘目录：`<DSH_HOME>/cu-click/target-table/<指纹>.json`（指纹 = 帧尺寸 + 结构哈希 + 坐标空间）。 */
+export function cuTargetTableDir(ctx?: any): string {
+  return join(dshRootOf(profileDir(ctx)), 'cu-click', 'target-table')
+}
+
+/** 一键关掉整套目标表的开关（默认开启）：`DSH_CU_TARGET_TABLE=0/false/off/no` 即关。 */
+export const CU_TARGET_TABLE_ENV = 'DSH_CU_TARGET_TABLE'
+/** 开关缺省值：默认开启（关掉只需设环境变量，不改代码）。 */
+export const CU_TARGET_TABLE_DEFAULT_ENABLED = true
+/** 兜底单次封顶（毫秒）：表不存在/未命中只补扫 1 次，不等待、不循环。 */
+export const CU_TARGET_TABLE_FALLBACK_BUDGET_MS = 200
+/** 同一目标最多重试次数，再换定位方式（与 G6 同一口径）。 */
+export const CU_TARGET_TABLE_MAX_RETRY = 1
+/** 结构指纹量化网格（px）：cluster 中心与尺寸量化后排序，±2 px 抖动落在同一格。 */
+export const CU_TARGET_TABLE_STRUCT_GRID_PX = 8
+/** 结构指纹允许的像素抖动：只作口径登记，算法上靠 CU_TARGET_TABLE_STRUCT_GRID_PX 吸收。 */
+export const CU_TARGET_TABLE_JITTER_PX = 2
+/** 预览 1792×963 → 帧 1920×1032 的换算常数（≈1.0714 / 1.0717）：全仓只此一处，别处不许另算一套。 */
+export const CU_TARGET_TABLE_PREVIEW_SCALE = Object.freeze({ x: 1920 / 1792, y: 1032 / 963 })
+/** 做完就作废旧表的动作清单（G2 的「重排」与 G22/G24 的失效条件共用这一份）。 */
+export const CU_TARGET_TABLE_INVALIDATING_ACTIONS: readonly string[] = Object.freeze([
+  'scroll', 'dialog', 'navigate', 'tab-switch', 'window-move', 'window-resize', 'dpi-change',
+])
+
+/**
+ * 目标表机制是否开启。默认开；`DSH_CU_TARGET_TABLE=0/false/no/off/disable/disabled` 关。
+ * @param env - 环境变量表（测试可注入；默认 process.env）。
+ * @returns 是否启用目标表。
+ */
+export function targetTableEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env?.[CU_TARGET_TABLE_ENV]
+  if (raw === undefined || raw === null || String(raw).trim() === '') return CU_TARGET_TABLE_DEFAULT_ENABLED
+  return !/^(0|false|no|off|disable|disabled)$/i.test(String(raw).trim())
+}
+
 /**
  * 一条坐标门：条件（可机械求值的谓词）+ 命中后必须做的动作。
  *
@@ -127,7 +178,7 @@ export function cuMeasureScriptPath(ctx?: any): string {
  * ∈ / ∉ / ≠ / ≥ / = 与显式集合，模型与回归都能按字面判定。
  */
 export type CuCoordinateGate = {
-  /** 门号，正文与回归都按它认门（G1…G12、G14…G20；G13 是空号，见下表注释）。 */
+  /** 门号，正文与回归都按它认门（G1…G12、G14…G24；G13 是空号，见下表注释）。 */
   id: string
   /** 门名（正文方括号里的第二段）。 */
   axis: string
@@ -138,21 +189,25 @@ export type CuCoordinateGate = {
 }
 
 /**
- * 坐标门表（2026-11-28 机制化 / 2026-11-29 追加 G16…G20）。顺序即正文顺序：帧 / 重排 / 阶梯 /
- * 锚点 / 合并 / 预算 / 黑名单 / 偏移 / 语义 / 参数 / 等待 / 存储 / 测量独立性 / 出口优先 /
- * 弹层枚举 / 落盘核验 / 剪贴板优先 / 变灰必解状态 / 输入落点确认。
+ * 坐标门表（2026-11-28 机制化 / 2026-11-29 追加 G16…G20 / 2026-11-29 追加 G21…G24 目标表）。
+ * 顺序即正文顺序：帧 / 重排 / 阶梯 / 锚点 / 合并 / 预算 / 黑名单 / 偏移 / 语义 / 参数 / 等待 / 存储 /
+ * 测量独立性 / 出口优先 / 弹层枚举 / 落盘核验 / 剪贴板优先 / 变灰必解状态 / 输入落点确认 /
+ * 目标表命中 / 结构变即作废 / 兜底单次 / 失效条件。
  *
- * G13 是空号：新增的门按用户给定编号写成 G14/G15 与 G16…G20，不回填 G13，避免正文里的门号
+ * G13 是空号：新增的门按用户给定编号写成 G14/G15、G16…G20 与 G21…G24，不回填 G13，避免正文里的门号
  * 与会话记录、报告里的门号指的不是同一道门。
  *
  * 全部判据都只用「值 ∈ 集合 / 相等 / 不等 / 次数」这种机械关系，没有一条依赖主观判断；
  * 其中 G1 的 frame=、G5 的 MERGE-SPAN、G10 的参数拒收、G14 的 REGION-ECHO、G16 的按行簇、
- * G20 的 caret 都由 measure.ps1 / 工具回执在同一次输出里给出现成读数（不额外加测、不加轮次）。
+ * G20 的 caret、G21…G24 的 table_hit/struct/coordinate_space 都由 measure.ps1 / target_table.py /
+ * 工具回执在同一次输出里给出现成读数（不额外加测、不加轮次）。
  * G14 的数值门槛固定 60 px：region 任一边 ≥ 60 px 才判 REGION-ECHO（拒中心），两边都 < 60 px 的同形
  * 回显豁免（脚本打 SPAN-EQUAL tight-region (<60px): center=ACCEPT，中心与分数照旧用）。这道门槛与
  * measure_core.py / measure.ps1 / measure_legacy.ps1 里的 ECHO_MIN_SPAN_PX=60 同源，脚本不许把它做成
  * 命令行参数，门文本与脚本两边也不许各算一套；豁免只免同形这一判据，MERGE-SPAN 与簇中心照旧独立生效。
  * 门只留机械判据与出口，「脚本会打印什么补救文字」这类说明门表与脚本 usage 各说一遍即可，正文不重复。
+ * G21…G24 的数字口径与常量同源：0.03s/0.17s 是 scan_frame 同帧/冷扫实测，0.2s =
+ * CU_TARGET_TABLE_FALLBACK_BUDGET_MS，1.0714/1.0717 = CU_TARGET_TABLE_PREVIEW_SCALE（1920/1792、1032/963）。
  * G1…G12 逐字冻结在回归 scripts/test-coordinate-mode.mjs 的 FROZEN_GATE_LINES 里：
  * 加门只准往后追加，改旧门必须同时改冻结表并在提交说明里写清。
  */
@@ -271,6 +326,30 @@ export const CU_COORDINATE_GATES: readonly CuCoordinateGate[] = Object.freeze([
     when: 'input_text 焦点点击∈{画布,文本编辑器,表格,文档区}',
     then: '先量该字段 bbox 且回执帧见 caret；无 caret=撤销一次（Ctrl+Z）并复验对象状态；禁止把 URL/正文打进编辑区',
   },
+  {
+    id: 'G21',
+    axis: '目标表命中',
+    when: '当前帧结构指纹 = 表内 structural_hash，且 coordinate_space = 表内 coordinate_space，且目标名字 ∈ 表内 elements',
+    then: '按表内该名字的 center 物理像素直接点，零测量、零等待、零新增调用，一击命中后本帧不再补扫',
+  },
+  {
+    id: 'G22',
+    axis: '结构变即作废',
+    when: '帧尺寸 ≠ 表内帧尺寸，或结构指纹 ≠ 表内 structural_hash，或上一动作 ∈ {滚动,弹窗开关,跳页,换标签,窗口移动,窗口缩放}',
+    then: '整份旧表作废并重扫 1 次，新表建好前禁止用旧坐标点',
+  },
+  {
+    id: 'G23',
+    axis: '兜底单次',
+    when: '表文件不存在，或 hit --name 命中 = 0（未命中）',
+    then: '同帧就地补扫 1 次（同帧约 0.03s、冷扫约 0.17s），扫到即点；扫不到报「定位不到」继续走，不等待、不循环、单次封顶 0.2s，同一目标最多重试 1 次再按 G6 换路；scan 失败放行（按原坐标点并告警）',
+  },
+  {
+    id: 'G24',
+    axis: '失效条件',
+    when: '帧 ∈ {滚动后,弹窗开关,跳页,切换标签,窗口移动,窗口缩放,DPI 变化,coordinate_space 变化（1792×963 预览 vs 1920×1032 帧）}',
+    then: '旧表立即作废并重扫 1 次；换算常数保留 1920/1792≈1.0714、1032/963≈1.0717，预览坐标必乘回 1920×1032 帧坐标后再点',
+  },
 ])
 
 /**
@@ -283,23 +362,49 @@ export function cuCoordinateGateLine(gate: CuCoordinateGate): string {
 }
 
 /**
- * 「先量后点 + 坐标门」规则正文（发给 CU 模型的原文）。
+ * 「目标表 + 先量后点 + 坐标门」规则正文（发给 CU 模型的原文）。
  *
- * 正文顺序：门表 → 量测协议（每帧最多一次脚本调用）→ 算式 → 落点核对。门表是数据，
- * 协议只保留脚本参数与算式这类必须逐字给模型的东西。
+ * 正文顺序：门表 → 目标表协议（扫 1 次 / 查表零测量 / 失效 / 兜底 / 换算）→ 量测协议（表不可用时）
+ * → 算式 → 落点核对。门表是数据，协议只保留脚本参数与算式这类必须逐字给模型的东西。
+ *
+ * 2026-11-29 修掉的历史缺口：旧正文只写 measure.ps1、一个字都没提 scan_frame.ps1，于是 CU 会话据此
+ * 退回「逐目标目测」，全帧扫描器等于没用上。现在扫/查/失效/兜底四步逐条写在正文里。
  * @param measurePath - 本机量坐标脚本绝对路径（默认按 DSH_HOME 派生）。
+ * @param scanPath - 全帧扫描器绝对路径（scan_frame.ps1）。
+ * @param tableScript - 目标表包装器绝对路径（target_table.py）。
+ * @param targetTable - 目标表机制是否开启（默认读 DSH_CU_TARGET_TABLE，缺省开）。
+ * @param tableDir - 目标表落盘目录。
  * @returns 规则文本；非空串，长度上限由回归断言看着。
  */
-export function computerUseCoordinatePolicyText(measurePath = cuMeasureScriptPath()): string {
+export function computerUseCoordinatePolicyText(
+  measurePath = cuMeasureScriptPath(),
+  scanPath = cuScanFrameScriptPath(),
+  tableScript = cuTargetTableScriptPath(),
+  targetTable = targetTableEnabled(),
+  tableDir = cuTargetTableDir(),
+): string {
+  const tableLines = targetTable
+    ? [
+        `0. 目标表（坐标缓存，默认开；${CU_TARGET_TABLE_ENV}=0 一键关掉，回退第 6 步逐目标量测）：`,
+        `1. 扫（进新页面/结构变/表未命中才扫，1 次扫全帧）：跑 python ${tableScript} scan --shot <本帧路径> --action <scroll|dialog|navigate|tab-switch|window-move|window-resize|dpi-change>；输出带名字的元素行（name/role/center）与 table=<json>，表落在 ${tableDir}。扫描器是 ${scanPath}，必须显式传 -Shot <当前帧>，禁止省略（省略会静默取最新附件，取错帧）。`,
+        '2. 查（结构没变就零测量）：按元素名字取表内 center 物理像素直接点，零测量、零等待、零新增调用，一击命中；补查单个元素跑同一脚本 hit --name <名字>。',
+        '3. 作废（结构一变旧表立刻废）：滚动、弹窗开关、跳页、切标签、窗口移动缩放、DPI 变之后重跑第 1 步（带 --action）；结构没变表继续用，变了自动重建，绝不用旧坐标。',
+        '4. 兜底（单次封顶 0.2s）：表不存在或未命中就地补扫 1 次（同帧约 0.03s、冷扫约 0.17s），扫到即点；扫不到报「定位不到」继续走，不等待、不循环，同一目标最多重试 1 次再按 G6 换路；scan 失败放行（按原坐标点并告警）。',
+        '5. 换算（预览必乘回帧）：1792×963 预览 vs 1920×1032 帧，乘 1920/1792≈1.0714、1032/963≈1.0717；coordinate_space 与当前帧不等即作废。',
+      ]
+    : [
+        `0. 目标表已关闭（${CU_TARGET_TABLE_ENV}=0）：不扫 scan_frame、不查表、不落盘，全部按下面第 6 步逐目标量测；G21…G24 停用。`,
+      ]
   return [
     'CU 坐标门（条件成立即照 → 做，不是建议）：',
     ...CU_COORDINATE_GATES.map(cuCoordinateGateLine),
     '',
-    '先量后点（每帧最多 1 次量测，不加轮次）：',
-    `1. 量：跑 ${measurePath} -Shot <path>（省略=自动取最新观察帧） -X0 <int> -X1 <int> -Y0 <int> -Y1 <int> -Mode dark|blue|yellow|gray -Split <int> -MinPixels <int>；一次量多区用 -Regions "<x0,x1,y0,y1>;…"（同帧同一次调用，共用同一 -Mode 与阈值）；读 frame= / TOTAL bbox / center=(x,y) fraction=[x,y]；打印的 image: WxH 必须等于本帧 attached_size；不要再复制截图。`,
-    '2. 算：包围盒 → center=((x1+x2)/2,(y1+y2)/2)；分数 = 中心像素 ÷ 截图宽或高 × 1000（像素会话直接传中心像素）。',
-    '3. 点：正文先写 frame=<量测打印值>，再发坐标动作。',
-    '4. 核：click 回执 Pointer landed at [x, y] physical pixels 必须落进包围盒；drag / long_press / input_text 没这句就按回执截图重新量包围盒；chrome 帧不减（1920×1032 同帧），harness 窗口帧减 x319 / y106。',
+    '先量后点（查表优先；每帧最多 1 次扫描/量测，不加轮次）：',
+    ...tableLines,
+    `6. 量：跑 ${measurePath} -Shot <path>（省略=自动取最新观察帧） -X0 <int> -X1 <int> -Y0 <int> -Y1 <int> -Mode dark|blue|yellow|gray -Split <int> -MinPixels <int>；一次量多区用 -Regions "<x0,x1,y0,y1>;…"（同帧同一次调用，共用同一 -Mode 与阈值）；读 frame= / TOTAL bbox / center=(x,y) fraction=[x,y]；打印的 image: WxH 必须等于本帧 attached_size；不要再复制截图。`,
+    '7. 算：包围盒 → center=((x1+x2)/2,(y1+y2)/2)；分数 = 中心像素 ÷ 截图宽或高 × 1000（像素会话直接传中心像素）。',
+    '8. 点：正文先写 frame=<量测打印值>，再发坐标动作。',
+    '9. 核：click 回执 Pointer landed at [x, y] physical pixels 必须落进包围盒；drag / long_press / input_text 没这句就按回执截图重新量包围盒；chrome 帧不减（1920×1032 同帧），harness 窗口帧减 x319 / y106。',
   ].join('\n')
 }
 
@@ -352,13 +457,26 @@ export function isComputerUseSessionOf(ctx: any, session: any): boolean {
  * @param disposers - 插件卸载时要一起摘掉的清理函数。
  */
 function installComputerUseCoordinatePolicy(ctx: any, disposers: Array<() => void>): void {
-  // 量坐标脚本路径按宿主真实 profile 目录派生一次（每次装配重算没必要，路径是机器静态事实）。
-  let measurePath = ''
-  try {
-    measurePath = cuMeasureScriptPath(ctx)
-  } catch {
-    measurePath = ''
+  // 脚本/目录路径按宿主真实 profile 目录派生一次（每次装配重算没必要，路径是机器静态事实）。
+  const pathOf = (derive: (ctx?: any) => string): string => {
+    try {
+      return derive(ctx)
+    } catch {
+      return ''
+    }
   }
+  const measurePath = pathOf(cuMeasureScriptPath)
+  const scanPath = pathOf(cuScanFrameScriptPath)
+  const tableScript = pathOf(cuTargetTableScriptPath)
+  const tableDir = pathOf(cuTargetTableDir)
+  // 开关每次装配现读环境变量：设 DSH_CU_TARGET_TABLE=0 后下一轮就停用，不用重启宿主。
+  const policyText = (): string => computerUseCoordinatePolicyText(
+    measurePath || undefined,
+    scanPath || undefined,
+    tableScript || undefined,
+    targetTableEnabled(),
+    tableDir || undefined,
+  )
   if (typeof ctx?.on === 'function') {
     const hook = async (assembly: any, context: any, next: () => Promise<any>): Promise<any> => {
       const inner = await next()
@@ -368,7 +486,7 @@ function installComputerUseCoordinatePolicy(ctx: any, disposers: Array<() => voi
         if (sections.some((section: any) => section?.name === CU_POLICY_SECTION_NAME)) return inner
         const appended = {
           name: CU_POLICY_SECTION_NAME,
-          text: computerUseCoordinatePolicyText(measurePath || undefined),
+          text: policyText(),
           interpolate: false,
         }
         return { ...inner, sections: [...sections, appended] }
@@ -397,7 +515,7 @@ function installComputerUseCoordinatePolicy(ctx: any, disposers: Array<() => voi
       order: CU_POLICY_SECTION_ORDER,
       text: (context: any) => (
         isComputerUseSessionOf(ctx, context?.agent?.session)
-          ? computerUseCoordinatePolicyText(measurePath || undefined)
+          ? policyText()
           : ''
       ),
     })

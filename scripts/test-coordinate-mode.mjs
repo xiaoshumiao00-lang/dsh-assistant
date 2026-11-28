@@ -15,7 +15,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFi
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
-import { registerCoordinateMode, COORDINATE_MODE_ROUTE, computerUseCoordinatePolicyText, cuMeasureScriptPath, CU_POLICY_SECTION_ORDER, CU_COORDINATE_GATES, cuCoordinateGateLine } from '../src/coordinate-mode.ts'
+import { registerCoordinateMode, COORDINATE_MODE_ROUTE, computerUseCoordinatePolicyText, cuMeasureScriptPath, CU_POLICY_SECTION_ORDER, CU_COORDINATE_GATES, cuCoordinateGateLine, cuScanFrameScriptPath, cuTargetTableScriptPath, cuTargetTableDir, CU_TARGET_TABLE_ENV, CU_TARGET_TABLE_DEFAULT_ENABLED, CU_TARGET_TABLE_FALLBACK_BUDGET_MS, CU_TARGET_TABLE_MAX_RETRY, CU_TARGET_TABLE_STRUCT_GRID_PX, CU_TARGET_TABLE_JITTER_PX, CU_TARGET_TABLE_PREVIEW_SCALE, CU_TARGET_TABLE_INVALIDATING_ACTIONS, targetTableEnabled } from '../src/coordinate-mode.ts'
 
 function makeCtx(dir, extra = {}) {
   const routes = new Map()
@@ -500,8 +500,10 @@ cases.push(['规则正文：坐标门与量测协议齐、长度受控、算式�
   // 2026-11-29 追加 G16…G20（14 → 19 道门）并把 G14/G15 里与脚本 usage 重复的说明删掉后，
   // 实测 1243 汉字 / 2962 字符——上限就是这两个实测值（提交说明里同步登记），
   // 再加门或再加判据句必须先删字，不许悄悄放宽上限。
-  assert.ok(cjk <= 1243, `规则正文要短：汉字 ${cjk} 个（上限 1243 = 19 道门的实测值）、全段 ${[...rule].length} 字符`)
-  assert.ok([...rule].length <= 2962, `规则正文字符数超限：${[...rule].length}（上限 2962 = 19 道门的实测值）`)
+  // 2026-11-29 追加 G21…G24（目标表：查表命中/结构变即作废/兜底单次/失效条件）与「扫→查→作废→兜底→换算」
+  // 协议段后，实测 1821 汉字 / 4446 字符——上限同步提到这两个实测值（新增的是机制说明，不是重复话）。
+  assert.ok(cjk <= 1821, `规则正文要短：汉字 ${cjk} 个（上限 1821 = 23 道门 + 目标表协议的实测值）、全段 ${[...rule].length} 字符`)
+  assert.ok([...rule].length <= 4446, `规则正文字符数超限：${[...rule].length}（上限 4446 = 23 道门 + 目标表协议的实测值）`)
   assert.ok(CU_POLICY_SECTION_ORDER > 1750 && CU_POLICY_SECTION_ORDER < 1770, `段位次序应紧跟内嵌 SU 的 1750（实际 ${CU_POLICY_SECTION_ORDER}）`)
   assert.ok(cuMeasureScriptPath().endsWith(join('cu-click', 'measure.ps1')), '量坐标脚本路径应落在 <DSH_HOME>/cu-click 下')
   // 宿主真形态：profile 目录 = <DSH_HOME>/profiles/<名字>，脚本在 <DSH_HOME>/cu-click/ 下
@@ -569,6 +571,18 @@ const GATE_MARKERS = {
     '再回同菜单同行重试', '禁止判定该功能不存在'],
   G20: ['input_text 焦点点击∈{画布,文本编辑器,表格,文档区}', '先量该字段 bbox', '回执帧见 caret',
     '无 caret=撤销一次（Ctrl+Z）', '复验对象状态', '禁止把 URL/正文打进编辑区'],
+  // 2026-11-29 目标表（坐标缓存）四道硬门：查表命中零测量 / 结构变即作废 / 兜底单次 0.2s / 失效条件。
+  // 数字口径与常量同源：0.03s/0.17s 是 scan_frame 实测，0.2s = CU_TARGET_TABLE_FALLBACK_BUDGET_MS，
+  // 1.0714/1.0717 = CU_TARGET_TABLE_PREVIEW_SCALE。四道门都不许把观察/量测轮次加上去。
+  G21: ['当前帧结构指纹 = 表内 structural_hash', 'coordinate_space = 表内 coordinate_space',
+    '目标名字 ∈ 表内 elements', 'center 物理像素', '零测量、零等待、零新增调用', '一击命中'],
+  G22: ['帧尺寸 ≠ 表内帧尺寸', '结构指纹 ≠ 表内 structural_hash',
+    '上一动作 ∈ {滚动,弹窗开关,跳页,换标签,窗口移动,窗口缩放}', '整份旧表作废并重扫 1 次', '禁止用旧坐标点'],
+  G23: ['表文件不存在', 'hit --name 命中 = 0', '同帧就地补扫 1 次', '同帧约 0.03s、冷扫约 0.17s',
+    '扫到即点', '定位不到', '不等待、不循环、单次封顶 0.2s', '最多重试 1 次', 'scan 失败放行'],
+  G24: ['滚动后', '弹窗开关', '跳页', '切换标签', '窗口移动', '窗口缩放', 'DPI 变化',
+    '1792×963 预览 vs 1920×1032 帧', '旧表立即作废并重扫 1 次',
+    '1920/1792≈1.0714', '1032/963≈1.0717', '预览坐标必乘回'],
 }
 
 /**
@@ -593,11 +607,11 @@ const FROZEN_GATE_LINES = [
   '[G12 存储] 条件：动作=判断界面状态 → 动作：只读界面；app 私有存储（书签 JSON/设置文件/注册表）不作 UI 真值',
 ]
 
-cases.push(['门表即正文：19 道门逐条渲染，条件可机械求值、动作是祈使句、没有散文式建议', async () => {
+cases.push(['门表即正文：23 道门逐条渲染，条件可机械求值、动作是祈使句、没有散文式建议', async () => {
   const rule = computerUseCoordinatePolicyText()
   const gateLines = rule.split('\n').filter((line) => line.startsWith('[G'))
   assert.equal(gateLines.length, CU_COORDINATE_GATES.length, '正文里的门行数应等于门表条数')
-  assert.equal(gateLines.length, 19, '用户口径 19 道门 = 原 12 道（帧/重排/阶梯/锚点/合并/预算/黑名单/偏移/语义/参数/等待/存储）+ G14 独立性 + G15 出口优先 + G16 弹层枚举 + G17 落盘核验 + G18 剪贴板优先 + G19 变灰必解状态 + G20 输入落点确认（G13 空号）')
+  assert.equal(gateLines.length, 23, '用户口径 23 道门 = 原 12 道（帧/重排/阶梯/锚点/合并/预算/黑名单/偏移/语义/参数/等待/存储）+ G14 独立性 + G15 出口优先 + G16 弹层枚举 + G17 落盘核验 + G18 剪贴板优先 + G19 变灰必解状态 + G20 输入落点确认 + G21 目标表命中 + G22 结构变即作废 + G23 兜底单次 + G24 失效条件（G13 空号）')
   const parsed = []
   for (const line of gateLines) {
     const match = GATE_LINE.exec(line)
@@ -610,7 +624,7 @@ cases.push(['门表即正文：19 道门逐条渲染，条件可机械求值、�
     parsed.push({ id, axis, when, then, line })
   }
   assert.deepEqual(parsed.map((gate) => gate.id), CU_COORDINATE_GATES.map((gate) => gate.id),
-    '门号顺序应与门表一致（G1…G12、G14…G20）')
+    '门号顺序应与门表一致（G1…G12、G14…G24）')
   assert.deepEqual(gateLines, CU_COORDINATE_GATES.map(cuCoordinateGateLine),
     '正文必须逐字来自门表（渲染器与门表不许漂移）')
 }])
@@ -634,7 +648,7 @@ cases.push(['每道门的判据都在：帧指纹/重排清单/阶梯/锚点/合
 
 cases.push(['零新增轮次：门表不引入任何额外观察/量测调用，量测仍是每帧一次', async () => {
   const rule = computerUseCoordinatePolicyText()
-  assert.ok(rule.includes('每帧最多 1 次量测'), '量测必须限每帧一次（否则就是新增轮次）')
+  assert.ok(rule.includes('每帧最多 1 次扫描/量测'), '量测/扫描必须限每帧一次（否则就是新增轮次）')
   assert.ok(rule.includes('不要再复制截图'), '省略 -Shot 后不许再有复制截图这一步')
   assert.ok(rule.includes('-Shot <path>（省略=自动取最新观察帧）'), '一次调用取帧的口径必须写在正文里')
   assert.ok(rule.includes('image: WxH 必须等于本帧 attached_size'), '自动取帧要有免费的真帧校验')
@@ -662,7 +676,7 @@ cases.push(['零新增轮次：门表不引入任何额外观察/量测调用，
   assert.ok(!/screenshot/.test(independence.when + independence.then + outlet.when + outlet.then),
     '两道新门都不许引入 screenshot（只有 G11 可以提）')
   // G16…G20 同样不许把观察/量测轮次加上去：全部门里只有 G11 能提 screenshot 与 wait/long_wait/bash sleep。
-  const added = ['G16', 'G17', 'G18', 'G19', 'G20']
+  const added = ['G16', 'G17', 'G18', 'G19', 'G20', 'G21', 'G22', 'G23', 'G24']
   for (const id of added) {
     const gate = CU_COORDINATE_GATES.find((item) => item.id === id)
     assert.ok(gate, `缺 ${id}`)
@@ -730,13 +744,14 @@ cases.push(['等待门：默认不等待、唯一例外是显式集合、wait 1s
    ② 两道新门进渲染门表、条件机械可判、判据逐条在，且都不新增调用轮次。
    ══════════════════════════════════════════════════════════════════════════ */
 
-cases.push(['逐字冻结：原 12 道门（含新 G11）一字未改，G14…G20 只追加在末尾', async () => {
+cases.push(['逐字冻结：原 12 道门（含新 G11）一字未改，G14…G24 只追加在末尾', async () => {
   const lines = CU_COORDINATE_GATES.map(cuCoordinateGateLine)
-  assert.equal(lines.length, 19, `门表应有 19 道门，实际 ${lines.length}`)
+  assert.equal(lines.length, 23, `门表应有 23 道门，实际 ${lines.length}`)
   assert.deepEqual(lines.slice(0, 12), FROZEN_GATE_LINES,
     'G1…G12 必须逐字等于冻结快照（改旧门要同步改冻结表并在提交说明里写清）')
-  assert.deepEqual(lines.slice(12).map((line) => GATE_LINE.exec(line)?.[1]), ['G14', 'G15', 'G16', 'G17', 'G18', 'G19', 'G20'],
-    '新门只准追加在末尾，且门号就是用户给定的 G14/G15/G16…G20（G13 空号）')
+  assert.deepEqual(lines.slice(12).map((line) => GATE_LINE.exec(line)?.[1]),
+    ['G14', 'G15', 'G16', 'G17', 'G18', 'G19', 'G20', 'G21', 'G22', 'G23', 'G24'],
+    '新门只准追加在末尾，且门号就是用户给定的 G14/G15/G16…G20 与 G21…G24（G13 空号）')
   // 上一轮刚收紧的等待门：逐字在场，这次一个字都不许动。
   const g11 = lines[10]
   assert.ok(g11.startsWith('[G11 等待]'), 'G11 必须还是等待门，位置不变')
@@ -748,7 +763,7 @@ cases.push(['逐字冻结：原 12 道门（含新 G11）一字未改，G14…G2
   for (const line of FROZEN_GATE_LINES) {
     assert.equal(lines.filter((item) => item === line).length, 1, `冻结行被改动或重复：${line}`)
   }
-  assert.equal(new Set(CU_COORDINATE_GATES.map((gate) => gate.id)).size, 19, '门号不许重复')
+  assert.equal(new Set(CU_COORDINATE_GATES.map((gate) => gate.id)).size, 23, '门号不许重复')
   assert.ok(!CU_COORDINATE_GATES.some((gate) => gate.id === 'G13'), 'G13 是空号，不许自己补门')
 }])
 
@@ -809,7 +824,7 @@ cases.push(['G14/G15 与新增 G16…G20 进渲染门表：REGION-ECHO 判据、
     }
   }
   // 门表即正文：正文里的门行数 = 门表条数（由「门表即正文」用例逐条对比）。
-  assert.equal(rule.split('\n').filter((line) => line.startsWith('[G')).length, 19, '正文门行数应为 19')
+  assert.equal(rule.split('\n').filter((line) => line.startsWith('[G')).length, 23, '正文门行数应为 23')
   assert.ok(rule.includes('REGION-ECHO'), '规则正文必须提到 REGION-ECHO 判据行')
 }])
 
@@ -1204,8 +1219,8 @@ cases.push(['五道新门 G16…G20：只追加在末尾、门名与机械条件
   const rule = computerUseCoordinatePolicyText()
   const lines = CU_COORDINATE_GATES.map(cuCoordinateGateLine)
   assert.deepEqual(lines.slice(12).map((line) => GATE_LINE.exec(line)?.[1]),
-    ['G14', 'G15', 'G16', 'G17', 'G18', 'G19', 'G20'],
-    'G16…G20 只准按用户给定门号追加在末尾（G13 仍是空号）')
+    ['G14', 'G15', 'G16', 'G17', 'G18', 'G19', 'G20', 'G21', 'G22', 'G23', 'G24'],
+    'G16…G20 与 G21…G24 只准按用户给定门号追加在末尾（G13 仍是空号）')
   const expected = { G16: '弹层枚举', G17: '落盘核验', G18: '剪贴板优先', G19: '变灰必解状态', G20: '输入落点确认' }
   for (const [id, axis] of Object.entries(expected)) {
     const gate = CU_COORDINATE_GATES.find((item) => item.id === id)
@@ -1234,7 +1249,7 @@ cases.push(['五道新门 G16…G20：只追加在末尾、门名与机械条件
   const g20 = CU_COORDINATE_GATES.find((gate) => gate.id === 'G20')
   assert.ok(g20.then.includes('回执帧见 caret'), 'G20 必须在回执帧里确认 caret')
   assert.ok(g20.then.includes('Ctrl+Z'), 'G20 看不到光标要撤销一次')
-  assert.equal(rule.split('\n').filter((line) => line.startsWith('[G')).length, 19, '正文门行数应为 19')
+  assert.equal(rule.split('\n').filter((line) => line.startsWith('[G')).length, 23, '正文门行数应为 23')
 }])
 
 cases.push(['measure.ps1 -Regions 批量口：一帧一次调用量 2 区，每区各自给 TOTAL bbox 与 center', async () => {
@@ -1376,6 +1391,256 @@ cases.push(['没有 agent 的装配（诊断用）不许抛错也不注入', asy
   }
 }])
 
+/* ══════════════════════════════════════════════════════════════════════════
+   2026-11-29 目标表（坐标缓存）：门 G21…G24、开关、路径、真实 scan_frame + target_table.py 跑通。
+   验收口径（用户定稿方案）：结构没变查表零测量；结构一变旧表作废重扫；兜底单次 0.2s；
+   失效条件（滚动/弹窗/跳页/切标签/窗口移动缩放/DPI/coordinate_space）逐条可判。
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const tableScriptCtx = { get: (name) => (name === 'profileContext' ? { dir: join(homedir(), '.dsh', 'profiles', 'desktop') } : undefined) }
+const scanFramePath = cuScanFrameScriptPath(tableScriptCtx)
+const targetTableScriptPath = cuTargetTableScriptPath(tableScriptCtx)
+const TABLE_SKIP = 'target_table.py / scan_frame.ps1 不在本机（<DSH_HOME>/cu-click），跳过真跑'
+
+function runTargetTable(args, env = {}) {
+  const result = spawnSync('python', [targetTableScriptPath, ...args], {
+    encoding: 'utf8',
+    env: { ...process.env, ...env },
+    timeout: 60000,
+  })
+  return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }
+}
+
+function outputField(stdout, name) {
+  const match = new RegExp(`(?:^|\\s)${name}=(\\S*)`, 'm').exec(stdout)
+  return match ? match[1] : ''
+}
+
+cases.push(['目标表开关：默认开启、DSH_CU_TARGET_TABLE=0/false/off 关闭、正文随开关切换', async () => {
+  assert.equal(CU_TARGET_TABLE_DEFAULT_ENABLED, true, '缺省必须开启（关掉只要设环境变量）')
+  assert.equal(targetTableEnabled({}), true, '没有环境变量时开启')
+  assert.equal(targetTableEnabled({ [CU_TARGET_TABLE_ENV]: '1' }), true, '1 仍是开启')
+  for (const off of ['0', 'false', 'no', 'off', 'disable', 'disabled', ' OFF ']) {
+    assert.equal(targetTableEnabled({ [CU_TARGET_TABLE_ENV]: off }), false, `「${off}」应关闭目标表`)
+  }
+  const on = computerUseCoordinatePolicyText()
+  assert.ok(on.includes('scan --shot'), '开启时正文必须写扫描命令')
+  assert.ok(on.includes('hit --name'), '开启时正文必须写查表命令')
+  const offText = computerUseCoordinatePolicyText(undefined, undefined, undefined, false)
+  assert.ok(offText.includes('目标表已关闭'), '关闭时正文必须写明已关闭')
+  assert.ok(!offText.includes('scan --shot'), '关闭时不许再让模型跑 scan（整套机制停用）')
+  assert.ok(offText.includes('measure.ps1'), '关闭时仍要保留逐目标量测路径')
+  // 门是规格，不随运行期开关消失（G21…G24 仍在门表里，开关句说明它们停用）。
+  assert.equal(offText.split('\n').filter((line) => line.startsWith('[G')).length, 23, '关闭时门表仍是 23 道')
+  assert.ok(offText.includes('G21…G24 停用'), '关闭句要点名 G21…G24 停用')
+}])
+
+cases.push(['目标表路径与常量：按 profile 目录退回 DSH_HOME，口径与门文同源', async () => {
+  const fakeRoot = join(tmpdir(), 'dsh-root-fixture-target-table')
+  const fakeCtx = { get: (name) => (name === 'profileContext' ? { dir: join(fakeRoot, 'profiles', 'desktop') } : undefined) }
+  assert.equal(cuScanFrameScriptPath(fakeCtx), join(fakeRoot, 'cu-click', 'scan_frame.ps1'), '扫描器应落在 <DSH_HOME>/cu-click')
+  assert.equal(cuTargetTableScriptPath(fakeCtx), join(fakeRoot, 'cu-click', 'target_table.py'), '目标表包装器应落在 <DSH_HOME>/cu-click')
+  assert.equal(cuTargetTableDir(fakeCtx), join(fakeRoot, 'cu-click', 'target-table'), '表目录应落在 <DSH_HOME>/cu-click/target-table')
+  assert.ok(cuScanFrameScriptPath().endsWith(join('cu-click', 'scan_frame.ps1')))
+  assert.ok(cuTargetTableDir().endsWith(join('cu-click', 'target-table')))
+  // 0.2s 封顶 / 重试 1 次 / 8 px 网格 / ±2 px 抖动 / 预览换算常数：门文里逐字对得上。
+  assert.equal(CU_TARGET_TABLE_FALLBACK_BUDGET_MS, 200)
+  assert.equal(CU_TARGET_TABLE_MAX_RETRY, 1)
+  assert.equal(CU_TARGET_TABLE_STRUCT_GRID_PX, 8)
+  assert.ok(CU_TARGET_TABLE_STRUCT_GRID_PX >= CU_TARGET_TABLE_JITTER_PX * 2, '网格至少是抖动的 2 倍，±2 px 才落在同一格')
+  assert.ok(Math.abs(CU_TARGET_TABLE_PREVIEW_SCALE.x - 1920 / 1792) < 1e-12, 'x 换算常数 = 1920/1792')
+  assert.ok(Math.abs(CU_TARGET_TABLE_PREVIEW_SCALE.y - 1032 / 963) < 1e-12, 'y 换算常数 = 1032/963')
+  assert.ok(Math.abs(Number(CU_TARGET_TABLE_PREVIEW_SCALE.x.toFixed(4)) - 1.0714) < 1e-9)
+  assert.ok(Math.abs(Number(CU_TARGET_TABLE_PREVIEW_SCALE.y.toFixed(4)) - 1.0717) < 1e-9)
+  assert.deepEqual([...CU_TARGET_TABLE_INVALIDATING_ACTIONS].sort(),
+    ['dialog', 'dpi-change', 'navigate', 'scroll', 'tab-switch', 'window-move', 'window-resize'])
+  const rule = computerUseCoordinatePolicyText()
+  assert.ok(rule.includes(`${CU_TARGET_TABLE_FALLBACK_BUDGET_MS / 1000}s`), '正文 0.2s 必须由常量渲染')
+  assert.ok(rule.includes(`最多重试 ${CU_TARGET_TABLE_MAX_RETRY} 次`), '正文重试次数必须由常量渲染')
+  // 包装器源码的两个硬口径：必须显式传 -Shot（省略=静默取最新附件，会取错帧）、必须读开关环境变量。
+  if (existsSync(targetTableScriptPath)) {
+    const cli = readFileSync(targetTableScriptPath, 'utf8')
+    assert.ok(cli.includes("'-Shot', str(shot)"), 'target_table.py 必须显式传 -Shot')
+    assert.ok(cli.includes('DSH_CU_TARGET_TABLE'), 'target_table.py 必须读 DSH_CU_TARGET_TABLE 开关')
+    assert.ok(cli.includes('SCAN_BUDGET_MS = 200'), '兜底预算必须是 200ms（0.2s 封顶）')
+  }
+}])
+
+cases.push(['策略正文：scan_frame 流程在场，不再只写 measure.ps1（上一轮退回纯目测的直接原因）', async () => {
+  const rule = computerUseCoordinatePolicyText()
+  for (const marker of ['scan_frame.ps1', 'scan --shot', 'target_table.py', 'target-table',
+    '零测量、零等待、零新增调用', '定位不到', '同帧约 0.03s', '冷扫约 0.17s', '0.2s',
+    '1.0714', '1.0717', 'coordinate_space', '--action', 'hit --name']) {
+    assert.ok(rule.includes(marker), `策略正文缺「${marker}」`)
+  }
+  assert.ok(rule.includes('必须显式传 -Shot'), '省略 -Shot 会静默取最新附件，正文必须点明')
+  assert.ok(rule.indexOf('scan_frame.ps1') < rule.indexOf('6. 量'), '查表/扫描流程必须排在量测路径之前')
+  assert.ok(rule.includes('measure.ps1'), '表不可用时仍要给 measure.ps1 路径（放行，不拦死）')
+}])
+
+cases.push(['目标表真跑：建表→复用→命中→±2px 抖动不失效→结构变/尺寸变/坐标空间变作废', async () => {
+  if (!existsSync(targetTableScriptPath) || !existsSync(scanFramePath)) return console.log(`  skip - ${TABLE_SKIP}`)
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-target-table-'))
+  const state = join(dir, 'state')
+  try {
+    // 一帧三块蓝色按钮：布局 A。
+    const frameA = join(dir, 'a.png')
+    writeFixturePngSize(frameA, 1200, 800, [
+      'd.rectangle([100, 100, 180, 140], fill=(0, 0, 255))',
+      'd.rectangle([400, 300, 480, 340], fill=(0, 0, 255))',
+      'd.rectangle([700, 500, 780, 540], fill=(0, 0, 255))',
+    ].join('\n'))
+    const first = runTargetTable(['scan', '--shot', frameA, '--state', state])
+    assert.equal(first.status, 0, `scan 应退出 0：${first.stderr}\n${first.stdout}`)
+    assert.equal(outputField(first.stdout, 'target_table'), 'enabled')
+    assert.equal(outputField(first.stdout, 'table_status'), 'rebuilt', '首扫必须建表')
+    assert.equal(outputField(first.stdout, 'coordinate_space'), 'pixel:1200x800')
+    assert.match(outputField(first.stdout, 'struct'), /^[0-9a-f]{16}$/, '结构指纹必须是 16 位 hex')
+    assert.equal(outputField(first.stdout, 'budget_ms'), '200', '兜底预算常量必须是 200ms')
+    assert.ok(['ok', 'over'].includes(outputField(first.stdout, 'budget')),
+      `预算标记只准是 ok/over（实测 ${outputField(first.stdout, 'scan_elapsed_ms')}ms）`)
+    assert.equal(outputField(first.stdout, 'reasons'), '', '首扫没有旧表，不该有失效原因')
+    const tablePathA = outputField(first.stdout, 'table')
+    assert.ok(existsSync(tablePathA), `表必须落盘：${tablePathA}`)
+    assert.ok(tablePathA.includes('target-table'), '表要落在 target-table 目录下')
+
+    const tableA = JSON.parse(readFileSync(tablePathA, 'utf8'))
+    assert.equal(tableA.version, 1)
+    assert.deepEqual(tableA.frame_size, { w: 1200, h: 800 })
+    assert.equal(tableA.coordinate_space, 'pixel:1200x800')
+    assert.match(tableA.generated_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/, '表里必须有生成时间')
+    assert.ok(Array.isArray(tableA.elements) && tableA.elements.length >= 3, '三个按钮都应入表')
+    for (const element of tableA.elements) {
+      assert.match(element.name, /^R\d{2}C\d{2}-(button|input|menu-row|icon)$/, `元素名必须稳定可读：${element.name}`)
+      assert.equal(typeof element.center.x, 'number')
+      assert.equal(typeof element.center.y, 'number')
+      assert.ok(element.bbox.x0 <= element.center.x && element.center.x <= element.bbox.x1, '中心必须落在 bbox 内')
+    }
+    const names = tableA.elements.map((element) => element.name)
+    assert.equal(new Set(names).size, names.length, '元素名必须唯一')
+    // 同一帧再扫：命中缓存表，不重建、不冒新表。
+    const second = runTargetTable(['scan', '--shot', frameA, '--state', state])
+    assert.equal(second.status, 0)
+    assert.equal(outputField(second.stdout, 'table_status'), 'reused', '同一帧必须复用同一张表')
+    assert.equal(outputField(second.stdout, 'table'), tablePathA, '同一帧的表路径不许变')
+    assert.equal(outputField(second.stdout, 'reasons'), '', '同一帧不该报失效')
+
+    // 零测量查表：hit 只读文件，不碰像素。
+    const target = tableA.elements[0]
+    const hit = runTargetTable(['hit', '--name', target.name, '--state', state])
+    assert.equal(hit.status, 0)
+    assert.equal(outputField(hit.stdout, 'hit'), '1', `按名字必须命中：${target.name}\n${hit.stdout}`)
+    assert.ok(hit.stdout.includes(`center=(${target.center.x},${target.center.y})`), '命中必须给表内中心坐标')
+    const miss = runTargetTable(['hit', '--name', 'R99C99-button', '--state', state])
+    assert.equal(outputField(miss.stdout, 'hit'), '0')
+    assert.ok(miss.stdout.includes('定位不到'), '未命中必须报「定位不到」')
+    const byFrame = runTargetTable(['hit', '--frame-hash', tableA.frame_hash, '--state', state])
+    assert.equal(outputField(byFrame.stdout, 'frame_hash_hit'), '1', '整帧像素级命中是零扫描快路')
+
+    // 布局不变、像素变（内容整体挪 2 px）：帧哈希换了，结构指纹不变 ⇒ 表继续有效。
+    const frameA2 = join(dir, 'a2.png')
+    writeFixturePngSize(frameA2, 1200, 800, [
+      'd.rectangle([102, 100, 182, 140], fill=(0, 0, 255))',
+      'd.rectangle([402, 300, 482, 340], fill=(0, 0, 255))',
+      'd.rectangle([702, 500, 782, 540], fill=(0, 0, 255))',
+    ].join('\n'))
+    const jitter = runTargetTable(['scan', '--shot', frameA2, '--state', state])
+    assert.equal(jitter.status, 0)
+    assert.notEqual(outputField(jitter.stdout, 'frame'), tableA.frame_hash, '两张图的帧哈希必须不同（像素级键会误判）')
+    assert.equal(outputField(jitter.stdout, 'struct'), tableA.structural_hash, '±2 px 抖动不许换结构指纹')
+    assert.equal(outputField(jitter.stdout, 'table_status'), 'reused', '±2 px 抖动必须复用旧表，不作废')
+    assert.equal(outputField(jitter.stdout, 'table'), tablePathA)
+
+    // 光标/caret 这类小簇一闪：不许换结构指纹（否则就是拿像素级哈希当唯一键）。
+    // 造一个「光标尖」形状的小簇（两条细线拼成 18x25、像素很少），远小于真按钮。
+    const frameCursor = join(dir, 'a-cursor.png')
+    writeFixturePngSize(frameCursor, 1200, 800, [
+      'd.rectangle([100, 100, 180, 140], fill=(0, 0, 255))',
+      'd.rectangle([400, 300, 480, 340], fill=(0, 0, 255))',
+      'd.rectangle([700, 500, 780, 540], fill=(0, 0, 255))',
+      'd.rectangle([600, 200, 601, 224], fill=(20, 20, 20))',
+      'd.rectangle([600, 200, 617, 201], fill=(20, 20, 20))',
+    ].join('\n'))
+    const cursor = runTargetTable(['scan', '--shot', frameCursor, '--state', state])
+    assert.equal(cursor.status, 0)
+    assert.equal(outputField(cursor.stdout, 'struct'), tableA.structural_hash, '光标小簇不许改结构指纹')
+    assert.equal(outputField(cursor.stdout, 'table_status'), 'reused', '光标一闪必须复用旧表，不许作废')
+    assert.ok(Number(outputField(cursor.stdout, 'transient_clusters')) >= 1, '小簇要记进 transient_clusters')
+    const cursorTable = JSON.parse(readFileSync(outputField(cursor.stdout, 'table'), 'utf8'))
+    assert.equal(cursorTable.structural_hash, tableA.structural_hash)
+    assert.ok(cursorTable.transient_clusters >= 1, '表里要记 transient_clusters（供人核对）')
+    assert.ok(cursorTable.struct_clusters >= 3, '表里要记参与指纹的结构簇数')
+    assert.ok(!cursorTable.elements.some((element) => (
+      element.bbox.x0 >= 595 && element.bbox.x1 <= 622 && element.bbox.y0 >= 195 && element.bbox.y1 <= 230
+    )), '光标小簇不许进元素表（它不是可点元素）')
+
+    // 布局变（多一个按钮）：结构指纹变 ⇒ 作废旧表并重建。
+    const frameB = join(dir, 'b.png')
+    writeFixturePngSize(frameB, 1200, 800, [
+      'd.rectangle([100, 100, 180, 140], fill=(0, 0, 255))',
+      'd.rectangle([400, 300, 480, 340], fill=(0, 0, 255))',
+      'd.rectangle([700, 500, 780, 540], fill=(0, 0, 255))',
+      'd.rectangle([900, 200, 980, 240], fill=(0, 0, 255))',
+    ].join('\n'))
+    const changed = runTargetTable(['scan', '--shot', frameB, '--state', state])
+    assert.equal(changed.status, 0)
+    assert.equal(outputField(changed.stdout, 'table_status'), 'rebuilt', '结构变必须重扫重建')
+    assert.ok(outputField(changed.stdout, 'reasons').includes('structural_hash'), '失效原因必须点名 structural_hash')
+    assert.equal(outputField(changed.stdout, 'invalidated'), tableA.table_key, '作废的旧表键必须报出来')
+    assert.notEqual(outputField(changed.stdout, 'table'), tablePathA, '新结构必须是新表文件')
+
+    // 动作类失效：滚动/弹窗/跳页/切标签/窗口移动缩放/DPI 必须带 --action 重扫。
+    const action = runTargetTable(['scan', '--shot', frameB, '--state', state, '--action', 'scroll'])
+    assert.equal(action.status, 0)
+    assert.ok(outputField(action.stdout, 'reasons').includes('action:scroll'), '--action 必须记进失效原因')
+
+    // 帧尺寸变：同一窗口缩放 ⇒ 旧表作废（frame_size）。
+    const frameC = join(dir, 'c.png')
+    writeFixturePngSize(frameC, 1400, 900, 'd.rectangle([100, 100, 180, 140], fill=(0, 0, 255))')
+    const resized = runTargetTable(['scan', '--shot', frameC, '--state', state])
+    assert.equal(resized.status, 0)
+    assert.equal(outputField(resized.stdout, 'coordinate_space'), 'pixel:1400x900')
+    assert.ok(outputField(resized.stdout, 'reasons').includes('frame_size'), '窗口缩放必须按 frame_size 作废')
+
+    // 坐标空间变：1792x963 预览 ⇒ 旧表作废，并打印换算常数。
+    const frameD = join(dir, 'd.png')
+    writeFixturePngSize(frameD, 1792, 963, 'd.rectangle([100, 100, 180, 140], fill=(0, 0, 255))')
+    const preview = runTargetTable(['scan', '--shot', frameD, '--state', state])
+    assert.equal(preview.status, 0)
+    assert.equal(outputField(preview.stdout, 'coordinate_space'), 'pixel:1792x963')
+    assert.ok(outputField(preview.stdout, 'reasons').includes('coordinate_space'), '预览/帧坐标空间不同必须作废旧表')
+    assert.equal(outputField(preview.stdout, 'scale_to_frame'), '1.0714,1.0717', '预览帧必须给换算常数')
+    const previewTable = JSON.parse(readFileSync(outputField(preview.stdout, 'table'), 'utf8'))
+    assert.deepEqual(previewTable.preview_scale.x, 1.0714)
+    assert.deepEqual(previewTable.preview_scale.y, 1.0717)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}])
+
+cases.push(['目标表放行与开关：扫失败不拦死（告警 + 原坐标），DSH_CU_TARGET_TABLE=0 时连扫都不扫', async () => {
+  if (!existsSync(targetTableScriptPath) || !existsSync(scanFramePath)) return console.log(`  skip - ${TABLE_SKIP}`)
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-target-table-off-'))
+  const state = join(dir, 'state')
+  try {
+    const broken = runTargetTable(['scan', '--shot', join(dir, 'nope.png'), '--state', state])
+    assert.equal(broken.status, 0, '扫失败也必须退出 0（放行，不许拦死）')
+    assert.ok(broken.stdout.includes('scan=failed'), '要报 scan=failed')
+    assert.ok(broken.stdout.includes('放行'), '要明确写「放行：按原坐标点并告警」')
+    assert.ok(!existsSync(join(state, 'current.json')), '扫失败不许写活动表')
+
+    const off = runTargetTable(['scan', '--shot', join(dir, 'nope.png'), '--state', state], { [CU_TARGET_TABLE_ENV]: '0' })
+    assert.equal(off.status, 0)
+    assert.equal(outputField(off.stdout, 'target_table'), 'disabled')
+    assert.ok(off.stdout.includes('回退逐目标量测'), '关闭时必须说明回退 measure.ps1')
+    const hitOff = runTargetTable(['hit', '--name', 'R01C01-button', '--state', state], { [CU_TARGET_TABLE_ENV]: '0' })
+    assert.equal(outputField(hitOff.stdout, 'target_table'), 'disabled')
+    assert.ok(!existsSync(join(state, 'current.json')), '关闭时查表也不许造活动表')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}])
+
 let failed = 0
 for (const [name, run] of cases) {
   try {
@@ -1392,3 +1657,6 @@ if (failed > 0) {
   process.exit(1)
 }
 console.log(`\n${cases.length}/${cases.length} 通过`)
+
+
+

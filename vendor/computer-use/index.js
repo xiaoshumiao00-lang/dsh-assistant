@@ -1,4 +1,6 @@
 import { c as modelPositionToHid, d as requirePixelPosition, f as runWithCaptureExcludeWindowIds, i as createPlatformBackend, l as requireClickModifiers, n as FOCUS_NOTE, o as delay, r as UNFOCUSED_WINDOW_NOTE, s as assertAllowedHotkey, t as FOCUS_FALLBACK_FOREGROUND, u as requireNormalizedPosition } from "./backend-18yEf5Jq.js";
+import { readFileSync, statSync } from "node:fs";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import { realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -1206,8 +1208,413 @@ function clickResultText(value) {
 	const mods = value.modifiers === void 0 ? "" : `, modifiers ${value.modifiers.join(", ")}`;
 	// 落点回读：物理像素里的实际位置。分数对了但落点变了，这句话立刻能看出来，不用等下一次截图标定。
 	const landed = value.landed === void 0 ? "" : ` Pointer landed at [${value.landed.join(", ")}] physical pixels.`;
-	return `Clicked screen ${String(value.screenIndex)} at [${value.position.join(", ")}] (${value.button}, count ${String(value.count)}${mods}).${landed} ${coordinatesRemain(value)}`;
+	// 吸附回执：snapped / pass-through 各一行（warn 另起一行），不吸就一个字都不多。
+	const snap = typeof value.snap === "string" && value.snap !== "" ? `\n${value.snap}` : "";
+	return `Clicked screen ${String(value.screenIndex)} at [${value.position.join(", ")}] (${value.button}, count ${String(value.count)}${mods}).${landed} ${coordinatesRemain(value)}${snap}`;
 }
+//#region src/click-snap.ts
+/**
+* 点击时坐标吸附（2026-11-29，最小补丁，只挂在 click 上）。
+*
+* 判定链（全部机械判据，不猜、不改提示词）：
+*   1. 目标坐标已落在本帧量测表某个元素 bbox 内 → 原样放行，不动（回执不加行）。
+*   2. 不在任何元素内 → 就地补扫一帧（复用 target_table.py scan + scan_frame.ps1 的同一份
+*      表 / 缓存 / 结构哈希判据），把坐标吸附到最近的元素中心（帧像素距离 ≤ 24 px 才吸）。
+*   3. 距离 > 24 px、扫描失败、整条路径超过 200 ms、没有可用表 → 放行原坐标，
+*      回执写一行 pass-through（出错时另起一行 warn）。
+*
+* 换算口径（只此一处，别处不许另算一套）：
+*   - 窗口原点：backend.click 自己加（target_table.py:818-820 的 click=(requested) 口径），
+*     这里**绝不**再 apply_window_origin，否则就是重复加偏移。
+*   - 预览缩放：1792×963 → 1920×1032 直接用表里 target_table.py 写下的 preview_scale
+*     （PREVIEW_SCALE = 1920/1792、1032/963）；其余尺寸按帧/截图比推，同一常数。
+*
+* 硬约束：不阻塞（异步 spawn，不 sleep、不等待）、不循环重试（最多补扫 1 次）、
+* 不新增任何模型工具调用（只读表 + 最多 1 次本地脚本），整条路径 200 ms 封顶（超时即放行）。
+*/
+const SNAP_ENV = "DSH_CU_SNAP";
+const SNAP_TARGET_TABLE_ENV = "DSH_CU_TARGET_TABLE";
+const SNAP_THRESHOLD_PX = 24;
+const SNAP_BUDGET_ENV = "DSH_CU_SNAP_BUDGET_MS";
+const SNAP_DEFAULT_BUDGET_MS = 1000;
+const SNAP_PYTHON_ENV = "DSH_CU_PYTHON";
+const SNAP_PREVIEW_SIZE = Object.freeze({
+	w: 1792,
+	h: 963
+});
+const SNAP_FRAME_SIZE = Object.freeze({
+	w: 1920,
+	h: 1032
+});
+const SNAP_OFF = /^(0|false|no|off|disable|disabled)$/i;
+/**
+* 开关读取：缺省开；`0/false/no/off/disable/disabled` 关；空串按缺省（默认开）。
+* @param env - 环境变量表。
+* @param key - 变量名。
+* @returns 是否开启。
+*/
+function snapSwitchOn(env, key) {
+	const raw = env?.[key];
+	if (raw === void 0 || raw === null || String(raw).trim() === "") return true;
+	return !SNAP_OFF.test(String(raw).trim());
+}
+/**
+* 整条吸附路径的封顶预算（毫秒）：默认 200，可用环境变量压小（测试超时分支用）。
+* @param env - 环境变量表。
+* @returns 预算毫秒数。
+*/
+function snapBudgetOf(env) {
+	const raw = Number(env?.[SNAP_BUDGET_ENV]);
+	return Number.isFinite(raw) && raw > 0 ? raw : SNAP_DEFAULT_BUDGET_MS;
+}
+/**
+* `<DSH_HOME>/cu-click`：与 src/coordinate-mode.ts 的 cuTargetTableDir() 同一口径
+* （表脚本 target_table.py 自己把状态目录定在脚本旁的 target-table/）。
+* @param env - 环境变量表。
+* @returns cu-click 目录。
+*/
+function snapCuClickDir(env) {
+	const home = typeof env?.DSH_HOME === "string" && env.DSH_HOME.trim() !== "" ? env.DSH_HOME.trim() : join(env?.USERPROFILE || env?.HOME || ".", ".dsh");
+	return join(home, "cu-click");
+}
+function snapReadJson(file) {
+	try {
+		return JSON.parse(readFileSync(file, "utf8"));
+	} catch {
+		return void 0;
+	}
+}
+/**
+* 读本帧量测表：current.json → 表文件。零扫描、零子进程，读不到就是没有表。
+* @param tableDir - target-table 目录。
+* @returns 表对象，或 undefined。
+*/
+function snapLoadTable(tableDir) {
+	const current = snapReadJson(join(tableDir, "current.json"));
+	if (current === void 0 || typeof current.table_file !== "string" || current.table_file === "") return void 0;
+	const table = snapReadJson(join(tableDir, current.table_file));
+	if (table === void 0 || table.version !== 1 || !Array.isArray(table.elements)) return void 0;
+	return table;
+}
+/**
+* 表能不能用在「这一帧」上：帧尺寸必须同尺寸，或正好是 1792×963 预览 vs 1920×1032 帧这一对；
+* 且 coordinate_space 必须与表内帧尺寸自洽（表自己写坏的不认）。
+* @param table - 表对象。
+* @param attached - 当前附的截图尺寸。
+* @returns 是否可用。
+*/
+function snapTableUsable(table, attached) {
+	if (table === void 0 || attached === void 0) return false;
+	const frame = table.frame_size;
+	if (frame === void 0 || !(Number(frame.w) > 0) || !(Number(frame.h) > 0)) return false;
+	if (String(table.coordinate_space ?? "") !== `pixel:${String(frame.w)}x${String(frame.h)}`) return false;
+	if (Number(frame.w) === attached.width && Number(frame.h) === attached.height) return true;
+	return attached.width === SNAP_PREVIEW_SIZE.w && attached.height === SNAP_PREVIEW_SIZE.h && Number(frame.w) === SNAP_FRAME_SIZE.w && Number(frame.h) === SNAP_FRAME_SIZE.h;
+}
+/**
+* 截图坐标 → 表帧坐标的比例：同尺寸 1:1；预览这一对用表里 target_table.py 写的 preview_scale
+* （= PREVIEW_SCALE 1920/1792、1032/963），其余尺寸按帧/截图比推。
+* @param attached - 当前附的截图尺寸。
+* @param frame - 表帧尺寸。
+* @param table - 表对象（读 preview_scale 用）。
+* @returns 比例。
+*/
+function snapScaleOf(attached, frame, table) {
+	if (attached.width === Number(frame.w) && attached.height === Number(frame.h)) return {
+		x: 1,
+		y: 1
+	};
+	const stored = table?.preview_scale;
+	const storedOk = typeof stored?.x === "number" && stored.x > 0 && typeof stored?.y === "number" && stored.y > 0;
+	if (attached.width === SNAP_PREVIEW_SIZE.w && attached.height === SNAP_PREVIEW_SIZE.h && Number(frame.w) === SNAP_FRAME_SIZE.w && Number(frame.h) === SNAP_FRAME_SIZE.h && storedOk) return {
+		x: stored.x,
+		y: stored.y
+	};
+	return {
+		x: Number(frame.w) / attached.width,
+		y: Number(frame.h) / attached.height
+	};
+}
+/**
+* 在表里找「落在哪个元素 bbox 内」与「最近的元素中心」。
+* @param table - 表对象。
+* @param px - 帧像素 x。
+* @param py - 帧像素 y。
+* @returns 命中的 bbox 元素与最近中心（都可能缺）。
+*/
+function snapLookup(table, px, py) {
+	let inside;
+	let nearest;
+	for (const element of table.elements) {
+		const box = element?.bbox;
+		const center = element?.center;
+		if (box === void 0 || center === void 0) continue;
+		if (!(Number.isFinite(Number(box.x0)) && Number.isFinite(Number(box.x1)) && Number.isFinite(Number(box.y0)) && Number.isFinite(Number(box.y1)))) continue;
+		if (inside === void 0 && px >= Number(box.x0) && px <= Number(box.x1) && py >= Number(box.y0) && py <= Number(box.y1)) inside = element;
+		if (!(Number.isFinite(Number(center.x)) && Number.isFinite(Number(center.y)))) continue;
+		const delta = Math.hypot(Number(center.x) - px, Number(center.y) - py);
+		if (nearest === void 0 || delta < nearest.delta) nearest = {
+			element,
+			delta
+		};
+	}
+	return {
+		inside,
+		nearest
+	};
+}
+/**
+* 这一帧的截图文件：取会话日志里最后一张 CU 观察图（或被点工具回执图）的附件 id，
+* 按附件库的内容寻址规则 `<DSH_HOME>/attachments/v1/{objects,request-images}/<id 前两位>/<id>` 取。
+* 只用 id 定位，不去枚举整个附件库（18527 个对象，枚举会直接吃光 200 ms 预算）。
+* @param session - CU 会话。
+* @returns 附件 id，或 undefined。
+*/
+function snapFrameAttachmentId(session) {
+	if (typeof session?.snapshotEvents !== "function") return void 0;
+	const events = session.snapshotEvents();
+	for (let index = events.length - 1; index >= 0; index -= 1) {
+		const event = events[index];
+		if (event?.type !== "user/message" && event?.type !== "tool/result") continue;
+		const content = event.type === "user/message" ? event.data?.content : event.data?.message?.content;
+		const id = snapImageIdIn(content);
+		if (id !== void 0) return id;
+	}
+	return void 0;
+}
+function snapImageIdIn(value) {
+	if (Array.isArray(value)) {
+		for (let index = value.length - 1; index >= 0; index -= 1) {
+			const id = snapImageIdIn(value[index]);
+			if (id !== void 0) return id;
+		}
+		return void 0;
+	}
+	if (value === null || typeof value !== "object") return void 0;
+	if (value.type === "image" && typeof value.attachment?.attachmentId === "string" && value.attachment.attachmentId !== "") return value.attachment.attachmentId;
+	for (const nested of Object.values(value)) {
+		const id = snapImageIdIn(nested);
+		if (id !== void 0) return id;
+	}
+	return void 0;
+}
+/**
+* 本帧截图的绝对路径（内容寻址，一次 stat）：拿不到就返回 undefined，绝不枚举附件库。
+* @param session - CU 会话。
+* @param cuClick - `<DSH_HOME>/cu-click`。
+* @returns 文件路径，或 undefined。
+*/
+function snapFrameShot(session, cuClick) {
+	const id = snapFrameAttachmentId(session);
+	if (id === void 0 || id.length < 3) return void 0;
+	const home = join(cuClick, "..");
+	for (const bucket of ["objects", "request-images"]) {
+		const file = join(home, "attachments", "v1", bucket, id.slice(0, 2), id);
+		try {
+			if (statSync(file).size > 0) return file;
+		} catch {}
+	}
+	return void 0;
+}
+/**
+* 就地补扫一帧：跑一次 target_table.py scan（同一份 scan_frame.ps1、同一份缓存与结构哈希判据）。
+* 一次调用、不重试、不循环；超时到点直接 kill 并判超时。
+* @param input - 脚本、截图、预算与 env。
+* @returns `{ ok, timeout, table, warn }`（不抛）。
+*/
+function snapRescan(input) {
+	return new Promise((resolve) => {
+		const script = join(input.cuClick, "target_table.py");
+		try {
+			if (!statSync(script).isFile()) {
+				resolve({
+					ok: false,
+					timeout: false,
+					warn: `target_table.py missing: ${script}`
+				});
+				return;
+			}
+		} catch {
+			resolve({
+				ok: false,
+				timeout: false,
+				warn: `target_table.py missing: ${script}`
+			});
+			return;
+		}
+		const shot = snapFrameShot(input.session, input.cuClick);
+		if (shot === void 0) {
+			resolve({
+				ok: false,
+				timeout: false,
+				warn: "no frame image for this session"
+			});
+			return;
+		}
+		const remaining = Math.max(1, input.deadline - Date.now());
+		if (remaining < 20) {
+			resolve({
+				ok: false,
+				timeout: true,
+				warn: `no budget left (${String(remaining)}ms)`
+			});
+			return;
+		}
+		const python = String(input.env?.[SNAP_PYTHON_ENV] ?? "python").trim() || "python";
+		let child;
+		try {
+			child = spawn(python, [script, "scan", "--shot", shot], {
+				windowsHide: true,
+				stdio: [
+					"ignore",
+					"pipe",
+					"pipe"
+				]
+			});
+		} catch (error) {
+			resolve({
+				ok: false,
+				timeout: false,
+				warn: `spawn failed: ${String(error?.message ?? error)}`
+			});
+			return;
+		}
+		let stderr = "";
+		let settled = false;
+		const finish = (value) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve(value);
+		};
+		const timer = setTimeout(() => {
+			try {
+				child.kill();
+			} catch {}
+			finish({
+				ok: false,
+				timeout: true,
+				warn: `scan killed at ${String(remaining)}ms`
+			});
+		}, remaining);
+		child.stdout?.on("data", () => {});
+		child.stderr?.on("data", (chunk) => {
+			if (stderr.length < 2048) stderr += String(chunk);
+		});
+		child.on("error", (error) => finish({
+			ok: false,
+			timeout: false,
+			warn: `spawn failed: ${String(error?.message ?? error)}`
+		}));
+		child.on("close", (code) => {
+			if (settled) return;
+			const table = snapLoadTable(join(input.cuClick, "target-table"));
+			if (code !== 0) {
+				finish({
+					ok: false,
+					timeout: false,
+					warn: `scan exit ${String(code)}: ${stderr.trim().split("\n")[0] || "no stderr"}`
+				});
+				return;
+			}
+			if (Date.now() > input.deadline) {
+				finish({
+					ok: false,
+					timeout: true,
+					warn: `scan finished over budget (${String(Date.now() - (input.deadline - input.budget))}ms)`
+				});
+				return;
+			}
+			if (!snapTableUsable(table, input.attached)) {
+				finish({
+					ok: false,
+					timeout: false,
+					warn: "scan produced no table for this frame"
+				});
+				return;
+			}
+			finish({
+				ok: true,
+				timeout: false,
+				table
+			});
+		});
+	});
+}
+/**
+* 点击前处理：给出这次点击真正要用的坐标，以及回执里那一行吸附说明。
+*
+* 不抛异常、不等待：任何一步出错都退回原坐标（reason 里写清是哪一步），
+* 并且回执只多一行，不给模型任何新动作。
+* @param exec - 工具执行上下文（取 session / signal）。
+* @param position - 校验过的模型坐标（pixel 或 0–1000，取决于会话坐标模式）。
+* @returns `{ position, line }`；line 为空串表示无需说明（表内不动或开关关掉）。
+*/
+async function snapClickPosition(exec, position) {
+	const original = [Number(position[0]), Number(position[1])];
+	const started = Date.now();
+	const budget = snapBudgetOf(process.env);
+	const env = process.env;
+	const passthrough = (reason, warn) => ({
+		position: original,
+		line: `pass-through: (${String(Math.round(original[0]))},${String(Math.round(original[1]))}) | reason=${reason}${warn === void 0 ? "" : `\nwarn=snap: ${warn}`}`
+	});
+	if (!Number.isFinite(original[0]) || !Number.isFinite(original[1])) return {
+		position: original,
+		line: ""
+	};
+	if (!snapSwitchOn(env, SNAP_ENV) || !snapSwitchOn(env, SNAP_TARGET_TABLE_ENV)) return {
+		position: original,
+		line: ""
+	};
+	try {
+		const session = sessionOf(exec);
+		const attached = lastAttachedRaster(session);
+		if (attached === void 0) return passthrough("无表", "no attached screenshot raster");
+		const mode = coordinateModeOf(session);
+		const shotX = mode === "pixel" ? original[0] : original[0] / 1000 * attached.width;
+		const shotY = mode === "pixel" ? original[1] : original[1] / 1000 * attached.height;
+		const cuClick = snapCuClickDir(env);
+		let table = snapLoadTable(join(cuClick, "target-table"));
+		if (!snapTableUsable(table, attached)) {
+			const scanned = await snapRescan({
+				cuClick,
+				attached,
+				env,
+				session,
+				budget,
+				deadline: started + budget
+			});
+			if (!scanned.ok) return passthrough(scanned.timeout ? "超时" : "扫描失败", scanned.warn);
+			table = scanned.table;
+		}
+		const frame = {
+			w: Number(table.frame_size.w),
+			h: Number(table.frame_size.h)
+		};
+		const scale = snapScaleOf(attached, frame, table);
+		const { inside, nearest } = snapLookup(table, shotX * scale.x, shotY * scale.y);
+		if (inside !== void 0) return {
+			position: original,
+			line: ""
+		};
+		if (nearest === void 0) return passthrough("无表", "table has no measurable element");
+		if (nearest.delta > SNAP_THRESHOLD_PX) return passthrough("超阈值", void 0);
+		if (Date.now() - started > budget) return passthrough("超时", `snap path took ${String(Date.now() - started)}ms`);
+		// 吸回元素中心：先回到截图坐标（除以缩放），再按会话坐标模式换回模型的写法。
+		const centerX = Number(nearest.element.center.x) / scale.x;
+		const centerY = Number(nearest.element.center.y) / scale.y;
+		const target = mode === "pixel" ? [Math.round(centerX), Math.round(centerY)] : [Math.round(centerX / attached.width * 1000), Math.round(centerY / attached.height * 1000)];
+		if (mode === "pixel" && (target[0] < 0 || target[1] < 0 || target[0] > attached.width || target[1] > attached.height)) return passthrough("超阈值", `snap target out of frame: (${String(target[0])},${String(target[1])})`);
+		return {
+			position: target,
+			line: `snapped: (${String(Math.round(original[0]))},${String(Math.round(original[1]))}) -> (${String(target[0])},${String(target[1])}) | delta=${String(Math.round(nearest.delta))}px | element=${String(nearest.element.name ?? "")}`
+		};
+	} catch (error) {
+		return passthrough("扫描失败", `snap path threw: ${String(error?.message ?? error)}`);
+	}
+}
+//#endregion
 /**
 * Register the exclusive GUI tools, the policy section, and first-frame screenshot attachment.
 * @param ctx - registration scope; requires `tools`, `systemPrompt`, and `attachments`.
@@ -1301,6 +1708,8 @@ function applyComputerUse(ctx, backend, config) {
 						type: "array",
 						items: { type: "number" }
 					},
+					// 吸附说明（snapped / pass-through 一行，出错再带一行 warn）：没动就是空。
+					snap: { type: "string" },
 					...COORDINATE_FIELDS,
 					screens: SCREENS_FIELD,
 					foreground: FOREGROUND_FIELD
@@ -1317,6 +1726,9 @@ function applyComputerUse(ctx, backend, config) {
 		async execute(args, exec) {
 			await assertImageCapableRoute(ctx, exec);
 			const position = validatedPosition(exec, args.position);
+			// 点击前吸附：拿本帧量测表核一遍（表内不动；偏了就吸回元素中心；吸不动按原坐标点）。
+			const snap = await snapClickPosition(exec, position);
+			const clickPosition = snap.position;
 			const button = args.button === "right" ? "right" : "left";
 			const count = args.count === 2 ? 2 : 1;
 			const modifiers = requireClickModifiers(args.modifiers);
@@ -1324,7 +1736,7 @@ function applyComputerUse(ctx, backend, config) {
 				const screen = requireScreen(await backend.listScreens(exec.signal), args.screen_index);
 				const click = await backend.click({
 					screen,
-					position: hidPosition(exec, position),
+					position: hidPosition(exec, clickPosition),
 					button,
 					count,
 					...modifiers === void 0 ? {} : { modifiers }
@@ -1332,11 +1744,12 @@ function applyComputerUse(ctx, backend, config) {
 				const observation = await recapture(ctx, backend, exec, config.postActionWaitMs);
 				return {
 					screenIndex: args.screen_index,
-					position,
+					position: clickPosition,
 					button,
 					count,
 					...modifiers === void 0 ? {} : { modifiers },
 					...click?.landed === void 0 ? {} : { landed: [click.landed.x, click.landed.y] },
+					...snap.line === "" ? {} : { snap: snap.line },
 					...observedFields(sessionOf(exec), observation)
 				};
 			});

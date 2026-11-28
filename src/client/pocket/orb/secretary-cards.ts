@@ -24,9 +24,12 @@
  *      后停在「更早的内容请到轨迹/搜索里看」。取数走宿主 `GET /api/assistant/secretary/history`，
  *      客户端绝不为分页把整条会话读回来（见 createSecretaryPager）。卡计数口径、24 字标题口径、
  *      词数口径都在 src/secretary-card-shared.ts，宿主与客户端共用。
- *   9. 通知卡过期（2026-11-24 改档：10 分钟 → 10 秒）：「系统 · 通知」那张卡从到达到消失只存在 10 秒
- *      （NOTICE_CARD_TTL_MS + noticeExpiry：秒级来源 = 首次观察到达时刻（落 localStorage，刷新不丢），
- *      钟面文本只作兜底；两条判据都只晚不早；过期只在渲染层收掉，绝不删宿主会话里的消息）。
+ *   9. 通知卡过期（2026-11-24 改档：10 分钟 → 10 秒；**2026-11-28 再改：第一帧即空壳**）：
+ *      「系统 · 通知」那张卡从**首次渲染**起就按已过期处理（NOTICE_CARD_SHELL_ON_FIRST_FRAME +
+ *      noticeCardShelled），走与 TTL 到期后完全相同的空壳出口，秘书页上没有任何可见形态；
+ *      TTL 判据（NOTICE_CARD_TTL_MS + noticeExpiry：秒级来源 = 首次观察到达时刻（落 localStorage，
+ *      刷新不丢），钟面文本只作兜底；两条判据都只晚不早）一个字没删，开关关掉即退回老行为；
+ *      收掉只在渲染层，绝不删宿主会话里的消息。
  *  10. compact 提示抑制（2026-11-23 第 3 项）：按已核实的宿主来源压掉那两行文本，见下。
  *  11. 引用登记（2026-11-23 第 4 项）：createSecretaryQuoteStore 与宿主 `/api/assistant/secretary-quote`
  *      同一套口径（真值在宿主、localStorage 兜底），供卡片脚部那颗「引用」按钮使用。
@@ -2214,6 +2217,36 @@ export function noticeCardExpired(
   return noticeExpiry(row, now, ttlMs, arrivalAt).expired
 }
 
+/**
+ * 通知卡「一帧即空壳」开关（2026-11-28 需求：系统通知卡从第一帧起就走已存在的过期空壳出口，
+ * 只占位、不显示任何可见内容——不能直接不渲染，那张空壳还撑着「宿主原生气泡不许冒回来」的
+ * `:has(...)` 判据）。
+ *
+ * true = 通知卡（kind=notice）永远算「已过期」，判定时点提前到首次渲染；
+ * false = 退回 2026-11-24 的口径（活满 NOTICE_CARD_TTL_MS 才收）。两种情况下 TTL 判据、
+ * 到达时刻记录、已读状态、原文都一个字没动，差别只在「何时进空壳」这一个判定。
+ */
+export const NOTICE_CARD_SHELL_ON_FIRST_FRAME: boolean = true
+
+/**
+ * 这张通知卡现在该不该走**空壳出口**（SecretaryUserCard.tsx 里那条 `data-dsh-scard-expired="1"`
+ * 的 `<article>`，与 TTL 到期后完全同一个分支）。
+ *
+ * 只认 kind=notice：用户卡与秘书回复卡永远 false（一律落到原来的完整卡/折叠行分支）；
+ * earlier-hint 那条「更早的内容」提示虽然也标 notice，但它由 syncEarlierHint 直接插 DOM、
+ * 不经过卡片组件，也不经过本判据，所以不会被压掉。
+ */
+export function noticeCardShelled(
+  row: { kind: string; clockText: string; key?: string },
+  now = Date.now(),
+  ttlMs = NOTICE_CARD_TTL_MS,
+  arrivalAt: number | null = null,
+): boolean {
+  if (row.kind !== CARD_KIND_NOTICE) return false
+  if (NOTICE_CARD_SHELL_ON_FIRST_FRAME) return true
+  return noticeCardExpired(row, now, ttlMs, arrivalAt)
+}
+
 /** ─── 到达时刻 store（2026-11-24）：秒级来源；localStorage 持久化 + 内存兜底，只增不改 ─── */
 
 export interface SecretaryNoticeArrivalStore {
@@ -3059,6 +3092,8 @@ export const secretaryCardsTestSurface = {
   noticeExpiry,
   nearestNoticeExpiryMs,
   noticeCardExpired,
+  NOTICE_CARD_SHELL_ON_FIRST_FRAME,
+  noticeCardShelled,
   createSecretaryNoticeArrivalStore,
   noticeArrivalStore,
   COMPACT_HINT_ATTRIBUTE,

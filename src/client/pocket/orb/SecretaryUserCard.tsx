@@ -7,8 +7,9 @@
  *   折叠/字号/点卡展开三种卡一律共用 SecretaryReplyCard.tsx 那一套实现，不许各自漂移。
  *
  * 两条新的口径：
- *   - 通知卡活 10 秒（2026-11-24 用户改档，原 10 分钟）只在渲染层收成空壳
- *     （noticeCardExpired / noticeExpiry / NOTICE_CARD_TTL_MS + 首次观察的到达时刻），会话数据一个字都不删；
+ *   - 通知卡**从第一帧起就是空壳**（2026-11-28 改；2026-11-24 那版是活 10 秒）：只在渲染层收成空壳
+ *     （noticeCardShelled + NOTICE_CARD_SHELL_ON_FIRST_FRAME，TTL 判据 noticeCardExpired/noticeExpiry 原样保留），
+ *     会话数据一个字都不删；空壳本身撑着「宿主气泡不许冒回来」的 :has 判据，所以不能直接不渲染；
  *   - 脚部那颗引用按钮（QuoteCardButton）三种卡都有，挂在时间左边。
  *
  * 挂载与取证：
@@ -35,7 +36,7 @@ import { SecretarySpeakButton } from './SecretarySpeakButton.tsx'
 import {
   assistantCardSpeechKey, buildSecretaryPagerCards, buildUserCardBody, CARD_KIND_NOTICE, CARD_KIND_USER, cardFoldStyle, collectSecretaryCardRows,
   clearSecretaryCompactHintRows, formatClock,
-  latestRealUserCardRef, noticeArrivalStore, noticeCardExpired, noticeCardSpeechKey, nearestNoticeExpiryMs, NOTICE_CARD_TTL_MS,
+  latestRealUserCardRef, noticeArrivalStore, noticeCardShelled, noticeCardSpeechKey, nearestNoticeExpiryMs, NOTICE_CARD_TTL_MS,
   parseNoticeCardBody, parseSessionRefs, parseUserCardBody, secretaryPager,
   secretaryQuoteStore, stripSessionRefs, tagSecretaryCompactHintRows, clearLatestTurnProcessTags, tagLatestTurnProcessRows, userCardSpeechKey, EARLIER_HINT_TEXT, SCROLL_TOP_THRESHOLD_PX,
   captureHistoryScrollSnapshot, planHistoryScrollRestore, shouldExpandOnScroll, startHistoryScrollGuard, HISTORY_FOLLOW_BOTTOM_PX,
@@ -145,8 +146,9 @@ function toEpoch(clockText: string): string {
 
 /**
  * 一张卡（用户卡 / 通知卡）：与秘书回复卡同一套外壳与折叠实现。
- * 通知卡多一条口径（2026-11-24 改档 10 秒）：从首次观察到到满 10 秒后这张卡在渲染层收成**空壳**
- * （原文还在宿主会话里，插件一个字都不删），空壳仍然挂在宿主那条用户行上，把宿主气泡压住不给它冒回来。
+ * 通知卡多一条口径（2026-11-28 改：通知卡从第一帧起就是空壳，不再是「活 10 秒后」）：
+ * 首次渲染即按已过期处理，直接在渲染层收成**空壳**（原文还在宿主会话里，插件一个字都不删），
+ * 空壳仍然挂在宿主那条用户行上，把宿主气泡压住不给它冒回来。
  */
 function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbApi }): any {
   const contentRef = useRef<HTMLDivElement | null>(null)
@@ -157,7 +159,9 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
   // 秒级判据：首次观察到这张通知卡的那一刻（落 localStorage，整页刷新后沿用同一条）；
   // 没有记录就退回钟面文本兜底（只晚不早，误差上界 59.999 秒）。
   const noticeArrival = notice ? noticeArrivalStore().at(speechKey) : null
-  const noticeExpired = notice ? noticeCardExpired(row, Date.now(), NOTICE_CARD_TTL_MS, noticeArrival) : false
+  // 2026-11-28：通知卡（kind=notice）**从第一帧起**就按已过期处理（开关在 noticeCardShelled 里），
+  // 于是第一次渲染就直接落到下面那条空壳出口——全尺寸卡与折叠行两条路径都到不了，见下面的 if。
+  const noticeExpired = notice ? noticeCardShelled(row, Date.now(), NOTICE_CARD_TTL_MS, noticeArrival) : false
   const readState = useSecretaryReadState(secretarySessionId())
   // 分页窗口：这张用户卡/通知卡完整渲染还是压成一行折叠行（hooks 一律在条件 return 之前）
   const windowState = useSecretaryCardWindow(speechKey)
@@ -179,8 +183,9 @@ function SecretaryMessageCard({ row, api }: { row: SecretaryCardRow; api?: OrbAp
   const { foldProps } = useCardFoldRegion(open, overflow, toggle)
   const quoteState = useSecretaryQuoteState(secretarySessionId())
 
-  // 过期通知卡（活满 10 秒）：只收成空壳。原文还在宿主会话里，插件一个字都不删；
-  // 空壳 kind=notice 仍然撑着那条 :has 判据，宿主气泡不会冒回来。
+  // 通知卡空壳（2026-11-28 起是「第一帧即空壳」，此前是「活满 10 秒」）：只收成空壳，
+  // 原文还在宿主会话里，插件一个字都不删；空壳 kind=notice 仍然撑着那条 :has 判据，
+  // 宿主气泡不会冒回来。全尺寸卡分支与折叠行分支都在它后面，所以两条路径都到不了。
   if (noticeExpired) {
     return (
       <article
