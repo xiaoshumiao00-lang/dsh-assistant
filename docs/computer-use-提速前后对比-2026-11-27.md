@@ -928,6 +928,7 @@ node scripts\cu-coordinate-resolver.mjs --shot 1920x1032 --bbox 346,888,471,917 
 - pre-execute：CU 会话的 click / drag / input_text / long_press 必须带 `coordinate_record`。缺记录 → deny `missing-coordinate-record`；记录过期 → `coordinate-record-stale`；记录坏/跨会话/坐标口径不一致 → `coordinate-record-invalid`；position 按记录换算后落在 bbox 外 → `coordinate-out-of-bounds`，并把偏差像素与建议分数写进拒绝原因。
 - post-execute：从工具回执的 `Pointer landed at [x, y]`（结构化 landed，文本兜底）与记录 bbox 比对；命中/未命中写进 turn-guard 日志。同一目标连续 2 次 miss 时，结果侧 block 并提示改用地址栏导航 URL / 键盘 Tab-Enter / 读页面文本链接。
 - 日志字段：tool / code / session / screen / bbox / landed / deviationPx / streak / record / advice / textChars；不落目标文本（没有 excerpt），不落本机绝对路径；沿用 `sanitizeTurnGuardLine` 掩码与 `MAX_LOG_BYTES = 200 × 1024` 轮转。
+- 参数声明：在 system-prompt/assemble 的最终 tools 上给 click / drag / input_text / long_press 补 `coordinate_record`（drag 另有 `coordinate_record_end`）；只加字段，不动 vendor 的 schema 语义。
 - 提示词：CU 会话每步可见一段硬门说明；普通会话为空串。
 
 ### 16.7.4 与已撤销覆盖层通道的关系
