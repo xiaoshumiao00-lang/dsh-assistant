@@ -81,6 +81,51 @@ async function readBody(req: any, limit = 8 * 1024): Promise<any> {
 }
 
 /**
+ * 给宿主 `system-prompt/assemble` 的载荷补上 `tools`。
+ *
+ * 2026-11-28 根因（新建 Computer Use 会话首轮必挂
+ * `Cannot read properties of undefined (reading 'map')`）：
+ * 内嵌 computer-use 的像素模式钩子 `system-prompt/assemble`
+ * （vendor/computer-use/index.js:1224-1232）读 `nextAssembly.tools` 再
+ * `tools.map(rewritePixelTool)`（同文件 :329），但本宿主 dsh-system-prompt 的瀑布载荷
+ * `PromptPresentation` 只带 sections / contexts / variables（见
+ * dsh/docs/subsystems/system-prompt.md：tool declarations remain provider-owned），
+ * `tools` 由 `assemble()` 在瀑布返回之后才挂上去。
+ * 于是：
+ *   - 进程内新建的空白 CU 会话 → `agent/created` 时盖成 pixel 戳 → 钩子走 `tools.map` → undefined.map；
+ *   - 从磁盘恢复的老会话 → 日志里已有 `session/end-seed`，vendor 的 `stampCoordinateMode`
+ *     直接早退、不盖戳 → `coordinateModeOf` 回落 millifraction → 钩子早退 → 不炸。
+ * 这正是「新建的 CU 会话跑回合必失败、旧会话照常」的分界。
+ *
+ * vendor 不许改，所以在自己的注册点把缺的字段补上：本插件的 apply 早于任何 agent 的预设
+ * 插件实例化，因此这个监听器排在 vendor 之外层（cordis waterfall 按注册顺序最外层先跑），
+ * 载荷对象沿瀑布按同一性传递（dsh-working-directory 也是就地改 contexts），内层读得到。
+ * @param ctx - dsh-assistant 宿主上下文。
+ * @param disposers - 插件卸载时要一起摘掉的清理函数。
+ */
+function installAssembleToolsPayload(ctx: any, disposers: Array<() => void>): void {
+  if (typeof ctx?.on !== 'function') return
+  const hook = async (assembly: any, context: any, next: () => Promise<any>): Promise<any> => {
+    if (assembly && typeof assembly === 'object' && assembly.tools === undefined) {
+      let tools: unknown[] = []
+      try {
+        const registry = (typeof ctx?.get === 'function' ? ctx.get('tools') : undefined) ?? ctx?.tools
+        const schemas = registry?.schemas?.(context?.scope, context?.toolSet)
+        if (Array.isArray(schemas)) tools = schemas
+      } catch { /* 注册表读不到就给空数组：像素模式只要求 tools 可迭代 */ }
+      try { assembly.tools = tools } catch { /* 载荷只读就交给内层，别在这里炸 */ }
+    }
+    return next()
+  }
+  try {
+    const off = ctx.on('system-prompt/assemble', hook)
+    if (typeof off === 'function') disposers.push(off)
+  } catch (err) {
+    try { ctx.logger?.('dsh-assistant')?.error?.('assemble tools payload patch failed: %s', String(err)) } catch {}
+  }
+}
+
+/**
  * 注册坐标模式设置：服务 + HTTP 路由。返回卸载函数（cordis 服务与路由随插件卸载）。
  * @param ctx - dsh-assistant 宿主上下文（需要 webServer 才能挂路由）。
  */
@@ -112,6 +157,8 @@ export function registerCoordinateMode(ctx: any): () => void {
   }
 
   const disposers: Array<() => void> = []
+  // 先补宿主 assemble 载荷缺的 `tools`（内嵌 computer-use 的像素模式钩子要求它存在）。
+  installAssembleToolsPayload(ctx, disposers)
   const routes = manageWebRoutes(ctx.webServer)
   disposers.push(routes.dispose)
   // 服务名专用，避免和 dsh-orb 的 orbCoordinateMode 撞名；内嵌 computer-use 优先读它。

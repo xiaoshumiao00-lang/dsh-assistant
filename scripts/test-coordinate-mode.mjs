@@ -15,10 +15,11 @@ import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { registerCoordinateMode, COORDINATE_MODE_ROUTE } from '../src/coordinate-mode.ts'
 
-function makeCtx(dir) {
+function makeCtx(dir, extra = {}) {
   const routes = new Map()
   const services = new Map()
   const errors = []
+  const hooks = new Map()
   const ctx = {
     get(name) {
       if (name === 'profileContext') return { dir }
@@ -28,12 +29,23 @@ function makeCtx(dir) {
       services.set(name, value)
       return () => services.delete(name)
     },
+    on(name, fn) {
+      const list = hooks.get(name) ?? []
+      list.push(fn)
+      hooks.set(name, list)
+      return () => {
+        const next = (hooks.get(name) ?? []).filter((item) => item !== fn)
+        hooks.set(name, next)
+      }
+    },
+    inject() {},
     webServer: {
       register(route) { routes.set(route.path, route) },
     },
-    logger: () => ({ error: (...args) => errors.push(args.join(' ')) }),
+    logger: () => ({ info() {}, warn() {}, error: (...args) => errors.push(args.join(' ')) }),
+    ...extra,
   }
-  return { ctx, routes, services, errors }
+  return { ctx, routes, services, errors, hooks }
 }
 
 async function call(handler, method, body) {
@@ -161,6 +173,68 @@ cases.push(['内嵌 computer-use 优先读个人助手服务（防止同步 vend
     /ctx\.get\("assistantCoordinateMode"\) \?\? ctx\.get\("orbCoordinateMode"\)/,
     'stampCoordinateMode 应优先读 assistantCoordinateMode，再回退 dsh-orb 的 orbCoordinateMode',
   )
+}])
+
+cases.push(['新建 CU 会话首轮不崩：像素模式下宿主播浪载荷缺 tools 也不许抛 map of undefined', async () => {
+  // 2026-11-28 根因回归（真实 vendor 模块 + 真实服务，不 mock 出错的那一行）：
+  // 宿主 dsh-system-prompt 的 system-prompt/assemble 载荷 PromptPresentation 只带
+  // sections / contexts / variables，tools 是瀑布返回之后才挂的；内嵌 computer-use 的像素
+  // 模式钩子却读 nextAssembly.tools 再 .map()（vendor/computer-use/index.js:329｜:1230）
+  // ⇒ 新建 CU 会话（进程内新盖 pixel 戳）首轮必抛
+  //   TypeError: Cannot read properties of undefined (reading 'map')
+  // 修法：coordinate-mode 注册时把缺的 tools 补进同一个载荷对象（跑在 vendor 之外层）。
+  const { applyComputerUse, createFakeDesktopBackend, resolveComputerUseConfig } = await import('../lib/computer-use.js')
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-cm-'))
+  try {
+    // 当前 profile 的真实取值：enabled=false → pixel
+    writeFileSync(join(dir, 'millifraction-coordinates.json'), JSON.stringify({ enabled: false }), 'utf8')
+    const clickSchema = () => [{
+      name: 'click',
+      description: 'Click at a 0–1000 position on the attached frontmost-window screenshot.',
+      parameters: {
+        type: 'object',
+        properties: {
+          screen_index: { type: 'integer', description: 'Screen' },
+          position: { type: 'array', description: '0–1000 position' },
+        },
+      },
+    }]
+    const { ctx, services, hooks } = makeCtx(dir, {
+      tools: { schemas: () => clickSchema(), register: () => () => {} },
+      systemPrompt: { section: () => () => {} },
+    })
+    const dispose = registerCoordinateMode(ctx)
+    assert.equal(services.get('assistantCoordinateMode').currentMode(), 'pixel', '前置：这条用例必须跑在像素模式')
+    // 预设插件（内嵌 computer-use）之后才实例化 → 它的监听器排在我们后面（内层）
+    applyComputerUse(ctx, createFakeDesktopBackend(), resolveComputerUseConfig({}))
+
+    const session = { id: 'session-coordinate-mode-regression', snapshotEvents: () => [], append: () => ({ seq: 0 }) }
+    for (const fn of hooks.get('agent/created') ?? []) await fn({ agent: { session } })
+
+    const assembleHooks = hooks.get('system-prompt/assemble') ?? []
+    assert.ok(assembleHooks.length >= 1, '内嵌 computer-use 应注册像素模式的 assemble 钩子')
+    // 按 cordis waterfall 的真实语义串起来：同一个载荷对象依次进每个监听器，
+    // 最内层 next() 返回这个对象本身（= 宿主 assemble() 的兜底 inner）。
+    const payload = { sections: [], contexts: [], variables: {} }
+    const context = { agent: { session }, modelSelection: { provider: 'x', model: 'y' } }
+    let call = async () => payload
+    for (let index = assembleHooks.length - 1; index >= 0; index -= 1) {
+      const fn = assembleHooks[index]
+      const inner = call
+      call = () => fn(payload, context, inner)
+    }
+    let thrown = null
+    try {
+      await call()
+    } catch (err) {
+      thrown = err
+    }
+    assert.equal(thrown, null, `不该再抛错，实际：${thrown?.message ?? ''}`)
+    assert.ok(Array.isArray(payload.tools), '载荷里应补上 tools（内嵌 SU 的像素模式前置条件）')
+    dispose()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 }])
 
 let failed = 0
